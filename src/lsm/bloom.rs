@@ -1,29 +1,46 @@
 //! Bloom filter for the LSM read path.
 //!
-//! Standard double-hashing bloom: we compute two 64-bit hashes of the key
-//! with xxh3 using two distinct seeds, then derive `hash_count` bit
-//! positions as `h1 + i * h2` for `i` in `0..hash_count`. Equivalent to
-//! running `hash_count` independent hash functions, without actually
-//! evaluating a family of hashers. Kirsch–Mitzenmacher (2006) shows the
-//! false-positive rate is indistinguishable from true independence when
-//! `hash_count` is small.
+//! Double-hashing bloom: derive two 64-bit seeds `h1`, `h2` from the
+//! key and compute `hash_count` bit positions as `h1 + i * h2` for `i`
+//! in `0..hash_count`. Equivalent to running `hash_count` independent
+//! hash functions under Kirsch–Mitzenmacher (2006) when the two seeds
+//! are independent and uniformly distributed.
+//!
+//! # Where do `h1` and `h2` come from?
+//!
+//! metadb's LSM keys are **never raw user input**. They are always a
+//! region of a SHA-256 content hash:
+//!
+//! - `dedup_index` key: the full 32-byte SHA-256.
+//! - `dedup_reverse` key: `[pba: 8 B BE][hash[..24]]`. The first 8
+//!   bytes are a PBA (non-uniform), but bytes 8..32 are still raw hash
+//!   output.
+//!
+//! The bloom extracts `h1` and `h2` from bytes `[8..16]` and `[16..24]`
+//! of the key. For `dedup_index`, those are uniform. For
+//! `dedup_reverse`, they are also uniform (they come from the content
+//! hash, not from the PBA prefix). This means we can skip the xxh3 we
+//! used to run over the 32-byte key — it was redundant work over an
+//! already-uniform input. Savings: ~one xxh3 call per bloom query.
+//!
+//! Caveat: this hardcodes "the last 24 bytes of a Hash32 are uniformly
+//! random". If a future caller ever uses an LSM keyed on non-hash
+//! bytes, the FP rate will be off. That would require redesigning
+//! `BloomFilter` (and its `from_parts` / on-disk layout) anyway, so
+//! this is a deliberate purpose-built choice for the Onyx workload.
 //!
 //! The filter owns its backing byte buffer but is otherwise cheap to
-//! copy (just a pointer + length). It is used in two ways:
-//! - `SstWriter` builds a fresh filter from the sorted record stream,
-//!   then the filter bytes are laid out across one or more pages in the
-//!   SST file.
-//! - `SstReader` loads those page bytes back into a `BloomFilter` and
-//!   serves `maybe_contains` checks before doing a binary search.
-
-use xxhash_rust::xxh3::xxh3_64_with_seed;
+//! copy. `SstWriter` builds one from the sorted record stream;
+//! `SstReader` reloads one via `from_parts` before doing point lookups.
 
 use super::format::Hash32;
 
-/// Seeds picked to be arbitrary and distinct. Changing them invalidates
-/// all on-disk SSTs; treat as a format constant.
-const SEED_A: u64 = 0x0123_4567_89AB_CDEF;
-const SEED_B: u64 = 0xFEDC_BA98_7654_3210;
+/// Byte offset of the 64-bit value used as `h1` in double hashing.
+/// Points at `hash[8..16]`. See module docs for why we skip the first
+/// 8 bytes (they may be a PBA prefix in `dedup_reverse`).
+const H1_OFFSET: usize = 8;
+/// Byte offset of `h2`. Points at `hash[16..24]`.
+const H2_OFFSET: usize = 16;
 
 /// Fixed-size 10-bit-per-entry bloom filter with 7 hash functions. This
 /// is the default configuration; it yields ≈ 1 % false-positive rate at
@@ -126,8 +143,11 @@ impl BloomFilter {
 }
 
 fn bit_positions(hash: &Hash32, bit_count: u32, hash_count: u32) -> impl Iterator<Item = u32> {
-    let h1 = xxh3_64_with_seed(hash, SEED_A);
-    let h2 = xxh3_64_with_seed(hash, SEED_B);
+    // Extract two 64-bit seeds directly from the key. See module docs:
+    // metadb LSM keys always have 24 bytes of uniform content-hash
+    // output starting at byte 8, so we can skip a round of xxh3.
+    let h1 = u64::from_le_bytes(hash[H1_OFFSET..H1_OFFSET + 8].try_into().unwrap());
+    let h2 = u64::from_le_bytes(hash[H2_OFFSET..H2_OFFSET + 8].try_into().unwrap());
     let bits = bit_count as u64;
     (0..hash_count).map(move |i| {
         let h = h1.wrapping_add((i as u64).wrapping_mul(h2));
@@ -138,14 +158,20 @@ fn bit_positions(hash: &Hash32, bit_count: u32, hash_count: u32) -> impl Iterato
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xxhash_rust::xxh3::xxh3_64_with_seed;
 
+    /// Produce a SHA-256-shaped test key from a small integer seed.
+    /// Bytes 8..24 are filled with diffused seed bits (via xxh3) so
+    /// they have the same uniform distribution as real content-hash
+    /// output. That matches what the bloom expects in production —
+    /// see the module docs — so FP-rate tests here are meaningful.
     fn h(seed: u64) -> Hash32 {
-        // Deterministic variety in all 32 bytes so the two seeds really
-        // produce different h1/h2.
         let mut out = [0u8; 32];
         out[..8].copy_from_slice(&seed.to_le_bytes());
-        out[8..16].copy_from_slice(&seed.wrapping_mul(0xDEAD).to_le_bytes());
-        out[16..24].copy_from_slice(&seed.wrapping_mul(0xBEEF).to_le_bytes());
+        let h1 = xxh3_64_with_seed(&seed.to_le_bytes(), 0xA5A5_A5A5);
+        let h2 = xxh3_64_with_seed(&seed.to_le_bytes(), 0x5A5A_5A5A);
+        out[8..16].copy_from_slice(&h1.to_le_bytes());
+        out[16..24].copy_from_slice(&h2.to_le_bytes());
         out[24..].copy_from_slice(&seed.wrapping_add(0xCAFE).to_le_bytes());
         out
     }
