@@ -5,13 +5,33 @@
 //! PBA-triggered reverse cleanup (a separate LSM instance keyed on
 //! `(pba, hash)`).
 //!
-//! This module lands in slices:
-//! 1. [`format`]: fixed 64-byte record codec and associated sizes.
-//! 2. [`memtable`]: sorted in-memory buffer of pending ops with a
+//! Modules landed in phase 5:
+//! - [`format`]: fixed 64-byte record codec and associated sizes.
+//! - [`memtable`]: sorted in-memory buffer of pending ops with a
 //!    freeze/release handoff protocol for the flusher.
-//! 3. (future) `sst`: on-disk run format, writer, reader, bloom filter.
-//! 4. (future) `lsm`: the multi-level facade that glues memtable + SSTs.
-//! 5. (future) `compact`: L0→L1 and Ln→Ln+1 merges.
+//! - [`bloom`]: double-hashing bloom filter sized per-SST.
+//! - [`sst`]: on-disk run format, writer, reader, and scan iterator.
+//! - [`persist`]: chained `LsmLevels` pages for serialising the level
+//!    → SST-handle table into the manifest.
+//! - [`lsm`]: memtable + multi-level facade with point `get`, memtable
+//!    flush to L0, and reader-drain coordination.
+//! - [`compact`]: L0 → L1 and leveled Ln → Ln+1 merges.
+//!
+//! # Phase-5 items deferred into phase 6
+//!
+//! - **`dedup_reverse` LSM instance** (`(pba, hash_first_24B) →
+//!   hash_last_8B`). Used by PBA refcount → 0 to locate and tombstone
+//!   the corresponding `dedup_index` entries. Intentionally not
+//!   implemented here because correctness requires atomic commit
+//!   across refcount tree + `dedup_index` + `dedup_reverse`, which is
+//!   exactly what phase 6's transaction layer provides. See
+//!   [`docs/ROADMAP.md`](../../docs/ROADMAP.md) Phase 5 → "Deferred".
+//! - **WAL-backed mutation replay**. Today a crash between `Db::flush`
+//!   calls can lose LSM + refcount writes. Phase 6 wires ops through
+//!   the WAL.
+//! - **Property + crash-injection test suite (phase 5f)**. Planned
+//!   against the unified transaction API from phase 6 rather than the
+//!   intermediate per-call API here.
 
 pub mod bloom;
 pub mod compact;
