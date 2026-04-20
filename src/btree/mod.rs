@@ -11,8 +11,10 @@
 //! 2. (future) `ops`: traversal, lookup, insert, delete, split, merge.
 //! 3. (future) `scan`: range iterator over a subtree.
 
+pub mod cache;
 pub mod format;
 
+pub use cache::PageBuf;
 pub use format::{
     L2P_KEY_SIZE, L2P_VALUE_SIZE, L2pValue, LEAF_ENTRY_SIZE, MAX_INTERNAL_CHILDREN,
     MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, init_internal, init_leaf, internal_child_at,
