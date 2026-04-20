@@ -122,7 +122,9 @@ fn check_subtree(
             }
             // Snapshot keys + children (releases the page borrow so
             // recursive reads can reuse buf).
-            let keys: Vec<u64> = (0..count).map(|i| internal_key_at(buf.read(pid).unwrap(), i)).collect();
+            let keys: Vec<u64> = (0..count)
+                .map(|i| internal_key_at(buf.read(pid).unwrap(), i))
+                .collect();
             let children: Vec<PageId> = (0..=count)
                 .map(|i| internal_child_at(buf.read(pid).unwrap(), i))
                 .collect();
@@ -136,7 +138,15 @@ fn check_subtree(
             for i in 0..=count {
                 let child_min = if i == 0 { min_incl } else { Some(keys[i - 1]) };
                 let child_max = if i == count { max_excl } else { Some(keys[i]) };
-                check_subtree(buf, children[i], child_min, child_max, depth + 1, false, leaf_depths)?;
+                check_subtree(
+                    buf,
+                    children[i],
+                    child_min,
+                    child_max,
+                    depth + 1,
+                    false,
+                    leaf_depths,
+                )?;
             }
             Ok(())
         }
