@@ -25,6 +25,7 @@
 
 pub mod btree;
 pub mod config;
+pub mod db;
 pub mod error;
 pub mod manifest;
 pub mod page;
@@ -36,8 +37,9 @@ pub mod wal;
 
 pub use btree::{BTree, L2pValue, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter};
 pub use config::{Config, PAGE_SIZE};
+pub use db::{Db, SnapshotView};
 pub use error::{MetaDbError, Result};
-pub use manifest::{MANIFEST_BODY_VERSION, Manifest, ManifestStore};
+pub use manifest::{MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry};
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 pub use page_store::PageStore;
 pub use recovery::{ReplayOutcome, replay};

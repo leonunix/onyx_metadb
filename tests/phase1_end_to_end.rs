@@ -9,7 +9,6 @@ use onyx_metadb::manifest::{Manifest, ManifestStore};
 use onyx_metadb::page_store::PageStore;
 use onyx_metadb::recovery::replay;
 use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
-use onyx_metadb::types::NULL_PAGE;
 use onyx_metadb::wal::Wal;
 use tempfile::TempDir;
 
@@ -87,13 +86,9 @@ fn fresh_to_replay_round_trip() {
             let lsn = db.wal.submit(format!("{i}").into_bytes()).unwrap();
             assert_eq!(lsn, i + 1);
         }
-        db.manifest_store
-            .commit(&Manifest {
-                body_version: onyx_metadb::manifest::MANIFEST_BODY_VERSION,
-                checkpoint_lsn: 10,
-                free_list_head: NULL_PAGE,
-            })
-            .unwrap();
+        let mut m = Manifest::empty();
+        m.checkpoint_lsn = 10;
+        db.manifest_store.commit(&m).unwrap();
         for i in 20..30u64 {
             let lsn = db.wal.submit(format!("{i}").into_bytes()).unwrap();
             assert_eq!(lsn, i + 1);
@@ -170,13 +165,9 @@ fn manifest_survives_page_store_reopen() {
         let faults = FaultController::new();
         let (mut mstore, _) = ManifestStore::open_or_create(ps, faults).unwrap();
         for lsn in [42u64, 77, 123] {
-            mstore
-                .commit(&Manifest {
-                    body_version: onyx_metadb::manifest::MANIFEST_BODY_VERSION,
-                    checkpoint_lsn: lsn,
-                    free_list_head: NULL_PAGE,
-                })
-                .unwrap();
+            let mut m = Manifest::empty();
+            m.checkpoint_lsn = lsn;
+            mstore.commit(&m).unwrap();
         }
     }
 

@@ -118,7 +118,13 @@ impl BTree {
 
     /// Point lookup. Returns `Some(value)` on a hit, `None` on a miss.
     pub fn get(&mut self, key: u64) -> Result<Option<L2pValue>> {
-        let mut current = self.root;
+        self.get_at(self.root, key)
+    }
+
+    /// Point lookup descending from an arbitrary root page id.  Used
+    /// by `SnapshotView` to read from a pinned historical root.
+    pub fn get_at(&mut self, root: PageId, key: u64) -> Result<Option<L2pValue>> {
+        let mut current = root;
         loop {
             let probe = {
                 let page = self.buf.read(current)?;
@@ -727,7 +733,17 @@ impl BTree {
     /// `a..=b`, `..b`, `..=b`, `a..`. Unbounded on either side is
     /// valid.
     pub fn range<R: RangeBounds<u64>>(&mut self, range: R) -> Result<RangeIter<'_>> {
-        RangeIter::start(self, range)
+        RangeIter::start(self, self.root, range)
+    }
+
+    /// Range iterator descending from an arbitrary root page id. Used
+    /// by `SnapshotView` for historical range scans.
+    pub fn range_at<R: RangeBounds<u64>>(
+        &mut self,
+        root: PageId,
+        range: R,
+    ) -> Result<RangeIter<'_>> {
+        RangeIter::start(self, root, range)
     }
 
     // -------- diagnostics (public for tests) ------------------------------
@@ -801,6 +817,23 @@ impl BTree {
     pub fn check_invariants(&mut self) -> Result<()> {
         crate::btree::invariants::check_tree(&mut self.buf, self.root)
     }
+
+    /// Bump the current root's refcount. Used by snapshot creation to
+    /// pin the root so CoW descent on subsequent writes recognises it
+    /// as shared.
+    pub fn incref_root_for_snapshot(&mut self) -> Result<()> {
+        let g = self.new_gen();
+        self.buf.incref(self.root, g)?;
+        Ok(())
+    }
+
+    /// Decrement a page's refcount, cascading frees. Used by
+    /// `drop_snapshot` (landing in slice 3d) to release a pinned
+    /// snapshot root.
+    pub fn decref(&mut self, pid: PageId) -> Result<crate::btree::DecrefOutcome> {
+        let g = self.new_gen();
+        self.buf.decref(pid, g)
+    }
 }
 
 enum GetProbe {
@@ -843,7 +876,7 @@ struct LeafCursor {
 }
 
 impl<'a> RangeIter<'a> {
-    fn start<R: RangeBounds<u64>>(tree: &'a mut BTree, range: R) -> Result<Self> {
+    fn start<R: RangeBounds<u64>>(tree: &'a mut BTree, root: PageId, range: R) -> Result<Self> {
         // Copy the raw Bound<&u64> out so we own the endpoints without
         // a borrow on `range`.
         let lower = cloned_bound(range.start_bound());
@@ -857,7 +890,7 @@ impl<'a> RangeIter<'a> {
         };
 
         let mut stack = Vec::new();
-        let mut current = tree.root;
+        let mut current = root;
 
         let leaf = loop {
             let header = tree.buf.read(current)?.header()?;
