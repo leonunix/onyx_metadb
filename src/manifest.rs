@@ -223,11 +223,14 @@ impl Manifest {
                     entry.l2p_shard_roots.len(),
                 )));
             }
-            if !self.refcount_shard_roots.is_empty()
+            // Phase 6.5b dropped refcount snapshots — they're empty
+            // on new writes. Legacy v4+ manifests may still carry a
+            // full-length vector, which we accept as-is.
+            if !entry.refcount_shard_roots.is_empty()
                 && entry.refcount_shard_roots.len() != shard_count
             {
                 return Err(MetaDbError::InvalidArgument(format!(
-                    "snapshot {} has {} refcount roots, expected {shard_count}",
+                    "snapshot {} has {} refcount roots, expected {shard_count} or 0",
                     entry.id,
                     entry.refcount_shard_roots.len(),
                 )));

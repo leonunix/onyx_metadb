@@ -486,6 +486,75 @@ the B+tree itself has become overkill for Onyx's L2P workload:
 
 ---
 
+## Phase 6.5b — BTree specialized to refcount  (~2 days) — **landed**
+
+After 6.5a moved L2P to a paged radix tree, the B+tree only served
+refcount. Snapshotting refcount doesn't make sense in Onyx's model
+(refcount is a running tally across all volumes and snapshots, not a
+point-in-time value), so most of the B+tree's machinery was dead
+weight. 6.5b trimmed the tree down to what refcount actually needs and
+shrunk the value type to match.
+
+### What changed
+
+- **L2pValue + DiffEntry moved to `crate::paged`**. BTree stops
+  pretending to be a general-purpose index; `paged` owns the L2P
+  concepts.
+- **BTree value shrunk from 28 B → 4 B `u32`**. Leaf entry size drops
+  from 36 B to 12 B, so each leaf page holds **336 entries instead of
+  112** (3× the branching factor with zero on-disk waste).
+- **Snapshot machinery removed**:
+  - `cow_for_write`, `incref`, `decref`, `DecrefOutcome` gone from
+    `btree::cache::PageBuf`.
+  - `incref_root_for_snapshot`, `drop_subtree`, `diff_subtrees`,
+    `get_at`, `range_at`, `collect_subtree`, `merge_diff_into` gone
+    from `btree::tree::BTree`.
+  - Writes are in-place; pages still carry a `refcount` field in the
+    header (shared with other page types) but it stays at 1 for every
+    live page.
+- **Manifest**: snapshot entries now leave `refcount_shard_roots`
+  empty and `refcount_roots_page = NULL_PAGE`. The encode-time
+  validation is relaxed: a per-snapshot refcount roots vector of
+  length 0 is accepted alongside the legacy full-length form, so
+  pre-6.5b manifests still decode.
+- **`Db`**: `take_snapshot` skips the per-tree refcount incref;
+  `drop_snapshot` skips the refcount drop_subtree loop; the
+  `refcount_from_value` / `refcount_to_value` helpers are gone — the
+  refcount path reads and writes `u32` directly through BTree's new
+  API.
+
+### Why refcount snapshot isn't needed
+
+Snapshot semantics in VDO-style deduplicating storage: taking a
+snapshot means every PBA the L2P points to picks up one more live
+reference. Dropping a snapshot releases those references. Refcount
+reflects the current live graph, not "what the count was at some
+earlier LSN." If an API ever wants "refcount value at snapshot time,"
+the answer is either "current refcount" (it already counts the
+snapshot) or "has to be reconstructed by walking the snapshot's L2P"
+— which no Onyx caller asks for.
+
+### Exit criteria
+
+- 282 lib tests + all integration suites (btree_proptest,
+  db_concurrency, db_phase6_proptest, db_snapshot_proptest, WAL crash,
+  phase-1 end-to-end) pass.
+- Clippy clean.
+- `Db::diff` / `diff_with_current` / snapshot views keep working
+  (they never touched refcount).
+
+### Deferred / follow-ups
+
+- BTree page types still named `L2pLeaf` / `L2pInternal` for historical
+  reasons. The numeric values stay at 1 / 2, so on-disk format is
+  unchanged; renaming is a pure code-churn optional cleanup.
+- Manifest version stays at v5; the schema is wire-compatible with
+  6.5b's empty-refcount-snapshot convention. A v6 bump that drops the
+  `refcount_shard_roots` / `refcount_roots_page` fields from
+  `SnapshotEntry` entirely is possible but not urgent.
+
+---
+
 ## Phase 6.5 — Page cache + bounded memory  (3–5 days)
 
 A blocker for anything that runs under production load. The phase-2–6
@@ -696,7 +765,7 @@ Items that don't gate Phase 7 but do gate production.
 | 5     | 3     |  15        | Fixed-record LSM + PBA refcount                       | landed              |
 | 6     | 2     |  17        | Transactions + WAL replay + `dedup_reverse`           | landed              |
 | 6.5a  | ~1    |  18        | Paged L2P radix tree (replaces B+tree for L2P)        | landed              |
-| 6.5b  | ~0.5  |  18.5      | Refcount B+tree value specialization (28 B → 4 B)     | planned             |
+| 6.5b  | ~0.5  |  18.5      | Refcount B+tree value specialization (28 B → 4 B)     | landed              |
 | 6.5   | ~1    |  19.5      | Bounded page cache (paged + LSM)                      | planned             |
 | 8a    | 2     |  21.5      | Pre-integration hardening + week soak (gates phase 7) | planned             |
 | 7     | 2     |  23.5      | Onyx integration + migration                          |                     |

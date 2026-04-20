@@ -1,27 +1,25 @@
-//! L2P B+tree.
+//! Refcount B+tree (phase 6.5b).
 //!
-//! Each partition owns one B+tree whose keys are 8-byte big-endian LBAs
-//! and whose values are 28-byte opaque blobs (Onyx's `BlockmapValue`,
-//! but metadb does not interpret it). Pages are 4 KiB and live in the
-//! shared page store.
+//! Single-writer, in-place, no snapshots. Each shard owns one B+tree
+//! keyed by 8-byte big-endian PBAs with 4-byte big-endian `u32`
+//! refcounts. L2P moved to [`crate::paged`] in phase 6.5a; `DiffEntry`
+//! and `L2pValue` moved with it.
 //!
-//! This module lands in slices:
-//! 1. [`format`]: on-disk layout for leaf and internal pages; pure
-//!    accessors (no algorithm, no IO).
-//! 2. (future) `ops`: traversal, lookup, insert, delete, split, merge.
-//! 3. (future) `scan`: range iterator over a subtree.
+//! Pages are 4 KiB and live in the shared page store. 336 entries per
+//! leaf, 251 separator keys per internal node (same internal layout as
+//! before the narrow-value specialization).
 
 pub mod cache;
 pub mod format;
 pub mod invariants;
 pub mod tree;
 
-pub use cache::{DecrefOutcome, PageBuf};
+pub use cache::PageBuf;
 pub use format::{
-    L2P_KEY_SIZE, L2P_VALUE_SIZE, L2pValue, LEAF_ENTRY_SIZE, MAX_INTERNAL_CHILDREN,
-    MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, init_internal, init_leaf, internal_child_at,
-    internal_insert, internal_key_at, internal_key_count, internal_remove, internal_search,
+    L2P_KEY_SIZE, L2P_VALUE_SIZE, LEAF_ENTRY_SIZE, MAX_INTERNAL_CHILDREN, MAX_INTERNAL_KEYS,
+    MAX_LEAF_ENTRIES, init_internal, init_leaf, internal_child_at, internal_insert,
+    internal_key_at, internal_key_count, internal_remove, internal_search,
     internal_set_first_child, leaf_insert, leaf_key_at, leaf_key_count, leaf_remove, leaf_search,
     leaf_set_entry, leaf_value_at,
 };
-pub use tree::{BTree, DiffEntry, RangeIter};
+pub use tree::{BTree, RangeIter};

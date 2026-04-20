@@ -126,10 +126,26 @@ const _: () = {
 /// Level byte lives at type-header offset 0.
 const TYPE_HDR_LEVEL: usize = 0;
 
-/// Alias the B+tree's 28-byte L2P value directly. The engine treats
-/// this as opaque bytes — both index implementations agree on the type
-/// so `Db` can swap between them without per-API conversions.
-pub use crate::btree::L2pValue;
+/// 28-byte opaque value stored against each L2P key. The engine treats
+/// this as opaque bytes — Onyx encodes its `BlockmapValue` into these
+/// 28 bytes in the embedder layer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct L2pValue(pub [u8; LEAF_VALUE_SIZE]);
+
+impl L2pValue {
+    /// All-zero value. Useful in tests and as a placeholder in unset
+    /// leaf slots (leaves clear slots to zero on delete).
+    pub const ZERO: Self = Self([0u8; LEAF_VALUE_SIZE]);
+
+    /// Construct from a byte slice (padded with zeros if shorter than
+    /// `LEAF_VALUE_SIZE`; panics if longer).
+    pub fn from_slice(s: &[u8]) -> Self {
+        assert!(s.len() <= LEAF_VALUE_SIZE, "value slice too long");
+        let mut v = [0u8; LEAF_VALUE_SIZE];
+        v[..s.len()].copy_from_slice(s);
+        Self(v)
+    }
+}
 
 /// Initialize a fresh empty leaf with `generation` stamped in the header.
 /// Caller must `seal()` before persisting.

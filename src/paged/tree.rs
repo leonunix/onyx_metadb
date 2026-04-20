@@ -72,6 +72,33 @@ fn ref_bound(b: &Bound<u64>) -> Bound<&u64> {
     }
 }
 
+/// One entry in the delta between two subtrees. Emitted by
+/// [`PagedL2p::diff_subtrees`] and surfaced via `Db::diff`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DiffEntry {
+    /// Key exists in B but not in A.
+    AddedInB { key: u64, new: L2pValue },
+    /// Key exists in A but not in B.
+    RemovedInB { key: u64, old: L2pValue },
+    /// Key exists in both; value changed.
+    Changed {
+        key: u64,
+        old: L2pValue,
+        new: L2pValue,
+    },
+}
+
+impl DiffEntry {
+    /// Key this diff entry concerns.
+    pub fn key(&self) -> u64 {
+        match self {
+            Self::AddedInB { key, .. }
+            | Self::RemovedInB { key, .. }
+            | Self::Changed { key, .. } => *key,
+        }
+    }
+}
+
 /// Iterator returned by [`PagedL2p::range`]. All items are materialised
 /// up-front — range scans on Onyx's L2P are rare (snapshot exports,
 /// debug tools) so eager collection keeps the implementation simple.
@@ -436,11 +463,7 @@ impl PagedL2p {
     /// on the hot path — callers are snapshot diff tools — so the
     /// implementation is a simple "collect both subtrees, merge sorted
     /// streams". Returns entries in ascending key order.
-    pub fn diff_subtrees(
-        &mut self,
-        a: PageId,
-        b: PageId,
-    ) -> Result<Vec<crate::btree::DiffEntry>> {
+    pub fn diff_subtrees(&mut self, a: PageId, b: PageId) -> Result<Vec<DiffEntry>> {
         let a_items: Vec<(u64, L2pValue)> = self
             .range_at(a, ..)?
             .collect::<Result<Vec<_>>>()?;
@@ -557,9 +580,8 @@ fn slot_span_for_level(level: u8) -> u64 {
 fn merge_diff_into(
     a: &[(u64, L2pValue)],
     b: &[(u64, L2pValue)],
-    out: &mut Vec<crate::btree::DiffEntry>,
+    out: &mut Vec<DiffEntry>,
 ) {
-    use crate::btree::DiffEntry;
     let mut i = 0usize;
     let mut j = 0usize;
     while i < a.len() && j < b.len() {
@@ -592,14 +614,14 @@ fn merge_diff_into(
         }
     }
     while i < a.len() {
-        out.push(crate::btree::DiffEntry::RemovedInB {
+        out.push(DiffEntry::RemovedInB {
             key: a[i].0,
             old: a[i].1,
         });
         i += 1;
     }
     while j < b.len() {
-        out.push(crate::btree::DiffEntry::AddedInB {
+        out.push(DiffEntry::AddedInB {
             key: b[j].0,
             new: b[j].1,
         });

@@ -179,7 +179,7 @@ mod tests {
     fn populated_tree_passes() {
         let (_d, mut t) = mk_tree();
         for i in 0u64..2000 {
-            t.insert(i, crate::btree::L2pValue::ZERO).unwrap();
+            t.insert(i, 0).unwrap();
         }
         t.check_invariants().unwrap();
     }
@@ -188,7 +188,7 @@ mod tests {
     fn invariants_hold_after_deletes() {
         let (_d, mut t) = mk_tree();
         for i in 0u64..1000 {
-            t.insert(i, crate::btree::L2pValue::ZERO).unwrap();
+            t.insert(i, 0).unwrap();
         }
         for i in (0u64..1000).step_by(3) {
             t.delete(i).unwrap();

@@ -18,7 +18,7 @@
 //!
 //! [`WalOp`]: crate::wal::WalOp
 
-use crate::btree::L2pValue;
+use crate::paged::L2pValue;
 use crate::error::Result;
 use crate::lsm::{DedupValue, Hash32};
 use crate::types::{Lba, Lsn, Pba};

@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn replay_into_invokes_callback_for_each_decoded_op() {
-        use crate::btree::L2pValue;
+        use crate::paged::L2pValue;
         use crate::wal::{WalOp, encode_body};
 
         let dir = TempDir::new().unwrap();
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn replay_into_stops_and_truncates_torn_tail() {
-        use crate::btree::L2pValue;
+        use crate::paged::L2pValue;
         use crate::wal::{WalOp, encode_body};
         use std::os::unix::fs::FileExt;
 

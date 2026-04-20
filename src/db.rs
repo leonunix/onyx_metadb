@@ -14,7 +14,8 @@ use std::sync::Arc;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::btree::{BTree, DiffEntry, L2pValue};
+use crate::btree::BTree;
+use crate::paged::{DiffEntry, L2pValue};
 use crate::paged::PagedL2p;
 use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
@@ -475,7 +476,7 @@ impl Db {
     pub fn get_refcount(&self, pba: Pba) -> Result<u32> {
         let sid = self.refcount_shard_for(pba);
         let mut tree = self.refcount_shards[sid].tree.lock();
-        Ok(tree.get(pba)?.map(refcount_from_value).unwrap_or(0))
+        Ok(tree.get(pba)?.unwrap_or(0))
     }
 
     /// Increment `pba`'s refcount by `delta`. Returns the new value.
@@ -635,15 +636,13 @@ impl Db {
             tree.incref_root_for_snapshot()?;
             l2p_roots.push(tree.root());
         }
-        let mut refcount_roots = Vec::with_capacity(refcount_guards.len());
-        for tree in &mut refcount_guards {
-            tree.incref_root_for_snapshot()?;
-            refcount_roots.push(tree.root());
-        }
+        // Phase 6.5b: refcount is a running tally, not point-in-time
+        // state. Snapshots only capture L2P. We still need `refcount_guards`
+        // below for `max_generation_from_two_groups` and
+        // `refresh_manifest_from_locked`, but skip the per-tree
+        // snapshot incref.
         let created_lsn = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
         let l2p_roots_page = write_snapshot_roots_page(&self.page_store, &l2p_roots, created_lsn)?;
-        let refcount_roots_page =
-            write_snapshot_roots_page(&self.page_store, &refcount_roots, created_lsn)?;
 
         self.flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_locked_refcount_shards(&mut refcount_guards)?;
@@ -656,10 +655,10 @@ impl Db {
         manifest_state.manifest.snapshots.push(SnapshotEntry {
             id,
             l2p_roots_page,
-            refcount_roots_page,
+            refcount_roots_page: crate::types::NULL_PAGE,
             created_lsn,
             l2p_shard_roots: l2p_roots.into_boxed_slice(),
-            refcount_shard_roots: refcount_roots.into_boxed_slice(),
+            refcount_shard_roots: Vec::new().into_boxed_slice(),
         });
         manifest_state.manifest.next_snapshot_id = id
             .checked_add(1)
@@ -769,17 +768,12 @@ impl Db {
         {
             values.extend(tree.drop_subtree(root)?);
         }
-        if !entry.refcount_shard_roots.is_empty() {
-            for (tree, root) in refcount_guards
-                .iter_mut()
-                .zip(entry.refcount_shard_roots.iter().copied())
-            {
-                // Refcount subtree values are discarded; the caller
-                // doesn't care about refcount-at-snapshot values, only
-                // about freeing the pages.
-                let _ = tree.drop_subtree(root)?;
-            }
-        }
+        // Phase 6.5b: refcount is not snapshotted; nothing to drop
+        // from refcount trees here. Any legacy pre-6.5b snapshot that
+        // still carries `refcount_shard_roots` would surface as a
+        // Corruption on open, since paged L2P opens check root
+        // types — so we can assume the field is always empty.
+        debug_assert!(entry.refcount_shard_roots.is_empty());
         self.flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_locked_refcount_shards(&mut refcount_guards)?;
         self.refresh_manifest_from_locked(
@@ -1079,16 +1073,6 @@ fn max_generation_from_two_groups(
     max_generation_from_locked_l2p(a).max(max_generation_from_locked(b))
 }
 
-fn refcount_from_value(v: L2pValue) -> u32 {
-    u32::from_be_bytes([v.0[0], v.0[1], v.0[2], v.0[3]])
-}
-
-fn refcount_to_value(count: u32) -> L2pValue {
-    let mut bytes = [0u8; 28];
-    bytes[..4].copy_from_slice(&count.to_be_bytes());
-    L2pValue(bytes)
-}
-
 /// Encode a `(pba, hash)` pair for storage in the `dedup_reverse` LSM.
 ///
 /// The LSM key is 32 bytes (`Hash32`). We pack the 8-byte big-endian
@@ -1161,19 +1145,19 @@ fn apply_op_bare(
         WalOp::Incref { pba, delta } => {
             let sid = shard_for_key(refcount_shards, pba);
             let mut tree = refcount_shards[sid].tree.lock();
-            let current = tree.get(pba)?.map(refcount_from_value).unwrap_or(0);
+            let current = tree.get(pba)?.unwrap_or(0);
             let new = current.checked_add(delta).ok_or_else(|| {
                 MetaDbError::InvalidArgument(format!("refcount overflow for pba {pba}"))
             })?;
             if new != 0 {
-                tree.insert(pba, refcount_to_value(new))?;
+                tree.insert(pba, new)?;
             }
             Ok(ApplyOutcome::RefcountNew(new))
         }
         WalOp::Decref { pba, delta } => {
             let sid = shard_for_key(refcount_shards, pba);
             let mut tree = refcount_shards[sid].tree.lock();
-            let current = tree.get(pba)?.map(refcount_from_value).unwrap_or(0);
+            let current = tree.get(pba)?.unwrap_or(0);
             let new = current.checked_sub(delta).ok_or_else(|| {
                 MetaDbError::InvalidArgument(format!(
                     "decref underflow for pba {pba}: {current} - {delta}",
@@ -1182,7 +1166,7 @@ fn apply_op_bare(
             if new == 0 {
                 tree.delete(pba)?;
             } else {
-                tree.insert(pba, refcount_to_value(new))?;
+                tree.insert(pba, new)?;
             }
             Ok(ApplyOutcome::RefcountNew(new))
         }
@@ -1640,13 +1624,13 @@ mod tests {
         for pba in 0u64..50 {
             assert_eq!(db.get_refcount(pba).unwrap(), 2);
         }
-        // Snapshot-view access to refcount tree isn't yet exposed, but
-        // we can at least verify the snapshot was persisted with both
-        // root pages recorded.
+        // Phase 6.5b: refcount is a running tally, not a point-in-time
+        // value — snapshots only capture L2P. The entry's refcount
+        // fields are empty / NULL by design.
         let snap_entry = &db.snapshots()[0];
         assert_ne!(snap_entry.l2p_roots_page, crate::types::NULL_PAGE);
-        assert_ne!(snap_entry.refcount_roots_page, crate::types::NULL_PAGE);
-        assert_eq!(snap_entry.refcount_shard_roots.len(), db.shard_count());
+        assert_eq!(snap_entry.refcount_roots_page, crate::types::NULL_PAGE);
+        assert!(snap_entry.refcount_shard_roots.is_empty());
     }
 
     #[test]

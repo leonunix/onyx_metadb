@@ -39,9 +39,8 @@ pub mod tx;
 pub mod types;
 pub mod wal;
 
-pub use btree::{
-    BTree, DiffEntry, L2pValue, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter,
-};
+pub use btree::{BTree, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter};
+pub use paged::{DiffEntry, L2pValue, PagedL2p};
 pub use cache::{PageCache, PageCacheStats};
 pub use config::{Config, PAGE_SIZE};
 pub use db::{Db, DbRangeIter, DropReport, SnapshotView};
