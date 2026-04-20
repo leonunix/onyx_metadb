@@ -288,6 +288,75 @@ pub fn internal_set_first_child(page: &mut Page, child: PageId) {
     internal_set_child_raw(page, 0, child);
 }
 
+/// Overwrite an existing separator key at position `i` in-place. Used
+/// by the delete path when a sibling borrow or merge changes the
+/// parent's pivot without changing `key_count`.
+pub fn internal_set_key_at(page: &mut Page, i: usize, key: u64) {
+    debug_assert!(
+        i < internal_key_count(page),
+        "internal_set_key_at: out of range",
+    );
+    internal_set_key_raw(page, i, key);
+}
+
+/// Prepend `(new_key, new_child)` at the front: `keys[0] = new_key`,
+/// `children[0] = new_child`, shifting everything else right by one.
+pub fn internal_push_front(page: &mut Page, new_key: u64, new_child: PageId) -> Result<()> {
+    let n = internal_key_count(page);
+    if n >= MAX_INTERNAL_KEYS {
+        return Err(MetaDbError::InvalidArgument(
+            "internal_push_front: internal is full".into(),
+        ));
+    }
+    if n > 0 {
+        let start = 0;
+        let end = n * L2P_KEY_SIZE;
+        page.payload_mut().copy_within(start..end, L2P_KEY_SIZE);
+    }
+    {
+        let start = CHILDREN_REGION_OFFSET;
+        let end = CHILDREN_REGION_OFFSET + (n + 1) * 8;
+        page.payload_mut().copy_within(start..end, start + 8);
+    }
+    internal_set_key_raw(page, 0, new_key);
+    internal_set_child_raw(page, 0, new_child);
+    page.set_key_count((n + 1) as u16);
+    Ok(())
+}
+
+/// Remove `keys[0]` and `children[0]`, shifting everything else left
+/// by one slot. Inverse of [`internal_push_front`].
+pub fn internal_pop_front(page: &mut Page) -> Result<()> {
+    let n = internal_key_count(page);
+    if n == 0 {
+        return Err(MetaDbError::InvalidArgument(
+            "internal_pop_front: page has no entries".into(),
+        ));
+    }
+    {
+        let start = L2P_KEY_SIZE;
+        let end = n * L2P_KEY_SIZE;
+        page.payload_mut().copy_within(start..end, 0);
+    }
+    {
+        let start = CHILDREN_REGION_OFFSET + 8;
+        let end = CHILDREN_REGION_OFFSET + (n + 1) * 8;
+        page.payload_mut()
+            .copy_within(start..end, CHILDREN_REGION_OFFSET);
+    }
+    // Zero vacated tail.
+    let key_off = (n - 1) * L2P_KEY_SIZE;
+    for b in &mut page.payload_mut()[key_off..key_off + L2P_KEY_SIZE] {
+        *b = 0;
+    }
+    let child_off = CHILDREN_REGION_OFFSET + n * 8;
+    for b in &mut page.payload_mut()[child_off..child_off + 8] {
+        *b = 0;
+    }
+    page.set_key_count((n - 1) as u16);
+    Ok(())
+}
+
 /// Descent index for `key`: the position in `children[..]` that
 /// contains keys whose values are in the range covered by `key`.
 /// Returns a value in `[0, key_count]`. Pure binary search; O(log N).
@@ -647,6 +716,66 @@ mod tests {
         let p = fresh_internal(42);
         assert_eq!(internal_search(&p, 0), 0);
         assert_eq!(internal_search(&p, u64::MAX), 0);
+    }
+
+    #[test]
+    fn internal_push_front_shifts_right() {
+        let mut p = fresh_internal(100);
+        internal_insert(&mut p, 0, 10, 110).unwrap();
+        internal_insert(&mut p, 1, 20, 120).unwrap();
+        // Before: keys=[10,20], children=[100,110,120]
+        internal_push_front(&mut p, 5, 50).unwrap();
+        // After:  keys=[5,10,20], children=[50,100,110,120]
+        assert_eq!(internal_key_count(&p), 3);
+        assert_eq!(internal_key_at(&p, 0), 5);
+        assert_eq!(internal_key_at(&p, 1), 10);
+        assert_eq!(internal_key_at(&p, 2), 20);
+        assert_eq!(internal_child_at(&p, 0), 50);
+        assert_eq!(internal_child_at(&p, 1), 100);
+        assert_eq!(internal_child_at(&p, 2), 110);
+        assert_eq!(internal_child_at(&p, 3), 120);
+    }
+
+    #[test]
+    fn internal_pop_front_shifts_left() {
+        let mut p = fresh_internal(100);
+        internal_insert(&mut p, 0, 10, 110).unwrap();
+        internal_insert(&mut p, 1, 20, 120).unwrap();
+        internal_insert(&mut p, 2, 30, 130).unwrap();
+        // Before: keys=[10,20,30], children=[100,110,120,130]
+        internal_pop_front(&mut p).unwrap();
+        // After:  keys=[20,30], children=[110,120,130]
+        assert_eq!(internal_key_count(&p), 2);
+        assert_eq!(internal_key_at(&p, 0), 20);
+        assert_eq!(internal_key_at(&p, 1), 30);
+        assert_eq!(internal_child_at(&p, 0), 110);
+        assert_eq!(internal_child_at(&p, 1), 120);
+        assert_eq!(internal_child_at(&p, 2), 130);
+    }
+
+    #[test]
+    fn internal_push_pop_front_round_trip() {
+        let mut p = fresh_internal(1);
+        internal_insert(&mut p, 0, 10, 2).unwrap();
+        internal_insert(&mut p, 1, 20, 3).unwrap();
+        internal_push_front(&mut p, 5, 9).unwrap();
+        internal_pop_front(&mut p).unwrap();
+        // Back to original.
+        assert_eq!(internal_key_count(&p), 2);
+        assert_eq!(internal_key_at(&p, 0), 10);
+        assert_eq!(internal_key_at(&p, 1), 20);
+        assert_eq!(internal_child_at(&p, 0), 1);
+        assert_eq!(internal_child_at(&p, 1), 2);
+        assert_eq!(internal_child_at(&p, 2), 3);
+    }
+
+    #[test]
+    fn internal_set_key_at_updates_in_place() {
+        let mut p = fresh_internal(1);
+        internal_insert(&mut p, 0, 10, 2).unwrap();
+        internal_set_key_at(&mut p, 0, 99);
+        assert_eq!(internal_key_at(&p, 0), 99);
+        assert_eq!(internal_key_count(&p), 1);
     }
 
     #[test]

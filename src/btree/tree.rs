@@ -21,14 +21,25 @@ use std::sync::Arc;
 use crate::btree::cache::PageBuf;
 use crate::btree::format::{
     L2pValue, LEAF_ENTRY_SIZE, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, internal_child_at,
-    internal_insert, internal_key_at, internal_key_count, internal_search,
-    internal_set_first_child, leaf_insert, leaf_key_at, leaf_key_count, leaf_search,
-    leaf_set_entry, leaf_value_at,
+    internal_insert, internal_key_at, internal_key_count, internal_pop_front, internal_push_front,
+    internal_remove, internal_search, internal_set_first_child, internal_set_key_at, leaf_insert,
+    leaf_key_at, leaf_key_count, leaf_remove, leaf_search, leaf_set_entry, leaf_value_at,
 };
 use crate::error::{MetaDbError, Result};
 use crate::page::PageType;
 use crate::page_store::PageStore;
 use crate::types::{Lsn, PageId};
+
+/// Minimum leaf fill before a delete triggers a borrow-or-merge. Set
+/// to half of [`MAX_LEAF_ENTRIES`] so two underflowing leaves always
+/// merge into one; any higher threshold would force borrowing in
+/// cases where a merge would fit.
+const LEAF_UNDERFLOW_THRESHOLD: usize = MAX_LEAF_ENTRIES / 2;
+
+/// Minimum internal fill before a delete triggers a borrow-or-merge.
+/// Set to half of [`MAX_INTERNAL_KEYS`] so two underflowing internals
+/// plus a pivot key always fit in one merged page.
+const INTERNAL_UNDERFLOW_THRESHOLD: usize = MAX_INTERNAL_KEYS / 2;
 
 /// Single-partition B+tree. Not `Send` across threads without external
 /// synchronization — phase 4 will shard + wrap this type.
@@ -191,8 +202,14 @@ impl BTree {
                     return Ok(None);
                 }
                 Action::Split { pos } => {
-                    let (sep_key, new_right) =
-                        split_leaf_and_insert(&mut self.buf, current, pos, key, &value, generation)?;
+                    let (sep_key, new_right) = split_leaf_and_insert(
+                        &mut self.buf,
+                        current,
+                        pos,
+                        key,
+                        &value,
+                        generation,
+                    )?;
                     self.propagate_split_up(&path, sep_key, new_right, generation)?;
                     return Ok(None);
                 }
@@ -205,6 +222,388 @@ impl BTree {
                 }
             }
         }
+    }
+
+    // -------- delete -----------------------------------------------------
+
+    /// Remove `key`. Returns `Some(old)` if the key was present,
+    /// `None` otherwise. Rebalances the tree via sibling borrow or
+    /// merge; collapses a single-child root if one emerges.
+    pub fn delete(&mut self, key: u64) -> Result<Option<L2pValue>> {
+        let generation = self.new_gen();
+        let mut path: Vec<(PageId, usize)> = Vec::new();
+        let mut current = self.root;
+
+        loop {
+            let action = {
+                let page = self.buf.read(current)?;
+                match page.header()?.page_type {
+                    PageType::L2pLeaf => match leaf_search(page, key) {
+                        Ok(pos) => DeleteAction::Remove {
+                            pos,
+                            old: leaf_value_at(page, pos),
+                        },
+                        Err(_) => DeleteAction::Miss,
+                    },
+                    PageType::L2pInternal => {
+                        let slot = internal_search(page, key);
+                        let child = internal_child_at(page, slot);
+                        DeleteAction::Descend { child, slot }
+                    }
+                    other => {
+                        return Err(MetaDbError::Corruption(format!(
+                            "unexpected page type {other:?} at page {current}",
+                        )));
+                    }
+                }
+            };
+
+            match action {
+                DeleteAction::Miss => return Ok(None),
+                DeleteAction::Remove { pos, old } => {
+                    {
+                        let page = self.buf.modify(current, generation)?;
+                        leaf_remove(page, pos)?;
+                    }
+                    self.rebalance_after_remove(path, current, generation)?;
+                    return Ok(Some(old));
+                }
+                DeleteAction::Descend { child, slot } => {
+                    path.push((current, slot));
+                    current = child;
+                }
+            }
+        }
+    }
+
+    /// Walk the path from leaf toward root, rebalancing pages that
+    /// dropped below the underflow threshold. Handles root collapse
+    /// when the root is a childless internal at the end.
+    fn rebalance_after_remove(
+        &mut self,
+        path: Vec<(PageId, usize)>,
+        leaf_pid: PageId,
+        generation: Lsn,
+    ) -> Result<()> {
+        let mut current_pid = leaf_pid;
+        for (parent_pid, child_slot) in path.into_iter().rev() {
+            let (underflow, is_leaf) = self.check_underflow(current_pid)?;
+            if !underflow {
+                return Ok(());
+            }
+            let merged =
+                self.rebalance_child(parent_pid, child_slot, current_pid, is_leaf, generation)?;
+            if !merged {
+                return Ok(());
+            }
+            current_pid = parent_pid;
+        }
+        // current_pid is self.root; collapse if it's a childless internal.
+        self.maybe_collapse_root(current_pid, generation)?;
+        Ok(())
+    }
+
+    fn check_underflow(&mut self, pid: PageId) -> Result<(bool, bool)> {
+        let page = self.buf.read(pid)?;
+        let header = page.header()?;
+        match header.page_type {
+            PageType::L2pLeaf => {
+                let count = leaf_key_count(page);
+                Ok((count < LEAF_UNDERFLOW_THRESHOLD, true))
+            }
+            PageType::L2pInternal => {
+                let count = internal_key_count(page);
+                Ok((count < INTERNAL_UNDERFLOW_THRESHOLD, false))
+            }
+            other => Err(MetaDbError::Corruption(format!(
+                "unexpected page type {other:?} at {pid}",
+            ))),
+        }
+    }
+
+    /// Try to rebalance `child_pid` within `parent_pid` by borrowing
+    /// from or merging with an immediate sibling. Returns `true` if a
+    /// merge occurred (so the parent lost a key), `false` if a borrow
+    /// made the child non-underflow.
+    fn rebalance_child(
+        &mut self,
+        parent_pid: PageId,
+        child_slot: usize,
+        child_pid: PageId,
+        child_is_leaf: bool,
+        generation: Lsn,
+    ) -> Result<bool> {
+        let parent_n = internal_key_count(self.buf.read(parent_pid)?);
+        let has_left = child_slot > 0;
+        let has_right = child_slot < parent_n;
+        let threshold = if child_is_leaf {
+            LEAF_UNDERFLOW_THRESHOLD
+        } else {
+            INTERNAL_UNDERFLOW_THRESHOLD
+        };
+
+        // Prefer right borrow for predictability; fall back to left.
+        if has_right {
+            let right_pid = internal_child_at(self.buf.read(parent_pid)?, child_slot + 1);
+            let right_count = self.page_count(right_pid, child_is_leaf)?;
+            if right_count > threshold {
+                if child_is_leaf {
+                    self.borrow_from_right_leaf(
+                        parent_pid, child_slot, child_pid, right_pid, generation,
+                    )?;
+                } else {
+                    self.borrow_from_right_internal(
+                        parent_pid, child_slot, child_pid, right_pid, generation,
+                    )?;
+                }
+                return Ok(false);
+            }
+        }
+        if has_left {
+            let left_pid = internal_child_at(self.buf.read(parent_pid)?, child_slot - 1);
+            let left_count = self.page_count(left_pid, child_is_leaf)?;
+            if left_count > threshold {
+                if child_is_leaf {
+                    self.borrow_from_left_leaf(
+                        parent_pid,
+                        child_slot - 1,
+                        left_pid,
+                        child_pid,
+                        generation,
+                    )?;
+                } else {
+                    self.borrow_from_left_internal(
+                        parent_pid,
+                        child_slot - 1,
+                        left_pid,
+                        child_pid,
+                        generation,
+                    )?;
+                }
+                return Ok(false);
+            }
+        }
+        // Can't borrow. Merge with whichever sibling exists (preferring
+        // right so `child_pid` is the absorber and stays alive).
+        if has_right {
+            let right_pid = internal_child_at(self.buf.read(parent_pid)?, child_slot + 1);
+            if child_is_leaf {
+                self.merge_leaves(parent_pid, child_slot, child_pid, right_pid, generation)?;
+            } else {
+                self.merge_internals(parent_pid, child_slot, child_pid, right_pid, generation)?;
+            }
+            return Ok(true);
+        }
+        if has_left {
+            let left_pid = internal_child_at(self.buf.read(parent_pid)?, child_slot - 1);
+            if child_is_leaf {
+                self.merge_leaves(parent_pid, child_slot - 1, left_pid, child_pid, generation)?;
+            } else {
+                self.merge_internals(parent_pid, child_slot - 1, left_pid, child_pid, generation)?;
+            }
+            return Ok(true);
+        }
+        // No siblings — parent has exactly 1 child (only possible when
+        // parent is root). Nothing to rebalance here; caller handles
+        // root collapse after the loop.
+        Ok(false)
+    }
+
+    fn page_count(&mut self, pid: PageId, is_leaf: bool) -> Result<usize> {
+        let page = self.buf.read(pid)?;
+        Ok(if is_leaf {
+            leaf_key_count(page)
+        } else {
+            internal_key_count(page)
+        })
+    }
+
+    fn borrow_from_right_leaf(
+        &mut self,
+        parent_pid: PageId,
+        pivot_slot: usize,
+        left_pid: PageId,
+        right_pid: PageId,
+        generation: Lsn,
+    ) -> Result<()> {
+        let (k, v) = {
+            let right = self.buf.read(right_pid)?;
+            (leaf_key_at(right, 0), leaf_value_at(right, 0))
+        };
+        {
+            let right = self.buf.modify(right_pid, generation)?;
+            leaf_remove(right, 0)?;
+        }
+        {
+            let left = self.buf.modify(left_pid, generation)?;
+            let n = leaf_key_count(left);
+            leaf_insert(left, n, k, &v)?;
+        }
+        let new_pivot = leaf_key_at(self.buf.read(right_pid)?, 0);
+        let parent = self.buf.modify(parent_pid, generation)?;
+        internal_set_key_at(parent, pivot_slot, new_pivot);
+        Ok(())
+    }
+
+    fn borrow_from_left_leaf(
+        &mut self,
+        parent_pid: PageId,
+        pivot_slot: usize,
+        left_pid: PageId,
+        right_pid: PageId,
+        generation: Lsn,
+    ) -> Result<()> {
+        let (k, v) = {
+            let left = self.buf.read(left_pid)?;
+            let n = leaf_key_count(left);
+            (leaf_key_at(left, n - 1), leaf_value_at(left, n - 1))
+        };
+        {
+            let left = self.buf.modify(left_pid, generation)?;
+            let n = leaf_key_count(left);
+            leaf_remove(left, n - 1)?;
+        }
+        {
+            let right = self.buf.modify(right_pid, generation)?;
+            leaf_insert(right, 0, k, &v)?;
+        }
+        let parent = self.buf.modify(parent_pid, generation)?;
+        internal_set_key_at(parent, pivot_slot, k);
+        Ok(())
+    }
+
+    fn borrow_from_right_internal(
+        &mut self,
+        parent_pid: PageId,
+        pivot_slot: usize,
+        left_pid: PageId,
+        right_pid: PageId,
+        generation: Lsn,
+    ) -> Result<()> {
+        let (right_first_key, right_first_child) = {
+            let right = self.buf.read(right_pid)?;
+            (internal_key_at(right, 0), internal_child_at(right, 0))
+        };
+        let old_pivot = internal_key_at(self.buf.read(parent_pid)?, pivot_slot);
+        {
+            let left = self.buf.modify(left_pid, generation)?;
+            let n = internal_key_count(left);
+            internal_insert(left, n, old_pivot, right_first_child)?;
+        }
+        {
+            let right = self.buf.modify(right_pid, generation)?;
+            internal_pop_front(right)?;
+        }
+        let parent = self.buf.modify(parent_pid, generation)?;
+        internal_set_key_at(parent, pivot_slot, right_first_key);
+        Ok(())
+    }
+
+    fn borrow_from_left_internal(
+        &mut self,
+        parent_pid: PageId,
+        pivot_slot: usize,
+        left_pid: PageId,
+        right_pid: PageId,
+        generation: Lsn,
+    ) -> Result<()> {
+        let (left_last_key, left_last_child) = {
+            let left = self.buf.read(left_pid)?;
+            let n = internal_key_count(left);
+            (internal_key_at(left, n - 1), internal_child_at(left, n))
+        };
+        let old_pivot = internal_key_at(self.buf.read(parent_pid)?, pivot_slot);
+        {
+            let left = self.buf.modify(left_pid, generation)?;
+            let n = internal_key_count(left);
+            internal_remove(left, n - 1)?;
+        }
+        {
+            let right = self.buf.modify(right_pid, generation)?;
+            internal_push_front(right, old_pivot, left_last_child)?;
+        }
+        let parent = self.buf.modify(parent_pid, generation)?;
+        internal_set_key_at(parent, pivot_slot, left_last_key);
+        Ok(())
+    }
+
+    fn merge_leaves(
+        &mut self,
+        parent_pid: PageId,
+        pivot_slot: usize,
+        left_pid: PageId,
+        right_pid: PageId,
+        generation: Lsn,
+    ) -> Result<()> {
+        let moved: Vec<(u64, L2pValue)> = {
+            let right = self.buf.read(right_pid)?;
+            (0..leaf_key_count(right))
+                .map(|i| (leaf_key_at(right, i), leaf_value_at(right, i)))
+                .collect()
+        };
+        {
+            let left = self.buf.modify(left_pid, generation)?;
+            let start = leaf_key_count(left);
+            for (offset, (k, v)) in moved.into_iter().enumerate() {
+                leaf_insert(left, start + offset, k, &v)?;
+            }
+        }
+        {
+            let parent = self.buf.modify(parent_pid, generation)?;
+            internal_remove(parent, pivot_slot)?;
+        }
+        self.buf.free(right_pid, generation)?;
+        Ok(())
+    }
+
+    fn merge_internals(
+        &mut self,
+        parent_pid: PageId,
+        pivot_slot: usize,
+        left_pid: PageId,
+        right_pid: PageId,
+        generation: Lsn,
+    ) -> Result<()> {
+        let pivot_key = internal_key_at(self.buf.read(parent_pid)?, pivot_slot);
+        let (right_keys, right_children) = {
+            let right = self.buf.read(right_pid)?;
+            let n = internal_key_count(right);
+            let keys: Vec<u64> = (0..n).map(|i| internal_key_at(right, i)).collect();
+            let children: Vec<PageId> = (0..=n).map(|i| internal_child_at(right, i)).collect();
+            (keys, children)
+        };
+        {
+            let left = self.buf.modify(left_pid, generation)?;
+            let left_n = internal_key_count(left);
+            internal_insert(left, left_n, pivot_key, right_children[0])?;
+            for (i, k) in right_keys.iter().enumerate() {
+                let n_now = internal_key_count(left);
+                internal_insert(left, n_now, *k, right_children[i + 1])?;
+            }
+        }
+        {
+            let parent = self.buf.modify(parent_pid, generation)?;
+            internal_remove(parent, pivot_slot)?;
+        }
+        self.buf.free(right_pid, generation)?;
+        Ok(())
+    }
+
+    fn maybe_collapse_root(&mut self, root_pid: PageId, generation: Lsn) -> Result<()> {
+        let (should_collapse, new_root) = {
+            let page = self.buf.read(root_pid)?;
+            let header = page.header()?;
+            if header.page_type == PageType::L2pInternal && internal_key_count(page) == 0 {
+                (true, internal_child_at(page, 0))
+            } else {
+                (false, 0)
+            }
+        };
+        if should_collapse {
+            self.buf.free(root_pid, generation)?;
+            self.root = new_root;
+        }
+        Ok(())
     }
 
     fn propagate_split_up(
@@ -261,7 +660,9 @@ impl BTree {
                     current = internal_child_at(self.buf.read(current)?, 0);
                 }
                 other => {
-                    return Err(MetaDbError::Corruption(format!("unexpected type {other:?}")));
+                    return Err(MetaDbError::Corruption(format!(
+                        "unexpected type {other:?}"
+                    )));
                 }
             }
         }
@@ -294,7 +695,9 @@ impl BTree {
                     }
                 }
                 other => {
-                    return Err(MetaDbError::Corruption(format!("unexpected type {other:?}")));
+                    return Err(MetaDbError::Corruption(format!(
+                        "unexpected type {other:?}"
+                    )));
                 }
             }
         }
@@ -328,6 +731,12 @@ enum Action {
         child_pid: PageId,
         child_slot: usize,
     },
+}
+
+enum DeleteAction {
+    Miss,
+    Remove { pos: usize, old: L2pValue },
+    Descend { child: PageId, slot: usize },
 }
 
 // -------- split helpers (module-private) ----------------------------------
@@ -552,8 +961,8 @@ mod tests {
 
     #[test]
     fn split_keeps_all_keys_for_random_insert() {
-        use rand::seq::SliceRandom;
         use rand::SeedableRng;
+        use rand::seq::SliceRandom;
         use rand_chacha::ChaCha8Rng;
 
         let (_d, mut t) = mk_tree();
@@ -644,6 +1053,153 @@ mod tests {
         assert_eq!(t.depth().unwrap(), 1);
         // Updates only touch the single root leaf.
         assert_eq!(t.cached_pages(), before_pages);
+    }
+
+    // -------- delete --------
+
+    #[test]
+    fn delete_miss_returns_none() {
+        let (_d, mut t) = mk_tree();
+        assert_eq!(t.delete(42).unwrap(), None);
+        t.insert(1, v(1)).unwrap();
+        assert_eq!(t.delete(42).unwrap(), None);
+        assert_eq!(t.get(1).unwrap(), Some(v(1)));
+    }
+
+    #[test]
+    fn delete_hit_returns_old_value() {
+        let (_d, mut t) = mk_tree();
+        t.insert(10, v(7)).unwrap();
+        assert_eq!(t.delete(10).unwrap(), Some(v(7)));
+        assert_eq!(t.get(10).unwrap(), None);
+        assert_eq!(t.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_all_from_single_leaf() {
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..(MAX_LEAF_ENTRIES as u64) {
+            t.insert(i, v(i as u8)).unwrap();
+        }
+        for i in 0u64..(MAX_LEAF_ENTRIES as u64) {
+            assert_eq!(t.delete(i).unwrap(), Some(v(i as u8)));
+        }
+        assert_eq!(t.len().unwrap(), 0);
+        assert_eq!(t.depth().unwrap(), 1);
+    }
+
+    #[test]
+    fn delete_triggers_leaf_merge_and_root_collapse() {
+        let (_d, mut t) = mk_tree();
+        let n = MAX_LEAF_ENTRIES as u64 + 5;
+        for i in 0u64..n {
+            t.insert(i, v(0)).unwrap();
+        }
+        assert_eq!(t.depth().unwrap(), 2);
+        // Delete enough keys to make the second leaf underflow and
+        // merge back; the tree should collapse to depth 1.
+        for i in 0u64..n {
+            t.delete(i).unwrap();
+        }
+        assert_eq!(t.len().unwrap(), 0);
+        assert_eq!(t.depth().unwrap(), 1);
+    }
+
+    #[test]
+    fn delete_exercises_borrow_path() {
+        let (_d, mut t) = mk_tree();
+        // Fill the tree so we have at least 3 leaves under one parent.
+        let n = (MAX_LEAF_ENTRIES as u64) * 3;
+        for i in 0u64..n {
+            t.insert(i, v(0)).unwrap();
+        }
+        assert!(t.depth().unwrap() >= 2);
+        // Delete a few keys from the middle leaf until it would
+        // underflow, forcing a borrow from a sibling.
+        for i in (MAX_LEAF_ENTRIES as u64)..(MAX_LEAF_ENTRIES as u64 + 60) {
+            t.delete(i).unwrap();
+        }
+        // All remaining keys still retrievable.
+        for i in 0u64..(MAX_LEAF_ENTRIES as u64) {
+            assert_eq!(t.get(i).unwrap(), Some(v(0)));
+        }
+        for i in (MAX_LEAF_ENTRIES as u64 + 60)..n {
+            assert_eq!(t.get(i).unwrap(), Some(v(0)));
+        }
+    }
+
+    #[test]
+    fn insert_delete_insert_round_trip_seeded() {
+        use rand::SeedableRng;
+        use rand::seq::SliceRandom;
+        use rand_chacha::ChaCha8Rng;
+
+        let (_d, mut t) = mk_tree();
+        let n: u64 = 5000;
+        let mut keys: Vec<u64> = (0..n).collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(999);
+        keys.shuffle(&mut rng);
+        for &k in &keys {
+            t.insert(k, v((k & 0xFF) as u8)).unwrap();
+        }
+        keys.shuffle(&mut rng);
+        // Delete the first half.
+        for &k in &keys[..(keys.len() / 2)] {
+            assert_eq!(t.delete(k).unwrap(), Some(v((k & 0xFF) as u8)));
+        }
+        // The second half is still retrievable.
+        for &k in &keys[(keys.len() / 2)..] {
+            assert_eq!(t.get(k).unwrap(), Some(v((k & 0xFF) as u8)));
+        }
+        // The first half misses.
+        for &k in &keys[..(keys.len() / 2)] {
+            assert_eq!(t.get(k).unwrap(), None);
+        }
+        assert_eq!(t.len().unwrap(), keys.len() / 2);
+    }
+
+    #[test]
+    fn full_drain_returns_empty_tree_with_root_leaf() {
+        let (_d, mut t) = mk_tree();
+        let n = 2000u64;
+        for i in 0..n {
+            t.insert(i, v(0)).unwrap();
+        }
+        for i in 0..n {
+            t.delete(i).unwrap();
+        }
+        assert_eq!(t.len().unwrap(), 0);
+        assert_eq!(t.depth().unwrap(), 1);
+        // And we can still insert fresh keys.
+        t.insert(42, v(1)).unwrap();
+        assert_eq!(t.get(42).unwrap(), Some(v(1)));
+    }
+
+    #[test]
+    fn reopen_after_deletes_preserves_state() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("p.onyx_meta");
+        let root = {
+            let ps = Arc::new(PageStore::create(&path).unwrap());
+            let mut t = BTree::create(ps).unwrap();
+            for i in 0u64..500 {
+                t.insert(i, v(0)).unwrap();
+            }
+            for i in 0u64..300 {
+                t.delete(i).unwrap();
+            }
+            t.flush().unwrap();
+            t.root()
+        };
+        let ps = Arc::new(PageStore::open(&path).unwrap());
+        let mut t = BTree::open(ps, root, 9999).unwrap();
+        assert_eq!(t.len().unwrap(), 200);
+        for i in 0u64..300 {
+            assert_eq!(t.get(i).unwrap(), None);
+        }
+        for i in 300u64..500 {
+            assert_eq!(t.get(i).unwrap(), Some(v(0)));
+        }
     }
 
     #[test]
