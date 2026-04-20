@@ -288,6 +288,16 @@ pub fn internal_set_first_child(page: &mut Page, child: PageId) {
     internal_set_child_raw(page, 0, child);
 }
 
+/// Overwrite `children[i]` without touching key_count. Used by the
+/// CoW descent to rewire a parent to its freshly-CoW'd child.
+pub fn internal_set_child(page: &mut Page, i: usize, child: PageId) {
+    debug_assert!(
+        i <= internal_key_count(page),
+        "internal_set_child: i > count"
+    );
+    internal_set_child_raw(page, i, child);
+}
+
 /// Overwrite an existing separator key at position `i` in-place. Used
 /// by the delete path when a sibling borrow or merge changes the
 /// parent's pivot without changing `key_count`.

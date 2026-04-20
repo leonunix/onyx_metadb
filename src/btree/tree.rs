@@ -23,8 +23,9 @@ use crate::btree::cache::PageBuf;
 use crate::btree::format::{
     L2pValue, LEAF_ENTRY_SIZE, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, internal_child_at,
     internal_insert, internal_key_at, internal_key_count, internal_pop_front, internal_push_front,
-    internal_remove, internal_search, internal_set_first_child, internal_set_key_at, leaf_insert,
-    leaf_key_at, leaf_key_count, leaf_remove, leaf_search, leaf_set_entry, leaf_value_at,
+    internal_remove, internal_search, internal_set_child, internal_set_first_child,
+    internal_set_key_at, leaf_insert, leaf_key_at, leaf_key_count, leaf_remove, leaf_search,
+    leaf_set_entry, leaf_value_at,
 };
 use crate::error::{MetaDbError, Result};
 use crate::page::PageType;
@@ -150,14 +151,22 @@ impl BTree {
 
     /// Insert or update `(key, value)`. Returns `Some(old_value)` if
     /// the key was already present; `None` if it was newly inserted.
+    ///
+    /// Does top-down copy-on-write: every page on the descent path
+    /// whose refcount is > 1 (shared with a snapshot) is cloned before
+    /// we touch it. Any snapshot observer still sees its original
+    /// tree; current writers mutate a fresh copy.
     pub fn insert(&mut self, key: u64, value: L2pValue) -> Result<Option<L2pValue>> {
         let generation = self.new_gen();
+
+        // CoW the root if it's shared. self.root tracks the live copy.
+        let new_root = self.buf.cow_for_write(self.root, generation)?;
+        self.root = new_root;
+
         let mut path: Vec<(PageId, usize)> = Vec::new();
         let mut current = self.root;
 
         loop {
-            // Probe the current page under a short read borrow, decide
-            // what to do, drop the borrow, then act.
             let action = {
                 let page = self.buf.read(current)?;
                 let header = page.header()?;
@@ -218,8 +227,15 @@ impl BTree {
                     child_pid,
                     child_slot,
                 } => {
+                    // Top-down CoW: clone the child if it's shared,
+                    // then rewire the parent to point at the copy.
+                    let new_child = self.buf.cow_for_write(child_pid, generation)?;
+                    if new_child != child_pid {
+                        let parent = self.buf.modify(current, generation)?;
+                        internal_set_child(parent, child_slot, new_child);
+                    }
                     path.push((current, child_slot));
-                    current = child_pid;
+                    current = new_child;
                 }
             }
         }
@@ -230,8 +246,15 @@ impl BTree {
     /// Remove `key`. Returns `Some(old)` if the key was present,
     /// `None` otherwise. Rebalances the tree via sibling borrow or
     /// merge; collapses a single-child root if one emerges.
+    ///
+    /// Does top-down CoW on the descent path, plus opportunistic CoW
+    /// of sibling pages when rebalancing crosses into them.
     pub fn delete(&mut self, key: u64) -> Result<Option<L2pValue>> {
         let generation = self.new_gen();
+
+        let new_root = self.buf.cow_for_write(self.root, generation)?;
+        self.root = new_root;
+
         let mut path: Vec<(PageId, usize)> = Vec::new();
         let mut current = self.root;
 
@@ -270,8 +293,13 @@ impl BTree {
                     return Ok(Some(old));
                 }
                 DeleteAction::Descend { child, slot } => {
+                    let new_child = self.buf.cow_for_write(child, generation)?;
+                    if new_child != child {
+                        let parent = self.buf.modify(current, generation)?;
+                        internal_set_child(parent, slot, new_child);
+                    }
                     path.push((current, slot));
-                    current = child;
+                    current = new_child;
                 }
             }
         }
@@ -348,13 +376,15 @@ impl BTree {
             let right_pid = internal_child_at(self.buf.read(parent_pid)?, child_slot + 1);
             let right_count = self.page_count(right_pid, child_is_leaf)?;
             if right_count > threshold {
+                let new_right =
+                    self.cow_sibling(parent_pid, child_slot + 1, right_pid, generation)?;
                 if child_is_leaf {
                     self.borrow_from_right_leaf(
-                        parent_pid, child_slot, child_pid, right_pid, generation,
+                        parent_pid, child_slot, child_pid, new_right, generation,
                     )?;
                 } else {
                     self.borrow_from_right_internal(
-                        parent_pid, child_slot, child_pid, right_pid, generation,
+                        parent_pid, child_slot, child_pid, new_right, generation,
                     )?;
                 }
                 return Ok(false);
@@ -364,11 +394,13 @@ impl BTree {
             let left_pid = internal_child_at(self.buf.read(parent_pid)?, child_slot - 1);
             let left_count = self.page_count(left_pid, child_is_leaf)?;
             if left_count > threshold {
+                let new_left =
+                    self.cow_sibling(parent_pid, child_slot - 1, left_pid, generation)?;
                 if child_is_leaf {
                     self.borrow_from_left_leaf(
                         parent_pid,
                         child_slot - 1,
-                        left_pid,
+                        new_left,
                         child_pid,
                         generation,
                     )?;
@@ -376,7 +408,7 @@ impl BTree {
                     self.borrow_from_left_internal(
                         parent_pid,
                         child_slot - 1,
-                        left_pid,
+                        new_left,
                         child_pid,
                         generation,
                     )?;
@@ -388,6 +420,8 @@ impl BTree {
         // right so `child_pid` is the absorber and stays alive).
         if has_right {
             let right_pid = internal_child_at(self.buf.read(parent_pid)?, child_slot + 1);
+            // child_pid is the absorber (unique from descent); right_pid
+            // is only read and then decref'd, so no CoW needed.
             if child_is_leaf {
                 self.merge_leaves(parent_pid, child_slot, child_pid, right_pid, generation)?;
             } else {
@@ -397,10 +431,12 @@ impl BTree {
         }
         if has_left {
             let left_pid = internal_child_at(self.buf.read(parent_pid)?, child_slot - 1);
+            // Left is the absorber here; CoW if shared.
+            let new_left = self.cow_sibling(parent_pid, child_slot - 1, left_pid, generation)?;
             if child_is_leaf {
-                self.merge_leaves(parent_pid, child_slot - 1, left_pid, child_pid, generation)?;
+                self.merge_leaves(parent_pid, child_slot - 1, new_left, child_pid, generation)?;
             } else {
-                self.merge_internals(parent_pid, child_slot - 1, left_pid, child_pid, generation)?;
+                self.merge_internals(parent_pid, child_slot - 1, new_left, child_pid, generation)?;
             }
             return Ok(true);
         }
@@ -408,6 +444,24 @@ impl BTree {
         // parent is root). Nothing to rebalance here; caller handles
         // root collapse after the loop.
         Ok(false)
+    }
+
+    /// CoW a sibling (or any peer page) and rewire the parent's slot
+    /// if the CoW produced a new page id. Returns the page id now in
+    /// place for modification.
+    fn cow_sibling(
+        &mut self,
+        parent_pid: PageId,
+        slot: usize,
+        sibling_pid: PageId,
+        generation: Lsn,
+    ) -> Result<PageId> {
+        let new_sibling = self.buf.cow_for_write(sibling_pid, generation)?;
+        if new_sibling != sibling_pid {
+            let parent = self.buf.modify(parent_pid, generation)?;
+            internal_set_child(parent, slot, new_sibling);
+        }
+        Ok(new_sibling)
     }
 
     fn page_count(&mut self, pid: PageId, is_leaf: bool) -> Result<usize> {
@@ -553,7 +607,10 @@ impl BTree {
             let parent = self.buf.modify(parent_pid, generation)?;
             internal_remove(parent, pivot_slot)?;
         }
-        self.buf.free(right_pid, generation)?;
+        // right loses its parent edge from the current tree. decref
+        // frees it if unique; leaves it alive under a snapshot's
+        // reachability otherwise.
+        self.buf.decref(right_pid, generation)?;
         Ok(())
     }
 
@@ -582,11 +639,19 @@ impl BTree {
                 internal_insert(left, n_now, *k, right_children[i + 1])?;
             }
         }
+        // Each of right's children now has an additional parent edge
+        // (from left). incref them so subsequent decref(right) — which
+        // cascades through right's children — nets to zero change on
+        // children that were uniquely owned by right, and to +1 on
+        // children that were already shared.
+        for c in &right_children {
+            self.buf.incref(*c, generation)?;
+        }
         {
             let parent = self.buf.modify(parent_pid, generation)?;
             internal_remove(parent, pivot_slot)?;
         }
-        self.buf.free(right_pid, generation)?;
+        self.buf.decref(right_pid, generation)?;
         Ok(())
     }
 
@@ -601,7 +666,13 @@ impl BTree {
             }
         };
         if should_collapse {
-            self.buf.free(root_pid, generation)?;
+            // The new root gains a parent edge (the manifest edge
+            // moving down from the old root). We bump it then decref
+            // the old root: if the old root was unique, decref frees
+            // it and cascades, matching the incref. If it was shared,
+            // its children stay correctly accounted for.
+            self.buf.incref(new_root, generation)?;
+            self.buf.decref(root_pid, generation)?;
             self.root = new_root;
         }
         Ok(())
@@ -1607,6 +1678,89 @@ mod tests {
             .map(|(k, _)| k)
             .collect();
         assert_eq!(ks, vec![20, 30]);
+    }
+
+    // -------- CoW --------
+
+    #[test]
+    fn cow_descent_isolates_pinned_root_from_writes() {
+        // Manually pin the current root (simulating a future
+        // snapshot) by incref'ing it. Then do a write; the descent
+        // path should be CoW'd. After the write, reading from the
+        // pinned root should still see the pre-write state.
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..20 {
+            t.insert(i, v(i as u8)).unwrap();
+        }
+        let snap_root = t.root();
+        // Pretend we took a snapshot.
+        let pin_gen = t.new_gen();
+        t.buf.incref(snap_root, pin_gen).unwrap();
+
+        // Mutate.
+        t.insert(42, v(99)).unwrap();
+        t.insert(0, v(77)).unwrap();
+        t.insert(19, v(88)).unwrap();
+
+        assert_eq!(t.get(42).unwrap(), Some(v(99)));
+        assert_eq!(t.get(0).unwrap(), Some(v(77)));
+        assert_eq!(t.get(19).unwrap(), Some(v(88)));
+        assert_ne!(t.root(), snap_root, "root must move after CoW");
+
+        // The pinned (old) root still sees the pre-write state.
+        let ad_hoc_get = |t: &mut BTree, root: PageId, key: u64| -> Result<Option<L2pValue>> {
+            let mut current = root;
+            loop {
+                let page = t.buf.read(current)?;
+                match page.header()?.page_type {
+                    PageType::L2pLeaf => {
+                        return Ok(match leaf_search(page, key) {
+                            Ok(i) => Some(leaf_value_at(page, i)),
+                            Err(_) => None,
+                        });
+                    }
+                    PageType::L2pInternal => {
+                        let slot = internal_search(page, key);
+                        current = internal_child_at(page, slot);
+                    }
+                    other => {
+                        return Err(MetaDbError::Corruption(format!("unexpected {other:?}")));
+                    }
+                }
+            }
+        };
+
+        for i in 0u64..20 {
+            assert_eq!(
+                ad_hoc_get(&mut t, snap_root, i).unwrap(),
+                Some(v(i as u8)),
+                "snap_root must still see original key {i}",
+            );
+        }
+        assert_eq!(ad_hoc_get(&mut t, snap_root, 42).unwrap(), None);
+    }
+
+    #[test]
+    fn without_snapshots_no_extra_pages_allocated() {
+        // Sanity: in the phase-2 workload (no refcount bumps), CoW
+        // descent is a no-op and the cache footprint should not blow
+        // up beyond the normal pre-phase-3 levels.
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..1000 {
+            t.insert(i, v(0)).unwrap();
+        }
+        let depth = t.depth().unwrap();
+        // Cache holds at most O(tree size) but for a freshly-built
+        // tree every allocated page is in the cache, and we should
+        // not have allocated a bunch of throw-away CoW copies. A
+        // sufficient-if-loose upper bound: depth + number of leaves,
+        // which for 1000 keys at fanout 112 is ~10 leaves + internals.
+        assert!(
+            t.cached_pages() < 100,
+            "cache larger than expected for a no-snapshot 1000-key insert: {}",
+            t.cached_pages(),
+        );
+        assert!(depth >= 2);
     }
 
     #[test]
