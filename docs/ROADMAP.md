@@ -492,13 +492,17 @@ Replace RocksDB usage in onyx-storage.
 
 ---
 
-## Phase 8a — Pre-integration hardening  (1 week) — gates Phase 7
+## Phase 8a — Pre-integration hardening  (2 weeks) — gates Phase 7
 
-Correctness hardening that must land before staking Onyx on metadb.
-Everything listed here either finds a latent bug or gives Phase 7 a
-tool to debug one.
+Correctness hardening that must land **before** staking Onyx on
+metadb. The guiding principle: once Phase 7 begins, any symptom under
+Onyx load has an ambiguous origin ("is it Onyx? is it metadb?") and
+debug time multiplies. metadb must prove it is rock-solid standalone
+first.
 
 ### Scope
+
+**Static + pre-soak correctness**
 
 - **Scale up `db_phase6_proptest`** from 16 cases × 30–80 ops to
   500+ cases × 200+ ops. Budget a multi-hour run.
@@ -514,22 +518,44 @@ tool to debug one.
   verify every inserted key is readable at every point during the
   compaction storm (no bloom / range / binary-search regression
   under pressure).
+- **Fuzz**: `cargo-fuzz` on the WAL record decoder, page header
+  decoder, manifest body decoder, and bloom-filter bit decoder.
+  Run for a few hours per target; file any findings.
 - **`metadb-verify` CLI**: walks the page store, cross-checks
   manifest `shard_roots` / `refcount_shard_roots` /
   `dedup_level_heads` against on-disk pages, asserts free-list has
   no duplicates and no overlap with live pages, asserts each live
   page's refcount matches the count of pages that point to it.
-  Also useful as a Phase 7 debugging tool.
-- **Fuzz**: `cargo-fuzz` on the WAL record decoder, page header
-  decoder, manifest body decoder, and bloom-filter bit decoder.
-  Run for a few hours; file any findings.
-- **Multi-hour local soak**: random ops + periodic reopen + fault
-  injection on a single machine.
+  Also the primary debugging tool for Phase 7.
+
+**Standalone soak (the load-bearing piece of 8a)**
+
+- **`metadb-soak` harness**: standalone binary, NOT driven by Onyx.
+  A self-contained workload generator that does:
+  - Multi-threaded random mix of insert / delete / put_dedup /
+    delete_dedup / incref / decref / snapshot / drop_snapshot /
+    flush, against a reference model held in-memory.
+  - Periodic process restart (simulated crash: `kill -9` + reopen)
+    and reference replay.
+  - Configurable fault-injection density via `FaultController`.
+  - Continuous `metadb-verify` audit between restarts.
+  - Structured log + summary report.
+- **Week-long local soak** under that harness, configured with a
+  realistic write:read mix, moderate fault-injection, and a target
+  of billions of ops. This has to clear cleanly BEFORE phase 7
+  begins. Real-hardware soak (if needed) comes in phase 8b with
+  real workload data.
 
 ### Exit criteria
 
-- All new proptest / fuzz / soak runs clean for one full cycle.
-- `metadb-verify` returns no issues against the soak result.
+- All proptest / fuzz runs clean for one full cycle at the new
+  budgets.
+- **Week-long `metadb-soak` completes with zero corruption, zero
+  assertion failures, zero reference-model divergence, and no
+  unbounded memory or disk growth.** If the soak trips, the bug is
+  fixed and the week restarts from zero — no amnesty.
+- `metadb-verify` returns no issues at every checkpoint during and
+  after the soak.
 - Every fault-injection bug surfaced here is fixed or has an
   explicit ticketed waiver.
 
@@ -551,8 +577,11 @@ Items that don't gate Phase 7 but do gate production.
 - **Prometheus-compatible metrics exporter** for all subsystems.
 - **Operational tooling**: `metadb-dump`, `metadb-replay`,
   companion to `metadb-verify` from 8a.
-- **Long soak on real hardware** (week-long, fault injection),
-  driven from the Onyx `stability_harness`.
+- **Real-hardware soak** under the Onyx `stability_harness` once
+  integration is in place — reuses the phase-8a `metadb-soak`
+  invariants where possible but drives real workload through the
+  Onyx write path. Complements, doesn't replace, the standalone
+  8a soak.
 - **Documentation**: recovery playbook, tuning guide.
 - **Bloom scan resistance sanity check** once the cache in phase
   6.5 lands — make sure compaction doesn't defeat it.
@@ -578,22 +607,25 @@ Items that don't gate Phase 7 but do gate production.
 
 ## Summary table
 
-| Phase | Weeks | Cum. weeks | Delivers                                        | Status              |
-|-------|-------|-----------:|-------------------------------------------------|---------------------|
-| 0     | ~1    |   1        | Scaffolding, docs, CI                           | landed              |
-| 1     | 3     |   4        | WAL + page store + recovery                     | landed              |
-| 2     | 3     |   7        | B+tree single-writer                            | landed              |
-| 3     | 3     |  10        | COW + refcount + snapshots                      | landed              |
-| 4     | 2     |  12        | Sharded multi-writer B+tree                     | partially landed    |
-| 5     | 3     |  15        | Fixed-record LSM + PBA refcount                 | landed              |
-| 6     | 2     |  17        | Transactions + WAL replay + `dedup_reverse`     | landed              |
-| 6.5   | ~1    |  18        | Bounded page cache (B+tree + LSM)               | planned             |
-| 8a    | 1     |  19        | Pre-integration hardening (gates phase 7)       | planned             |
-| 7     | 2     |  21        | Onyx integration + migration                    |                     |
-| 8b    | 3+    |  24+       | Production polish (parallel with / after 7)     |                     |
+| Phase | Weeks | Cum. weeks | Delivers                                              | Status              |
+|-------|-------|-----------:|-------------------------------------------------------|---------------------|
+| 0     | ~1    |   1        | Scaffolding, docs, CI                                 | landed              |
+| 1     | 3     |   4        | WAL + page store + recovery                           | landed              |
+| 2     | 3     |   7        | B+tree single-writer                                  | landed              |
+| 3     | 3     |  10        | COW + refcount + snapshots                            | landed              |
+| 4     | 2     |  12        | Sharded multi-writer B+tree                           | partially landed    |
+| 5     | 3     |  15        | Fixed-record LSM + PBA refcount                       | landed              |
+| 6     | 2     |  17        | Transactions + WAL replay + `dedup_reverse`           | landed              |
+| 6.5   | ~1    |  18        | Bounded page cache (B+tree + LSM)                     | planned             |
+| 8a    | 2     |  20        | Pre-integration hardening + week soak (gates phase 7) | planned             |
+| 7     | 2     |  22        | Onyx integration + migration                          |                     |
+| 8b    | 3+    |  25+       | Production polish (parallel with / after 7)           |                     |
 
-Phase 8a runs before Phase 7 so integration doesn't pull in latent
-metadb bugs. Phase 8b is the continuous-work tail and can overlap with
-Phase 7 soak.
+Phase 8a runs before Phase 7 and owns the **standalone week-long
+soak**. Integrating before metadb has cleared a self-contained soak
+would conflate Onyx-side symptoms with metadb-side bugs and multiply
+debug cost. 8b is the continuous-work tail and overlaps with Phase 7;
+its real-hardware soak runs through the Onyx write path and
+complements (not replaces) the 8a soak.
 
 Total to a production-usable v0.1: ~5–6 months.
