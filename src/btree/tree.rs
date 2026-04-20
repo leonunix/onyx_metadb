@@ -16,6 +16,7 @@
 //! freshness marker; phase 6 will align the counter with the WAL LSN
 //! assignment order so replay can reconstruct the state.
 
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use crate::btree::cache::PageBuf;
@@ -644,6 +645,20 @@ impl BTree {
         Ok(())
     }
 
+    // -------- range scan --------------------------------------------------
+
+    /// Open an in-order iterator over entries whose keys match `range`.
+    /// Holds a `&mut` borrow on `self` for its lifetime — any mutation
+    /// of the tree is rejected at compile time while iteration is
+    /// active.
+    ///
+    /// `range` accepts every [`RangeBounds<u64>`] type: `..`, `a..b`,
+    /// `a..=b`, `..b`, `..=b`, `a..`. Unbounded on either side is
+    /// valid.
+    pub fn range<R: RangeBounds<u64>>(&mut self, range: R) -> Result<RangeIter<'_>> {
+        RangeIter::start(self, range)
+    }
+
     // -------- diagnostics (public for tests) ------------------------------
 
     /// Tree depth: 1 if the root is a leaf, 2 if the root is an
@@ -714,6 +729,212 @@ enum GetProbe {
     Hit(L2pValue),
     Miss,
     Descend(PageId),
+}
+
+// -------- range iterator --------------------------------------------------
+
+/// Ascending iterator over (key, value) pairs within a range.
+///
+/// Traversal is stack-based over the tree with no sibling pointers:
+/// each stack frame tracks an internal ancestor and the next child
+/// slot to visit when the current subtree is exhausted. Pages are
+/// read through the BTree's `PageBuf`; no entries are copied until
+/// the iterator yields them.
+///
+/// Errors are surfaced via the `Result<Item, _>` payload; the
+/// iterator stops after the first error.
+pub struct RangeIter<'a> {
+    tree: &'a mut BTree,
+    stack: Vec<StackFrame>,
+    leaf: Option<LeafCursor>,
+    upper: Bound<u64>,
+    done: bool,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct StackFrame {
+    pid: PageId,
+    next_child_slot: usize,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct LeafCursor {
+    pid: PageId,
+    pos: usize,
+    count: usize,
+}
+
+impl<'a> RangeIter<'a> {
+    fn start<R: RangeBounds<u64>>(tree: &'a mut BTree, range: R) -> Result<Self> {
+        // Copy the raw Bound<&u64> out so we own the endpoints without
+        // a borrow on `range`.
+        let lower = cloned_bound(range.start_bound());
+        let upper = cloned_bound(range.end_bound());
+
+        // Effective key to descend on: Excluded(k) and Included(k)
+        // both descend on k; Unbounded descends on 0 (leftmost).
+        let start_key = match lower {
+            Bound::Included(k) | Bound::Excluded(k) => k,
+            Bound::Unbounded => 0,
+        };
+
+        let mut stack = Vec::new();
+        let mut current = tree.root;
+
+        let leaf = loop {
+            let header = tree.buf.read(current)?.header()?;
+            match header.page_type {
+                PageType::L2pLeaf => {
+                    let page = tree.buf.read(current)?;
+                    let count = leaf_key_count(page);
+                    let mut pos = match leaf_search(page, start_key) {
+                        Ok(i) => i,
+                        Err(i) => i,
+                    };
+                    if matches!(lower, Bound::Excluded(_))
+                        && pos < count
+                        && leaf_key_at(page, pos) == start_key
+                    {
+                        pos += 1;
+                    }
+                    break LeafCursor {
+                        pid: current,
+                        pos,
+                        count,
+                    };
+                }
+                PageType::L2pInternal => {
+                    let page = tree.buf.read(current)?;
+                    let slot = internal_search(page, start_key);
+                    let child = internal_child_at(page, slot);
+                    stack.push(StackFrame {
+                        pid: current,
+                        next_child_slot: slot + 1,
+                    });
+                    current = child;
+                }
+                other => {
+                    return Err(MetaDbError::Corruption(format!(
+                        "unexpected page type {other:?} at {current}",
+                    )));
+                }
+            }
+        };
+
+        Ok(Self {
+            tree,
+            stack,
+            leaf: Some(leaf),
+            upper,
+            done: false,
+        })
+    }
+
+    fn advance_to_next_leaf(&mut self) -> Result<bool> {
+        while let Some(frame) = self.stack.last().copied() {
+            let n_children = internal_key_count(self.tree.buf.read(frame.pid)?) + 1;
+            if frame.next_child_slot < n_children {
+                let child =
+                    internal_child_at(self.tree.buf.read(frame.pid)?, frame.next_child_slot);
+                self.stack.last_mut().unwrap().next_child_slot += 1;
+                self.descend_leftmost(child)?;
+                return Ok(true);
+            }
+            self.stack.pop();
+        }
+        Ok(false)
+    }
+
+    fn descend_leftmost(&mut self, start: PageId) -> Result<()> {
+        let mut current = start;
+        loop {
+            let header = self.tree.buf.read(current)?.header()?;
+            match header.page_type {
+                PageType::L2pLeaf => {
+                    let count = leaf_key_count(self.tree.buf.read(current)?);
+                    self.leaf = Some(LeafCursor {
+                        pid: current,
+                        pos: 0,
+                        count,
+                    });
+                    return Ok(());
+                }
+                PageType::L2pInternal => {
+                    let child = internal_child_at(self.tree.buf.read(current)?, 0);
+                    self.stack.push(StackFrame {
+                        pid: current,
+                        next_child_slot: 1,
+                    });
+                    current = child;
+                }
+                other => {
+                    return Err(MetaDbError::Corruption(format!(
+                        "unexpected page type {other:?} at {current}",
+                    )));
+                }
+            }
+        }
+    }
+}
+
+fn cloned_bound(b: Bound<&u64>) -> Bound<u64> {
+    match b {
+        Bound::Included(k) => Bound::Included(*k),
+        Bound::Excluded(k) => Bound::Excluded(*k),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+impl<'a> Iterator for RangeIter<'a> {
+    type Item = Result<(u64, L2pValue)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            if let Some(leaf) = self.leaf {
+                if leaf.pos < leaf.count {
+                    let entry = {
+                        let page = match self.tree.buf.read(leaf.pid) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                self.done = true;
+                                return Some(Err(e));
+                            }
+                        };
+                        (leaf_key_at(page, leaf.pos), leaf_value_at(page, leaf.pos))
+                    };
+                    let past_upper = match self.upper {
+                        Bound::Included(u) => entry.0 > u,
+                        Bound::Excluded(u) => entry.0 >= u,
+                        Bound::Unbounded => false,
+                    };
+                    if past_upper {
+                        self.done = true;
+                        return None;
+                    }
+                    self.leaf = Some(LeafCursor {
+                        pos: leaf.pos + 1,
+                        ..leaf
+                    });
+                    return Some(Ok(entry));
+                }
+                self.leaf = None;
+            }
+            match self.advance_to_next_leaf() {
+                Ok(true) => continue,
+                Ok(false) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
 }
 
 enum Action {
@@ -1200,6 +1421,185 @@ mod tests {
         for i in 300u64..500 {
             assert_eq!(t.get(i).unwrap(), Some(v(0)));
         }
+    }
+
+    // -------- range --------
+
+    fn collect_range<R: RangeBounds<u64>>(t: &mut BTree, range: R) -> Vec<(u64, L2pValue)> {
+        t.range(range).unwrap().collect::<Result<Vec<_>>>().unwrap()
+    }
+
+    #[test]
+    fn range_on_empty_tree() {
+        let (_d, mut t) = mk_tree();
+        assert_eq!(collect_range(&mut t, ..), vec![]);
+        assert_eq!(collect_range(&mut t, 0..100), vec![]);
+    }
+
+    #[test]
+    fn range_full_single_leaf() {
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..10 {
+            t.insert(i, v(i as u8)).unwrap();
+        }
+        let got = collect_range(&mut t, ..);
+        assert_eq!(got.len(), 10);
+        for (i, (k, val)) in got.iter().enumerate() {
+            assert_eq!(*k, i as u64);
+            assert_eq!(*val, v(i as u8));
+        }
+    }
+
+    #[test]
+    fn range_bounded_inclusive() {
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..20 {
+            t.insert(i, v(0)).unwrap();
+        }
+        let ks: Vec<u64> = collect_range(&mut t, 5u64..=10)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(ks, vec![5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn range_bounded_exclusive() {
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..20 {
+            t.insert(i, v(0)).unwrap();
+        }
+        let ks: Vec<u64> = collect_range(&mut t, 5u64..10)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(ks, vec![5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn range_lower_excluded() {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..10 {
+            t.insert(i, v(0)).unwrap();
+        }
+        let ks: Vec<u64> = t
+            .range((Excluded(5u64), Unbounded))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(ks, vec![6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn range_unbounded_upper() {
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..10 {
+            t.insert(i, v(0)).unwrap();
+        }
+        let ks: Vec<u64> = collect_range(&mut t, 7u64..)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(ks, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn range_unbounded_lower() {
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..10 {
+            t.insert(i, v(0)).unwrap();
+        }
+        let ks: Vec<u64> = collect_range(&mut t, ..4u64)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(ks, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn range_spans_multiple_leaves() {
+        let (_d, mut t) = mk_tree();
+        let n = (MAX_LEAF_ENTRIES as u64) * 4;
+        for i in 0..n {
+            t.insert(i, v((i & 0xFF) as u8)).unwrap();
+        }
+        assert!(t.depth().unwrap() >= 2);
+        let got = collect_range(&mut t, ..);
+        assert_eq!(got.len(), n as usize);
+        for i in 0..n {
+            assert_eq!(got[i as usize].0, i);
+        }
+    }
+
+    #[test]
+    fn range_spans_multiple_levels_with_bounds() {
+        let (_d, mut t) = mk_tree();
+        let n = (MAX_LEAF_ENTRIES as u64) * 5;
+        for i in 0..n {
+            t.insert(i, v(0)).unwrap();
+        }
+        let lo = (MAX_LEAF_ENTRIES as u64) + 50;
+        let hi = lo + 200;
+        let ks: Vec<u64> = collect_range(&mut t, lo..hi)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(ks, (lo..hi).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn range_empty_range_yields_nothing() {
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..10 {
+            t.insert(i, v(0)).unwrap();
+        }
+        // Reversed bounds → empty.
+        assert_eq!(collect_range(&mut t, 5u64..5).len(), 0);
+        // Entirely past-the-end.
+        assert_eq!(collect_range(&mut t, 100u64..200).len(), 0);
+    }
+
+    #[test]
+    fn range_after_deletes() {
+        let (_d, mut t) = mk_tree();
+        for i in 0u64..200 {
+            t.insert(i, v(0)).unwrap();
+        }
+        for i in 0u64..200 {
+            if i % 3 == 0 {
+                t.delete(i).unwrap();
+            }
+        }
+        let ks: Vec<u64> = collect_range(&mut t, ..)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let expected: Vec<u64> = (0u64..200).filter(|i| i % 3 != 0).collect();
+        assert_eq!(ks, expected);
+    }
+
+    #[test]
+    fn range_exact_match_on_boundary() {
+        let (_d, mut t) = mk_tree();
+        for i in [10u64, 20, 30, 40, 50] {
+            t.insert(i, v(0)).unwrap();
+        }
+        // Included lower matches exactly.
+        let ks: Vec<u64> = collect_range(&mut t, 20u64..=40)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(ks, vec![20, 30, 40]);
+        // Excluded upper drops exact match.
+        let ks: Vec<u64> = collect_range(&mut t, 20u64..40)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(ks, vec![20, 30]);
     }
 
     #[test]
