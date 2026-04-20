@@ -282,6 +282,12 @@ fn internal_set_child_raw(page: &mut Page, i: usize, child: PageId) {
     p[off..off + 8].copy_from_slice(&child.to_be_bytes());
 }
 
+/// Overwrite `children[0]` without touching key_count. Used by the
+/// split path to re-seat the leftmost child after a rewrite.
+pub fn internal_set_first_child(page: &mut Page, child: PageId) {
+    internal_set_child_raw(page, 0, child);
+}
+
 /// Descent index for `key`: the position in `children[..]` that
 /// contains keys whose values are in the range covered by `key`.
 /// Returns a value in `[0, key_count]`. Pure binary search; O(log N).
