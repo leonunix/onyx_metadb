@@ -355,6 +355,16 @@ impl Db {
 
         let tree_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
         let wal_checkpoint = *self.last_applied_lsn.lock();
+
+        // Flush each LSM's memtable to an L0 SST BEFORE advancing
+        // `checkpoint_lsn`. Without this, a memtable put at LSN
+        // `L <= checkpoint_lsn` would be reflected neither in SSTs
+        // (memtable never spilled) nor in WAL replay (replay starts at
+        // `checkpoint_lsn + 1`), and the write would silently vanish
+        // on reopen.
+        self.dedup_index.flush_memtable(tree_generation)?;
+        self.dedup_reverse.flush_memtable(tree_generation)?;
+
         let old_dedup_heads: Vec<PageId> = manifest_state.manifest.dedup_level_heads.to_vec();
         let old_dedup_reverse_heads: Vec<PageId> =
             manifest_state.manifest.dedup_reverse_level_heads.to_vec();

@@ -145,7 +145,25 @@ impl WriterState {
         start_lsn: Lsn,
         faults: Arc<FaultController>,
     ) -> Result<Self> {
-        let seg = SegmentFile::create(&dir, start_lsn)?;
+        // If the directory already has segments (e.g., from a previous
+        // open that was recovered up to `start_lsn - 1`), append to the
+        // newest one; otherwise create a fresh segment at `start_lsn`.
+        let segments = crate::wal::segment::list_segments(&dir)?;
+        let seg = match segments.last() {
+            Some((existing_start, _)) if *existing_start < start_lsn => {
+                SegmentFile::open_for_append(&dir, *existing_start)?
+            }
+            Some((existing_start, _)) if *existing_start == start_lsn => {
+                SegmentFile::open_for_append(&dir, *existing_start)?
+            }
+            Some((existing_start, _)) => {
+                return Err(MetaDbError::Corruption(format!(
+                    "WAL segment wal-{existing_start:020} starts ahead of requested \
+                     start_lsn {start_lsn}",
+                )));
+            }
+            None => SegmentFile::create(&dir, start_lsn)?,
+        };
         Ok(Self {
             dir,
             current: Some(seg),
