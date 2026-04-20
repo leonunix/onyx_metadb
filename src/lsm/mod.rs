@@ -14,6 +14,7 @@
 //! 5. (future) `compact`: L0→L1 and Ln→Ln+1 merges.
 
 pub mod bloom;
+pub mod compact;
 pub mod format;
 #[allow(clippy::module_inception)]
 pub mod lsm;
@@ -22,6 +23,7 @@ pub mod persist;
 pub mod sst;
 
 pub use bloom::{BloomFilter, DEFAULT_BITS_PER_ENTRY};
+pub use compact::CompactionReport;
 pub use format::{
     DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash32, KIND_DELETE, KIND_PUT, LSM_RECORD_SIZE,
     RECORDS_PER_PAGE, Record,

@@ -42,13 +42,25 @@ pub struct LsmConfig {
     pub memtable_bytes: usize,
     /// Bloom filter budget, in bits per entry.
     pub bits_per_entry: u32,
+    /// L0 SST count at which `L0 → L1` compaction should fire.
+    pub l0_sst_count_trigger: usize,
+    /// Records per output SST during compaction. Target only; the final
+    /// SST in a compaction may hold fewer.
+    pub target_sst_records: usize,
+    /// Per-level record-count ratio used when computing `Ln` size
+    /// budgets.
+    pub level_ratio: u32,
 }
 
 impl Default for LsmConfig {
     fn default() -> Self {
+        let memtable_bytes = 8 * 1024 * 1024; // 8 MiB
         Self {
-            memtable_bytes: 8 * 1024 * 1024, // 8 MiB
+            memtable_bytes,
             bits_per_entry: super::bloom::DEFAULT_BITS_PER_ENTRY,
+            l0_sst_count_trigger: 4,
+            target_sst_records: memtable_bytes / super::LSM_RECORD_SIZE,
+            level_ratio: 10,
         }
     }
 }
@@ -68,7 +80,12 @@ pub struct Lsm {
     page_store: Arc<PageStore>,
     memtable: Memtable,
     levels: RwLock<Vec<Vec<SstHandle>>>,
-    flush_lock: Mutex<()>,
+    /// Serialises flush + compaction. Either path mutates `levels`, so
+    /// they must not run concurrently.
+    modify_lock: Mutex<()>,
+    /// Read side held by `get` while it does SST IO; write side used by
+    /// compaction as a drain barrier before freeing victim pages.
+    reader_drain: RwLock<()>,
     config: LsmConfig,
 }
 
@@ -79,7 +96,8 @@ impl Lsm {
             page_store,
             memtable: Memtable::new(config.memtable_bytes),
             levels: RwLock::new(vec![Vec::new()]),
-            flush_lock: Mutex::new(()),
+            modify_lock: Mutex::new(()),
+            reader_drain: RwLock::new(()),
             config,
         }
     }
@@ -102,7 +120,8 @@ impl Lsm {
             page_store,
             memtable: Memtable::new(config.memtable_bytes),
             levels: RwLock::new(levels),
-            flush_lock: Mutex::new(()),
+            modify_lock: Mutex::new(()),
+            reader_drain: RwLock::new(()),
             config,
         })
     }
@@ -118,6 +137,9 @@ impl Lsm {
     }
 
     pub fn get(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
+        // Hold the drain lock through the whole lookup so compaction
+        // cannot free victim SST pages while we are still reading them.
+        let _drain = self.reader_drain.read();
         match self.memtable.get(hash) {
             LookupResult::Hit(v) => return Ok(Some(v)),
             LookupResult::Tombstone => return Ok(None),
@@ -158,7 +180,7 @@ impl Lsm {
     /// breaking monotonicity does not corrupt the tree but may confuse
     /// the verifier.
     pub fn flush_memtable(&self, generation: Lsn) -> Result<Option<SstHandle>> {
-        let _guard = self.flush_lock.lock();
+        let _guard = self.modify_lock.lock();
 
         // If a previous flush failed after freezing but before the write
         // completed, the frozen slot is still populated. Resume from
@@ -193,6 +215,81 @@ impl Lsm {
         }
         self.memtable.release_frozen()?;
         Ok(Some(handle))
+    }
+
+    // -------- compaction ------------------------------------------------
+
+    /// Run at most one compaction round. Returns the report for the
+    /// round that fired, or `None` if every level is within budget.
+    ///
+    /// The function returns after a single round; a caller that wants
+    /// the LSM fully within budget should loop:
+    ///
+    /// ```ignore
+    /// while lsm.compact_once(gen)?.is_some() {}
+    /// ```
+    pub fn compact_once(&self, generation: Lsn) -> Result<Option<super::CompactionReport>> {
+        let _modify = self.modify_lock.lock();
+        let snapshot = self.levels.read().clone();
+
+        let plan_opt = self.choose_plan(&snapshot);
+        let Some(plan) = plan_opt else {
+            return Ok(None);
+        };
+
+        let outcome = super::compact::execute_plan(
+            &self.page_store,
+            generation,
+            self.config.bits_per_entry,
+            &plan,
+        )?;
+
+        // Swap handles under the levels lock.
+        {
+            let mut levels = self.levels.write();
+            super::compact::apply_plan(&mut levels, &plan, &outcome.new_handles);
+        }
+
+        // Drain readers that started before the swap. Acquiring +
+        // dropping the write side is a barrier; after this point no
+        // reader holds a reference to any of the victim handles.
+        drop(self.reader_drain.write());
+
+        let victims_count = plan.from_victims.len() + plan.to_victims.len();
+        let mut all_victims = plan.from_victims.clone();
+        all_victims.extend(plan.to_victims.iter().copied());
+        super::compact::free_victims(&self.page_store, generation, &all_victims)?;
+
+        Ok(Some(super::CompactionReport {
+            from_level: plan.from_level,
+            to_level: plan.to_level,
+            victims: victims_count,
+            new_ssts: outcome.new_handles.len(),
+            records_in: outcome.records_in,
+            records_out: outcome.records_out,
+        }))
+    }
+
+    fn choose_plan(&self, levels: &[Vec<SstHandle>]) -> Option<super::compact::Plan> {
+        if let Some(p) = super::compact::plan_l0_to_l1(
+            levels,
+            self.config.l0_sst_count_trigger,
+            self.config.target_sst_records,
+        ) {
+            return Some(p);
+        }
+        for level in 1..levels.len() {
+            if let Some(p) = super::compact::plan_ln_to_next(
+                levels,
+                level,
+                self.config.target_sst_records,
+                self.config.l0_sst_count_trigger,
+                self.config.level_ratio,
+            ) {
+                return Some(p);
+            }
+        }
+        None
     }
 
     // -------- introspection ---------------------------------------------
@@ -478,5 +575,179 @@ mod tests {
         assert_eq!(lsm.get(&h(1)).unwrap(), Some(v(1)));
         assert_eq!(lsm.get(&h(200)).unwrap(), Some(v(2)));
         assert_eq!(lsm.get(&h(50)).unwrap(), None);
+    }
+
+    fn small_cfg() -> LsmConfig {
+        LsmConfig {
+            memtable_bytes: 1024,
+            bits_per_entry: 10,
+            l0_sst_count_trigger: 3,
+            target_sst_records: 50,
+            level_ratio: 10,
+        }
+    }
+
+    fn mk_lsm_small() -> (TempDir, Arc<PageStore>, Lsm) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = Arc::new(PageStore::create(&path).unwrap());
+        let lsm = Lsm::create(ps.clone(), small_cfg());
+        (dir, ps, lsm)
+    }
+
+    #[test]
+    fn compact_noop_when_nothing_to_do() {
+        let (_d, _ps, lsm) = mk_lsm();
+        assert!(lsm.compact_once(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn compact_l0_to_l1_merges_disjoint_ssts() {
+        let (_d, _ps, lsm) = mk_lsm_small();
+        for round in 0..3u64 {
+            for i in 0..20u64 {
+                let key = round * 100 + i;
+                lsm.put(h(key), v(key as u8));
+            }
+            lsm.flush_memtable(round as Lsn + 1).unwrap().unwrap();
+        }
+        // Under trigger (3 SSTs in L0).
+        assert_eq!(lsm.levels_snapshot()[0].len(), 3);
+        let report = lsm.compact_once(10).unwrap().unwrap();
+        assert_eq!(report.from_level, 0);
+        assert_eq!(report.to_level, 1);
+        assert_eq!(report.victims, 3); // 3 L0 + 0 L1
+        let levels = lsm.levels_snapshot();
+        assert!(levels[0].is_empty());
+        assert!(!levels[1].is_empty());
+        // Every written key still reads correctly.
+        for round in 0..3u64 {
+            for i in 0..20u64 {
+                let key = round * 100 + i;
+                assert_eq!(lsm.get(&h(key)).unwrap(), Some(v(key as u8)));
+            }
+        }
+    }
+
+    #[test]
+    fn compact_l0_to_l1_merges_overlapping_l1() {
+        let (_d, _ps, lsm) = mk_lsm_small();
+        // First, populate L1 by flushing + compacting a round that
+        // targets hashes 0..50.
+        for i in 0..50u64 {
+            lsm.put(h(i), v(1));
+        }
+        lsm.flush_memtable(1).unwrap().unwrap();
+        for i in 0..50u64 {
+            lsm.put(h(i), v(1));
+        }
+        lsm.flush_memtable(2).unwrap().unwrap();
+        for i in 0..50u64 {
+            lsm.put(h(i), v(1));
+        }
+        lsm.flush_memtable(3).unwrap().unwrap();
+        lsm.compact_once(10).unwrap().unwrap(); // pushes to L1
+        assert_eq!(lsm.levels_snapshot()[0].len(), 0);
+        assert!(!lsm.levels_snapshot()[1].is_empty());
+
+        // Now overwrite the same keys so L0 overlaps L1.
+        for i in 0..50u64 {
+            lsm.put(h(i), v(2));
+        }
+        lsm.flush_memtable(11).unwrap().unwrap();
+        for i in 0..50u64 {
+            lsm.put(h(i), v(2));
+        }
+        lsm.flush_memtable(12).unwrap().unwrap();
+        for i in 0..50u64 {
+            lsm.put(h(i), v(2));
+        }
+        lsm.flush_memtable(13).unwrap().unwrap();
+        // Fire compaction; L0 should absorb L1 with newer puts.
+        let report = lsm.compact_once(20).unwrap().unwrap();
+        assert!(report.victims >= 4, "expected ≥4 victims, got {report:?}");
+        for i in 0..50u64 {
+            assert_eq!(lsm.get(&h(i)).unwrap(), Some(v(2)));
+        }
+    }
+
+    #[test]
+    fn compact_drops_tombstones_at_deepest_level() {
+        let (_d, _ps, lsm) = mk_lsm_small();
+        // Put + tombstone for hash 1 across L0.
+        for _ in 0..3 {
+            lsm.put(h(1), v(1));
+            lsm.flush_memtable(1).unwrap().unwrap();
+        }
+        lsm.delete(h(1));
+        lsm.flush_memtable(2).unwrap().unwrap();
+        // Four L0 SSTs; fire compaction — target L1 is deepest so
+        // tombstones get dropped entirely.
+        lsm.compact_once(10).unwrap().unwrap();
+        let levels = lsm.levels_snapshot();
+        let l1 = &levels[1];
+        assert_eq!(
+            l1.iter().map(|h| h.record_count).sum::<u64>(),
+            0,
+            "tombstone should have dropped to zero records in L1"
+        );
+        assert_eq!(lsm.get(&h(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn compact_preserves_tombstones_when_deeper_level_exists() {
+        let (_d, _ps, lsm) = mk_lsm_small();
+        // Seed L2 with put(h1) = v(1) by forcing multi-level.
+        // Step 1: put + flush + compact to L1.
+        for _ in 0..3 {
+            lsm.put(h(1), v(1));
+            lsm.flush_memtable(1).unwrap().unwrap();
+        }
+        lsm.compact_once(10).unwrap().unwrap(); // L1 now has put(h1,v1)
+        // Step 2: fake-promote L1 content to L2 so L1 is empty and L2
+        // holds put(h1,v1). We do this by injecting a synthetic level.
+        let levels_now = lsm.levels_snapshot();
+        assert_eq!(levels_now.len(), 2);
+        let l1_content = levels_now[1].clone();
+        lsm.debug_replace_levels(vec![Vec::new(), Vec::new(), l1_content]);
+        // Step 3: new L0 with tombstone(h1) and pressure to push to L1.
+        for _ in 0..3 {
+            lsm.delete(h(1));
+            lsm.flush_memtable(11).unwrap().unwrap();
+        }
+        lsm.compact_once(20).unwrap().unwrap(); // L0 → L1
+        // Since L2 exists (deeper), tombstones should survive in L1.
+        let levels = lsm.levels_snapshot();
+        let l1_total: u64 = levels[1].iter().map(|h| h.record_count).sum();
+        assert!(
+            l1_total > 0,
+            "tombstone must survive into L1 when L2 exists"
+        );
+        assert_eq!(lsm.get(&h(1)).unwrap(), None); // tombstone shadows L2
+    }
+
+    #[test]
+    fn repeated_compaction_loop_converges() {
+        let (_d, _ps, lsm) = mk_lsm_small();
+        // Write a lot of data and keep flushing + compacting.
+        for batch in 0..30u64 {
+            for i in 0..25u64 {
+                lsm.put(h(batch * 100 + i), v((batch + 1) as u8));
+            }
+            lsm.flush_memtable(batch as Lsn + 1).unwrap();
+            while lsm
+                .compact_once((batch as Lsn + 1) * 100)
+                .unwrap()
+                .is_some()
+            {}
+        }
+        // Every key should still be present with its original batch
+        // value. Check a subset.
+        for batch in 0..30u64 {
+            let key = batch * 100 + 13;
+            assert_eq!(lsm.get(&h(key)).unwrap(), Some(v((batch + 1) as u8)));
+        }
+        // Levels should have stabilised (L0 below trigger).
+        assert!(lsm.levels_snapshot()[0].len() < small_cfg().l0_sst_count_trigger);
     }
 }
