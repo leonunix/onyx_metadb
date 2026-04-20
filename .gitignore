@@ -1,0 +1,15 @@
+/target
+/Cargo.lock
+**/*.rs.bk
+
+# Local test artifacts
+/.dev
+/tmp
+*.onyx_meta
+*.wal
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

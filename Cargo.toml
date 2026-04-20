@@ -1,0 +1,57 @@
+[package]
+name = "onyx-metadb"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.78"
+description = "Embedded metadata engine for Onyx Storage: sharded COW B+tree + fixed-record LSM + shared WAL"
+license = "Apache-2.0"
+repository = "https://github.com/leonunix/onyx_metadb"
+readme = "README.md"
+
+[lib]
+name = "onyx_metadb"
+path = "src/lib.rs"
+
+[dependencies]
+# Core runtime
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+dashmap = "6"
+
+# IO / OS
+nix = { version = "0.29", features = ["fs", "mman"] }
+libc = "0.2"
+
+# Hashing / checksums
+crc32fast = "1.4"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Serialization (metadata only; on-disk formats are hand-rolled)
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Errors / tracing
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+rand = "0.8"
+rand_chacha = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+# Enable fault-injection hooks for crash / IO tests (build without in release).
+fault-injection = []
+# Enable expensive invariant checks after every mutation.
+paranoid = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = true
+
+[profile.bench]
+inherits = "release"
