@@ -1,8 +1,8 @@
 [package]
 name = "onyx-metadb"
 version = "0.0.1"
-edition = "2021"
-rust-version = "1.78"
+edition = "2024"
+rust-version = "1.85"
 description = "Embedded metadata engine for Onyx Storage: sharded COW B+tree + fixed-record LSM + shared WAL"
 license = "Apache-2.0"
 repository = "https://github.com/leonunix/onyx_metadb"
@@ -24,7 +24,7 @@ nix = { version = "0.29", features = ["fs", "mman"] }
 libc = "0.2"
 
 # Hashing / checksums
-crc32fast = "1.4"
+crc32c = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Serialization (metadata only; on-disk formats are hand-rolled)
