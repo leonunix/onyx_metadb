@@ -25,16 +25,20 @@
 
 pub mod config;
 pub mod error;
+pub mod manifest;
 pub mod page;
 pub mod page_store;
+pub mod recovery;
 pub mod testing;
 pub mod types;
 pub mod wal;
 
 pub use config::{Config, PAGE_SIZE};
 pub use error::{MetaDbError, Result};
+pub use manifest::{MANIFEST_BODY_VERSION, Manifest, ManifestStore};
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 pub use page_store::PageStore;
+pub use recovery::{ReplayOutcome, replay};
 pub use types::{
     FIRST_DATA_PAGE, Lba, Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, PartitionId,
     Pba, SnapshotId,
