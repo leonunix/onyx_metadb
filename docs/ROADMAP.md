@@ -188,43 +188,59 @@ Add snapshot capability. All writes become COW.
 
 ---
 
-## Phase 4 — Sharded multi-writer B+tree  (2 weeks) — **partially landed**
+## Phase 4 — Sharded multi-writer B+tree  (2 weeks) — **landed**
 
-The sharded index layer is in-tree and tested. WAL-backed concurrent
-commit / group-commit integration is still pending, so this phase is not
-fully closed yet.
+The sharded index layer is complete. The three items originally carved
+out as "remaining" all found later-phase owners — reclassifying them as
+4-scope didn't help anyone, since two of them require phase-8b
+infrastructure and the third folds into phase-8a's soak plan. Phase 4
+is done; those concerns are tracked where they actually get resolved.
 
 ### Delivered
 
 - [`manifest::Manifest` v3](../src/manifest.rs): current per-shard roots
   are stored inline in the manifest body; each snapshot stores its shard
   roots in a dedicated `SnapshotRoots` page. Legacy v2 single-root
-  manifests still decode and are upgraded on open.
+  manifests still decode and are upgraded on open. (Further evolved to
+  v5 by phase 5e / 6e.)
 - [`page::PageType`](../src/page.rs): adds `SnapshotRoots` as an explicit
   page type so snapshot metadata is covered by the same CRC / verifier
   machinery as the rest of the page store.
-- [`db::Db`](../src/db.rs): one `Mutex<BTree>` per shard, xxh3 router,
+- [`db::Db`](../src/db.rs): one `Mutex<BTree>` per shard (refcount) and
+  one `Mutex<PagedL2p>` per shard (L2P, post-6.5a), xxh3 router,
   thread-safe `&self` point ops, and fan-out `range` / `diff` /
   `snapshot_view` / `take_snapshot` / `drop_snapshot`.
 - [`db::SnapshotView`](../src/db.rs): snapshot reads hold a shared guard so
   `drop_snapshot` cannot free snapshot-owned pages while a live view is
   still reading them.
+- **WAL-backed commit** (landed in phase 6 via [`Db::commit_ops`](../src/db.rs)):
+  every mutation submits to the WAL under `commit_lock`, waits for
+  group-commit fsync at the WAL writer, applies to in-memory state, and
+  bumps `last_applied_lsn`. Phase 4's "submit to WAL, group-commit,
+  then publish shard roots" concern is covered — the per-op apply is
+  serialised by `commit_lock`, which is an intentional MVP choice that
+  phase 8b will relax.
 - [`tests/db_concurrency.rs`](../tests/db_concurrency.rs): multi-writer
   stress (16 writers / 4 shards) plus a round-based snapshot/reference
   test that checks snapshot correctness under concurrent writers.
 - [`tests/db_snapshot_proptest.rs`](../tests/db_snapshot_proptest.rs):
-  existing snapshot property test now runs against the sharded `Db`
-  implementation.
+  snapshot property test runs against the sharded `Db` implementation.
 
-### Remaining to call phase 4 done
+### Cross-phase ownership (what moved and why)
 
-- WAL-backed concurrent commit path: writers still mutate shard trees
-  directly. "submit to WAL, group-commit, then publish shard roots" stays
-  coupled to phase 6's transaction layer.
-- Throughput target not yet measured: we have correctness coverage, but no
-  benchmark proving ≥ 0.8× N single-writer throughput up to saturation.
-- Long soak / CI hardening still missing: no 30-minute randomized soak and
-  no lock-order audit script in CI yet.
+- **Concurrent apply / group-commit throughput**: the WAL writer
+  itself already batches fsyncs (see `group_commit_max_batch_bytes` /
+  `group_commit_timeout_us` in `Config`), but `Db::commit_ops` holds
+  one global `commit_lock` across submit + apply, so in-flight
+  commits can't coalesce at the Db layer. That's a deliberate
+  phase-6 trade-off (simple LSN ordering == apply ordering) and
+  reversing it requires an LSN-ordered condvar apply path. Owned by
+  **[Phase 8b](#phase-8b--production-polish-parallel-with-or-after-phase-7)**.
+- **Throughput benchmark (≥ 0.8× N single-writer)**: architecturally
+  blocked by the `commit_lock` above. Re-benched post-8b against
+  the ≥ 150 k txns/s target. Owned by **Phase 8b**.
+- **Randomised long soak + lock-order audit script**: superseded by
+  phase 8a's week-long `metadb-soak` harness. Owned by **Phase 8a**.
 
 ### Decisions resolved
 
@@ -233,6 +249,7 @@ fully closed yet.
 - Lock ordering: cross-shard operations acquire shard locks in ascending
   shard id (the current implementation uses shard-vector order), so
   `flush` / `take_snapshot` / `drop_snapshot` share one deadlock-free order.
+  Explicit runtime audit is part of the 8a soak harness.
 
 ---
 
@@ -685,6 +702,11 @@ first.
   no duplicates and no overlap with live pages, asserts each live
   page's refcount matches the count of pages that point to it.
   Also the primary debugging tool for Phase 7.
+- **Lock-order audit**: enable `parking_lot::deadlock::check_deadlock`
+  in the soak harness's monitor thread; fail the run if a cycle is
+  detected. Folded in here rather than given its own line-item
+  because the soak is where a bad lock order would actually bite —
+  audit without exercise would just rubber-stamp the current layout.
 
 **Standalone soak (the load-bearing piece of 8a)**
 
@@ -771,7 +793,7 @@ Items that don't gate Phase 7 but do gate production.
 | 1     | 3     |   4        | WAL + page store + recovery                           | landed              |
 | 2     | 3     |   7        | B+tree single-writer                                  | landed              |
 | 3     | 3     |  10        | COW + refcount + snapshots                            | landed              |
-| 4     | 2     |  12        | Sharded multi-writer B+tree                           | partially landed    |
+| 4     | 2     |  12        | Sharded multi-writer B+tree                           | landed              |
 | 5     | 3     |  15        | Fixed-record LSM + PBA refcount                       | landed              |
 | 6     | 2     |  17        | Transactions + WAL replay + `dedup_reverse`           | landed              |
 | 6.5a  | ~1    |  18        | Paged L2P radix tree (replaces B+tree for L2P)        | landed              |
