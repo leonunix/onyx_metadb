@@ -13,6 +13,7 @@
 
 pub mod cache;
 pub mod format;
+pub mod invariants;
 pub mod tree;
 
 pub use cache::PageBuf;

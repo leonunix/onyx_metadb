@@ -723,6 +723,13 @@ impl BTree {
     pub fn cached_pages(&self) -> usize {
         self.buf.len()
     }
+
+    /// Run the structural invariant checker. Returns `Err(Corruption)`
+    /// on violation. Intended for tests and the `metadb-verify` tool;
+    /// calling this on the hot path defeats the point.
+    pub fn check_invariants(&mut self) -> Result<()> {
+        crate::btree::invariants::check_tree(&mut self.buf, self.root)
+    }
 }
 
 enum GetProbe {
