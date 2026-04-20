@@ -13,7 +13,7 @@ use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::btree::{BTree, L2pValue, RangeIter};
+use crate::btree::{BTree, DiffEntry, L2pValue, RangeIter};
 use crate::error::{MetaDbError, Result};
 use crate::manifest::{Manifest, ManifestStore, SnapshotEntry};
 use crate::page_store::PageStore;
@@ -176,6 +176,34 @@ impl Db {
             tree: &mut self.tree,
             entry,
         })
+    }
+
+    /// Compute the diff between two snapshots. Returns
+    /// `Err(InvalidArgument)` if either id is unknown. Empty diff
+    /// means the two snapshots see identical keyspace content.
+    pub fn diff(&mut self, a: SnapshotId, b: SnapshotId) -> Result<Vec<DiffEntry>> {
+        let a_root = self
+            .manifest
+            .find_snapshot(a)
+            .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {a}")))?
+            .root;
+        let b_root = self
+            .manifest
+            .find_snapshot(b)
+            .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {b}")))?
+            .root;
+        self.tree.diff_subtrees(a_root, b_root)
+    }
+
+    /// Diff a snapshot against the current tree.
+    pub fn diff_with_current(&mut self, snap: SnapshotId) -> Result<Vec<DiffEntry>> {
+        let snap_root = self
+            .manifest
+            .find_snapshot(snap)
+            .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {snap}")))?
+            .root;
+        let cur_root = self.tree.root();
+        self.tree.diff_subtrees(snap_root, cur_root)
     }
 
     /// Drop a snapshot. Walks pages uniquely owned by the snapshot,
@@ -399,6 +427,104 @@ mod tests {
     fn snapshot_view_missing_id_returns_none() {
         let (_d, mut db) = mk_db();
         assert!(db.snapshot_view(999).is_none());
+    }
+
+    // -------- diff --------
+
+    #[test]
+    fn diff_identical_snapshots_is_empty() {
+        let (_d, mut db) = mk_db();
+        for i in 0u64..100 {
+            db.insert(i, v(1)).unwrap();
+        }
+        let a = db.take_snapshot().unwrap();
+        let b = db.take_snapshot().unwrap();
+        let diff = db.diff(a, b).unwrap();
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn diff_detects_added_removed_changed() {
+        let (_d, mut db) = mk_db();
+        for i in 0u64..10 {
+            db.insert(i, v(1)).unwrap();
+        }
+        let a = db.take_snapshot().unwrap();
+
+        // Current diffs from snapshot A.
+        db.insert(5, v(99)).unwrap(); // changed
+        db.delete(3).unwrap(); // removed
+        db.insert(42, v(7)).unwrap(); // added
+
+        let b = db.take_snapshot().unwrap();
+        let diff = db.diff(a, b).unwrap();
+        // Diff is key-ordered.
+        assert_eq!(diff.len(), 3);
+        match diff[0] {
+            DiffEntry::RemovedInB { key: 3, old } => assert_eq!(old, v(1)),
+            ref other => panic!("{other:?}"),
+        }
+        match diff[1] {
+            DiffEntry::Changed { key: 5, old, new } => {
+                assert_eq!(old, v(1));
+                assert_eq!(new, v(99));
+            }
+            ref other => panic!("{other:?}"),
+        }
+        match diff[2] {
+            DiffEntry::AddedInB { key: 42, new } => assert_eq!(new, v(7)),
+            ref other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_with_current_reflects_unsaved_writes() {
+        let (_d, mut db) = mk_db();
+        for i in 0u64..10 {
+            db.insert(i, v(1)).unwrap();
+        }
+        let a = db.take_snapshot().unwrap();
+        db.insert(100, v(5)).unwrap();
+        let diff = db.diff_with_current(a).unwrap();
+        assert_eq!(diff.len(), 1);
+        match diff[0] {
+            DiffEntry::AddedInB { key: 100, new } => assert_eq!(new, v(5)),
+            ref other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_on_large_mostly_unchanged_tree() {
+        // Take a snapshot after filling a deep tree, then change ten
+        // keys. The diff must return exactly those ten entries.
+        let (_d, mut db) = mk_db();
+        for i in 0u64..2000 {
+            db.insert(i, v(1)).unwrap();
+        }
+        let a = db.take_snapshot().unwrap();
+        for k in [0u64, 10, 50, 200, 500, 800, 999, 1234, 1800, 1999] {
+            db.insert(k, v(99)).unwrap();
+        }
+        let b = db.take_snapshot().unwrap();
+        let diff = db.diff(a, b).unwrap();
+        assert_eq!(diff.len(), 10);
+        for entry in diff {
+            match entry {
+                DiffEntry::Changed { old, new, .. } => {
+                    assert_eq!(old, v(1));
+                    assert_eq!(new, v(99));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn diff_rejects_unknown_snapshot() {
+        let (_d, mut db) = mk_db();
+        let a = db.take_snapshot().unwrap();
+        assert!(db.diff(a, 999).is_err());
+        assert!(db.diff(999, a).is_err());
     }
 
     // -------- drop_snapshot --------

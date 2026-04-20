@@ -35,7 +35,9 @@ pub mod testing;
 pub mod types;
 pub mod wal;
 
-pub use btree::{BTree, L2pValue, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter};
+pub use btree::{
+    BTree, DiffEntry, L2pValue, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter,
+};
 pub use config::{Config, PAGE_SIZE};
 pub use db::{Db, DropReport, SnapshotView};
 pub use error::{MetaDbError, Result};

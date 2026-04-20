@@ -43,6 +43,121 @@ const LEAF_UNDERFLOW_THRESHOLD: usize = MAX_LEAF_ENTRIES / 2;
 /// plus a pivot key always fit in one merged page.
 const INTERNAL_UNDERFLOW_THRESHOLD: usize = MAX_INTERNAL_KEYS / 2;
 
+/// One entry in the delta between two subtrees.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DiffEntry {
+    /// Key exists in B but not in A.
+    AddedInB { key: u64, new: L2pValue },
+    /// Key exists in A but not in B.
+    RemovedInB { key: u64, old: L2pValue },
+    /// Key exists in both; value changed.
+    Changed {
+        key: u64,
+        old: L2pValue,
+        new: L2pValue,
+    },
+}
+
+impl DiffEntry {
+    /// Key this diff entry concerns.
+    pub fn key(&self) -> u64 {
+        match self {
+            Self::AddedInB { key, .. }
+            | Self::RemovedInB { key, .. }
+            | Self::Changed { key, .. } => *key,
+        }
+    }
+}
+
+/// Walk a subtree in-order, collecting every (key, value) pair in
+/// ascending key order. Used by the diff fallback when Merkle skip
+/// isn't applicable.
+fn collect_subtree(buf: &mut PageBuf, root: PageId) -> Result<Vec<(u64, L2pValue)>> {
+    let mut out: Vec<(u64, L2pValue)> = Vec::new();
+    let mut stack: Vec<PageId> = vec![root];
+    // We use a two-phase walk: push children in reverse so leftmost
+    // pops first, producing in-order output.
+    while let Some(pid) = stack.pop() {
+        let page_type = buf.read(pid)?.header()?.page_type;
+        match page_type {
+            PageType::L2pLeaf => {
+                let page = buf.read(pid)?;
+                let n = leaf_key_count(page);
+                for i in 0..n {
+                    out.push((leaf_key_at(page, i), leaf_value_at(page, i)));
+                }
+            }
+            PageType::L2pInternal => {
+                let children: Vec<PageId> = {
+                    let page = buf.read(pid)?;
+                    let n = internal_key_count(page);
+                    (0..=n).map(|i| internal_child_at(page, i)).collect()
+                };
+                // Push in reverse so the leftmost pops first.
+                for c in children.into_iter().rev() {
+                    stack.push(c);
+                }
+            }
+            other => {
+                return Err(MetaDbError::Corruption(format!(
+                    "collect_subtree: unexpected page type {other:?} at {pid}",
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Merge two ascending (key, value) streams into `out` as
+/// [`DiffEntry`] items.
+fn merge_diff_into(a: &[(u64, L2pValue)], b: &[(u64, L2pValue)], out: &mut Vec<DiffEntry>) {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < a.len() && j < b.len() {
+        match a[i].0.cmp(&b[j].0) {
+            std::cmp::Ordering::Less => {
+                out.push(DiffEntry::RemovedInB {
+                    key: a[i].0,
+                    old: a[i].1,
+                });
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(DiffEntry::AddedInB {
+                    key: b[j].0,
+                    new: b[j].1,
+                });
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if a[i].1 != b[j].1 {
+                    out.push(DiffEntry::Changed {
+                        key: a[i].0,
+                        old: a[i].1,
+                        new: b[j].1,
+                    });
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while i < a.len() {
+        out.push(DiffEntry::RemovedInB {
+            key: a[i].0,
+            old: a[i].1,
+        });
+        i += 1;
+    }
+    while j < b.len() {
+        out.push(DiffEntry::AddedInB {
+            key: b[j].0,
+            new: b[j].1,
+        });
+        j += 1;
+    }
+}
+
 /// Single-partition B+tree. Not `Send` across threads without external
 /// synchronization — phase 4 will shard + wrap this type.
 pub struct BTree {
@@ -833,6 +948,100 @@ impl BTree {
     pub fn decref(&mut self, pid: PageId) -> Result<crate::btree::DecrefOutcome> {
         let g = self.new_gen();
         self.buf.decref(pid, g)
+    }
+
+    /// Compare two subtrees rooted at `a` and `b`, producing the
+    /// delta as a sequence of [`DiffEntry`] items in ascending key
+    /// order.
+    ///
+    /// Exploits the CoW invariant that **identical page ids imply
+    /// identical subtree contents**. Whenever the walker encounters
+    /// a pair of subtrees whose current root pages share a page id,
+    /// the entire subtree is skipped in O(1). This keeps a typical
+    /// "mostly-unchanged" diff proportional to the number of pages
+    /// that actually changed, not to total tree size.
+    ///
+    /// Pairs of internals whose separator key lists match exactly
+    /// are recursed pair-wise per child slot, preserving the Merkle
+    /// skip at every level. Pairs of internals with divergent
+    /// separators, or pairs with depth mismatch, fall back to a
+    /// flatten-and-merge diff within that subtree.
+    pub fn diff_subtrees(&mut self, a: PageId, b: PageId) -> Result<Vec<DiffEntry>> {
+        let mut out: Vec<DiffEntry> = Vec::new();
+        self.diff_recursive(a, b, &mut out)?;
+        Ok(out)
+    }
+
+    fn diff_recursive(&mut self, a: PageId, b: PageId, out: &mut Vec<DiffEntry>) -> Result<()> {
+        if a == b {
+            return Ok(());
+        }
+        let a_type = self.buf.read(a)?.header()?.page_type;
+        let b_type = self.buf.read(b)?.header()?.page_type;
+        if a_type == PageType::L2pLeaf && b_type == PageType::L2pLeaf {
+            self.diff_leaves(a, b, out)?;
+            return Ok(());
+        }
+        if a_type == PageType::L2pInternal && b_type == PageType::L2pInternal {
+            self.diff_internals(a, b, out)?;
+            return Ok(());
+        }
+        // Depth mismatch: flatten + merge within this subtree.
+        let a_items = collect_subtree(&mut self.buf, a)?;
+        let b_items = collect_subtree(&mut self.buf, b)?;
+        merge_diff_into(&a_items, &b_items, out);
+        Ok(())
+    }
+
+    fn diff_leaves(&mut self, a: PageId, b: PageId, out: &mut Vec<DiffEntry>) -> Result<()> {
+        let a_entries: Vec<(u64, L2pValue)> = {
+            let page = self.buf.read(a)?;
+            let n = leaf_key_count(page);
+            (0..n)
+                .map(|i| (leaf_key_at(page, i), leaf_value_at(page, i)))
+                .collect()
+        };
+        let b_entries: Vec<(u64, L2pValue)> = {
+            let page = self.buf.read(b)?;
+            let n = leaf_key_count(page);
+            (0..n)
+                .map(|i| (leaf_key_at(page, i), leaf_value_at(page, i)))
+                .collect()
+        };
+        merge_diff_into(&a_entries, &b_entries, out);
+        Ok(())
+    }
+
+    fn diff_internals(&mut self, a: PageId, b: PageId, out: &mut Vec<DiffEntry>) -> Result<()> {
+        let (a_keys, a_children) = {
+            let page = self.buf.read(a)?;
+            let n = internal_key_count(page);
+            let keys: Vec<u64> = (0..n).map(|i| internal_key_at(page, i)).collect();
+            let children: Vec<PageId> = (0..=n).map(|i| internal_child_at(page, i)).collect();
+            (keys, children)
+        };
+        let (b_keys, b_children) = {
+            let page = self.buf.read(b)?;
+            let n = internal_key_count(page);
+            let keys: Vec<u64> = (0..n).map(|i| internal_key_at(page, i)).collect();
+            let children: Vec<PageId> = (0..=n).map(|i| internal_child_at(page, i)).collect();
+            (keys, children)
+        };
+
+        // If separator keys match identically, recurse pair-wise and
+        // exploit page-id Merkle skip at every child slot.
+        if a_keys == b_keys {
+            for (ca, cb) in a_children.iter().zip(b_children.iter()) {
+                self.diff_recursive(*ca, *cb, out)?;
+            }
+            return Ok(());
+        }
+
+        // Divergent structure: flatten + merge within this subtree.
+        let a_items = collect_subtree(&mut self.buf, a)?;
+        let b_items = collect_subtree(&mut self.buf, b)?;
+        merge_diff_into(&a_items, &b_items, out);
+        Ok(())
     }
 
     /// Walk the subtree rooted at `snap_root`, decref'ing each page

@@ -24,4 +24,4 @@ pub use format::{
     internal_set_first_child, leaf_insert, leaf_key_at, leaf_key_count, leaf_remove, leaf_search,
     leaf_set_entry, leaf_value_at,
 };
-pub use tree::{BTree, RangeIter};
+pub use tree::{BTree, DiffEntry, RangeIter};
