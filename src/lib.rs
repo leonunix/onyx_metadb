@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod btree;
 pub mod config;
 pub mod error;
 pub mod manifest;
