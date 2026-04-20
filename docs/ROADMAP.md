@@ -236,10 +236,11 @@ fully closed yet.
 
 ---
 
-## Phase 5 — Fixed-record LSM for dedup (+ PBA refcount)  (3 weeks) — **partially landed**
+## Phase 5 — Fixed-record LSM for dedup (+ PBA refcount)  (3 weeks) — **landed**
 
-Second index type. Integrates with the shared manifest. WAL integration
-and cross-index atomicity wait for phase 6.
+Second index type. Phase 5 landed 5a–5e; the three items deferred at the
+time (`dedup_reverse`, WAL-backed replay, and the 5f proptest) all landed
+together under phase 6's transaction layer — see that section below.
 
 ### Decisions locked before coding
 
@@ -286,74 +287,123 @@ and cross-index atomicity wait for phase 6.
   Snapshots capture both tree groups (two `SnapshotRoots` pages per
   snapshot entry); `drop_snapshot` releases both.
 
-### Deferred (do not forget)
+### Still deferred
 
-- **`dedup_reverse` LSM instance** — the PBA → hash side table used to
-  clean up `dedup_index` when a PBA's refcount hits zero. Key design
-  locked (`key = [pba: 8B][hash_first_24B]`, `value = [hash_last_8B | zero]`;
-  prefix scan by 8-byte PBA prefix), but not implemented. Best landed
-  together with phase 6's transaction layer so the refcount-hits-zero
-  cleanup can be part of the same atomic commit; otherwise a crash
-  between `decref_pba == 0` and `scan_dedup_reverse` leaves orphan
-  `dedup_index` entries.
-- **WAL-backed op records + replay for LSM / refcount**. Phase 4 left
-  this hook open at the phase-6 transaction layer; phase 5 continued
-  that deferral. Today a crash between two `flush()` calls can lose
-  LSM memtable inserts and refcount writes even though `Db::insert` /
-  `put_dedup` returned.
-- **Phase 5f property + crash tests**
-  (`tests/lsm_proptest.rs`, `tests/db_dedup_proptest.rs`). Planned scope:
-  LSM vs `BTreeMap<[u8; 32], DedupOp>` reference with
-  put/delete/get/flush/compact at 1M ops × 1000 seeds; crash injection
-  at flush/compact/manifest swap; end-to-end `insert(lba) +
-  put_dedup(hash) + incref(pba)` cycles that survive reopen.
-- **Compaction stress bench** (10 GiB of inserts, end-to-end queryable
-  at every level). Wanted for phase-5 exit; not run yet.
-
-### Exit criteria (status)
-
-- ☑ Functional tests: 262 unit + 14 integration pass; dedup and
-  refcount survive flush + reopen.
-- ☐ Property tests (5f) — deferred.
-- ☐ Compaction stress bench — deferred.
-- ☐ `dedup_reverse` prefix-scan cleanup — deferred into phase 6.
-- ☐ Atomic `put(lba) + put_dedup + incref` commit — waits for phase 6.
+- **1 M-op / 1000-seed LSM proptest budget**. Phase 6 landed the
+  proptest skeleton (`tests/db_phase6_proptest.rs`) at a realistic case
+  count (16 × 30-80 ops, single-thread); the original "LSM vs.
+  `BTreeMap<[u8; 32], DedupOp>` at 1 M ops × 1000 seeds" budget is
+  aspirational and belongs in phase 8 hardening.
+- **Compaction stress bench** (10 GiB of inserts, queryable at every
+  level). Rolled into phase 8 hardening.
+- **Post-snapshot dedup reads from `SnapshotView`**. `SnapshotView`
+  still only surfaces L2P reads today; exposing dedup / refcount reads
+  at a `SnapshotId` is a phase-6 follow-up listed below.
 
 ---
 
-## Phase 6 — Transaction layer + MVCC reads  (2 weeks)
+## Phase 6 — Transaction layer + WAL replay  (2 weeks) — **landed**
 
-Tie the two indexes together under one transaction API.
+Tied the three indexes together under one transaction API, wired every
+mutation through the WAL, and picked up every phase-5 "deferred"
+bullet. Scope, landing commits, and the two bugs the new proptest
+uncovered are captured below.
 
-### Scope
+### Delivered
 
-- `Transaction` type buffering ops for both indexes + refcount.
-- `commit()` packs all ops into one WAL record.
-- Apply phase updates all index memtables / page caches under one
-  visibility fence.
-- `SnapshotId`-bound reads for dedup and refcount (not just B+tree).
-- **Pick up phase-5 deferrals** (see "Deferred" block in phase 5):
-  - Add the `dedup_reverse` LSM instance with 8-byte-prefix scan.
-    Cleanup path: when `decref_pba` drops refcount to zero, the same
-    transaction scans `dedup_reverse` by PBA prefix and tombstones the
-    matching `dedup_index` entries — atomic by construction.
-  - Wire `BTree` and `Lsm` mutations through the WAL as op records so
-    a crash between checkpoints doesn't lose committed writes.
-  - Land the phase-5f proptest + crash-injection tests against the
-    unified transaction API (writing them now against the
-    intermediate per-call API would be throwaway work).
+- **6a** [`src/wal/op.rs`](../src/wal/op.rs): `WalOp` enum — fixed-size
+  tagged variants for `L2P_PUT/DEL`, `DEDUP_PUT/DEL`,
+  `DEDUP_REVERSE_PUT/DEL`, `INCREF`, `DECREF`. `encode_body` /
+  `decode_body` concatenate ops into / from a WAL record body with no
+  length prefix (tag implies payload size).
+- **6b** [`src/tx.rs`](../src/tx.rs): `Transaction<'db>` buffers ops
+  against a `Db` and commits them as a single WAL record. `commit()`
+  returns the durable LSN; `commit_with_outcomes` additionally
+  surfaces per-op pre-images, which the auto-commit wrappers
+  (`Db::insert`, `Db::incref_pba`, …) use to preserve their existing
+  return types.
+- **6c** [`src/db.rs`](../src/db.rs): `Db` gains a `Wal`, a
+  `commit_lock`, and a `last_applied_lsn`. Every mutating method is
+  now a one-op auto-commit shim on top of `Transaction`. The commit
+  path takes `commit_lock` around WAL submit + apply so LSN order ==
+  apply order trivially; phase 8 can replace this with an
+  LSN-ordered condvar apply path for group-commit throughput.
+  `flush()` / `take_snapshot` / `drop_snapshot` also take
+  `commit_lock` and stamp `manifest.checkpoint_lsn` from the WAL
+  cursor (not from tree generations), so recovery replays cleanly
+  from `checkpoint_lsn + 1`.
+- **6d** [`src/recovery.rs`](../src/recovery.rs): `replay_into(dir,
+  from_lsn, |op| ...)` walks the WAL and invokes the caller's apply
+  function for each decoded op. `truncate_torn_tail` shears off a
+  torn final-segment tail before the new Wal writer resumes.
+  `Db::open` calls these in sequence: replay, truncate, then
+  `Wal::create` starting at `last_applied + 1`.
+- **6e** [`src/lsm/lsm.rs`](../src/lsm/lsm.rs),
+  [`src/db.rs`](../src/db.rs): the phase-5-deferred
+  **`dedup_reverse`** LSM. Key encoding is
+  `[pba: 8 B BE][hash[..24]]`, value is `[hash[24..] | zero padding]`;
+  the full 32-byte hash round-trips via `encode_reverse_entry` /
+  `decode_reverse_hash`. `Lsm::scan_prefix(prefix)` walks memtable +
+  frozen + every SST whose min/max range overlaps the prefix, newest
+  first, with tombstone shadowing. Manifest bumped to v5 (with a v4
+  compat read path) to carry `dedup_reverse_level_heads` alongside
+  `dedup_level_heads`. Db API: `register_dedup_reverse`,
+  `unregister_dedup_reverse`, `scan_dedup_reverse_for_pba`. Callers
+  can bundle `put_dedup` + `register_dedup_reverse` + `incref_pba`
+  (or the inverse) into one `tx.commit()` for atomic
+  register/release.
+- **6f** [`tests/db_phase6_proptest.rs`](../tests/db_phase6_proptest.rs):
+  proptest mirrors a `Db` against a triple-`BTreeMap` reference
+  model through random mixes of the phase-6 API, including
+  mid-sequence reopens that force WAL-replay to rebuild in-memory
+  state. Two further unit tests cover failed-commit atomicity (WAL
+  fsync fault → no in-memory apply) and the end-to-end
+  decref-to-zero cleanup via `dedup_reverse`.
+- **6g** (incidental) [`src/lsm/bloom.rs`](../src/lsm/bloom.rs):
+  dropped the xxh3 rehash of already-hashed LSM keys. `h1` / `h2`
+  now come straight from `hash[8..16]` and `hash[16..24]`, which lie
+  in the raw content-hash region of both LSM key layouts. Saves one
+  xxh3 call per bloom query. Module docs call out that this is an
+  Onyx-specific purpose-built choice.
 
-### Exit criteria
+### Bugs surfaced by the new proptest (both fixed)
 
-- All previous property tests still pass under the unified API.
-- Read-your-writes: a txn that commits successfully is visible on the
-  next read from any thread.
-- Snapshot isolation: a snapshot taken at LSN `L` sees exactly the state
-  as of `L`, including dedup entries.
-- `dedup_reverse` prefix-scan cleanup lands and is covered by the
-  cross-index proptest.
-- Benchmarks: mixed workload (80% B+tree put, 10% dedup put, 10%
-  incref), target ≥ 150 k txns/s on local NVMe with 16 writers.
+1. `Db::flush` was advancing `manifest.checkpoint_lsn` past LSNs whose
+   ops were still sitting in the LSM memtable (never spilled to an L0
+   SST). On reopen, WAL replay started at `checkpoint_lsn + 1` and
+   silently dropped those ops. Fix: flush both LSM memtables to L0
+   SSTs before committing the new manifest, so `checkpoint_lsn` is
+   only ever as high as what is durable on disk.
+2. `WriterState::init` always called `SegmentFile::create` (create_new),
+   which collides with a pre-existing empty segment after a
+   create-with-no-writes → reopen sequence. Fix: list segments at
+   startup; if the newest existing segment's `start_lsn` is ≤ the
+   requested `start_lsn`, open it for append; otherwise create fresh.
+   A segment whose `start_lsn` is strictly ahead of the requested
+   `start_lsn` is a hard corruption error.
+
+### Exit criteria (status)
+
+- ☑ All previous property tests + db tests pass under the unified
+  transaction API (295 tests green as of `0227f39`).
+- ☑ Read-your-writes: every commit returns only after WAL fsync, and
+  reads after that point see the committed state.
+- ☑ `dedup_reverse` prefix-scan cleanup landed and is covered by
+  `decref_to_zero_cleanup_via_dedup_reverse` in the phase-6 proptest
+  suite.
+- ☑ Atomic `put(lba) + put_dedup + register_dedup_reverse +
+  incref(pba)` commit — covered by
+  `tx_atomically_registers_dedup_index_and_reverse` and the phase-6
+  end-to-end test.
+- ☐ Benchmarks (≥ 150 k txns/s on local NVMe with 16 writers). Not
+  run — the single `commit_lock` MVP design intentionally sacrifices
+  group-commit throughput, so the current numbers will be far below
+  target. Revisit together with the LSN-ordered condvar apply path
+  under phase 8.
+- ☐ `SnapshotView` for dedup / refcount at a given `SnapshotId`. Not
+  wired: snapshots still only expose L2P reads. Small follow-up
+  (would extend `SnapshotView` with `dedup_at` / `refcount_at` that
+  take the snapshot's per-group shard root).
 
 ---
 
@@ -394,20 +444,32 @@ Continuous work that doesn't gate earlier phases but gates production.
   integration, `metadb-dump` / `metadb-verify` / `metadb-replay`.
 - Documentation: recovery playbook, tuning guide.
 
+### Backlog rolled in from earlier phases
+
+- **1 M-op / 1000-seed LSM + Db proptest budget** (phase 5f / 6f were
+  landed at a lower case count for realistic wall-clock).
+- **Compaction stress bench** (10 GiB inserts, queryable at every
+  level).
+- **LSN-ordered condvar apply path** to bring back group-commit WAL
+  throughput (phase 6's MVP intentionally serialises submit + apply
+  under one `commit_lock`).
+- **`SnapshotView` for dedup / refcount** at a given `SnapshotId`.
+  Snapshots currently expose L2P reads only.
+
 ---
 
 ## Summary table
 
-| Phase | Weeks | Cum. weeks | Delivers                               |
-|-------|-------|-----------:|----------------------------------------|
-| 0     | ~1    |   1        | Scaffolding, docs, CI                  |
-| 1     | 3     |   4        | WAL + page store + recovery            |
-| 2     | 3     |   7        | B+tree single-writer                   |
-| 3     | 3     |  10        | COW + refcount + snapshots             |
-| 4     | 2     |  12        | Sharded multi-writer B+tree            |
-| 5     | 3     |  15        | Fixed-record LSM + PBA refcount        |
-| 6     | 2     |  17        | Unified transactions                   |
-| 7     | 2     |  19        | Onyx integration + migration           |
-| 8     | 4+    |  23+       | Hardening                              |
+| Phase | Weeks | Cum. weeks | Delivers                                        | Status              |
+|-------|-------|-----------:|-------------------------------------------------|---------------------|
+| 0     | ~1    |   1        | Scaffolding, docs, CI                           | landed              |
+| 1     | 3     |   4        | WAL + page store + recovery                     | landed              |
+| 2     | 3     |   7        | B+tree single-writer                            | landed              |
+| 3     | 3     |  10        | COW + refcount + snapshots                      | landed              |
+| 4     | 2     |  12        | Sharded multi-writer B+tree                     | partially landed    |
+| 5     | 3     |  15        | Fixed-record LSM + PBA refcount                 | landed              |
+| 6     | 2     |  17        | Transactions + WAL replay + `dedup_reverse`     | landed              |
+| 7     | 2     |  19        | Onyx integration + migration                    |                     |
+| 8     | 4+    |  23+       | Hardening                                       |                     |
 
 Total to a production-usable v0.1: ~5 months.
