@@ -72,39 +72,52 @@ No index yet; pages are opaque blobs.
 
 ---
 
-## Phase 2 — B+tree, single-writer, single-partition  (3 weeks)
+## Phase 2 — B+tree, single-writer, single-partition  (3 weeks) — **landed**
 
 Correctness-first B+tree. No COW. No snapshots. One partition. One writer
 thread. In-place page edits.
 
-### Scope
+### Delivered
 
-- Leaf page format (fixed 8B key + 28B value).
-- Internal page format (fixed 8B key + 8B child_id).
-- Insert / delete / lookup / range scan.
-- Split / merge / redistribute.
-- Page cache with clock-pro eviction and pinning.
-- Crash recovery extends phase 1 to replay L2P ops into pages.
+- [`btree::format`](../src/btree/format.rs): leaf (112 × 36 B entries) and
+  internal (251 keys + 252 children in fixed-offset regions) page formats.
+- [`btree::cache::PageBuf`](../src/btree/cache.rs): per-BTree HashMap cache
+  with dirty tracking, alloc / read / modify / flush. No eviction yet —
+  working set is bounded by tree depth.
+- [`btree::tree::BTree`](../src/btree/tree.rs): create / open / get /
+  insert (with split) / delete (with borrow + merge + root collapse) /
+  range (RangeBounds<u64>) / flush. Generation counter monotonic per
+  mutation.
+- [`btree::invariants`](../src/btree/invariants.rs): structural checker —
+  keys ascending, separator brackets, leaf-depth uniformity, fill
+  thresholds, root not zero-key.
+- [`tests/btree_proptest.rs`](../tests/btree_proptest.rs): proptest vs
+  `std::collections::BTreeMap` reference, invariants after every op +
+  20 k-op deterministic ChaCha8 stress.
 
-### Exit criteria
+### Deferred to phase 2 hardening (combined with phase 1 hardening)
 
-- Property test against `std::collections::BTreeMap`:
-  - Random sequences of put/get/delete/range, 1M ops per run.
-  - 1000+ seeds pass under release build.
-  - Same suite under `paranoid` feature with invariant checks after every
-    op (parent-key invariant, sibling ordering, fill thresholds).
-- Crash injection on phase-1 points + new points
-  (`btree.split.before_parent_update`, `btree.merge.mid_parent_update`).
-- Range scan iterator produces keys in ascending order, stable under
-  concurrent reads.
+- Clock-pro page cache with pinning (phase 8).
+- WAL replay of L2P ops (phase 6 — unified transaction layer).
+- Crash-injection tests at btree.split.before_parent_update /
+  btree.merge.mid_parent_update — fault points still present but not yet
+  exercised via recovery tests.
+- 1 M-op / 1000-seed proptest budget (currently 64 cases × 500 ops).
 
 ### Decisions resolved
 
-- Latch protocol: read = latch-couple, write = hand-over-hand under the
-  single writer lock.
-- Underflow threshold: 30% fill before merge.
-- Key-value ordering in leaves: sorted ascending by big-endian key bytes
-  (equivalent to numeric order for unsigned keys).
+- Latch protocol: none (single writer, `&mut self`). Phase 4 will wrap
+  with sharding.
+- Underflow threshold: 50% fill (MAX / 2). At exactly threshold, two
+  merging siblings + pivot fit in one page exactly; any higher threshold
+  would force borrows where merges would work.
+- Key encoding: big-endian u64 (byte-wise sort matches numeric sort).
+- Separator convention: `keys[i]` is the first key present in the subtree
+  rooted at `children[i+1]`. `internal_search` returns the child index
+  via `partition_point(|&k| k <= needle)`.
+- No sibling pointers in leaves. Range scan walks the stack of ancestor
+  internals; the COW path in phase 3 would otherwise need to propagate
+  sibling-pointer updates across many pages per write.
 
 ---
 
