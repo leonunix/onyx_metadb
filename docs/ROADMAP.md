@@ -240,35 +240,81 @@ fully closed yet.
 
 Second index type. Integrates with the shared WAL and manifest.
 
-### Scope
+### Decisions locked before coding
 
-- Memtable with immutable handoff.
-- SST format (DESIGN §5.4): bloom header + sorted fixed records.
-- L0..Ln leveled layout, compaction thread.
-- Dedup ops: `put_dedup`, `delete_dedup`, `get_dedup`.
-- PBA refcount: implemented as a second LSM or as a dedicated paged
-  counter depending on phase-5 spike.
+- **PBA refcount** is a **second B+tree shard group** inside `Db`, not a
+  separate LSM. Reuses all of phase 2–4 code. Refcount value reuses the
+  existing 28-byte `L2pValue` (u32 refcount in the first 4 bytes, 24 bytes
+  reserved). No generics on BTree; the space overhead is acceptable for
+  v0.1 and can be reclaimed in phase 8 if it shows up in the budget.
+- **Dedup LSM records** are fixed 64 bytes: `[hash: 32][kind: 1][value:
+  28][padding: 3]`. 63 records per 4 KiB payload, exact fit. Value is
+  28 bytes (`DedupValue`) so it mirrors `L2pValue` layout and the writer's
+  output buffer can be shared with L2P paths where helpful.
+- **dedup_reverse** is a second LSM instance, not a BTree. Append-heavy
+  (every write registers), range-prefix scan on PBA free — both are LSM's
+  sweet spot.
+
+### Sub-phase breakdown
+
+- **5a — LSM scaffolding + memtable**  `src/lsm/{mod,format,memtable}.rs`
+  - Record format constants, `Hash32`, `DedupValue`, encode/decode helpers.
+  - `Memtable`: `BTreeMap<Hash32, DedupOp>` + `RwLock`, freeze / release,
+    one active + at most one frozen slot.
+  - `LookupResult` distinguishes `Hit(value) | Tombstone | Miss` so
+    higher levels don't override an explicit delete.
+- **5b — SST writer/reader + bloom**  `src/lsm/{sst,bloom}.rs`
+  - Bloom: 10 bits/entry default, 4 hash functions derived via double
+    hashing.
+  - SST header page (type = `LsmData`): record count, min/max hash,
+    bloom offset/length, body offset, body page count.
+  - Body pages: 63 sorted records per page, binary search across pages
+    via in-header min/max.
+  - `SstWriter` streams a sorted input (frozen memtable or merged
+    compaction cursor) into a page run.
+- **5c — `Lsm` facade + L0 fanout**  `src/lsm/lsm.rs`
+  - `Lsm` owns memtable + `Vec<Vec<SstHandle>>` (one Vec per level).
+  - `put` / `delete` go to memtable; on overflow, freeze + flush to L0.
+  - `get` walks memtable → L0 (reverse insertion order) → L1.. in order.
+  - Manifest v4: add `lsm_levels: Vec<Vec<SstHandle>>` per LSM instance.
+- **5d — Compaction**  `src/lsm/compact.rs`
+  - L0 → L1 when L0 file count ≥ trigger.
+  - Ln → Ln+1 when level byte size ≥ ratio × previous.
+  - Tombstones drop at the last level only.
+  - Single compaction thread per LSM instance.
+- **5e — Second LSM + PBA refcount tree**  `src/db.rs`, `src/manifest.rs`
+  - `Db` gains `dedup_index: Lsm`, `dedup_reverse: Lsm`, and
+    `refcount_shards: Vec<Shard>`.
+  - Surface API: `put_dedup`, `get_dedup`, `delete_dedup`,
+    `incref_pba`, `decref_pba`, `get_refcount`,
+    `scan_dedup_reverse_for_pba`.
+  - Refcount value layout: first 4B big-endian u32 refcount in
+    `L2pValue`; decref to zero returns `None` and the caller is expected
+    to follow up with a dedup_reverse scan.
+  - Manifest v4: shard_roots → `l2p_shard_roots` + `refcount_shard_roots`;
+    snapshot entries extended with both vectors; `lsm_levels` table for
+    each LSM instance.
+- **5f — Property + crash tests**  `tests/lsm_proptest.rs`,
+  `tests/db_dedup_proptest.rs`
+  - LSM vs. `BTreeMap<[u8; 32], DedupOp>` reference: put/delete/get +
+    flush + compact, millions of ops.
+  - Crash injection at flush / compact / manifest swap; assert LSM
+    matches memory reference after recovery.
+  - End-to-end: `insert(lba, v) + put_dedup(hash, e) + incref(pba)` one
+    at a time (phase 6 will make them atomic); after each op, the state
+    is queryable and survives reopen.
 
 ### Exit criteria
 
-- Property test vs. `BTreeMap<[u8; 32], Entry>` reference for
+- Property test vs. `BTreeMap<[u8; 32], DedupOp>` reference for
   put/get/delete/compact. 1M-ops runs × 1000 seeds.
 - Compaction stress: 10 GiB of inserts, verify all records queryable at
   every level of the compaction tree.
-- Cross-index transaction test: `put(partition, lba, v) &&
-  put_dedup(hash, e) && incref(pba, 1)` all visible after commit, all
-  absent after crash-before-commit.
-- PBA refcount cleanup: when refcount hits 0 during a commit, the commit
-  record includes the dedup-reverse cleanup ops atomically (see
-  DESIGN §2.2).
-
-### Decisions resolved (spike before coding)
-
-- PBA refcount as LSM vs. paged B+tree vs. paged counter array:
-  - LSM has write-amp tail; paged array has sparse-file waste; B+tree
-    adds a second index type managing refs. Spike each for a week, pick.
-  - Default bet: second B+tree partition (reuses the phase 2-4 code),
-    unless spike reveals a problem.
+- Cross-index consistency test: `put(lba, v)`, `put_dedup(hash, e)`,
+  `incref(pba, 1)` individually, all visible after reopen.
+- PBA refcount cleanup: when refcount hits 0, the caller can scan
+  dedup_reverse by PBA prefix and delete the matching dedup_index entry.
+  (Atomic cross-index commit lands in phase 6.)
 
 ---
 

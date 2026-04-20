@@ -27,6 +27,7 @@ pub mod btree;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod lsm;
 pub mod manifest;
 pub mod page;
 pub mod page_store;
@@ -41,6 +42,10 @@ pub use btree::{
 pub use config::{Config, PAGE_SIZE};
 pub use db::{Db, DbRangeIter, DropReport, SnapshotView};
 pub use error::{MetaDbError, Result};
+pub use lsm::{
+    DEDUP_VALUE_SIZE, DedupOp, DedupValue, HASH_SIZE, Hash32, LSM_RECORD_SIZE, LookupResult,
+    Memtable, MemtableStats, RECORDS_PER_PAGE, Record,
+};
 pub use manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, max_snapshots_for_shards,
 };

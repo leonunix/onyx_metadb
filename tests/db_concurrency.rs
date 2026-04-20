@@ -70,7 +70,8 @@ fn multi_writer_stress_finishes_and_reopens_cleanly() {
     }
 
     db.flush().unwrap();
-    let before_reopen: Vec<(u64, L2pValue)> = db.range(..).unwrap().collect::<Result<Vec<_>>>().unwrap();
+    let before_reopen: Vec<(u64, L2pValue)> =
+        db.range(..).unwrap().collect::<Result<Vec<_>>>().unwrap();
     assert!(
         before_reopen.windows(2).all(|w| w[0].0 < w[1].0),
         "range scan must stay globally ordered",
@@ -144,11 +145,8 @@ fn snapshots_match_reference_during_multi_writer_rounds() {
 
     for (snap, expected) in snapshots {
         let view = db.snapshot_view(snap).unwrap();
-        let got: Vec<(u64, L2pValue)> = view
-            .range(..)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
+        let got: Vec<(u64, L2pValue)> =
+            view.range(..).unwrap().collect::<Result<Vec<_>>>().unwrap();
         let want: Vec<(u64, L2pValue)> = expected.into_iter().collect();
         assert_eq!(got, want, "snapshot {snap} diverged from reference");
     }

@@ -178,10 +178,7 @@ impl Db {
 
     /// As [`open_with_config`](Self::open_with_config) but with an
     /// injectable fault controller.
-    pub fn open_with_config_and_faults(
-        cfg: Config,
-        faults: Arc<FaultController>,
-    ) -> Result<Self> {
+    pub fn open_with_config_and_faults(cfg: Config, faults: Arc<FaultController>) -> Result<Self> {
         let pages_path = page_file(&cfg.path);
         let page_store = Arc::new(PageStore::open(&pages_path)?);
         let (mut manifest_store, mut manifest) =
@@ -268,10 +265,7 @@ impl Db {
         let mut guards = self.lock_all_shards();
         let mut items = Vec::new();
         for tree in &mut guards {
-            items.extend(
-                tree.range(range.clone())?
-                    .collect::<Result<Vec<_>>>()?,
-            );
+            items.extend(tree.range(range.clone())?.collect::<Result<Vec<_>>>()?);
         }
         items.sort_unstable_by_key(|(k, _)| *k);
         Ok(DbRangeIter::new(items))
@@ -404,10 +398,7 @@ impl Db {
 
         let generation = max_generation_from_locked(&guards);
         self.page_store.free(entry.roots_page, generation)?;
-        let pages_freed = self
-            .page_store
-            .free_list_len()
-            .saturating_sub(free_before);
+        let pages_freed = self.page_store.free_list_len().saturating_sub(free_before);
 
         Ok(Some(DropReport {
             snapshot_id: id,
@@ -476,7 +467,8 @@ impl Db {
             )));
         }
         let mut out = Vec::new();
-        for ((a_root, b_root), shard) in a.iter().copied().zip(b.iter().copied()).zip(&self.shards) {
+        for ((a_root, b_root), shard) in a.iter().copied().zip(b.iter().copied()).zip(&self.shards)
+        {
             let mut tree = shard.tree.lock();
             out.extend(tree.diff_subtrees(a_root, b_root)?);
         }
@@ -540,7 +532,10 @@ fn validate_shard_count(shards_per_partition: u32) -> Result<usize> {
     Ok(shard_count)
 }
 
-fn create_shards(page_store: Arc<PageStore>, shard_count: usize) -> Result<(Vec<Shard>, Box<[PageId]>)> {
+fn create_shards(
+    page_store: Arc<PageStore>,
+    shard_count: usize,
+) -> Result<(Vec<Shard>, Box<[PageId]>)> {
     let mut shards = Vec::with_capacity(shard_count);
     let mut roots = Vec::with_capacity(shard_count);
     for _ in 0..shard_count {

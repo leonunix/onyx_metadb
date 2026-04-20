@@ -9,8 +9,8 @@
 //! snapshot roots out to separate pages keeps snapshot capacity high even
 //! with 16 shards.
 
+use std::mem::size_of;
 use std::sync::Arc;
-use std::{mem::size_of};
 
 use crate::error::{MetaDbError, Result};
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
@@ -166,12 +166,14 @@ impl Manifest {
 
         let p = page.payload_mut();
         p.fill(0);
-        p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].copy_from_slice(&MANIFEST_BODY_VERSION.to_le_bytes());
+        p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4]
+            .copy_from_slice(&MANIFEST_BODY_VERSION.to_le_bytes());
         p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
             .copy_from_slice(&self.checkpoint_lsn.to_le_bytes());
         p[OFF_FREE_LIST_HEAD..OFF_FREE_LIST_HEAD + 8]
             .copy_from_slice(&self.free_list_head.to_le_bytes());
-        p[OFF_SHARD_COUNT..OFF_SHARD_COUNT + 4].copy_from_slice(&(shard_count as u32).to_le_bytes());
+        p[OFF_SHARD_COUNT..OFF_SHARD_COUNT + 4]
+            .copy_from_slice(&(shard_count as u32).to_le_bytes());
         p[OFF_NEXT_SNAPSHOT_ID..OFF_NEXT_SNAPSHOT_ID + 8]
             .copy_from_slice(&self.next_snapshot_id.to_le_bytes());
         p[OFF_SNAPSHOT_COUNT..OFF_SNAPSHOT_COUNT + 4]
@@ -219,11 +221,9 @@ impl Manifest {
                 .try_into()
                 .unwrap(),
         );
-        let shard_count = u32::from_le_bytes(
-            p[OFF_SHARD_COUNT..OFF_SHARD_COUNT + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let shard_count =
+            u32::from_le_bytes(p[OFF_SHARD_COUNT..OFF_SHARD_COUNT + 4].try_into().unwrap())
+                as usize;
         if shard_count > MAX_SHARD_ROOTS_PER_PAGE {
             return Err(MetaDbError::Corruption(format!(
                 "manifest shard_count {shard_count} exceeds page capacity {MAX_SHARD_ROOTS_PER_PAGE}",
@@ -354,7 +354,8 @@ pub(crate) fn materialize_snapshot_root_pages(
     manifest.body_version = MANIFEST_BODY_VERSION;
     for entry in &mut manifest.snapshots {
         if entry.needs_roots_page() {
-            entry.roots_page = write_snapshot_roots_page(page_store, &entry.shard_roots, generation)?;
+            entry.roots_page =
+                write_snapshot_roots_page(page_store, &entry.shard_roots, generation)?;
             changed = true;
         }
     }
@@ -822,7 +823,10 @@ mod tests {
         m.shard_roots = roots(&[1, 2, 3, 4]);
         m.snapshots.push(snapshot(&ps, 7, &[42, 43, 44, 45], 100));
         assert_eq!(m.find_snapshot(7).unwrap().id, 7);
-        assert_eq!(m.find_snapshot(7).unwrap().shard_roots.as_ref(), &[42, 43, 44, 45]);
+        assert_eq!(
+            m.find_snapshot(7).unwrap().shard_roots.as_ref(),
+            &[42, 43, 44, 45]
+        );
         assert!(m.find_snapshot(99).is_none());
     }
 
