@@ -17,19 +17,27 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::btree::{BTree, DiffEntry, L2pValue};
 use crate::config::Config;
 use crate::error::{MetaDbError, Result};
+use crate::lsm::{DedupValue, Hash32, Lsm, LsmConfig};
 use crate::manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, materialize_snapshot_root_pages,
     write_snapshot_roots_page,
 };
 use crate::page_store::PageStore;
 use crate::testing::faults::FaultController;
-use crate::types::{Lsn, PageId, SnapshotId};
+use crate::types::{Lsn, PageId, Pba, SnapshotId};
 
 /// Embedded metadata database.
 pub struct Db {
     page_store: Arc<PageStore>,
     manifest_state: Mutex<ManifestState>,
+    /// L2P B+tree shards (LBA → `L2pValue`).
     shards: Vec<Shard>,
+    /// PBA refcount B+tree shards (PBA → first 4 bytes = u32 big-endian
+    /// refcount, remaining 24 bytes reserved).
+    refcount_shards: Vec<Shard>,
+    /// Global dedup index: 32-byte SHA-256 content hash → 28-byte opaque
+    /// `DedupValue`.
+    dedup_index: Lsm,
     /// Snapshot readers hold a shared guard; `drop_snapshot` takes the
     /// exclusive side so it can't free pages still visible to a live view.
     snapshot_views: RwLock<()>,
@@ -144,9 +152,13 @@ impl Db {
         let page_store = Arc::new(PageStore::create(&pages_path)?);
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
-        let (shards, roots) = create_shards(page_store.clone(), shard_count)?;
+        let (l2p_shards, l2p_roots) = create_shards(page_store.clone(), shard_count)?;
+        let (refcount_shards, refcount_roots) = create_shards(page_store.clone(), shard_count)?;
+        let dedup_index = Lsm::create(page_store.clone(), LsmConfig::default());
         manifest.body_version = MANIFEST_BODY_VERSION;
-        manifest.shard_roots = roots;
+        manifest.shard_roots = l2p_roots;
+        manifest.refcount_shard_roots = refcount_roots;
+        manifest.dedup_level_heads = Vec::new().into_boxed_slice();
         manifest_store.commit(&manifest)?;
         Ok(Self {
             page_store,
@@ -154,7 +166,9 @@ impl Db {
                 store: manifest_store,
                 manifest,
             }),
-            shards,
+            shards: l2p_shards,
+            refcount_shards,
+            dedup_index,
             snapshot_views: RwLock::new(()),
             faults,
             db_path: cfg.path,
@@ -190,10 +204,33 @@ impl Db {
         }
 
         let next_gen = manifest.checkpoint_lsn.max(1) + 1;
+
+        // v3 upgrade: manifest didn't carry refcount / dedup state.
+        // Materialize them so open returns a fully-populated v4 layout.
+        let mut manifest_dirty = false;
+        if manifest.refcount_shard_roots.is_empty() {
+            let (_owned, roots) = create_shards(page_store.clone(), manifest.shard_count())?;
+            manifest.refcount_shard_roots = roots;
+            manifest_dirty = true;
+            // Note: the Shard handles are discarded here; we rebuild
+            // them via `open_shards` below once the manifest is stable,
+            // to share the same codepath with normal opens.
+        }
         if materialize_snapshot_root_pages(&page_store, &mut manifest, next_gen)? {
+            manifest_dirty = true;
+        }
+        if manifest_dirty {
             manifest_store.commit(&manifest)?;
         }
-        let shards = open_shards(page_store.clone(), &manifest.shard_roots, next_gen)?;
+
+        let l2p_shards = open_shards(page_store.clone(), &manifest.shard_roots, next_gen)?;
+        let refcount_shards =
+            open_shards(page_store.clone(), &manifest.refcount_shard_roots, next_gen)?;
+        let dedup_index = Lsm::open(
+            page_store.clone(),
+            LsmConfig::default(),
+            &manifest.dedup_level_heads,
+        )?;
 
         Ok(Self {
             page_store,
@@ -201,7 +238,9 @@ impl Db {
                 store: manifest_store,
                 manifest,
             }),
-            shards,
+            shards: l2p_shards,
+            refcount_shards,
+            dedup_index,
             snapshot_views: RwLock::new(()),
             faults,
             db_path: cfg.path,
@@ -232,12 +271,109 @@ impl Db {
     /// current per-shard roots + checkpoint LSN.
     pub fn flush(&self) -> Result<()> {
         let mut manifest_state = self.manifest_state.lock();
-        let mut guards = self.lock_all_shards();
-        self.flush_locked_shards(&mut guards)?;
-        self.refresh_manifest_from_locked(&mut manifest_state.manifest, &guards);
+        let mut l2p_guards = self.lock_all_l2p_shards();
+        let mut refcount_guards = self.lock_all_refcount_shards();
+        self.flush_locked_shards(&mut l2p_guards)?;
+        self.flush_locked_shards(&mut refcount_guards)?;
+
+        let checkpoint_lsn = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        let old_dedup_heads: Vec<PageId> = manifest_state.manifest.dedup_level_heads.to_vec();
+        let new_dedup_heads = self.dedup_index.persist_levels(checkpoint_lsn)?;
+
+        self.refresh_manifest_from_locked(
+            &mut manifest_state.manifest,
+            &l2p_guards,
+            &refcount_guards,
+        );
+        manifest_state.manifest.dedup_level_heads = new_dedup_heads.clone().into_boxed_slice();
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
+
+        // Commit succeeded; free the old level chains.
+        self.dedup_index
+            .free_old_level_heads(&old_dedup_heads, checkpoint_lsn)?;
         Ok(())
+    }
+
+    // -------- refcount + dedup ops --------------------------------------
+
+    /// Return the current refcount for `pba`, or 0 if no entry exists.
+    pub fn get_refcount(&self, pba: Pba) -> Result<u32> {
+        let sid = self.refcount_shard_for(pba);
+        let mut tree = self.refcount_shards[sid].tree.lock();
+        Ok(tree.get(pba)?.map(refcount_from_value).unwrap_or(0))
+    }
+
+    /// Increment `pba`'s refcount by `delta`. Returns the new value.
+    /// `delta == 0` is a no-op that still performs a lookup.
+    pub fn incref_pba(&self, pba: Pba, delta: u32) -> Result<u32> {
+        let sid = self.refcount_shard_for(pba);
+        let mut tree = self.refcount_shards[sid].tree.lock();
+        let current = tree.get(pba)?.map(refcount_from_value).unwrap_or(0);
+        let new = current.checked_add(delta).ok_or_else(|| {
+            MetaDbError::InvalidArgument(format!("refcount overflow for pba {pba}"))
+        })?;
+        if new == 0 {
+            // Both current and delta are zero; nothing to persist.
+            return Ok(0);
+        }
+        tree.insert(pba, refcount_to_value(new))?;
+        Ok(new)
+    }
+
+    /// Decrement `pba`'s refcount by `delta`. Returns the new value.
+    /// Decrementing below zero is an error. When the new value hits
+    /// zero the row is removed entirely, so the caller is responsible
+    /// for cleaning up the corresponding dedup entry.
+    pub fn decref_pba(&self, pba: Pba, delta: u32) -> Result<u32> {
+        let sid = self.refcount_shard_for(pba);
+        let mut tree = self.refcount_shards[sid].tree.lock();
+        let current = tree.get(pba)?.map(refcount_from_value).unwrap_or(0);
+        let new = current.checked_sub(delta).ok_or_else(|| {
+            MetaDbError::InvalidArgument(format!(
+                "decref underflow for pba {pba}: {current} - {delta}",
+            ))
+        })?;
+        if new == 0 {
+            tree.delete(pba)?;
+        } else {
+            tree.insert(pba, refcount_to_value(new))?;
+        }
+        Ok(new)
+    }
+
+    /// Record a `hash → value` entry in the dedup index.
+    pub fn put_dedup(&self, hash: Hash32, value: DedupValue) {
+        self.dedup_index.put(hash, value);
+    }
+
+    /// Tombstone `hash` in the dedup index.
+    pub fn delete_dedup(&self, hash: Hash32) {
+        self.dedup_index.delete(hash);
+    }
+
+    /// Point-lookup `hash` in the dedup index.
+    pub fn get_dedup(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
+        self.dedup_index.get(hash)
+    }
+
+    /// `true` if the dedup memtable has reached its freeze threshold.
+    pub fn dedup_should_flush(&self) -> bool {
+        self.dedup_index.should_flush()
+    }
+
+    /// Flush the dedup memtable to a fresh L0 SST. Returns `None` if
+    /// the memtable is empty.
+    pub fn flush_dedup_memtable(&self) -> Result<bool> {
+        let generation = self.current_generation();
+        Ok(self.dedup_index.flush_memtable(generation)?.is_some())
+    }
+
+    /// Run one round of dedup compaction. Returns `true` if any work was
+    /// performed.
+    pub fn compact_dedup_once(&self) -> Result<bool> {
+        let generation = self.current_generation();
+        Ok(self.dedup_index.compact_once(generation)?.is_some())
     }
 
     // -------- tree operations --------------------------------------------
@@ -262,7 +398,7 @@ impl Db {
 
     pub fn range<R: RangeBounds<u64>>(&self, range: R) -> Result<DbRangeIter> {
         let range = OwnedRange::new(range);
-        let mut guards = self.lock_all_shards();
+        let mut guards = self.lock_all_l2p_shards();
         let mut items = Vec::new();
         for tree in &mut guards {
             items.extend(tree.range(range.clone())?.collect::<Result<Vec<_>>>()?);
@@ -273,28 +409,44 @@ impl Db {
 
     // -------- snapshot operations -----------------------------------------
 
-    /// Take a snapshot of the current sharded tree. Returns the new
-    /// snapshot id. Persisted immediately via a manifest commit.
+    /// Take a snapshot of both the L2P and refcount sharded trees.
+    /// Returns the new snapshot id. Persisted immediately via a
+    /// manifest commit.
     pub fn take_snapshot(&self) -> Result<SnapshotId> {
         let mut manifest_state = self.manifest_state.lock();
-        let mut guards = self.lock_all_shards();
+        let mut l2p_guards = self.lock_all_l2p_shards();
+        let mut refcount_guards = self.lock_all_refcount_shards();
 
         let id = manifest_state.manifest.next_snapshot_id;
-        let mut roots = Vec::with_capacity(guards.len());
-        for tree in &mut guards {
+        let mut l2p_roots = Vec::with_capacity(l2p_guards.len());
+        for tree in &mut l2p_guards {
             tree.incref_root_for_snapshot()?;
-            roots.push(tree.root());
+            l2p_roots.push(tree.root());
         }
-        let created_lsn = max_generation_from_locked(&guards);
-        let roots_page = write_snapshot_roots_page(&self.page_store, &roots, created_lsn)?;
+        let mut refcount_roots = Vec::with_capacity(refcount_guards.len());
+        for tree in &mut refcount_guards {
+            tree.incref_root_for_snapshot()?;
+            refcount_roots.push(tree.root());
+        }
+        let created_lsn = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        let l2p_roots_page = write_snapshot_roots_page(&self.page_store, &l2p_roots, created_lsn)?;
+        let refcount_roots_page =
+            write_snapshot_roots_page(&self.page_store, &refcount_roots, created_lsn)?;
 
-        self.flush_locked_shards(&mut guards)?;
-        self.refresh_manifest_from_locked(&mut manifest_state.manifest, &guards);
+        self.flush_locked_shards(&mut l2p_guards)?;
+        self.flush_locked_shards(&mut refcount_guards)?;
+        self.refresh_manifest_from_locked(
+            &mut manifest_state.manifest,
+            &l2p_guards,
+            &refcount_guards,
+        );
         manifest_state.manifest.snapshots.push(SnapshotEntry {
             id,
-            roots_page,
+            l2p_roots_page,
+            refcount_roots_page,
             created_lsn,
-            shard_roots: roots.into_boxed_slice(),
+            l2p_shard_roots: l2p_roots.into_boxed_slice(),
+            refcount_shard_roots: refcount_roots.into_boxed_slice(),
         });
         manifest_state.manifest.next_snapshot_id = id
             .checked_add(1)
@@ -328,13 +480,13 @@ impl Db {
                 .manifest
                 .find_snapshot(a)
                 .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {a}")))?
-                .shard_roots
+                .l2p_shard_roots
                 .clone();
             let b_roots = manifest_state
                 .manifest
                 .find_snapshot(b)
                 .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {b}")))?
-                .shard_roots
+                .l2p_shard_roots
                 .clone();
             (a_roots, b_roots)
         };
@@ -350,11 +502,11 @@ impl Db {
                 .manifest
                 .find_snapshot(snap)
                 .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {snap}")))?
-                .shard_roots
+                .l2p_shard_roots
                 .clone()
         };
 
-        let mut guards = self.lock_all_shards();
+        let mut guards = self.lock_all_l2p_shards();
         let mut out = Vec::new();
         for (tree, snap_root) in guards.iter_mut().zip(snap_roots.iter().copied()) {
             let current_root = tree.root();
@@ -382,22 +534,51 @@ impl Db {
         let entry = manifest_state.manifest.snapshots[pos].clone();
         let free_before = self.page_store.free_list_len();
 
-        let mut guards = self.lock_all_shards();
-        self.flush_locked_shards(&mut guards)?;
+        let mut l2p_guards = self.lock_all_l2p_shards();
+        let mut refcount_guards = self.lock_all_refcount_shards();
+        self.flush_locked_shards(&mut l2p_guards)?;
+        self.flush_locked_shards(&mut refcount_guards)?;
         manifest_state.manifest.snapshots.remove(pos);
-        self.refresh_manifest_from_locked(&mut manifest_state.manifest, &guards);
+        self.refresh_manifest_from_locked(
+            &mut manifest_state.manifest,
+            &l2p_guards,
+            &refcount_guards,
+        );
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
 
         let mut values = Vec::new();
-        for (tree, root) in guards.iter_mut().zip(entry.shard_roots.iter().copied()) {
+        for (tree, root) in l2p_guards
+            .iter_mut()
+            .zip(entry.l2p_shard_roots.iter().copied())
+        {
             values.extend(tree.drop_subtree(root)?);
         }
-        self.flush_locked_shards(&mut guards)?;
-        self.refresh_manifest_from_locked(&mut manifest_state.manifest, &guards);
+        if !entry.refcount_shard_roots.is_empty() {
+            for (tree, root) in refcount_guards
+                .iter_mut()
+                .zip(entry.refcount_shard_roots.iter().copied())
+            {
+                // Refcount subtree values are discarded; the caller
+                // doesn't care about refcount-at-snapshot values, only
+                // about freeing the pages.
+                let _ = tree.drop_subtree(root)?;
+            }
+        }
+        self.flush_locked_shards(&mut l2p_guards)?;
+        self.flush_locked_shards(&mut refcount_guards)?;
+        self.refresh_manifest_from_locked(
+            &mut manifest_state.manifest,
+            &l2p_guards,
+            &refcount_guards,
+        );
 
-        let generation = max_generation_from_locked(&guards);
-        self.page_store.free(entry.roots_page, generation)?;
+        let generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        self.page_store.free(entry.l2p_roots_page, generation)?;
+        if entry.refcount_roots_page != crate::types::NULL_PAGE {
+            self.page_store
+                .free(entry.refcount_roots_page, generation)?;
+        }
         let pages_freed = self.page_store.free_list_len().saturating_sub(free_before);
 
         Ok(Some(DropReport {
@@ -412,8 +593,20 @@ impl Db {
         (xxh3_64(&key.to_be_bytes()) as usize) % self.shards.len()
     }
 
-    fn lock_all_shards(&self) -> Vec<MutexGuard<'_, BTree>> {
+    fn refcount_shard_for(&self, pba: Pba) -> usize {
+        debug_assert!(!self.refcount_shards.is_empty());
+        (xxh3_64(&pba.to_be_bytes()) as usize) % self.refcount_shards.len()
+    }
+
+    fn lock_all_l2p_shards(&self) -> Vec<MutexGuard<'_, BTree>> {
         self.shards.iter().map(|shard| shard.tree.lock()).collect()
+    }
+
+    fn lock_all_refcount_shards(&self) -> Vec<MutexGuard<'_, BTree>> {
+        self.refcount_shards
+            .iter()
+            .map(|shard| shard.tree.lock())
+            .collect()
     }
 
     fn flush_locked_shards(&self, guards: &mut [MutexGuard<'_, BTree>]) -> Result<()> {
@@ -426,15 +619,27 @@ impl Db {
     fn refresh_manifest_from_locked(
         &self,
         manifest: &mut Manifest,
-        guards: &[MutexGuard<'_, BTree>],
+        l2p_guards: &[MutexGuard<'_, BTree>],
+        refcount_guards: &[MutexGuard<'_, BTree>],
     ) {
         manifest.body_version = MANIFEST_BODY_VERSION;
-        manifest.shard_roots = guards
+        manifest.shard_roots = l2p_guards
             .iter()
             .map(|tree| tree.root())
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        manifest.checkpoint_lsn = max_generation_from_locked(guards);
+        manifest.refcount_shard_roots = refcount_guards
+            .iter()
+            .map(|tree| tree.root())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        manifest.checkpoint_lsn = max_generation_from_two_groups(l2p_guards, refcount_guards);
+    }
+
+    fn current_generation(&self) -> Lsn {
+        let l2p = self.lock_all_l2p_shards();
+        let refcount = self.lock_all_refcount_shards();
+        max_generation_from_two_groups(&l2p, &refcount)
     }
 
     fn collect_range_for_roots(&self, roots: &[PageId], range: OwnedRange) -> Result<DbRangeIter> {
@@ -511,13 +716,13 @@ impl<'a> SnapshotView<'a> {
     pub fn get(&self, key: u64) -> Result<Option<L2pValue>> {
         let sid = self.db.shard_for(key);
         let mut tree = self.db.shards[sid].tree.lock();
-        tree.get_at(self.entry.shard_roots[sid], key)
+        tree.get_at(self.entry.l2p_shard_roots[sid], key)
     }
 
     /// Range scan as of the snapshot's LSN.
     pub fn range<R: RangeBounds<u64>>(&self, range: R) -> Result<DbRangeIter> {
         self.db
-            .collect_range_for_roots(&self.entry.shard_roots, OwnedRange::new(range))
+            .collect_range_for_roots(&self.entry.l2p_shard_roots, OwnedRange::new(range))
     }
 }
 
@@ -564,6 +769,20 @@ fn max_generation_from_locked(guards: &[MutexGuard<'_, BTree>]) -> Lsn {
         .map(|tree| tree.next_generation())
         .max()
         .unwrap_or(0)
+}
+
+fn max_generation_from_two_groups(a: &[MutexGuard<'_, BTree>], b: &[MutexGuard<'_, BTree>]) -> Lsn {
+    max_generation_from_locked(a).max(max_generation_from_locked(b))
+}
+
+fn refcount_from_value(v: L2pValue) -> u32 {
+    u32::from_be_bytes([v.0[0], v.0[1], v.0[2], v.0[3]])
+}
+
+fn refcount_to_value(count: u32) -> L2pValue {
+    let mut bytes = [0u8; 28];
+    bytes[..4].copy_from_slice(&count.to_be_bytes());
+    L2pValue(bytes)
 }
 
 #[cfg(test)]
@@ -829,5 +1048,201 @@ mod tests {
             assert_eq!(v2.get(5).unwrap(), Some(v(2)));
         }
         assert_eq!(db.get(5).unwrap(), Some(v(3)));
+    }
+
+    // -------- phase 5e: refcount + dedup integration --------
+
+    fn h(n: u64) -> crate::lsm::Hash32 {
+        let mut out = [0u8; 32];
+        out[..8].copy_from_slice(&n.to_be_bytes());
+        out
+    }
+
+    fn dv(n: u8) -> crate::lsm::DedupValue {
+        let mut x = [0u8; 28];
+        x[0] = n;
+        crate::lsm::DedupValue(x)
+    }
+
+    #[test]
+    fn refcount_fresh_pba_reads_as_zero() {
+        let (_d, db) = mk_db();
+        assert_eq!(db.get_refcount(1234).unwrap(), 0);
+    }
+
+    #[test]
+    fn incref_and_decref_roundtrip() {
+        let (_d, db) = mk_db();
+        assert_eq!(db.incref_pba(42, 1).unwrap(), 1);
+        assert_eq!(db.incref_pba(42, 1).unwrap(), 2);
+        assert_eq!(db.incref_pba(42, 3).unwrap(), 5);
+        assert_eq!(db.get_refcount(42).unwrap(), 5);
+        assert_eq!(db.decref_pba(42, 2).unwrap(), 3);
+        assert_eq!(db.decref_pba(42, 3).unwrap(), 0);
+        // Row should be gone.
+        assert_eq!(db.get_refcount(42).unwrap(), 0);
+    }
+
+    #[test]
+    fn decref_underflow_errors() {
+        let (_d, db) = mk_db();
+        db.incref_pba(1, 2).unwrap();
+        assert!(matches!(
+            db.decref_pba(1, 3).unwrap_err(),
+            MetaDbError::InvalidArgument(_)
+        ));
+    }
+
+    #[test]
+    fn incref_overflow_errors() {
+        let (_d, db) = mk_db();
+        db.incref_pba(1, u32::MAX - 1).unwrap();
+        assert_eq!(db.incref_pba(1, 1).unwrap(), u32::MAX);
+        assert!(matches!(
+            db.incref_pba(1, 1).unwrap_err(),
+            MetaDbError::InvalidArgument(_)
+        ));
+    }
+
+    #[test]
+    fn refcount_survives_flush_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            for pba in 0u64..100 {
+                db.incref_pba(pba, (pba as u32 % 7) + 1).unwrap();
+            }
+            db.flush().unwrap();
+        }
+        let db = Db::open(dir.path()).unwrap();
+        for pba in 0u64..100 {
+            assert_eq!(
+                db.get_refcount(pba).unwrap(),
+                (pba as u32 % 7) + 1,
+                "pba {pba} mismatch after reopen",
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_put_get_roundtrip_via_memtable() {
+        let (_d, db) = mk_db();
+        db.put_dedup(h(1), dv(10));
+        db.put_dedup(h(2), dv(20));
+        assert_eq!(db.get_dedup(&h(1)).unwrap(), Some(dv(10)));
+        assert_eq!(db.get_dedup(&h(2)).unwrap(), Some(dv(20)));
+        assert_eq!(db.get_dedup(&h(3)).unwrap(), None);
+    }
+
+    #[test]
+    fn dedup_delete_tombstones_key() {
+        let (_d, db) = mk_db();
+        db.put_dedup(h(1), dv(10));
+        db.delete_dedup(h(1));
+        assert_eq!(db.get_dedup(&h(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn dedup_flush_to_l0_then_read() {
+        let (_d, db) = mk_db();
+        for i in 0u64..50 {
+            db.put_dedup(h(i), dv(i as u8));
+        }
+        assert!(db.flush_dedup_memtable().unwrap());
+        for i in 0u64..50 {
+            assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dv(i as u8)));
+        }
+    }
+
+    #[test]
+    fn dedup_survives_flush_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            for i in 0u64..100 {
+                db.put_dedup(h(i), dv(i as u8));
+            }
+            // Force a couple of L0 SSTs so persistence is exercised.
+            assert!(db.flush_dedup_memtable().unwrap());
+            for i in 100u64..200 {
+                db.put_dedup(h(i), dv((i % 255) as u8));
+            }
+            assert!(db.flush_dedup_memtable().unwrap());
+            db.flush().unwrap();
+        }
+        let db = Db::open(dir.path()).unwrap();
+        for i in 0u64..100 {
+            assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dv(i as u8)));
+        }
+        for i in 100u64..200 {
+            assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dv((i % 255) as u8)));
+        }
+    }
+
+    #[test]
+    fn take_snapshot_captures_refcount_state() {
+        let (_d, db) = mk_db();
+        for pba in 0u64..50 {
+            db.incref_pba(pba, 1).unwrap();
+        }
+        let _snap = db.take_snapshot().unwrap();
+        // Overwrite refcount state after the snapshot.
+        for pba in 0u64..50 {
+            db.incref_pba(pba, 1).unwrap();
+        }
+        for pba in 0u64..50 {
+            assert_eq!(db.get_refcount(pba).unwrap(), 2);
+        }
+        // Snapshot-view access to refcount tree isn't yet exposed, but
+        // we can at least verify the snapshot was persisted with both
+        // root pages recorded.
+        let snap_entry = &db.snapshots()[0];
+        assert_ne!(snap_entry.l2p_roots_page, crate::types::NULL_PAGE);
+        assert_ne!(snap_entry.refcount_roots_page, crate::types::NULL_PAGE);
+        assert_eq!(snap_entry.refcount_shard_roots.len(), db.shard_count());
+    }
+
+    #[test]
+    fn drop_snapshot_releases_refcount_state() {
+        let (_d, db) = mk_db();
+        for pba in 0u64..200 {
+            db.incref_pba(pba, 1).unwrap();
+        }
+        db.flush().unwrap();
+        let hw_before_snap = db.high_water();
+        let s = db.take_snapshot().unwrap();
+        for pba in 0u64..200 {
+            db.incref_pba(pba, 1).unwrap();
+        }
+        db.flush().unwrap();
+        let hw_after = db.high_water();
+        assert!(hw_after > hw_before_snap);
+        let report = db.drop_snapshot(s).unwrap().unwrap();
+        assert!(report.pages_freed > 0);
+        for pba in 0u64..200 {
+            assert_eq!(db.get_refcount(pba).unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn dedup_compaction_can_be_triggered_from_db() {
+        let (_d, db) = mk_db();
+        for batch in 0..4u64 {
+            for i in 0u64..10 {
+                db.put_dedup(h(batch * 100 + i), dv(batch as u8));
+            }
+            db.flush_dedup_memtable().unwrap();
+        }
+        // With 4 L0 SSTs we're at the default trigger; compaction
+        // should do something.
+        assert!(db.compact_dedup_once().unwrap());
+        for batch in 0..4u64 {
+            for i in 0u64..10 {
+                assert_eq!(
+                    db.get_dedup(&h(batch * 100 + i)).unwrap(),
+                    Some(dv(batch as u8)),
+                );
+            }
+        }
     }
 }
