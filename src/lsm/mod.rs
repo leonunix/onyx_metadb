@@ -13,11 +13,15 @@
 //! 4. (future) `lsm`: the multi-level facade that glues memtable + SSTs.
 //! 5. (future) `compact`: L0→L1 and Ln→Ln+1 merges.
 
+pub mod bloom;
 pub mod format;
 pub mod memtable;
+pub mod sst;
 
+pub use bloom::{BloomFilter, DEFAULT_BITS_PER_ENTRY};
 pub use format::{
     DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash32, KIND_DELETE, KIND_PUT, LSM_RECORD_SIZE,
     RECORDS_PER_PAGE, Record,
 };
 pub use memtable::{DedupOp, LookupResult, Memtable, MemtableStats};
+pub use sst::{SST_LAYOUT_VERSION, SstHandle, SstReader, SstScan, SstWriter};

@@ -179,6 +179,43 @@ impl PageStore {
         Ok(page_id)
     }
 
+    /// Allocate a contiguous run of `count` fresh page ids.
+    ///
+    /// Always extends the high-water mark; the free list is never
+    /// consulted, because a LIFO pool of individual pages does not
+    /// efficiently produce contiguous runs. The returned page id is the
+    /// first page of the run. On-disk content is uninitialized; the
+    /// caller is expected to write a sealed page at each id.
+    pub fn allocate_run(&self, count: usize) -> Result<PageId> {
+        if count == 0 {
+            return Err(MetaDbError::InvalidArgument(
+                "allocate_run requires count > 0".into(),
+            ));
+        }
+        let count = u64::try_from(count)
+            .map_err(|_| MetaDbError::InvalidArgument("page run too large".into()))?;
+        let mut inner = self.inner.lock();
+        let start = inner.high_water;
+        let new_high = inner
+            .high_water
+            .checked_add(count)
+            .ok_or(MetaDbError::OutOfSpace)?;
+        self.file.set_len(new_high * PAGE_SIZE as u64)?;
+        inner.high_water = new_high;
+        Ok(start)
+    }
+
+    /// Free `count` pages starting at `start`, stamping each with
+    /// `generation`. Pages rejoin the single-page free list individually.
+    /// Convenience wrapper over [`free`]; fails as soon as any page id
+    /// falls outside the allowed range.
+    pub fn free_run(&self, start: PageId, count: u32, generation: Lsn) -> Result<()> {
+        for i in 0..count as u64 {
+            self.free(start + i, generation)?;
+        }
+        Ok(())
+    }
+
     /// Mark `page_id` as free. Writes a sealed `Free`-typed page stamped
     /// with `generation` and pushes onto the free list. `generation`
     /// should be the current LSN so verifier tooling can tell when the
@@ -437,5 +474,58 @@ mod tests {
         let path = dir.path().join("pages.onyx_meta");
         let ps = PageStore::create(&path).unwrap();
         assert_eq!(ps.path(), path);
+    }
+
+    #[test]
+    fn allocate_run_returns_contiguous_range() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        let start = ps.allocate_run(8).unwrap();
+        assert_eq!(start, FIRST_DATA_PAGE);
+        assert_eq!(ps.high_water(), FIRST_DATA_PAGE + 8);
+        // A subsequent single allocate extends further; no overlap.
+        let next = ps.allocate().unwrap();
+        assert_eq!(next, FIRST_DATA_PAGE + 8);
+    }
+
+    #[test]
+    fn allocate_run_rejects_zero_count() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        assert!(matches!(
+            ps.allocate_run(0).unwrap_err(),
+            MetaDbError::InvalidArgument(_)
+        ));
+    }
+
+    #[test]
+    fn allocate_run_skips_free_list() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        // Seed the free list with one individual page.
+        let pid = ps.allocate().unwrap();
+        ps.write_page(pid, &mk_page(1, 0)).unwrap();
+        ps.free(pid, 1).unwrap();
+        assert_eq!(ps.free_list_len(), 1);
+        // Run allocation bypasses the free list entirely.
+        let start = ps.allocate_run(4).unwrap();
+        assert_eq!(start, FIRST_DATA_PAGE + 1);
+        assert_eq!(ps.free_list_len(), 1);
+    }
+
+    #[test]
+    fn free_run_returns_pages_to_free_list() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        let start = ps.allocate_run(3).unwrap();
+        for i in 0..3 {
+            ps.write_page(start + i, &mk_page(1, 0)).unwrap();
+        }
+        ps.free_run(start, 3, 99).unwrap();
+        assert_eq!(ps.free_list_len(), 3);
     }
 }
