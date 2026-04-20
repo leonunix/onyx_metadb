@@ -106,6 +106,93 @@ proptest! {
     }
 }
 
+// --- extended proptest: mid-sequence reopens must preserve state ----
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn tree_survives_reopens(ops in proptest::collection::vec(arb_op(), 1..400)) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("p.onyx_meta");
+        let mut ps = Arc::new(PageStore::create(&path).unwrap());
+        let mut tree = BTree::create(Arc::clone(&ps)).unwrap();
+        let mut reference: BTreeMap<u64, L2pValue> = BTreeMap::new();
+
+        for (i, op) in ops.into_iter().enumerate() {
+            // Every 30 ops, force a flush + close + reopen.
+            if i > 0 && i % 30 == 0 {
+                tree.flush().unwrap();
+                let root = tree.root();
+                let ng = tree.next_generation();
+                drop(tree);
+                drop(ps);
+                ps = Arc::new(PageStore::open(&path).unwrap());
+                tree = BTree::open(Arc::clone(&ps), root, ng).unwrap();
+                tree.check_invariants().map_err(|e| {
+                    TestCaseError::fail(format!("post-reopen invariants: {e}"))
+                })?;
+                // Full contents cross-check.
+                let items: Vec<(u64, L2pValue)> = tree
+                    .range(..)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let ref_items: Vec<(u64, L2pValue)> =
+                    reference.iter().map(|(k, v)| (*k, *v)).collect();
+                prop_assert_eq!(items, ref_items);
+            }
+            match op {
+                Op::Insert(k, v) => {
+                    let value = v_of(v);
+                    let tree_old = tree.insert(k, value).unwrap();
+                    let ref_old = reference.insert(k, value);
+                    prop_assert_eq!(tree_old, ref_old);
+                }
+                Op::Delete(k) => {
+                    let tree_old = tree.delete(k).unwrap();
+                    let ref_old = reference.remove(&k);
+                    prop_assert_eq!(tree_old, ref_old);
+                }
+                Op::Get(k) => {
+                    prop_assert_eq!(tree.get(k).unwrap(), reference.get(&k).copied());
+                }
+                Op::Range(lo, hi) => {
+                    let got: Vec<(u64, L2pValue)> = tree
+                        .range(lo..hi)
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    let want: Vec<(u64, L2pValue)> =
+                        reference.range(lo..hi).map(|(k, v)| (*k, *v)).collect();
+                    prop_assert_eq!(got, want);
+                }
+            }
+        }
+
+        // Final reopen + compare.
+        tree.flush().unwrap();
+        let root = tree.root();
+        let ng = tree.next_generation();
+        drop(tree);
+        drop(ps);
+        ps = Arc::new(PageStore::open(&path).unwrap());
+        tree = BTree::open(Arc::clone(&ps), root, ng).unwrap();
+        let items: Vec<(u64, L2pValue)> = tree
+            .range(..)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let ref_items: Vec<(u64, L2pValue)> =
+            reference.iter().map(|(k, v)| (*k, *v)).collect();
+        prop_assert_eq!(items, ref_items);
+        let _ = ps; // silence "unused assignment" warning on the final bind
+    }
+}
+
 // --- deterministic stress test that lives outside proptest so it runs
 // --- unconditionally on every CI invocation.
 
