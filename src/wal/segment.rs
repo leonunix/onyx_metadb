@@ -132,6 +132,15 @@ impl SegmentFile {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Truncate the segment file at `path` to `len` bytes. Used by
+    /// recovery to discard a torn tail before the next writer resumes.
+    pub fn truncate_to(path: &Path, len: u64) -> Result<()> {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(len)?;
+        file.sync_all()?;
+        Ok(())
+    }
 }
 
 /// Read a whole segment file into memory. For small-to-medium segments

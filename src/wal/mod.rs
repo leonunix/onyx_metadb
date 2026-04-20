@@ -13,10 +13,15 @@
 //! phase and will live alongside these layers rather than being
 //! embedded inside any of them.
 
+pub mod op;
 pub mod record;
 pub mod segment;
 pub mod writer;
 
+pub use op::{
+    TAG_DECREF, TAG_DEDUP_DELETE, TAG_DEDUP_PUT, TAG_INCREF, TAG_L2P_DELETE, TAG_L2P_PUT, WalOp,
+    decode_body, encode_body,
+};
 pub use record::{
     DecodeError, WAL_HEADER_SIZE, WAL_MAX_BODY, WalRecordIter, WalRecordRef, decode, encode,
 };

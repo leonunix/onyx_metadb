@@ -8,13 +8,13 @@
 //! Modules landed in phase 5:
 //! - [`format`]: fixed 64-byte record codec and associated sizes.
 //! - [`memtable`]: sorted in-memory buffer of pending ops with a
-//!    freeze/release handoff protocol for the flusher.
+//!   freeze/release handoff protocol for the flusher.
 //! - [`bloom`]: double-hashing bloom filter sized per-SST.
 //! - [`sst`]: on-disk run format, writer, reader, and scan iterator.
 //! - [`persist`]: chained `LsmLevels` pages for serialising the level
-//!    → SST-handle table into the manifest.
+//!   → SST-handle table into the manifest.
 //! - [`lsm`]: memtable + multi-level facade with point `get`, memtable
-//!    flush to L0, and reader-drain coordination.
+//!   flush to L0, and reader-drain coordination.
 //! - [`compact`]: L0 → L1 and leveled Ln → Ln+1 merges.
 //!
 //! # Phase-5 items deferred into phase 6

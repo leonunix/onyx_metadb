@@ -11,12 +11,15 @@
 //! B+tree and LSM state. The invariants checked here — monotonic LSN,
 //! torn tail only at the final segment — will remain.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{MetaDbError, Result};
+use crate::tx::ApplyOutcome;
 use crate::types::Lsn;
+use crate::wal::WalOp;
+use crate::wal::op::decode_body;
 use crate::wal::record::{DecodeError, WalRecordIter};
-use crate::wal::segment::{list_segments, read_segment};
+use crate::wal::segment::{SegmentFile, list_segments, read_segment};
 
 /// Result of a successful replay. On IO or structural error we return
 /// [`MetaDbError`] instead.
@@ -36,6 +39,8 @@ pub struct ReplayOutcome {
     /// Byte offset within the final segment at which the last cleanly-
     /// decoded record ended. Suggested truncation point.
     pub tail_offset_bytes: u64,
+    /// Path of the final segment (used by [`truncate_torn_tail`]).
+    pub final_segment: Option<PathBuf>,
 }
 
 /// Walk every WAL segment in `dir` in LSN order, decoding records. Any
@@ -44,6 +49,29 @@ pub struct ReplayOutcome {
 /// [`ReplayOutcome::torn_tail`]; a torn record in a *non-final* segment
 /// or any non-monotonic LSN is a hard corruption error.
 pub fn replay(dir: &Path, from_lsn: Lsn) -> Result<ReplayOutcome> {
+    replay_impl(dir, from_lsn, |_| Ok(()))
+}
+
+/// Replay WAL records forward and invoke `apply_op` for each decoded
+/// op. Stops at the same points [`replay`] does (torn final tail, mid-
+/// log corruption). Used at `Db::open` to replay all committed ops onto
+/// in-memory state before resuming writes.
+pub fn replay_into<F>(dir: &Path, from_lsn: Lsn, mut apply_op: F) -> Result<ReplayOutcome>
+where
+    F: FnMut(&WalOp) -> Result<ApplyOutcome>,
+{
+    replay_impl(dir, from_lsn, |body| {
+        for op in decode_body(body)? {
+            apply_op(&op)?;
+        }
+        Ok(())
+    })
+}
+
+fn replay_impl<F>(dir: &Path, from_lsn: Lsn, mut per_record: F) -> Result<ReplayOutcome>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
     let segments = list_segments(dir)?;
     let segment_count = segments.len();
 
@@ -53,9 +81,11 @@ pub fn replay(dir: &Path, from_lsn: Lsn) -> Result<ReplayOutcome> {
         record_count: 0,
         torn_tail: None,
         tail_offset_bytes: 0,
+        final_segment: None,
     };
 
     for (idx, (_, path)) in segments.into_iter().enumerate() {
+        let is_final_segment = idx + 1 == segment_count;
         let buf = read_segment(&path)?;
         let mut iter = WalRecordIter::new(&buf);
         for rec in iter.by_ref() {
@@ -70,15 +100,18 @@ pub fn replay(dir: &Path, from_lsn: Lsn) -> Result<ReplayOutcome> {
                     )));
                 }
             }
+            per_record(rec.body)?;
             if outcome.first_lsn.is_none() {
                 outcome.first_lsn = Some(rec.lsn);
             }
             outcome.last_lsn = Some(rec.lsn);
             outcome.record_count += 1;
         }
-        outcome.tail_offset_bytes = iter.consumed() as u64;
+        if is_final_segment {
+            outcome.tail_offset_bytes = iter.consumed() as u64;
+            outcome.final_segment = Some(path.clone());
+        }
         if let Some(err) = iter.stopped() {
-            let is_final_segment = idx + 1 == segment_count;
             if is_final_segment {
                 outcome.torn_tail = Some(err);
             } else {
@@ -92,6 +125,25 @@ pub fn replay(dir: &Path, from_lsn: Lsn) -> Result<ReplayOutcome> {
     }
 
     Ok(outcome)
+}
+
+/// If the replay outcome reports a torn tail in the final segment,
+/// truncate that segment to the offset of the last cleanly-decoded
+/// record. No-op otherwise.
+///
+/// Must be called BEFORE constructing a new `Wal` on the same
+/// directory: the writer appends at the file's current length, so a
+/// torn tail left in place would leave unreachable garbage ahead of
+/// every new record.
+pub fn truncate_torn_tail(_dir: &Path, outcome: &ReplayOutcome) -> Result<()> {
+    if outcome.torn_tail.is_none() {
+        return Ok(());
+    }
+    let Some(path) = outcome.final_segment.as_ref() else {
+        return Ok(());
+    };
+    SegmentFile::truncate_to(path, outcome.tail_offset_bytes)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -266,5 +318,86 @@ mod tests {
         assert_eq!(out.record_count, 30);
         assert_eq!(out.first_lsn, Some(1));
         assert_eq!(out.last_lsn, Some(30));
+    }
+
+    #[test]
+    fn replay_into_invokes_callback_for_each_decoded_op() {
+        use crate::btree::L2pValue;
+        use crate::wal::{WalOp, encode_body};
+
+        let dir = TempDir::new().unwrap();
+        {
+            let wal = Wal::create(dir.path(), &cfg(), 1, FaultController::new()).unwrap();
+            // Record 1: two ops.
+            let body1 = encode_body(&[
+                WalOp::L2pPut {
+                    lba: 1,
+                    value: L2pValue([1; 28]),
+                },
+                WalOp::L2pPut {
+                    lba: 2,
+                    value: L2pValue([2; 28]),
+                },
+            ]);
+            wal.submit(body1).unwrap();
+            // Record 2: one op.
+            let body2 = encode_body(&[WalOp::L2pDelete { lba: 1 }]);
+            wal.submit(body2).unwrap();
+            wal.shutdown().unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let out = replay_into(dir.path(), 1, |op| {
+            seen.push(op.clone());
+            Ok(ApplyOutcome::Dedup) // callback return is ignored
+        })
+        .unwrap();
+        assert_eq!(out.record_count, 2);
+        assert_eq!(out.last_lsn, Some(2));
+        assert_eq!(seen.len(), 3);
+        assert!(matches!(seen[0], WalOp::L2pPut { lba: 1, .. }));
+        assert!(matches!(seen[1], WalOp::L2pPut { lba: 2, .. }));
+        assert!(matches!(seen[2], WalOp::L2pDelete { lba: 1 }));
+    }
+
+    #[test]
+    fn replay_into_stops_and_truncates_torn_tail() {
+        use crate::btree::L2pValue;
+        use crate::wal::{WalOp, encode_body};
+        use std::os::unix::fs::FileExt;
+
+        let dir = TempDir::new().unwrap();
+        {
+            let wal = Wal::create(dir.path(), &cfg(), 1, FaultController::new()).unwrap();
+            for i in 0..5u64 {
+                wal.submit(encode_body(&[WalOp::L2pPut {
+                    lba: i,
+                    value: L2pValue([i as u8; 28]),
+                }]))
+                .unwrap();
+            }
+            wal.shutdown().unwrap();
+        }
+        // Append garbage to the tail so the next record is torn.
+        let segs = list_segments(dir.path()).unwrap();
+        let (_, path) = &segs[0];
+        let at = std::fs::metadata(path).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.write_all_at(&[0xDE, 0xAD, 0xBE, 0xEF], at).unwrap();
+        f.sync_all().unwrap();
+
+        let mut applied = 0usize;
+        let out = replay_into(dir.path(), 1, |_op| {
+            applied += 1;
+            Ok(ApplyOutcome::Dedup)
+        })
+        .unwrap();
+        assert_eq!(applied, 5);
+        assert!(out.torn_tail.is_some());
+        truncate_torn_tail(dir.path(), &out).unwrap();
+        // After truncation, re-running replay finds no torn tail.
+        let out2 = replay_into(dir.path(), 1, |_op| Ok(ApplyOutcome::Dedup)).unwrap();
+        assert_eq!(out2.record_count, 5);
+        assert!(out2.torn_tail.is_none());
     }
 }

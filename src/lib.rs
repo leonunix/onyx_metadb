@@ -33,6 +33,7 @@ pub mod page;
 pub mod page_store;
 pub mod recovery;
 pub mod testing;
+pub mod tx;
 pub mod types;
 pub mod wal;
 
@@ -52,6 +53,7 @@ pub use manifest::{
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 pub use page_store::PageStore;
 pub use recovery::{ReplayOutcome, replay};
+pub use tx::{ApplyOutcome, Transaction};
 pub use types::{
     FIRST_DATA_PAGE, Lba, Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, PartitionId,
     Pba, SnapshotId,

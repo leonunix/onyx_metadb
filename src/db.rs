@@ -24,7 +24,9 @@ use crate::manifest::{
 };
 use crate::page_store::PageStore;
 use crate::testing::faults::FaultController;
+use crate::tx::{ApplyOutcome, Transaction};
 use crate::types::{Lsn, PageId, Pba, SnapshotId};
+use crate::wal::{Wal, WalOp, encode_body};
 
 /// Embedded metadata database.
 pub struct Db {
@@ -38,6 +40,17 @@ pub struct Db {
     /// Global dedup index: 32-byte SHA-256 content hash → 28-byte opaque
     /// `DedupValue`.
     dedup_index: Lsm,
+    /// Write-ahead log. All mutations route through here so they survive
+    /// crash between checkpoints.
+    wal: Wal,
+    /// Serialises WAL submit + apply so LSN order trivially equals apply
+    /// order. See [`tx`](crate::tx) for the reasoning.
+    commit_lock: Mutex<()>,
+    /// LSN of the most recent op applied to in-memory state. Initialised
+    /// from `manifest.checkpoint_lsn` on open (the manifest promises that
+    /// every LSN at or below this value is already reflected in the
+    /// trees / SSTs) and bumped on every commit.
+    last_applied_lsn: Mutex<Lsn>,
     /// Snapshot readers hold a shared guard; `drop_snapshot` takes the
     /// exclusive side so it can't free pages still visible to a live view.
     snapshot_views: RwLock<()>,
@@ -108,6 +121,11 @@ fn page_file(root: &Path) -> PathBuf {
     root.join("pages.onyx_meta")
 }
 
+/// Directory that holds the WAL segments.
+fn wal_dir(root: &Path) -> PathBuf {
+    root.join("wal")
+}
+
 fn clone_bound(bound: Bound<&u64>) -> Bound<u64> {
     match bound {
         Bound::Included(v) => Bound::Included(*v),
@@ -160,6 +178,14 @@ impl Db {
         manifest.refcount_shard_roots = refcount_roots;
         manifest.dedup_level_heads = Vec::new().into_boxed_slice();
         manifest_store.commit(&manifest)?;
+
+        let wal = Wal::create(
+            &wal_dir(&cfg.path),
+            &cfg,
+            manifest.checkpoint_lsn + 1,
+            faults.clone(),
+        )?;
+
         Ok(Self {
             page_store,
             manifest_state: Mutex::new(ManifestState {
@@ -169,6 +195,9 @@ impl Db {
             shards: l2p_shards,
             refcount_shards,
             dedup_index,
+            wal,
+            commit_lock: Mutex::new(()),
+            last_applied_lsn: Mutex::new(0),
             snapshot_views: RwLock::new(()),
             faults,
             db_path: cfg.path,
@@ -232,6 +261,21 @@ impl Db {
             &manifest.dedup_level_heads,
         )?;
 
+        // Replay WAL segments forward from checkpoint_lsn+1 onto the
+        // freshly-opened in-memory state. Applies every op exactly the
+        // way a live commit would. The result tells us the LSN of the
+        // last cleanly-decoded record so the new WAL can resume there.
+        let wal_path = wal_dir(&cfg.path);
+        let from_lsn = manifest.checkpoint_lsn + 1;
+        let replay_outcome = crate::recovery::replay_into(&wal_path, from_lsn, |op| {
+            apply_op_bare(&l2p_shards, &refcount_shards, &dedup_index, op)
+        })?;
+        let last_applied = replay_outcome.last_lsn.unwrap_or(manifest.checkpoint_lsn);
+        // If the last segment ended torn, truncate it to the last clean
+        // record before handing the directory to the new Wal.
+        crate::recovery::truncate_torn_tail(&wal_path, &replay_outcome)?;
+        let wal = Wal::create(&wal_path, &cfg, last_applied + 1, faults.clone())?;
+
         Ok(Self {
             page_store,
             manifest_state: Mutex::new(ManifestState {
@@ -241,6 +285,9 @@ impl Db {
             shards: l2p_shards,
             refcount_shards,
             dedup_index,
+            wal,
+            commit_lock: Mutex::new(()),
+            last_applied_lsn: Mutex::new(last_applied),
             snapshot_views: RwLock::new(()),
             faults,
             db_path: cfg.path,
@@ -269,30 +316,76 @@ impl Db {
 
     /// Persist dirty shard pages and commit a fresh manifest with the
     /// current per-shard roots + checkpoint LSN.
+    ///
+    /// `checkpoint_lsn` is set to the WAL LSN of the most-recently-
+    /// applied commit, so after `open` replay can correctly begin at
+    /// `checkpoint_lsn + 1`.
     pub fn flush(&self) -> Result<()> {
+        // Serialise with any in-flight commit: reading `last_applied_lsn`
+        // outside of `commit_lock` could race with `commit_ops` between
+        // "apply to trees" and "bump last_applied". Taking the lock
+        // ensures all applied-but-not-yet-bumped LSNs are accounted for.
+        let _commit_guard = self.commit_lock.lock();
         let mut manifest_state = self.manifest_state.lock();
         let mut l2p_guards = self.lock_all_l2p_shards();
         let mut refcount_guards = self.lock_all_refcount_shards();
         self.flush_locked_shards(&mut l2p_guards)?;
         self.flush_locked_shards(&mut refcount_guards)?;
 
-        let checkpoint_lsn = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        let tree_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        let wal_checkpoint = *self.last_applied_lsn.lock();
         let old_dedup_heads: Vec<PageId> = manifest_state.manifest.dedup_level_heads.to_vec();
-        let new_dedup_heads = self.dedup_index.persist_levels(checkpoint_lsn)?;
+        let new_dedup_heads = self.dedup_index.persist_levels(tree_generation)?;
 
         self.refresh_manifest_from_locked(
             &mut manifest_state.manifest,
             &l2p_guards,
             &refcount_guards,
         );
+        // The tree generation is a local monotonic counter; checkpoint
+        // LSN must be the durable WAL LSN, not the tree counter.
+        manifest_state.manifest.checkpoint_lsn = wal_checkpoint;
         manifest_state.manifest.dedup_level_heads = new_dedup_heads.clone().into_boxed_slice();
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
 
         // Commit succeeded; free the old level chains.
         self.dedup_index
-            .free_old_level_heads(&old_dedup_heads, checkpoint_lsn)?;
+            .free_old_level_heads(&old_dedup_heads, tree_generation)?;
         Ok(())
+    }
+
+    // -------- transaction / commit --------------------------------------
+
+    /// Start a new transaction that buffers ops until `commit()`.
+    pub fn begin(&self) -> Transaction<'_> {
+        Transaction::new(self)
+    }
+
+    /// LSN of the most recent successful commit.
+    pub fn last_applied_lsn(&self) -> Lsn {
+        *self.last_applied_lsn.lock()
+    }
+
+    /// Internal: submit a set of ops to the WAL, apply them to indexes,
+    /// and return the assigned LSN plus any per-op outcomes.
+    pub(crate) fn commit_ops(&self, ops: &[WalOp]) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+        if ops.is_empty() {
+            return Ok((self.last_applied_lsn(), Vec::new()));
+        }
+        let body = encode_body(ops);
+        let _guard = self.commit_lock.lock();
+        let lsn = self.wal.submit(body)?;
+        let mut outcomes = Vec::with_capacity(ops.len());
+        for op in ops {
+            outcomes.push(self.apply_op(op)?);
+        }
+        *self.last_applied_lsn.lock() = lsn;
+        Ok((lsn, outcomes))
+    }
+
+    fn apply_op(&self, op: &WalOp) -> Result<ApplyOutcome> {
+        apply_op_bare(&self.shards, &self.refcount_shards, &self.dedup_index, op)
     }
 
     // -------- refcount + dedup ops --------------------------------------
@@ -307,18 +400,13 @@ impl Db {
     /// Increment `pba`'s refcount by `delta`. Returns the new value.
     /// `delta == 0` is a no-op that still performs a lookup.
     pub fn incref_pba(&self, pba: Pba, delta: u32) -> Result<u32> {
-        let sid = self.refcount_shard_for(pba);
-        let mut tree = self.refcount_shards[sid].tree.lock();
-        let current = tree.get(pba)?.map(refcount_from_value).unwrap_or(0);
-        let new = current.checked_add(delta).ok_or_else(|| {
-            MetaDbError::InvalidArgument(format!("refcount overflow for pba {pba}"))
-        })?;
-        if new == 0 {
-            // Both current and delta are zero; nothing to persist.
-            return Ok(0);
+        let mut tx = self.begin();
+        tx.incref_pba(pba, delta);
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        match outcomes.into_iter().next().unwrap() {
+            ApplyOutcome::RefcountNew(v) => Ok(v),
+            _ => unreachable!("incref produces RefcountNew"),
         }
-        tree.insert(pba, refcount_to_value(new))?;
-        Ok(new)
     }
 
     /// Decrement `pba`'s refcount by `delta`. Returns the new value.
@@ -326,30 +414,27 @@ impl Db {
     /// zero the row is removed entirely, so the caller is responsible
     /// for cleaning up the corresponding dedup entry.
     pub fn decref_pba(&self, pba: Pba, delta: u32) -> Result<u32> {
-        let sid = self.refcount_shard_for(pba);
-        let mut tree = self.refcount_shards[sid].tree.lock();
-        let current = tree.get(pba)?.map(refcount_from_value).unwrap_or(0);
-        let new = current.checked_sub(delta).ok_or_else(|| {
-            MetaDbError::InvalidArgument(format!(
-                "decref underflow for pba {pba}: {current} - {delta}",
-            ))
-        })?;
-        if new == 0 {
-            tree.delete(pba)?;
-        } else {
-            tree.insert(pba, refcount_to_value(new))?;
+        let mut tx = self.begin();
+        tx.decref_pba(pba, delta);
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        match outcomes.into_iter().next().unwrap() {
+            ApplyOutcome::RefcountNew(v) => Ok(v),
+            _ => unreachable!("decref produces RefcountNew"),
         }
-        Ok(new)
     }
 
-    /// Record a `hash → value` entry in the dedup index.
-    pub fn put_dedup(&self, hash: Hash32, value: DedupValue) {
-        self.dedup_index.put(hash, value);
+    /// Record a `hash → value` entry in the dedup index (WAL-logged).
+    pub fn put_dedup(&self, hash: Hash32, value: DedupValue) -> Result<Lsn> {
+        let mut tx = self.begin();
+        tx.put_dedup(hash, value);
+        tx.commit()
     }
 
-    /// Tombstone `hash` in the dedup index.
-    pub fn delete_dedup(&self, hash: Hash32) {
-        self.dedup_index.delete(hash);
+    /// Tombstone `hash` in the dedup index (WAL-logged).
+    pub fn delete_dedup(&self, hash: Hash32) -> Result<Lsn> {
+        let mut tx = self.begin();
+        tx.delete_dedup(hash);
+        tx.commit()
     }
 
     /// Point-lookup `hash` in the dedup index.
@@ -385,15 +470,23 @@ impl Db {
     }
 
     pub fn insert(&self, key: u64, value: L2pValue) -> Result<Option<L2pValue>> {
-        let sid = self.shard_for(key);
-        let mut tree = self.shards[sid].tree.lock();
-        tree.insert(key, value)
+        let mut tx = self.begin();
+        tx.insert(key, value);
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        match outcomes.into_iter().next().unwrap() {
+            ApplyOutcome::L2pPrev(prev) => Ok(prev),
+            _ => unreachable!("insert produces L2pPrev"),
+        }
     }
 
     pub fn delete(&self, key: u64) -> Result<Option<L2pValue>> {
-        let sid = self.shard_for(key);
-        let mut tree = self.shards[sid].tree.lock();
-        tree.delete(key)
+        let mut tx = self.begin();
+        tx.delete(key);
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        match outcomes.into_iter().next().unwrap() {
+            ApplyOutcome::L2pPrev(prev) => Ok(prev),
+            _ => unreachable!("delete produces L2pPrev"),
+        }
     }
 
     pub fn range<R: RangeBounds<u64>>(&self, range: R) -> Result<DbRangeIter> {
@@ -413,6 +506,9 @@ impl Db {
     /// Returns the new snapshot id. Persisted immediately via a
     /// manifest commit.
     pub fn take_snapshot(&self) -> Result<SnapshotId> {
+        // Serialise with in-flight commits so `last_applied_lsn` is
+        // stable while we sample tree roots and write the manifest.
+        let _commit_guard = self.commit_lock.lock();
         let mut manifest_state = self.manifest_state.lock();
         let mut l2p_guards = self.lock_all_l2p_shards();
         let mut refcount_guards = self.lock_all_refcount_shards();
@@ -440,6 +536,7 @@ impl Db {
             &l2p_guards,
             &refcount_guards,
         );
+        manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
         manifest_state.manifest.snapshots.push(SnapshotEntry {
             id,
             l2p_roots_page,
@@ -521,6 +618,7 @@ impl Db {
     /// prefers leaks over exposing a dropped snapshot that points at freed
     /// pages.
     pub fn drop_snapshot(&self, id: SnapshotId) -> Result<Option<DropReport>> {
+        let _commit_guard = self.commit_lock.lock();
         let _drop_guard = self.snapshot_views.write();
         let mut manifest_state = self.manifest_state.lock();
         let Some(pos) = manifest_state
@@ -544,6 +642,7 @@ impl Db {
             &l2p_guards,
             &refcount_guards,
         );
+        manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
 
@@ -572,6 +671,7 @@ impl Db {
             &l2p_guards,
             &refcount_guards,
         );
+        manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
 
         let generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
         self.page_store.free(entry.l2p_roots_page, generation)?;
@@ -616,6 +716,12 @@ impl Db {
         Ok(())
     }
 
+    /// Refresh manifest fields that mirror in-memory state.
+    ///
+    /// Does NOT touch `checkpoint_lsn` — that is the durable-WAL LSN
+    /// cursor and is only ever advanced by code paths that have taken
+    /// `commit_lock` and therefore have an authoritative reading of
+    /// `last_applied_lsn`.
     fn refresh_manifest_from_locked(
         &self,
         manifest: &mut Manifest,
@@ -633,7 +739,6 @@ impl Db {
             .map(|tree| tree.root())
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        manifest.checkpoint_lsn = max_generation_from_two_groups(l2p_guards, refcount_guards);
     }
 
     fn current_generation(&self) -> Lsn {
@@ -783,6 +888,73 @@ fn refcount_to_value(count: u32) -> L2pValue {
     let mut bytes = [0u8; 28];
     bytes[..4].copy_from_slice(&count.to_be_bytes());
     L2pValue(bytes)
+}
+
+/// Apply one [`WalOp`] to raw `Db` state. Used by both the live commit
+/// path (through `self.apply_op`) and the WAL-replay path (before
+/// `Self` exists). Takes individual references so it can run against
+/// locally-constructed state during `open`. Private to this module
+/// because `Shard` is.
+fn apply_op_bare(
+    l2p_shards: &[Shard],
+    refcount_shards: &[Shard],
+    dedup_index: &Lsm,
+    op: &WalOp,
+) -> Result<ApplyOutcome> {
+    match *op {
+        WalOp::L2pPut { lba, value } => {
+            let sid = shard_for_key(l2p_shards, lba);
+            let mut tree = l2p_shards[sid].tree.lock();
+            let prev = tree.insert(lba, value)?;
+            Ok(ApplyOutcome::L2pPrev(prev))
+        }
+        WalOp::L2pDelete { lba } => {
+            let sid = shard_for_key(l2p_shards, lba);
+            let mut tree = l2p_shards[sid].tree.lock();
+            let prev = tree.delete(lba)?;
+            Ok(ApplyOutcome::L2pPrev(prev))
+        }
+        WalOp::DedupPut { hash, value } => {
+            dedup_index.put(hash, value);
+            Ok(ApplyOutcome::Dedup)
+        }
+        WalOp::DedupDelete { hash } => {
+            dedup_index.delete(hash);
+            Ok(ApplyOutcome::Dedup)
+        }
+        WalOp::Incref { pba, delta } => {
+            let sid = shard_for_key(refcount_shards, pba);
+            let mut tree = refcount_shards[sid].tree.lock();
+            let current = tree.get(pba)?.map(refcount_from_value).unwrap_or(0);
+            let new = current.checked_add(delta).ok_or_else(|| {
+                MetaDbError::InvalidArgument(format!("refcount overflow for pba {pba}"))
+            })?;
+            if new != 0 {
+                tree.insert(pba, refcount_to_value(new))?;
+            }
+            Ok(ApplyOutcome::RefcountNew(new))
+        }
+        WalOp::Decref { pba, delta } => {
+            let sid = shard_for_key(refcount_shards, pba);
+            let mut tree = refcount_shards[sid].tree.lock();
+            let current = tree.get(pba)?.map(refcount_from_value).unwrap_or(0);
+            let new = current.checked_sub(delta).ok_or_else(|| {
+                MetaDbError::InvalidArgument(format!(
+                    "decref underflow for pba {pba}: {current} - {delta}",
+                ))
+            })?;
+            if new == 0 {
+                tree.delete(pba)?;
+            } else {
+                tree.insert(pba, refcount_to_value(new))?;
+            }
+            Ok(ApplyOutcome::RefcountNew(new))
+        }
+    }
+}
+
+fn shard_for_key(shards: &[Shard], key: u64) -> usize {
+    (xxh3_64(&key.to_be_bytes()) as usize) % shards.len()
 }
 
 #[cfg(test)]
@@ -1127,8 +1299,8 @@ mod tests {
     #[test]
     fn dedup_put_get_roundtrip_via_memtable() {
         let (_d, db) = mk_db();
-        db.put_dedup(h(1), dv(10));
-        db.put_dedup(h(2), dv(20));
+        db.put_dedup(h(1), dv(10)).unwrap();
+        db.put_dedup(h(2), dv(20)).unwrap();
         assert_eq!(db.get_dedup(&h(1)).unwrap(), Some(dv(10)));
         assert_eq!(db.get_dedup(&h(2)).unwrap(), Some(dv(20)));
         assert_eq!(db.get_dedup(&h(3)).unwrap(), None);
@@ -1137,8 +1309,8 @@ mod tests {
     #[test]
     fn dedup_delete_tombstones_key() {
         let (_d, db) = mk_db();
-        db.put_dedup(h(1), dv(10));
-        db.delete_dedup(h(1));
+        db.put_dedup(h(1), dv(10)).unwrap();
+        db.delete_dedup(h(1)).unwrap();
         assert_eq!(db.get_dedup(&h(1)).unwrap(), None);
     }
 
@@ -1146,7 +1318,7 @@ mod tests {
     fn dedup_flush_to_l0_then_read() {
         let (_d, db) = mk_db();
         for i in 0u64..50 {
-            db.put_dedup(h(i), dv(i as u8));
+            db.put_dedup(h(i), dv(i as u8)).unwrap();
         }
         assert!(db.flush_dedup_memtable().unwrap());
         for i in 0u64..50 {
@@ -1160,12 +1332,12 @@ mod tests {
         {
             let db = Db::create(dir.path()).unwrap();
             for i in 0u64..100 {
-                db.put_dedup(h(i), dv(i as u8));
+                db.put_dedup(h(i), dv(i as u8)).unwrap();
             }
             // Force a couple of L0 SSTs so persistence is exercised.
             assert!(db.flush_dedup_memtable().unwrap());
             for i in 100u64..200 {
-                db.put_dedup(h(i), dv((i % 255) as u8));
+                db.put_dedup(h(i), dv((i % 255) as u8)).unwrap();
             }
             assert!(db.flush_dedup_memtable().unwrap());
             db.flush().unwrap();
@@ -1229,7 +1401,7 @@ mod tests {
         let (_d, db) = mk_db();
         for batch in 0..4u64 {
             for i in 0u64..10 {
-                db.put_dedup(h(batch * 100 + i), dv(batch as u8));
+                db.put_dedup(h(batch * 100 + i), dv(batch as u8)).unwrap();
             }
             db.flush_dedup_memtable().unwrap();
         }
@@ -1244,5 +1416,139 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -------- phase 6: WAL durability --------
+
+    #[test]
+    fn writes_without_flush_survive_reopen_via_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            for i in 0u64..50 {
+                db.insert(i, v(i as u8)).unwrap();
+            }
+            // NO flush() before drop — only WAL is durable.
+        }
+        let db = Db::open(dir.path()).unwrap();
+        for i in 0u64..50 {
+            assert_eq!(db.get(i).unwrap(), Some(v(i as u8)));
+        }
+    }
+
+    #[test]
+    fn refcount_writes_survive_reopen_without_flush() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            for pba in 0u64..100 {
+                db.incref_pba(pba, (pba as u32 % 3) + 1).unwrap();
+            }
+        }
+        let db = Db::open(dir.path()).unwrap();
+        for pba in 0u64..100 {
+            assert_eq!(db.get_refcount(pba).unwrap(), (pba as u32 % 3) + 1);
+        }
+    }
+
+    #[test]
+    fn dedup_writes_survive_reopen_without_flush() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            for i in 0u64..30 {
+                db.put_dedup(h(i), dv(i as u8)).unwrap();
+            }
+        }
+        let db = Db::open(dir.path()).unwrap();
+        for i in 0u64..30 {
+            assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dv(i as u8)));
+        }
+    }
+
+    #[test]
+    fn multi_op_tx_commits_atomically_and_all_ops_visible() {
+        let (_d, db) = mk_db();
+        let mut tx = db.begin();
+        tx.insert(1, v(1));
+        tx.insert(2, v(2));
+        tx.incref_pba(10, 3);
+        tx.put_dedup(h(1), dv(9));
+        let lsn = tx.commit().unwrap();
+        assert!(lsn >= 1);
+        assert_eq!(db.get(1).unwrap(), Some(v(1)));
+        assert_eq!(db.get(2).unwrap(), Some(v(2)));
+        assert_eq!(db.get_refcount(10).unwrap(), 3);
+        assert_eq!(db.get_dedup(&h(1)).unwrap(), Some(dv(9)));
+    }
+
+    #[test]
+    fn multi_op_tx_survives_reopen_all_or_nothing() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            let mut tx = db.begin();
+            tx.insert(1, v(1));
+            tx.insert(2, v(2));
+            tx.incref_pba(10, 3);
+            tx.put_dedup(h(1), dv(9));
+            tx.commit().unwrap();
+        }
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.get(1).unwrap(), Some(v(1)));
+        assert_eq!(db.get(2).unwrap(), Some(v(2)));
+        assert_eq!(db.get_refcount(10).unwrap(), 3);
+        assert_eq!(db.get_dedup(&h(1)).unwrap(), Some(dv(9)));
+    }
+
+    #[test]
+    fn last_applied_lsn_advances_per_commit() {
+        let (_d, db) = mk_db();
+        let before = db.last_applied_lsn();
+        db.insert(1, v(1)).unwrap();
+        let after_one = db.last_applied_lsn();
+        assert!(after_one > before);
+        db.incref_pba(100, 1).unwrap();
+        let after_two = db.last_applied_lsn();
+        assert!(after_two > after_one);
+    }
+
+    #[test]
+    fn checkpoint_advances_on_flush() {
+        let dir = TempDir::new().unwrap();
+        let db = Db::create(dir.path()).unwrap();
+        for i in 0u64..10 {
+            db.insert(i, v(i as u8)).unwrap();
+        }
+        let applied = db.last_applied_lsn();
+        assert_eq!(db.manifest().checkpoint_lsn, 0);
+        db.flush().unwrap();
+        assert_eq!(db.manifest().checkpoint_lsn, applied);
+    }
+
+    #[test]
+    fn empty_tx_commit_is_noop() {
+        let (_d, db) = mk_db();
+        let tx = db.begin();
+        let lsn = tx.commit().unwrap();
+        assert_eq!(lsn, db.last_applied_lsn());
+        assert_eq!(db.last_applied_lsn(), 0);
+    }
+
+    #[test]
+    fn reopen_replay_advances_last_applied() {
+        let dir = TempDir::new().unwrap();
+        let committed_lsn = {
+            let db = Db::create(dir.path()).unwrap();
+            for i in 0u64..5 {
+                db.insert(i, v(i as u8)).unwrap();
+            }
+            db.last_applied_lsn()
+        };
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.last_applied_lsn(), committed_lsn);
+        // New commits after reopen start at committed_lsn + 1.
+        db.insert(100, v(0)).unwrap();
+        assert_eq!(db.last_applied_lsn(), committed_lsn + 1);
     }
 }
