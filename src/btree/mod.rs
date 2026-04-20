@@ -16,7 +16,7 @@ pub mod format;
 pub mod invariants;
 pub mod tree;
 
-pub use cache::PageBuf;
+pub use cache::{DecrefOutcome, PageBuf};
 pub use format::{
     L2P_KEY_SIZE, L2P_VALUE_SIZE, L2pValue, LEAF_ENTRY_SIZE, MAX_INTERNAL_CHILDREN,
     MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, init_internal, init_leaf, internal_child_at,
