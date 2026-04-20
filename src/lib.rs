@@ -27,7 +27,9 @@ pub mod config;
 pub mod error;
 pub mod page;
 pub mod page_store;
+pub mod testing;
 pub mod types;
+pub mod wal;
 
 pub use config::{Config, PAGE_SIZE};
 pub use error::{MetaDbError, Result};
