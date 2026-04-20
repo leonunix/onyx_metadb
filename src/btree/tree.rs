@@ -834,6 +834,75 @@ impl BTree {
         let g = self.new_gen();
         self.buf.decref(pid, g)
     }
+
+    /// Walk the subtree rooted at `snap_root`, decref'ing each page
+    /// as we visit it. For each leaf that reaches refcount zero
+    /// (uniquely owned by this snapshot), every value in the leaf is
+    /// collected and returned. For each internal page that reaches
+    /// zero, its children are enqueued for the same treatment. Pages
+    /// whose refcount stays above zero (still reachable from the
+    /// current tree or another snapshot) are left alone, and their
+    /// subtrees are *not* walked — those pages still hold their own
+    /// values on behalf of other readers.
+    pub fn drop_subtree(&mut self, snap_root: PageId) -> Result<Vec<L2pValue>> {
+        let generation = self.new_gen();
+        let mut collected: Vec<L2pValue> = Vec::new();
+        let mut worklist: Vec<PageId> = vec![snap_root];
+        while let Some(pid) = worklist.pop() {
+            let (new_rc, page_type, children, values) = {
+                let page = self.buf.modify(pid, generation)?;
+                let rc = page.refcount();
+                if rc == 0 {
+                    return Err(MetaDbError::Corruption(format!(
+                        "drop_subtree: page {pid} already at refcount 0",
+                    )));
+                }
+                let new_rc = rc - 1;
+                page.set_refcount(new_rc);
+                let page_type = page.header()?.page_type;
+                if new_rc == 0 {
+                    match page_type {
+                        PageType::L2pLeaf => {
+                            let n = leaf_key_count(page);
+                            let vs: Vec<L2pValue> =
+                                (0..n).map(|i| leaf_value_at(page, i)).collect();
+                            (new_rc, page_type, Vec::new(), vs)
+                        }
+                        PageType::L2pInternal => {
+                            let n = internal_key_count(page);
+                            let cs: Vec<PageId> =
+                                (0..=n).map(|i| internal_child_at(page, i)).collect();
+                            (new_rc, page_type, cs, Vec::new())
+                        }
+                        other => {
+                            return Err(MetaDbError::Corruption(format!(
+                                "drop_subtree: unexpected page type {other:?} at {pid}",
+                            )));
+                        }
+                    }
+                } else {
+                    (new_rc, page_type, Vec::new(), Vec::new())
+                }
+            };
+            if new_rc == 0 {
+                // Safety net against logic errors: if somehow the
+                // page type decoded wrong, surface that rather than
+                // silently freeing a non-btree page.
+                match page_type {
+                    PageType::L2pLeaf | PageType::L2pInternal => {}
+                    _ => {
+                        return Err(MetaDbError::Corruption(format!(
+                            "drop_subtree: refusing to free {pid} with type {page_type:?}",
+                        )));
+                    }
+                }
+                collected.extend(values);
+                worklist.extend(children);
+                self.buf.free(pid, generation)?;
+            }
+        }
+        Ok(collected)
+    }
 }
 
 enum GetProbe {

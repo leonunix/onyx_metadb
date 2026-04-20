@@ -177,6 +177,48 @@ impl Db {
             entry,
         })
     }
+
+    /// Drop a snapshot. Walks pages uniquely owned by the snapshot,
+    /// freeing them; pages still reachable from the current tree or
+    /// another snapshot are left alone. Returns a [`DropReport`] with
+    /// the values from freed leaves so the caller (e.g. Onyx) can
+    /// decrement its own PBA refcounts on the data those values
+    /// pointed at.
+    pub fn drop_snapshot(&mut self, id: SnapshotId) -> Result<Option<DropReport>> {
+        let Some(entry) = self.manifest.find_snapshot(id).copied() else {
+            return Ok(None);
+        };
+        let free_before = self.page_store.free_list_len();
+        let values = self.tree.drop_subtree(entry.root)?;
+        let pages_freed = self.page_store.free_list_len().saturating_sub(free_before);
+
+        self.manifest.snapshots.retain(|e| e.id != id);
+        self.flush()?;
+
+        Ok(Some(DropReport {
+            snapshot_id: id,
+            freed_leaf_values: values,
+            pages_freed,
+        }))
+    }
+}
+
+/// Result of [`Db::drop_snapshot`]. The embedder uses this to
+/// propagate page-level reclamation into its own higher-level
+/// storage accounting (for Onyx: the PBA refcount table and
+/// data-plane allocator).
+#[derive(Clone, Debug)]
+pub struct DropReport {
+    /// Id of the snapshot that was dropped.
+    pub snapshot_id: SnapshotId,
+    /// Every value stored in leaves that were uniquely owned by this
+    /// snapshot (and therefore freed). These values have lost their
+    /// reference from the metadb layer; the embedder decides what to
+    /// do with the PBAs they encode.
+    pub freed_leaf_values: Vec<L2pValue>,
+    /// Number of metadb pages (both leaves and internals) released
+    /// back to the page store's free list by this drop.
+    pub pages_freed: usize,
 }
 
 /// Read-only view of the tree as it existed when a snapshot was
@@ -357,6 +399,130 @@ mod tests {
     fn snapshot_view_missing_id_returns_none() {
         let (_d, mut db) = mk_db();
         assert!(db.snapshot_view(999).is_none());
+    }
+
+    // -------- drop_snapshot --------
+
+    #[test]
+    fn drop_snapshot_returns_none_for_unknown_id() {
+        let (_d, mut db) = mk_db();
+        assert!(db.drop_snapshot(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn drop_snapshot_on_untouched_snapshot_reclaims_no_pages() {
+        // A snapshot taken on an empty tree and dropped immediately
+        // (before any writes) shares its only page with the current
+        // tree, so dropping shouldn't free anything.
+        let (_d, mut db) = mk_db();
+        let s = db.take_snapshot().unwrap();
+        let report = db.drop_snapshot(s).unwrap().unwrap();
+        assert_eq!(report.snapshot_id, s);
+        // No unique pages.
+        assert_eq!(report.pages_freed, 0);
+        assert!(report.freed_leaf_values.is_empty());
+        assert!(db.snapshots().is_empty());
+    }
+
+    #[test]
+    fn drop_snapshot_reclaims_uniquely_owned_pages() {
+        // 1000 keys, take snapshot, overwrite every key so every leaf
+        // gets CoW'd. Drop snapshot; every old leaf becomes unique
+        // and must be freed.
+        let (_d, mut db) = mk_db();
+        for i in 0u64..1000 {
+            db.insert(i, v(1)).unwrap();
+        }
+        db.flush().unwrap();
+        let free_before_snap = db.high_water();
+        let s = db.take_snapshot().unwrap();
+
+        for i in 0u64..1000 {
+            db.insert(i, v(2)).unwrap();
+        }
+        db.flush().unwrap();
+        let hw_after_writes = db.high_water();
+        // Writes must have allocated new pages (CoW).
+        assert!(hw_after_writes > free_before_snap);
+
+        let report = db.drop_snapshot(s).unwrap().unwrap();
+        assert!(
+            report.pages_freed > 0,
+            "expected freed pages, got {}",
+            report.pages_freed,
+        );
+        assert_eq!(report.freed_leaf_values.len(), 1000);
+        assert!(
+            report.freed_leaf_values.iter().all(|val| *val == v(1)),
+            "all freed values should be the pre-snapshot value",
+        );
+
+        // Current tree is still intact.
+        for i in 0u64..1000 {
+            assert_eq!(db.get(i).unwrap(), Some(v(2)));
+        }
+    }
+
+    #[test]
+    fn drop_snapshot_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let s = {
+            let mut db = Db::create(dir.path()).unwrap();
+            for i in 0u64..100 {
+                db.insert(i, v(1)).unwrap();
+            }
+            let s = db.take_snapshot().unwrap();
+            for i in 0u64..100 {
+                db.insert(i, v(2)).unwrap();
+            }
+            db.flush().unwrap();
+            s
+        };
+        {
+            let mut db = Db::open(dir.path()).unwrap();
+            assert_eq!(db.snapshots().len(), 1);
+            let report = db.drop_snapshot(s).unwrap().unwrap();
+            assert!(!report.freed_leaf_values.is_empty());
+            assert!(db.snapshots().is_empty());
+            db.flush().unwrap();
+        }
+        let db = Db::open(dir.path()).unwrap();
+        assert!(db.snapshots().is_empty());
+    }
+
+    #[test]
+    fn drop_one_of_two_snapshots_preserves_the_other() {
+        let (_d, mut db) = mk_db();
+        for i in 0u64..20 {
+            db.insert(i, v(1)).unwrap();
+        }
+        let s1 = db.take_snapshot().unwrap();
+        for i in 0u64..20 {
+            db.insert(i, v(2)).unwrap();
+        }
+        let s2 = db.take_snapshot().unwrap();
+        for i in 0u64..20 {
+            db.insert(i, v(3)).unwrap();
+        }
+
+        // Drop s1. s2 should still see its state.
+        db.drop_snapshot(s1).unwrap().unwrap();
+        {
+            let mut view = db.snapshot_view(s2).unwrap();
+            for i in 0u64..20 {
+                assert_eq!(view.get(i).unwrap(), Some(v(2)));
+            }
+        }
+        // Current tree also still sees its state.
+        for i in 0u64..20 {
+            assert_eq!(db.get(i).unwrap(), Some(v(3)));
+        }
+
+        // Drop s2 too. Current tree untouched.
+        db.drop_snapshot(s2).unwrap().unwrap();
+        for i in 0u64..20 {
+            assert_eq!(db.get(i).unwrap(), Some(v(3)));
+        }
     }
 
     #[test]
