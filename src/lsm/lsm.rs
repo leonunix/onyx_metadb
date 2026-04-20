@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::{MetaDbError, Result};
 use crate::page_store::PageStore;
 use crate::types::{Lsn, PageId};
@@ -78,6 +79,7 @@ pub struct LsmStats {
 #[derive(Debug)]
 pub struct Lsm {
     page_store: Arc<PageStore>,
+    page_cache: Arc<PageCache>,
     memtable: Memtable,
     levels: RwLock<Vec<Vec<SstHandle>>>,
     /// Serialises flush + compaction. Either path mutates `levels`, so
@@ -92,8 +94,19 @@ pub struct Lsm {
 impl Lsm {
     /// Fresh LSM with one empty level (L0) and no SSTs.
     pub fn create(page_store: Arc<PageStore>, config: LsmConfig) -> Self {
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), DEFAULT_PAGE_CACHE_BYTES));
+        Self::create_with_cache(page_store, page_cache, config)
+    }
+
+    /// Fresh LSM using the shared `page_cache`.
+    pub fn create_with_cache(
+        page_store: Arc<PageStore>,
+        page_cache: Arc<PageCache>,
+        config: LsmConfig,
+    ) -> Self {
         Self {
             page_store,
+            page_cache,
             memtable: Memtable::new(config.memtable_bytes),
             levels: RwLock::new(vec![Vec::new()]),
             modify_lock: Mutex::new(()),
@@ -110,6 +123,17 @@ impl Lsm {
         config: LsmConfig,
         level_heads: &[PageId],
     ) -> Result<Self> {
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), DEFAULT_PAGE_CACHE_BYTES));
+        Self::open_with_cache(page_store, page_cache, config, level_heads)
+    }
+
+    /// Open an LSM using the shared `page_cache`.
+    pub fn open_with_cache(
+        page_store: Arc<PageStore>,
+        page_cache: Arc<PageCache>,
+        config: LsmConfig,
+        level_heads: &[PageId],
+    ) -> Result<Self> {
         let mut levels = read_levels(&page_store, level_heads)?;
         // Always guarantee at least L0 exists so `put` / `flush_memtable`
         // can push into `levels[0]` unconditionally.
@@ -118,6 +142,7 @@ impl Lsm {
         }
         Ok(Self {
             page_store,
+            page_cache,
             memtable: Memtable::new(config.memtable_bytes),
             levels: RwLock::new(levels),
             modify_lock: Mutex::new(()),
@@ -239,6 +264,7 @@ impl Lsm {
 
         let outcome = super::compact::execute_plan(
             &self.page_store,
+            &self.page_cache,
             generation,
             self.config.bits_per_entry,
             &plan,
@@ -258,7 +284,7 @@ impl Lsm {
         let victims_count = plan.from_victims.len() + plan.to_victims.len();
         let mut all_victims = plan.from_victims.clone();
         all_victims.extend(plan.to_victims.iter().copied());
-        super::compact::free_victims(&self.page_store, generation, &all_victims)?;
+        super::compact::free_victims(&self.page_store, &self.page_cache, generation, &all_victims)?;
 
         Ok(Some(super::CompactionReport {
             from_level: plan.from_level,
@@ -329,7 +355,7 @@ impl Lsm {
                 if !prefix_might_match_range(&handle.min_hash, &handle.max_hash, prefix) {
                     continue;
                 }
-                let reader = SstReader::open(&self.page_store, handle)?;
+                let reader = SstReader::open(&self.page_store, &self.page_cache, handle)?;
                 for rec_result in reader.scan() {
                     let rec = rec_result?;
                     if !key_has_prefix(rec.hash(), prefix) {
@@ -417,7 +443,7 @@ impl Lsm {
             if hash < &handle.min_hash || hash > &handle.max_hash {
                 continue;
             }
-            let reader = SstReader::open(&self.page_store, *handle)?;
+            let reader = SstReader::open(&self.page_store, &self.page_cache, *handle)?;
             match reader.get(hash)? {
                 LookupResult::Hit(v) => return Ok(LookupResult::Hit(v)),
                 LookupResult::Tombstone => return Ok(LookupResult::Tombstone),
@@ -436,7 +462,7 @@ impl Lsm {
             if hash < &handle.min_hash || hash > &handle.max_hash {
                 continue;
             }
-            let reader = SstReader::open(&self.page_store, *handle)?;
+            let reader = SstReader::open(&self.page_store, &self.page_cache, *handle)?;
             return reader.get(hash);
         }
         Ok(LookupResult::Miss)

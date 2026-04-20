@@ -14,10 +14,11 @@
 //!    scenario that motivates the dedup_reverse LSM.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
-use onyx_metadb::{Db, DedupValue, Hash32, L2pValue, MetaDbError};
+use onyx_metadb::{Config, Db, DedupValue, Hash32, L2pValue, MetaDbError};
 use proptest::prelude::*;
 use tempfile::TempDir;
 
@@ -140,6 +141,70 @@ fn apply_to_db(op: &Op, db: &Db) -> Result<(), MetaDbError> {
     Ok(())
 }
 
+fn tiny_cache_config(path: &Path) -> Config {
+    let mut cfg = Config::new(path);
+    cfg.page_cache_bytes = 1024 * 1024;
+    cfg
+}
+
+fn run_ops_with_config(ops: &[Op], cfg: &Config) -> Result<(), TestCaseError> {
+    let mut current_l2p: L2pRef = BTreeMap::new();
+    let mut current_refcount: RefcountRef = BTreeMap::new();
+    let mut current_dedup: DedupRef = BTreeMap::new();
+
+    let mut db = Db::create_with_config(cfg.clone()).unwrap();
+
+    for op in ops {
+        // Apply to reference; skip the op on both sides if it would
+        // underflow (u32) so we stay in-sync with the Db, which
+        // returns an error in that case.
+        let snapshot_ref = (
+            current_l2p.clone(),
+            current_refcount.clone(),
+            current_dedup.clone(),
+        );
+        if apply_to_reference(
+            op,
+            &mut current_l2p,
+            &mut current_refcount,
+            &mut current_dedup,
+        )
+        .is_err()
+        {
+            current_l2p = snapshot_ref.0;
+            current_refcount = snapshot_ref.1;
+            current_dedup = snapshot_ref.2;
+            continue;
+        }
+
+        match apply_to_db(op, &db) {
+            Ok(()) => {}
+            Err(_) => {
+                // Likely a checked-arithmetic mismatch; resync
+                // by skipping.
+                current_l2p = snapshot_ref.0;
+                current_refcount = snapshot_ref.1;
+                current_dedup = snapshot_ref.2;
+                continue;
+            }
+        }
+
+        if matches!(op, Op::Reopen) {
+            drop(db);
+            db = Db::open_with_config(cfg.clone()).unwrap();
+        }
+
+        assert_db_matches(&db, &current_l2p, &current_refcount, &current_dedup)?;
+        prop_assert!(db.cache_stats().current_bytes <= cfg.page_cache_bytes);
+    }
+
+    drop(db);
+    let db = Db::open_with_config(cfg.clone()).unwrap();
+    assert_db_matches(&db, &current_l2p, &current_refcount, &current_dedup)?;
+    prop_assert!(db.cache_stats().current_bytes <= cfg.page_cache_bytes);
+    Ok(())
+}
+
 fn assert_db_matches(
     db: &Db,
     current_l2p: &L2pRef,
@@ -176,59 +241,15 @@ proptest! {
     #[test]
     fn db_vs_reference_with_reopens(ops in proptest::collection::vec(arb_op(), 30..80)) {
         let dir = TempDir::new().unwrap();
-        let mut current_l2p: L2pRef = BTreeMap::new();
-        let mut current_refcount: RefcountRef = BTreeMap::new();
-        let mut current_dedup: DedupRef = BTreeMap::new();
+        run_ops_with_config(&ops, &Config::new(dir.path()))?;
+    }
 
-        let mut db = Db::create(dir.path()).unwrap();
-
-        for op in &ops {
-            // Apply to reference; skip the op on both sides if it would
-            // underflow (u32) so we stay in-sync with the Db, which
-            // returns an error in that case.
-            let snapshot_ref = (
-                current_l2p.clone(),
-                current_refcount.clone(),
-                current_dedup.clone(),
-            );
-            if apply_to_reference(
-                op,
-                &mut current_l2p,
-                &mut current_refcount,
-                &mut current_dedup,
-            )
-            .is_err()
-            {
-                current_l2p = snapshot_ref.0;
-                current_refcount = snapshot_ref.1;
-                current_dedup = snapshot_ref.2;
-                continue;
-            }
-
-            match apply_to_db(op, &db) {
-                Ok(()) => {}
-                Err(_) => {
-                    // Likely a checked-arithmetic mismatch; resync
-                    // by skipping.
-                    current_l2p = snapshot_ref.0;
-                    current_refcount = snapshot_ref.1;
-                    current_dedup = snapshot_ref.2;
-                    continue;
-                }
-            }
-
-            if matches!(op, Op::Reopen) {
-                drop(db);
-                db = Db::open(dir.path()).unwrap();
-            }
-
-            assert_db_matches(&db, &current_l2p, &current_refcount, &current_dedup)?;
-        }
-
-        // Final: close and reopen once more, check state is preserved.
-        drop(db);
-        let db = Db::open(dir.path()).unwrap();
-        assert_db_matches(&db, &current_l2p, &current_refcount, &current_dedup)?;
+    #[test]
+    fn db_vs_reference_with_reopens_tiny_cache(
+        ops in proptest::collection::vec(arb_op(), 30..80)
+    ) {
+        let dir = TempDir::new().unwrap();
+        run_ops_with_config(&ops, &tiny_cache_config(dir.path()))?;
     }
 }
 

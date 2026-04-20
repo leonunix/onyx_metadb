@@ -20,6 +20,7 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use crate::btree::cache::PageBuf;
+use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::btree::format::{
     L2pValue, LEAF_ENTRY_SIZE, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, internal_child_at,
     internal_insert, internal_key_at, internal_key_count, internal_pop_front, internal_push_front,
@@ -170,7 +171,16 @@ impl BTree {
     /// Create a fresh empty tree on `page_store`. Allocates one empty
     /// leaf, persists it, and records its page id as the root.
     pub fn create(page_store: Arc<PageStore>) -> Result<Self> {
-        let mut buf = PageBuf::new(page_store);
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), DEFAULT_PAGE_CACHE_BYTES));
+        Self::create_with_cache(page_store, page_cache)
+    }
+
+    /// Create a fresh empty tree using the shared `page_cache`.
+    pub fn create_with_cache(
+        page_store: Arc<PageStore>,
+        page_cache: Arc<PageCache>,
+    ) -> Result<Self> {
+        let mut buf = PageBuf::with_cache(page_store, page_cache);
         let root = buf.alloc_leaf(1)?;
         buf.flush()?;
         Ok(Self {
@@ -184,7 +194,19 @@ impl BTree {
     /// caller is responsible for knowing which page the root lives at
     /// (phase 3+ reads it from the manifest's partition table).
     pub fn open(page_store: Arc<PageStore>, root: PageId, next_gen: Lsn) -> Result<Self> {
-        let mut buf = PageBuf::new(page_store);
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), DEFAULT_PAGE_CACHE_BYTES));
+        Self::open_with_cache(page_store, page_cache, root, next_gen)
+    }
+
+    /// Attach to an already-persisted tree rooted at `root` using the
+    /// shared `page_cache`.
+    pub fn open_with_cache(
+        page_store: Arc<PageStore>,
+        page_cache: Arc<PageCache>,
+        root: PageId,
+        next_gen: Lsn,
+    ) -> Result<Self> {
+        let mut buf = PageBuf::with_cache(page_store, page_cache);
         // Sanity: the root must decode as either a leaf or an internal.
         let page = buf.read(root)?;
         match page.header()?.page_type {

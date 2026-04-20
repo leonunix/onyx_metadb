@@ -15,6 +15,7 @@ use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::btree::{BTree, DiffEntry, L2pValue};
+use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
 use crate::error::{MetaDbError, Result};
 use crate::lsm::{DedupValue, Hash32, Lsm, LsmConfig};
@@ -31,6 +32,7 @@ use crate::wal::{Wal, WalOp, encode_body};
 /// Embedded metadata database.
 pub struct Db {
     page_store: Arc<PageStore>,
+    page_cache: Arc<PageCache>,
     manifest_state: Mutex<ManifestState>,
     /// L2P B+tree shards (LBA → `L2pValue`).
     shards: Vec<Shard>,
@@ -174,12 +176,18 @@ impl Db {
         std::fs::create_dir_all(&cfg.path)?;
         let pages_path = page_file(&cfg.path);
         let page_store = Arc::new(PageStore::create(&pages_path)?);
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), cfg.page_cache_bytes));
+        let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
-        let (l2p_shards, l2p_roots) = create_shards(page_store.clone(), shard_count)?;
-        let (refcount_shards, refcount_roots) = create_shards(page_store.clone(), shard_count)?;
-        let dedup_index = Lsm::create(page_store.clone(), LsmConfig::default());
-        let dedup_reverse = Lsm::create(page_store.clone(), LsmConfig::default());
+        let (l2p_shards, l2p_roots) =
+            create_shards(page_store.clone(), page_cache.clone(), shard_count)?;
+        let (refcount_shards, refcount_roots) =
+            create_shards(page_store.clone(), page_cache.clone(), shard_count)?;
+        let dedup_index =
+            Lsm::create_with_cache(page_store.clone(), page_cache.clone(), lsm_config.clone());
+        let dedup_reverse =
+            Lsm::create_with_cache(page_store.clone(), page_cache.clone(), lsm_config);
         manifest.body_version = MANIFEST_BODY_VERSION;
         manifest.shard_roots = l2p_roots;
         manifest.refcount_shard_roots = refcount_roots;
@@ -196,6 +204,7 @@ impl Db {
 
         Ok(Self {
             page_store,
+            page_cache,
             manifest_state: Mutex::new(ManifestState {
                 store: manifest_store,
                 manifest,
@@ -233,6 +242,8 @@ impl Db {
     pub fn open_with_config_and_faults(cfg: Config, faults: Arc<FaultController>) -> Result<Self> {
         let pages_path = page_file(&cfg.path);
         let page_store = Arc::new(PageStore::open(&pages_path)?);
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), cfg.page_cache_bytes));
+        let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
         if manifest.shard_roots.is_empty() {
@@ -247,7 +258,8 @@ impl Db {
         // Materialize them so open returns a fully-populated v4 layout.
         let mut manifest_dirty = false;
         if manifest.refcount_shard_roots.is_empty() {
-            let (_owned, roots) = create_shards(page_store.clone(), manifest.shard_count())?;
+            let (_owned, roots) =
+                create_shards(page_store.clone(), page_cache.clone(), manifest.shard_count())?;
             manifest.refcount_shard_roots = roots;
             manifest_dirty = true;
             // Note: the Shard handles are discarded here; we rebuild
@@ -261,17 +273,28 @@ impl Db {
             manifest_store.commit(&manifest)?;
         }
 
-        let l2p_shards = open_shards(page_store.clone(), &manifest.shard_roots, next_gen)?;
-        let refcount_shards =
-            open_shards(page_store.clone(), &manifest.refcount_shard_roots, next_gen)?;
-        let dedup_index = Lsm::open(
+        let l2p_shards = open_shards(
             page_store.clone(),
-            LsmConfig::default(),
+            page_cache.clone(),
+            &manifest.shard_roots,
+            next_gen,
+        )?;
+        let refcount_shards = open_shards(
+            page_store.clone(),
+            page_cache.clone(),
+            &manifest.refcount_shard_roots,
+            next_gen,
+        )?;
+        let dedup_index = Lsm::open_with_cache(
+            page_store.clone(),
+            page_cache.clone(),
+            lsm_config.clone(),
             &manifest.dedup_level_heads,
         )?;
-        let dedup_reverse = Lsm::open(
+        let dedup_reverse = Lsm::open_with_cache(
             page_store.clone(),
-            LsmConfig::default(),
+            page_cache.clone(),
+            lsm_config,
             &manifest.dedup_reverse_level_heads,
         )?;
 
@@ -298,6 +321,7 @@ impl Db {
 
         Ok(Self {
             page_store,
+            page_cache,
             manifest_state: Mutex::new(ManifestState {
                 store: manifest_store,
                 manifest,
@@ -333,6 +357,11 @@ impl Db {
     /// Number of pages currently allocated in the page store.
     pub fn high_water(&self) -> u64 {
         self.page_store.high_water()
+    }
+
+    /// Snapshot shared page-cache counters.
+    pub fn cache_stats(&self) -> PageCacheStats {
+        self.page_cache.stats()
     }
 
     /// Persist dirty shard pages and commit a fresh manifest with the
@@ -923,12 +952,13 @@ fn validate_shard_count(shards_per_partition: u32) -> Result<usize> {
 
 fn create_shards(
     page_store: Arc<PageStore>,
+    page_cache: Arc<PageCache>,
     shard_count: usize,
 ) -> Result<(Vec<Shard>, Box<[PageId]>)> {
     let mut shards = Vec::with_capacity(shard_count);
     let mut roots = Vec::with_capacity(shard_count);
     for _ in 0..shard_count {
-        let tree = BTree::create(page_store.clone())?;
+        let tree = BTree::create_with_cache(page_store.clone(), page_cache.clone())?;
         roots.push(tree.root());
         shards.push(Shard {
             tree: Mutex::new(tree),
@@ -937,14 +967,35 @@ fn create_shards(
     Ok((shards, roots.into_boxed_slice()))
 }
 
-fn open_shards(page_store: Arc<PageStore>, roots: &[PageId], next_gen: Lsn) -> Result<Vec<Shard>> {
+fn open_shards(
+    page_store: Arc<PageStore>,
+    page_cache: Arc<PageCache>,
+    roots: &[PageId],
+    next_gen: Lsn,
+) -> Result<Vec<Shard>> {
     let mut shards = Vec::with_capacity(roots.len());
     for &root in roots {
         shards.push(Shard {
-            tree: Mutex::new(BTree::open(page_store.clone(), root, next_gen)?),
+            tree: Mutex::new(BTree::open_with_cache(
+                page_store.clone(),
+                page_cache.clone(),
+                root,
+                next_gen,
+            )?),
         });
     }
     Ok(shards)
+}
+
+fn lsm_config_from_cfg(cfg: &Config) -> LsmConfig {
+    let target_sst_records = ((cfg.lsm_memtable_bytes as usize) / crate::lsm::LSM_RECORD_SIZE).max(1);
+    LsmConfig {
+        memtable_bytes: cfg.lsm_memtable_bytes as usize,
+        bits_per_entry: cfg.lsm_bloom_bits_per_entry,
+        l0_sst_count_trigger: cfg.lsm_l0_sst_count_trigger as usize,
+        target_sst_records,
+        level_ratio: cfg.lsm_level_ratio,
+    }
 }
 
 fn max_generation_from_locked(guards: &[MutexGuard<'_, BTree>]) -> Lsn {
@@ -1094,6 +1145,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cfg = Config::new(dir.path());
         cfg.shards_per_partition = shards;
+        let db = Db::create_with_config(cfg).unwrap();
+        (dir, db)
+    }
+
+    fn mk_db_with_cache_bytes(page_cache_bytes: u64) -> (TempDir, Db) {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = Config::new(dir.path());
+        cfg.page_cache_bytes = page_cache_bytes;
         let db = Db::create_with_config(cfg).unwrap();
         (dir, db)
     }
@@ -1440,6 +1499,33 @@ mod tests {
         for i in 0u64..50 {
             assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dv(i as u8)));
         }
+    }
+
+    #[test]
+    fn cache_stats_show_hits_evictions_and_respect_budget() {
+        let cache_budget = 1024 * 1024;
+        let (_d, db) = mk_db_with_cache_bytes(cache_budget);
+
+        for i in 0u64..40_000 {
+            db.put_dedup(h(i), dv((i % 251) as u8)).unwrap();
+        }
+        assert!(db.flush_dedup_memtable().unwrap());
+
+        let cold = db.cache_stats();
+        assert_eq!(db.get_dedup(&h(12_345)).unwrap(), Some(dv((12_345 % 251) as u8)));
+        let after_first = db.cache_stats();
+        assert!(after_first.misses > cold.misses);
+
+        assert_eq!(db.get_dedup(&h(12_345)).unwrap(), Some(dv((12_345 % 251) as u8)));
+        let after_second = db.cache_stats();
+        assert!(after_second.hits > after_first.hits);
+
+        for i in (0u64..40_000).step_by(crate::lsm::RECORDS_PER_PAGE) {
+            assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dv((i % 251) as u8)));
+        }
+        let after_sweep = db.cache_stats();
+        assert!(after_sweep.evictions > 0);
+        assert!(after_sweep.current_bytes <= cache_budget);
     }
 
     #[test]

@@ -154,6 +154,7 @@ impl PageHeader {
 /// The buffer lives on the heap so `Page` values are cheap to move around.
 /// Construction does not zero the buffer twice — we allocate a zeroed box
 /// directly.
+#[derive(Clone)]
 pub struct Page {
     bytes: Box<[u8; PAGE_SIZE]>,
 }

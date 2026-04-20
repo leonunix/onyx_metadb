@@ -28,6 +28,7 @@
 
 use std::iter::Peekable;
 
+use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
 use crate::page_store::PageStore;
 use crate::types::Lsn;
@@ -217,6 +218,7 @@ pub(super) fn apply_plan(levels: &mut Vec<Vec<SstHandle>>, plan: &Plan, new_hand
 /// and write new SSTs to disk. Returns the list of new handles.
 pub(super) fn execute_plan<'a>(
     page_store: &'a PageStore,
+    page_cache: &'a PageCache,
     generation: Lsn,
     bits_per_entry: u32,
     plan: &Plan,
@@ -239,7 +241,7 @@ pub(super) fn execute_plan<'a>(
 
     let mut readers: Vec<SstReader<'a>> = ordered
         .iter()
-        .map(|h| SstReader::open(page_store, *h))
+        .map(|h| SstReader::open(page_store, page_cache, *h))
         .collect::<Result<Vec<_>>>()?;
 
     // Build peekable scan iterators for each reader. The scan must
@@ -356,10 +358,12 @@ pub(super) struct ExecuteOutcome {
 /// swap has been observed by `reader_drain`.
 pub(super) fn free_victims(
     page_store: &PageStore,
+    page_cache: &PageCache,
     generation: Lsn,
     victims: &[SstHandle],
 ) -> Result<()> {
     for handle in victims {
+        page_cache.invalidate_run(handle.head_page, handle.page_count());
         page_store.free_run(handle.head_page, handle.page_count(), generation)?;
     }
     Ok(())

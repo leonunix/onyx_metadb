@@ -24,6 +24,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod btree;
+pub mod cache;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -40,6 +41,7 @@ pub mod wal;
 pub use btree::{
     BTree, DiffEntry, L2pValue, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter,
 };
+pub use cache::{PageCache, PageCacheStats};
 pub use config::{Config, PAGE_SIZE};
 pub use db::{Db, DbRangeIter, DropReport, SnapshotView};
 pub use error::{MetaDbError, Result};

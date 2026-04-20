@@ -1,16 +1,10 @@
-//! Per-BTree page buffer: a simple HashMap-based cache with dirty
-//! tracking.
+//! Per-BTree page buffer layered on top of the shared [`PageCache`].
 //!
-//! This is the phase-2, single-writer scratch space. Every read and
-//! write performed by a `BTree` goes through one `PageBuf`; pages live
-//! in memory until [`PageBuf::flush`], which seals and writes every
-//! dirty page through the underlying [`PageStore`] and then `fsync`s.
-//!
-//! There is no eviction: the buffer grows to hold every page touched
-//! in a session. For phase 2 that is bounded by the working set of
-//! the active operation (tree depth × constant factor), so a HashMap
-//! suffices. Phase 8 will replace this with a clock-pro cache with
-//! pinning semantics.
+//! Clean pages are fetched from the shared cache and kept as cheap
+//! `Arc<Page>` handles. Dirty pages stay private to the `PageBuf` until
+//! [`flush`](PageBuf::flush), at which point they are written through
+//! the underlying [`PageStore`] and reinserted into the shared cache as
+//! clean entries.
 //!
 //! Concurrency is out of scope here — `PageBuf` is `&mut self` only.
 
@@ -18,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::btree::format::{init_internal, init_leaf, internal_child_at, internal_key_count};
+use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageType};
 use crate::page_store::PageStore;
@@ -26,12 +21,26 @@ use crate::types::{Lsn, PageId};
 /// Page buffer.
 pub struct PageBuf {
     page_store: Arc<PageStore>,
+    page_cache: Arc<PageCache>,
     pages: HashMap<PageId, Slot>,
 }
 
-struct Slot {
-    page: Page,
-    dirty: bool,
+enum Slot {
+    Clean(Arc<Page>),
+    Dirty(Page),
+}
+
+impl Slot {
+    fn page(&self) -> &Page {
+        match self {
+            Self::Clean(page) => page,
+            Self::Dirty(page) => page,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        matches!(self, Self::Dirty(_))
+    }
 }
 
 /// Reported outcome of a [`PageBuf::decref`] call on the top-level
@@ -50,8 +59,15 @@ pub enum DecrefOutcome {
 impl PageBuf {
     /// Construct an empty buffer backed by `page_store`.
     pub fn new(page_store: Arc<PageStore>) -> Self {
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), DEFAULT_PAGE_CACHE_BYTES));
+        Self::with_cache(page_store, page_cache)
+    }
+
+    /// Construct an empty buffer backed by the shared `page_cache`.
+    pub fn with_cache(page_store: Arc<PageStore>, page_cache: Arc<PageCache>) -> Self {
         Self {
             page_store,
+            page_cache,
             pages: HashMap::new(),
         }
     }
@@ -65,17 +81,36 @@ impl PageBuf {
     /// the result as clean.
     pub fn read(&mut self, pid: PageId) -> Result<&Page> {
         self.ensure_loaded(pid)?;
-        Ok(&self.pages[&pid].page)
+        Ok(self.pages[&pid].page())
     }
 
     /// Mutable access to a page. The returned page is stamped with
     /// `generation` and marked dirty.
     pub fn modify(&mut self, pid: PageId, generation: Lsn) -> Result<&mut Page> {
-        self.ensure_loaded(pid)?;
-        let slot = self.pages.get_mut(&pid).unwrap();
-        slot.page.set_generation(generation);
-        slot.dirty = true;
-        Ok(&mut slot.page)
+        let page = match self.pages.remove(&pid) {
+            Some(slot) => match slot {
+                Slot::Dirty(mut page) => {
+                    page.set_generation(generation);
+                    page
+                }
+                Slot::Clean(page) => {
+                    self.page_cache.invalidate(pid);
+                    let mut page = (*page).clone();
+                    page.set_generation(generation);
+                    page
+                }
+            },
+            None => {
+                let mut page = self.page_cache.get_for_modify(pid)?;
+                page.set_generation(generation);
+                page
+            }
+        };
+        self.pages.insert(pid, Slot::Dirty(page));
+        match self.pages.get_mut(&pid).unwrap() {
+            Slot::Dirty(page) => Ok(page),
+            Slot::Clean(_) => unreachable!("modify always stores a dirty page"),
+        }
     }
 
     /// Allocate a brand-new leaf page, initialize its header, cache as
@@ -85,7 +120,7 @@ impl PageBuf {
         let pid = self.page_store.allocate()?;
         let mut page = Page::zeroed();
         init_leaf(&mut page, generation);
-        self.pages.insert(pid, Slot { page, dirty: true });
+        self.pages.insert(pid, Slot::Dirty(page));
         Ok(pid)
     }
 
@@ -95,7 +130,7 @@ impl PageBuf {
         let pid = self.page_store.allocate()?;
         let mut page = Page::zeroed();
         init_internal(&mut page, generation, first_child);
-        self.pages.insert(pid, Slot { page, dirty: true });
+        self.pages.insert(pid, Slot::Dirty(page));
         Ok(pid)
     }
 
@@ -114,6 +149,7 @@ impl PageBuf {
     /// instead.
     pub fn free(&mut self, pid: PageId, generation: Lsn) -> Result<()> {
         self.pages.remove(&pid);
+        self.page_cache.invalidate(pid);
         self.page_store.free(pid, generation)?;
         Ok(())
     }
@@ -172,6 +208,7 @@ impl PageBuf {
             if new_rc == 0 {
                 worklist.extend(children);
                 self.pages.remove(&p);
+                self.page_cache.invalidate(p);
                 self.page_store.free(p, generation)?;
             }
         }
@@ -218,13 +255,7 @@ impl PageBuf {
             .copy_from_slice(self.read(pid)?.bytes());
         new_page.set_generation(generation);
         new_page.set_refcount(1);
-        self.pages.insert(
-            new_pid,
-            Slot {
-                page: new_page,
-                dirty: true,
-            },
-        );
+        self.pages.insert(new_pid, Slot::Dirty(new_page));
 
         // The new copy is an additional parent of every child.
         for c in &children {
@@ -257,7 +288,7 @@ impl PageBuf {
 
     /// Number of dirty pages currently pending flush.
     pub fn dirty_count(&self) -> usize {
-        self.pages.values().filter(|s| s.dirty).count()
+        self.pages.values().filter(|s| s.is_dirty()).count()
     }
 
     /// Seal every dirty page, write through the page store in
@@ -268,19 +299,24 @@ impl PageBuf {
         let mut dirty: Vec<PageId> = self
             .pages
             .iter()
-            .filter_map(|(pid, slot)| if slot.dirty { Some(*pid) } else { None })
+            .filter_map(|(pid, slot)| if slot.is_dirty() { Some(*pid) } else { None })
             .collect();
         if dirty.is_empty() {
             return Ok(());
         }
         dirty.sort_unstable();
+        let mut flushed: Vec<(PageId, Arc<Page>)> = Vec::with_capacity(dirty.len());
         for pid in &dirty {
-            let slot = self.pages.get_mut(pid).unwrap();
-            slot.page.seal();
-            self.page_store.write_page(*pid, &slot.page)?;
-            slot.dirty = false;
+            let mut page = self.pages[pid].page().clone();
+            page.seal();
+            self.page_store.write_page(*pid, &page)?;
+            flushed.push((*pid, Arc::new(page)));
         }
         self.page_store.sync()?;
+        for (pid, page) in flushed {
+            self.page_cache.insert(pid, page.clone());
+            self.pages.insert(pid, Slot::Clean(page));
+        }
         Ok(())
     }
 
@@ -288,8 +324,8 @@ impl PageBuf {
         if self.pages.contains_key(&pid) {
             return Ok(());
         }
-        let page = self.page_store.read_page(pid)?;
-        self.pages.insert(pid, Slot { page, dirty: false });
+        let page = self.page_cache.get(pid)?;
+        self.pages.insert(pid, Slot::Clean(page));
         Ok(())
     }
 }

@@ -39,6 +39,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
@@ -273,7 +274,7 @@ struct SstHeader {
 /// Read-side accessor for a finalized SST.
 #[derive(Debug)]
 pub struct SstReader<'a> {
-    page_store: &'a PageStore,
+    page_cache: &'a PageCache,
     handle: SstHandle,
     header: SstHeader,
     bloom: BloomFilter,
@@ -283,8 +284,12 @@ impl<'a> SstReader<'a> {
     /// Open an SST given its handle. Reads the header page, loads the
     /// bloom filter bytes into memory, and validates that the on-disk
     /// metadata matches the handle.
-    pub fn open(page_store: &'a PageStore, handle: SstHandle) -> Result<Self> {
-        let header_page = page_store.read_page(handle.head_page)?;
+    pub fn open(
+        _page_store: &'a PageStore,
+        page_cache: &'a PageCache,
+        handle: SstHandle,
+    ) -> Result<Self> {
+        let header_page = page_cache.get(handle.head_page)?;
         let header = decode_header(&header_page, handle.head_page)?;
 
         // Cross-check: the handle and header must agree.
@@ -303,7 +308,7 @@ impl<'a> SstReader<'a> {
         // Read bloom filter bytes.
         let mut bloom_bytes = Vec::with_capacity((header.bloom_bit_count / 8) as usize);
         for i in 0..header.bloom_page_count as u64 {
-            let page = page_store.read_page(handle.head_page + 1 + i)?;
+            let page = page_cache.get(handle.head_page + 1 + i)?;
             let remaining = (header.bloom_bit_count as usize / 8) - bloom_bytes.len();
             let take = remaining.min(PAGE_PAYLOAD_SIZE);
             bloom_bytes.extend_from_slice(&page.payload()[..take]);
@@ -312,7 +317,7 @@ impl<'a> SstReader<'a> {
             BloomFilter::from_parts(bloom_bytes, header.bloom_bit_count, header.bloom_hash_count);
 
         Ok(Self {
-            page_store,
+            page_cache,
             handle,
             header,
             bloom,
@@ -349,8 +354,8 @@ impl<'a> SstReader<'a> {
             let mid = lo + (hi - lo) / 2;
             let page_idx = (mid as usize) / RECORDS_PER_PAGE;
             let page = self
-                .page_store
-                .read_page(self.handle.body_start_page() + page_idx as u64)?;
+                .page_cache
+                .get(self.handle.body_start_page() + page_idx as u64)?;
             let page_records = page.key_count() as usize;
             match self.search_page(&page, page_records, hash)? {
                 IntraPageResult::Found(kind, value) => {
@@ -374,7 +379,7 @@ impl<'a> SstReader<'a> {
     /// Iterator over every record in hash order. Used by compaction.
     pub fn scan(&self) -> SstScan<'_> {
         SstScan {
-            page_store: self.page_store,
+            page_cache: self.page_cache,
             body_start: self.handle.body_start_page(),
             body_pages: self.handle.body_page_count,
             next_page_idx: 0,
@@ -444,7 +449,7 @@ enum IntraPageResult {
 /// Iterator over the full record stream of an SST. Cheap: at most one
 /// in-flight page buffered at a time.
 pub struct SstScan<'a> {
-    page_store: &'a PageStore,
+    page_cache: &'a PageCache,
     body_start: PageId,
     body_pages: u32,
     next_page_idx: u32,
@@ -467,7 +472,7 @@ impl<'a> Iterator for SstScan<'a> {
             }
             let page_id = self.body_start + self.next_page_idx as u64;
             self.next_page_idx += 1;
-            let page = match self.page_store.read_page(page_id) {
+            let page = match self.page_cache.get_bypass(page_id) {
                 Ok(p) => p,
                 Err(e) => return Some(Err(e)),
             };
@@ -573,14 +578,17 @@ fn ceil_div(num: usize, denom: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::PageCache;
+    use crate::config::PAGE_SIZE;
     use crate::lsm::format::DedupValue;
     use tempfile::TempDir;
 
-    fn mk_ps() -> (TempDir, PageStore) {
+    fn mk_ps() -> (TempDir, Arc<PageStore>, Arc<PageCache>) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pages.onyx_meta");
-        let ps = PageStore::create(&path).unwrap();
-        (dir, ps)
+        let ps = Arc::new(PageStore::create(&path).unwrap());
+        let cache = Arc::new(PageCache::new(ps.clone(), 256 * PAGE_SIZE as u64));
+        (dir, ps, cache)
     }
 
     fn h(n: u64) -> Hash32 {
@@ -605,7 +613,7 @@ mod tests {
 
     #[test]
     fn empty_records_rejected() {
-        let (_d, ps) = mk_ps();
+        let (_d, ps, _cache) = mk_ps();
         let w = SstWriter::new(&ps, 1);
         assert!(matches!(
             w.write_sorted(&[]).unwrap_err(),
@@ -615,14 +623,14 @@ mod tests {
 
     #[test]
     fn single_record_round_trip() {
-        let (_d, ps) = mk_ps();
+        let (_d, ps, cache) = mk_ps();
         let records = vec![Record::put(&h(7), &v(42))];
         let handle = SstWriter::new(&ps, 1).write_sorted(&records).unwrap();
         assert_eq!(handle.record_count, 1);
         assert_eq!(handle.min_hash, h(7));
         assert_eq!(handle.max_hash, h(7));
 
-        let reader = SstReader::open(&ps, handle).unwrap();
+        let reader = SstReader::open(&ps, &cache, handle).unwrap();
         match reader.get(&h(7)).unwrap() {
             LookupResult::Hit(got) => assert_eq!(got, v(42)),
             other => panic!("{other:?}"),
@@ -632,14 +640,14 @@ mod tests {
 
     #[test]
     fn tombstones_round_trip() {
-        let (_d, ps) = mk_ps();
+        let (_d, ps, cache) = mk_ps();
         let records = vec![
             Record::put(&h(1), &v(10)),
             Record::tombstone(&h(2)),
             Record::put(&h(3), &v(30)),
         ];
         let handle = SstWriter::new(&ps, 1).write_sorted(&records).unwrap();
-        let reader = SstReader::open(&ps, handle).unwrap();
+        let reader = SstReader::open(&ps, &cache, handle).unwrap();
         assert_eq!(reader.get(&h(1)).unwrap(), LookupResult::Hit(v(10)));
         assert_eq!(reader.get(&h(2)).unwrap(), LookupResult::Tombstone);
         assert_eq!(reader.get(&h(3)).unwrap(), LookupResult::Hit(v(30)));
@@ -647,14 +655,14 @@ mod tests {
 
     #[test]
     fn many_records_binary_search() {
-        let (_d, ps) = mk_ps();
+        let (_d, ps, cache) = mk_ps();
         // Enough to span multiple body pages.
         let count = (RECORDS_PER_PAGE as u64 * 5) + 13; // 328
         let records = sorted_puts(count);
         let handle = SstWriter::new(&ps, 1).write_sorted(&records).unwrap();
         assert!(handle.body_page_count >= 6);
 
-        let reader = SstReader::open(&ps, handle).unwrap();
+        let reader = SstReader::open(&ps, &cache, handle).unwrap();
         for i in 0..count {
             match reader.get(&h(i)).unwrap() {
                 LookupResult::Hit(got) => assert_eq!(got, v(i as u8)),
@@ -667,11 +675,11 @@ mod tests {
 
     #[test]
     fn scan_returns_sorted_records() {
-        let (_d, ps) = mk_ps();
+        let (_d, ps, cache) = mk_ps();
         let count = 200u64;
         let records = sorted_puts(count);
         let handle = SstWriter::new(&ps, 1).write_sorted(&records).unwrap();
-        let reader = SstReader::open(&ps, handle).unwrap();
+        let reader = SstReader::open(&ps, &cache, handle).unwrap();
 
         let got: Vec<Record> = reader.scan().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(got.len(), count as usize);
@@ -682,7 +690,7 @@ mod tests {
 
     #[test]
     fn handle_mismatch_flagged() {
-        let (_d, ps) = mk_ps();
+        let (_d, ps, cache) = mk_ps();
         let handle = SstWriter::new(&ps, 1)
             .write_sorted(&sorted_puts(10))
             .unwrap();
@@ -690,7 +698,7 @@ mod tests {
             record_count: 9999, // wrong!
             ..handle
         };
-        match SstReader::open(&ps, bogus).unwrap_err() {
+        match SstReader::open(&ps, &cache, bogus).unwrap_err() {
             MetaDbError::Corruption(_) => {}
             e => panic!("{e}"),
         }
@@ -699,7 +707,7 @@ mod tests {
     #[test]
     fn memtable_flush_produces_sst() {
         use crate::lsm::memtable::Memtable;
-        let (_d, ps) = mk_ps();
+        let (_d, ps, cache) = mk_ps();
         let m = Memtable::new(1_024);
         for i in 0..100u64 {
             m.put(h(i), v(i as u8));
@@ -710,7 +718,7 @@ mod tests {
             .write_memtable(&frozen)
             .unwrap()
             .unwrap();
-        let reader = SstReader::open(&ps, handle).unwrap();
+        let reader = SstReader::open(&ps, &cache, handle).unwrap();
         for i in 0..100u64 {
             if i == 50 {
                 assert_eq!(reader.get(&h(i)).unwrap(), LookupResult::Tombstone);
@@ -723,7 +731,7 @@ mod tests {
     #[test]
     fn memtable_flush_empty_returns_none() {
         use crate::lsm::memtable::Memtable;
-        let (_d, ps) = mk_ps();
+        let (_d, ps, _cache) = mk_ps();
         let m = Memtable::new(1_024);
         let frozen = m.freeze().unwrap();
         assert!(
@@ -739,11 +747,11 @@ mod tests {
         // Enough records that the bloom spans several 4 KiB pages.
         // With 10 bits/entry, 8 KB / 1.25 B per entry ≈ 6400 entries
         // per bloom page, so aim for ~20 000 to force ≥ 4 bloom pages.
-        let (_d, ps) = mk_ps();
+        let (_d, ps, cache) = mk_ps();
         let records = sorted_puts(20_000);
         let handle = SstWriter::new(&ps, 1).write_sorted(&records).unwrap();
         assert!(handle.bloom_page_count >= 4);
-        let reader = SstReader::open(&ps, handle).unwrap();
+        let reader = SstReader::open(&ps, &cache, handle).unwrap();
         for i in (0..20_000u64).step_by(137) {
             assert_eq!(reader.get(&h(i)).unwrap(), LookupResult::Hit(v(i as u8)));
         }
