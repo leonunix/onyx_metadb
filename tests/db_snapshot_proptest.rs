@@ -106,7 +106,7 @@ proptest! {
     #[test]
     fn db_matches_reference(ops in proptest::collection::vec(arb_op(), 1..400)) {
         let dir = TempDir::new().unwrap();
-        let mut db = onyx_metadb::Db::create(dir.path()).unwrap();
+        let db = onyx_metadb::Db::create(dir.path()).unwrap();
         let mut current: Ref = BTreeMap::new();
         let mut snapshots: HashMap<SnapshotId, Ref> = HashMap::new();
         let mut snap_ids: Vec<SnapshotId> = Vec::new();
@@ -156,7 +156,7 @@ proptest! {
                     let i = (idx as usize) % snap_ids.len();
                     let id = snap_ids[i];
                     let expected = snapshots.get(&id).unwrap().clone();
-                    let mut view = db.snapshot_view(id).unwrap();
+                    let view = db.snapshot_view(id).unwrap();
                     let got: Vec<(u64, L2pValue)> = view
                         .range(..)
                         .unwrap()
@@ -186,7 +186,7 @@ proptest! {
         // Final: every live snapshot must still read correctly.
         for id in &snap_ids {
             let expected = snapshots.get(id).unwrap().clone();
-            let mut view = db.snapshot_view(*id).unwrap();
+            let view = db.snapshot_view(*id).unwrap();
             let got: Vec<(u64, L2pValue)> = view
                 .range(..)
                 .unwrap()
@@ -214,7 +214,7 @@ fn deterministic_snapshot_stress() {
     use rand_chacha::ChaCha8Rng;
 
     let dir = TempDir::new().unwrap();
-    let mut db = onyx_metadb::Db::create(dir.path()).unwrap();
+    let db = onyx_metadb::Db::create(dir.path()).unwrap();
     let mut current: Ref = BTreeMap::new();
     let mut snapshots: HashMap<SnapshotId, Ref> = HashMap::new();
     let mut snap_ids: Vec<SnapshotId> = Vec::new();

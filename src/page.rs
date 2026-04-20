@@ -97,6 +97,8 @@ pub enum PageType {
     FreeListNode = 4,
     /// One slot of the double-buffered manifest.
     Manifest = 5,
+    /// Per-snapshot page holding the pinned shard-root vector.
+    SnapshotRoots = 6,
 }
 
 impl PageType {
@@ -109,6 +111,7 @@ impl PageType {
             3 => Self::LsmData,
             4 => Self::FreeListNode,
             5 => Self::Manifest,
+            6 => Self::SnapshotRoots,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }

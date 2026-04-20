@@ -39,9 +39,11 @@ pub use btree::{
     BTree, DiffEntry, L2pValue, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter,
 };
 pub use config::{Config, PAGE_SIZE};
-pub use db::{Db, DropReport, SnapshotView};
+pub use db::{Db, DbRangeIter, DropReport, SnapshotView};
 pub use error::{MetaDbError, Result};
-pub use manifest::{MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry};
+pub use manifest::{
+    MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, max_snapshots_for_shards,
+};
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 pub use page_store::PageStore;
 pub use recovery::{ReplayOutcome, replay};

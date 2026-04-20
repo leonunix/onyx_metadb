@@ -188,34 +188,51 @@ Add snapshot capability. All writes become COW.
 
 ---
 
-## Phase 4 — Sharded multi-writer B+tree  (2 weeks)
+## Phase 4 — Sharded multi-writer B+tree  (2 weeks) — **partially landed**
 
-Scale single-partition write throughput.
+The sharded index layer is in-tree and tested. WAL-backed concurrent
+commit / group-commit integration is still pending, so this phase is not
+fully closed yet.
 
-### Scope
+### Delivered
 
-- N independent B+tree shards per partition.
-- Shard router (xxh3 → shard id).
-- Writers issue concurrent WAL submissions; group commit coalesces.
-- Range scan fans out across shards and merges.
+- [`manifest::Manifest` v3](../src/manifest.rs): current per-shard roots
+  are stored inline in the manifest body; each snapshot stores its shard
+  roots in a dedicated `SnapshotRoots` page. Legacy v2 single-root
+  manifests still decode and are upgraded on open.
+- [`page::PageType`](../src/page.rs): adds `SnapshotRoots` as an explicit
+  page type so snapshot metadata is covered by the same CRC / verifier
+  machinery as the rest of the page store.
+- [`db::Db`](../src/db.rs): one `Mutex<BTree>` per shard, xxh3 router,
+  thread-safe `&self` point ops, and fan-out `range` / `diff` /
+  `snapshot_view` / `take_snapshot` / `drop_snapshot`.
+- [`db::SnapshotView`](../src/db.rs): snapshot reads hold a shared guard so
+  `drop_snapshot` cannot free snapshot-owned pages while a live view is
+  still reading them.
+- [`tests/db_concurrency.rs`](../tests/db_concurrency.rs): multi-writer
+  stress (16 writers / 4 shards) plus a round-based snapshot/reference
+  test that checks snapshot correctness under concurrent writers.
+- [`tests/db_snapshot_proptest.rs`](../tests/db_snapshot_proptest.rs):
+  existing snapshot property test now runs against the sharded `Db`
+  implementation.
 
-### Exit criteria
+### Remaining to call phase 4 done
 
-- Concurrency stress: 16 writers × 4 shards × mixed workload for 30
-  minutes, no assertion failures, no deadlocks (lock-order audit script
-  added to CI).
-- Throughput: N writers give ≥ 0.8× N single-writer throughput up to CPU
-  or disk saturation.
-- Snapshot take / drop still correct under concurrent writers (property
-  test extended).
-- Fan-out range scan order-preserving (verified against reference).
+- WAL-backed concurrent commit path: writers still mutate shard trees
+  directly. "submit to WAL, group-commit, then publish shard roots" stays
+  coupled to phase 6's transaction layer.
+- Throughput target not yet measured: we have correctness coverage, but no
+  benchmark proving ≥ 0.8× N single-writer throughput up to saturation.
+- Long soak / CI hardening still missing: no 30-minute randomized soak and
+  no lock-order audit script in CI yet.
 
 ### Decisions resolved
 
-- Shard count default: 16 per partition. Configurable.
-- Lock ordering: always acquire by ascending shard id to prevent deadlock
-  on cross-shard operations (in practice, only `drop_partition` needs
-  this).
+- Shard count default: 16 per partition. Configurable via
+  [`Config::shards_per_partition`](../src/config.rs).
+- Lock ordering: cross-shard operations acquire shard locks in ascending
+  shard id (the current implementation uses shard-vector order), so
+  `flush` / `take_snapshot` / `drop_snapshot` share one deadlock-free order.
 
 ---
 
