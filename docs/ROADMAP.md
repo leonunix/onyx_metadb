@@ -407,6 +407,68 @@ uncovered are captured below.
 
 ---
 
+## Phase 6.5 — Page cache + bounded memory  (3–5 days)
+
+A blocker for anything that runs under production load. The phase-2–6
+code bypasses any shared cache:
+
+- `BTree::PageBuf` is an unbounded `HashMap<PageId, Page>`, one per
+  tree. Soak / long-running Onyx workloads will grow it until RAM runs
+  out.
+- `SstReader` re-reads header + bloom + body pages from disk on every
+  `get`. Bloom pages get hit dozens of times per query. No cross-query
+  reuse.
+
+Without this phase, Phase 7 (Onyx integration) will OOM or saturate
+IOPS on any realistic workload.
+
+### Decisions locked before coding
+
+- **Unified `PageCache`** serves both B+tree and LSM; not two caches.
+  Cross-subsystem reuse of hot pages, single capacity budget.
+- **LRU** via the `lru` crate for MVP. Clock-Pro can come later once
+  we have measurements that motivate it.
+- **16 shards** to match the existing B+tree shard layout. Cache-
+  internal mutex contention was a known risk in the phase-4 review.
+- **Scan-resistant** for LSM compaction: the `SstScan` path tags
+  pages "bypass LRU" so a full 10 GiB compaction can't flush every
+  hot page out of cache.
+- **Dirty pin**: B+tree writes that would mutate a cached page take
+  a dirty-pin, which keeps it from evicting until the next `flush`.
+
+### Scope
+
+- `src/cache.rs`: `PageCache` with `get` / `get_for_modify` /
+  `invalidate` / `stats`, sharded LRU backed by `PageStore::read_page`.
+- `src/btree/cache.rs` (`PageBuf`): switch the backing store from
+  per-tree `HashMap` to `PageCache`; keep dirty tracking, add
+  dirty-pin on `modify`.
+- `src/lsm/sst.rs` (`SstReader`): read header / bloom / body pages
+  via `PageCache`. `SstScan` uses a bypass path so it doesn't
+  pollute LRU.
+- `src/db.rs`: `Db` owns one `PageCache`, hands `Arc<PageCache>`
+  into BTree + Lsm at construction. Surface `cache_stats()` for
+  observability.
+- `src/config.rs::page_cache_bytes` (already present at 512 MiB
+  default) is finally wired through.
+
+### Exit criteria
+
+- Proptest: same mixes as `db_phase6_proptest`, but with
+  `page_cache_bytes = 1 MiB` (tiny). Random ops + reopens still
+  produce state that matches the reference model. The cache must
+  evict a lot under this cap — regression guard for the
+  dirty-pin / mutation path.
+- Observability: `Db::cache_stats()` reports hits, misses,
+  evictions, current byte size. Used by phase 7's soak harness.
+- Microbench: `put_dedup → get_dedup` loop at warm cache is ≥ 5×
+  faster than the cold-cache baseline (proves the cache does
+  something).
+- No B+tree or LSM functionality regression. All pre-6.5 tests
+  still pass with cache enabled at default size.
+
+---
+
 ## Phase 7 — Integration with onyx-storage  (2 weeks)
 
 Replace RocksDB usage in onyx-storage.
@@ -430,31 +492,87 @@ Replace RocksDB usage in onyx-storage.
 
 ---
 
-## Phase 8 — Hardening  (ongoing; 4+ weeks before production)
+## Phase 8a — Pre-integration hardening  (1 week) — gates Phase 7
 
-Continuous work that doesn't gate earlier phases but gates production.
+Correctness hardening that must land before staking Onyx on metadb.
+Everything listed here either finds a latent bug or gives Phase 7 a
+tool to debug one.
 
 ### Scope
 
-- Fuzz campaigns: WAL parser, page decoder, manifest decoder, bloom.
-- Week-long soak with fault injection on real hardware.
-- Perf tuning: page cache policy, compaction throttle, group-commit
-  timing.
-- Operational tooling: metrics (Prometheus-exporter-compatible), tracing
-  integration, `metadb-dump` / `metadb-verify` / `metadb-replay`.
-- Documentation: recovery playbook, tuning guide.
+- **Scale up `db_phase6_proptest`** from 16 cases × 30–80 ops to
+  500+ cases × 200+ ops. Budget a multi-hour run.
+- **Mid-commit crash injection**: fault points between "WAL fsync
+  succeeded" and "apply finished", plus "apply finished" and
+  "`last_applied_lsn` bumped". Today we only test the WAL-fsync
+  failure edge.
+- **Manifest-swap crash injection**: fault between "new
+  `dedup_level_heads` page chain written" and "manifest commit
+  succeeded". Check that the post-recovery state is consistent with
+  either the pre- or post-commit view.
+- **10 GiB compaction stress**: insert until the LSM reaches L3+,
+  verify every inserted key is readable at every point during the
+  compaction storm (no bloom / range / binary-search regression
+  under pressure).
+- **`metadb-verify` CLI**: walks the page store, cross-checks
+  manifest `shard_roots` / `refcount_shard_roots` /
+  `dedup_level_heads` against on-disk pages, asserts free-list has
+  no duplicates and no overlap with live pages, asserts each live
+  page's refcount matches the count of pages that point to it.
+  Also useful as a Phase 7 debugging tool.
+- **Fuzz**: `cargo-fuzz` on the WAL record decoder, page header
+  decoder, manifest body decoder, and bloom-filter bit decoder.
+  Run for a few hours; file any findings.
+- **Multi-hour local soak**: random ops + periodic reopen + fault
+  injection on a single machine.
 
-### Backlog rolled in from earlier phases
+### Exit criteria
 
-- **1 M-op / 1000-seed LSM + Db proptest budget** (phase 5f / 6f were
-  landed at a lower case count for realistic wall-clock).
-- **Compaction stress bench** (10 GiB inserts, queryable at every
-  level).
-- **LSN-ordered condvar apply path** to bring back group-commit WAL
-  throughput (phase 6's MVP intentionally serialises submit + apply
-  under one `commit_lock`).
-- **`SnapshotView` for dedup / refcount** at a given `SnapshotId`.
-  Snapshots currently expose L2P reads only.
+- All new proptest / fuzz / soak runs clean for one full cycle.
+- `metadb-verify` returns no issues against the soak result.
+- Every fault-injection bug surfaced here is fixed or has an
+  explicit ticketed waiver.
+
+---
+
+## Phase 8b — Production polish  (parallel with or after Phase 7)
+
+Items that don't gate Phase 7 but do gate production.
+
+### Scope
+
+- **LSN-ordered condvar apply path**: undo phase-6's single
+  `commit_lock`; serialise apply via a condvar on
+  `last_applied_lsn` so WAL group-commit batches can form again.
+  Bench the mixed workload against the ≥ 150 k txns/s target.
+- **Snapshot reads for dedup / refcount**: `SnapshotView::dedup_at`
+  / `refcount_at(SnapshotId)` using each snapshot's per-group
+  shard root.
+- **Prometheus-compatible metrics exporter** for all subsystems.
+- **Operational tooling**: `metadb-dump`, `metadb-replay`,
+  companion to `metadb-verify` from 8a.
+- **Long soak on real hardware** (week-long, fault injection),
+  driven from the Onyx `stability_harness`.
+- **Documentation**: recovery playbook, tuning guide.
+- **Bloom scan resistance sanity check** once the cache in phase
+  6.5 lands — make sure compaction doesn't defeat it.
+
+### Backlog from earlier phases
+
+- **1 M-op / 1000-seed LSM + Db proptest budget**. Phase 5f / 6f
+  landed a smaller case count for realistic wall-clock; Phase 8a
+  scales it up, but the full 1M × 1000 aspirational target lives
+  here.
+- **SnapshotView dedup/refcount** — listed above; rolled forward
+  from the phase-6 exit-criteria checklist.
+
+### Exit criteria
+
+- All phase-8b scope items landed.
+- Real-hardware week-long soak passes with no corruption and no
+  unbounded growth.
+- Prometheus exporter demonstrates non-zero time-series under a
+  reproducible benchmark.
 
 ---
 
@@ -469,7 +587,13 @@ Continuous work that doesn't gate earlier phases but gates production.
 | 4     | 2     |  12        | Sharded multi-writer B+tree                     | partially landed    |
 | 5     | 3     |  15        | Fixed-record LSM + PBA refcount                 | landed              |
 | 6     | 2     |  17        | Transactions + WAL replay + `dedup_reverse`     | landed              |
-| 7     | 2     |  19        | Onyx integration + migration                    |                     |
-| 8     | 4+    |  23+       | Hardening                                       |                     |
+| 6.5   | ~1    |  18        | Bounded page cache (B+tree + LSM)               | planned             |
+| 8a    | 1     |  19        | Pre-integration hardening (gates phase 7)       | planned             |
+| 7     | 2     |  21        | Onyx integration + migration                    |                     |
+| 8b    | 3+    |  24+       | Production polish (parallel with / after 7)     |                     |
 
-Total to a production-usable v0.1: ~5 months.
+Phase 8a runs before Phase 7 so integration doesn't pull in latent
+metadb bugs. Phase 8b is the continuous-work tail and can overlap with
+Phase 7 soak.
+
+Total to a production-usable v0.1: ~5–6 months.
