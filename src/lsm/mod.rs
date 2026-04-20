@@ -15,7 +15,10 @@
 
 pub mod bloom;
 pub mod format;
+#[allow(clippy::module_inception)]
+pub mod lsm;
 pub mod memtable;
+pub mod persist;
 pub mod sst;
 
 pub use bloom::{BloomFilter, DEFAULT_BITS_PER_ENTRY};
@@ -23,5 +26,7 @@ pub use format::{
     DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash32, KIND_DELETE, KIND_PUT, LSM_RECORD_SIZE,
     RECORDS_PER_PAGE, Record,
 };
+pub use lsm::{Lsm, LsmConfig, LsmStats};
 pub use memtable::{DedupOp, LookupResult, Memtable, MemtableStats};
+pub use persist::{HANDLES_PER_PAGE, LSM_LEVELS_LAYOUT_VERSION};
 pub use sst::{SST_LAYOUT_VERSION, SstHandle, SstReader, SstScan, SstWriter};

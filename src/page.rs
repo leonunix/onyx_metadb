@@ -91,7 +91,9 @@ pub enum PageType {
     L2pLeaf = 1,
     /// B+tree internal node for an L2P partition.
     L2pInternal = 2,
-    /// Sequence of sorted fixed-size records in an LSM SST.
+    /// Sequence of sorted fixed-size records in an LSM SST, or the SST's
+    /// header / bloom pages (all share the same page type; the content
+    /// is disambiguated by position within the SST run).
     LsmData = 3,
     /// Chunk of the persisted free-list chain.
     FreeListNode = 4,
@@ -99,6 +101,8 @@ pub enum PageType {
     Manifest = 5,
     /// Per-snapshot page holding the pinned shard-root vector.
     SnapshotRoots = 6,
+    /// Page in the chained list of SST handles for one LSM level.
+    LsmLevels = 7,
 }
 
 impl PageType {
@@ -112,6 +116,7 @@ impl PageType {
             4 => Self::FreeListNode,
             5 => Self::Manifest,
             6 => Self::SnapshotRoots,
+            7 => Self::LsmLevels,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }
