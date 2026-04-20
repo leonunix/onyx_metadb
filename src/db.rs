@@ -15,6 +15,7 @@ use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::btree::{BTree, DiffEntry, L2pValue};
+use crate::paged::PagedL2p;
 use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
 use crate::error::{MetaDbError, Result};
@@ -34,8 +35,11 @@ pub struct Db {
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     manifest_state: Mutex<ManifestState>,
-    /// L2P B+tree shards (LBA → `L2pValue`).
-    shards: Vec<Shard>,
+    /// L2P paged radix-tree shards (LBA → `L2pValue`). Replaced the old
+    /// per-shard B+tree in phase 6.5a: LBA keys are dense u64s so the
+    /// paged table saves both the per-entry key storage and the tree-
+    /// descent key comparisons that a B+tree would otherwise pay.
+    shards: Vec<L2pShard>,
     /// PBA refcount B+tree shards (PBA → first 4 bytes = u32 big-endian
     /// refcount, remaining 24 bytes reserved).
     refcount_shards: Vec<Shard>,
@@ -75,6 +79,10 @@ struct ManifestState {
 
 struct Shard {
     tree: Mutex<BTree>,
+}
+
+struct L2pShard {
+    tree: Mutex<PagedL2p>,
 }
 
 /// Iterator over a globally key-ordered range scan assembled from all
@@ -181,7 +189,7 @@ impl Db {
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
         let (l2p_shards, l2p_roots) =
-            create_shards(page_store.clone(), page_cache.clone(), shard_count)?;
+            create_l2p_shards(page_store.clone(), page_cache.clone(), shard_count)?;
         let (refcount_shards, refcount_roots) =
             create_shards(page_store.clone(), page_cache.clone(), shard_count)?;
         let dedup_index =
@@ -273,7 +281,7 @@ impl Db {
             manifest_store.commit(&manifest)?;
         }
 
-        let l2p_shards = open_shards(
+        let l2p_shards = open_l2p_shards(
             page_store.clone(),
             page_cache.clone(),
             &manifest.shard_roots,
@@ -379,8 +387,8 @@ impl Db {
         let mut manifest_state = self.manifest_state.lock();
         let mut l2p_guards = self.lock_all_l2p_shards();
         let mut refcount_guards = self.lock_all_refcount_shards();
-        self.flush_locked_shards(&mut l2p_guards)?;
-        self.flush_locked_shards(&mut refcount_guards)?;
+        self.flush_locked_l2p_shards(&mut l2p_guards)?;
+        self.flush_locked_refcount_shards(&mut refcount_guards)?;
 
         let tree_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
         let wal_checkpoint = *self.last_applied_lsn.lock();
@@ -637,8 +645,8 @@ impl Db {
         let refcount_roots_page =
             write_snapshot_roots_page(&self.page_store, &refcount_roots, created_lsn)?;
 
-        self.flush_locked_shards(&mut l2p_guards)?;
-        self.flush_locked_shards(&mut refcount_guards)?;
+        self.flush_locked_l2p_shards(&mut l2p_guards)?;
+        self.flush_locked_refcount_shards(&mut refcount_guards)?;
         self.refresh_manifest_from_locked(
             &mut manifest_state.manifest,
             &l2p_guards,
@@ -742,8 +750,8 @@ impl Db {
 
         let mut l2p_guards = self.lock_all_l2p_shards();
         let mut refcount_guards = self.lock_all_refcount_shards();
-        self.flush_locked_shards(&mut l2p_guards)?;
-        self.flush_locked_shards(&mut refcount_guards)?;
+        self.flush_locked_l2p_shards(&mut l2p_guards)?;
+        self.flush_locked_refcount_shards(&mut refcount_guards)?;
         manifest_state.manifest.snapshots.remove(pos);
         self.refresh_manifest_from_locked(
             &mut manifest_state.manifest,
@@ -772,8 +780,8 @@ impl Db {
                 let _ = tree.drop_subtree(root)?;
             }
         }
-        self.flush_locked_shards(&mut l2p_guards)?;
-        self.flush_locked_shards(&mut refcount_guards)?;
+        self.flush_locked_l2p_shards(&mut l2p_guards)?;
+        self.flush_locked_refcount_shards(&mut refcount_guards)?;
         self.refresh_manifest_from_locked(
             &mut manifest_state.manifest,
             &l2p_guards,
@@ -806,7 +814,7 @@ impl Db {
         (xxh3_64(&pba.to_be_bytes()) as usize) % self.refcount_shards.len()
     }
 
-    fn lock_all_l2p_shards(&self) -> Vec<MutexGuard<'_, BTree>> {
+    fn lock_all_l2p_shards(&self) -> Vec<MutexGuard<'_, PagedL2p>> {
         self.shards.iter().map(|shard| shard.tree.lock()).collect()
     }
 
@@ -817,7 +825,20 @@ impl Db {
             .collect()
     }
 
-    fn flush_locked_shards(&self, guards: &mut [MutexGuard<'_, BTree>]) -> Result<()> {
+    fn flush_locked_l2p_shards(
+        &self,
+        guards: &mut [MutexGuard<'_, PagedL2p>],
+    ) -> Result<()> {
+        for tree in guards {
+            tree.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush_locked_refcount_shards(
+        &self,
+        guards: &mut [MutexGuard<'_, BTree>],
+    ) -> Result<()> {
         for tree in guards {
             tree.flush()?;
         }
@@ -833,7 +854,7 @@ impl Db {
     fn refresh_manifest_from_locked(
         &self,
         manifest: &mut Manifest,
-        l2p_guards: &[MutexGuard<'_, BTree>],
+        l2p_guards: &[MutexGuard<'_, PagedL2p>],
         refcount_guards: &[MutexGuard<'_, BTree>],
     ) {
         manifest.body_version = MANIFEST_BODY_VERSION;
@@ -987,6 +1008,43 @@ fn open_shards(
     Ok(shards)
 }
 
+fn create_l2p_shards(
+    page_store: Arc<PageStore>,
+    page_cache: Arc<PageCache>,
+    shard_count: usize,
+) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
+    let mut shards = Vec::with_capacity(shard_count);
+    let mut roots = Vec::with_capacity(shard_count);
+    for _ in 0..shard_count {
+        let tree = PagedL2p::create_with_cache(page_store.clone(), page_cache.clone())?;
+        roots.push(tree.root());
+        shards.push(L2pShard {
+            tree: Mutex::new(tree),
+        });
+    }
+    Ok((shards, roots.into_boxed_slice()))
+}
+
+fn open_l2p_shards(
+    page_store: Arc<PageStore>,
+    page_cache: Arc<PageCache>,
+    roots: &[PageId],
+    next_gen: Lsn,
+) -> Result<Vec<L2pShard>> {
+    let mut shards = Vec::with_capacity(roots.len());
+    for &root in roots {
+        shards.push(L2pShard {
+            tree: Mutex::new(PagedL2p::open_with_cache(
+                page_store.clone(),
+                page_cache.clone(),
+                root,
+                next_gen,
+            )?),
+        });
+    }
+    Ok(shards)
+}
+
 fn lsm_config_from_cfg(cfg: &Config) -> LsmConfig {
     let target_sst_records = ((cfg.lsm_memtable_bytes as usize) / crate::lsm::LSM_RECORD_SIZE).max(1);
     LsmConfig {
@@ -1006,8 +1064,19 @@ fn max_generation_from_locked(guards: &[MutexGuard<'_, BTree>]) -> Lsn {
         .unwrap_or(0)
 }
 
-fn max_generation_from_two_groups(a: &[MutexGuard<'_, BTree>], b: &[MutexGuard<'_, BTree>]) -> Lsn {
-    max_generation_from_locked(a).max(max_generation_from_locked(b))
+fn max_generation_from_locked_l2p(guards: &[MutexGuard<'_, PagedL2p>]) -> Lsn {
+    guards
+        .iter()
+        .map(|tree| tree.next_generation())
+        .max()
+        .unwrap_or(0)
+}
+
+fn max_generation_from_two_groups(
+    a: &[MutexGuard<'_, PagedL2p>],
+    b: &[MutexGuard<'_, BTree>],
+) -> Lsn {
+    max_generation_from_locked_l2p(a).max(max_generation_from_locked(b))
 }
 
 fn refcount_from_value(v: L2pValue) -> u32 {
@@ -1052,7 +1121,7 @@ pub(crate) fn decode_reverse_hash(key: &Hash32, value: &DedupValue) -> Hash32 {
 /// locally-constructed state during `open`. Private to this module
 /// because `Shard` is.
 fn apply_op_bare(
-    l2p_shards: &[Shard],
+    l2p_shards: &[L2pShard],
     refcount_shards: &[Shard],
     dedup_index: &Lsm,
     dedup_reverse: &Lsm,
@@ -1060,13 +1129,13 @@ fn apply_op_bare(
 ) -> Result<ApplyOutcome> {
     match *op {
         WalOp::L2pPut { lba, value } => {
-            let sid = shard_for_key(l2p_shards, lba);
+            let sid = shard_for_key_l2p(l2p_shards, lba);
             let mut tree = l2p_shards[sid].tree.lock();
             let prev = tree.insert(lba, value)?;
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::L2pDelete { lba } => {
-            let sid = shard_for_key(l2p_shards, lba);
+            let sid = shard_for_key_l2p(l2p_shards, lba);
             let mut tree = l2p_shards[sid].tree.lock();
             let prev = tree.delete(lba)?;
             Ok(ApplyOutcome::L2pPrev(prev))
@@ -1121,6 +1190,10 @@ fn apply_op_bare(
 }
 
 fn shard_for_key(shards: &[Shard], key: u64) -> usize {
+    (xxh3_64(&key.to_be_bytes()) as usize) % shards.len()
+}
+
+fn shard_for_key_l2p(shards: &[L2pShard], key: u64) -> usize {
     (xxh3_64(&key.to_be_bytes()) as usize) % shards.len()
 }
 

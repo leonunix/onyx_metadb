@@ -103,6 +103,11 @@ pub enum PageType {
     SnapshotRoots = 6,
     /// Page in the chained list of SST handles for one LSM level.
     LsmLevels = 7,
+    /// Paged L2P leaf: 128 × 28 B entries plus a 128-bit presence bitmap.
+    PagedLeaf = 8,
+    /// Paged L2P index: 256 × 8 B child page pointers with a level byte in
+    /// the type-header. Forms the upper 1..=4 levels of the paged radix tree.
+    PagedIndex = 9,
 }
 
 impl PageType {
@@ -117,6 +122,8 @@ impl PageType {
             5 => Self::Manifest,
             6 => Self::SnapshotRoots,
             7 => Self::LsmLevels,
+            8 => Self::PagedLeaf,
+            9 => Self::PagedIndex,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }

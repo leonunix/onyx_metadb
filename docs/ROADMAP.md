@@ -407,6 +407,85 @@ uncovered are captured below.
 
 ---
 
+## Phase 6.5a — Paged L2P radix tree  (~1 week) — **landed**
+
+The L2P index started life as a per-shard COW B+tree. That was the
+right call while we were still figuring out the rest of the engine:
+shared page-store + refcount semantics, manifest + WAL integration,
+snapshot / drop / diff. Now that the surrounding machinery is stable,
+the B+tree itself has become overkill for Onyx's L2P workload:
+
+- Keys are always `u64` LBAs — dense, no lexicographic surprises.
+- Values are fixed 28 B (`BlockmapValue` equivalent).
+- Reads are point lookups; no range scan on the hot path.
+- Most volumes are densely written (ops come from the buffer flusher
+  which coalesces by LBA), so a radix tree's "no key storage,
+  arithmetic addressing" fits without sparseness penalties.
+
+### What changed
+
+- New `src/paged/` module:
+  - `format.rs`: on-disk leaf (128 × 28 B with a 128-bit presence
+    bitmap) and index (256 × 8 B child pointers, level byte in the
+    type-header) layouts. Leaf addressing: `lba & 0x7F` for bit,
+    `lba >> 7` for leaf id. Index addressing: `(leaf_idx >> (8*L)) &
+    0xFF` at level `L`.
+  - `cache.rs`: `PageBuf` with cascade over paged-index children.
+    Structurally parallel to `btree::cache::PageBuf` but purpose-built
+    for paged pages, keeping the cascade logic clear.
+  - `tree.rs`: `PagedL2p` with `create` / `open` / `get` / `insert` /
+    `delete` / `flush` / `range` / `get_at` / `incref_root_for_snapshot`
+    / `decref_root` / `drop_subtree` / `diff_subtrees`. Same API shape
+    as `BTree` so `Db` swaps in place. Root grows on demand up to
+    level 4 (covers 2 PiB of 4 KiB LBAs per shard); empty leaves and
+    indexes are pruned upward on delete.
+- `src/page.rs`: two new `PageType` variants (`PagedLeaf`, `PagedIndex`).
+- `src/db.rs`: L2P shards now hold `Mutex<PagedL2p>` (refcount shards
+  still `Mutex<BTree>` — that's phase 6.5b's target). `apply_op_bare`,
+  `collect_range_for_roots`, `diff_roots`, `drop_snapshot`, the
+  snapshot save/restore/compare paths, and the manifest refresh all
+  thread through the new type without structural change.
+
+### Why not touch refcount yet
+
+- Refcount writes come from flusher / GC batches, not the user read
+  path — B+tree traversal cost isn't visible to latency-sensitive
+  ops.
+- Refcount value shrinks to 4 B (vs 28 B for L2P); the B+tree gets 3×
+  the branching factor once the value type is specialized. That's
+  phase 6.5b.
+
+### What this does not change
+
+- Snapshot model: per-shard root pointers live in the manifest, exactly
+  as before. Readers take a read lock on `snapshot_views`; mutators
+  take the write lock only in `drop_snapshot`.
+- Recovery: WAL replay goes through `Db::apply_op` just like a live
+  commit; the swap is invisible to the replay machinery.
+- Dedup LSMs: unchanged. Hash-keyed, sparse, prefix-scanned — paged
+  would be wrong for them.
+
+### Exit criteria
+
+- 29 paged-specific unit tests (format + cache + tree) pass.
+- All pre-6.5a Db / snapshot / WAL proptests still pass unmodified
+  (319 lib tests + integration suites).
+- Clippy clean on the new module.
+
+### Deferred / follow-ups
+
+- 6.5b: `BTree` value specialization from 28 B → 4 B for refcount.
+- Manifest version bump from v5 → v6 was considered but deferred: the
+  page-level check in `PagedL2p::open` fails cleanly on a pre-6.5a
+  manifest (which would point at `L2pLeaf` / `L2pInternal` pages), so
+  no silent corruption risk.
+- No `drop_subtree`-style efficient shrink path; deletes just prune
+  upward and leave root at whatever level it grew to. Root never
+  shrinks back down. Fine for Onyx's workload; revisit if it becomes
+  a problem.
+
+---
+
 ## Phase 6.5 — Page cache + bounded memory  (3–5 days)
 
 A blocker for anything that runs under production load. The phase-2–6
@@ -616,10 +695,12 @@ Items that don't gate Phase 7 but do gate production.
 | 4     | 2     |  12        | Sharded multi-writer B+tree                           | partially landed    |
 | 5     | 3     |  15        | Fixed-record LSM + PBA refcount                       | landed              |
 | 6     | 2     |  17        | Transactions + WAL replay + `dedup_reverse`           | landed              |
-| 6.5   | ~1    |  18        | Bounded page cache (B+tree + LSM)                     | planned             |
-| 8a    | 2     |  20        | Pre-integration hardening + week soak (gates phase 7) | planned             |
-| 7     | 2     |  22        | Onyx integration + migration                          |                     |
-| 8b    | 3+    |  25+       | Production polish (parallel with / after 7)           |                     |
+| 6.5a  | ~1    |  18        | Paged L2P radix tree (replaces B+tree for L2P)        | landed              |
+| 6.5b  | ~0.5  |  18.5      | Refcount B+tree value specialization (28 B → 4 B)     | planned             |
+| 6.5   | ~1    |  19.5      | Bounded page cache (paged + LSM)                      | planned             |
+| 8a    | 2     |  21.5      | Pre-integration hardening + week soak (gates phase 7) | planned             |
+| 7     | 2     |  23.5      | Onyx integration + migration                          |                     |
+| 8b    | 3+    |  26.5+     | Production polish (parallel with / after 7)           |                     |
 
 Phase 8a runs before Phase 7 and owns the **standalone week-long
 soak**. Integrating before metadb has cleared a self-contained soak
