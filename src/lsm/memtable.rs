@@ -134,6 +134,40 @@ impl Memtable {
         LookupResult::Miss
     }
 
+    /// Collect every (key, op) pair in the memtable whose key starts
+    /// with `prefix`. Scans both active and frozen; entries in active
+    /// shadow entries in frozen for the same key.
+    ///
+    /// Used by the dedup_reverse prefix-scan path. The returned vector
+    /// is sorted ascending by key.
+    pub fn collect_prefix(&self, prefix: &[u8]) -> Vec<(Hash32, DedupOp)> {
+        if prefix.is_empty() {
+            let inner = self.inner.read();
+            let mut out: BTreeMap<Hash32, DedupOp> = BTreeMap::new();
+            if let Some(frozen) = &inner.frozen {
+                for (k, v) in frozen.iter() {
+                    out.insert(*k, *v);
+                }
+            }
+            for (k, v) in inner.active.iter() {
+                out.insert(*k, *v);
+            }
+            return out.into_iter().collect();
+        }
+        let (lo, hi) = prefix_bounds(prefix);
+        let inner = self.inner.read();
+        let mut out: BTreeMap<Hash32, DedupOp> = BTreeMap::new();
+        if let Some(frozen) = &inner.frozen {
+            for (k, v) in frozen.range(lo..hi) {
+                out.insert(*k, *v);
+            }
+        }
+        for (k, v) in inner.active.range(lo..hi) {
+            out.insert(*k, *v);
+        }
+        out.into_iter().collect()
+    }
+
     /// Whether the active memtable has reached its freeze threshold.
     pub fn should_freeze(&self) -> bool {
         let inner = self.inner.read();
@@ -203,6 +237,33 @@ fn op_to_lookup(op: DedupOp) -> LookupResult {
         DedupOp::Put(v) => LookupResult::Hit(v),
         DedupOp::Delete => LookupResult::Tombstone,
     }
+}
+
+/// Returns `[prefix || 0x00..00, prefix || 0xFF..FF exclusive]` as a
+/// `(lo, hi)` pair suitable for `BTreeMap::range(lo..hi)`. Callers are
+/// expected to have already checked `prefix.len() <= 32`.
+fn prefix_bounds(prefix: &[u8]) -> (Hash32, Hash32) {
+    debug_assert!(prefix.len() <= 32);
+    let mut lo = [0u8; 32];
+    lo[..prefix.len()].copy_from_slice(prefix);
+    // `hi` is the smallest key that is NOT in the prefix. Compute it
+    // by incrementing the last byte of `prefix` and zero-filling the
+    // remainder; if that carries out of the prefix, use 0xFF..0xFF as
+    // an inclusive bound — the caller will use `lo..=hi` in that case,
+    // but for typical 8-byte prefixes this never happens.
+    let mut hi = [0xFFu8; 32];
+    for i in (0..prefix.len()).rev() {
+        if prefix[i] < 0xFF {
+            hi[..i].copy_from_slice(&prefix[..i]);
+            hi[i] = prefix[i] + 1;
+            for byte in hi.iter_mut().skip(i + 1) {
+                *byte = 0;
+            }
+            return (lo, hi);
+        }
+    }
+    // All-0xFF prefix: `hi` stays at 0xFF..0xFF (sentinel).
+    (lo, hi)
 }
 
 #[cfg(test)]

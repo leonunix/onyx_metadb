@@ -292,6 +292,64 @@ impl Lsm {
         None
     }
 
+    // -------- prefix scan ------------------------------------------------
+
+    /// Collect every live (non-tombstoned) record whose key begins with
+    /// `prefix`. Resolves shadowing correctly: a newer tombstone hides
+    /// an older put, and a newer put overrides an older one.
+    ///
+    /// Used by `dedup_reverse` to find all (pba, hash) rows that a
+    /// given PBA owns. Cost: one read + scan of every memtable plus
+    /// every SST whose min/max hash range overlaps the prefix. Not
+    /// optimal — a real range iterator lands in phase 8.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Hash32, DedupValue)>> {
+        let _drain = self.reader_drain.read();
+        use std::collections::BTreeMap;
+        // `seen` maps key → Option<DedupValue>. Some = live put, None
+        // = tombstone. First insertion wins (newest layer).
+        let mut seen: BTreeMap<Hash32, Option<DedupValue>> = BTreeMap::new();
+
+        // Memtable (newest) — shadows everything.
+        for (k, op) in self.memtable.collect_prefix(prefix) {
+            seen.entry(k).or_insert(match op {
+                DedupOp::Put(v) => Some(v),
+                DedupOp::Delete => None,
+            });
+        }
+
+        // SSTs, newest-to-oldest.
+        let snapshot = self.levels.read().clone();
+        for (level_idx, handles) in snapshot.iter().enumerate() {
+            let ordered: Vec<SstHandle> = if level_idx == 0 {
+                handles.iter().rev().copied().collect()
+            } else {
+                handles.to_vec()
+            };
+            for handle in ordered {
+                if !prefix_might_match_range(&handle.min_hash, &handle.max_hash, prefix) {
+                    continue;
+                }
+                let reader = SstReader::open(&self.page_store, handle)?;
+                for rec_result in reader.scan() {
+                    let rec = rec_result?;
+                    if !key_has_prefix(rec.hash(), prefix) {
+                        continue;
+                    }
+                    seen.entry(*rec.hash()).or_insert(if rec.is_put() {
+                        Some(rec.value())
+                    } else {
+                        None
+                    });
+                }
+            }
+        }
+
+        Ok(seen
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .collect())
+    }
+
     // -------- introspection ---------------------------------------------
 
     /// Snapshot of the current level → SST table.
@@ -389,6 +447,27 @@ impl Lsm {
 // DedupOp import path; `use` is needed to keep the `_` pattern matching
 // from turning into a dead-code warning if this file ever lands without
 // `flush_memtable` being exercised.
+#[allow(dead_code)]
+fn key_has_prefix(key: &Hash32, prefix: &[u8]) -> bool {
+    key.len() >= prefix.len() && &key[..prefix.len()] == prefix
+}
+
+/// Whether keys starting with `prefix` could fall within `[min, max]`.
+/// Conservative: returns true unless we can prove no match exists.
+fn prefix_might_match_range(min: &Hash32, max: &Hash32, prefix: &[u8]) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    // Any key starting with `prefix` lies in `[prefix || 0x00..,
+    // prefix || 0xFF..]` inclusive. Overlap with `[min, max]` means
+    // `prefix_upper >= min && prefix_lower <= max`.
+    let mut lower = [0u8; 32];
+    lower[..prefix.len()].copy_from_slice(prefix);
+    let mut upper = [0xFFu8; 32];
+    upper[..prefix.len()].copy_from_slice(prefix);
+    upper.as_slice() >= min.as_slice() && lower.as_slice() <= max.as_slice()
+}
+
 #[allow(dead_code)]
 fn _dedup_op_import_anchor(op: DedupOp) -> DedupOp {
     op

@@ -24,20 +24,30 @@ use crate::testing::faults::{FaultController, FaultPoint};
 use crate::types::{Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, SnapshotId};
 
 /// Version of the current manifest body layout.
-pub const MANIFEST_BODY_VERSION: u32 = 4;
+pub const MANIFEST_BODY_VERSION: u32 = 5;
 
-// v4 body layout.
+// v5 body layout. Extends v4 with dedup_reverse level heads so the
+// second dedup LSM gets the same on-disk treatment as dedup_index.
 const OFF_BODY_VERSION: usize = 0;
 const OFF_CHECKPOINT_LSN: usize = 4;
 const OFF_FREE_LIST_HEAD: usize = 12;
 const OFF_SHARD_COUNT: usize = 20;
 const OFF_DEDUP_LEVEL_COUNT: usize = 24;
-const OFF_NEXT_SNAPSHOT_ID: usize = 28;
-const OFF_SNAPSHOT_COUNT: usize = 36;
-const OFF_V4_VARIABLE: usize = 40;
-/// v4 per-snapshot entry: id, l2p_roots_page, refcount_roots_page,
-/// created_lsn = 4 × u64 = 32 bytes.
+const OFF_DEDUP_REVERSE_LEVEL_COUNT: usize = 28;
+const OFF_NEXT_SNAPSHOT_ID: usize = 32;
+const OFF_SNAPSHOT_COUNT: usize = 40;
+const OFF_V5_VARIABLE: usize = 44;
+/// Per-snapshot entry: id, l2p_roots_page, refcount_roots_page,
+/// created_lsn = 4 × u64 = 32 bytes. Unchanged from v4.
 const SNAPSHOT_ENTRY_SIZE: usize = 32;
+
+// v4 compatibility layout (phase 5).
+const V4_BODY_VERSION: u32 = 4;
+const V4_OFF_SHARD_COUNT: usize = 20;
+const V4_OFF_DEDUP_LEVEL_COUNT: usize = 24;
+const V4_OFF_NEXT_SNAPSHOT_ID: usize = 28;
+const V4_OFF_SNAPSHOT_COUNT: usize = 36;
+const V4_OFF_VARIABLE: usize = 40;
 
 // v3 compatibility layout (phase 4). Single index, roots inline,
 // snapshot entries 24 bytes (id + roots_page + created_lsn).
@@ -53,9 +63,10 @@ const _: () = {
     assert!(OFF_CHECKPOINT_LSN + 8 == OFF_FREE_LIST_HEAD);
     assert!(OFF_FREE_LIST_HEAD + 8 == OFF_SHARD_COUNT);
     assert!(OFF_SHARD_COUNT + 4 == OFF_DEDUP_LEVEL_COUNT);
-    assert!(OFF_DEDUP_LEVEL_COUNT + 4 == OFF_NEXT_SNAPSHOT_ID);
+    assert!(OFF_DEDUP_LEVEL_COUNT + 4 == OFF_DEDUP_REVERSE_LEVEL_COUNT);
+    assert!(OFF_DEDUP_REVERSE_LEVEL_COUNT + 4 == OFF_NEXT_SNAPSHOT_ID);
     assert!(OFF_NEXT_SNAPSHOT_ID + 8 == OFF_SNAPSHOT_COUNT);
-    assert!(OFF_SNAPSHOT_COUNT + 4 == OFF_V4_VARIABLE);
+    assert!(OFF_SNAPSHOT_COUNT + 4 == OFF_V5_VARIABLE);
     assert!(SNAPSHOT_ENTRY_SIZE == 32);
     assert!(V3_SNAPSHOT_ENTRY_SIZE == 24);
 };
@@ -72,8 +83,9 @@ pub fn max_snapshots_for_shards(shard_count: usize) -> usize {
 }
 
 /// Same as [`max_snapshots_for_shards`] but accounts for the
-/// dedup-level count explicitly.
-pub fn max_snapshots_for_layout(shard_count: usize, dedup_level_count: usize) -> usize {
+/// dedup-level counts explicitly (sum of forward + reverse level
+/// counts).
+pub fn max_snapshots_for_layout(shard_count: usize, total_dedup_level_count: usize) -> usize {
     let roots_bytes = match shard_count
         .checked_mul(2)
         .and_then(|v| v.checked_mul(size_of::<PageId>()))
@@ -81,11 +93,11 @@ pub fn max_snapshots_for_layout(shard_count: usize, dedup_level_count: usize) ->
         Some(v) => v,
         None => return 0,
     };
-    let dedup_bytes = match dedup_level_count.checked_mul(size_of::<PageId>()) {
+    let dedup_bytes = match total_dedup_level_count.checked_mul(size_of::<PageId>()) {
         Some(v) => v,
         None => return 0,
     };
-    let used = OFF_V4_VARIABLE + roots_bytes + dedup_bytes;
+    let used = OFF_V5_VARIABLE + roots_bytes + dedup_bytes;
     if used > PAGE_PAYLOAD_SIZE {
         return 0;
     }
@@ -130,9 +142,13 @@ pub struct Manifest {
     /// `shard_roots`. Empty if the manifest was loaded as v3 and has
     /// not yet been materialized.
     pub refcount_shard_roots: Box<[PageId]>,
-    /// Head page id of each dedup LSM level's chain. One per level;
-    /// `NULL_PAGE` for an empty level.
+    /// Head page id of each dedup_index LSM level's chain. One per
+    /// level; `NULL_PAGE` for an empty level.
     pub dedup_level_heads: Box<[PageId]>,
+    /// Head page id of each dedup_reverse LSM level's chain. Same
+    /// per-level shape as `dedup_level_heads`. Empty if the manifest
+    /// was loaded as v4 and not yet materialized.
+    pub dedup_reverse_level_heads: Box<[PageId]>,
     /// Monotonic counter: next snapshot id to hand out.
     pub next_snapshot_id: u64,
     /// Registered snapshots, in order of creation.
@@ -149,6 +165,7 @@ impl Manifest {
             shard_roots: Vec::new().into_boxed_slice(),
             refcount_shard_roots: Vec::new().into_boxed_slice(),
             dedup_level_heads: Vec::new().into_boxed_slice(),
+            dedup_reverse_level_heads: Vec::new().into_boxed_slice(),
             next_snapshot_id: 1,
             snapshots: Vec::new(),
         }
@@ -159,9 +176,14 @@ impl Manifest {
         self.shard_roots.len()
     }
 
-    /// Number of dedup levels currently tracked.
+    /// Number of dedup_index levels currently tracked.
     pub fn dedup_level_count(&self) -> usize {
         self.dedup_level_heads.len()
+    }
+
+    /// Number of dedup_reverse levels currently tracked.
+    pub fn dedup_reverse_level_count(&self) -> usize {
+        self.dedup_reverse_level_heads.len()
     }
 
     /// Find a snapshot by id.
@@ -184,7 +206,9 @@ impl Manifest {
             )));
         }
         let dedup_level_count = self.dedup_level_heads.len();
-        let max_snapshots = max_snapshots_for_layout(shard_count, dedup_level_count);
+        let dedup_reverse_level_count = self.dedup_reverse_level_heads.len();
+        let total_dedup_levels = dedup_level_count + dedup_reverse_level_count;
+        let max_snapshots = max_snapshots_for_layout(shard_count, total_dedup_levels);
         if self.snapshots.len() > max_snapshots {
             return Err(MetaDbError::InvalidArgument(format!(
                 "manifest snapshot count {} exceeds capacity {max_snapshots}",
@@ -234,19 +258,18 @@ impl Manifest {
             .copy_from_slice(&(shard_count as u32).to_le_bytes());
         p[OFF_DEDUP_LEVEL_COUNT..OFF_DEDUP_LEVEL_COUNT + 4]
             .copy_from_slice(&(dedup_level_count as u32).to_le_bytes());
+        p[OFF_DEDUP_REVERSE_LEVEL_COUNT..OFF_DEDUP_REVERSE_LEVEL_COUNT + 4]
+            .copy_from_slice(&(dedup_reverse_level_count as u32).to_le_bytes());
         p[OFF_NEXT_SNAPSHOT_ID..OFF_NEXT_SNAPSHOT_ID + 8]
             .copy_from_slice(&self.next_snapshot_id.to_le_bytes());
         p[OFF_SNAPSHOT_COUNT..OFF_SNAPSHOT_COUNT + 4]
             .copy_from_slice(&(self.snapshots.len() as u32).to_le_bytes());
 
-        let mut off = OFF_V4_VARIABLE;
+        let mut off = OFF_V5_VARIABLE;
         for root in self.shard_roots.iter().copied() {
             p[off..off + 8].copy_from_slice(&root.to_le_bytes());
             off += 8;
         }
-        // Refcount roots region is always sized to match L2P, zero-filled
-        // if we haven't materialized refcount trees yet. That way the
-        // layout is stable across upgrades.
         for i in 0..shard_count {
             let root = if self.refcount_shard_roots.is_empty() {
                 NULL_PAGE
@@ -257,6 +280,10 @@ impl Manifest {
             off += 8;
         }
         for head in self.dedup_level_heads.iter().copied() {
+            p[off..off + 8].copy_from_slice(&head.to_le_bytes());
+            off += 8;
+        }
+        for head in self.dedup_reverse_level_heads.iter().copied() {
             p[off..off + 8].copy_from_slice(&head.to_le_bytes());
             off += 8;
         }
@@ -278,7 +305,8 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            MANIFEST_BODY_VERSION => Self::decode_v4(page, page_store),
+            MANIFEST_BODY_VERSION => Self::decode_v5(page, page_store),
+            V4_BODY_VERSION => Self::decode_v4(page, page_store),
             V3_BODY_VERSION => Self::decode_v3(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
                 "unsupported manifest body version {other}",
@@ -286,7 +314,7 @@ impl Manifest {
         }
     }
 
-    fn decode_v4(page: &Page, page_store: &PageStore) -> Result<Self> {
+    fn decode_v5(page: &Page, page_store: &PageStore) -> Result<Self> {
         let p = page.payload();
         let checkpoint_lsn = u64::from_le_bytes(
             p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
@@ -311,6 +339,11 @@ impl Manifest {
                 .try_into()
                 .unwrap(),
         ) as usize;
+        let dedup_reverse_level_count = u32::from_le_bytes(
+            p[OFF_DEDUP_REVERSE_LEVEL_COUNT..OFF_DEDUP_REVERSE_LEVEL_COUNT + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         let next_snapshot_id = u64::from_le_bytes(
             p[OFF_NEXT_SNAPSHOT_ID..OFF_NEXT_SNAPSHOT_ID + 8]
                 .try_into()
@@ -321,14 +354,15 @@ impl Manifest {
                 .try_into()
                 .unwrap(),
         ) as usize;
-        let max_snapshots = max_snapshots_for_layout(shard_count, dedup_level_count);
+        let total_dedup_levels = dedup_level_count + dedup_reverse_level_count;
+        let max_snapshots = max_snapshots_for_layout(shard_count, total_dedup_levels);
         if snapshot_count > max_snapshots {
             return Err(MetaDbError::Corruption(format!(
                 "manifest snapshot_count {snapshot_count} exceeds capacity {max_snapshots}",
             )));
         }
 
-        let mut off = OFF_V4_VARIABLE;
+        let mut off = OFF_V5_VARIABLE;
         let shard_roots = read_u64_vec(p, &mut off, shard_count);
         let refcount_shard_roots_raw = read_u64_vec(p, &mut off, shard_count);
         let refcount_shard_roots = if refcount_shard_roots_raw.iter().all(|r| *r == NULL_PAGE) {
@@ -337,6 +371,7 @@ impl Manifest {
             refcount_shard_roots_raw
         };
         let dedup_level_heads = read_u64_vec(p, &mut off, dedup_level_count);
+        let dedup_reverse_level_heads = read_u64_vec(p, &mut off, dedup_reverse_level_count);
 
         let mut snapshots = Vec::with_capacity(snapshot_count);
         for _ in 0..snapshot_count {
@@ -381,6 +416,104 @@ impl Manifest {
             shard_roots,
             refcount_shard_roots,
             dedup_level_heads,
+            dedup_reverse_level_heads,
+            next_snapshot_id,
+            snapshots,
+        })
+    }
+
+    fn decode_v4(page: &Page, page_store: &PageStore) -> Result<Self> {
+        let p = page.payload();
+        let checkpoint_lsn = u64::from_le_bytes(
+            p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let free_list_head = u64::from_le_bytes(
+            p[OFF_FREE_LIST_HEAD..OFF_FREE_LIST_HEAD + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let shard_count = u32::from_le_bytes(
+            p[V4_OFF_SHARD_COUNT..V4_OFF_SHARD_COUNT + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        if shard_count > MAX_SHARD_ROOTS_PER_PAGE {
+            return Err(MetaDbError::Corruption(format!(
+                "v4 manifest shard_count {shard_count} exceeds page capacity {MAX_SHARD_ROOTS_PER_PAGE}",
+            )));
+        }
+        let dedup_level_count = u32::from_le_bytes(
+            p[V4_OFF_DEDUP_LEVEL_COUNT..V4_OFF_DEDUP_LEVEL_COUNT + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let next_snapshot_id = u64::from_le_bytes(
+            p[V4_OFF_NEXT_SNAPSHOT_ID..V4_OFF_NEXT_SNAPSHOT_ID + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let snapshot_count = u32::from_le_bytes(
+            p[V4_OFF_SNAPSHOT_COUNT..V4_OFF_SNAPSHOT_COUNT + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        let mut off = V4_OFF_VARIABLE;
+        let shard_roots = read_u64_vec(p, &mut off, shard_count);
+        let refcount_shard_roots_raw = read_u64_vec(p, &mut off, shard_count);
+        let refcount_shard_roots = if refcount_shard_roots_raw.iter().all(|r| *r == NULL_PAGE) {
+            Vec::new().into_boxed_slice()
+        } else {
+            refcount_shard_roots_raw
+        };
+        let dedup_level_heads = read_u64_vec(p, &mut off, dedup_level_count);
+
+        let mut snapshots = Vec::with_capacity(snapshot_count);
+        for _ in 0..snapshot_count {
+            let id = u64::from_le_bytes(p[off..off + 8].try_into().unwrap());
+            let l2p_roots_page = u64::from_le_bytes(p[off + 8..off + 16].try_into().unwrap());
+            let refcount_roots_page = u64::from_le_bytes(p[off + 16..off + 24].try_into().unwrap());
+            let created_lsn = u64::from_le_bytes(p[off + 24..off + 32].try_into().unwrap());
+            let l2p_shard_roots = load_snapshot_roots(page_store, l2p_roots_page)?;
+            if l2p_shard_roots.len() != shard_count {
+                return Err(MetaDbError::Corruption(format!(
+                    "v4 snapshot {id} L2P roots page has {} entries, expected {shard_count}",
+                    l2p_shard_roots.len(),
+                )));
+            }
+            let refcount_shard_roots = if refcount_roots_page == NULL_PAGE {
+                Vec::new().into_boxed_slice()
+            } else {
+                let rr = load_snapshot_roots(page_store, refcount_roots_page)?;
+                if rr.len() != shard_count {
+                    return Err(MetaDbError::Corruption(format!(
+                        "v4 snapshot {id} refcount roots page has {} entries, expected {shard_count}",
+                        rr.len(),
+                    )));
+                }
+                rr
+            };
+            snapshots.push(SnapshotEntry {
+                id,
+                l2p_roots_page,
+                refcount_roots_page,
+                created_lsn,
+                l2p_shard_roots,
+                refcount_shard_roots,
+            });
+            off += SNAPSHOT_ENTRY_SIZE;
+        }
+
+        Ok(Self {
+            body_version: V4_BODY_VERSION,
+            checkpoint_lsn,
+            free_list_head,
+            shard_roots,
+            refcount_shard_roots,
+            dedup_level_heads,
+            dedup_reverse_level_heads: Vec::new().into_boxed_slice(),
             next_snapshot_id,
             snapshots,
         })
@@ -446,6 +579,7 @@ impl Manifest {
             shard_roots,
             refcount_shard_roots: Vec::new().into_boxed_slice(),
             dedup_level_heads: Vec::new().into_boxed_slice(),
+            dedup_reverse_level_heads: Vec::new().into_boxed_slice(),
             next_snapshot_id,
             snapshots,
         })
@@ -745,6 +879,7 @@ mod tests {
             shard_roots: bx(&[7, 8, 9, 10]),
             refcount_shard_roots: bx(&[17, 18, 19, 20]),
             dedup_level_heads: bx(&[NULL_PAGE, NULL_PAGE]),
+            dedup_reverse_level_heads: bx(&[NULL_PAGE]),
             next_snapshot_id: 5,
             snapshots: vec![snap(&ps, 1, &[11, 12, 13, 14], &[21, 22, 23, 24], 100)],
         };
@@ -908,6 +1043,7 @@ mod tests {
             shard_roots: bx(&[42, 43, 44, 45]),
             refcount_shard_roots: bx(&[142, 143, 144, 145]),
             dedup_level_heads: bx(&[NULL_PAGE, 200, 300]),
+            dedup_reverse_level_heads: bx(&[NULL_PAGE, 400]),
             next_snapshot_id: 99,
             snapshots: vec![
                 snap(&ps, 1, &[10, 11, 12, 13], &[110, 111, 112, 113], 100),
@@ -996,6 +1132,7 @@ mod tests {
             shard_roots: bx(&[7, 8, 9, 10]),
             refcount_shard_roots: Vec::new().into_boxed_slice(),
             dedup_level_heads: Vec::new().into_boxed_slice(),
+            dedup_reverse_level_heads: Vec::new().into_boxed_slice(),
             next_snapshot_id: 2,
             snapshots: vec![SnapshotEntry {
                 id: 1,

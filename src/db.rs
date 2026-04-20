@@ -40,6 +40,12 @@ pub struct Db {
     /// Global dedup index: 32-byte SHA-256 content hash → 28-byte opaque
     /// `DedupValue`.
     dedup_index: Lsm,
+    /// Reverse index: key = `[pba: 8B BE][hash_first_24B]`, value =
+    /// `[hash_last_8B | zero padding]`. Used by PBA refcount → 0 to
+    /// discover and clean up the `dedup_index` entries whose PBA is
+    /// going away. Prefix-scan by 8-byte PBA locates every matching
+    /// row.
+    dedup_reverse: Lsm,
     /// Write-ahead log. All mutations route through here so they survive
     /// crash between checkpoints.
     wal: Wal,
@@ -173,10 +179,12 @@ impl Db {
         let (l2p_shards, l2p_roots) = create_shards(page_store.clone(), shard_count)?;
         let (refcount_shards, refcount_roots) = create_shards(page_store.clone(), shard_count)?;
         let dedup_index = Lsm::create(page_store.clone(), LsmConfig::default());
+        let dedup_reverse = Lsm::create(page_store.clone(), LsmConfig::default());
         manifest.body_version = MANIFEST_BODY_VERSION;
         manifest.shard_roots = l2p_roots;
         manifest.refcount_shard_roots = refcount_roots;
         manifest.dedup_level_heads = Vec::new().into_boxed_slice();
+        manifest.dedup_reverse_level_heads = Vec::new().into_boxed_slice();
         manifest_store.commit(&manifest)?;
 
         let wal = Wal::create(
@@ -195,6 +203,7 @@ impl Db {
             shards: l2p_shards,
             refcount_shards,
             dedup_index,
+            dedup_reverse,
             wal,
             commit_lock: Mutex::new(()),
             last_applied_lsn: Mutex::new(0),
@@ -260,6 +269,11 @@ impl Db {
             LsmConfig::default(),
             &manifest.dedup_level_heads,
         )?;
+        let dedup_reverse = Lsm::open(
+            page_store.clone(),
+            LsmConfig::default(),
+            &manifest.dedup_reverse_level_heads,
+        )?;
 
         // Replay WAL segments forward from checkpoint_lsn+1 onto the
         // freshly-opened in-memory state. Applies every op exactly the
@@ -268,7 +282,13 @@ impl Db {
         let wal_path = wal_dir(&cfg.path);
         let from_lsn = manifest.checkpoint_lsn + 1;
         let replay_outcome = crate::recovery::replay_into(&wal_path, from_lsn, |op| {
-            apply_op_bare(&l2p_shards, &refcount_shards, &dedup_index, op)
+            apply_op_bare(
+                &l2p_shards,
+                &refcount_shards,
+                &dedup_index,
+                &dedup_reverse,
+                op,
+            )
         })?;
         let last_applied = replay_outcome.last_lsn.unwrap_or(manifest.checkpoint_lsn);
         // If the last segment ended torn, truncate it to the last clean
@@ -285,6 +305,7 @@ impl Db {
             shards: l2p_shards,
             refcount_shards,
             dedup_index,
+            dedup_reverse,
             wal,
             commit_lock: Mutex::new(()),
             last_applied_lsn: Mutex::new(last_applied),
@@ -335,7 +356,10 @@ impl Db {
         let tree_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
         let wal_checkpoint = *self.last_applied_lsn.lock();
         let old_dedup_heads: Vec<PageId> = manifest_state.manifest.dedup_level_heads.to_vec();
+        let old_dedup_reverse_heads: Vec<PageId> =
+            manifest_state.manifest.dedup_reverse_level_heads.to_vec();
         let new_dedup_heads = self.dedup_index.persist_levels(tree_generation)?;
+        let new_dedup_reverse_heads = self.dedup_reverse.persist_levels(tree_generation)?;
 
         self.refresh_manifest_from_locked(
             &mut manifest_state.manifest,
@@ -346,12 +370,16 @@ impl Db {
         // LSN must be the durable WAL LSN, not the tree counter.
         manifest_state.manifest.checkpoint_lsn = wal_checkpoint;
         manifest_state.manifest.dedup_level_heads = new_dedup_heads.clone().into_boxed_slice();
+        manifest_state.manifest.dedup_reverse_level_heads =
+            new_dedup_reverse_heads.clone().into_boxed_slice();
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
 
-        // Commit succeeded; free the old level chains.
+        // Commit succeeded; free the old level chains for both LSMs.
         self.dedup_index
             .free_old_level_heads(&old_dedup_heads, tree_generation)?;
+        self.dedup_reverse
+            .free_old_level_heads(&old_dedup_reverse_heads, tree_generation)?;
         Ok(())
     }
 
@@ -385,7 +413,13 @@ impl Db {
     }
 
     fn apply_op(&self, op: &WalOp) -> Result<ApplyOutcome> {
-        apply_op_bare(&self.shards, &self.refcount_shards, &self.dedup_index, op)
+        apply_op_bare(
+            &self.shards,
+            &self.refcount_shards,
+            &self.dedup_index,
+            &self.dedup_reverse,
+            op,
+        )
     }
 
     // -------- refcount + dedup ops --------------------------------------
@@ -440,6 +474,41 @@ impl Db {
     /// Point-lookup `hash` in the dedup index.
     pub fn get_dedup(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
         self.dedup_index.get(hash)
+    }
+
+    // -------- dedup_reverse operations ----------------------------------
+
+    /// Register `hash` as mapped to `pba` in the reverse index. This
+    /// is an LSM put, not a modification of the forward dedup index.
+    /// Callers typically pair it with `put_dedup(hash, value)` inside
+    /// one `begin() / commit()` transaction so both land atomically.
+    pub fn register_dedup_reverse(&self, pba: Pba, hash: Hash32) -> Result<Lsn> {
+        let mut tx = self.begin();
+        tx.register_dedup_reverse(pba, hash);
+        tx.commit()
+    }
+
+    /// Remove the `(pba, hash)` entry from the reverse index.
+    pub fn unregister_dedup_reverse(&self, pba: Pba, hash: Hash32) -> Result<Lsn> {
+        let mut tx = self.begin();
+        tx.unregister_dedup_reverse(pba, hash);
+        tx.commit()
+    }
+
+    /// Every full 32-byte hash currently registered for `pba` in the
+    /// reverse index. Does **not** include tombstoned entries.
+    ///
+    /// Cost: scans every `dedup_reverse` SST whose min/max range
+    /// intersects the 8-byte PBA prefix, plus the memtable. Fine for
+    /// the decref-to-zero cleanup path (rare, per-PBA); not suitable
+    /// for hot-path queries.
+    pub fn scan_dedup_reverse_for_pba(&self, pba: Pba) -> Result<Vec<Hash32>> {
+        let prefix = pba.to_be_bytes();
+        let rows = self.dedup_reverse.scan_prefix(&prefix)?;
+        Ok(rows
+            .into_iter()
+            .map(|(key, value)| decode_reverse_hash(&key, &value))
+            .collect())
     }
 
     /// `true` if the dedup memtable has reached its freeze threshold.
@@ -890,6 +959,32 @@ fn refcount_to_value(count: u32) -> L2pValue {
     L2pValue(bytes)
 }
 
+/// Encode a `(pba, hash)` pair for storage in the `dedup_reverse` LSM.
+///
+/// The LSM key is 32 bytes (`Hash32`). We pack the 8-byte big-endian
+/// PBA into the first 8 bytes so prefix scans by PBA become range
+/// scans, and the first 24 bytes of the content hash into the
+/// remaining 24 bytes of the key. The remaining 8 bytes of the hash
+/// live in the value; decoders recover the full 32-byte hash by
+/// concatenating `key[8..32]` with `value[0..8]`.
+pub(crate) fn encode_reverse_entry(pba: Pba, hash: &Hash32) -> (Hash32, DedupValue) {
+    let mut key = [0u8; 32];
+    key[..8].copy_from_slice(&pba.to_be_bytes());
+    key[8..32].copy_from_slice(&hash[..24]);
+    let mut value = [0u8; 28];
+    value[..8].copy_from_slice(&hash[24..]);
+    (key, DedupValue(value))
+}
+
+/// Reconstruct the full 32-byte hash from a `dedup_reverse` key/value
+/// pair written by [`encode_reverse_entry`].
+pub(crate) fn decode_reverse_hash(key: &Hash32, value: &DedupValue) -> Hash32 {
+    let mut hash = [0u8; 32];
+    hash[..24].copy_from_slice(&key[8..32]);
+    hash[24..].copy_from_slice(&value.0[..8]);
+    hash
+}
+
 /// Apply one [`WalOp`] to raw `Db` state. Used by both the live commit
 /// path (through `self.apply_op`) and the WAL-replay path (before
 /// `Self` exists). Takes individual references so it can run against
@@ -899,6 +994,7 @@ fn apply_op_bare(
     l2p_shards: &[Shard],
     refcount_shards: &[Shard],
     dedup_index: &Lsm,
+    dedup_reverse: &Lsm,
     op: &WalOp,
 ) -> Result<ApplyOutcome> {
     match *op {
@@ -920,6 +1016,16 @@ fn apply_op_bare(
         }
         WalOp::DedupDelete { hash } => {
             dedup_index.delete(hash);
+            Ok(ApplyOutcome::Dedup)
+        }
+        WalOp::DedupReversePut { pba, hash } => {
+            let (key, value) = encode_reverse_entry(pba, &hash);
+            dedup_reverse.put(key, value);
+            Ok(ApplyOutcome::Dedup)
+        }
+        WalOp::DedupReverseDelete { pba, hash } => {
+            let (key, _) = encode_reverse_entry(pba, &hash);
+            dedup_reverse.delete(key);
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::Incref { pba, delta } => {
@@ -1550,5 +1656,112 @@ mod tests {
         // New commits after reopen start at committed_lsn + 1.
         db.insert(100, v(0)).unwrap();
         assert_eq!(db.last_applied_lsn(), committed_lsn + 1);
+    }
+
+    // -------- phase 6e: dedup_reverse --------
+
+    fn hash_full(high: u64, low: u64) -> Hash32 {
+        // Build a 32B hash with arbitrary but distinct bytes so we can
+        // verify reverse round-trip preserves all 32 bytes (not just
+        // the first 24 that fit in the reverse key).
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&high.to_be_bytes());
+        h[8..16].copy_from_slice(&(high.wrapping_mul(7)).to_be_bytes());
+        h[16..24].copy_from_slice(&(low.wrapping_mul(11)).to_be_bytes());
+        h[24..].copy_from_slice(&low.to_be_bytes());
+        h
+    }
+
+    #[test]
+    fn reverse_entry_round_trip_recovers_full_hash() {
+        let hash = hash_full(0xAABB_CCDD_1111_2222, 0xDEAD_BEEF_CAFE_F00D);
+        let (key, value) = encode_reverse_entry(42, &hash);
+        assert_eq!(&key[..8], &42u64.to_be_bytes());
+        let back = decode_reverse_hash(&key, &value);
+        assert_eq!(back, hash);
+    }
+
+    #[test]
+    fn register_and_scan_by_pba() {
+        let (_d, db) = mk_db();
+        let h1 = hash_full(1, 100);
+        let h2 = hash_full(2, 200);
+        db.register_dedup_reverse(42, h1).unwrap();
+        db.register_dedup_reverse(42, h2).unwrap();
+        db.register_dedup_reverse(99, hash_full(3, 300)).unwrap();
+
+        let mut found = db.scan_dedup_reverse_for_pba(42).unwrap();
+        found.sort();
+        let mut expected = vec![h1, h2];
+        expected.sort();
+        assert_eq!(found, expected);
+
+        assert_eq!(
+            db.scan_dedup_reverse_for_pba(12345).unwrap(),
+            Vec::<Hash32>::new()
+        );
+    }
+
+    #[test]
+    fn unregister_removes_from_scan() {
+        let (_d, db) = mk_db();
+        let h1 = hash_full(10, 1);
+        let h2 = hash_full(10, 2);
+        db.register_dedup_reverse(7, h1).unwrap();
+        db.register_dedup_reverse(7, h2).unwrap();
+        db.unregister_dedup_reverse(7, h1).unwrap();
+        let found = db.scan_dedup_reverse_for_pba(7).unwrap();
+        assert_eq!(found, vec![h2]);
+    }
+
+    #[test]
+    fn scan_sees_entries_after_flush_to_sst() {
+        let (_d, db) = mk_db();
+        for i in 0u64..25 {
+            db.register_dedup_reverse(17, hash_full(i, i)).unwrap();
+        }
+        // Flush the dedup_reverse memtable so the next scan reads SST data.
+        let lsn = db.last_applied_lsn();
+        db.dedup_reverse.flush_memtable(lsn).unwrap();
+        let found = db.scan_dedup_reverse_for_pba(17).unwrap();
+        assert_eq!(found.len(), 25);
+    }
+
+    #[test]
+    fn tx_atomically_registers_dedup_index_and_reverse() {
+        let (_d, db) = mk_db();
+        let hash = hash_full(5, 5);
+        let mut tx = db.begin();
+        tx.put_dedup(hash, dv(7));
+        tx.register_dedup_reverse(999, hash);
+        tx.incref_pba(999, 1);
+        tx.commit().unwrap();
+        assert_eq!(db.get_dedup(&hash).unwrap(), Some(dv(7)));
+        assert_eq!(db.scan_dedup_reverse_for_pba(999).unwrap(), vec![hash]);
+        assert_eq!(db.get_refcount(999).unwrap(), 1);
+    }
+
+    #[test]
+    fn dedup_reverse_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let h_a = hash_full(77, 1);
+        let h_b = hash_full(77, 2);
+        {
+            let db = Db::create(dir.path()).unwrap();
+            db.register_dedup_reverse(77, h_a).unwrap();
+            db.register_dedup_reverse(77, h_b).unwrap();
+            // flush half so we exercise both WAL-replay AND
+            // SST-reload paths.
+            let lsn = db.last_applied_lsn();
+            db.dedup_reverse.flush_memtable(lsn).unwrap();
+            db.flush().unwrap();
+            db.register_dedup_reverse(77, hash_full(77, 3)).unwrap();
+        }
+        let db = Db::open(dir.path()).unwrap();
+        let mut found = db.scan_dedup_reverse_for_pba(77).unwrap();
+        found.sort();
+        let mut expected = vec![h_a, h_b, hash_full(77, 3)];
+        expected.sort();
+        assert_eq!(found, expected);
     }
 }

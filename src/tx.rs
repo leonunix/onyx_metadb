@@ -91,6 +91,18 @@ impl<'db> Transaction<'db> {
         self
     }
 
+    /// Buffer a `dedup_reverse` registration (`pba` owns `hash`).
+    pub fn register_dedup_reverse(&mut self, pba: Pba, hash: Hash32) -> &mut Self {
+        self.ops.push(WalOp::DedupReversePut { pba, hash });
+        self
+    }
+
+    /// Buffer a `dedup_reverse` tombstone for `(pba, hash)`.
+    pub fn unregister_dedup_reverse(&mut self, pba: Pba, hash: Hash32) -> &mut Self {
+        self.ops.push(WalOp::DedupReverseDelete { pba, hash });
+        self
+    }
+
     /// Buffer a refcount increment. `delta == 0` is allowed.
     pub fn incref_pba(&mut self, pba: Pba, delta: u32) -> &mut Self {
         self.ops.push(WalOp::Incref { pba, delta });

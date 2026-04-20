@@ -19,14 +19,16 @@
 //!
 //! Tag table:
 //!
-//! | tag | mnemonic      | payload                                     | size |
-//! |-----|---------------|---------------------------------------------|------|
-//! | 01  | `L2P_PUT`     | lba (8 B BE) + value (28 B)                 |  36  |
-//! | 02  | `L2P_DELETE`  | lba (8 B BE)                                |   8  |
-//! | 10  | `DEDUP_PUT`   | hash (32 B) + value (28 B)                  |  60  |
-//! | 11  | `DEDUP_DEL`   | hash (32 B)                                 |  32  |
-//! | 20  | `INCREF`      | pba (8 B BE) + delta (4 B BE)               |  12  |
-//! | 21  | `DECREF`      | pba (8 B BE) + delta (4 B BE)               |  12  |
+//! | tag | mnemonic            | payload                                     | size |
+//! |-----|---------------------|---------------------------------------------|------|
+//! | 01  | `L2P_PUT`           | lba (8 B BE) + value (28 B)                 |  36  |
+//! | 02  | `L2P_DELETE`        | lba (8 B BE)                                |   8  |
+//! | 10  | `DEDUP_PUT`         | hash (32 B) + value (28 B)                  |  60  |
+//! | 11  | `DEDUP_DEL`         | hash (32 B)                                 |  32  |
+//! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                  |  40  |
+//! | 13  | `DEDUP_REVERSE_DEL` | pba (8 B BE) + hash (32 B)                  |  40  |
+//! | 20  | `INCREF`            | pba (8 B BE) + delta (4 B BE)               |  12  |
+//! | 21  | `DECREF`            | pba (8 B BE) + delta (4 B BE)               |  12  |
 //!
 //! Keys use big-endian so byte order matches numeric order; that's
 //! consistent with the rest of metadb.
@@ -40,18 +42,48 @@ pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;
 pub const TAG_DEDUP_PUT: u8 = 0x10;
 pub const TAG_DEDUP_DELETE: u8 = 0x11;
+pub const TAG_DEDUP_REVERSE_PUT: u8 = 0x12;
+pub const TAG_DEDUP_REVERSE_DELETE: u8 = 0x13;
 pub const TAG_INCREF: u8 = 0x20;
 pub const TAG_DECREF: u8 = 0x21;
 
 /// One mutation op as stored in a WAL record body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WalOp {
-    L2pPut { lba: Lba, value: L2pValue },
-    L2pDelete { lba: Lba },
-    DedupPut { hash: Hash32, value: DedupValue },
-    DedupDelete { hash: Hash32 },
-    Incref { pba: Pba, delta: u32 },
-    Decref { pba: Pba, delta: u32 },
+    L2pPut {
+        lba: Lba,
+        value: L2pValue,
+    },
+    L2pDelete {
+        lba: Lba,
+    },
+    DedupPut {
+        hash: Hash32,
+        value: DedupValue,
+    },
+    DedupDelete {
+        hash: Hash32,
+    },
+    /// Record that `pba` owns `hash`. Stored in `dedup_reverse` so a
+    /// later `decref_pba → 0` can prefix-scan by PBA and tombstone the
+    /// corresponding `dedup_index` entries.
+    DedupReversePut {
+        pba: Pba,
+        hash: Hash32,
+    },
+    /// Tombstone a `(pba, hash)` entry in `dedup_reverse`.
+    DedupReverseDelete {
+        pba: Pba,
+        hash: Hash32,
+    },
+    Incref {
+        pba: Pba,
+        delta: u32,
+    },
+    Decref {
+        pba: Pba,
+        delta: u32,
+    },
 }
 
 impl WalOp {
@@ -76,6 +108,16 @@ impl WalOp {
                 out.push(TAG_DEDUP_DELETE);
                 out.extend_from_slice(hash);
             }
+            WalOp::DedupReversePut { pba, hash } => {
+                out.push(TAG_DEDUP_REVERSE_PUT);
+                out.extend_from_slice(&pba.to_be_bytes());
+                out.extend_from_slice(hash);
+            }
+            WalOp::DedupReverseDelete { pba, hash } => {
+                out.push(TAG_DEDUP_REVERSE_DELETE);
+                out.extend_from_slice(&pba.to_be_bytes());
+                out.extend_from_slice(hash);
+            }
             WalOp::Incref { pba, delta } => {
                 out.push(TAG_INCREF);
                 out.extend_from_slice(&pba.to_be_bytes());
@@ -96,6 +138,7 @@ impl WalOp {
             WalOp::L2pDelete { .. } => 1 + 8,
             WalOp::DedupPut { .. } => 1 + 32 + 28,
             WalOp::DedupDelete { .. } => 1 + 32,
+            WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 32,
             WalOp::Incref { .. } | WalOp::Decref { .. } => 1 + 8 + 4,
         }
     }
@@ -164,6 +207,18 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(&payload[..32]);
             Ok((WalOp::DedupDelete { hash }, &payload[32..]))
+        }
+        TAG_DEDUP_REVERSE_PUT | TAG_DEDUP_REVERSE_DELETE => {
+            require_len(payload, 40, "DEDUP_REVERSE")?;
+            let pba = u64::from_be_bytes(payload[..8].try_into().unwrap());
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&payload[8..40]);
+            let op = if tag == TAG_DEDUP_REVERSE_PUT {
+                WalOp::DedupReversePut { pba, hash }
+            } else {
+                WalOp::DedupReverseDelete { pba, hash }
+            };
+            Ok((op, &payload[40..]))
         }
         TAG_INCREF | TAG_DECREF => {
             require_len(payload, 12, "INCREF/DECREF")?;
