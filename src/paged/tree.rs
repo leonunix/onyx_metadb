@@ -22,10 +22,9 @@ use crate::error::{MetaDbError, Result};
 use crate::page_store::PageStore;
 use crate::paged::cache::PageBuf;
 use crate::paged::format::{
-    INDEX_FANOUT, INDEX_SHIFT, L2pValue, LEAF_ENTRY_COUNT, LEAF_MASK, LEAF_SHIFT,
-    MAX_INDEX_LEVEL, index_child_at, index_child_count, index_set_child, leaf_bit_set,
-    leaf_clear, leaf_entry_count, leaf_set, leaf_value_at, max_leaf_idx_at_level,
-    slot_in_index,
+    INDEX_FANOUT, INDEX_SHIFT, L2pValue, LEAF_ENTRY_COUNT, LEAF_MASK, LEAF_SHIFT, MAX_INDEX_LEVEL,
+    index_child_at, index_child_count, index_set_child, leaf_bit_set, leaf_clear, leaf_entry_count,
+    leaf_set, leaf_value_at, max_leaf_idx_at_level, slot_in_index,
 };
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
@@ -213,6 +212,11 @@ impl PagedL2p {
         self.buf.page_store()
     }
 
+    /// Run the structural checker over the whole tree.
+    pub fn check_invariants(&self) -> Result<()> {
+        crate::paged::invariants::check_tree(self.buf.page_store(), self.root)
+    }
+
     // -------- read path --------------------------------------------------
 
     /// Point lookup. `None` if `lba` is not mapped.
@@ -227,12 +231,7 @@ impl PagedL2p {
         self.get_at_level(root, level, lba)
     }
 
-    fn get_at_level(
-        &mut self,
-        root: PageId,
-        root_level: u8,
-        lba: u64,
-    ) -> Result<Option<L2pValue>> {
+    fn get_at_level(&mut self, root: PageId, root_level: u8, lba: u64) -> Result<Option<L2pValue>> {
         let leaf_idx = lba >> LEAF_SHIFT;
         let bit = (lba & LEAF_MASK) as usize;
         if leaf_idx > max_leaf_idx_at_level(root_level) {
@@ -345,7 +344,11 @@ impl PagedL2p {
                 None => break, // empty_id is the root; never freed.
             };
             self.buf.decref(empty_id, generation)?;
-            index_set_child(self.buf.modify(parent, generation)?, slot_in_parent, NULL_PAGE);
+            index_set_child(
+                self.buf.modify(parent, generation)?,
+                slot_in_parent,
+                NULL_PAGE,
+            );
             if index_child_count(self.buf.read(parent)?) == 0 {
                 empty_child = Some(parent);
             }
@@ -464,12 +467,8 @@ impl PagedL2p {
     /// implementation is a simple "collect both subtrees, merge sorted
     /// streams". Returns entries in ascending key order.
     pub fn diff_subtrees(&mut self, a: PageId, b: PageId) -> Result<Vec<DiffEntry>> {
-        let a_items: Vec<(u64, L2pValue)> = self
-            .range_at(a, ..)?
-            .collect::<Result<Vec<_>>>()?;
-        let b_items: Vec<(u64, L2pValue)> = self
-            .range_at(b, ..)?
-            .collect::<Result<Vec<_>>>()?;
+        let a_items: Vec<(u64, L2pValue)> = self.range_at(a, ..)?.collect::<Result<Vec<_>>>()?;
+        let b_items: Vec<(u64, L2pValue)> = self.range_at(b, ..)?.collect::<Result<Vec<_>>>()?;
         let mut out = Vec::new();
         merge_diff_into(&a_items, &b_items, &mut out);
         Ok(out)
@@ -577,11 +576,7 @@ fn slot_span_for_level(level: u8) -> u64 {
 /// Merge two ascending `(key, value)` streams into `DiffEntry` items in
 /// ascending key order. Same shape as `btree::merge_diff_into` so tests
 /// that assert diff ordering don't need special casing.
-fn merge_diff_into(
-    a: &[(u64, L2pValue)],
-    b: &[(u64, L2pValue)],
-    out: &mut Vec<DiffEntry>,
-) {
+fn merge_diff_into(a: &[(u64, L2pValue)], b: &[(u64, L2pValue)], out: &mut Vec<DiffEntry>) {
     let mut i = 0usize;
     let mut j = 0usize;
     while i < a.len() && j < b.len() {

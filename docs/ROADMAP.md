@@ -799,7 +799,7 @@ Items that don't gate Phase 7 but do gate production.
 | 6.5a  | ~1    |  18        | Paged L2P radix tree (replaces B+tree for L2P)        | landed              |
 | 6.5b  | ~0.5  |  18.5      | Refcount B+tree value specialization (28 B → 4 B)     | landed              |
 | 6.5   | ~1    |  19.5      | Bounded page cache (paged + LSM)                      | landed              |
-| 8a    | 2     |  21.5      | Pre-integration hardening + week soak (gates phase 7) | planned             |
+| 8a    | 2     |  21.5      | Pre-integration hardening + week soak (gates phase 7) | in progress         |
 | 7     | 2     |  23.5      | Onyx integration + migration                          |                     |
 | 8b    | 3+    |  26.5+     | Production polish (parallel with / after 7)           |                     |
 

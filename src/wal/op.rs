@@ -33,9 +33,9 @@
 //! Keys use big-endian so byte order matches numeric order; that's
 //! consistent with the rest of metadb.
 
-use crate::paged::L2pValue;
 use crate::error::{MetaDbError, Result};
 use crate::lsm::{DedupValue, Hash32};
+use crate::paged::L2pValue;
 use crate::types::{Lba, Pba};
 
 pub const TAG_L2P_PUT: u8 = 0x01;

@@ -697,7 +697,63 @@ pub struct ManifestStore {
     faults: Arc<FaultController>,
 }
 
+/// Latest valid manifest slot loaded from disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedManifest {
+    pub slot: PageId,
+    pub sequence: u64,
+    pub manifest: Manifest,
+}
+
 impl ManifestStore {
+    /// Load the newest valid manifest slot from disk without mutating the
+    /// page store. Returns `Ok(None)` if neither slot decodes.
+    pub fn load_latest(page_store: &PageStore) -> Result<Option<LoadedManifest>> {
+        let a = load_slot(page_store, MANIFEST_PAGE_A).map(|(sequence, manifest)| LoadedManifest {
+            slot: MANIFEST_PAGE_A,
+            sequence,
+            manifest,
+        });
+        let b = load_slot(page_store, MANIFEST_PAGE_B).map(|(sequence, manifest)| LoadedManifest {
+            slot: MANIFEST_PAGE_B,
+            sequence,
+            manifest,
+        });
+        Ok(match (a, b) {
+            (Some(a), Some(b)) => Some(if a.sequence >= b.sequence { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        })
+    }
+
+    /// Open an existing manifest. Unlike [`open_or_create`](Self::open_or_create),
+    /// this never writes a fresh empty manifest when both slots are invalid.
+    pub fn open_existing(
+        page_store: Arc<PageStore>,
+        faults: Arc<FaultController>,
+    ) -> Result<(Self, Manifest)> {
+        let Some(loaded) = Self::load_latest(&page_store)? else {
+            return Err(MetaDbError::Corruption(
+                "no valid manifest slot found in existing database".into(),
+            ));
+        };
+        let next_slot = if loaded.slot == MANIFEST_PAGE_A {
+            MANIFEST_PAGE_B
+        } else {
+            MANIFEST_PAGE_A
+        };
+        Ok((
+            Self {
+                page_store,
+                sequence: loaded.sequence,
+                next_slot,
+                faults,
+            },
+            loaded.manifest,
+        ))
+    }
+
     /// Open the manifest for a page store, creating a fresh empty
     /// manifest on disk if neither slot is valid. Returns the loaded
     /// (or freshly-persisted) [`Manifest`] alongside the store.
@@ -705,62 +761,31 @@ impl ManifestStore {
         page_store: Arc<PageStore>,
         faults: Arc<FaultController>,
     ) -> Result<(Self, Manifest)> {
-        let a = load_slot(&page_store, MANIFEST_PAGE_A);
-        let b = load_slot(&page_store, MANIFEST_PAGE_B);
-        match (a, b) {
-            (Some((ga, ma)), Some((gb, mb))) => {
-                if ga >= gb {
-                    Ok((
-                        Self {
-                            page_store,
-                            sequence: ga,
-                            next_slot: MANIFEST_PAGE_B,
-                            faults,
-                        },
-                        ma,
-                    ))
-                } else {
-                    Ok((
-                        Self {
-                            page_store,
-                            sequence: gb,
-                            next_slot: MANIFEST_PAGE_A,
-                            faults,
-                        },
-                        mb,
-                    ))
-                }
-            }
-            (Some((g, m)), None) => Ok((
+        if let Some(loaded) = Self::load_latest(&page_store)? {
+            let next_slot = if loaded.slot == MANIFEST_PAGE_A {
+                MANIFEST_PAGE_B
+            } else {
+                MANIFEST_PAGE_A
+            };
+            return Ok((
                 Self {
                     page_store,
-                    sequence: g,
-                    next_slot: MANIFEST_PAGE_B,
+                    sequence: loaded.sequence,
+                    next_slot,
                     faults,
                 },
-                m,
-            )),
-            (None, Some((g, m))) => Ok((
-                Self {
-                    page_store,
-                    sequence: g,
-                    next_slot: MANIFEST_PAGE_A,
-                    faults,
-                },
-                m,
-            )),
-            (None, None) => {
-                let mut store = Self {
-                    page_store,
-                    sequence: 0,
-                    next_slot: MANIFEST_PAGE_A,
-                    faults,
-                };
-                let empty = Manifest::empty();
-                store.commit(&empty)?;
-                Ok((store, empty))
-            }
+                loaded.manifest,
+            ));
         }
+        let mut store = Self {
+            page_store,
+            sequence: 0,
+            next_slot: MANIFEST_PAGE_A,
+            faults,
+        };
+        let empty = Manifest::empty();
+        store.commit(&empty)?;
+        Ok((store, empty))
     }
 
     /// Current in-memory sequence number; bumped by each successful
@@ -812,6 +837,11 @@ fn load_slot(page_store: &PageStore, slot: PageId) -> Option<(u64, Manifest)> {
     }
     let manifest = Manifest::decode(&page, page_store).ok()?;
     Some((header.generation, manifest))
+}
+
+#[doc(hidden)]
+pub fn decode_page_for_fuzz(page: &Page, page_store: &PageStore) -> Result<Manifest> {
+    Manifest::decode(page, page_store)
 }
 
 #[cfg(test)]

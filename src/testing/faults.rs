@@ -44,6 +44,12 @@ pub enum FaultPoint {
     WalFsyncBefore,
     /// Immediately after the WAL fsync system call returns.
     WalFsyncAfter,
+    /// After the WAL submit/fsync completed for a commit but before any
+    /// in-memory apply starts.
+    CommitPostWalBeforeApply,
+    /// After every op in a commit was applied to memory but before
+    /// `last_applied_lsn` is bumped.
+    CommitPostApplyBeforeLsnBump,
     /// Before a page is written to the page file.
     PageWriteBefore,
     /// After a page has been written to the page file.
@@ -52,6 +58,9 @@ pub enum FaultPoint {
     ManifestFsyncBefore,
     /// After the manifest slot is fsync'd.
     ManifestFsyncAfter,
+    /// After new dedup level-head chains were written during `flush`,
+    /// but before the manifest swap committed them durable.
+    FlushPostLevelRewriteBeforeManifest,
     /// Midway through a COW cascade, after a new child page has been
     /// written but before its parent has been linked to it.
     CowCascadeMidParentLink,
@@ -64,10 +73,13 @@ impl FaultPoint {
         match self {
             Self::WalFsyncBefore => "wal.fsync.before",
             Self::WalFsyncAfter => "wal.fsync.after",
+            Self::CommitPostWalBeforeApply => "commit.post_wal.before_apply",
+            Self::CommitPostApplyBeforeLsnBump => "commit.post_apply.before_lsn_bump",
             Self::PageWriteBefore => "page.write.before",
             Self::PageWriteAfter => "page.write.after",
             Self::ManifestFsyncBefore => "manifest.fsync.before",
             Self::ManifestFsyncAfter => "manifest.fsync.after",
+            Self::FlushPostLevelRewriteBeforeManifest => "flush.level_rewrite.before_manifest",
             Self::CowCascadeMidParentLink => "cow.cascade.mid_parent_link",
         }
     }

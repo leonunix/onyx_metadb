@@ -143,9 +143,7 @@ fn warm_vs_cold_wall_clock() {
     let warm = warm_start.elapsed();
 
     let ratio = cold.as_secs_f64() / warm.as_secs_f64();
-    eprintln!(
-        "cache microbench: cold={cold:?}  warm={warm:?}  ratio={ratio:.2}×"
-    );
+    eprintln!("cache microbench: cold={cold:?}  warm={warm:?}  ratio={ratio:.2}×");
     // The cache cannot make reads *slower*. Anything ≥ 1.0× means the
     // hit path at least doesn't regress against the miss path. The
     // real speedup on disk-bound workloads is much larger; it gets

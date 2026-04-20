@@ -251,7 +251,11 @@ pub fn leaf_entry_count(page: &Page) -> u16 {
 pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Option<L2pValue> {
     debug_assert!(i < LEAF_ENTRY_COUNT);
     let was_set = leaf_bit_set(page, i);
-    let old = if was_set { Some(leaf_value_at(page, i)) } else { None };
+    let old = if was_set {
+        Some(leaf_value_at(page, i))
+    } else {
+        None
+    };
     leaf_set_value(page, i, v);
     if !was_set {
         leaf_bit_set_true(page, i);
@@ -342,7 +346,8 @@ pub fn max_leaf_idx_at_level(level: u8) -> u64 {
     }
     // 256^level - 1. Safe up to level 8 (256^8 = 2^64 overflows at
     // level 8). MAX_INDEX_LEVEL is 4 so no overflow concern here.
-    1u64.wrapping_shl(INDEX_SHIFT * level as u32).wrapping_sub(1)
+    1u64.wrapping_shl(INDEX_SHIFT * level as u32)
+        .wrapping_sub(1)
 }
 
 /// Given `leaf_idx` and the page's level, return the slot within this
@@ -437,10 +442,7 @@ mod tests {
                 assert_eq!(leaf_value_at(&p, i), L2pValue::ZERO);
             }
         }
-        assert_eq!(
-            leaf_entry_count(&p),
-            (LEAF_ENTRY_COUNT.div_ceil(7)) as u16
-        );
+        assert_eq!(leaf_entry_count(&p), (LEAF_ENTRY_COUNT.div_ceil(7)) as u16);
     }
 
     #[test]

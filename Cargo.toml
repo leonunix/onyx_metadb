@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Core runtime
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["deadlock_detection"] }
 crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
 dashmap = "6"
@@ -30,6 +30,8 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Serialization (metadata only; on-disk formats are hand-rolled)
 bytemuck = { version = "1.14", features = ["derive"] }
+rand = "0.8"
+rand_chacha = "0.3"
 
 # Errors / tracing
 thiserror = "1"
@@ -38,8 +40,6 @@ tracing = "0.1"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
-rand = "0.8"
-rand_chacha = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]

@@ -1,0 +1,43 @@
+[package]
+name = "onyx-metadb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+onyx-metadb = { path = ".." }
+
+[[bin]]
+name = "fuzz_wal_record_decode"
+path = "fuzz_targets/fuzz_wal_record_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_page_header_decode"
+path = "fuzz_targets/fuzz_page_header_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_manifest_body_decode"
+path = "fuzz_targets/fuzz_manifest_body_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bloom_bits_decode"
+path = "fuzz_targets/fuzz_bloom_bits_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

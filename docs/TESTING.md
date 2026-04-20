@@ -153,6 +153,24 @@ proptest! {
 - Pre-release: 100,000 cases × 10,000 ops with `paranoid`. As long as it
   takes.
 
+Phase-8a in-tree entrypoints:
+
+```bash
+METADB_PHASE8A_CASES=500 \
+METADB_PHASE8A_MIN_OPS=200 \
+METADB_PHASE8A_MAX_OPS=400 \
+cargo test --test db_phase6_proptest \
+  db_vs_reference_with_reopens_phase8a_budget \
+  -- --ignored
+
+METADB_PHASE8A_CASES=500 \
+METADB_PHASE8A_MIN_OPS=200 \
+METADB_PHASE8A_MAX_OPS=400 \
+cargo test --test db_phase6_proptest \
+  db_vs_reference_with_reopens_tiny_cache_phase8a_budget \
+  -- --ignored
+```
+
 ### Shrinking
 
 Proptest's built-in shrinking is mandatory — every failure must shrink to
@@ -217,20 +235,41 @@ Tracked in CI by an injection-point-hit matrix.
 
 ## 6. Fuzzing
 
-`cargo-fuzz` targets:
+Implemented `cargo-fuzz` targets in `fuzz/fuzz_targets/`:
 - `fuzz_wal_record_decode`: random bytes → decode → never panics.
-- `fuzz_page_decode`: random 4 KiB → decode → never panics; if valid,
-  round-trips.
-- `fuzz_manifest_decode`: random bytes → decode → never panics.
-- `fuzz_lsm_sst_decode`: random bytes → never panics; random-prefix
-  lookups return consistent results.
-- `fuzz_key_generator`: any sequence of u64 LBAs → never triggers panic
-  in B+tree.
+- `fuzz_page_header_decode`: random 4 KiB → page header + CRC verify →
+  never panics.
+- `fuzz_manifest_body_decode`: random 4 KiB → manifest body decoder →
+  never panics.
+- `fuzz_bloom_bits_decode`: random bytes → bloom filter bit decoder /
+  query path → never panics.
+
+Run with:
+
+```bash
+cargo check --manifest-path fuzz/Cargo.toml
+cargo fuzz run fuzz_wal_record_decode
+cargo fuzz run fuzz_page_header_decode
+cargo fuzz run fuzz_manifest_body_decode
+cargo fuzz run fuzz_bloom_bits_decode
+```
 
 Goal: zero panics on malformed input. Malformed input is expected (power
 failure during write); crashing the process on it is unacceptable.
 
 Run continuously on CI's fuzz runner, report findings as regressions.
+
+Phase-8a compaction stress entrypoints:
+
+```bash
+cargo test --test db_compaction_stress dedup_compaction_smoke_reopen_clean
+
+METADB_COMPACTION_TARGET_BYTES=$((10 * 1024 * 1024 * 1024)) \
+METADB_COMPACTION_VERIFY_EVERY=262144 \
+cargo test --test db_compaction_stress \
+  dedup_compaction_10gib_reaches_l3_and_stays_readable \
+  -- --ignored
+```
 
 ## 7. Stress / concurrency tests
 
@@ -254,6 +293,26 @@ A separate binary `onyx-metadb-soak` with:
 - Periodically triggers fault injection (if enabled).
 - Emits metrics (throughput, latency histograms, page cache hit rate).
 - Emits `summary.json` on exit with failure status.
+
+Current implementation ships as `metadb-soak` and uses a parent/child
+controller:
+- Child process runs the live `Db` workload with `parking_lot`
+  deadlock monitoring enabled.
+- Parent process maintains the in-memory reference model, drives worker
+  ops over IPC, kills the child with `SIGKILL` between cycles, reopens
+  the DB, and runs `metadb-verify --strict`.
+- `events.jsonl` captures cycle-level structured events; `summary.json`
+  captures the final result.
+
+Smoke command:
+
+```bash
+cargo run --bin metadb-soak -- /tmp/metadb-soak \
+  --duration-secs 60 \
+  --ops-per-cycle 10000 \
+  --threads 4 \
+  --fault-density-pct 25
+```
 
 Exit on first invariant violation. Log preserved for post-mortem.
 

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
 use onyx_metadb::{Config, Db, DedupValue, Hash32, L2pValue, MetaDbError};
 use proptest::prelude::*;
+use proptest::test_runner::TestRunner;
 use tempfile::TempDir;
 
 type L2pRef = BTreeMap<u64, L2pValue>;
@@ -232,11 +233,25 @@ fn assert_db_matches(
     Ok(())
 }
 
+fn quick_proptest_config() -> ProptestConfig {
+    ProptestConfig {
+        // Per-case cost is high (WAL fsync per op, reopens). Keep the
+        // default `cargo test` budget small, but make it overrideable
+        // so Phase 8a multi-hour runs can use the same test body.
+        cases: read_env_u32("METADB_PROPTEST_CASES", 16),
+        ..ProptestConfig::default()
+    }
+}
+
+fn read_env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 16,  // per-case cost is high (WAL fsync per op, reopens)
-        .. ProptestConfig::default()
-    })]
+    #![proptest_config(quick_proptest_config())]
 
     #[test]
     fn db_vs_reference_with_reopens(ops in proptest::collection::vec(arb_op(), 30..80)) {
@@ -251,6 +266,38 @@ proptest! {
         let dir = TempDir::new().unwrap();
         run_ops_with_config(&ops, &tiny_cache_config(dir.path()))?;
     }
+}
+
+#[test]
+#[ignore = "Phase 8a high-budget run: defaults to 500 cases x 200..400 ops"]
+fn db_vs_reference_with_reopens_phase8a_budget() {
+    run_phase8a_budget(false).unwrap();
+}
+
+#[test]
+#[ignore = "Phase 8a high-budget run: defaults to 500 cases x 200..400 ops, tiny cache"]
+fn db_vs_reference_with_reopens_tiny_cache_phase8a_budget() {
+    run_phase8a_budget(true).unwrap();
+}
+
+fn run_phase8a_budget(tiny_cache: bool) -> Result<(), TestCaseError> {
+    let cases = read_env_u32("METADB_PHASE8A_CASES", 500);
+    let min_ops = read_env_u32("METADB_PHASE8A_MIN_OPS", 200) as usize;
+    let max_ops = read_env_u32("METADB_PHASE8A_MAX_OPS", 400) as usize;
+    let strategy = proptest::collection::vec(arb_op(), min_ops..=max_ops);
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases,
+        ..ProptestConfig::default()
+    });
+    Ok(runner.run(&strategy, |ops| {
+        let dir = TempDir::new().unwrap();
+        let cfg = if tiny_cache {
+            tiny_cache_config(dir.path())
+        } else {
+            Config::new(dir.path())
+        };
+        run_ops_with_config(&ops, &cfg)
+    })?)
 }
 
 #[test]

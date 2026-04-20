@@ -86,40 +86,8 @@ pub fn read_level(page_store: &PageStore, head: PageId) -> Result<Vec<SstHandle>
     let mut cursor = head;
     while cursor != NULL_PAGE {
         let page = page_store.read_page(cursor)?;
-        let h = page.header()?;
-        if h.page_type != PageType::LsmLevels {
-            return Err(MetaDbError::Corruption(format!(
-                "page {cursor} expected to be LsmLevels, found {:?}",
-                h.page_type
-            )));
-        }
-        let p = page.payload();
-        let layout = u32::from_le_bytes(
-            p[OFF_LAYOUT_VERSION..OFF_LAYOUT_VERSION + 4]
-                .try_into()
-                .unwrap(),
-        );
-        if layout != LSM_LEVELS_LAYOUT_VERSION {
-            return Err(MetaDbError::Corruption(format!(
-                "LsmLevels page {cursor}: unknown layout version {layout}",
-            )));
-        }
-        let next = u64::from_le_bytes(p[OFF_NEXT_PAGE..OFF_NEXT_PAGE + 8].try_into().unwrap());
-        let count = u32::from_le_bytes(
-            p[OFF_HANDLE_COUNT..OFF_HANDLE_COUNT + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        if count > HANDLES_PER_PAGE {
-            return Err(MetaDbError::Corruption(format!(
-                "LsmLevels page {cursor}: handle_count {count} exceeds capacity {HANDLES_PER_PAGE}",
-            )));
-        }
-        let mut off = OFF_HANDLES_START;
-        for _ in 0..count {
-            out.push(decode_handle(&p[off..off + HANDLE_ENCODED_SIZE]));
-            off += HANDLE_ENCODED_SIZE;
-        }
+        let (next, handles) = decode_level_page(cursor, &page)?;
+        out.extend(handles);
         cursor = next;
     }
     Ok(out)
@@ -163,6 +131,45 @@ pub fn read_levels(page_store: &PageStore, heads: &[PageId]) -> Result<Vec<Vec<S
         .iter()
         .map(|&h| read_level(page_store, h))
         .collect::<Result<Vec<_>>>()
+}
+
+pub(crate) fn decode_level_page(page_id: PageId, page: &Page) -> Result<(PageId, Vec<SstHandle>)> {
+    let h = page.header()?;
+    if h.page_type != PageType::LsmLevels {
+        return Err(MetaDbError::Corruption(format!(
+            "page {page_id} expected to be LsmLevels, found {:?}",
+            h.page_type
+        )));
+    }
+    let p = page.payload();
+    let layout = u32::from_le_bytes(
+        p[OFF_LAYOUT_VERSION..OFF_LAYOUT_VERSION + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if layout != LSM_LEVELS_LAYOUT_VERSION {
+        return Err(MetaDbError::Corruption(format!(
+            "LsmLevels page {page_id}: unknown layout version {layout}",
+        )));
+    }
+    let next = u64::from_le_bytes(p[OFF_NEXT_PAGE..OFF_NEXT_PAGE + 8].try_into().unwrap());
+    let count = u32::from_le_bytes(
+        p[OFF_HANDLE_COUNT..OFF_HANDLE_COUNT + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    if count > HANDLES_PER_PAGE {
+        return Err(MetaDbError::Corruption(format!(
+            "LsmLevels page {page_id}: handle_count {count} exceeds capacity {HANDLES_PER_PAGE}",
+        )));
+    }
+    let mut handles = Vec::with_capacity(count);
+    let mut off = OFF_HANDLES_START;
+    for _ in 0..count {
+        handles.push(decode_handle(&p[off..off + HANDLE_ENCODED_SIZE]));
+        off += HANDLE_ENCODED_SIZE;
+    }
+    Ok((next, handles))
 }
 
 fn write_one_page(

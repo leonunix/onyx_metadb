@@ -182,6 +182,15 @@ impl Page {
         }
     }
 
+    /// Build a page directly from raw bytes. Intended for recovery and
+    /// fuzzing paths that need to inspect arbitrary on-disk images.
+    #[doc(hidden)]
+    pub fn from_raw_bytes(bytes: [u8; PAGE_SIZE]) -> Self {
+        Self {
+            bytes: Box::new(bytes),
+        }
+    }
+
     /// Create a page initialized with `header`. Not yet sealed — the caller
     /// is expected to populate the payload, then call `seal()` before
     /// writing to disk.

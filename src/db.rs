@@ -15,8 +15,6 @@ use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::btree::BTree;
-use crate::paged::{DiffEntry, L2pValue};
-use crate::paged::PagedL2p;
 use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
 use crate::error::{MetaDbError, Result};
@@ -26,9 +24,12 @@ use crate::manifest::{
     write_snapshot_roots_page,
 };
 use crate::page_store::PageStore;
-use crate::testing::faults::FaultController;
+use crate::paged::PagedL2p;
+use crate::paged::{DiffEntry, L2pValue};
+use crate::testing::faults::{FaultController, FaultPoint};
 use crate::tx::{ApplyOutcome, Transaction};
 use crate::types::{Lsn, PageId, Pba, SnapshotId};
+use crate::verify;
 use crate::wal::{Wal, WalOp, encode_body};
 
 /// Embedded metadata database.
@@ -84,6 +85,11 @@ struct Shard {
 
 struct L2pShard {
     tree: Mutex<PagedL2p>,
+}
+
+struct DedupManifestUpdate {
+    old_dedup_heads: Vec<PageId>,
+    old_dedup_reverse_heads: Vec<PageId>,
 }
 
 /// Iterator over a globally key-ordered range scan assembled from all
@@ -254,7 +260,9 @@ impl Db {
         let page_cache = Arc::new(PageCache::new(page_store.clone(), cfg.page_cache_bytes));
         let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
-            ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
+            ManifestStore::open_existing(page_store.clone(), faults.clone())?;
+        let reclaim_generation = manifest.checkpoint_lsn.max(1) + 1;
+        verify::reclaim_orphan_pages(&page_store, &manifest, reclaim_generation)?;
         if manifest.shard_roots.is_empty() {
             return Err(MetaDbError::Corruption(
                 "manifest has no shard roots; database was not initialized".into(),
@@ -267,8 +275,11 @@ impl Db {
         // Materialize them so open returns a fully-populated v4 layout.
         let mut manifest_dirty = false;
         if manifest.refcount_shard_roots.is_empty() {
-            let (_owned, roots) =
-                create_shards(page_store.clone(), page_cache.clone(), manifest.shard_count())?;
+            let (_owned, roots) = create_shards(
+                page_store.clone(),
+                page_cache.clone(),
+                manifest.shard_count(),
+            )?;
             manifest.refcount_shard_roots = roots;
             manifest_dirty = true;
             // Note: the Shard handles are discarded here; we rebuild
@@ -393,21 +404,10 @@ impl Db {
 
         let tree_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
         let wal_checkpoint = *self.last_applied_lsn.lock();
-
-        // Flush each LSM's memtable to an L0 SST BEFORE advancing
-        // `checkpoint_lsn`. Without this, a memtable put at LSN
-        // `L <= checkpoint_lsn` would be reflected neither in SSTs
-        // (memtable never spilled) nor in WAL replay (replay starts at
-        // `checkpoint_lsn + 1`), and the write would silently vanish
-        // on reopen.
-        self.dedup_index.flush_memtable(tree_generation)?;
-        self.dedup_reverse.flush_memtable(tree_generation)?;
-
-        let old_dedup_heads: Vec<PageId> = manifest_state.manifest.dedup_level_heads.to_vec();
-        let old_dedup_reverse_heads: Vec<PageId> =
-            manifest_state.manifest.dedup_reverse_level_heads.to_vec();
-        let new_dedup_heads = self.dedup_index.persist_levels(tree_generation)?;
-        let new_dedup_reverse_heads = self.dedup_reverse.persist_levels(tree_generation)?;
+        let dedup_update =
+            self.prepare_dedup_manifest_update(&mut manifest_state.manifest, tree_generation)?;
+        self.faults
+            .inject(FaultPoint::FlushPostLevelRewriteBeforeManifest)?;
 
         self.refresh_manifest_from_locked(
             &mut manifest_state.manifest,
@@ -417,17 +417,9 @@ impl Db {
         // The tree generation is a local monotonic counter; checkpoint
         // LSN must be the durable WAL LSN, not the tree counter.
         manifest_state.manifest.checkpoint_lsn = wal_checkpoint;
-        manifest_state.manifest.dedup_level_heads = new_dedup_heads.clone().into_boxed_slice();
-        manifest_state.manifest.dedup_reverse_level_heads =
-            new_dedup_reverse_heads.clone().into_boxed_slice();
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
-
-        // Commit succeeded; free the old level chains for both LSMs.
-        self.dedup_index
-            .free_old_level_heads(&old_dedup_heads, tree_generation)?;
-        self.dedup_reverse
-            .free_old_level_heads(&old_dedup_reverse_heads, tree_generation)?;
+        self.finish_dedup_manifest_update(dedup_update, tree_generation)?;
         Ok(())
     }
 
@@ -452,10 +444,13 @@ impl Db {
         let body = encode_body(ops);
         let _guard = self.commit_lock.lock();
         let lsn = self.wal.submit(body)?;
+        self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
         let mut outcomes = Vec::with_capacity(ops.len());
         for op in ops {
             outcomes.push(self.apply_op(op)?);
         }
+        self.faults
+            .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
         *self.last_applied_lsn.lock() = lsn;
         Ok((lsn, outcomes))
     }
@@ -646,6 +641,8 @@ impl Db {
 
         self.flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_locked_refcount_shards(&mut refcount_guards)?;
+        let dedup_update =
+            self.prepare_dedup_manifest_update(&mut manifest_state.manifest, created_lsn)?;
         self.refresh_manifest_from_locked(
             &mut manifest_state.manifest,
             &l2p_guards,
@@ -665,6 +662,7 @@ impl Db {
             .ok_or_else(|| MetaDbError::Corruption("snapshot id overflow".into()))?;
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
+        self.finish_dedup_manifest_update(dedup_update, created_lsn)?;
         Ok(id)
     }
 
@@ -751,6 +749,9 @@ impl Db {
         let mut refcount_guards = self.lock_all_refcount_shards();
         self.flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_locked_refcount_shards(&mut refcount_guards)?;
+        let tree_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        let dedup_update =
+            self.prepare_dedup_manifest_update(&mut manifest_state.manifest, tree_generation)?;
         manifest_state.manifest.snapshots.remove(pos);
         self.refresh_manifest_from_locked(
             &mut manifest_state.manifest,
@@ -760,6 +761,7 @@ impl Db {
         manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
+        self.finish_dedup_manifest_update(dedup_update, tree_generation)?;
 
         let mut values = Vec::new();
         for (tree, root) in l2p_guards
@@ -808,6 +810,45 @@ impl Db {
         (xxh3_64(&pba.to_be_bytes()) as usize) % self.refcount_shards.len()
     }
 
+    fn prepare_dedup_manifest_update(
+        &self,
+        manifest: &mut Manifest,
+        generation: Lsn,
+    ) -> Result<DedupManifestUpdate> {
+        // Any manifest commit that advances checkpoint_lsn must first
+        // make the dedup memtables durable, otherwise replay would skip
+        // WAL-applied rows that only existed in RAM.
+        self.dedup_index.flush_memtable(generation)?;
+        self.dedup_reverse.flush_memtable(generation)?;
+
+        let old_dedup_heads = manifest.dedup_level_heads.to_vec();
+        let old_dedup_reverse_heads = manifest.dedup_reverse_level_heads.to_vec();
+        manifest.dedup_level_heads = self
+            .dedup_index
+            .persist_levels(generation)?
+            .into_boxed_slice();
+        manifest.dedup_reverse_level_heads = self
+            .dedup_reverse
+            .persist_levels(generation)?
+            .into_boxed_slice();
+        Ok(DedupManifestUpdate {
+            old_dedup_heads,
+            old_dedup_reverse_heads,
+        })
+    }
+
+    fn finish_dedup_manifest_update(
+        &self,
+        update: DedupManifestUpdate,
+        generation: Lsn,
+    ) -> Result<()> {
+        self.dedup_index
+            .free_old_level_heads(&update.old_dedup_heads, generation)?;
+        self.dedup_reverse
+            .free_old_level_heads(&update.old_dedup_reverse_heads, generation)?;
+        Ok(())
+    }
+
     fn lock_all_l2p_shards(&self) -> Vec<MutexGuard<'_, PagedL2p>> {
         self.shards.iter().map(|shard| shard.tree.lock()).collect()
     }
@@ -819,20 +860,14 @@ impl Db {
             .collect()
     }
 
-    fn flush_locked_l2p_shards(
-        &self,
-        guards: &mut [MutexGuard<'_, PagedL2p>],
-    ) -> Result<()> {
+    fn flush_locked_l2p_shards(&self, guards: &mut [MutexGuard<'_, PagedL2p>]) -> Result<()> {
         for tree in guards {
             tree.flush()?;
         }
         Ok(())
     }
 
-    fn flush_locked_refcount_shards(
-        &self,
-        guards: &mut [MutexGuard<'_, BTree>],
-    ) -> Result<()> {
+    fn flush_locked_refcount_shards(&self, guards: &mut [MutexGuard<'_, BTree>]) -> Result<()> {
         for tree in guards {
             tree.flush()?;
         }
@@ -1040,7 +1075,8 @@ fn open_l2p_shards(
 }
 
 fn lsm_config_from_cfg(cfg: &Config) -> LsmConfig {
-    let target_sst_records = ((cfg.lsm_memtable_bytes as usize) / crate::lsm::LSM_RECORD_SIZE).max(1);
+    let target_sst_records =
+        ((cfg.lsm_memtable_bytes as usize) / crate::lsm::LSM_RECORD_SIZE).max(1);
     LsmConfig {
         memtable_bytes: cfg.lsm_memtable_bytes as usize,
         bits_per_entry: cfg.lsm_bloom_bits_per_entry,
@@ -1569,11 +1605,17 @@ mod tests {
         assert!(db.flush_dedup_memtable().unwrap());
 
         let cold = db.cache_stats();
-        assert_eq!(db.get_dedup(&h(12_345)).unwrap(), Some(dv((12_345 % 251) as u8)));
+        assert_eq!(
+            db.get_dedup(&h(12_345)).unwrap(),
+            Some(dv((12_345 % 251) as u8))
+        );
         let after_first = db.cache_stats();
         assert!(after_first.misses > cold.misses);
 
-        assert_eq!(db.get_dedup(&h(12_345)).unwrap(), Some(dv((12_345 % 251) as u8)));
+        assert_eq!(
+            db.get_dedup(&h(12_345)).unwrap(),
+            Some(dv((12_345 % 251) as u8))
+        );
         let after_second = db.cache_stats();
         assert!(after_second.hits > after_first.hits);
 

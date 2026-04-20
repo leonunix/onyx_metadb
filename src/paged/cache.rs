@@ -17,9 +17,7 @@ use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageType};
 use crate::page_store::PageStore;
-use crate::paged::format::{
-    index_collect_children, init_index, init_leaf, page_level,
-};
+use crate::paged::format::{index_collect_children, init_index, init_leaf, page_level};
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
 /// Cache entry.
@@ -326,9 +324,7 @@ impl PageBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paged::format::{
-        L2pValue, index_child_at, index_set_child, leaf_bit_set, leaf_set,
-    };
+    use crate::paged::format::{L2pValue, index_child_at, index_set_child, leaf_bit_set, leaf_set};
     use tempfile::TempDir;
 
     fn mk_store() -> (TempDir, Arc<PageStore>) {

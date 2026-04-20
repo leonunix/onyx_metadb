@@ -188,7 +188,11 @@ impl BTree {
                 };
                 for (i, child) in children.into_iter().enumerate() {
                     let child_lo = if i == 0 { u64::MIN } else { keys[i - 1] };
-                    let child_hi = if i == keys.len() { u64::MAX } else { keys[i] - 1 };
+                    let child_hi = if i == keys.len() {
+                        u64::MAX
+                    } else {
+                        keys[i] - 1
+                    };
                     // Prune: skip subtrees whose entire key range is
                     // outside [lo, hi].
                     if !range_overlaps(lo, hi, child_lo, child_hi) {
@@ -343,7 +347,12 @@ impl BTree {
         // Fell off the root: grow the tree by one level.
         let old_root = self.root;
         let new_root = self.buf.alloc_internal(generation, old_root)?;
-        internal_insert(self.buf.modify(new_root, generation)?, 0, sep_key, right_child)?;
+        internal_insert(
+            self.buf.modify(new_root, generation)?,
+            0,
+            sep_key,
+            right_child,
+        )?;
         self.root = new_root;
         Ok(())
     }
@@ -479,7 +488,11 @@ impl BTree {
             // Find a sibling. Prefer borrowing from the left sibling,
             // fall back to the right, merge as last resort.
             let parent_key_count = internal_key_count(self.buf.read(parent)?);
-            let left_idx = if child_slot > 0 { Some(child_slot - 1) } else { None };
+            let left_idx = if child_slot > 0 {
+                Some(child_slot - 1)
+            } else {
+                None
+            };
             let right_idx = if child_slot < parent_key_count {
                 Some(child_slot + 1)
             } else {
@@ -584,10 +597,7 @@ impl BTree {
                 // with the parent separator; prepend to child.
                 let sep = internal_key_at(self.buf.read(parent)?, child_slot - 1);
                 let last_key_idx = internal_key_count(self.buf.read(left_sibling)?) - 1;
-                let last_child = internal_child_at(
-                    self.buf.read(left_sibling)?,
-                    last_key_idx + 1,
-                );
+                let last_child = internal_child_at(self.buf.read(left_sibling)?, last_key_idx + 1);
                 let last_key = internal_key_at(self.buf.read(left_sibling)?, last_key_idx);
                 internal_push_front(self.buf.modify(child, generation)?, sep, last_child)?;
                 internal_remove(self.buf.modify(left_sibling, generation)?, last_key_idx)?;
@@ -701,7 +711,10 @@ impl BTree {
 
     fn advance_gen(&mut self) -> Lsn {
         let g = self.next_gen;
-        self.next_gen = self.next_gen.checked_add(1).expect("btree: next_gen overflow");
+        self.next_gen = self
+            .next_gen
+            .checked_add(1)
+            .expect("btree: next_gen overflow");
         g
     }
 
@@ -846,11 +859,7 @@ mod tests {
         for i in 0..100u64 {
             t.insert(i, i as u32).unwrap();
         }
-        let got: Vec<(u64, u32)> = t
-            .range(10..=20)
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let got: Vec<(u64, u32)> = t.range(10..=20).unwrap().map(|r| r.unwrap()).collect();
         let expected: Vec<(u64, u32)> = (10..=20).map(|i| (i, i as u32)).collect();
         assert_eq!(got, expected);
     }
