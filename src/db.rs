@@ -474,6 +474,32 @@ impl Db {
         Ok(tree.get(pba)?.unwrap_or(0))
     }
 
+    /// Batched refcount lookup. Groups `pbas` by shard, locks each shard
+    /// once, and reads every PBA that falls to it before moving on. Output
+    /// order matches input order; duplicates produce repeated results.
+    /// Unmapped PBAs read back as `0`, same as [`get_refcount`].
+    pub fn multi_get_refcount(&self, pbas: &[Pba]) -> Result<Vec<u32>> {
+        if pbas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let shard_count = self.refcount_shards.len();
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
+        for (idx, pba) in pbas.iter().enumerate() {
+            buckets[self.refcount_shard_for(*pba)].push(idx);
+        }
+        let mut out: Vec<u32> = vec![0; pbas.len()];
+        for (sid, idxs) in buckets.into_iter().enumerate() {
+            if idxs.is_empty() {
+                continue;
+            }
+            let mut tree = self.refcount_shards[sid].tree.lock();
+            for idx in idxs {
+                out[idx] = tree.get(pbas[idx])?.unwrap_or(0);
+            }
+        }
+        Ok(out)
+    }
+
     /// Increment `pba`'s refcount by `delta`. Returns the new value.
     /// `delta == 0` is a no-op that still performs a lookup.
     pub fn incref_pba(&self, pba: Pba, delta: u32) -> Result<u32> {
@@ -519,6 +545,13 @@ impl Db {
         self.dedup_index.get(hash)
     }
 
+    /// Batched dedup index lookup. Shares one LSM reader-drain and one
+    /// `levels` snapshot across all hashes. Output order matches input
+    /// order; duplicates produce repeated results.
+    pub fn multi_get_dedup(&self, hashes: &[Hash32]) -> Result<Vec<Option<DedupValue>>> {
+        self.dedup_index.multi_get(hashes)
+    }
+
     // -------- dedup_reverse operations ----------------------------------
 
     /// Register `hash` as mapped to `pba` in the reverse index. This
@@ -554,6 +587,32 @@ impl Db {
             .collect())
     }
 
+    /// Batched `dedup_reverse` prefix scan: one call per PBA, one
+    /// reader-drain acquisition and one `levels` snapshot shared across
+    /// all PBAs. Returns one `Vec<Hash32>` per input PBA, in input order.
+    ///
+    /// Intended caller: writer / dedup cleanup path sweeping dead PBAs
+    /// in a single batch (see onyx-storage `cleanup_dedup_for_pbas_batch`).
+    pub fn multi_scan_dedup_reverse_for_pba(
+        &self,
+        pbas: &[Pba],
+    ) -> Result<Vec<Vec<Hash32>>> {
+        if pbas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefixes: Vec<[u8; 8]> = pbas.iter().map(|pba| pba.to_be_bytes()).collect();
+        let prefix_refs: Vec<&[u8]> = prefixes.iter().map(|p| p.as_slice()).collect();
+        let rows_per_pba = self.dedup_reverse.multi_scan_prefix(&prefix_refs)?;
+        Ok(rows_per_pba
+            .into_iter()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(key, value)| decode_reverse_hash(&key, &value))
+                    .collect()
+            })
+            .collect())
+    }
+
     /// `true` if the dedup memtable has reached its freeze threshold.
     pub fn dedup_should_flush(&self) -> bool {
         self.dedup_index.should_flush()
@@ -579,6 +638,31 @@ impl Db {
         let sid = self.shard_for(key);
         let mut tree = self.shards[sid].tree.lock();
         tree.get(key)
+    }
+
+    /// Batched L2P lookup. Groups `keys` by shard, locks each shard once,
+    /// and reads every key that falls to it before moving on. Output
+    /// order matches input order; duplicates produce repeated results.
+    pub fn multi_get(&self, keys: &[u64]) -> Result<Vec<Option<L2pValue>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let shard_count = self.shards.len();
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
+        for (idx, key) in keys.iter().enumerate() {
+            buckets[self.shard_for(*key)].push(idx);
+        }
+        let mut out: Vec<Option<L2pValue>> = vec![None; keys.len()];
+        for (sid, idxs) in buckets.into_iter().enumerate() {
+            if idxs.is_empty() {
+                continue;
+            }
+            let mut tree = self.shards[sid].tree.lock();
+            for idx in idxs {
+                out[idx] = tree.get(keys[idx])?;
+            }
+        }
+        Ok(out)
     }
 
     pub fn insert(&self, key: u64, value: L2pValue) -> Result<Option<L2pValue>> {
@@ -1958,5 +2042,100 @@ mod tests {
         let mut expected = vec![h_a, h_b, hash_full(77, 3)];
         expected.sort();
         assert_eq!(found, expected);
+    }
+
+    // -------- batch read API --------------------------------------------
+
+    #[test]
+    fn multi_get_empty_input_returns_empty() {
+        let (_d, db) = mk_db();
+        assert!(db.multi_get(&[]).unwrap().is_empty());
+        assert!(db.multi_get_refcount(&[]).unwrap().is_empty());
+        assert!(db.multi_get_dedup(&[]).unwrap().is_empty());
+        assert!(db.multi_scan_dedup_reverse_for_pba(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn multi_get_matches_single_gets_across_shards() {
+        // 4 shards so we actually exercise the bucket + group logic.
+        let (_d, db) = mk_db_with_shards(4);
+        for i in 0u64..200 {
+            db.insert(i, v((i as u8).wrapping_mul(3))).unwrap();
+        }
+        // Mix mapped + unmapped + duplicate keys, in non-sorted order.
+        let keys = vec![199, 5000, 0, 199, 42, 10_000, 1, 42];
+        let got = db.multi_get(&keys).unwrap();
+        assert_eq!(got.len(), keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(got[i], db.get(*key).unwrap(), "key {key} mismatch");
+        }
+    }
+
+    #[test]
+    fn multi_get_refcount_matches_single_gets_across_shards() {
+        let (_d, db) = mk_db_with_shards(4);
+        for pba in 0u64..100 {
+            db.incref_pba(pba, (pba as u32 % 5) + 1).unwrap();
+        }
+        let pbas: Vec<Pba> = vec![99, 0, 50, 9999, 42, 50, 1, 2, 9999];
+        let got = db.multi_get_refcount(&pbas).unwrap();
+        assert_eq!(got.len(), pbas.len());
+        for (i, pba) in pbas.iter().enumerate() {
+            assert_eq!(
+                got[i],
+                db.get_refcount(*pba).unwrap(),
+                "pba {pba} mismatch",
+            );
+        }
+    }
+
+    #[test]
+    fn multi_get_dedup_hits_memtable_and_sst() {
+        let (_d, db) = mk_db();
+        // First half lands in L0 after the flush; second half stays in
+        // the memtable. Makes sure the multi-key path walks both.
+        for i in 0u64..40 {
+            db.put_dedup(h(i), dv(i as u8)).unwrap();
+        }
+        assert!(db.flush_dedup_memtable().unwrap());
+        for i in 40u64..80 {
+            db.put_dedup(h(i), dv(i as u8)).unwrap();
+        }
+        // Include a tombstoned key and an unknown key.
+        db.delete_dedup(h(5)).unwrap();
+        let hashes = vec![h(0), h(5), h(39), h(40), h(79), h(999), h(0)];
+        let got = db.multi_get_dedup(&hashes).unwrap();
+        assert_eq!(got.len(), hashes.len());
+        for (i, hash) in hashes.iter().enumerate() {
+            assert_eq!(got[i], db.get_dedup(hash).unwrap(), "hash {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn multi_scan_dedup_reverse_preserves_order_and_per_pba_rows() {
+        let (_d, db) = mk_db();
+        // pba=10 has two hashes, pba=20 has three, pba=30 has zero.
+        // Flush some to force the cross-layer code path (memtable +
+        // SST) for at least one PBA.
+        db.register_dedup_reverse(10, hash_full(10, 1)).unwrap();
+        db.register_dedup_reverse(10, hash_full(10, 2)).unwrap();
+        let flush_lsn = db.last_applied_lsn();
+        db.dedup_reverse.flush_memtable(flush_lsn).unwrap();
+        db.register_dedup_reverse(20, hash_full(20, 1)).unwrap();
+        db.register_dedup_reverse(20, hash_full(20, 2)).unwrap();
+        db.register_dedup_reverse(20, hash_full(20, 3)).unwrap();
+
+        // Include a repeated PBA to make sure the batched impl doesn't
+        // de-duplicate or collapse results.
+        let pbas: Vec<Pba> = vec![30, 20, 10, 20];
+        let batched = db.multi_scan_dedup_reverse_for_pba(&pbas).unwrap();
+        assert_eq!(batched.len(), pbas.len());
+        for (i, pba) in pbas.iter().enumerate() {
+            let mut expected = db.scan_dedup_reverse_for_pba(*pba).unwrap();
+            let mut got = batched[i].clone();
+            expected.sort();
+            got.sort();
+            assert_eq!(got, expected, "pba {pba} mismatch");
+        }
     }
 }

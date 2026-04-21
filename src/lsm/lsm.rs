@@ -165,6 +165,29 @@ impl Lsm {
         // Hold the drain lock through the whole lookup so compaction
         // cannot free victim SST pages while we are still reading them.
         let _drain = self.reader_drain.read();
+        self.lookup_locked(hash)
+    }
+
+    /// Batched point lookup. Shares one `reader_drain` acquisition and
+    /// one `levels` snapshot across all input hashes, avoiding the
+    /// re-snapshot cost the single-key `get` pays per call.
+    ///
+    /// Output order matches input order. Duplicate hashes produce
+    /// repeated results (no de-dup on the caller's behalf).
+    pub fn multi_get(&self, hashes: &[Hash32]) -> Result<Vec<Option<DedupValue>>> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _drain = self.reader_drain.read();
+        let snapshot = self.levels.read().clone();
+        let mut out = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            out.push(self.lookup_with_snapshot(hash, &snapshot)?);
+        }
+        Ok(out)
+    }
+
+    fn lookup_locked(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
         match self.memtable.get(hash) {
             LookupResult::Hit(v) => return Ok(Some(v)),
             LookupResult::Tombstone => return Ok(None),
@@ -174,12 +197,31 @@ impl Lsm {
         // `Copy`, so cloning is cheap; the main cost is the underlying
         // Vec allocations.
         let snapshot = self.levels.read().clone();
+        self.search_levels(hash, &snapshot)
+    }
+
+    fn lookup_with_snapshot(
+        &self,
+        hash: &Hash32,
+        snapshot: &[Vec<SstHandle>],
+    ) -> Result<Option<DedupValue>> {
+        match self.memtable.get(hash) {
+            LookupResult::Hit(v) => return Ok(Some(v)),
+            LookupResult::Tombstone => return Ok(None),
+            LookupResult::Miss => {}
+        }
+        self.search_levels(hash, snapshot)
+    }
+
+    fn search_levels(
+        &self,
+        hash: &Hash32,
+        snapshot: &[Vec<SstHandle>],
+    ) -> Result<Option<DedupValue>> {
         for (level_idx, handles) in snapshot.iter().enumerate() {
             let result = if level_idx == 0 {
-                // L0 SSTs may overlap in hash range. Newest first.
                 self.find_in_overlapping(handles.iter().rev(), hash)?
             } else {
-                // L1+ SSTs are disjoint. At most one can match.
                 self.find_in_disjoint(handles, hash)?
             };
             match result {
@@ -330,6 +372,39 @@ impl Lsm {
     /// optimal — a real range iterator lands in phase 8.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Hash32, DedupValue)>> {
         let _drain = self.reader_drain.read();
+        let snapshot = self.levels.read().clone();
+        self.scan_prefix_with_snapshot(prefix, &snapshot)
+    }
+
+    /// Batched prefix scan. Shares `reader_drain` and `levels` snapshot
+    /// across all input prefixes. Output order matches input order; each
+    /// output Vec is the result of the corresponding prefix scan.
+    ///
+    /// Single-prefix cost is unchanged; the saving comes from amortising
+    /// snapshot allocation and the drain lock across many prefixes. For
+    /// the intended caller (dedup cleanup of N dead PBAs) that is a
+    /// measurable win when N grows.
+    pub fn multi_scan_prefix(
+        &self,
+        prefixes: &[&[u8]],
+    ) -> Result<Vec<Vec<(Hash32, DedupValue)>>> {
+        if prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _drain = self.reader_drain.read();
+        let snapshot = self.levels.read().clone();
+        let mut out = Vec::with_capacity(prefixes.len());
+        for prefix in prefixes {
+            out.push(self.scan_prefix_with_snapshot(prefix, &snapshot)?);
+        }
+        Ok(out)
+    }
+
+    fn scan_prefix_with_snapshot(
+        &self,
+        prefix: &[u8],
+        snapshot: &[Vec<SstHandle>],
+    ) -> Result<Vec<(Hash32, DedupValue)>> {
         use std::collections::BTreeMap;
         // `seen` maps key → Option<DedupValue>. Some = live put, None
         // = tombstone. First insertion wins (newest layer).
@@ -344,7 +419,6 @@ impl Lsm {
         }
 
         // SSTs, newest-to-oldest.
-        let snapshot = self.levels.read().clone();
         for (level_idx, handles) in snapshot.iter().enumerate() {
             let ordered: Vec<SstHandle> = if level_idx == 0 {
                 handles.iter().rev().copied().collect()
@@ -854,5 +928,80 @@ mod tests {
         }
         // Levels should have stabilised (L0 below trigger).
         assert!(lsm.levels_snapshot()[0].len() < small_cfg().l0_sst_count_trigger);
+    }
+
+    // -------- batch read API --------------------------------------------
+
+    #[test]
+    fn multi_get_matches_single_gets_mixed_layers() {
+        let (_d, _ps, lsm) = mk_lsm();
+        // First batch flushes to L0; second batch stays in the memtable.
+        for i in 0u64..32 {
+            lsm.put(h(i), v(i as u8));
+        }
+        lsm.flush_memtable(1).unwrap();
+        for i in 32u64..64 {
+            lsm.put(h(i), v(i as u8));
+        }
+        // Tombstone one of each layer's keys.
+        lsm.delete(h(5));
+        lsm.delete(h(40));
+
+        let hashes = vec![h(0), h(5), h(31), h(32), h(40), h(63), h(999), h(0)];
+        let got = lsm.multi_get(&hashes).unwrap();
+        assert_eq!(got.len(), hashes.len());
+        for (i, hash) in hashes.iter().enumerate() {
+            assert_eq!(got[i], lsm.get(hash).unwrap(), "hash {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn multi_get_empty_input_returns_empty() {
+        let (_d, _ps, lsm) = mk_lsm();
+        lsm.put(h(1), v(1));
+        assert!(lsm.multi_get(&[]).unwrap().is_empty());
+        assert!(lsm.multi_scan_prefix(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn multi_scan_prefix_matches_single_prefix_scans() {
+        let (_d, _ps, lsm) = mk_lsm();
+        // Group A (prefix 0x00..00..01) — 3 entries, partially flushed.
+        let prefix_a = [0u8; 1];
+        let mut key_a = |n: u64| {
+            let mut h = [0u8; 32];
+            h[0] = prefix_a[0];
+            h[1..9].copy_from_slice(&n.to_be_bytes());
+            h
+        };
+        lsm.put(key_a(1), v(1));
+        lsm.put(key_a(2), v(2));
+        lsm.flush_memtable(1).unwrap();
+        lsm.put(key_a(3), v(3));
+
+        // Group B (prefix 0x42) — 2 entries, entirely in memtable.
+        let mut key_b = |n: u64| {
+            let mut h = [0u8; 32];
+            h[0] = 0x42;
+            h[1..9].copy_from_slice(&n.to_be_bytes());
+            h
+        };
+        lsm.put(key_b(10), v(10));
+        lsm.put(key_b(20), v(20));
+
+        // Group C (prefix 0xFF) — empty.
+        let prefix_c = [0xFFu8; 1];
+
+        let prefix_b = [0x42u8; 1];
+        let prefixes: Vec<&[u8]> = vec![&prefix_a, &prefix_b, &prefix_c];
+        let batched = lsm.multi_scan_prefix(&prefixes).unwrap();
+        assert_eq!(batched.len(), 3);
+        for (i, prefix) in prefixes.iter().enumerate() {
+            let mut expected = lsm.scan_prefix(prefix).unwrap();
+            let mut got = batched[i].clone();
+            expected.sort_by_key(|(k, _)| *k);
+            got.sort_by_key(|(k, _)| *k);
+            assert_eq!(got, expected, "prefix {i} mismatch");
+        }
     }
 }
