@@ -2138,4 +2138,35 @@ mod tests {
             assert_eq!(got, expected, "pba {pba} mismatch");
         }
     }
+
+    #[test]
+    fn multi_scan_dedup_reverse_hides_tombstoned_rows_explicitly() {
+        let (_d, db) = mk_db();
+        let p10_a = hash_full(10, 1);
+        let p10_b = hash_full(10, 2);
+        let p10_c = hash_full(10, 3);
+        let p20_a = hash_full(20, 1);
+
+        // Oldest persisted layer.
+        db.register_dedup_reverse(10, p10_a).unwrap();
+        db.register_dedup_reverse(10, p10_b).unwrap();
+        db.register_dedup_reverse(20, p20_a).unwrap();
+        let flush_lsn = db.last_applied_lsn();
+        db.dedup_reverse.flush_memtable(flush_lsn).unwrap();
+
+        // Newer memtable updates: remove one old row, add a new one.
+        db.unregister_dedup_reverse(10, p10_a).unwrap();
+        db.register_dedup_reverse(10, p10_c).unwrap();
+
+        let pbas: Vec<Pba> = vec![10, 20, 30, 10];
+        let mut got = db.multi_scan_dedup_reverse_for_pba(&pbas).unwrap();
+        for rows in &mut got {
+            rows.sort();
+        }
+
+        assert_eq!(got[0], vec![p10_b, p10_c]);
+        assert_eq!(got[1], vec![p20_a]);
+        assert!(got[2].is_empty());
+        assert_eq!(got[3], vec![p10_b, p10_c]);
+    }
 }

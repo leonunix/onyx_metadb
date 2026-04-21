@@ -968,7 +968,7 @@ mod tests {
         let (_d, _ps, lsm) = mk_lsm();
         // Group A (prefix 0x00..00..01) — 3 entries, partially flushed.
         let prefix_a = [0u8; 1];
-        let mut key_a = |n: u64| {
+        let key_a = |n: u64| {
             let mut h = [0u8; 32];
             h[0] = prefix_a[0];
             h[1..9].copy_from_slice(&n.to_be_bytes());
@@ -980,7 +980,7 @@ mod tests {
         lsm.put(key_a(3), v(3));
 
         // Group B (prefix 0x42) — 2 entries, entirely in memtable.
-        let mut key_b = |n: u64| {
+        let key_b = |n: u64| {
             let mut h = [0u8; 32];
             h[0] = 0x42;
             h[1..9].copy_from_slice(&n.to_be_bytes());
@@ -1003,5 +1003,62 @@ mod tests {
             got.sort_by_key(|(k, _)| *k);
             assert_eq!(got, expected, "prefix {i} mismatch");
         }
+    }
+
+    #[test]
+    fn scan_prefix_explicitly_resolves_shadowing_and_tombstones() {
+        let (_d, _ps, lsm) = mk_lsm();
+
+        fn prefixed(prefix: u8, n: u64) -> Hash32 {
+            let mut h = [0u8; 32];
+            h[0] = prefix;
+            h[1..9].copy_from_slice(&n.to_be_bytes());
+            h
+        }
+
+        let prefix_a = [0x11u8; 1];
+        let prefix_b = [0x22u8; 1];
+
+        let a1 = prefixed(prefix_a[0], 1);
+        let a2 = prefixed(prefix_a[0], 2);
+        let a3 = prefixed(prefix_a[0], 3);
+        let a4 = prefixed(prefix_a[0], 4);
+        let a5 = prefixed(prefix_a[0], 5);
+        let b1 = prefixed(prefix_b[0], 1);
+
+        // Oldest layer.
+        lsm.put(a1, v(1));
+        lsm.put(a2, v(2));
+        lsm.put(a3, v(3));
+        lsm.put(b1, v(9));
+        lsm.flush_memtable(1).unwrap();
+
+        // Newer flushed layer.
+        lsm.put(a1, v(11)); // overwrite older put
+        lsm.delete(a2); // tombstone older put
+        lsm.put(a4, v(4)); // brand-new key
+        lsm.flush_memtable(2).unwrap();
+
+        // Newest memtable layer.
+        lsm.delete(a3); // tombstone only lives in memtable
+        lsm.put(a5, v(5));
+
+        let mut got_a = lsm.scan_prefix(&prefix_a).unwrap();
+        got_a.sort_by_key(|(k, _)| *k);
+        let mut expected_a = vec![(a1, v(11)), (a4, v(4)), (a5, v(5))];
+        expected_a.sort_by_key(|(k, _)| *k);
+        assert_eq!(got_a, expected_a);
+
+        let mut got_b = lsm.scan_prefix(&prefix_b).unwrap();
+        got_b.sort_by_key(|(k, _)| *k);
+        assert_eq!(got_b, vec![(b1, v(9))]);
+
+        let mut batched = lsm
+            .multi_scan_prefix(&[&prefix_a[..], &prefix_b[..]])
+            .unwrap();
+        batched[0].sort_by_key(|(k, _)| *k);
+        batched[1].sort_by_key(|(k, _)| *k);
+        assert_eq!(batched[0], expected_a);
+        assert_eq!(batched[1], vec![(b1, v(9))]);
     }
 }

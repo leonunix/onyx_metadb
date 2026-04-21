@@ -702,6 +702,17 @@ first.
   no duplicates and no overlap with live pages, asserts each live
   page's refcount matches the count of pages that point to it.
   Also the primary debugging tool for Phase 7.
+- **Read-side batch APIs for integration hot paths**:
+  `Lsm::multi_get`, `Lsm::multi_scan_prefix`,
+  `Db::multi_get`, `Db::multi_get_refcount`,
+  `Db::multi_get_dedup`, and
+  `Db::multi_scan_dedup_reverse_for_pba`. These share the single-key
+  lookup implementation where possible, amortise shard / level
+  snapshots across a batch, and land with dedicated tests for
+  ordering, duplicates, mixed memtable+SST / cross-shard paths, and
+  explicit tombstone / shadowing semantics. The point is to remove
+  "did the new batch helper misread metadata?" from the Phase-7
+  debugging surface before Onyx starts leaning on those paths.
 - **Lock-order audit**: enable `parking_lot::deadlock::check_deadlock`
   in the soak harness's monitor thread; fail the run if a cycle is
   detected. Folded in here rather than given its own line-item
