@@ -4,17 +4,22 @@
 //! together as a single WAL record. The commit path is:
 //!
 //! 1. Serialize the ops into a record body.
-//! 2. Submit the body to the WAL; wait for fsync.
-//! 3. Apply every op to in-memory state under a global commit lock.
-//! 4. Return the LSN (and, for auto-commit wrappers, any per-op
+//! 2. Submit the body to the WAL (no Db-level lock held). Multiple
+//!    concurrent submits coalesce into one group-commit fsync.
+//! 3. Wait on `commit_cvar` until every lower LSN has applied, then
+//!    apply our ops under `apply_gate.read()`.
+//! 4. Bump `last_applied_lsn` to our LSN and `notify_all`, **before**
+//!    dropping the apply gate — otherwise a concurrent flush could
+//!    observe trees whose state is ahead of `last_applied_lsn` and
+//!    recovery would double-apply on restart (refcount incref is not
+//!    idempotent).
+//! 5. Return the LSN (and, for auto-commit wrappers, any per-op
 //!    pre-image the caller expected).
 //!
-//! The `commit_lock` makes the apply phase single-threaded. That
-//! sacrifices the group-commit throughput benefits of phase 1's WAL
-//! writer for MVP-friendly correctness: LSN order equals apply order
-//! trivially, so recovery always reproduces the same in-memory state as
-//! normal operation. Phase 8 can replace this with an LSN-ordered
-//! condvar apply path.
+//! Phase 6 shipped this path under a single `commit_lock` around submit
+//! + apply for an MVP-simple "LSN order == apply order trivially" proof;
+//! Phase 8b replaced that with the LSN-ordered condvar queue described
+//! above so WAL group commit can actually form batches.
 //!
 //! [`WalOp`]: crate::wal::WalOp
 

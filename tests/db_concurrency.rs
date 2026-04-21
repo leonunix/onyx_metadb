@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
 use onyx_metadb::{Config, Db, L2pValue, Result, SnapshotId};
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
@@ -154,4 +155,60 @@ fn snapshots_match_reference_during_multi_writer_rounds() {
     let current: Vec<(u64, L2pValue)> = db.range(..).unwrap().collect::<Result<Vec<_>>>().unwrap();
     let want_current: Vec<(u64, L2pValue)> = model.lock().iter().map(|(k, v)| (*k, *v)).collect();
     assert_eq!(current, want_current);
+}
+
+/// Phase 8b regression: `commit_ops` submits to the WAL *without* any
+/// Db-level lock, so concurrent commits from N threads land in the same
+/// group-commit batch at the WAL writer and amortise one fsync across
+/// many records. Under the old `commit_lock` path every submit was
+/// serialised before reaching the WAL, so the writer only ever saw one
+/// record at a time and fsync count tracked record count 1:1.
+///
+/// We install `FaultPoint::WalFsyncBefore` with `fire_on_hit = u64::MAX`
+/// so it never triggers but still counts hits via `hits(...)`. The
+/// assertion requires fsyncs to be strictly less than commits by a
+/// healthy margin — any regression that re-serialises WAL submit would
+/// push the ratio back to 1.
+#[test]
+fn concurrent_commits_coalesce_into_wal_group_batches() {
+    const WRITERS: usize = 8;
+    const PER_THREAD: usize = 500;
+
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    faults.install(FaultPoint::WalFsyncBefore, u64::MAX, FaultAction::Error);
+
+    let mut cfg = Config::new(dir.path());
+    cfg.shards_per_partition = 4;
+    let db = Arc::new(Db::create_with_config_and_faults(cfg, faults.clone()).unwrap());
+
+    let barrier = Arc::new(std::sync::Barrier::new(WRITERS));
+    let mut handles = Vec::new();
+    for tid in 0..WRITERS {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            let base = (tid as u64 + 1) * 1_000_000;
+            for i in 0..PER_THREAD {
+                db.insert(base + i as u64, v(tid as u8)).unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let fsyncs = faults.hits(FaultPoint::WalFsyncBefore);
+    let commits = (WRITERS * PER_THREAD) as u64;
+    // Roof at 80% so the test tolerates scheduling jitter on loaded CI
+    // hosts but still catches any regression that puts WAL submit back
+    // under a global lock (which would force 1:1).
+    assert!(
+        fsyncs * 5 < commits * 4,
+        "expected WAL group-commit batching: {fsyncs} fsyncs for {commits} commits",
+    );
+
+    let applied = db.last_applied_lsn();
+    assert_eq!(applied, commits, "LSN must match total committed records");
 }

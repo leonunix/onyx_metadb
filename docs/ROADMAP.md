@@ -158,10 +158,10 @@ Add snapshot capability. All writes become COW.
 - 1000-snapshot stress run (current proptest caps live snapshots at
   ~100 to stay under MAX_SNAPSHOTS_PER_MANIFEST until chained
   manifests land).
-- `metadb-verify` binary (no dangling pages, no negative refcounts):
-  the `invariants` module already covers structural checks for the
-  btree itself, but a full page-reachability audit across snapshots
-  hasn't been written.
+- `metadb-verify` binary: **landed in phase 8a** as the offline
+  page-walker / reachability audit. It stayed deferred past phase 3
+  because the full set of page owners (paged L2P, refcount B+tree,
+  dedup level heads, snapshot roots) was not stable enough earlier.
 - Crash injection at `cow.new_page_written.before_parent_link`:
   needs WAL integration (phase 6) to assert anything meaningful
   about recovery.
@@ -758,10 +758,18 @@ Items that don't gate Phase 7 but do gate production.
 
 ### Scope
 
-- **LSN-ordered condvar apply path**: undo phase-6's single
-  `commit_lock`; serialise apply via a condvar on
-  `last_applied_lsn` so WAL group-commit batches can form again.
-  Bench the mixed workload against the ≥ 150 k txns/s target.
+- ☑ **LSN-ordered condvar apply path** (landed). Phase 6's single
+  `commit_lock` is gone; WAL submit now happens under no Db-level
+  lock so concurrent submitters coalesce at the WAL writer, and
+  apply order is restored via a `commit_cvar` queue keyed on
+  `last_applied_lsn`. Commit takes `apply_gate.read()` across
+  apply + bump; flush / take_snapshot / drop_snapshot take
+  `apply_gate.write()` to sample a quiescent tree state. Regression
+  guard: `tests/db_concurrency.rs::concurrent_commits_coalesce_into_wal_group_batches`
+  asserts fsync count falls well below commit count under 8 writers
+  (currently ≈ 12 % on the dev host). The ≥ 150 k txns/s headline
+  target is a hardware-bound follow-up — bench at integration time
+  against real NVMe.
 - **Snapshot reads for dedup / refcount**: `SnapshotView::dedup_at`
   / `refcount_at(SnapshotId)` using each snapshot's per-group
   shard root.

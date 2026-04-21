@@ -11,7 +11,7 @@ use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::btree::BTree;
@@ -57,14 +57,27 @@ pub struct Db {
     /// Write-ahead log. All mutations route through here so they survive
     /// crash between checkpoints.
     wal: Wal,
-    /// Serialises WAL submit + apply so LSN order trivially equals apply
-    /// order. See [`tx`](crate::tx) for the reasoning.
-    commit_lock: Mutex<()>,
+    /// Excludes apply phases from flush / snapshot. Commit takes
+    /// `.read()` across the apply + bump; flush / take_snapshot /
+    /// drop_snapshot take `.write()` so they observe a quiescent tree
+    /// state matching `last_applied_lsn`. Replaces the phase-6
+    /// `commit_lock`: submission to the WAL now happens **outside** any
+    /// lock, so concurrent submitters land in the same WAL group-commit
+    /// batch. Apply order is restored by the LSN-ordered condvar queue
+    /// below, not by serialising WAL submits.
+    apply_gate: RwLock<()>,
     /// LSN of the most recent op applied to in-memory state. Initialised
     /// from `manifest.checkpoint_lsn` on open (the manifest promises that
     /// every LSN at or below this value is already reflected in the
-    /// trees / SSTs) and bumped on every commit.
+    /// trees / SSTs) and bumped on every commit. Paired with
+    /// [`commit_cvar`](Self::commit_cvar) to form the apply-order queue.
     last_applied_lsn: Mutex<Lsn>,
+    /// Notified whenever `last_applied_lsn` advances. Commit threads
+    /// wait on this after WAL submit returns with their assigned LSN,
+    /// re-checking `*last_applied_lsn + 1 == lsn` on each wakeup. Every
+    /// LSN is unique, so at most one thread waits for any given
+    /// predecessor value.
+    commit_cvar: Condvar,
     /// Snapshot readers hold a shared guard; `drop_snapshot` takes the
     /// exclusive side so it can't free pages still visible to a live view.
     snapshot_views: RwLock<()>,
@@ -229,8 +242,9 @@ impl Db {
             dedup_index,
             dedup_reverse,
             wal,
-            commit_lock: Mutex::new(()),
+            apply_gate: RwLock::new(()),
             last_applied_lsn: Mutex::new(0),
+            commit_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             faults,
             db_path: cfg.path,
@@ -351,8 +365,9 @@ impl Db {
             dedup_index,
             dedup_reverse,
             wal,
-            commit_lock: Mutex::new(()),
+            apply_gate: RwLock::new(()),
             last_applied_lsn: Mutex::new(last_applied),
+            commit_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             faults,
             db_path: cfg.path,
@@ -391,11 +406,11 @@ impl Db {
     /// applied commit, so after `open` replay can correctly begin at
     /// `checkpoint_lsn + 1`.
     pub fn flush(&self) -> Result<()> {
-        // Serialise with any in-flight commit: reading `last_applied_lsn`
-        // outside of `commit_lock` could race with `commit_ops` between
-        // "apply to trees" and "bump last_applied". Taking the lock
-        // ensures all applied-but-not-yet-bumped LSNs are accounted for.
-        let _commit_guard = self.commit_lock.lock();
+        // Exclude every in-flight apply phase: after `apply_gate.write()`
+        // returns, no commit is between "touched a tree" and "bumped
+        // last_applied_lsn", so the LSN we sample below matches exactly
+        // the state the trees will have when we flush them.
+        let _apply_guard = self.apply_gate.write();
         let mut manifest_state = self.manifest_state.lock();
         let mut l2p_guards = self.lock_all_l2p_shards();
         let mut refcount_guards = self.lock_all_refcount_shards();
@@ -437,21 +452,51 @@ impl Db {
 
     /// Internal: submit a set of ops to the WAL, apply them to indexes,
     /// and return the assigned LSN plus any per-op outcomes.
+    ///
+    /// Concurrency: WAL submission runs **outside** any Db-level lock so
+    /// multiple submitters coalesce into one group-commit batch at the
+    /// WAL writer. Apply order is re-serialised after submit via the
+    /// `last_applied_lsn` + `commit_cvar` queue — each commit waits
+    /// until `*last_applied_lsn + 1 == lsn`, applies under
+    /// `apply_gate.read()`, then bumps `last_applied_lsn` **before**
+    /// dropping the gate so flush / snapshot never observe trees whose
+    /// state is ahead of `last_applied_lsn`.
     pub(crate) fn commit_ops(&self, ops: &[WalOp]) -> Result<(Lsn, Vec<ApplyOutcome>)> {
         if ops.is_empty() {
             return Ok((self.last_applied_lsn(), Vec::new()));
         }
         let body = encode_body(ops);
-        let _guard = self.commit_lock.lock();
         let lsn = self.wal.submit(body)?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
+
+        // Wait until every lower LSN has applied. LSNs are unique and
+        // assigned in submit order by the WAL writer, so exactly one
+        // waiter is unblocked by each bump.
+        {
+            let mut applied = self.last_applied_lsn.lock();
+            while *applied + 1 < lsn {
+                self.commit_cvar.wait(&mut applied);
+            }
+        }
+
+        let apply_guard = self.apply_gate.read();
         let mut outcomes = Vec::with_capacity(ops.len());
         for op in ops {
             outcomes.push(self.apply_op(op)?);
         }
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
-        *self.last_applied_lsn.lock() = lsn;
+
+        // Bump BEFORE dropping the gate: if we released the gate first
+        // a concurrent flush could observe `last_applied_lsn = lsn - 1`
+        // while trees already contain op `lsn`, causing recovery to
+        // double-apply on restart (refcount incref is not idempotent).
+        {
+            let mut applied = self.last_applied_lsn.lock();
+            *applied = lsn;
+            self.commit_cvar.notify_all();
+        }
+        drop(apply_guard);
         Ok((lsn, outcomes))
     }
 
@@ -702,9 +747,9 @@ impl Db {
     /// Returns the new snapshot id. Persisted immediately via a
     /// manifest commit.
     pub fn take_snapshot(&self) -> Result<SnapshotId> {
-        // Serialise with in-flight commits so `last_applied_lsn` is
-        // stable while we sample tree roots and write the manifest.
-        let _commit_guard = self.commit_lock.lock();
+        // Exclude in-flight apply phases so `last_applied_lsn` and the
+        // per-shard roots we sample below describe the same LSN point.
+        let _apply_guard = self.apply_gate.write();
         let mut manifest_state = self.manifest_state.lock();
         let mut l2p_guards = self.lock_all_l2p_shards();
         let mut refcount_guards = self.lock_all_refcount_shards();
@@ -815,7 +860,7 @@ impl Db {
     /// prefers leaks over exposing a dropped snapshot that points at freed
     /// pages.
     pub fn drop_snapshot(&self, id: SnapshotId) -> Result<Option<DropReport>> {
-        let _commit_guard = self.commit_lock.lock();
+        let _apply_guard = self.apply_gate.write();
         let _drop_guard = self.snapshot_views.write();
         let mut manifest_state = self.manifest_state.lock();
         let Some(pos) = manifest_state
@@ -962,8 +1007,8 @@ impl Db {
     ///
     /// Does NOT touch `checkpoint_lsn` — that is the durable-WAL LSN
     /// cursor and is only ever advanced by code paths that have taken
-    /// `commit_lock` and therefore have an authoritative reading of
-    /// `last_applied_lsn`.
+    /// `apply_gate.write()` (flush / take_snapshot / drop_snapshot) and
+    /// therefore have an authoritative reading of `last_applied_lsn`.
     fn refresh_manifest_from_locked(
         &self,
         manifest: &mut Manifest,

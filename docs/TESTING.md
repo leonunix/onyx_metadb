@@ -357,13 +357,20 @@ Runs every invariant from §2. Returns 0 on success, 1 on violation,
 ### `metadb-bench`
 
 ```
-metadb-bench put        --writers N --partitions M --ops K [--shards S]
-metadb-bench get        --threads N --keys K
-metadb-bench snapshot   --partition P --keys K
-metadb-bench diff       --snap-a A --snap-b B
+metadb-bench l2p-put        [--path DIR] [--reset] [--ops N] [--threads N] [--shards N]
+metadb-bench l2p-get        [--path DIR] [--reset] [--ops N] [--threads N] [--key-space N]
+metadb-bench l2p-multi-get  [--path DIR] [--reset] [--ops N] [--threads N] [--key-space N] [--batch-size N]
+metadb-bench meta-tx        [--path DIR] [--reset] [--ops N] [--threads N] [--key-space N] [--overwrite-pct N] [--dedup-hit-pct N]
 ```
 
-Emits latency histograms (HDR) and throughput.
+Current output is JSON or human-readable text with:
+- throughput (`ops/s`, `items/s`)
+- latency summary (`avg`, `p50`, `p95`, `p99`, `max`)
+- cache hit/miss delta for read-path benches
+
+The `meta-tx` scenario is the closest in-tree approximation of the
+Onyx metadata write path today: LBA->PBA remap plus refcount and dedup
+index / reverse-index maintenance in a single transaction.
 
 ### `metadb-replay`
 

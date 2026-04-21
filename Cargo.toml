@@ -32,6 +32,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 bytemuck = { version = "1.14", features = ["derive"] }
 rand = "0.8"
 rand_chacha = "0.3"
+rocksdb = { version = "0.24", features = ["lz4", "zstd"] }
 
 # Errors / tracing
 thiserror = "1"

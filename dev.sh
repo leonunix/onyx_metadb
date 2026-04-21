@@ -1,0 +1,619 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJ_ROOT="$(cd "$(dirname "$0")" && pwd)"
+STATE_DIR="$PROJ_ROOT/.dev"
+LOG_DIR="$STATE_DIR/logs"
+RUN_ROOT="$STATE_DIR/soak"
+PID_FILE="$STATE_DIR/soak.pid"
+RUN_DIR_FILE="$STATE_DIR/soak-run-dir"
+LOG_FILE="$LOG_DIR/soak.log"
+BENCH_ROOT="$STATE_DIR/bench"
+BENCH_RUN_DIR_FILE="$STATE_DIR/bench-run-dir"
+
+DEFAULT_DURATION="${METADB_SOAK_DURATION:-24h}"
+DEFAULT_OPS_PER_CYCLE="${METADB_SOAK_OPS_PER_CYCLE:-10000}"
+DEFAULT_THREADS="${METADB_SOAK_THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+DEFAULT_FAULT_DENSITY_PCT="${METADB_SOAK_FAULT_DENSITY_PCT:-25}"
+DEFAULT_SEED="${METADB_SOAK_SEED:-1592625758}"
+DEFAULT_EXTRA_ARGS="${METADB_SOAK_EXTRA_ARGS:-}"
+
+BENCH_DEFAULT_THREADS="${METADB_BENCH_THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+BENCH_DEFAULT_GET_OPS="${METADB_BENCH_GET_OPS:-200000}"
+BENCH_DEFAULT_MULTI_OPS="${METADB_BENCH_MULTI_OPS:-20000}"
+BENCH_DEFAULT_MULTI_BATCH_SIZE="${METADB_BENCH_MULTI_BATCH_SIZE:-64}"
+BENCH_DEFAULT_META_OPS="${METADB_BENCH_META_OPS:-50000}"
+BENCH_DEFAULT_PUT_OPS="${METADB_BENCH_PUT_OPS:-20000}"
+BENCH_DEFAULT_GET_WARMUP="${METADB_BENCH_GET_WARMUP_OPS:-20000}"
+BENCH_DEFAULT_MULTI_WARMUP="${METADB_BENCH_MULTI_WARMUP_OPS:-5000}"
+BENCH_DEFAULT_SHARDS="${METADB_BENCH_SHARDS:-16}"
+BENCH_DEFAULT_CACHE_MB="${METADB_BENCH_CACHE_MB:-512}"
+BENCH_DEFAULT_SEED="${METADB_BENCH_SEED:-1592625758}"
+BENCH_DEFAULT_OVERWRITE_PCT="${METADB_BENCH_OVERWRITE_PCT:-40}"
+BENCH_DEFAULT_DEDUP_HIT_PCT="${METADB_BENCH_DEDUP_HIT_PCT:-20}"
+BENCH_DEFAULT_SIZE="${METADB_BENCH_SIZE:-1g}"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR" "$RUN_ROOT" "$BENCH_ROOT"
+
+quote_shell_arg() {
+    printf "%q" "$1"
+}
+
+save_run_dir() {
+    printf '%s\n' "$1" > "$RUN_DIR_FILE"
+}
+
+saved_run_dir() {
+    if [[ -f "$RUN_DIR_FILE" ]]; then
+        head -n 1 "$RUN_DIR_FILE"
+    fi
+}
+
+clear_run_dir() {
+    rm -f "$RUN_DIR_FILE"
+}
+
+save_bench_run_dir() {
+    printf '%s\n' "$1" > "$BENCH_RUN_DIR_FILE"
+}
+
+saved_bench_run_dir() {
+    if [[ -f "$BENCH_RUN_DIR_FILE" ]]; then
+        head -n 1 "$BENCH_RUN_DIR_FILE"
+    fi
+}
+
+is_running() {
+    [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+parse_duration_secs() {
+    local raw="${1:-}"
+    if [[ -z "$raw" ]]; then
+        echo "duration is required" >&2
+        exit 1
+    fi
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$raw"
+        return
+    fi
+    if [[ "$raw" =~ ^([0-9]+)([smhd])$ ]]; then
+        local value="${BASH_REMATCH[1]}"
+        local unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            s) printf '%s\n' "$value" ;;
+            m) printf '%s\n' "$((value * 60))" ;;
+            h) printf '%s\n' "$((value * 3600))" ;;
+            d) printf '%s\n' "$((value * 86400))" ;;
+        esac
+        return
+    fi
+    echo "invalid duration: $raw (expected e.g. 3600, 30m, 12h, 7d)" >&2
+    exit 1
+}
+
+parse_size_bytes() {
+    local raw="${1:-}"
+    local value unit
+    if [[ -z "$raw" ]]; then
+        echo "size is required" >&2
+        exit 1
+    fi
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$raw"
+        return
+    fi
+    if [[ "$raw" =~ ^([0-9]+)([kKmMgGtT])$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            k|K) printf '%s\n' "$((value * 1024))" ;;
+            m|M) printf '%s\n' "$((value * 1024 * 1024))" ;;
+            g|G) printf '%s\n' "$((value * 1024 * 1024 * 1024))" ;;
+            t|T) printf '%s\n' "$((value * 1024 * 1024 * 1024 * 1024))" ;;
+        esac
+        return
+    fi
+    echo "invalid size: $raw (expected e.g. 1073741824, 1g, 10g)" >&2
+    exit 1
+}
+
+ensure_release_binaries() {
+    echo "Building release binaries..."
+    (
+        cd "$PROJ_ROOT"
+        cargo build --release --bin metadb-soak --bin metadb-verify
+    )
+}
+
+ensure_bench_binaries() {
+    echo "Building release benchmark binaries..."
+    (
+        cd "$PROJ_ROOT"
+        cargo build --release --bin metadb-bench --bin rocksdb-bench
+    )
+}
+
+run_dir_for_start() {
+    if [[ -n "${METADB_SOAK_RUN_DIR:-}" ]]; then
+        printf '%s\n' "$METADB_SOAK_RUN_DIR"
+    else
+        printf '%s/%s\n' "$RUN_ROOT" "$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+}
+
+stop_process_group() {
+    local pid="$1"
+    local pgid
+    pgid="$(ps -o pgid= -p "$pid" | tr -d ' ' || true)"
+    if [[ -n "$pgid" ]]; then
+        kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    else
+        kill "$pid" 2>/dev/null || true
+    fi
+}
+
+cmd_start() {
+    local duration="${1:-$DEFAULT_DURATION}"
+    local duration_secs run_dir qroot qrun_dir qduration qops qthreads qfault qseed qextra cmd
+
+    if is_running; then
+        echo "soak already running (pid $(cat "$PID_FILE"))"
+        echo "log: $LOG_FILE"
+        exit 0
+    fi
+
+    duration_secs="$(parse_duration_secs "$duration")"
+    run_dir="$(run_dir_for_start)"
+    mkdir -p "$run_dir"
+    save_run_dir "$run_dir"
+    ensure_release_binaries
+
+    qroot="$(quote_shell_arg "$PROJ_ROOT")"
+    qrun_dir="$(quote_shell_arg "$run_dir")"
+    qduration="$(quote_shell_arg "$duration_secs")"
+    qops="$(quote_shell_arg "$DEFAULT_OPS_PER_CYCLE")"
+    qthreads="$(quote_shell_arg "$DEFAULT_THREADS")"
+    qfault="$(quote_shell_arg "$DEFAULT_FAULT_DENSITY_PCT")"
+    qseed="$(quote_shell_arg "$DEFAULT_SEED")"
+    qextra="$DEFAULT_EXTRA_ARGS"
+
+    cmd="cd $qroot && exec target/release/metadb-soak $qrun_dir --duration-secs $qduration --ops-per-cycle $qops --threads $qthreads --fault-density-pct $qfault --seed $qseed"
+    if [[ -n "$qextra" ]]; then
+        cmd="$cmd $qextra"
+    fi
+
+    if command -v setsid >/dev/null 2>&1; then
+        setsid bash -lc "$cmd" > "$LOG_FILE" 2>&1 &
+    else
+        bash -lc "$cmd" > "$LOG_FILE" 2>&1 &
+    fi
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+
+    echo "soak started"
+    echo "  pid:      $pid"
+    echo "  run dir:  $run_dir"
+    echo "  log:      $LOG_FILE"
+    echo "  duration: $duration ($duration_secs s)"
+}
+
+cmd_stop() {
+    if ! is_running; then
+        echo "soak not running"
+        rm -f "$PID_FILE"
+        exit 0
+    fi
+    local pid
+    pid="$(cat "$PID_FILE")"
+    stop_process_group "$pid"
+    rm -f "$PID_FILE"
+    echo "soak stopped (was pid $pid)"
+}
+
+cmd_restart() {
+    local duration="${1:-$DEFAULT_DURATION}"
+    cmd_stop || true
+    sleep 1
+    cmd_start "$duration"
+}
+
+cmd_status() {
+    local run_dir summary_path events_path
+    run_dir="$(saved_run_dir || true)"
+    if is_running; then
+        echo "soak: running (pid $(cat "$PID_FILE"))"
+    else
+        echo "soak: stopped"
+    fi
+    if [[ -n "$run_dir" ]]; then
+        echo "run dir: $run_dir"
+        summary_path="$run_dir/summary.json"
+        events_path="$run_dir/events.jsonl"
+        [[ -f "$summary_path" ]] && echo "summary: $summary_path"
+        [[ -f "$events_path" ]] && echo "events:  $events_path"
+    else
+        echo "run dir: (none yet)"
+    fi
+    echo "log: $LOG_FILE"
+}
+
+cmd_logs() {
+    touch "$LOG_FILE"
+    tail -f "$LOG_FILE"
+}
+
+cmd_events() {
+    local run_dir
+    run_dir="$(saved_run_dir || true)"
+    if [[ -z "$run_dir" ]]; then
+        echo "no saved run dir" >&2
+        exit 1
+    fi
+    touch "$run_dir/events.jsonl"
+    tail -f "$run_dir/events.jsonl"
+}
+
+cmd_summary() {
+    local run_dir
+    run_dir="$(saved_run_dir || true)"
+    if [[ -z "$run_dir" ]]; then
+        echo "no saved run dir" >&2
+        exit 1
+    fi
+    cat "$run_dir/summary.json"
+}
+
+cmd_verify() {
+    local run_dir
+    run_dir="$(saved_run_dir || true)"
+    if [[ -z "$run_dir" ]]; then
+        echo "no saved run dir" >&2
+        exit 1
+    fi
+    ensure_release_binaries
+    (
+        cd "$PROJ_ROOT"
+        exec target/release/metadb-verify "$run_dir" --strict
+    )
+}
+
+bench_run_dir() {
+    local target="$1"
+    local scenario="$2"
+    local size_label="$3"
+    local stamp
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    printf '%s/%s-%s-%s-%s\n' "$BENCH_ROOT" "$stamp" "$target" "$scenario" "$size_label"
+}
+
+bench_scenario_arg() {
+    case "$1" in
+        prefill) printf '%s\n' "l2p-prefill" ;;
+        put) printf '%s\n' "l2p-put" ;;
+        get) printf '%s\n' "l2p-get" ;;
+        multi-get) printf '%s\n' "l2p-multi-get" ;;
+        meta-tx) printf '%s\n' "meta-tx" ;;
+        *)
+            echo "unknown bench scenario: $1" >&2
+            exit 1
+            ;;
+    esac
+}
+
+bench_scenarios() {
+    local scenario="$1"
+    case "$scenario" in
+        all)
+            printf '%s\n' prefill get multi-get meta-tx
+            ;;
+        prefill|put|get|multi-get|meta-tx)
+            printf '%s\n' "$scenario"
+            ;;
+        *)
+            echo "unknown bench scenario: $scenario" >&2
+            exit 1
+            ;;
+    esac
+}
+
+bench_prefill_needed() {
+    case "$1" in
+        get|multi-get) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+bench_key_count_for_bytes() {
+    local bytes="$1"
+    # L2P payload value is 28B; use ceil division for equivalent key count.
+    printf '%s\n' "$(((bytes + 27) / 28))"
+}
+
+run_bench_backend() {
+    local backend="$1"
+    local scenario="$2"
+    local run_dir="$3"
+    local size_bytes="${4:-0}"
+    local path_tag="${5:-$scenario}"
+    local reuse_existing="${6:-0}"
+    local skip_prefill="${7:-0}"
+    local scenario_arg json_path bench_path key_space
+    local -a cmd
+
+    scenario_arg="$(bench_scenario_arg "$scenario")"
+    bench_path="$run_dir/$backend-$path_tag"
+    json_path="$run_dir/$backend-$scenario.json"
+    cmd=(
+        "$PROJ_ROOT/target/release/$backend-bench"
+        "$scenario_arg"
+        "--path" "$bench_path"
+        "--threads" "$BENCH_DEFAULT_THREADS"
+        "--seed" "$BENCH_DEFAULT_SEED"
+        "--json"
+    )
+    if [[ "$reuse_existing" == "1" ]]; then
+        cmd+=("--reuse-existing")
+    else
+        cmd+=("--reset")
+    fi
+    if [[ "$skip_prefill" == "1" ]]; then
+        cmd+=("--skip-prefill")
+    fi
+
+    case "$scenario" in
+        prefill)
+            key_space="$(bench_key_count_for_bytes "$size_bytes")"
+            cmd+=(
+                "--ops" 1
+                "--key-space" "$key_space"
+                "--prefill-bytes" "$size_bytes"
+            )
+            [[ "$backend" == "metadb" ]] && cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
+            [[ "$backend" == "metadb" || "$backend" == "rocksdb" ]] && cmd+=("--cache-mb" "$BENCH_DEFAULT_CACHE_MB")
+            ;;
+        put)
+            cmd+=(
+                "--ops" "$BENCH_DEFAULT_PUT_OPS"
+                "--cache-mb" "$BENCH_DEFAULT_CACHE_MB"
+            )
+            [[ "$backend" == "metadb" ]] && cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
+            ;;
+        get)
+            key_space="$(bench_key_count_for_bytes "$size_bytes")"
+            cmd+=(
+                "--ops" "$BENCH_DEFAULT_GET_OPS"
+                "--key-space" "$key_space"
+                "--prefill-bytes" "$size_bytes"
+                "--warmup-ops" "$BENCH_DEFAULT_GET_WARMUP"
+            )
+            [[ "$backend" == "metadb" ]] && cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
+            [[ "$backend" == "metadb" || "$backend" == "rocksdb" ]] && cmd+=("--cache-mb" "$BENCH_DEFAULT_CACHE_MB")
+            ;;
+        multi-get)
+            key_space="$(bench_key_count_for_bytes "$size_bytes")"
+            cmd+=(
+                "--ops" "$BENCH_DEFAULT_MULTI_OPS"
+                "--key-space" "$key_space"
+                "--prefill-bytes" "$size_bytes"
+                "--batch-size" "$BENCH_DEFAULT_MULTI_BATCH_SIZE"
+                "--warmup-ops" "$BENCH_DEFAULT_MULTI_WARMUP"
+            )
+            [[ "$backend" == "metadb" ]] && cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
+            [[ "$backend" == "metadb" || "$backend" == "rocksdb" ]] && cmd+=("--cache-mb" "$BENCH_DEFAULT_CACHE_MB")
+            ;;
+        meta-tx)
+            cmd+=(
+                "--ops" "$BENCH_DEFAULT_META_OPS"
+                "--threads" "$BENCH_DEFAULT_THREADS"
+                "--key-space" "${METADB_BENCH_META_KEY_SPACE:-200000}"
+                "--overwrite-pct" "$BENCH_DEFAULT_OVERWRITE_PCT"
+                "--dedup-hit-pct" "$BENCH_DEFAULT_DEDUP_HIT_PCT"
+            )
+            [[ "$backend" == "metadb" ]] && cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
+            ;;
+    esac
+
+    echo "Running $backend $scenario ..." >&2
+    "${cmd[@]}" > "$json_path"
+    printf '%s\n' "$json_path"
+}
+
+print_bench_summary() {
+    python3 - <<'PY' "$1"
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+data = json.loads(p.read_text())
+print(f"backend: {p.stem}")
+print(f"  scenario: {data['scenario']}")
+if data.get('prefill_keys', 0):
+    print(
+        f"  prefill: keys={data['prefill_keys']} bytes={data['prefill_bytes']} "
+        f"secs={data['prefill_elapsed_secs']:.3f} "
+        f"keys/s={data['prefill_ops_per_sec']:.2f} bytes/s={data['prefill_bytes_per_sec']:.2f}"
+    )
+print(
+    f"  measure: ops={data['ops']} items={data['items']} secs={data['elapsed_secs']:.3f} "
+    f"ops/s={data['ops_per_sec']:.2f} items/s={data['items_per_sec']:.2f}"
+)
+lat = data['latency_us']
+print(
+    f"  latency_us: avg={lat['avg']:.2f} p50={lat['p50']} "
+    f"p95={lat['p95']} p99={lat['p99']} max={lat['max']}"
+)
+cache = data.get('cache_delta')
+if cache:
+    print(
+        f"  cache: hits={cache['hits']} misses={cache['misses']} "
+        f"evictions={cache['evictions']} pages={cache['current_pages']} bytes={cache['current_bytes']}"
+    )
+PY
+}
+
+print_bench_compare() {
+    python3 - <<'PY' "$1" "$2"
+import json, pathlib, sys
+a = json.loads(pathlib.Path(sys.argv[1]).read_text())
+b = json.loads(pathlib.Path(sys.argv[2]).read_text())
+def ratio(fast, slow):
+    return fast / slow if slow else 0.0
+print(f"scenario: {a['scenario']}")
+if a.get('prefill_keys', 0) or b.get('prefill_keys', 0):
+    print("prefill:")
+    print(f"  metadb  keys/s={a.get('prefill_ops_per_sec', 0):.2f} bytes/s={a.get('prefill_bytes_per_sec', 0):.2f}")
+    print(f"  rocksdb keys/s={b.get('prefill_ops_per_sec', 0):.2f} bytes/s={b.get('prefill_bytes_per_sec', 0):.2f}")
+print("measure:")
+print(f"  metadb  ops/s={a['ops_per_sec']:.2f} items/s={a['items_per_sec']:.2f}")
+print(f"  rocksdb ops/s={b['ops_per_sec']:.2f} items/s={b['items_per_sec']:.2f}")
+print("latency_us:")
+for key in ('avg', 'p50', 'p95', 'p99', 'max'):
+    print(f"  {key}: metadb={a['latency_us'][key]} rocksdb={b['latency_us'][key]}")
+faster = 'metadb' if a['ops_per_sec'] >= b['ops_per_sec'] else 'rocksdb'
+r = ratio(max(a['ops_per_sec'], b['ops_per_sec']), min(a['ops_per_sec'], b['ops_per_sec']))
+print(f"winner_by_ops: {faster} ({r:.2f}x)")
+PY
+}
+
+cmd_bench() {
+    local target="${1:-compare}"
+    local scenario="${2:-multi-get}"
+    local size_label="${3:-$BENCH_DEFAULT_SIZE}"
+    local size_bytes=0
+    local run_dir metadb_json rocksdb_json current_scenario
+    local metadb_read_tag rocksdb_read_tag
+    local -a scenarios
+
+    case "$target" in
+        metadb|rocksdb|compare) ;;
+        *)
+            echo "unknown bench target: $target" >&2
+            exit 1
+            ;;
+    esac
+    mapfile -t scenarios < <(bench_scenarios "$scenario")
+
+    if [[ "$scenario" == "all" || "$scenario" == "get" || "$scenario" == "multi-get" ]]; then
+        size_bytes="$(parse_size_bytes "$size_label")"
+    elif ! bench_prefill_needed "$scenario"; then
+        size_label="na"
+    fi
+
+    run_dir="$(bench_run_dir "$target" "$scenario" "$size_label")"
+    mkdir -p "$run_dir"
+    save_bench_run_dir "$run_dir"
+    ensure_bench_binaries
+    metadb_read_tag="readset"
+    rocksdb_read_tag="readset"
+
+    for current_scenario in "${scenarios[@]}"; do
+        if [[ ${#scenarios[@]} -gt 1 ]]; then
+            echo ""
+            echo "=== $current_scenario ==="
+        fi
+        case "$target" in
+            metadb)
+                case "$current_scenario" in
+                    prefill)
+                        metadb_json="$(run_bench_backend metadb prefill "$run_dir" "$size_bytes" "$metadb_read_tag" 0 0)"
+                        ;;
+                    get|multi-get)
+                        metadb_json="$(run_bench_backend metadb "$current_scenario" "$run_dir" "$size_bytes" "$metadb_read_tag" 1 1)"
+                        ;;
+                    *)
+                        metadb_json="$(run_bench_backend metadb "$current_scenario" "$run_dir" "$size_bytes")"
+                        ;;
+                esac
+                print_bench_summary "$metadb_json"
+                ;;
+            rocksdb)
+                case "$current_scenario" in
+                    prefill)
+                        rocksdb_json="$(run_bench_backend rocksdb prefill "$run_dir" "$size_bytes" "$rocksdb_read_tag" 0 0)"
+                        ;;
+                    get|multi-get)
+                        rocksdb_json="$(run_bench_backend rocksdb "$current_scenario" "$run_dir" "$size_bytes" "$rocksdb_read_tag" 1 1)"
+                        ;;
+                    *)
+                        rocksdb_json="$(run_bench_backend rocksdb "$current_scenario" "$run_dir" "$size_bytes")"
+                        ;;
+                esac
+                print_bench_summary "$rocksdb_json"
+                ;;
+            compare)
+                case "$current_scenario" in
+                    prefill)
+                        metadb_json="$(run_bench_backend metadb prefill "$run_dir" "$size_bytes" "$metadb_read_tag" 0 0)"
+                        rocksdb_json="$(run_bench_backend rocksdb prefill "$run_dir" "$size_bytes" "$rocksdb_read_tag" 0 0)"
+                        ;;
+                    get|multi-get)
+                        metadb_json="$(run_bench_backend metadb "$current_scenario" "$run_dir" "$size_bytes" "$metadb_read_tag" 1 1)"
+                        rocksdb_json="$(run_bench_backend rocksdb "$current_scenario" "$run_dir" "$size_bytes" "$rocksdb_read_tag" 1 1)"
+                        ;;
+                    *)
+                        metadb_json="$(run_bench_backend metadb "$current_scenario" "$run_dir" "$size_bytes")"
+                        rocksdb_json="$(run_bench_backend rocksdb "$current_scenario" "$run_dir" "$size_bytes")"
+                        ;;
+                esac
+                print_bench_compare "$metadb_json" "$rocksdb_json"
+                ;;
+        esac
+    done
+
+    echo "bench dir: $run_dir"
+}
+
+usage() {
+    echo "Usage: $0 {start|stop|restart|status|logs|events|summary|verify|bench} [...]"
+    echo ""
+    echo "  start   [duration]  Start soak in background (default: $DEFAULT_DURATION)"
+    echo "  stop                Stop the running soak"
+    echo "  restart [duration]  Restart the soak"
+    echo "  status              Show pid, run dir, summary path"
+    echo "  logs                Tail the soak stdout/stderr log"
+    echo "  events              Tail events.jsonl for the current run"
+    echo "  summary             Print summary.json for the current run"
+    echo "  verify              Run metadb-verify --strict on the current run dir"
+    echo "  bench               Run metadb / rocksdb / compare benchmark"
+    echo ""
+    echo "Examples:"
+    echo "  ./dev.sh start"
+    echo "  ./dev.sh start 1h"
+    echo "  ./dev.sh restart 7d"
+    echo "  ./dev.sh status"
+    echo "  ./dev.sh logs"
+    echo "  ./dev.sh bench compare get 1g"
+    echo "  ./dev.sh bench compare all 10g"
+    echo "  ./dev.sh bench compare put"
+    echo "  ./dev.sh bench metadb multi-get 10g"
+    echo "  ./dev.sh bench rocksdb meta-tx"
+    echo ""
+    echo "Environment overrides:"
+    echo "  METADB_SOAK_DURATION=$DEFAULT_DURATION"
+    echo "  METADB_SOAK_OPS_PER_CYCLE=$DEFAULT_OPS_PER_CYCLE"
+    echo "  METADB_SOAK_THREADS=$DEFAULT_THREADS"
+    echo "  METADB_SOAK_FAULT_DENSITY_PCT=$DEFAULT_FAULT_DENSITY_PCT"
+    echo "  METADB_SOAK_SEED=$DEFAULT_SEED"
+    echo "  METADB_SOAK_RUN_DIR=<explicit run dir>"
+    echo "  METADB_SOAK_EXTRA_ARGS='<extra metadb-soak args>'"
+    echo "  METADB_BENCH_THREADS=$BENCH_DEFAULT_THREADS"
+    echo "  METADB_BENCH_SIZE=$BENCH_DEFAULT_SIZE"
+    echo "  METADB_BENCH_GET_OPS=$BENCH_DEFAULT_GET_OPS"
+    echo "  METADB_BENCH_MULTI_OPS=$BENCH_DEFAULT_MULTI_OPS"
+    echo "  METADB_BENCH_MULTI_BATCH_SIZE=$BENCH_DEFAULT_MULTI_BATCH_SIZE"
+    echo "  METADB_BENCH_META_OPS=$BENCH_DEFAULT_META_OPS"
+    echo "  METADB_BENCH_PUT_OPS=$BENCH_DEFAULT_PUT_OPS"
+    echo "  METADB_BENCH_CACHE_MB=$BENCH_DEFAULT_CACHE_MB"
+}
+
+case "${1:-}" in
+    start)   cmd_start "${2:-$DEFAULT_DURATION}" ;;
+    stop)    cmd_stop ;;
+    restart) cmd_restart "${2:-$DEFAULT_DURATION}" ;;
+    status)  cmd_status ;;
+    logs)    cmd_logs ;;
+    events)  cmd_events ;;
+    summary) cmd_summary ;;
+    verify)  cmd_verify ;;
+    bench)   cmd_bench "${2:-compare}" "${3:-multi-get}" "${4:-$BENCH_DEFAULT_SIZE}" ;;
+    *)       usage ;;
+esac

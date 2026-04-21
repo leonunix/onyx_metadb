@@ -99,9 +99,9 @@ src/
   lsm/              Fixed-record LSM (dedup_index + dedup_reverse)
   cache.rs          Unified 16-shard page cache (LRU, scan-resistant)
   recovery.rs       WAL replay on open
-  verify.rs         Structural verifier (groundwork for metadb-verify)
+  verify.rs         Structural verifier + offline audit backing metadb-verify
   testing/          Fault injection + shared test harness
-  bin/              CLI binaries (metadb-verify scheduled for 8a)
+  bin/              CLI binaries (metadb-verify, metadb-soak, metadb-bench)
 
 docs/
   DESIGN.md         Architecture, on-disk formats, recovery semantics
