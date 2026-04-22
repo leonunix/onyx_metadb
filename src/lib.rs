@@ -51,7 +51,9 @@ pub use lsm::{
     Memtable, MemtableStats, RECORDS_PER_PAGE, Record,
 };
 pub use manifest::{
-    MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, max_snapshots_for_shards,
+    MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VOLUME_ENTRY_FIXED_SIZE,
+    VOLUME_FLAG_DROP_PENDING, VolumeEntry, decode_volume_entry_inline,
+    encode_volume_entry_inline, max_snapshots_for_shards, volume_entry_inline_size,
 };
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 pub use page_store::PageStore;
@@ -59,7 +61,7 @@ pub use paged::{DiffEntry, L2pValue, PagedL2p};
 pub use recovery::{ReplayOutcome, replay};
 pub use tx::{ApplyOutcome, Transaction};
 pub use types::{
-    FIRST_DATA_PAGE, Lba, Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, PartitionId,
-    Pba, SnapshotId,
+    FIRST_DATA_PAGE, INVALID_VOLUME, Lba, Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId,
+    PartitionId, Pba, SnapshotId, VolumeOrdinal,
 };
 pub use verify::{VerifyOptions, VerifyReport, verify_path};

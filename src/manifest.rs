@@ -21,7 +21,7 @@ use crate::error::{MetaDbError, Result};
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::testing::faults::{FaultController, FaultPoint};
-use crate::types::{Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, SnapshotId};
+use crate::types::{Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, SnapshotId, VolumeOrdinal};
 
 /// Version of the current manifest body layout.
 pub const MANIFEST_BODY_VERSION: u32 = 5;
@@ -126,6 +126,119 @@ impl SnapshotEntry {
     fn needs_refcount_roots_page(&self) -> bool {
         self.refcount_roots_page == NULL_PAGE && !self.refcount_shard_roots.is_empty()
     }
+}
+
+// ---- Phase 7 / manifest v6 building blocks -------------------------------
+//
+// Not plugged into the live encode/decode path yet — the write path still
+// emits v5. These types + codecs land now so Phase B can flip the wire
+// format in one atomic change. Keeping them as standalone additive code
+// during Phase A means the 8a soak can keep running against v5 without
+// drift.
+
+/// Flag bits on a [`VolumeEntry`].
+pub const VOLUME_FLAG_DROP_PENDING: u8 = 0x01;
+
+/// One entry in the v6 manifest `volumes` table.
+///
+/// `l2p_shard_roots` is stored inline when it fits in the residual page
+/// budget; v6 will spill to an external `SnapshotRoots` page (reusing the
+/// existing page type + codec) past the threshold. This struct is the
+/// in-memory representation; see [`encode_volume_entry_inline`] /
+/// [`decode_volume_entry_inline`] for the on-disk form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeEntry {
+    pub ord: VolumeOrdinal,
+    pub shard_count: u32,
+    pub l2p_shard_roots: Box<[PageId]>,
+    pub created_lsn: Lsn,
+    pub flags: u8,
+}
+
+/// Size of a [`VolumeEntry`]'s fixed header when encoded inline. The
+/// variable `l2p_shard_roots` tail follows immediately.
+pub const VOLUME_ENTRY_FIXED_SIZE: usize = 2 /* ord */
+    + 4 /* shard_count */
+    + 8 /* created_lsn */
+    + 1 /* flags */
+    + 1 /* reserved / alignment */;
+
+/// Inline-encoded byte length of a volume entry with the given shard count.
+pub fn volume_entry_inline_size(shard_count: usize) -> usize {
+    VOLUME_ENTRY_FIXED_SIZE + shard_count * size_of::<PageId>()
+}
+
+/// Encode `entry` inline into `buf[off..off+len]` and advance `off`.
+///
+/// Fails with [`MetaDbError::InvalidArgument`] if the buffer does not have
+/// enough residual bytes or if `entry.shard_count` doesn't match the
+/// length of `entry.l2p_shard_roots`.
+pub fn encode_volume_entry_inline(
+    entry: &VolumeEntry,
+    buf: &mut [u8],
+    off: &mut usize,
+) -> Result<()> {
+    if entry.l2p_shard_roots.len() != entry.shard_count as usize {
+        return Err(MetaDbError::InvalidArgument(format!(
+            "volume {} has {} roots, declared shard_count {}",
+            entry.ord,
+            entry.l2p_shard_roots.len(),
+            entry.shard_count,
+        )));
+    }
+    let needed = volume_entry_inline_size(entry.shard_count as usize);
+    if buf.len() < *off + needed {
+        return Err(MetaDbError::InvalidArgument(format!(
+            "volume entry requires {needed} bytes, only {} available",
+            buf.len().saturating_sub(*off),
+        )));
+    }
+    buf[*off..*off + 2].copy_from_slice(&entry.ord.to_le_bytes());
+    buf[*off + 2..*off + 6].copy_from_slice(&entry.shard_count.to_le_bytes());
+    buf[*off + 6..*off + 14].copy_from_slice(&entry.created_lsn.to_le_bytes());
+    buf[*off + 14] = entry.flags;
+    buf[*off + 15] = 0; // reserved
+    *off += VOLUME_ENTRY_FIXED_SIZE;
+    for root in entry.l2p_shard_roots.iter().copied() {
+        buf[*off..*off + 8].copy_from_slice(&root.to_le_bytes());
+        *off += 8;
+    }
+    Ok(())
+}
+
+/// Decode one volume entry inline from `buf[off..]` and advance `off`.
+pub fn decode_volume_entry_inline(buf: &[u8], off: &mut usize) -> Result<VolumeEntry> {
+    if buf.len() < *off + VOLUME_ENTRY_FIXED_SIZE {
+        return Err(MetaDbError::Corruption(format!(
+            "volume entry truncated: expected {VOLUME_ENTRY_FIXED_SIZE} header bytes, {} remain",
+            buf.len().saturating_sub(*off),
+        )));
+    }
+    let ord = u16::from_le_bytes(buf[*off..*off + 2].try_into().unwrap());
+    let shard_count = u32::from_le_bytes(buf[*off + 2..*off + 6].try_into().unwrap());
+    let created_lsn = u64::from_le_bytes(buf[*off + 6..*off + 14].try_into().unwrap());
+    let flags = buf[*off + 14];
+    // buf[*off + 15] reserved
+    *off += VOLUME_ENTRY_FIXED_SIZE;
+    let needed_roots = shard_count as usize * size_of::<PageId>();
+    if buf.len() < *off + needed_roots {
+        return Err(MetaDbError::Corruption(format!(
+            "volume {ord} roots truncated: need {needed_roots}, {} remain",
+            buf.len().saturating_sub(*off),
+        )));
+    }
+    let mut roots = Vec::with_capacity(shard_count as usize);
+    for _ in 0..shard_count {
+        roots.push(u64::from_le_bytes(buf[*off..*off + 8].try_into().unwrap()));
+        *off += 8;
+    }
+    Ok(VolumeEntry {
+        ord,
+        shard_count,
+        l2p_shard_roots: roots.into_boxed_slice(),
+        created_lsn,
+        flags,
+    })
 }
 
 /// Decoded manifest body.
@@ -1181,5 +1294,124 @@ mod tests {
         assert!(materialize_snapshot_root_pages(&ps, &mut manifest, 77).unwrap());
         assert_eq!(manifest.body_version, MANIFEST_BODY_VERSION);
         assert_eq!(manifest.snapshots[0].refcount_roots_page, NULL_PAGE);
+    }
+
+    #[test]
+    fn volume_entry_inline_round_trip() {
+        let entry = VolumeEntry {
+            ord: 42,
+            shard_count: 4,
+            l2p_shard_roots: bx(&[100, 101, 102, 103]),
+            created_lsn: 0xABCD_1234,
+            flags: VOLUME_FLAG_DROP_PENDING,
+        };
+        let mut buf = vec![0u8; volume_entry_inline_size(entry.shard_count as usize)];
+        let mut off = 0;
+        encode_volume_entry_inline(&entry, &mut buf, &mut off).unwrap();
+        assert_eq!(off, buf.len());
+        let mut off = 0;
+        let decoded = decode_volume_entry_inline(&buf, &mut off).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(off, buf.len());
+    }
+
+    #[test]
+    fn volume_entry_inline_rejects_shard_count_mismatch() {
+        let entry = VolumeEntry {
+            ord: 1,
+            shard_count: 2,
+            l2p_shard_roots: bx(&[7]), // length 1, but shard_count 2
+            created_lsn: 10,
+            flags: 0,
+        };
+        let mut buf = vec![0u8; 256];
+        let mut off = 0;
+        assert!(matches!(
+            encode_volume_entry_inline(&entry, &mut buf, &mut off),
+            Err(MetaDbError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn volume_entry_inline_rejects_buffer_too_small() {
+        let entry = VolumeEntry {
+            ord: 9,
+            shard_count: 16,
+            l2p_shard_roots: bx(&[1; 16]),
+            created_lsn: 0,
+            flags: 0,
+        };
+        let mut buf = vec![0u8; VOLUME_ENTRY_FIXED_SIZE + 8]; // one root worth
+        let mut off = 0;
+        assert!(matches!(
+            encode_volume_entry_inline(&entry, &mut buf, &mut off),
+            Err(MetaDbError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn volume_entry_decode_rejects_truncated_roots() {
+        // Encode a legit entry, then lop the final root off the buffer.
+        let entry = VolumeEntry {
+            ord: 3,
+            shard_count: 3,
+            l2p_shard_roots: bx(&[11, 22, 33]),
+            created_lsn: 7,
+            flags: 0,
+        };
+        let mut buf = vec![0u8; volume_entry_inline_size(3)];
+        let mut off = 0;
+        encode_volume_entry_inline(&entry, &mut buf, &mut off).unwrap();
+        buf.truncate(buf.len() - 8);
+        let mut off = 0;
+        assert!(matches!(
+            decode_volume_entry_inline(&buf, &mut off),
+            Err(MetaDbError::Corruption(_))
+        ));
+    }
+
+    #[test]
+    fn volume_entry_many_back_to_back() {
+        // Write several entries contiguously into a single buffer, decode
+        // them all, verify the sliding offset + round-trip equality.
+        let entries = vec![
+            VolumeEntry {
+                ord: 0,
+                shard_count: 2,
+                l2p_shard_roots: bx(&[10, 11]),
+                created_lsn: 100,
+                flags: 0,
+            },
+            VolumeEntry {
+                ord: 1,
+                shard_count: 4,
+                l2p_shard_roots: bx(&[20, 21, 22, 23]),
+                created_lsn: 200,
+                flags: VOLUME_FLAG_DROP_PENDING,
+            },
+            VolumeEntry {
+                ord: 65534,
+                shard_count: 1,
+                l2p_shard_roots: bx(&[NULL_PAGE]),
+                created_lsn: 300,
+                flags: 0,
+            },
+        ];
+        let total: usize = entries
+            .iter()
+            .map(|e| volume_entry_inline_size(e.shard_count as usize))
+            .sum();
+        let mut buf = vec![0u8; total];
+        let mut off = 0;
+        for entry in &entries {
+            encode_volume_entry_inline(entry, &mut buf, &mut off).unwrap();
+        }
+        assert_eq!(off, total);
+        let mut off = 0;
+        for expected in &entries {
+            let got = decode_volume_entry_inline(&buf, &mut off).unwrap();
+            assert_eq!(&got, expected);
+        }
+        assert_eq!(off, total);
     }
 }
