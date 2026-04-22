@@ -7,9 +7,11 @@
 //! - thread-safe point writes via one mutex per shard
 //! - fan-out range / diff / snapshot operations
 
+use std::collections::HashMap;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
 
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use xxhash_rust::xxh3::xxh3_64;
@@ -28,22 +30,36 @@ use crate::paged::PagedL2p;
 use crate::paged::{DiffEntry, L2pValue};
 use crate::testing::faults::{FaultController, FaultPoint};
 use crate::tx::{ApplyOutcome, Transaction};
-use crate::types::{Lsn, PageId, Pba, SnapshotId};
+use crate::types::{Lsn, PageId, Pba, SnapshotId, VolumeOrdinal};
 use crate::verify;
 use crate::wal::{Wal, WalOp, encode_body};
+
+/// Ordinal of the always-present bootstrap volume. Phase B commit 5 keeps the
+/// surface API single-volume, so every L2P routing decision lands here. Later
+/// commits take per-volume arguments from callers and route through the map
+/// directly.
+const BOOTSTRAP_VOLUME_ORD: VolumeOrdinal = 0;
 
 /// Embedded metadata database.
 pub struct Db {
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     manifest_state: Mutex<ManifestState>,
-    /// L2P paged radix-tree shards (LBA → `L2pValue`). Replaced the old
-    /// per-shard B+tree in phase 6.5a: LBA keys are dense u64s so the
-    /// paged table saves both the per-entry key storage and the tree-
-    /// descent key comparisons that a B+tree would otherwise pay.
-    shards: Vec<L2pShard>,
+    /// Per-volume L2P paged radix-tree shard groups. Phase B commit 5 always
+    /// contains exactly one entry for [`BOOTSTRAP_VOLUME_ORD`]; commit 6/7
+    /// introduce real `create_volume` / `drop_volume` / `clone_volume` traffic
+    /// that mutates this map. The map lives behind an `RwLock` so the hot
+    /// path (commit / get / range) takes `.read()` — contention happens only
+    /// against the rare volume-lifecycle writer.
+    ///
+    /// Each volume owns its own `Vec<L2pShard>`; xxh3 routing divides by
+    /// `volume.shards.len()`, so shard routing is identical to the pre-7
+    /// flat-shard layout as long as every volume is created with the same
+    /// shard count.
+    volumes: RwLock<HashMap<VolumeOrdinal, Arc<Volume>>>,
     /// PBA refcount B+tree shards (PBA → first 4 bytes = u32 big-endian
-    /// refcount, remaining 24 bytes reserved).
+    /// refcount, remaining 24 bytes reserved). Refcount is a global running
+    /// tally — not per-volume — and stays at the top level for that reason.
     refcount_shards: Vec<Shard>,
     /// Global dedup index: 32-byte SHA-256 content hash → 28-byte opaque
     /// `DedupValue`.
@@ -93,10 +109,13 @@ pub struct Db {
     /// taking the apply gate, so their ops can sneak between our plan
     /// and our apply.
     ///
-    /// Lock order: `drop_gate` → `apply_gate` → `manifest_state`
-    /// → `snapshot_views`. Everyone entering `commit_ops` or
-    /// `drop_snapshot` respects this prefix; internal reads that don't
-    /// mutate skip `drop_gate` entirely.
+    /// Lock order: `drop_gate` → `apply_gate` → `volumes` →
+    /// `manifest_state` → shard mutex → `snapshot_views`. Everyone
+    /// entering `commit_ops` or `drop_snapshot` respects this prefix;
+    /// internal reads that don't mutate skip `drop_gate` entirely. The
+    /// `volumes` link is read-only in the hot path — `.read()` is taken
+    /// just long enough to clone the `Arc<Volume>` out so shard mutexes
+    /// can be acquired without keeping the map guard alive.
     drop_gate: RwLock<()>,
     #[allow(dead_code)]
     faults: Arc<FaultController>,
@@ -115,6 +134,33 @@ struct Shard {
 
 struct L2pShard {
     tree: Mutex<PagedL2p>,
+}
+
+/// L2P home for one user-facing volume. Owns its own shard group; shard
+/// routing inside a volume uses `xxh3_64(lba) % shards.len()`, identical to
+/// the pre-7 flat layout.
+///
+/// Fields beyond `shards` are placeholders for commit 6/7 semantics:
+/// `created_lsn` will be stamped by `CreateVolume` / `CloneVolume` so
+/// recovery can skip L2P ops for volumes that hadn't been created yet at a
+/// given LSN; `flags` is reserved for the drop-pending bit.
+#[allow(dead_code)]
+struct Volume {
+    ord: VolumeOrdinal,
+    shards: Vec<L2pShard>,
+    created_lsn: Lsn,
+    flags: AtomicU8,
+}
+
+impl Volume {
+    fn new(ord: VolumeOrdinal, shards: Vec<L2pShard>, created_lsn: Lsn) -> Self {
+        Self {
+            ord,
+            shards,
+            created_lsn,
+            flags: AtomicU8::new(0),
+        }
+    }
 }
 
 struct DedupManifestUpdate {
@@ -247,6 +293,10 @@ impl Db {
             faults.clone(),
         )?;
 
+        let volume_zero = Arc::new(Volume::new(BOOTSTRAP_VOLUME_ORD, l2p_shards, 0));
+        let mut volumes = HashMap::with_capacity(1);
+        volumes.insert(BOOTSTRAP_VOLUME_ORD, volume_zero);
+
         Ok(Self {
             page_store,
             page_cache,
@@ -254,7 +304,7 @@ impl Db {
                 store: manifest_store,
                 manifest,
             }),
-            shards: l2p_shards,
+            volumes: RwLock::new(volumes),
             refcount_shards,
             dedup_index,
             dedup_reverse,
@@ -329,6 +379,13 @@ impl Db {
             &manifest.shard_roots,
             next_gen,
         )?;
+        // Phase B commit 5: wrap the bootstrap volume early so replay can
+        // route through the same `Arc<Volume>` the live `Db` will own.
+        let volume_zero = Arc::new(Volume::new(
+            BOOTSTRAP_VOLUME_ORD,
+            l2p_shards,
+            manifest.checkpoint_lsn,
+        ));
         let refcount_shards = open_shards(
             page_store.clone(),
             page_cache.clone(),
@@ -361,7 +418,7 @@ impl Db {
         let mut replayed_drop = false;
         let replay_outcome = crate::recovery::replay_into(&wal_path, from_lsn, |lsn, op| {
             let outcome = apply_op_bare(
-                &l2p_shards,
+                &volume_zero.shards,
                 &refcount_shards,
                 &dedup_index,
                 &dedup_reverse,
@@ -403,6 +460,9 @@ impl Db {
         let reclaim_generation = last_applied.max(manifest.checkpoint_lsn).max(1) + 1;
         verify::reclaim_orphan_pages(&page_store, &manifest, reclaim_generation)?;
 
+        let mut volumes = HashMap::with_capacity(1);
+        volumes.insert(BOOTSTRAP_VOLUME_ORD, volume_zero);
+
         Ok(Self {
             page_store,
             page_cache,
@@ -410,7 +470,7 @@ impl Db {
                 store: manifest_store,
                 manifest,
             }),
-            shards: l2p_shards,
+            volumes: RwLock::new(volumes),
             refcount_shards,
             dedup_index,
             dedup_reverse,
@@ -435,9 +495,12 @@ impl Db {
         self.manifest_state.lock().manifest.snapshots.clone()
     }
 
-    /// Number of shards in this database.
+    /// Number of shards in this database. In Phase B commit 5 this reports
+    /// the bootstrap volume's shard count; every volume in the map is
+    /// created with the same shard count, so this remains the right answer
+    /// once multi-volume support lands.
     pub fn shard_count(&self) -> usize {
-        self.shards.len()
+        self.volume_zero().shards.len()
     }
 
     /// Number of pages currently allocated in the page store.
@@ -463,9 +526,10 @@ impl Db {
         // the state the trees will have when we flush them.
         let _apply_guard = self.apply_gate.write();
         let mut manifest_state = self.manifest_state.lock();
-        let mut l2p_guards = self.lock_all_l2p_shards();
+        let volumes = self.volumes_snapshot();
+        let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
         let mut refcount_guards = self.lock_all_refcount_shards();
-        self.flush_locked_l2p_shards(&mut l2p_guards)?;
+        flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_locked_refcount_shards(&mut refcount_guards)?;
 
         let tree_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
@@ -537,9 +601,14 @@ impl Db {
         }
 
         let apply_guard = self.apply_gate.read();
+        // Clone out the bootstrap volume once per commit — holding the
+        // `Arc` keeps its shards alive for the whole apply loop without
+        // pinning the `volumes` RwLock, so a concurrent volume-lifecycle
+        // writer (commit 8+) can still proceed if it ever arrives.
+        let volume = self.volume_zero();
         let mut outcomes = Vec::with_capacity(ops.len());
         for op in ops {
-            outcomes.push(self.apply_op(lsn, op)?);
+            outcomes.push(self.apply_op(&volume, lsn, op)?);
         }
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
@@ -557,9 +626,9 @@ impl Db {
         Ok((lsn, outcomes))
     }
 
-    fn apply_op(&self, lsn: Lsn, op: &WalOp) -> Result<ApplyOutcome> {
+    fn apply_op(&self, volume: &Volume, lsn: Lsn, op: &WalOp) -> Result<ApplyOutcome> {
         let outcome = apply_op_bare(
-            &self.shards,
+            &volume.shards,
             &self.refcount_shards,
             &self.dedup_index,
             &self.dedup_reverse,
@@ -748,8 +817,9 @@ impl Db {
     // -------- tree operations --------------------------------------------
 
     pub fn get(&self, key: u64) -> Result<Option<L2pValue>> {
-        let sid = self.shard_for(key);
-        let mut tree = self.shards[sid].tree.lock();
+        let volume = self.volume_zero();
+        let sid = shard_for_key_l2p(&volume.shards, key);
+        let mut tree = volume.shards[sid].tree.lock();
         tree.get(key)
     }
 
@@ -760,17 +830,18 @@ impl Db {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let shard_count = self.shards.len();
+        let volume = self.volume_zero();
+        let shard_count = volume.shards.len();
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
         for (idx, key) in keys.iter().enumerate() {
-            buckets[self.shard_for(*key)].push(idx);
+            buckets[shard_for_key_l2p(&volume.shards, *key)].push(idx);
         }
         let mut out: Vec<Option<L2pValue>> = vec![None; keys.len()];
         for (sid, idxs) in buckets.into_iter().enumerate() {
             if idxs.is_empty() {
                 continue;
             }
-            let mut tree = self.shards[sid].tree.lock();
+            let mut tree = volume.shards[sid].tree.lock();
             for idx in idxs {
                 out[idx] = tree.get(keys[idx])?;
             }
@@ -800,7 +871,8 @@ impl Db {
 
     pub fn range<R: RangeBounds<u64>>(&self, range: R) -> Result<DbRangeIter> {
         let range = OwnedRange::new(range);
-        let mut guards = self.lock_all_l2p_shards();
+        let volumes = self.volumes_snapshot();
+        let mut guards = lock_all_l2p_shards_for(&volumes);
         let mut items = Vec::new();
         for tree in &mut guards {
             items.extend(tree.range(range.clone())?.collect::<Result<Vec<_>>>()?);
@@ -819,7 +891,8 @@ impl Db {
         // per-shard roots we sample below describe the same LSN point.
         let _apply_guard = self.apply_gate.write();
         let mut manifest_state = self.manifest_state.lock();
-        let mut l2p_guards = self.lock_all_l2p_shards();
+        let volumes = self.volumes_snapshot();
+        let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
         let mut refcount_guards = self.lock_all_refcount_shards();
 
         let id = manifest_state.manifest.next_snapshot_id;
@@ -836,7 +909,7 @@ impl Db {
         let created_lsn = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
         let l2p_roots_page = write_snapshot_roots_page(&self.page_store, &l2p_roots, created_lsn)?;
 
-        self.flush_locked_l2p_shards(&mut l2p_guards)?;
+        flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_locked_refcount_shards(&mut refcount_guards)?;
         let dedup_update =
             self.prepare_dedup_manifest_update(&mut manifest_state.manifest, created_lsn)?;
@@ -913,7 +986,8 @@ impl Db {
                 .clone()
         };
 
-        let mut guards = self.lock_all_l2p_shards();
+        let volumes = self.volumes_snapshot();
+        let mut guards = lock_all_l2p_shards_for(&volumes);
         let mut out = Vec::new();
         for (tree, snap_root) in guards.iter_mut().zip(snap_roots.iter().copied()) {
             let current_root = tree.root();
@@ -969,13 +1043,14 @@ impl Db {
         // roots, because the v4→v5 on-open upgrade path rejects them.
         debug_assert!(entry.refcount_shard_roots.is_empty());
 
+        let volumes = self.volumes_snapshot();
         let mut pages: Vec<PageId> = Vec::new();
         {
-            let mut l2p_guards = self.lock_all_l2p_shards();
+            let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
             // Flush any dirty tree pages (including the root's
             // post-take_snapshot rc bump) so apply_op_bare reads the
             // live values by pid via page_store.
-            self.flush_locked_l2p_shards(&mut l2p_guards)?;
+            flush_locked_l2p_shards(&mut l2p_guards)?;
             for (tree, &root) in l2p_guards.iter_mut().zip(entry.l2p_shard_roots.iter()) {
                 if root == crate::types::NULL_PAGE {
                     continue;
@@ -1022,8 +1097,12 @@ impl Db {
             }
         }
 
+        // Phase B commit 5: snapshots still live in the bootstrap volume
+        // only, so apply + cache invalidation target volume 0's shards.
+        // Commit 9 widens this to per-volume snapshots.
+        let volume_zero = self.volume_zero();
         let outcome = apply_op_bare(
-            &self.shards,
+            &volume_zero.shards,
             &self.refcount_shards,
             &self.dedup_index,
             &self.dedup_reverse,
@@ -1041,7 +1120,7 @@ impl Db {
         // from disk.
         for &pid in &pages {
             self.page_cache.invalidate(pid);
-            for shard in &self.shards {
+            for shard in &volume_zero.shards {
                 shard.tree.lock().forget_page(pid);
             }
         }
@@ -1076,9 +1155,24 @@ impl Db {
         }))
     }
 
-    fn shard_for(&self, key: u64) -> usize {
-        debug_assert!(!self.shards.is_empty());
-        (xxh3_64(&key.to_be_bytes()) as usize) % self.shards.len()
+    /// Sorted snapshot of the volume set. Callers clone the `Arc<Volume>`s
+    /// out so shard mutexes can be acquired without the `volumes` read
+    /// guard lingering, and sorting by ordinal gives every caller the same
+    /// lock order when they grab shard mutexes from multiple volumes.
+    fn volumes_snapshot(&self) -> Vec<Arc<Volume>> {
+        let mut vols: Vec<Arc<Volume>> = self.volumes.read().values().cloned().collect();
+        vols.sort_by_key(|v| v.ord);
+        vols
+    }
+
+    /// Clone out the bootstrap volume. Panics if it is missing — it is
+    /// inserted at create / open time and Phase B never removes it.
+    fn volume_zero(&self) -> Arc<Volume> {
+        self.volumes
+            .read()
+            .get(&BOOTSTRAP_VOLUME_ORD)
+            .expect("bootstrap volume must always exist")
+            .clone()
     }
 
     fn refcount_shard_for(&self, pba: Pba) -> usize {
@@ -1125,22 +1219,11 @@ impl Db {
         Ok(())
     }
 
-    fn lock_all_l2p_shards(&self) -> Vec<MutexGuard<'_, PagedL2p>> {
-        self.shards.iter().map(|shard| shard.tree.lock()).collect()
-    }
-
     fn lock_all_refcount_shards(&self) -> Vec<MutexGuard<'_, BTree>> {
         self.refcount_shards
             .iter()
             .map(|shard| shard.tree.lock())
             .collect()
-    }
-
-    fn flush_locked_l2p_shards(&self, guards: &mut [MutexGuard<'_, PagedL2p>]) -> Result<()> {
-        for tree in guards {
-            tree.flush()?;
-        }
-        Ok(())
     }
 
     fn flush_locked_refcount_shards(&self, guards: &mut [MutexGuard<'_, BTree>]) -> Result<()> {
@@ -1162,6 +1245,10 @@ impl Db {
         l2p_guards: &[MutexGuard<'_, PagedL2p>],
         refcount_guards: &[MutexGuard<'_, BTree>],
     ) {
+        // Phase B commit 5 keeps the v5 manifest shape: `shard_roots` is the
+        // bootstrap volume's per-shard root list. `l2p_guards` is flat across
+        // volumes, but today only volume 0 exists so the length matches the
+        // legacy field.
         manifest.body_version = MANIFEST_BODY_VERSION;
         manifest.shard_roots = l2p_guards
             .iter()
@@ -1176,21 +1263,23 @@ impl Db {
     }
 
     fn current_generation(&self) -> Lsn {
-        let l2p = self.lock_all_l2p_shards();
+        let volumes = self.volumes_snapshot();
+        let l2p = lock_all_l2p_shards_for(&volumes);
         let refcount = self.lock_all_refcount_shards();
         max_generation_from_two_groups(&l2p, &refcount)
     }
 
     fn collect_range_for_roots(&self, roots: &[PageId], range: OwnedRange) -> Result<DbRangeIter> {
-        if roots.len() != self.shards.len() {
+        let volume = self.volume_zero();
+        if roots.len() != volume.shards.len() {
             return Err(MetaDbError::Corruption(format!(
                 "snapshot root count {} does not match shard count {}",
                 roots.len(),
-                self.shards.len(),
+                volume.shards.len(),
             )));
         }
         let mut items = Vec::new();
-        for (root, shard) in roots.iter().copied().zip(&self.shards) {
+        for (root, shard) in roots.iter().copied().zip(&volume.shards) {
             let mut tree = shard.tree.lock();
             items.extend(
                 tree.range_at(root, range.clone())?
@@ -1202,16 +1291,18 @@ impl Db {
     }
 
     fn diff_roots(&self, a: &[PageId], b: &[PageId]) -> Result<Vec<DiffEntry>> {
-        if a.len() != self.shards.len() || b.len() != self.shards.len() {
+        let volume = self.volume_zero();
+        if a.len() != volume.shards.len() || b.len() != volume.shards.len() {
             return Err(MetaDbError::Corruption(format!(
                 "diff root counts ({}, {}) do not match shard count {}",
                 a.len(),
                 b.len(),
-                self.shards.len(),
+                volume.shards.len(),
             )));
         }
         let mut out = Vec::new();
-        for ((a_root, b_root), shard) in a.iter().copied().zip(b.iter().copied()).zip(&self.shards)
+        for ((a_root, b_root), shard) in
+            a.iter().copied().zip(b.iter().copied()).zip(&volume.shards)
         {
             let mut tree = shard.tree.lock();
             out.extend(tree.diff_subtrees(a_root, b_root)?);
@@ -1253,8 +1344,12 @@ impl<'a> SnapshotView<'a> {
 
     /// Point lookup as of the snapshot's LSN.
     pub fn get(&self, key: u64) -> Result<Option<L2pValue>> {
-        let sid = self.db.shard_for(key);
-        let mut tree = self.db.shards[sid].tree.lock();
+        // Phase B commit 5 still keys snapshots off the bootstrap volume's
+        // shard layout. Commit 9 moves snapshots per-volume and this resolves
+        // via `self.entry.vol_ord` instead.
+        let volume = self.db.volume_zero();
+        let sid = shard_for_key_l2p(&volume.shards, key);
+        let mut tree = volume.shards[sid].tree.lock();
         tree.get_at(self.entry.l2p_shard_roots[sid], key)
     }
 
@@ -1263,6 +1358,27 @@ impl<'a> SnapshotView<'a> {
         self.db
             .collect_range_for_roots(&self.entry.l2p_shard_roots, OwnedRange::new(range))
     }
+}
+
+/// Lock every L2P shard mutex across the given volume set, in
+/// (`volumes` order, shard index) order. Callers that reach multiple
+/// volumes pass the sorted output of `Db::volumes_snapshot` so every
+/// caller agrees on a single lock order, preventing the shard mutexes
+/// from deadlocking against each other. Volumes are passed in as a slice
+/// of `Arc<Volume>` so the clones keep the mutexes alive for the guard
+/// lifetime.
+fn lock_all_l2p_shards_for<'v>(volumes: &'v [Arc<Volume>]) -> Vec<MutexGuard<'v, PagedL2p>> {
+    volumes
+        .iter()
+        .flat_map(|vol| vol.shards.iter().map(|shard| shard.tree.lock()))
+        .collect()
+}
+
+fn flush_locked_l2p_shards(guards: &mut [MutexGuard<'_, PagedL2p>]) -> Result<()> {
+    for tree in guards {
+        tree.flush()?;
+    }
+    Ok(())
 }
 
 fn validate_shard_count(shards_per_partition: u32) -> Result<usize> {
