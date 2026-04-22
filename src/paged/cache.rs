@@ -139,6 +139,16 @@ impl PageBuf {
         self.pages.remove(&pid);
     }
 
+    /// Drop every page from the local cache without touching the shared
+    /// `PageCache` or the on-disk refcounts. Used by `attach_subtree_root`
+    /// (Phase 7) when the tree's root is swapped out from under it: every
+    /// page pid held in `self.pages` is about to refer to a different
+    /// subtree, so the dirty-flag tracking would be wrong. The caller is
+    /// responsible for making sure the old root was already flushed.
+    pub fn forget_all(&mut self) {
+        self.pages.clear();
+    }
+
     /// Return `pid` to the page store's free list, stamping with
     /// `generation`. Low-level — skips refcount accounting. Use
     /// [`decref`](Self::decref) instead for shared pages.

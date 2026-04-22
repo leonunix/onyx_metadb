@@ -161,6 +161,14 @@ impl BTree {
         }))
     }
 
+    /// Iterate the entire tree. Same materialisation caveat as
+    /// [`BTree::range`] today — the `_stream` suffix reserves space for
+    /// a Phase C swap to a lazy walker without touching call sites.
+    /// Phase 7 uses this to expose `Db::iter_refcounts`.
+    pub fn iter_stream(&mut self) -> Result<RangeIter> {
+        self.range(..)
+    }
+
     fn collect_range(
         &mut self,
         pid: PageId,
@@ -910,5 +918,29 @@ mod tests {
             let _ = t.get(i).unwrap();
             assert_eq!(t.cached_pages_for_test(), 0);
         }
+    }
+
+    #[test]
+    fn iter_stream_visits_every_key_in_order() {
+        let (_d, mut t) = mk_tree();
+        let keys: Vec<u64> = (0..512u64).map(|i| i * 13).collect();
+        for k in &keys {
+            t.insert(*k, *k as u32).unwrap();
+        }
+        let got: Vec<(u64, u32)> = t.iter_stream().unwrap().map(|r| r.unwrap()).collect();
+        let mut expected: Vec<(u64, u32)> = keys.iter().map(|k| (*k, *k as u32)).collect();
+        expected.sort_unstable_by_key(|(k, _)| *k);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn iter_stream_matches_full_range() {
+        let (_d, mut t) = mk_tree();
+        for i in 0..128u64 {
+            t.insert(i * 7, i as u32).unwrap();
+        }
+        let via_range: Vec<_> = t.range(..).unwrap().map(|r| r.unwrap()).collect();
+        let via_iter: Vec<_> = t.iter_stream().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(via_range, via_iter);
     }
 }

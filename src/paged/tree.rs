@@ -615,6 +615,46 @@ impl PagedL2p {
         self.root_level = level;
     }
 
+    /// Swap the tree's root to a foreign page that is already durable on
+    /// disk, dropping the local page cache so stale dirty-bit tracking
+    /// can't misroute a later write.
+    ///
+    /// Used by Phase 7 `CloneVolume` apply: the clone target's shard is
+    /// initialised pointing at one of the source snapshot's shard roots,
+    /// with the page-store-level refcount incref already performed by the
+    /// caller (so `pid`'s on-disk header carries the updated rc). The
+    /// first write into the clone will then `cow_for_write` down from
+    /// `pid`, leaving the snapshot's view of the subtree intact.
+    ///
+    /// `level` must match the page's actual level (caller reads it via
+    /// `PageBuf::read_level`); this function does not re-derive it from
+    /// disk so the caller can reuse a level it already has on hand. If
+    /// `level > MAX_INDEX_LEVEL` the call is rejected.
+    pub fn attach_subtree_root(&mut self, pid: PageId, level: u8) -> Result<()> {
+        if level > MAX_INDEX_LEVEL {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "paged::attach_subtree_root: level {level} exceeds max {MAX_INDEX_LEVEL}"
+            )));
+        }
+        self.buf.forget_all();
+        self.root = pid;
+        self.root_level = level;
+        Ok(())
+    }
+
+    /// Streaming range scan. **Today this materialises its result upfront**
+    /// (same implementation as [`PagedL2p::range`]) — the public surface is
+    /// exposed now so callers can code against the "stream" API while a
+    /// Phase C commit swaps the body to a lazy frame-stack walker without
+    /// touching any callsite. The `PagedRangeIter` yields items in
+    /// ascending key order either way.
+    ///
+    /// Semantically equivalent to `range` for now; the distinction is
+    /// forward-looking.
+    pub fn range_stream<R: RangeBounds<u64>>(&mut self, range: R) -> Result<PagedRangeIter> {
+        self.range(range)
+    }
+
     // -------- lifecycle --------------------------------------------------
 
     /// Persist all dirty pages. Must be called before the caller
@@ -939,5 +979,68 @@ mod tests {
         for k in &keys {
             assert_eq!(t.get(*k).unwrap(), None, "key {k} not deleted");
         }
+    }
+
+    #[test]
+    fn range_stream_matches_range() {
+        let (_d, ps) = mk_store();
+        let mut t = PagedL2p::create(ps).unwrap();
+        for (i, k) in [3u64, 10, 57, 200, 2048, 50_000].iter().enumerate() {
+            t.insert(*k, v(i as u8)).unwrap();
+        }
+        let via_range: Vec<_> = t.range(..).unwrap().collect::<Result<Vec<_>>>().unwrap();
+        let via_stream: Vec<_> = t
+            .range_stream(..)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(via_range, via_stream);
+        // Non-empty sanity.
+        assert_eq!(via_stream.len(), 6);
+    }
+
+    #[test]
+    fn attach_subtree_root_adopts_foreign_root_for_reads() {
+        // Populate a source tree, snapshot its root (incref), then attach
+        // that root into a freshly-created empty tree. Reads via the
+        // attached tree must see the source's data.
+        let (_d, ps) = mk_store();
+        let mut src = PagedL2p::create_with_cache(
+            ps.clone(),
+            Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES)),
+        )
+        .unwrap();
+        for (i, k) in [1u64, 200, 4096].iter().enumerate() {
+            src.insert(*k, v((i + 1) as u8)).unwrap();
+        }
+        let src_root = src.root();
+        let src_level = src.root_level();
+        // Bump the root's on-disk refcount so the clone share survives.
+        src.incref_root_for_snapshot().unwrap();
+        src.flush().unwrap();
+
+        let mut dst = PagedL2p::create_with_cache(
+            ps.clone(),
+            Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES)),
+        )
+        .unwrap();
+        dst.attach_subtree_root(src_root, src_level).unwrap();
+        assert_eq!(dst.root(), src_root);
+        assert_eq!(dst.root_level(), src_level);
+        assert_eq!(dst.get(1).unwrap(), Some(v(1)));
+        assert_eq!(dst.get(200).unwrap(), Some(v(2)));
+        assert_eq!(dst.get(4096).unwrap(), Some(v(3)));
+        assert_eq!(dst.get(9999).unwrap(), None);
+    }
+
+    #[test]
+    fn attach_subtree_root_rejects_invalid_level() {
+        let (_d, ps) = mk_store();
+        let mut t = PagedL2p::create(ps).unwrap();
+        let bad_level = MAX_INDEX_LEVEL + 1;
+        assert!(matches!(
+            t.attach_subtree_root(42, bad_level),
+            Err(MetaDbError::InvalidArgument(_))
+        ));
     }
 }
