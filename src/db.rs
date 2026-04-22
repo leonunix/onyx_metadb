@@ -117,6 +117,10 @@ pub struct Db {
     /// just long enough to clone the `Arc<Volume>` out so shard mutexes
     /// can be acquired without keeping the map guard alive.
     drop_gate: RwLock<()>,
+    /// Runtime cap on the volumes table size. Seeded from
+    /// [`Config::max_volumes`] at create / open. `create_volume` refuses
+    /// to mint a new ordinal once the live volume count hits this value.
+    max_volumes: u32,
     #[allow(dead_code)]
     faults: Arc<FaultController>,
     #[allow(dead_code)]
@@ -323,6 +327,7 @@ impl Db {
             commit_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             drop_gate: RwLock::new(()),
+            max_volumes: cfg.max_volumes,
             faults,
             db_path: cfg.path,
         })
@@ -357,36 +362,29 @@ impl Db {
                 "manifest has no volume entries; database was not initialized".into(),
             ));
         }
-        let bootstrap_entry = manifest
-            .volumes
-            .iter()
-            .find(|v| v.ord == BOOTSTRAP_VOLUME_ORD)
-            .ok_or_else(|| {
-                MetaDbError::Corruption(
-                    "manifest is missing the bootstrap (ord=0) volume entry".into(),
-                )
-            })?
-            .clone();
+        if !manifest.volumes.iter().any(|v| v.ord == BOOTSTRAP_VOLUME_ORD) {
+            return Err(MetaDbError::Corruption(
+                "manifest is missing the bootstrap (ord=0) volume entry".into(),
+            ));
+        }
 
         let next_gen = manifest.checkpoint_lsn.max(1) + 1;
 
-        // Phase B commit 6: build the bootstrap volume directly from
-        // `manifest.volumes[ord=0]`. Earlier versions of the manifest
-        // (v3/v4/v5) are not readable — Phase 7 is fresh-install only,
-        // and `Manifest::decode` rejects them at the page-layer.
-        let bootstrap_shards = open_l2p_shards(
-            page_store.clone(),
-            page_cache.clone(),
-            &bootstrap_entry.l2p_shard_roots,
-            next_gen,
-        )?;
-        let volume_zero = Arc::new(Volume::new(
-            BOOTSTRAP_VOLUME_ORD,
-            bootstrap_shards,
-            bootstrap_entry.created_lsn,
-        ));
-        let mut volumes: HashMap<VolumeOrdinal, Arc<Volume>> = HashMap::with_capacity(1);
-        volumes.insert(BOOTSTRAP_VOLUME_ORD, volume_zero);
+        // Phase 7 commit 8: open every volume recorded in the manifest.
+        // Earlier versions of the manifest (v3/v4/v5) are not readable —
+        // Phase 7 is fresh-install only, and `Manifest::decode` rejects
+        // them at the page-layer.
+        let mut volumes: HashMap<VolumeOrdinal, Arc<Volume>> =
+            HashMap::with_capacity(manifest.volumes.len());
+        for entry in &manifest.volumes {
+            let shards = open_l2p_shards(
+                page_store.clone(),
+                page_cache.clone(),
+                &entry.l2p_shard_roots,
+                next_gen,
+            )?;
+            volumes.insert(entry.ord, Arc::new(Volume::new(entry.ord, shards, entry.created_lsn)));
+        }
         let refcount_shards = open_shards(
             page_store.clone(),
             page_cache.clone(),
@@ -414,24 +412,70 @@ impl Db {
         // `DropSnapshot` replay also mutates `manifest.snapshots`; that
         // is handled in the closure after `apply_op_bare` does the page
         // work, mirroring the live path in `Db::apply_op`.
+        //
+        // `CreateVolume` / `DropVolume` mutate the volumes map + the
+        // manifest's volumes table, so they're dispatched ahead of
+        // `apply_op_bare` (whose volume-lifecycle arm is still
+        // `Err(Corruption)` — commit 8 routes live traffic through
+        // `Db::create_volume` / `Db::drop_volume`, which bypass
+        // `commit_ops` entirely).
         let wal_path = wal_dir(&cfg.path);
         let from_lsn = manifest.checkpoint_lsn + 1;
         let mut replayed_drop = false;
+        let mut mutated_volumes = false;
         let replay_outcome = crate::recovery::replay_into(&wal_path, from_lsn, |lsn, op| {
-            let outcome = apply_op_bare(
-                &volumes,
-                &refcount_shards,
-                &dedup_index,
-                &dedup_reverse,
-                &page_store,
-                lsn,
-                op,
-            )?;
-            if let WalOp::DropSnapshot { id, .. } = op {
-                manifest.snapshots.retain(|s| s.id != *id);
-                replayed_drop = true;
+            match op {
+                WalOp::CreateVolume { ord, shard_count } => {
+                    if !volumes.contains_key(ord) {
+                        let (shards, roots) = apply_create_volume(
+                            &page_store,
+                            &page_cache,
+                            *shard_count,
+                        )?;
+                        volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
+                        manifest.volumes.push(VolumeEntry {
+                            ord: *ord,
+                            shard_count: *shard_count,
+                            l2p_shard_roots: roots,
+                            created_lsn: lsn,
+                            flags: 0,
+                        });
+                        mutated_volumes = true;
+                    }
+                    manifest.next_volume_ord = manifest
+                        .next_volume_ord
+                        .max(ord.checked_add(1).unwrap_or(u16::MAX));
+                    Ok(ApplyOutcome::Dedup)
+                }
+                WalOp::DropVolume { ord, pages } => {
+                    if volumes.contains_key(ord) {
+                        apply_drop_volume(&page_store, lsn, pages)?;
+                        volumes.remove(ord);
+                        manifest.volumes.retain(|v| v.ord != *ord);
+                        mutated_volumes = true;
+                    }
+                    Ok(ApplyOutcome::Dedup)
+                }
+                WalOp::CloneVolume { .. } => Err(MetaDbError::Corruption(
+                    "CloneVolume replay is not implemented (commit 10)".into(),
+                )),
+                _ => {
+                    let outcome = apply_op_bare(
+                        &volumes,
+                        &refcount_shards,
+                        &dedup_index,
+                        &dedup_reverse,
+                        &page_store,
+                        lsn,
+                        op,
+                    )?;
+                    if let WalOp::DropSnapshot { id, .. } = op {
+                        manifest.snapshots.retain(|s| s.id != *id);
+                        replayed_drop = true;
+                    }
+                    Ok(outcome)
+                }
             }
-            Ok(outcome)
         })?;
         let last_applied = replay_outcome.last_lsn.unwrap_or(manifest.checkpoint_lsn);
         // If the last segment ended torn, truncate it to the last clean
@@ -439,15 +483,13 @@ impl Db {
         crate::recovery::truncate_torn_tail(&wal_path, &replay_outcome)?;
         let wal = Wal::create(&wal_path, &cfg, last_applied + 1, faults.clone())?;
 
-        // If replay removed any snapshots from the in-memory manifest,
-        // persist the updated list before we start freeing pages. The
-        // on-disk manifest would otherwise still reference those
-        // dropped snapshots' metadata pages, and `reclaim_orphan_pages`
-        // below would mark them as orphan (nothing in-memory points at
-        // them) and free them — then a subsequent offline decode of
-        // the stale on-disk manifest would fail on the now-Free pages.
-        // By committing here we keep disk and memory in sync.
-        if replayed_drop {
+        // If replay removed any snapshots or altered the volumes table,
+        // persist the updated manifest before we start freeing pages.
+        // Reclaim below walks `manifest` as its source of live page
+        // roots; committing here keeps the on-disk copy in sync with the
+        // in-memory one so a subsequent offline decode doesn't trip on
+        // dangling references.
+        if replayed_drop || mutated_volumes {
             manifest.checkpoint_lsn = last_applied;
             manifest_store.commit(&manifest)?;
         }
@@ -478,6 +520,7 @@ impl Db {
             commit_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             drop_gate: RwLock::new(()),
+            max_volumes: cfg.max_volumes,
             faults,
             db_path: cfg.path,
         })
@@ -1198,6 +1241,225 @@ impl Db {
         }))
     }
 
+    // -------- volume lifecycle ------------------------------------------
+
+    /// Mint a new volume. Returns the freshly-assigned ordinal. Uses the
+    /// same shard count as the bootstrap volume, matching the "every
+    /// volume has the same shard count" invariant documented on
+    /// [`Volume`].
+    ///
+    /// Serialisation:
+    /// - `drop_gate.write()` — blocks new `commit_ops` callers and waits
+    ///   for in-flight commits to finish so our subsequent WAL submit +
+    ///   `commit_cvar` wait cannot deadlock behind an LSN assigned to a
+    ///   commit that hasn't reached apply yet.
+    /// - `apply_gate.write()` — excludes `flush` / `take_snapshot` /
+    ///   `drop_snapshot`.
+    ///
+    /// Crash semantics:
+    /// - Before WAL fsync: no effect observable.
+    /// - After WAL fsync, before/during apply: recovery re-applies the
+    ///   `CreateVolume` record. The in-memory `volumes.contains_key(ord)`
+    ///   guard plus deterministic page allocation make replay idempotent.
+    ///
+    /// No manifest commit happens inside this function; the next natural
+    /// [`flush`](Self::flush) captures the new volumes table.
+    pub fn create_volume(&self) -> Result<VolumeOrdinal> {
+        let _drop_guard = self.drop_gate.write();
+        let _apply_guard = self.apply_gate.write();
+
+        let (ord, shard_count) = {
+            let mstate = self.manifest_state.lock();
+            if (mstate.manifest.volumes.len() as u32) >= self.max_volumes {
+                return Err(MetaDbError::InvalidArgument(format!(
+                    "max_volumes ({}) reached",
+                    self.max_volumes,
+                )));
+            }
+            let ord = mstate.manifest.next_volume_ord;
+            let shard_count = self.volume_zero().shards.len() as u32;
+            (ord, shard_count)
+        };
+
+        let op = WalOp::CreateVolume { ord, shard_count };
+        let body = encode_body(std::slice::from_ref(&op));
+        let lsn = self.wal.submit(body)?;
+        self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
+
+        // Under our two write gates no other commit is between submit
+        // and apply, so last_applied_lsn + 1 == lsn already. The cvar
+        // wait keeps the pattern symmetric with `drop_snapshot`.
+        {
+            let mut applied = self.last_applied_lsn.lock();
+            while *applied + 1 < lsn {
+                self.commit_cvar.wait(&mut applied);
+            }
+        }
+
+        let (shards, roots) =
+            apply_create_volume(&self.page_store, &self.page_cache, shard_count)?;
+        self.faults
+            .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
+
+        {
+            let mut volumes_map = self.volumes.write();
+            if volumes_map.contains_key(&ord) {
+                return Err(MetaDbError::Corruption(format!(
+                    "create_volume: ord {ord} already present"
+                )));
+            }
+            volumes_map.insert(ord, Arc::new(Volume::new(ord, shards, lsn)));
+        }
+
+        {
+            let mut mstate = self.manifest_state.lock();
+            mstate.manifest.volumes.push(VolumeEntry {
+                ord,
+                shard_count,
+                l2p_shard_roots: roots,
+                created_lsn: lsn,
+                flags: 0,
+            });
+            mstate.manifest.next_volume_ord = ord
+                .checked_add(1)
+                .ok_or_else(|| MetaDbError::Corruption("volume ord overflow".into()))?;
+        }
+
+        {
+            let mut applied = self.last_applied_lsn.lock();
+            *applied = lsn;
+            self.commit_cvar.notify_all();
+        }
+
+        Ok(ord)
+    }
+
+    /// Drop the volume at `vol_ord`. Refuses to drop the bootstrap
+    /// volume (ord 0) or any volume with a live snapshot pinning it.
+    /// Unknown ordinals return `Ok(None)` to mirror `drop_snapshot`'s
+    /// idempotent shape.
+    ///
+    /// Serialisation:
+    /// - `drop_gate.write()` — excludes every `commit_ops` path. The
+    ///   rc-dependent drop plan relies on no concurrent `cow_for_write`
+    ///   moving rcs out from under us.
+    /// - `apply_gate.write()` — excludes `flush` / `take_snapshot` /
+    ///   `drop_snapshot` / `create_volume`.
+    /// - `snapshot_views.write()` — waits for outstanding
+    ///   [`SnapshotView`]s to drop before any page is freed.
+    ///
+    /// Crash semantics:
+    /// - Before WAL fsync: no effect observable.
+    /// - After WAL fsync, before/during apply: recovery replays the op
+    ///   using the durable plan + per-page generation stamp for
+    ///   idempotency, yielding the same final state as a clean run.
+    ///
+    /// No manifest commit happens inside this function; the next
+    /// natural [`flush`](Self::flush) captures the new volumes list.
+    pub fn drop_volume(&self, vol_ord: VolumeOrdinal) -> Result<Option<DropVolumeReport>> {
+        if vol_ord == BOOTSTRAP_VOLUME_ORD {
+            return Err(MetaDbError::InvalidArgument(
+                "cannot drop the bootstrap volume (ord=0)".into(),
+            ));
+        }
+        let _drop_guard = self.drop_gate.write();
+        let _apply_guard = self.apply_gate.write();
+        let _view_guard = self.snapshot_views.write();
+
+        // Live snapshots on the dying volume would outlive their source
+        // trees' roots. Reject and let the caller drop them first.
+        {
+            let mstate = self.manifest_state.lock();
+            if mstate
+                .manifest
+                .snapshots
+                .iter()
+                .any(|s| s.vol_ord == vol_ord)
+            {
+                return Err(MetaDbError::InvalidArgument(format!(
+                    "cannot drop volume {vol_ord} with live snapshots"
+                )));
+            }
+        }
+
+        let volume = match self.volumes.read().get(&vol_ord).cloned() {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let mut pages: Vec<PageId> = Vec::new();
+        {
+            let mut guards: Vec<MutexGuard<'_, PagedL2p>> =
+                volume.shards.iter().map(|s| s.tree.lock()).collect();
+            // Flush any dirty tree pages so apply_drop_snapshot_pages
+            // reads the live rcs by pid via page_store.
+            flush_locked_l2p_shards(&mut guards)?;
+            for tree in &mut guards {
+                let root = tree.root();
+                if root == crate::types::NULL_PAGE {
+                    continue;
+                }
+                pages.extend(tree.collect_drop_pages(root)?);
+            }
+        }
+
+        let op = WalOp::DropVolume {
+            ord: vol_ord,
+            pages: pages.clone(),
+        };
+        let body = encode_body(std::slice::from_ref(&op));
+        let lsn = self.wal.submit(body)?;
+        self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
+        {
+            let mut applied = self.last_applied_lsn.lock();
+            while *applied + 1 < lsn {
+                self.commit_cvar.wait(&mut applied);
+            }
+        }
+
+        let pages_freed = apply_drop_volume(&self.page_store, lsn, &pages)?;
+        self.faults
+            .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
+
+        // apply_drop_snapshot_pages wrote pages through page_store,
+        // bypassing shard-local PageBuf + shared page_cache — invalidate
+        // both so the next cow_for_write / lookup pulls fresh bytes.
+        for &pid in &pages {
+            self.page_cache.invalidate(pid);
+            for shard in &volume.shards {
+                shard.tree.lock().forget_page(pid);
+            }
+        }
+        drop(volume);
+
+        {
+            let mut volumes_map = self.volumes.write();
+            volumes_map.remove(&vol_ord);
+        }
+        {
+            let mut mstate = self.manifest_state.lock();
+            mstate.manifest.volumes.retain(|v| v.ord != vol_ord);
+        }
+
+        {
+            let mut applied = self.last_applied_lsn.lock();
+            *applied = lsn;
+            self.commit_cvar.notify_all();
+        }
+
+        Ok(Some(DropVolumeReport {
+            vol_ord,
+            pages_freed,
+        }))
+    }
+
+    /// Sorted list of live volume ordinals.
+    pub fn volumes(&self) -> Vec<VolumeOrdinal> {
+        let mut ords: Vec<VolumeOrdinal> = self.volumes.read().keys().copied().collect();
+        ords.sort_unstable();
+        ords
+    }
+
     /// Sorted snapshot of the volume set. Callers clone the `Arc<Volume>`s
     /// out so shard mutexes can be acquired without the `volumes` read
     /// guard lingering, and sorting by ordinal gives every caller the same
@@ -1409,6 +1671,15 @@ pub struct DropReport {
     /// Every value stored in leaves that were uniquely owned by this
     /// snapshot.
     pub freed_leaf_values: Vec<L2pValue>,
+    /// Number of metadb pages released back to the page store.
+    pub pages_freed: usize,
+}
+
+/// Result of [`Db::drop_volume`].
+#[derive(Clone, Debug)]
+pub struct DropVolumeReport {
+    /// Ordinal of the volume that was dropped.
+    pub vol_ord: VolumeOrdinal,
     /// Number of metadb pages released back to the page store.
     pub pages_freed: usize,
 }
@@ -1733,6 +2004,36 @@ fn apply_op_bare(
         | WalOp::CloneVolume { new_ord: ord, .. } => Err(MetaDbError::Corruption(format!(
             "Phase 7 volume-lifecycle WAL op for ord {ord} hit the commit-6 apply path; \
              commit 8/9 implements these — this binary is too old to replay it"
+        ))),
+    }
+}
+
+/// Allocate a fresh shard group for a `CreateVolume` apply. Delegates
+/// to [`create_l2p_shards`]; kept separate so the Db public API and
+/// the recovery replay closure share one call site.
+fn apply_create_volume(
+    page_store: &Arc<PageStore>,
+    page_cache: &Arc<PageCache>,
+    shard_count: u32,
+) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
+    let n = validate_shard_count(shard_count)?;
+    create_l2p_shards(page_store.clone(), page_cache.clone(), n)
+}
+
+/// Apply a `DropVolume` op's page-decref cascade. Reuses
+/// [`apply_drop_snapshot_pages`]; `DropVolume` has the same
+/// per-page semantics (decref, free at rc=0, idempotent via
+/// `page.generation >= lsn`) and just doesn't need the freed-leaf-values
+/// vec the snapshot path surfaces in its report.
+fn apply_drop_volume(
+    page_store: &Arc<PageStore>,
+    lsn: Lsn,
+    pages: &[PageId],
+) -> Result<usize> {
+    match apply_drop_snapshot_pages(page_store, lsn, pages)? {
+        ApplyOutcome::DropSnapshot { pages_freed, .. } => Ok(pages_freed),
+        other => Err(MetaDbError::Corruption(format!(
+            "apply_drop_volume: unexpected outcome {other:?}"
         ))),
     }
 }
@@ -2089,6 +2390,137 @@ mod tests {
             assert_eq!(v2.get(5).unwrap(), Some(v(2)));
         }
         assert_eq!(db.get(0,5).unwrap(), Some(v(3)));
+    }
+
+    // -------- phase 7 commit 8: volume lifecycle --------
+
+    #[test]
+    fn fresh_db_volumes_lists_only_bootstrap() {
+        let (_d, db) = mk_db();
+        assert_eq!(db.volumes(), vec![BOOTSTRAP_VOLUME_ORD]);
+        assert_eq!(db.manifest().next_volume_ord, BOOTSTRAP_VOLUME_ORD + 1);
+    }
+
+    #[test]
+    fn create_volume_assigns_monotonic_ords() {
+        let (_d, db) = mk_db();
+        let a = db.create_volume().unwrap();
+        let b = db.create_volume().unwrap();
+        let c = db.create_volume().unwrap();
+        assert_eq!((a, b, c), (1, 2, 3));
+        assert_eq!(db.volumes(), vec![0, 1, 2, 3]);
+        let m = db.manifest();
+        assert_eq!(m.next_volume_ord, 4);
+        assert_eq!(m.volumes.len(), 4);
+    }
+
+    #[test]
+    fn create_volume_respects_max_volumes() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = Config::new(dir.path());
+        cfg.max_volumes = 2; // bootstrap + one
+        let db = Db::create_with_config(cfg).unwrap();
+        let _a = db.create_volume().unwrap();
+        match db.create_volume().unwrap_err() {
+            MetaDbError::InvalidArgument(msg) => {
+                assert!(msg.contains("max_volumes"), "msg={msg}");
+            }
+            e => panic!("unexpected error {e:?}"),
+        }
+    }
+
+    #[test]
+    fn new_volume_is_isolated_from_bootstrap() {
+        let (_d, db) = mk_db();
+        let ord = db.create_volume().unwrap();
+        db.insert(0, 7, v(1)).unwrap();
+        db.insert(ord, 7, v(2)).unwrap();
+        assert_eq!(db.get(0, 7).unwrap(), Some(v(1)));
+        assert_eq!(db.get(ord, 7).unwrap(), Some(v(2)));
+    }
+
+    #[test]
+    fn drop_volume_bootstrap_refused() {
+        let (_d, db) = mk_db();
+        match db.drop_volume(0).unwrap_err() {
+            MetaDbError::InvalidArgument(msg) => {
+                assert!(msg.contains("bootstrap"), "msg={msg}");
+            }
+            e => panic!("unexpected error {e:?}"),
+        }
+        // The bootstrap volume is still live.
+        assert_eq!(db.volumes(), vec![0]);
+    }
+
+    #[test]
+    fn drop_volume_unknown_returns_none() {
+        let (_d, db) = mk_db();
+        assert!(db.drop_volume(99).unwrap().is_none());
+    }
+
+    #[test]
+    fn drop_volume_removes_ord_from_map_and_manifest() {
+        let (_d, db) = mk_db();
+        let ord = db.create_volume().unwrap();
+        for i in 0u64..32 {
+            db.insert(ord, i, v(i as u8)).unwrap();
+        }
+        let report = db.drop_volume(ord).unwrap().unwrap();
+        assert_eq!(report.vol_ord, ord);
+        assert!(report.pages_freed > 0);
+        assert_eq!(db.volumes(), vec![0]);
+        assert!(!db.manifest().volumes.iter().any(|v| v.ord == ord));
+        // Reads against the dropped ord surface as InvalidArgument.
+        match db.get(ord, 0).unwrap_err() {
+            MetaDbError::InvalidArgument(_) => {}
+            e => panic!("unexpected error {e:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_lifecycle_survives_reopen_without_flush() {
+        let dir = TempDir::new().unwrap();
+        let ord;
+        {
+            let db = Db::create(dir.path()).unwrap();
+            ord = db.create_volume().unwrap();
+            db.insert(ord, 100, v(42)).unwrap();
+            // No flush — rely on WAL replay.
+        }
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.volumes(), vec![0, ord]);
+        assert_eq!(db.get(ord, 100).unwrap(), Some(v(42)));
+        assert_eq!(db.manifest().next_volume_ord, ord + 1);
+    }
+
+    #[test]
+    fn drop_volume_lifecycle_survives_reopen_without_flush() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            let ord = db.create_volume().unwrap();
+            db.insert(ord, 5, v(7)).unwrap();
+            db.drop_volume(ord).unwrap().unwrap();
+        }
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.volumes(), vec![0]);
+        // next_volume_ord must stay bumped past the dropped ord.
+        assert!(db.manifest().next_volume_ord >= 2);
+    }
+
+    #[test]
+    fn create_volume_persists_through_flush_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let ord;
+        {
+            let db = Db::create(dir.path()).unwrap();
+            ord = db.create_volume().unwrap();
+            db.insert(ord, 1, v(9)).unwrap();
+            db.flush().unwrap();
+        }
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.volumes(), vec![0, ord]);
+        assert_eq!(db.get(ord, 1).unwrap(), Some(v(9)));
     }
 
     // -------- phase 5e: refcount + dedup integration --------
