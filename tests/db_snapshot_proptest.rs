@@ -125,7 +125,7 @@ proptest! {
                     prop_assert_eq!(tree_old, ref_old);
                 }
                 Op::Snapshot => {
-                    let id = db.take_snapshot().unwrap();
+                    let id = db.take_snapshot(0).unwrap();
                     snapshots.insert(id, current.clone());
                     snap_ids.push(id);
                 }
@@ -240,7 +240,7 @@ fn deterministic_snapshot_stress() {
                 // so we don't accidentally hit the manifest limit while
                 // stress-testing everything else.
                 if snap_ids.len() < 100 {
-                    let id = db.take_snapshot().unwrap();
+                    let id = db.take_snapshot(0).unwrap();
                     snapshots.insert(id, current.clone());
                     snap_ids.push(id);
                 }

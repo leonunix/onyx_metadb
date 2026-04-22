@@ -553,7 +553,7 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
                 let ack = match verb {
                     "FLUSH" => db.flush().map(|_| Ack::Ok(id)),
                     "SNAPSHOT" => db
-                        .take_snapshot()
+                        .take_snapshot(0)
                         .map(|snapshot| Ack::Snapshot(id, snapshot)),
                     "DROP" => {
                         let snap_id = parse_part_u64(parts.next(), "snapshot id")?;

@@ -147,7 +147,7 @@ fn snapshot_checkpoint_does_not_drop_unflushed_dedup_rows() {
     {
         let db = Db::create(dir.path()).unwrap();
         db.put_dedup(h(777), dval(7)).unwrap();
-        let _ = db.take_snapshot().unwrap();
+        let _ = db.take_snapshot(0).unwrap();
     }
     let db = Db::open(dir.path()).unwrap();
     assert_eq!(db.get_dedup(&h(777)).unwrap(), Some(dval(7)));
@@ -158,7 +158,7 @@ fn drop_snapshot_checkpoint_does_not_drop_unflushed_dedup_rows() {
     let dir = TempDir::new().unwrap();
     {
         let db = Db::create(dir.path()).unwrap();
-        let snap = db.take_snapshot().unwrap();
+        let snap = db.take_snapshot(0).unwrap();
         db.put_dedup(h(888), dval(8)).unwrap();
         let _ = db.drop_snapshot(snap).unwrap();
     }
@@ -200,7 +200,7 @@ fn drop_snapshot_crash_at_manifest_commit_preserves_refcount_consistency() {
             }
             db.flush().unwrap();
 
-            let snap = db.take_snapshot().unwrap();
+            let snap = db.take_snapshot(0).unwrap();
 
             // Fire on the first post-WAL-fsync injection — guaranteed to
             // be inside drop_snapshot's commit_ops because no other

@@ -79,7 +79,7 @@ let revs  = db.multi_scan_dedup_reverse_for_pba(&dead_pbas)?;
 for item in db.range(lba_lo..lba_hi)? { let (k, v) = item?; }
 
 // Snapshots (L2P only)
-let snap = db.take_snapshot()?;
+let snap = db.take_snapshot(0)?;
 let view = db.snapshot_view(snap).unwrap();
 let diff = db.diff_with_current(snap)?;
 db.drop_snapshot(snap)?;

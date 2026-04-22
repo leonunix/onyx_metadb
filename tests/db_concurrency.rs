@@ -134,7 +134,7 @@ fn snapshots_match_reference_during_multi_writer_rounds() {
     for _round in 0..ROUNDS {
         barrier.wait();
         let expected = model.lock().clone();
-        let snap = db.take_snapshot().unwrap();
+        let snap = db.take_snapshot(0).unwrap();
         snapshots.push((snap, expected));
         barrier.wait();
         thread::sleep(Duration::from_millis(5));

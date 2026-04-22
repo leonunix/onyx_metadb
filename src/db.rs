@@ -536,6 +536,20 @@ impl Db {
         self.manifest_state.lock().manifest.snapshots.clone()
     }
 
+    /// Enumerate snapshots pinned to volume `vol_ord`. Returns an empty
+    /// vec for unknown ordinals (the concept of "snapshots on a volume
+    /// that doesn't exist" is well-defined: there are none).
+    pub fn snapshots_for(&self, vol_ord: VolumeOrdinal) -> Vec<SnapshotEntry> {
+        self.manifest_state
+            .lock()
+            .manifest
+            .snapshots
+            .iter()
+            .filter(|s| s.vol_ord == vol_ord)
+            .cloned()
+            .collect()
+    }
+
     /// Number of shards in this database. In Phase B commit 5 this reports
     /// the bootstrap volume's shard count; every volume in the map is
     /// created with the same shard count, so this remains the right answer
@@ -954,27 +968,55 @@ impl Db {
 
     // -------- snapshot operations -----------------------------------------
 
-    /// Take a snapshot of both the L2P and refcount sharded trees.
-    /// Returns the new snapshot id. Persisted immediately via a
-    /// manifest commit.
-    pub fn take_snapshot(&self) -> Result<SnapshotId> {
+    /// Take a snapshot of volume `vol_ord`'s L2P state. Returns the new
+    /// snapshot id. Persisted immediately via a manifest commit. Unknown
+    /// volume ordinals surface as `InvalidArgument`.
+    ///
+    /// Refcount state is global (Phase 6.5b retired per-snapshot refcount
+    /// roots), so the snapshot only captures the target volume's L2P
+    /// shard roots + an incref on each of them so the snapshot's view
+    /// outlives subsequent COW writes on the target volume.
+    ///
+    /// Takes `apply_gate.write()` so `last_applied_lsn` and the shard
+    /// roots we sample below describe the same LSN point. Holds shard
+    /// mutexes for every volume for the flush-before-manifest-commit
+    /// step — checkpoint_lsn advances across all volumes, so every
+    /// volume's dirty pages must be on disk before the commit fsyncs
+    /// the manifest slot.
+    pub fn take_snapshot(&self, vol_ord: VolumeOrdinal) -> Result<SnapshotId> {
         // Exclude in-flight apply phases so `last_applied_lsn` and the
         // per-shard roots we sample below describe the same LSN point.
         let _apply_guard = self.apply_gate.write();
+        // Resolve the target volume before touching manifest state so an
+        // unknown ordinal short-circuits with a clean `InvalidArgument`.
+        let target = self.volume(vol_ord)?;
         let mut manifest_state = self.manifest_state.lock();
         let volumes = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
         let mut refcount_guards = self.lock_all_refcount_shards();
 
+        // Locate the contiguous range of `l2p_guards` that belongs to
+        // `target`. `lock_all_l2p_shards_for` iterates `volumes` in
+        // ordinal order, so we walk preceding volumes and sum their
+        // shard counts.
+        let mut target_start = 0usize;
+        for vol in &volumes {
+            if vol.ord == vol_ord {
+                break;
+            }
+            target_start += vol.shards.len();
+        }
+        let target_end = target_start + target.shards.len();
+
         let id = manifest_state.manifest.next_snapshot_id;
-        let mut l2p_roots = Vec::with_capacity(l2p_guards.len());
-        for tree in &mut l2p_guards {
+        let mut l2p_roots = Vec::with_capacity(target.shards.len());
+        for tree in &mut l2p_guards[target_start..target_end] {
             tree.incref_root_for_snapshot()?;
             l2p_roots.push(tree.root());
         }
         // Phase 6.5b: refcount is a running tally, not point-in-time
-        // state. Snapshots only capture L2P. We still need `refcount_guards`
-        // below for `max_generation_from_two_groups` and
+        // state. Snapshots only capture L2P. We still hold refcount
+        // guards below for `max_generation_from_two_groups` and
         // `refresh_manifest_from_locked`, but skip the per-tree
         // snapshot incref.
         let created_lsn = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
@@ -993,9 +1035,7 @@ impl Db {
         manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
         manifest_state.manifest.snapshots.push(SnapshotEntry {
             id,
-            // Phase B commit 6: snapshots still come out of the bootstrap
-            // volume. Commit 9 will set this from the real source volume.
-            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            vol_ord,
             l2p_roots_page,
             created_lsn,
             l2p_shard_roots: l2p_roots.into_boxed_slice(),
@@ -1128,15 +1168,37 @@ impl Db {
         // v6 SnapshotEntry no longer carries refcount state (Phase 6.5b
         // retired it), so there's nothing to assert about refcount here.
 
-        let volumes = self.volumes_snapshot();
+        // Commit 9: snapshots are per-volume, so page collection +
+        // cache invalidation target the source volume only. The
+        // entry's vol_ord is load-bearing here — `drop_volume` refuses
+        // to drop a volume while any snapshot pins it, so this lookup
+        // cannot miss in a well-formed manifest.
+        let source_volume = self.volume(entry.vol_ord).map_err(|_| {
+            MetaDbError::Corruption(format!(
+                "drop_snapshot: snapshot {id} references unknown volume ord {}",
+                entry.vol_ord,
+            ))
+        })?;
+        if entry.l2p_shard_roots.len() != source_volume.shards.len() {
+            return Err(MetaDbError::Corruption(format!(
+                "drop_snapshot: snapshot {id} has {} roots but volume {} has {} shards",
+                entry.l2p_shard_roots.len(),
+                entry.vol_ord,
+                source_volume.shards.len(),
+            )));
+        }
         let mut pages: Vec<PageId> = Vec::new();
         {
-            let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
+            let mut guards: Vec<MutexGuard<'_, PagedL2p>> = source_volume
+                .shards
+                .iter()
+                .map(|s| s.tree.lock())
+                .collect();
             // Flush any dirty tree pages (including the root's
             // post-take_snapshot rc bump) so apply_op_bare reads the
             // live values by pid via page_store.
-            flush_locked_l2p_shards(&mut l2p_guards)?;
-            for (tree, &root) in l2p_guards.iter_mut().zip(entry.l2p_shard_roots.iter()) {
+            flush_locked_l2p_shards(&mut guards)?;
+            for (tree, &root) in guards.iter_mut().zip(entry.l2p_shard_roots.iter()) {
                 if root == crate::types::NULL_PAGE {
                     continue;
                 }
@@ -1148,12 +1210,12 @@ impl Db {
         // *logically* becomes unreferenced when we apply the drop.
         // We deliberately leave it alone here though: the on-disk
         // manifest still has the snapshot entry (no commit happens
-        // inside drop_snapshot), and `Manifest::decode_v5` would call
-        // `load_snapshot_roots` on it during any subsequent open —
-        // turning it Free would break decode and deadlock recovery.
-        // The page becomes a genuine orphan only after the next flush
-        // persists a snapshot-less manifest; `reclaim_orphan_pages`
-        // (run after WAL replay in `Db::open`) picks it up from there.
+        // inside drop_snapshot), and an older-than-expected open would
+        // call `load_snapshot_roots` on it — turning it Free would
+        // break decode and deadlock recovery. The page becomes a
+        // genuine orphan only after the next flush persists a
+        // snapshot-less manifest; `reclaim_orphan_pages` (run after
+        // WAL replay in `Db::open`) picks it up from there.
 
         // Submit + apply inline without going through commit_ops'
         // cvar queue. We hold drop_gate.write + apply_gate.write, so
@@ -1182,10 +1244,6 @@ impl Db {
             }
         }
 
-        // Phase B commit 5: snapshots still live in the bootstrap volume
-        // only, so apply + cache invalidation target volume 0's shards.
-        // Commit 9 widens this to per-volume snapshots.
-        let volume_zero = self.volume_zero();
         let volumes_map = self.volumes.read().clone();
         let outcome = apply_op_bare(
             &volumes_map,
@@ -1200,13 +1258,15 @@ impl Db {
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
         // Apply's page writes went straight through page_store; the
-        // shards' PageBuf caches still hold stale refcounts for
-        // anything apply touched. Invalidate every one of those pids
-        // so the next cow_for_write / lookup pulls the fresh bytes
-        // from disk.
+        // source volume's shards' PageBuf caches still hold stale
+        // refcounts for anything apply touched. Invalidate every one
+        // of those pids so the next cow_for_write / lookup pulls the
+        // fresh bytes from disk. Other volumes' PageBufs never cached
+        // these pages (COW ownership is per-tree), so skipping them is
+        // safe.
         for &pid in &pages {
             self.page_cache.invalidate(pid);
-            for shard in &volume_zero.shards {
+            for shard in &source_volume.shards {
                 shard.tree.lock().forget_page(pid);
             }
         }
@@ -2193,9 +2253,9 @@ mod tests {
     #[test]
     fn take_snapshot_assigns_monotonic_ids() {
         let (_d, db) = mk_db();
-        let a = db.take_snapshot().unwrap();
-        let b = db.take_snapshot().unwrap();
-        let c = db.take_snapshot().unwrap();
+        let a = db.take_snapshot(0).unwrap();
+        let b = db.take_snapshot(0).unwrap();
+        let c = db.take_snapshot(0).unwrap();
         assert_eq!(a, 1);
         assert_eq!(b, 2);
         assert_eq!(c, 3);
@@ -2208,7 +2268,7 @@ mod tests {
         for i in 0u64..100 {
             db.insert(0,i, v(1)).unwrap();
         }
-        let snap = db.take_snapshot().unwrap();
+        let snap = db.take_snapshot(0).unwrap();
 
         for i in 0u64..100 {
             db.insert(0,i, v(2)).unwrap();
@@ -2233,7 +2293,7 @@ mod tests {
         for i in 0u64..50 {
             db.insert(0,i, v(i as u8)).unwrap();
         }
-        let snap = db.take_snapshot().unwrap();
+        let snap = db.take_snapshot(0).unwrap();
         for i in 0u64..50 {
             db.insert(0,i, v(99)).unwrap();
         }
@@ -2258,7 +2318,7 @@ mod tests {
             for i in 0u64..200 {
                 db.insert(0,i, v(1)).unwrap();
             }
-            let id = db.take_snapshot().unwrap();
+            let id = db.take_snapshot(0).unwrap();
             for i in 0u64..200 {
                 db.insert(0,i, v(2)).unwrap();
             }
@@ -2292,13 +2352,13 @@ mod tests {
         for i in 0u64..10 {
             db.insert(0,i, v(1)).unwrap();
         }
-        let a = db.take_snapshot().unwrap();
+        let a = db.take_snapshot(0).unwrap();
 
         db.insert(0,5, v(99)).unwrap();
         db.delete(0,3).unwrap();
         db.insert(0,42, v(7)).unwrap();
 
-        let b = db.take_snapshot().unwrap();
+        let b = db.take_snapshot(0).unwrap();
         let diff = db.diff(a, b).unwrap();
         assert_eq!(diff.len(), 3);
         match diff[0] {
@@ -2324,7 +2384,7 @@ mod tests {
         for i in 0u64..10 {
             db.insert(0,i, v(1)).unwrap();
         }
-        let a = db.take_snapshot().unwrap();
+        let a = db.take_snapshot(0).unwrap();
         db.insert(0,100, v(5)).unwrap();
         let diff = db.diff_with_current(a).unwrap();
         assert_eq!(diff.len(), 1);
@@ -2348,7 +2408,7 @@ mod tests {
         }
         db.flush().unwrap();
         let free_before_snap = db.high_water();
-        let s = db.take_snapshot().unwrap();
+        let s = db.take_snapshot(0).unwrap();
 
         for i in 0u64..1000 {
             db.insert(0,i, v(2)).unwrap();
@@ -2372,11 +2432,11 @@ mod tests {
         for i in 0u64..20 {
             db.insert(0,i, v(1)).unwrap();
         }
-        let s1 = db.take_snapshot().unwrap();
+        let s1 = db.take_snapshot(0).unwrap();
         for i in 0u64..20 {
             db.insert(0,i, v(2)).unwrap();
         }
-        let s2 = db.take_snapshot().unwrap();
+        let s2 = db.take_snapshot(0).unwrap();
         for i in 0u64..20 {
             db.insert(0,i, v(3)).unwrap();
         }
@@ -2521,6 +2581,142 @@ mod tests {
         let db = Db::open(dir.path()).unwrap();
         assert_eq!(db.volumes(), vec![0, ord]);
         assert_eq!(db.get(ord, 1).unwrap(), Some(v(9)));
+    }
+
+    // -------- phase 7 commit 9: per-volume snapshot --------
+
+    #[test]
+    fn take_snapshot_stamps_vol_ord_on_entry() {
+        let (_d, db) = mk_db();
+        let ord = db.create_volume().unwrap();
+        db.insert(ord, 1, v(7)).unwrap();
+        let snap = db.take_snapshot(ord).unwrap();
+        let entry = db
+            .snapshots()
+            .into_iter()
+            .find(|s| s.id == snap)
+            .unwrap();
+        assert_eq!(entry.vol_ord, ord);
+        // Incref happened on exactly the target volume's shards.
+        assert_eq!(entry.l2p_shard_roots.len(), db.shard_count());
+    }
+
+    #[test]
+    fn take_snapshot_unknown_vol_ord_is_invalid_argument() {
+        let (_d, db) = mk_db();
+        match db.take_snapshot(99).unwrap_err() {
+            MetaDbError::InvalidArgument(msg) => assert!(msg.contains("unknown volume")),
+            e => panic!("unexpected error {e:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshots_for_filters_by_vol_ord() {
+        let (_d, db) = mk_db();
+        let a = db.create_volume().unwrap();
+        let b = db.create_volume().unwrap();
+        db.insert(a, 1, v(1)).unwrap();
+        db.insert(b, 2, v(2)).unwrap();
+
+        let s_a = db.take_snapshot(a).unwrap();
+        let s_b = db.take_snapshot(b).unwrap();
+        let s_boot = db.take_snapshot(0).unwrap();
+
+        let on_a: Vec<_> = db.snapshots_for(a).into_iter().map(|e| e.id).collect();
+        let on_b: Vec<_> = db.snapshots_for(b).into_iter().map(|e| e.id).collect();
+        let on_boot: Vec<_> = db.snapshots_for(0).into_iter().map(|e| e.id).collect();
+
+        assert_eq!(on_a, vec![s_a]);
+        assert_eq!(on_b, vec![s_b]);
+        assert_eq!(on_boot, vec![s_boot]);
+        assert_eq!(db.snapshots_for(99), Vec::<SnapshotEntry>::new());
+        assert_eq!(db.snapshots().len(), 3);
+    }
+
+    #[test]
+    fn snapshot_view_reads_from_target_volume() {
+        let (_d, db) = mk_db();
+        let a = db.create_volume().unwrap();
+        let b = db.create_volume().unwrap();
+        db.insert(a, 42, v(1)).unwrap();
+        db.insert(b, 42, v(2)).unwrap();
+        let snap_a = db.take_snapshot(a).unwrap();
+        // Subsequent writes on either volume must not affect the snapshot.
+        db.insert(a, 42, v(9)).unwrap();
+        db.insert(b, 42, v(9)).unwrap();
+        let view = db.snapshot_view(snap_a).unwrap();
+        assert_eq!(view.vol_ord(), a);
+        assert_eq!(view.get(42).unwrap(), Some(v(1)));
+        // Current state reflects the post-snapshot write.
+        assert_eq!(db.get(a, 42).unwrap(), Some(v(9)));
+    }
+
+    #[test]
+    fn drop_snapshot_of_one_volume_leaves_others_intact() {
+        let (_d, db) = mk_db();
+        let a = db.create_volume().unwrap();
+        let b = db.create_volume().unwrap();
+        for i in 0u64..16 {
+            db.insert(a, i, v(1)).unwrap();
+            db.insert(b, i, v(2)).unwrap();
+        }
+        let snap_a = db.take_snapshot(a).unwrap();
+        for i in 0u64..16 {
+            db.insert(a, i, v(3)).unwrap();
+        }
+
+        let _ = db.drop_snapshot(snap_a).unwrap().unwrap();
+
+        for i in 0u64..16 {
+            assert_eq!(db.get(a, i).unwrap(), Some(v(3)));
+            assert_eq!(db.get(b, i).unwrap(), Some(v(2)));
+        }
+        assert!(db.snapshots().is_empty());
+    }
+
+    #[test]
+    fn drop_volume_with_live_snapshot_refused() {
+        let (_d, db) = mk_db();
+        let ord = db.create_volume().unwrap();
+        db.insert(ord, 0, v(1)).unwrap();
+        let _snap = db.take_snapshot(ord).unwrap();
+        match db.drop_volume(ord).unwrap_err() {
+            MetaDbError::InvalidArgument(msg) => {
+                assert!(msg.contains("snapshot"), "msg={msg}");
+            }
+            e => panic!("unexpected error {e:?}"),
+        }
+        assert_eq!(db.volumes(), vec![0, ord]);
+    }
+
+    #[test]
+    fn dropping_bootstrap_snapshot_does_not_affect_other_volume_snapshots() {
+        let (_d, db) = mk_db();
+        let a = db.create_volume().unwrap();
+        db.insert(0, 1, v(0)).unwrap();
+        db.insert(a, 1, v(1)).unwrap();
+        let s_boot = db.take_snapshot(0).unwrap();
+        let s_a = db.take_snapshot(a).unwrap();
+        let _ = db.drop_snapshot(s_boot).unwrap().unwrap();
+        // Snapshot on volume `a` still readable post-drop of bootstrap snapshot.
+        let view = db.snapshot_view(s_a).unwrap();
+        assert_eq!(view.get(1).unwrap(), Some(v(1)));
+    }
+
+    #[test]
+    fn diff_across_volumes_rejected() {
+        let (_d, db) = mk_db();
+        let a = db.create_volume().unwrap();
+        db.insert(0, 1, v(0)).unwrap();
+        db.insert(a, 1, v(1)).unwrap();
+        let s_boot = db.take_snapshot(0).unwrap();
+        let s_a = db.take_snapshot(a).unwrap();
+        match db.diff(s_boot, s_a).unwrap_err() {
+            MetaDbError::InvalidArgument(msg) => {
+                assert!(msg.contains("across volumes"), "msg={msg}");
+            }
+            e => panic!("unexpected error {e:?}"),
+        }
     }
 
     // -------- phase 5e: refcount + dedup integration --------
@@ -2691,7 +2887,7 @@ mod tests {
         for pba in 0u64..50 {
             db.incref_pba(pba, 1).unwrap();
         }
-        let _snap = db.take_snapshot().unwrap();
+        let _snap = db.take_snapshot(0).unwrap();
         // Overwrite refcount state after the snapshot.
         for pba in 0u64..50 {
             db.incref_pba(pba, 1).unwrap();
@@ -2715,7 +2911,7 @@ mod tests {
         }
         db.flush().unwrap();
         let hw_before_snap = db.high_water();
-        let s = db.take_snapshot().unwrap();
+        let s = db.take_snapshot(0).unwrap();
         for pba in 0u64..200 {
             db.incref_pba(pba, 1).unwrap();
         }
