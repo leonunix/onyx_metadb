@@ -456,9 +456,44 @@ impl Db {
                     }
                     Ok(ApplyOutcome::Dedup)
                 }
-                WalOp::CloneVolume { .. } => Err(MetaDbError::Corruption(
-                    "CloneVolume replay is not implemented (commit 10)".into(),
-                )),
+                WalOp::CloneVolume {
+                    src_ord: _,
+                    new_ord,
+                    src_snap_id: _,
+                    src_shard_roots,
+                } => {
+                    if !volumes.contains_key(new_ord) {
+                        apply_clone_volume_incref(&page_store, lsn, src_shard_roots)?;
+                        for &pid in src_shard_roots {
+                            if pid != crate::types::NULL_PAGE {
+                                page_cache.invalidate(pid);
+                            }
+                        }
+                        let (shards, actual_roots) = build_clone_volume_shards(
+                            src_shard_roots,
+                            &page_store,
+                            &page_cache,
+                            lsn,
+                        )?;
+                        let shard_count = shards.len() as u32;
+                        volumes.insert(
+                            *new_ord,
+                            Arc::new(Volume::new(*new_ord, shards, lsn)),
+                        );
+                        manifest.volumes.push(VolumeEntry {
+                            ord: *new_ord,
+                            shard_count,
+                            l2p_shard_roots: actual_roots,
+                            created_lsn: lsn,
+                            flags: 0,
+                        });
+                        mutated_volumes = true;
+                    }
+                    manifest.next_volume_ord = manifest
+                        .next_volume_ord
+                        .max(new_ord.checked_add(1).unwrap_or(u16::MAX));
+                    Ok(ApplyOutcome::Dedup)
+                }
                 _ => {
                     let outcome = apply_op_bare(
                         &volumes,
@@ -1513,6 +1548,137 @@ impl Db {
         }))
     }
 
+    /// VDO-style writable clone of snapshot `src_snap_id`. The new volume's
+    /// initial state mirrors the snapshot: each shard's root points at the
+    /// corresponding source root, page-store refcount bumped by one so
+    /// subsequent COW writes on either side copy pages instead of
+    /// clobbering shared state. Returns the freshly-assigned ordinal.
+    ///
+    /// The source snapshot must still be alive at call time —
+    /// [`drop_snapshot`](Self::drop_snapshot) after the clone is fine
+    /// (the clone's incref keeps the shared pages pinned), but dropping
+    /// before the clone leaves no valid `src_shard_roots` to inline into
+    /// the WAL record.
+    ///
+    /// Serialisation mirrors [`create_volume`](Self::create_volume):
+    /// - `drop_gate.write()` — waits for all in-flight commits to finish
+    ///   so our LSN sits right after `last_applied_lsn`.
+    /// - `apply_gate.write()` — excludes flush / take_snapshot /
+    ///   drop_snapshot.
+    ///
+    /// Crash semantics:
+    /// - Before WAL fsync: no effect observable.
+    /// - After WAL fsync, before/during apply: recovery replays the op.
+    ///   The incref half is idempotent via `page.generation >= lsn`; the
+    ///   volume-map insertion short-circuits on `volumes.contains_key(new_ord)`.
+    ///
+    /// No manifest commit happens inside this function; the next natural
+    /// [`flush`](Self::flush) — or, on crash, the post-replay commit in
+    /// [`open`](Self::open) — captures the new volumes table.
+    pub fn clone_volume(&self, src_snap_id: SnapshotId) -> Result<VolumeOrdinal> {
+        let _drop_guard = self.drop_gate.write();
+        let _apply_guard = self.apply_gate.write();
+
+        // Resolve the snapshot entry + allocate the new ord under the
+        // manifest mutex so two concurrent clones can't hand out the
+        // same ordinal.
+        let (src_ord, src_shard_roots, new_ord) = {
+            let mstate = self.manifest_state.lock();
+            let entry = mstate
+                .manifest
+                .snapshots
+                .iter()
+                .find(|s| s.id == src_snap_id)
+                .ok_or_else(|| {
+                    MetaDbError::InvalidArgument(format!("unknown snapshot id {src_snap_id}"))
+                })?;
+            if (mstate.manifest.volumes.len() as u32) >= self.max_volumes {
+                return Err(MetaDbError::InvalidArgument(format!(
+                    "max_volumes ({}) reached",
+                    self.max_volumes,
+                )));
+            }
+            let new_ord = mstate.manifest.next_volume_ord;
+            (
+                entry.vol_ord,
+                entry.l2p_shard_roots.to_vec(),
+                new_ord,
+            )
+        };
+
+        let op = WalOp::CloneVolume {
+            src_ord,
+            new_ord,
+            src_snap_id,
+            src_shard_roots: src_shard_roots.clone(),
+        };
+        let body = encode_body(std::slice::from_ref(&op));
+        let lsn = self.wal.submit(body)?;
+        self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
+
+        // Under our two write gates no other commit sits between submit
+        // and apply; the cvar wait is defensive and matches
+        // `create_volume` / `drop_snapshot`.
+        {
+            let mut applied = self.last_applied_lsn.lock();
+            while *applied + 1 < lsn {
+                self.commit_cvar.wait(&mut applied);
+            }
+        }
+
+        apply_clone_volume_incref(&self.page_store, lsn, &src_shard_roots)?;
+        // Shared page_cache may hold pre-incref copies of the roots.
+        // Invalidate so `open_with_cache` below pulls the freshly
+        // stamped bytes from disk.
+        for &pid in &src_shard_roots {
+            if pid != crate::types::NULL_PAGE {
+                self.page_cache.invalidate(pid);
+            }
+        }
+        self.faults
+            .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
+
+        let (shards, actual_roots) = build_clone_volume_shards(
+            &src_shard_roots,
+            &self.page_store,
+            &self.page_cache,
+            lsn,
+        )?;
+        let shard_count = shards.len() as u32;
+
+        {
+            let mut volumes_map = self.volumes.write();
+            if volumes_map.contains_key(&new_ord) {
+                return Err(MetaDbError::Corruption(format!(
+                    "clone_volume: ord {new_ord} already present"
+                )));
+            }
+            volumes_map.insert(new_ord, Arc::new(Volume::new(new_ord, shards, lsn)));
+        }
+
+        {
+            let mut mstate = self.manifest_state.lock();
+            mstate.manifest.volumes.push(VolumeEntry {
+                ord: new_ord,
+                shard_count,
+                l2p_shard_roots: actual_roots,
+                created_lsn: lsn,
+                flags: 0,
+            });
+            mstate.manifest.next_volume_ord = new_ord
+                .checked_add(1)
+                .ok_or_else(|| MetaDbError::Corruption("volume ord overflow".into()))?;
+        }
+
+        {
+            let mut applied = self.last_applied_lsn.lock();
+            *applied = lsn;
+            self.commit_cvar.notify_all();
+        }
+
+        Ok(new_ord)
+    }
+
     /// Sorted list of live volume ordinals.
     pub fn volumes(&self) -> Vec<VolumeOrdinal> {
         let mut ords: Vec<VolumeOrdinal> = self.volumes.read().keys().copied().collect();
@@ -2096,6 +2262,75 @@ fn apply_drop_volume(
             "apply_drop_volume: unexpected outcome {other:?}"
         ))),
     }
+}
+
+/// Increment the on-disk refcount of each shard root that a cloned
+/// volume pins. Idempotent across replays: pages already stamped with
+/// `page.generation >= lsn` are skipped (same guard pattern
+/// [`apply_drop_snapshot_pages`] uses). `NULL_PAGE` roots — empty
+/// source shards — are ignored because the clone materialises fresh
+/// empty trees for those shards (see [`build_clone_volume_shards`]).
+fn apply_clone_volume_incref(
+    page_store: &Arc<PageStore>,
+    lsn: Lsn,
+    src_shard_roots: &[PageId],
+) -> Result<()> {
+    for &pid in src_shard_roots {
+        if pid == crate::types::NULL_PAGE {
+            continue;
+        }
+        let mut page = page_store.read_page_unchecked(pid)?;
+        page.verify(pid)?;
+        let header = page.header()?;
+        if header.generation >= lsn {
+            // Already incref'd by a prior apply of this same CloneVolume
+            // op (replay-after-crash case); skip.
+            continue;
+        }
+        let new_rc = header.refcount.checked_add(1).ok_or_else(|| {
+            MetaDbError::Corruption(format!(
+                "clone_volume: refcount overflow on source root page {pid}"
+            ))
+        })?;
+        page.set_refcount(new_rc);
+        page.set_generation(lsn);
+        page.seal();
+        page_store.write_page(pid, &page)?;
+    }
+    page_store.sync()?;
+    Ok(())
+}
+
+/// Build the new volume's shard group for a clone. Each source root
+/// becomes the initial root of a fresh [`PagedL2p`]; empty source
+/// shards (`NULL_PAGE` root) get a freshly-allocated empty leaf so the
+/// tree is always operable. Caller must have already incref'd the
+/// non-null roots via [`apply_clone_volume_incref`].
+fn build_clone_volume_shards(
+    src_shard_roots: &[PageId],
+    page_store: &Arc<PageStore>,
+    page_cache: &Arc<PageCache>,
+    created_lsn: Lsn,
+) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
+    let mut shards = Vec::with_capacity(src_shard_roots.len());
+    let mut actual_roots = Vec::with_capacity(src_shard_roots.len());
+    for &root in src_shard_roots {
+        let tree = if root == crate::types::NULL_PAGE {
+            PagedL2p::create_with_cache(page_store.clone(), page_cache.clone())?
+        } else {
+            PagedL2p::open_with_cache(
+                page_store.clone(),
+                page_cache.clone(),
+                root,
+                created_lsn + 1,
+            )?
+        };
+        actual_roots.push(tree.root());
+        shards.push(L2pShard {
+            tree: Mutex::new(tree),
+        });
+    }
+    Ok((shards, actual_roots.into_boxed_slice()))
 }
 
 /// Core of the `DropSnapshot` apply. Iterates `pages`, decrements each
@@ -2717,6 +2952,123 @@ mod tests {
             }
             e => panic!("unexpected error {e:?}"),
         }
+    }
+
+    // -------- phase 7 commit 10: clone_volume --------
+
+    #[test]
+    fn clone_volume_produces_readable_copy() {
+        let (_d, db) = mk_db();
+        let src = db.create_volume().unwrap();
+        db.insert(src, 1, v(10)).unwrap();
+        db.insert(src, 2, v(20)).unwrap();
+        let snap = db.take_snapshot(src).unwrap();
+        let clone = db.clone_volume(snap).unwrap();
+        assert!(clone > src);
+        assert_eq!(db.get(clone, 1).unwrap(), Some(v(10)));
+        assert_eq!(db.get(clone, 2).unwrap(), Some(v(20)));
+        assert_eq!(db.volumes(), vec![0, src, clone]);
+    }
+
+    #[test]
+    fn clone_volume_unknown_snapshot_is_invalid_argument() {
+        let (_d, db) = mk_db();
+        match db.clone_volume(999).unwrap_err() {
+            MetaDbError::InvalidArgument(msg) => assert!(msg.contains("unknown snapshot")),
+            e => panic!("unexpected error {e:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_volume_respects_max_volumes() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = Config::new(dir.path());
+        cfg.max_volumes = 2; // bootstrap + one more
+        let db = Db::create_with_config(cfg).unwrap();
+        let src = db.create_volume().unwrap();
+        let snap = db.take_snapshot(src).unwrap();
+        match db.clone_volume(snap).unwrap_err() {
+            MetaDbError::InvalidArgument(msg) => {
+                assert!(msg.contains("max_volumes"), "msg={msg}");
+            }
+            e => panic!("unexpected error {e:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_is_writable_and_diverges_from_source() {
+        let (_d, db) = mk_db();
+        let src = db.create_volume().unwrap();
+        db.insert(src, 1, v(1)).unwrap();
+        let snap = db.take_snapshot(src).unwrap();
+        let clone = db.clone_volume(snap).unwrap();
+
+        db.insert(src, 1, v(2)).unwrap();
+        db.insert(clone, 1, v(3)).unwrap();
+        assert_eq!(db.get(src, 1).unwrap(), Some(v(2)));
+        assert_eq!(db.get(clone, 1).unwrap(), Some(v(3)));
+        // Snapshot unchanged by either write.
+        assert_eq!(db.snapshot_view(snap).unwrap().get(1).unwrap(), Some(v(1)));
+    }
+
+    #[test]
+    fn dropping_source_snapshot_keeps_clone_alive() {
+        let (_d, db) = mk_db();
+        let src = db.create_volume().unwrap();
+        for i in 0u64..32 {
+            db.insert(src, i, v(i as u8)).unwrap();
+        }
+        let snap = db.take_snapshot(src).unwrap();
+        let clone = db.clone_volume(snap).unwrap();
+        let _ = db.drop_snapshot(snap).unwrap().unwrap();
+        for i in 0u64..32 {
+            assert_eq!(db.get(clone, i).unwrap(), Some(v(i as u8)));
+        }
+        assert_eq!(db.snapshots(), Vec::<SnapshotEntry>::new());
+    }
+
+    #[test]
+    fn clone_assigns_fresh_monotonic_ord() {
+        let (_d, db) = mk_db();
+        let src = db.create_volume().unwrap();
+        db.insert(src, 1, v(1)).unwrap();
+        let snap = db.take_snapshot(src).unwrap();
+        let clone_a = db.clone_volume(snap).unwrap();
+        let clone_b = db.clone_volume(snap).unwrap();
+        assert!(clone_b > clone_a);
+        assert_eq!(db.manifest().next_volume_ord, clone_b + 1);
+    }
+
+    #[test]
+    fn clone_survives_reopen_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        let (src, snap, clone) = {
+            let db = Db::create(dir.path()).unwrap();
+            let src = db.create_volume().unwrap();
+            db.insert(src, 5, v(50)).unwrap();
+            let snap = db.take_snapshot(src).unwrap();
+            let clone = db.clone_volume(snap).unwrap();
+            db.insert(clone, 10, v(100)).unwrap();
+            (src, snap, clone)
+        };
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.volumes(), vec![0, src, clone]);
+        assert_eq!(db.get(clone, 5).unwrap(), Some(v(50)));
+        assert_eq!(db.get(clone, 10).unwrap(), Some(v(100)));
+        // Source volume unaffected by clone divergence.
+        assert_eq!(db.get(src, 5).unwrap(), Some(v(50)));
+        assert_eq!(db.snapshot_view(snap).unwrap().get(5).unwrap(), Some(v(50)));
+    }
+
+    #[test]
+    fn clone_of_empty_volume_is_empty_and_writable() {
+        let (_d, db) = mk_db();
+        let src = db.create_volume().unwrap();
+        let snap = db.take_snapshot(src).unwrap();
+        let clone = db.clone_volume(snap).unwrap();
+        assert_eq!(db.get(clone, 1).unwrap(), None);
+        db.insert(clone, 1, v(7)).unwrap();
+        assert_eq!(db.get(clone, 1).unwrap(), Some(v(7)));
     }
 
     // -------- phase 5e: refcount + dedup integration --------
