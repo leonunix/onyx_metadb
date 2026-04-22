@@ -86,25 +86,24 @@ impl PageBuf {
         Ok(self.pages[&pid].page())
     }
 
-    /// Mutable page access. The returned page is stamped with
-    /// `generation` and marked dirty.
-    pub fn modify(&mut self, pid: PageId, generation: Lsn) -> Result<&mut Page> {
+    /// Mutable page access. Loads the page if not cached and marks it
+    /// dirty. **Does not stamp `page.generation`** — that field is
+    /// reserved for WAL-apply idempotency markers
+    /// ([`apply_drop_snapshot_pages`](crate::db) /
+    /// [`apply_clone_volume_incref`](crate::db)); tree-internal cow
+    /// scratches should never overwrite it, or the gen-based
+    /// `>= lsn` guard in those apply paths would spuriously fire.
+    /// The `_generation` argument is kept for API continuity and to
+    /// make call-site LSN-awareness visible, but is intentionally
+    /// ignored.
+    pub fn modify(&mut self, pid: PageId, _generation: Lsn) -> Result<&mut Page> {
         let page = match self.pages.remove(&pid) {
-            Some(Slot::Dirty(mut page)) => {
-                page.set_generation(generation);
-                page
-            }
+            Some(Slot::Dirty(page)) => page,
             Some(Slot::Clean(page)) => {
                 self.page_cache.invalidate(pid);
-                let mut page = (*page).clone();
-                page.set_generation(generation);
-                page
+                (*page).clone()
             }
-            None => {
-                let mut page = self.page_cache.get_for_modify(pid)?;
-                page.set_generation(generation);
-                page
-            }
+            None => self.page_cache.get_for_modify(pid)?,
         };
         self.pages.insert(pid, Slot::Dirty(page));
         match self.pages.get_mut(&pid).unwrap() {
@@ -113,21 +112,24 @@ impl PageBuf {
         }
     }
 
-    /// Allocate a fresh leaf, initialize it, cache as dirty.
-    pub fn alloc_leaf(&mut self, generation: Lsn) -> Result<PageId> {
+    /// Allocate a fresh leaf, initialize it, cache as dirty. Stamps
+    /// `page.generation = 0` so the WAL-apply idempotency guard treats
+    /// newly-allocated tree pages as untouched by any WAL op.
+    pub fn alloc_leaf(&mut self, _generation: Lsn) -> Result<PageId> {
         let pid = self.page_store.allocate()?;
         let mut page = Page::zeroed();
-        init_leaf(&mut page, generation);
+        init_leaf(&mut page, 0);
         self.pages.insert(pid, Slot::Dirty(page));
         Ok(pid)
     }
 
     /// Allocate a fresh index page at `level`, initialize it (all children
-    /// NULL_PAGE), cache as dirty.
-    pub fn alloc_index(&mut self, generation: Lsn, level: u8) -> Result<PageId> {
+    /// NULL_PAGE), cache as dirty. See [`alloc_leaf`](Self::alloc_leaf)
+    /// for why the generation is stamped as 0.
+    pub fn alloc_index(&mut self, _generation: Lsn, level: u8) -> Result<PageId> {
         let pid = self.page_store.allocate()?;
         let mut page = Page::zeroed();
-        init_index(&mut page, generation, level);
+        init_index(&mut page, 0, level);
         self.pages.insert(pid, Slot::Dirty(page));
         Ok(pid)
     }
@@ -248,7 +250,10 @@ impl PageBuf {
         new_page
             .bytes_mut()
             .copy_from_slice(self.read(pid)?.bytes());
-        new_page.set_generation(generation);
+        // Tree pages deliberately carry `generation = 0`; see
+        // [`modify`](Self::modify) for why WAL-apply is the only
+        // writer of this field.
+        new_page.set_generation(0);
         new_page.set_refcount(1);
         self.pages.insert(new_pid, Slot::Dirty(new_page));
 

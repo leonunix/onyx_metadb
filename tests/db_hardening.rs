@@ -235,3 +235,147 @@ fn drop_snapshot_crash_at_manifest_commit_preserves_refcount_consistency() {
         report.issues
     );
 }
+
+// ---- Phase 7 commit 12: volume-lifecycle fault-injection regressions ----
+
+/// `create_volume` durably records the `CreateVolume` WAL op before
+/// committing the manifest. A crash at
+/// `FaultPoint::CreateVolumePostWalBeforeManifest` simulates the
+/// window where the WAL record is fsync'd but the in-memory volumes
+/// table hasn't been updated. Recovery must see the WAL record on
+/// reopen and reconstruct the volume via the replay arm.
+#[test]
+fn create_volume_crash_after_wal_before_manifest_reconstructs() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            faults.install(
+                FaultPoint::CreateVolumePostWalBeforeManifest,
+                1,
+                FaultAction::Panic,
+            );
+            let _ = db.create_volume();
+            panic!("create_volume returned but fault should have panicked");
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    // Post-recovery, the clone/creation op replays and the new volume
+    // should appear in `volumes()`.
+    let vols = db.volumes();
+    assert_eq!(vols, vec![0, 1], "volumes after recovery: {vols:?}");
+    // The new volume is operable end-to-end.
+    db.insert(1, 42, l2p(7)).unwrap();
+    assert_eq!(db.get(1, 42).unwrap(), Some(l2p(7)));
+    drop(db);
+
+    let report = verify_path(dir.path(), VerifyOptions::default()).unwrap();
+    assert!(
+        report.is_clean(),
+        "verifier reported issues after create_volume crash: {:?}",
+        report.issues
+    );
+}
+
+/// `drop_volume`'s WAL record is durable before
+/// `apply_drop_volume` touches any page refcount.
+/// `FaultPoint::DropVolumePostWalBeforeApply` panics in that window;
+/// reopen must replay the op and free the volume's pages.
+#[test]
+fn drop_volume_crash_after_wal_before_apply_recovers() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+
+    // Set up: create a volume and populate it, then simulate a crash
+    // during its drop.
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let ord = db.create_volume().unwrap();
+            for i in 0u64..32 {
+                db.insert(ord, i, l2p(i as u8)).unwrap();
+            }
+            db.flush().unwrap();
+
+            faults.install(
+                FaultPoint::DropVolumePostWalBeforeApply,
+                1,
+                FaultAction::Panic,
+            );
+            let _ = db.drop_volume(ord);
+            panic!("drop_volume returned but fault should have panicked");
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(db.volumes(), vec![0], "dropped volume must be gone after recovery");
+    drop(db);
+
+    let report = verify_path(dir.path(), VerifyOptions::default()).unwrap();
+    assert!(
+        report.is_clean(),
+        "verifier reported issues after drop_volume crash: {:?}",
+        report.issues
+    );
+}
+
+/// Mid-incref crash inside `apply_clone_volume_incref` — one shard
+/// root has its refcount bumped + generation stamped on disk, the rest
+/// have not. Recovery's generation guard must skip the already-stamped
+/// root and finish the remaining ones. Final clone should read back
+/// the source snapshot's data end-to-end.
+#[test]
+fn clone_volume_crash_mid_incref_completes_on_recovery() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+
+    let snap_id;
+    let setup = |path: &std::path::Path| {
+        let db = Db::create(path).unwrap();
+        for i in 0u64..16 {
+            db.insert(0, i, l2p(i as u8)).unwrap();
+        }
+        let sid = db.take_snapshot(0).unwrap();
+        db.flush().unwrap();
+        sid
+    };
+    snap_id = setup(dir.path());
+
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::open_with_faults(&path, faults.clone()).unwrap();
+            faults.install(FaultPoint::CloneVolumeMidIncref, 1, FaultAction::Panic);
+            let _ = db.clone_volume(snap_id);
+            panic!("clone_volume returned but fault should have panicked");
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    // The clone completed via replay.
+    let vols = db.volumes();
+    assert!(
+        vols.len() >= 2 && vols.contains(&1),
+        "expected clone vol=1 after recovery, got {vols:?}",
+    );
+    let clone = 1;
+    for i in 0u64..16 {
+        assert_eq!(db.get(clone, i).unwrap(), Some(l2p(i as u8)));
+    }
+    drop(db);
+
+    let report = verify_path(dir.path(), VerifyOptions::default()).unwrap();
+    assert!(
+        report.is_clean(),
+        "verifier reported issues after clone_volume mid-incref crash: {:?}",
+        report.issues
+    );
+}

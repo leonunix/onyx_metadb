@@ -64,6 +64,22 @@ pub enum FaultPoint {
     /// Midway through a COW cascade, after a new child page has been
     /// written but before its parent has been linked to it.
     CowCascadeMidParentLink,
+    /// Inside `Db::create_volume`, after the WAL submit + apply (shard
+    /// roots allocated, volume installed in the map) but before the
+    /// in-memory manifest's volumes table has been extended. Exercises
+    /// the window where the WAL holds a `CreateVolume` record but no
+    /// manifest commit has captured it — recovery must reconstruct the
+    /// volume from the replayed op.
+    CreateVolumePostWalBeforeManifest,
+    /// Inside `Db::drop_volume`, after the WAL submit records the drop
+    /// but before `apply_drop_volume` has touched any page refcount.
+    /// Exercises the replay path that has to re-run the rc-dependent
+    /// page cascade from the WAL record's inlined page list.
+    DropVolumePostWalBeforeApply,
+    /// Mid-way through `apply_clone_volume_incref`: one shard root has
+    /// been incref'd and sealed to disk, the rest have not. Exercises
+    /// the generation-stamp idempotency guard on CloneVolume replay.
+    CloneVolumeMidIncref,
 }
 
 impl FaultPoint {
@@ -81,6 +97,9 @@ impl FaultPoint {
             Self::ManifestFsyncAfter => "manifest.fsync.after",
             Self::FlushPostLevelRewriteBeforeManifest => "flush.level_rewrite.before_manifest",
             Self::CowCascadeMidParentLink => "cow.cascade.mid_parent_link",
+            Self::CreateVolumePostWalBeforeManifest => "create_volume.post_wal.before_manifest",
+            Self::DropVolumePostWalBeforeApply => "drop_volume.post_wal.before_apply",
+            Self::CloneVolumeMidIncref => "clone_volume.mid_incref",
         }
     }
 }

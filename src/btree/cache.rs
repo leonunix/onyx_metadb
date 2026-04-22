@@ -74,25 +74,20 @@ impl PageBuf {
         Ok(self.pages[&pid].page())
     }
 
-    /// Mutable page access. The returned page is stamped with
-    /// `generation` and marked dirty.
-    pub fn modify(&mut self, pid: PageId, generation: Lsn) -> Result<&mut Page> {
+    /// Mutable page access. Loads the page if not cached and marks it
+    /// dirty. **Does not stamp `page.generation`** — that field is
+    /// reserved for WAL-apply idempotency markers; see
+    /// [`PagedPageBuf::modify`](crate::paged::PageBuf::modify) for the
+    /// full rationale (the same invariant applies here because the
+    /// refcount BTree's pages flow through the same WAL-apply paths).
+    pub fn modify(&mut self, pid: PageId, _generation: Lsn) -> Result<&mut Page> {
         let page = match self.pages.remove(&pid) {
-            Some(Slot::Dirty(mut page)) => {
-                page.set_generation(generation);
-                page
-            }
+            Some(Slot::Dirty(page)) => page,
             Some(Slot::Clean(page)) => {
                 self.page_cache.invalidate(pid);
-                let mut page = (*page).clone();
-                page.set_generation(generation);
-                page
+                (*page).clone()
             }
-            None => {
-                let mut page = self.page_cache.get_for_modify(pid)?;
-                page.set_generation(generation);
-                page
-            }
+            None => self.page_cache.get_for_modify(pid)?,
         };
         self.pages.insert(pid, Slot::Dirty(page));
         match self.pages.get_mut(&pid).unwrap() {
@@ -102,21 +97,22 @@ impl PageBuf {
     }
 
     /// Allocate a brand-new leaf page, initialize its header, cache as
-    /// dirty, and return its page id.
-    pub fn alloc_leaf(&mut self, generation: Lsn) -> Result<PageId> {
+    /// dirty, and return its page id. Stamps `page.generation = 0`;
+    /// see [`modify`](Self::modify) for why.
+    pub fn alloc_leaf(&mut self, _generation: Lsn) -> Result<PageId> {
         let pid = self.page_store.allocate()?;
         let mut page = Page::zeroed();
-        init_leaf(&mut page, generation);
+        init_leaf(&mut page, 0);
         self.pages.insert(pid, Slot::Dirty(page));
         Ok(pid)
     }
 
     /// Allocate a brand-new internal page with a single child and no
     /// separator keys. Cached as dirty.
-    pub fn alloc_internal(&mut self, generation: Lsn, first_child: PageId) -> Result<PageId> {
+    pub fn alloc_internal(&mut self, _generation: Lsn, first_child: PageId) -> Result<PageId> {
         let pid = self.page_store.allocate()?;
         let mut page = Page::zeroed();
-        init_internal(&mut page, generation, first_child);
+        init_internal(&mut page, 0, first_child);
         self.pages.insert(pid, Slot::Dirty(page));
         Ok(pid)
     }
@@ -254,7 +250,10 @@ mod tests {
         buf.flush().unwrap();
         assert_eq!(buf.dirty_count(), 0);
         let p = buf.modify(pid, 9).unwrap();
-        assert_eq!(p.header().unwrap().generation, 9);
+        // `modify` no longer stamps generation (reserved for WAL apply
+        // markers); alloc_leaf stamped 0 regardless of the `5` we
+        // passed in. See `PageBuf::modify` doc.
+        assert_eq!(p.header().unwrap().generation, 0);
         assert_eq!(buf.dirty_count(), 1);
     }
 

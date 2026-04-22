@@ -486,16 +486,29 @@ impl Db {
                     Ok(ApplyOutcome::Dedup)
                 }
                 WalOp::CloneVolume {
-                    src_ord: _,
+                    src_ord,
                     new_ord,
                     src_snap_id: _,
                     src_shard_roots,
                 } => {
                     if !volumes.contains_key(new_ord) {
-                        apply_clone_volume_incref(&page_store, lsn, src_shard_roots)?;
+                        apply_clone_volume_incref(&page_store, &faults, lsn, src_shard_roots)?;
+                        // Same stale-buffer hazard as `Db::clone_volume`:
+                        // the source volume's PagedL2p buffers (opened
+                        // above from the on-disk manifest) still hold
+                        // pre-incref Clean copies of these roots. Drop
+                        // them or a later `L2pPut` replay on the source
+                        // volume would cow from a stale refcount.
+                        let src_vol = volumes.get(src_ord).cloned();
                         for &pid in src_shard_roots {
-                            if pid != crate::types::NULL_PAGE {
-                                page_cache.invalidate(pid);
+                            if pid == crate::types::NULL_PAGE {
+                                continue;
+                            }
+                            page_cache.invalidate(pid);
+                            if let Some(vol) = &src_vol {
+                                for shard in &vol.shards {
+                                    shard.tree.lock().forget_page(pid);
+                                }
                             }
                         }
                         let (shards, actual_roots) = build_clone_volume_shards(
@@ -547,15 +560,65 @@ impl Db {
         crate::recovery::truncate_torn_tail(&wal_path, &replay_outcome)?;
         let wal = Wal::create(&wal_path, &cfg, last_applied + 1, faults.clone())?;
 
-        // If replay removed any snapshots or altered the volumes table,
-        // persist the updated manifest before we start freeing pages.
-        // Reclaim below walks `manifest` as its source of live page
-        // roots; committing here keeps the on-disk copy in sync with the
-        // in-memory one so a subsequent offline decode doesn't trip on
-        // dangling references.
-        if replayed_drop || mutated_volumes {
+        // If anything was replayed, flush every tree + dedup memtable,
+        // refresh the manifest from the post-replay in-memory roots,
+        // advance `checkpoint_lsn`, and commit. This is important
+        // because the subsequent `reclaim_orphan_pages` walks
+        // `manifest.volumes` to decide which pages are still reachable:
+        // without refreshing the roots here, any page the replay
+        // allocated (e.g. a `cow_for_write` target during `L2pPut`
+        // apply) is not yet on disk AND is not reachable from the
+        // pre-replay manifest roots — reclaim would free it, then the
+        // next allocation would hand out that same pid and two shards
+        // would end up sharing a leaf. Flushing first also guarantees
+        // every tree page physically exists on disk before reclaim's
+        // scan runs. Dedup memtable + level heads follow the same rule
+        // (`prepare_dedup_manifest_update`'s invariant): advancing
+        // `checkpoint_lsn` past a DedupPut replay without flushing the
+        // memtable loses the entry.
+        //
+        // Skipping this block when nothing was replayed keeps the
+        // common "close + reopen with no WAL tail" path zero-cost.
+        let replayed_anything = replay_outcome.last_lsn.is_some();
+        if replayed_anything || replayed_drop || mutated_volumes {
+            let sorted: Vec<Arc<Volume>> = {
+                let mut v: Vec<Arc<Volume>> = volumes.values().cloned().collect();
+                v.sort_by_key(|vol| vol.ord);
+                v
+            };
+            let mut l2p_guards = lock_all_l2p_shards_for(&sorted);
+            let mut refcount_guards: Vec<MutexGuard<'_, BTree>> =
+                refcount_shards.iter().map(|s| s.tree.lock()).collect();
+            flush_locked_l2p_shards(&mut l2p_guards)?;
+            for tree in refcount_guards.iter_mut() {
+                tree.flush()?;
+            }
+
+            // Dedup memtable / level heads: mirror what
+            // `Db::flush` does via `prepare_dedup_manifest_update`.
+            let dedup_generation = last_applied.max(1) + 1;
+            dedup_index.flush_memtable(dedup_generation)?;
+            dedup_reverse.flush_memtable(dedup_generation)?;
+            let old_dedup_heads = manifest.dedup_level_heads.to_vec();
+            let old_dedup_reverse_heads = manifest.dedup_reverse_level_heads.to_vec();
+            manifest.dedup_level_heads = dedup_index
+                .persist_levels(dedup_generation)?
+                .into_boxed_slice();
+            manifest.dedup_reverse_level_heads = dedup_reverse
+                .persist_levels(dedup_generation)?
+                .into_boxed_slice();
+
+            refresh_manifest_entries(
+                &mut manifest,
+                &sorted,
+                &l2p_guards,
+                &refcount_guards,
+            )?;
             manifest.checkpoint_lsn = last_applied;
             manifest_store.commit(&manifest)?;
+
+            dedup_index.free_old_level_heads(&old_dedup_heads, dedup_generation)?;
+            dedup_reverse.free_old_level_heads(&old_dedup_reverse_heads, dedup_generation)?;
         }
 
         // Reclaim orphan pages AFTER replay + post-replay commit:
@@ -1482,6 +1545,13 @@ impl Db {
             volumes_map.insert(ord, Arc::new(Volume::new(ord, shards, lsn)));
         }
 
+        // Window exposed to fault-injection tests: WAL record is durable
+        // + the in-memory volumes map is populated, but the manifest's
+        // volumes table hasn't been extended. A crash here is recovered
+        // on reopen via the CreateVolume replay arm.
+        self.faults
+            .inject(FaultPoint::CreateVolumePostWalBeforeManifest)?;
+
         {
             let mut mstate = self.manifest_state.lock();
             mstate.manifest.volumes.push(VolumeEntry {
@@ -1581,6 +1651,11 @@ impl Db {
         let body = encode_body(std::slice::from_ref(&op));
         let lsn = self.wal.submit(body)?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
+        // Fault window specific to drop_volume: WAL record durable, no
+        // page decref has touched disk yet. Recovery re-drives the full
+        // cascade from the WAL op's inlined `pages` list.
+        self.faults
+            .inject(FaultPoint::DropVolumePostWalBeforeApply)?;
         {
             let mut applied = self.last_applied_lsn.lock();
             while *applied + 1 < lsn {
@@ -1702,13 +1777,26 @@ impl Db {
             }
         }
 
-        apply_clone_volume_incref(&self.page_store, lsn, &src_shard_roots)?;
-        // Shared page_cache may hold pre-incref copies of the roots.
-        // Invalidate so `open_with_cache` below pulls the freshly
-        // stamped bytes from disk.
+        apply_clone_volume_incref(&self.page_store, &self.faults, lsn, &src_shard_roots)?;
+        // `apply_clone_volume_incref` writes through `page_store`, so the
+        // shared `page_cache` *and* every in-memory `PageBuf` that holds
+        // a stale pre-incref copy of one of these roots need to drop it
+        // or a subsequent `cow_for_write` on the source volume would
+        // read the wrong refcount (see `drop_snapshot` for the same
+        // invariant). The source volume is the only one that could have
+        // a stale buffer here — `build_clone_volume_shards` below opens
+        // fresh `PagedL2p`s for the clone, which read straight from
+        // disk.
+        let src_volume = self.volumes.read().get(&src_ord).cloned();
         for &pid in &src_shard_roots {
-            if pid != crate::types::NULL_PAGE {
-                self.page_cache.invalidate(pid);
+            if pid == crate::types::NULL_PAGE {
+                continue;
+            }
+            self.page_cache.invalidate(pid);
+            if let Some(vol) = &src_volume {
+                for shard in &vol.shards {
+                    shard.tree.lock().forget_page(pid);
+                }
             }
         }
         self.faults
@@ -1866,43 +1954,7 @@ impl Db {
         l2p_guards: &[MutexGuard<'_, PagedL2p>],
         refcount_guards: &[MutexGuard<'_, BTree>],
     ) -> Result<()> {
-        // v6: the manifest tracks L2P roots per volume. `volumes` is the
-        // sorted snapshot the caller took (matches the order of shard
-        // guards in `l2p_guards`), so we can walk both in lockstep.
-        manifest.body_version = MANIFEST_BODY_VERSION;
-        let expected_total: usize = volumes.iter().map(|v| v.shards.len()).sum();
-        if expected_total != l2p_guards.len() {
-            return Err(MetaDbError::Corruption(format!(
-                "refresh_manifest_from_locked: shard guard count {} does not match \
-                 sum of volume shard counts {expected_total}",
-                l2p_guards.len(),
-            )));
-        }
-        let mut guard_cursor = 0usize;
-        let mut new_entries = Vec::with_capacity(volumes.len());
-        for vol in volumes {
-            let mut roots = Vec::with_capacity(vol.shards.len());
-            for _ in 0..vol.shards.len() {
-                roots.push(l2p_guards[guard_cursor].root());
-                guard_cursor += 1;
-            }
-            new_entries.push(VolumeEntry {
-                ord: vol.ord,
-                shard_count: vol.shards.len() as u32,
-                l2p_shard_roots: roots.into_boxed_slice(),
-                created_lsn: vol.created_lsn,
-                flags: vol
-                    .flags
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            });
-        }
-        manifest.volumes = new_entries;
-        manifest.refcount_shard_roots = refcount_guards
-            .iter()
-            .map(|tree| tree.root())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Ok(())
+        refresh_manifest_entries(manifest, volumes, l2p_guards, refcount_guards)
     }
 
     fn current_generation(&self) -> Lsn {
@@ -2041,6 +2093,51 @@ fn lock_all_l2p_shards_for<'v>(volumes: &'v [Arc<Volume>]) -> Vec<MutexGuard<'v,
         .iter()
         .flat_map(|vol| vol.shards.iter().map(|shard| shard.tree.lock()))
         .collect()
+}
+
+/// Rebuild `manifest.volumes` and `manifest.refcount_shard_roots` from
+/// the live tree roots held by the supplied guard slices. Used by
+/// `Db::flush` / `Db::take_snapshot` (via the `&self` wrapper) and by
+/// `Db::open` post-replay to sync the on-disk manifest with in-memory
+/// state before any page reclaim.
+fn refresh_manifest_entries(
+    manifest: &mut Manifest,
+    volumes: &[Arc<Volume>],
+    l2p_guards: &[MutexGuard<'_, PagedL2p>],
+    refcount_guards: &[MutexGuard<'_, BTree>],
+) -> Result<()> {
+    manifest.body_version = MANIFEST_BODY_VERSION;
+    let expected_total: usize = volumes.iter().map(|v| v.shards.len()).sum();
+    if expected_total != l2p_guards.len() {
+        return Err(MetaDbError::Corruption(format!(
+            "refresh_manifest_entries: shard guard count {} does not match \
+             sum of volume shard counts {expected_total}",
+            l2p_guards.len(),
+        )));
+    }
+    let mut guard_cursor = 0usize;
+    let mut new_entries = Vec::with_capacity(volumes.len());
+    for vol in volumes {
+        let mut roots = Vec::with_capacity(vol.shards.len());
+        for _ in 0..vol.shards.len() {
+            roots.push(l2p_guards[guard_cursor].root());
+            guard_cursor += 1;
+        }
+        new_entries.push(VolumeEntry {
+            ord: vol.ord,
+            shard_count: vol.shards.len() as u32,
+            l2p_shard_roots: roots.into_boxed_slice(),
+            created_lsn: vol.created_lsn,
+            flags: vol.flags.load(std::sync::atomic::Ordering::Relaxed),
+        });
+    }
+    manifest.volumes = new_entries;
+    manifest.refcount_shard_roots = refcount_guards
+        .iter()
+        .map(|tree| tree.root())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    Ok(())
 }
 
 fn flush_locked_l2p_shards(guards: &mut [MutexGuard<'_, PagedL2p>]) -> Result<()> {
@@ -2348,10 +2445,11 @@ fn apply_drop_volume(
 /// empty trees for those shards (see [`build_clone_volume_shards`]).
 fn apply_clone_volume_incref(
     page_store: &Arc<PageStore>,
+    faults: &FaultController,
     lsn: Lsn,
     src_shard_roots: &[PageId],
 ) -> Result<()> {
-    for &pid in src_shard_roots {
+    for (idx, &pid) in src_shard_roots.iter().enumerate() {
         if pid == crate::types::NULL_PAGE {
             continue;
         }
@@ -2372,6 +2470,12 @@ fn apply_clone_volume_incref(
         page.set_generation(lsn);
         page.seal();
         page_store.write_page(pid, &page)?;
+        // Fault injection window: fires after the first root is durably
+        // incref'd but before subsequent ones. Recovery's generation-stamp
+        // guard skips the pre-fault root and completes the rest.
+        if idx == 0 {
+            faults.inject(FaultPoint::CloneVolumeMidIncref)?;
+        }
     }
     page_store.sync()?;
     Ok(())
