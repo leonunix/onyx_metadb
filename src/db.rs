@@ -194,6 +194,35 @@ impl Iterator for DbRangeIter {
     }
 }
 
+/// Iterator over every `(Pba, refcount)` pair in the global refcount
+/// table, in Pba order. Currently materialised upfront across all
+/// refcount shards; the `impl Iterator` surface lets future commits
+/// swap the body for a lazy walker without touching call sites.
+pub struct DbRefcountIter {
+    inner: std::vec::IntoIter<(Pba, u32)>,
+}
+
+impl Iterator for DbRefcountIter {
+    type Item = Result<(Pba, u32)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(Ok)
+    }
+}
+
+/// Iterator over every live `(Hash32, DedupValue)` entry in the
+/// dedup forward index. Tombstoned rows are hidden. Output is sorted
+/// by hash.
+pub struct DbDedupIter {
+    inner: std::vec::IntoIter<(Hash32, DedupValue)>,
+}
+
+impl Iterator for DbDedupIter {
+    type Item = Result<(Hash32, DedupValue)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(Ok)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct OwnedRange {
     start: Bound<u64>,
@@ -911,6 +940,40 @@ impl Db {
         Ok(self.dedup_index.compact_once(generation)?.is_some())
     }
 
+    /// Iterate every `(Pba, refcount)` pair across all refcount shards,
+    /// sorted by Pba. Refcount is a running tally (global), so there is
+    /// no per-volume filtering — callers doing volume-scoped audits
+    /// cross-reference with [`range`](Self::range) output themselves.
+    ///
+    /// Currently materialised upfront; the `impl Iterator` surface is
+    /// exposed so future commits can swap the body for a lazy walker
+    /// without touching call sites.
+    pub fn iter_refcounts(&self) -> Result<DbRefcountIter> {
+        let mut all: Vec<(Pba, u32)> = Vec::new();
+        for shard in &self.refcount_shards {
+            let mut tree = shard.tree.lock();
+            for rec in tree.iter_stream()? {
+                all.push(rec?);
+            }
+        }
+        all.sort_unstable_by_key(|(pba, _)| *pba);
+        Ok(DbRefcountIter {
+            inner: all.into_iter(),
+        })
+    }
+
+    /// Iterate every live `(Hash32, DedupValue)` entry in the dedup
+    /// forward index, sorted by hash. Tombstoned hashes are hidden.
+    /// Materialised via the LSM's prefix-scan path with an empty prefix;
+    /// shares one `reader_drain` and one `levels` snapshot with any
+    /// concurrent readers.
+    pub fn iter_dedup(&self) -> Result<DbDedupIter> {
+        let all = self.dedup_index.scan_prefix(&[])?;
+        Ok(DbDedupIter {
+            inner: all.into_iter(),
+        })
+    }
+
     // -------- tree operations --------------------------------------------
 
     /// Point lookup in volume `vol_ord`'s L2P tree.
@@ -999,6 +1062,19 @@ impl Db {
         }
         items.sort_unstable_by_key(|(k, _)| *k);
         Ok(DbRangeIter::new(items))
+    }
+
+    /// Streaming variant of [`range`](Self::range). Currently an alias —
+    /// the body delegates to `range`'s eager materialisation so every
+    /// caller already gets a stable iterator surface, and a future commit
+    /// can swap the body for a lazy frame-stack walker without touching
+    /// call sites.
+    pub fn range_stream<R: RangeBounds<Lba>>(
+        &self,
+        vol_ord: VolumeOrdinal,
+        range: R,
+    ) -> Result<DbRangeIter> {
+        self.range(vol_ord, range)
     }
 
     // -------- snapshot operations -----------------------------------------
@@ -3069,6 +3145,140 @@ mod tests {
         assert_eq!(db.get(clone, 1).unwrap(), None);
         db.insert(clone, 1, v(7)).unwrap();
         assert_eq!(db.get(clone, 1).unwrap(), Some(v(7)));
+    }
+
+    // -------- phase 7 commit 11: streaming iterators --------
+
+    #[test]
+    fn iter_refcounts_empty_db_returns_empty() {
+        let (_d, db) = mk_db();
+        let items: Vec<_> = db
+            .iter_refcounts()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn iter_refcounts_emits_all_entries_sorted_by_pba() {
+        let (_d, db) = mk_db();
+        for (pba, delta) in [(100u64, 7u32), (50, 3), (200, 1), (10, 5)] {
+            db.incref_pba(pba, delta).unwrap();
+        }
+        let items: Vec<(Pba, u32)> = db
+            .iter_refcounts()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(items, vec![(10, 5), (50, 3), (100, 7), (200, 1)]);
+    }
+
+    #[test]
+    fn iter_refcounts_hides_decremented_to_zero() {
+        let (_d, db) = mk_db();
+        db.incref_pba(42, 2).unwrap();
+        db.decref_pba(42, 2).unwrap(); // rc back to 0 → row removed
+        db.incref_pba(99, 1).unwrap();
+        let items: Vec<(Pba, u32)> = db
+            .iter_refcounts()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(items, vec![(99, 1)]);
+    }
+
+    #[test]
+    fn iter_dedup_empty_db_returns_empty() {
+        let (_d, db) = mk_db();
+        let items: Vec<_> = db
+            .iter_dedup()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn iter_dedup_emits_live_puts_and_hides_tombstones() {
+        let (_d, db) = mk_db();
+        let h1 = h(1);
+        let h2 = h(2);
+        let h3 = h(3);
+        db.put_dedup(h1, dv(1)).unwrap();
+        db.put_dedup(h2, dv(2)).unwrap();
+        db.put_dedup(h3, dv(3)).unwrap();
+        db.delete_dedup(h2).unwrap();
+        let items: Vec<_> = db
+            .iter_dedup()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let keys: Vec<Hash32> = items.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&h1));
+        assert!(!keys.contains(&h2));
+        assert!(keys.contains(&h3));
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn iter_dedup_survives_flush_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let h1 = h(7);
+        let h2 = h(8);
+        {
+            let db = Db::create(dir.path()).unwrap();
+            db.put_dedup(h1, dv(1)).unwrap();
+            db.put_dedup(h2, dv(2)).unwrap();
+            db.flush().unwrap();
+        }
+        let db = Db::open(dir.path()).unwrap();
+        let items: Vec<_> = db
+            .iter_dedup()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn range_stream_matches_range() {
+        let (_d, db) = mk_db();
+        for i in 0u64..20 {
+            db.insert(0, i, v(i as u8)).unwrap();
+        }
+        let lazy: Vec<_> = db
+            .range_stream(0, 5..15)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let eager: Vec<_> = db
+            .range(0, 5..15)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(lazy, eager);
+        assert_eq!(lazy.len(), 10);
+    }
+
+    #[test]
+    fn range_stream_routes_per_volume() {
+        let (_d, db) = mk_db();
+        let a = db.create_volume().unwrap();
+        db.insert(0, 1, v(0)).unwrap();
+        db.insert(a, 1, v(1)).unwrap();
+        let on_boot: Vec<_> = db
+            .range_stream(0, ..)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let on_a: Vec<_> = db
+            .range_stream(a, ..)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(on_boot, vec![(1, v(0))]);
+        assert_eq!(on_a, vec![(1, v(1))]);
     }
 
     // -------- phase 5e: refcount + dedup integration --------

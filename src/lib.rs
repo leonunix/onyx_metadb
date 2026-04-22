@@ -44,7 +44,9 @@ pub mod wal;
 pub use btree::{BTree, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter};
 pub use cache::{PageCache, PageCacheStats};
 pub use config::{Config, PAGE_SIZE};
-pub use db::{Db, DbRangeIter, DropReport, SnapshotView};
+pub use db::{
+    Db, DbDedupIter, DbRangeIter, DbRefcountIter, DropReport, DropVolumeReport, SnapshotView,
+};
 pub use error::{MetaDbError, Result};
 pub use lsm::{
     DEDUP_VALUE_SIZE, DedupOp, DedupValue, HASH_SIZE, Hash32, LSM_RECORD_SIZE, LookupResult,
