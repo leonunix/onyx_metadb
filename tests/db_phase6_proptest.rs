@@ -117,10 +117,10 @@ fn apply_to_reference(
 fn apply_to_db(op: &Op, db: &Db) -> Result<(), MetaDbError> {
     match *op {
         Op::Insert(k, v) => {
-            db.insert(k, l2p(v))?;
+            db.insert(0,k, l2p(v))?;
         }
         Op::Delete(k) => {
-            db.delete(k)?;
+            db.delete(0,k)?;
         }
         Op::PutDedup(hk, hv) => {
             db.put_dedup(h(hk), dval(hv))?;
@@ -214,7 +214,7 @@ fn assert_db_matches(
 ) -> Result<(), TestCaseError> {
     // Sample L2P keys (we cover the whole 0..50 range).
     for k in 0u64..50 {
-        let got = db.get(k).unwrap();
+        let got = db.get(0,k).unwrap();
         let want = current_l2p.get(&k).copied();
         prop_assert_eq!(got, want, "L2P key {} diverged", k);
     }
@@ -312,20 +312,20 @@ fn failed_commit_does_not_apply_to_memory_state() {
     let faults = FaultController::new();
     let db = Db::create_with_faults(dir.path(), faults.clone()).unwrap();
 
-    db.insert(1, l2p(1)).unwrap();
+    db.insert(0,1, l2p(1)).unwrap();
     db.incref_pba(10, 5).unwrap();
     db.put_dedup(h(100), dval(1)).unwrap();
 
     faults.install(FaultPoint::WalFsyncBefore, 1, FaultAction::Error);
 
     let mut tx = db.begin();
-    tx.insert(1, l2p(99));
+    tx.insert(0,1, l2p(99));
     tx.incref_pba(10, 1);
     tx.put_dedup(h(100), dval(99));
     assert!(tx.commit().is_err());
 
     // Old values remain because apply never ran.
-    assert_eq!(db.get(1).unwrap(), Some(l2p(1)));
+    assert_eq!(db.get(0,1).unwrap(), Some(l2p(1)));
     assert_eq!(db.get_refcount(10).unwrap(), 5);
     assert_eq!(db.get_dedup(&h(100)).unwrap(), Some(dval(1)));
 }

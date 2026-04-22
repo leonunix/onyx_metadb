@@ -323,7 +323,7 @@ fn run_l2p_put(cfg: &BenchConfig, db: Arc<Db>) -> Result<BenchReport, String> {
                 let key = key_base + i;
                 let value = l2p_value_from_pba(key);
                 let start = Instant::now();
-                db.insert(key, value).unwrap();
+                db.insert(0, key, value).unwrap();
                 out.latencies_us.push(start.elapsed().as_micros() as u64);
                 out.ops += 1;
                 out.items += 1;
@@ -380,7 +380,7 @@ fn run_l2p_get(cfg: &BenchConfig, db_cfg: Config) -> Result<BenchReport, String>
             for _ in 0..thread_ops {
                 let key = rng.gen_range(0..key_space);
                 let start = Instant::now();
-                let got = db.get(key).unwrap();
+                let got = db.get(0, key).unwrap();
                 out.latencies_us.push(start.elapsed().as_micros() as u64);
                 debug_assert!(got.is_some());
                 out.ops += 1;
@@ -450,7 +450,7 @@ fn run_l2p_multi_get(cfg: &BenchConfig, db_cfg: Config) -> Result<BenchReport, S
                     *key = rng.gen_range(0..key_space);
                 }
                 let start = Instant::now();
-                let got = db.multi_get(&keys).unwrap();
+                let got = db.multi_get(0, &keys).unwrap();
                 out.latencies_us.push(start.elapsed().as_micros() as u64);
                 debug_assert_eq!(got.len(), keys.len());
                 out.ops += 1;
@@ -534,7 +534,7 @@ fn run_meta_tx(cfg: &BenchConfig, db: Arc<Db>) -> Result<BenchReport, String> {
                     let idx = active_dedup[rng.gen_range(0..active_dedup.len())];
                     let entry = &mut dedup_entries[idx];
                     entry.live_refs += 1;
-                    tx.insert(lba, l2p_value_from_pba(entry.pba));
+                    tx.insert(0,lba, l2p_value_from_pba(entry.pba));
                     tx.incref_pba(entry.pba, 1);
                     Mapping {
                         pba: entry.pba,
@@ -545,7 +545,7 @@ fn run_meta_tx(cfg: &BenchConfig, db: Arc<Db>) -> Result<BenchReport, String> {
                     next_pba += 1;
                     let hash = hash_from_parts(tid as u64, next_hash_seq);
                     next_hash_seq += 1;
-                    tx.insert(lba, l2p_value_from_pba(pba));
+                    tx.insert(0,lba, l2p_value_from_pba(pba));
                     tx.incref_pba(pba, 1);
                     tx.put_dedup(hash, dedup_value_from_pba(pba));
                     tx.register_dedup_reverse(pba, hash);
@@ -631,7 +631,7 @@ fn prefill_l2p(
         let end = (done + batch_size as u64).min(count);
         let mut tx = db.begin();
         for key in done..end {
-            tx.insert(key, l2p_value_from_pba(key));
+            tx.insert(0,key, l2p_value_from_pba(key));
         }
         tx.commit().map_err(|e| e.to_string())?;
         done = end;
@@ -694,7 +694,7 @@ fn warmup_l2p_reads(
             barrier.wait();
             for _ in 0..warmup_ops {
                 let key = rng.gen_range(0..key_space);
-                let _ = db.get(key).unwrap();
+                let _ = db.get(0, key).unwrap();
             }
         }));
     }
@@ -726,7 +726,7 @@ fn warmup_l2p_multi_reads(
                 for key in &mut keys {
                     *key = rng.gen_range(0..key_space);
                 }
-                let _ = db.multi_get(&keys).unwrap();
+                let _ = db.multi_get(0, &keys).unwrap();
             }
         }));
     }

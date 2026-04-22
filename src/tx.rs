@@ -27,7 +27,7 @@
 use crate::error::Result;
 use crate::lsm::{DedupValue, Hash32};
 use crate::paged::L2pValue;
-use crate::types::{Lba, Lsn, Pba};
+use crate::types::{Lba, Lsn, Pba, VolumeOrdinal};
 use crate::wal::WalOp;
 
 /// Per-op outcome returned from the apply phase. Auto-commit wrappers
@@ -84,21 +84,21 @@ impl<'db> Transaction<'db> {
         self.ops.is_empty()
     }
 
-    /// Buffer an L2P put. Phase B commit 6 targets the bootstrap volume
-    /// unconditionally; commit 7 exposes an explicit `vol_ord` parameter.
-    pub fn insert(&mut self, lba: Lba, value: L2pValue) -> &mut Self {
+    /// Buffer an L2P put targeted at volume `vol_ord`. The apply path
+    /// routes to the volume's shard group; an unknown ordinal fails the
+    /// commit with `Corruption` during apply.
+    pub fn insert(&mut self, vol_ord: VolumeOrdinal, lba: Lba, value: L2pValue) -> &mut Self {
         self.ops.push(WalOp::L2pPut {
-            vol_ord: 0,
+            vol_ord,
             lba,
             value,
         });
         self
     }
 
-    /// Buffer an L2P delete. Same `vol_ord = 0` note as
-    /// [`insert`](Self::insert).
-    pub fn delete(&mut self, lba: Lba) -> &mut Self {
-        self.ops.push(WalOp::L2pDelete { vol_ord: 0, lba });
+    /// Buffer an L2P delete for `vol_ord`. See [`insert`](Self::insert).
+    pub fn delete(&mut self, vol_ord: VolumeOrdinal, lba: Lba) -> &mut Self {
+        self.ops.push(WalOp::L2pDelete { vol_ord, lba });
         self
     }
 

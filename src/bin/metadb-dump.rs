@@ -197,7 +197,9 @@ fn cmd_lba(args: &[String]) -> Result<ExitCode, String> {
                 .ok_or_else(|| format!("unknown snapshot id {id}"))?;
             view.get(lba).map_err(|e| e.to_string())?
         }
-        None => db.get(lba).map_err(|e| e.to_string())?,
+        // Commit 7: only the bootstrap volume exists; when commit 8 lets
+        // users create real volumes, this grows a `--vol N` flag.
+        None => db.get(0, lba).map_err(|e| e.to_string())?,
     };
 
     if json {
@@ -255,7 +257,7 @@ fn cmd_l2p(args: &[String]) -> Result<ExitCode, String> {
             )?
         }
         None => collect_range(
-            db.range(bounded_range(from, to))
+            db.range(0, bounded_range(from, to))
                 .map_err(|e| e.to_string())?,
             limit,
         )?,

@@ -53,13 +53,13 @@ fn multi_writer_stress_finishes_and_reopens_cleanly() {
                 let key = rng.r#gen::<u64>() % 2_048;
                 match rng.r#gen::<u8>() % 5 {
                     0..=2 => {
-                        db.insert(key, v(rng.r#gen::<u8>())).unwrap();
+                        db.insert(0,key, v(rng.r#gen::<u8>())).unwrap();
                     }
                     3 => {
-                        let _ = db.delete(key).unwrap();
+                        let _ = db.delete(0,key).unwrap();
                     }
                     _ => {
-                        let _ = db.get(key).unwrap();
+                        let _ = db.get(0,key).unwrap();
                     }
                 }
             }
@@ -72,7 +72,7 @@ fn multi_writer_stress_finishes_and_reopens_cleanly() {
 
     db.flush().unwrap();
     let before_reopen: Vec<(u64, L2pValue)> =
-        db.range(..).unwrap().collect::<Result<Vec<_>>>().unwrap();
+        db.range(0,..).unwrap().collect::<Result<Vec<_>>>().unwrap();
     assert!(
         before_reopen.windows(2).all(|w| w[0].0 < w[1].0),
         "range scan must stay globally ordered",
@@ -81,7 +81,7 @@ fn multi_writer_stress_finishes_and_reopens_cleanly() {
     drop(db);
     let reopened = Db::open(dir.path()).unwrap();
     let after_reopen: Vec<(u64, L2pValue)> = reopened
-        .range(..)
+        .range(0, ..)
         .unwrap()
         .collect::<Result<Vec<_>>>()
         .unwrap();
@@ -114,12 +114,12 @@ fn snapshots_match_reference_during_multi_writer_rounds() {
                 for _ in 0..OPS_PER_ROUND {
                     let key = keys[rng.r#gen::<usize>() % keys.len()];
                     if rng.r#gen::<u8>() % 4 == 0 {
-                        let db_old = db.delete(key).unwrap();
+                        let db_old = db.delete(0,key).unwrap();
                         let ref_old = model.lock().remove(&key);
                         assert_eq!(db_old, ref_old);
                     } else {
                         let value = v(rng.r#gen::<u8>());
-                        let db_old = db.insert(key, value).unwrap();
+                        let db_old = db.insert(0,key, value).unwrap();
                         let ref_old = model.lock().insert(key, value);
                         assert_eq!(db_old, ref_old);
                     }
@@ -152,7 +152,7 @@ fn snapshots_match_reference_during_multi_writer_rounds() {
         assert_eq!(got, want, "snapshot {snap} diverged from reference");
     }
 
-    let current: Vec<(u64, L2pValue)> = db.range(..).unwrap().collect::<Result<Vec<_>>>().unwrap();
+    let current: Vec<(u64, L2pValue)> = db.range(0,..).unwrap().collect::<Result<Vec<_>>>().unwrap();
     let want_current: Vec<(u64, L2pValue)> = model.lock().iter().map(|(k, v)| (*k, *v)).collect();
     assert_eq!(current, want_current);
 }
@@ -191,7 +191,7 @@ fn concurrent_commits_coalesce_into_wal_group_batches() {
             barrier.wait();
             let base = (tid as u64 + 1) * 1_000_000;
             for i in 0..PER_THREAD {
-                db.insert(base + i as u64, v(tid as u8)).unwrap();
+                db.insert(0,base + i as u64, v(tid as u8)).unwrap();
             }
         }));
     }

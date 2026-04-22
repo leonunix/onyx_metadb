@@ -115,12 +115,12 @@ proptest! {
             match op {
                 Op::Insert(k, v) => {
                     let value = v_of(v);
-                    let tree_old = db.insert(k, value).unwrap();
+                    let tree_old = db.insert(0,k, value).unwrap();
                     let ref_old = current.insert(k, value);
                     prop_assert_eq!(tree_old, ref_old);
                 }
                 Op::Delete(k) => {
-                    let tree_old = db.delete(k).unwrap();
+                    let tree_old = db.delete(0,k).unwrap();
                     let ref_old = current.remove(&k);
                     prop_assert_eq!(tree_old, ref_old);
                 }
@@ -141,7 +141,7 @@ proptest! {
                 }
                 Op::VerifyCurrent => {
                     let got: Vec<(u64, L2pValue)> = db
-                        .range(..)
+                        .range(0, ..)
                         .unwrap()
                         .collect::<onyx_metadb::Result<Vec<_>>>()
                         .unwrap();
@@ -198,7 +198,7 @@ proptest! {
         }
         // And current state matches.
         let got: Vec<(u64, L2pValue)> = db
-            .range(..)
+            .range(0, ..)
             .unwrap()
             .collect::<onyx_metadb::Result<Vec<_>>>()
             .unwrap();
@@ -226,12 +226,12 @@ fn deterministic_snapshot_stress() {
             0..=9 => {
                 let k = rng.r#gen::<u64>() % 500;
                 let v = v_of(rng.r#gen::<u8>());
-                db.insert(k, v).unwrap();
+                db.insert(0,k, v).unwrap();
                 current.insert(k, v);
             }
             10..=13 => {
                 let k = rng.r#gen::<u64>() % 500;
-                let a = db.delete(k).unwrap();
+                let a = db.delete(0,k).unwrap();
                 let b = current.remove(&k);
                 assert_eq!(a, b);
             }
@@ -270,7 +270,7 @@ fn deterministic_snapshot_stress() {
 
     // Final reconciliation.
     let cur: Vec<(u64, L2pValue)> = db
-        .range(..)
+        .range(0, ..)
         .unwrap()
         .collect::<onyx_metadb::Result<Vec<_>>>()
         .unwrap();

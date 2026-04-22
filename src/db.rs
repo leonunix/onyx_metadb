@@ -30,7 +30,7 @@ use crate::paged::PagedL2p;
 use crate::paged::{DiffEntry, L2pValue};
 use crate::testing::faults::{FaultController, FaultPoint};
 use crate::tx::{ApplyOutcome, Transaction};
-use crate::types::{Lsn, PageId, Pba, SnapshotId, VolumeOrdinal};
+use crate::types::{Lba, Lsn, PageId, Pba, SnapshotId, VolumeOrdinal};
 use crate::verify;
 use crate::wal::{Wal, WalOp, encode_body};
 
@@ -821,42 +821,55 @@ impl Db {
 
     // -------- tree operations --------------------------------------------
 
-    pub fn get(&self, key: u64) -> Result<Option<L2pValue>> {
-        let volume = self.volume_zero();
-        let sid = shard_for_key_l2p(&volume.shards, key);
+    /// Point lookup in volume `vol_ord`'s L2P tree.
+    pub fn get(&self, vol_ord: VolumeOrdinal, lba: Lba) -> Result<Option<L2pValue>> {
+        let volume = self.volume(vol_ord)?;
+        let sid = shard_for_key_l2p(&volume.shards, lba);
         let mut tree = volume.shards[sid].tree.lock();
-        tree.get(key)
+        tree.get(lba)
     }
 
-    /// Batched L2P lookup. Groups `keys` by shard, locks each shard once,
-    /// and reads every key that falls to it before moving on. Output
-    /// order matches input order; duplicates produce repeated results.
-    pub fn multi_get(&self, keys: &[u64]) -> Result<Vec<Option<L2pValue>>> {
-        if keys.is_empty() {
+    /// Batched L2P lookup inside volume `vol_ord`. Groups `lbas` by shard,
+    /// locks each shard once, and reads every lba that falls to it before
+    /// moving on. Output order matches input order; duplicates produce
+    /// repeated results.
+    pub fn multi_get(
+        &self,
+        vol_ord: VolumeOrdinal,
+        lbas: &[Lba],
+    ) -> Result<Vec<Option<L2pValue>>> {
+        if lbas.is_empty() {
             return Ok(Vec::new());
         }
-        let volume = self.volume_zero();
+        let volume = self.volume(vol_ord)?;
         let shard_count = volume.shards.len();
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
-        for (idx, key) in keys.iter().enumerate() {
-            buckets[shard_for_key_l2p(&volume.shards, *key)].push(idx);
+        for (idx, lba) in lbas.iter().enumerate() {
+            buckets[shard_for_key_l2p(&volume.shards, *lba)].push(idx);
         }
-        let mut out: Vec<Option<L2pValue>> = vec![None; keys.len()];
+        let mut out: Vec<Option<L2pValue>> = vec![None; lbas.len()];
         for (sid, idxs) in buckets.into_iter().enumerate() {
             if idxs.is_empty() {
                 continue;
             }
             let mut tree = volume.shards[sid].tree.lock();
             for idx in idxs {
-                out[idx] = tree.get(keys[idx])?;
+                out[idx] = tree.get(lbas[idx])?;
             }
         }
         Ok(out)
     }
 
-    pub fn insert(&self, key: u64, value: L2pValue) -> Result<Option<L2pValue>> {
+    /// Insert `lba → value` in volume `vol_ord`, returning the previous
+    /// value if any. Auto-commits as a one-op transaction.
+    pub fn insert(
+        &self,
+        vol_ord: VolumeOrdinal,
+        lba: Lba,
+        value: L2pValue,
+    ) -> Result<Option<L2pValue>> {
         let mut tx = self.begin();
-        tx.insert(key, value);
+        tx.insert(vol_ord, lba, value);
         let (_, outcomes) = tx.commit_with_outcomes()?;
         match outcomes.into_iter().next().unwrap() {
             ApplyOutcome::L2pPrev(prev) => Ok(prev),
@@ -864,9 +877,11 @@ impl Db {
         }
     }
 
-    pub fn delete(&self, key: u64) -> Result<Option<L2pValue>> {
+    /// Delete `lba` from volume `vol_ord`, returning the previous value
+    /// if any. Auto-commits as a one-op transaction.
+    pub fn delete(&self, vol_ord: VolumeOrdinal, lba: Lba) -> Result<Option<L2pValue>> {
         let mut tx = self.begin();
-        tx.delete(key);
+        tx.delete(vol_ord, lba);
         let (_, outcomes) = tx.commit_with_outcomes()?;
         match outcomes.into_iter().next().unwrap() {
             ApplyOutcome::L2pPrev(prev) => Ok(prev),
@@ -874,10 +889,18 @@ impl Db {
         }
     }
 
-    pub fn range<R: RangeBounds<u64>>(&self, range: R) -> Result<DbRangeIter> {
+    /// Range scan within volume `vol_ord`. Returns globally-key-ordered
+    /// `(lba, value)` pairs by locking every shard of the volume and
+    /// merging their individual range scans.
+    pub fn range<R: RangeBounds<Lba>>(
+        &self,
+        vol_ord: VolumeOrdinal,
+        range: R,
+    ) -> Result<DbRangeIter> {
         let range = OwnedRange::new(range);
-        let volumes = self.volumes_snapshot();
-        let mut guards = lock_all_l2p_shards_for(&volumes);
+        let volume = self.volume(vol_ord)?;
+        let mut guards: Vec<MutexGuard<'_, PagedL2p>> =
+            volume.shards.iter().map(|s| s.tree.lock()).collect();
         let mut items = Vec::new();
         for tree in &mut guards {
             items.extend(tree.range(range.clone())?.collect::<Result<Vec<_>>>()?);
@@ -958,43 +981,57 @@ impl Db {
         })
     }
 
-    /// Compute the diff between two snapshots.
+    /// Compute the diff between two snapshots. Both snapshots must
+    /// belong to the same volume; cross-volume diff is rejected.
     pub fn diff(&self, a: SnapshotId, b: SnapshotId) -> Result<Vec<DiffEntry>> {
         let _guard = self.snapshot_views.read();
-        let (a_roots, b_roots) = {
+        let (vol_ord, a_roots, b_roots) = {
             let manifest_state = self.manifest_state.lock();
-            let a_roots = manifest_state
+            let a_entry = manifest_state
                 .manifest
                 .find_snapshot(a)
-                .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {a}")))?
-                .l2p_shard_roots
-                .clone();
-            let b_roots = manifest_state
+                .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {a}")))?;
+            let b_entry = manifest_state
                 .manifest
                 .find_snapshot(b)
-                .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {b}")))?
-                .l2p_shard_roots
-                .clone();
-            (a_roots, b_roots)
+                .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {b}")))?;
+            if a_entry.vol_ord != b_entry.vol_ord {
+                return Err(MetaDbError::InvalidArgument(format!(
+                    "cannot diff snapshots across volumes: {a} on vol {} vs {b} on vol {}",
+                    a_entry.vol_ord, b_entry.vol_ord,
+                )));
+            }
+            (
+                a_entry.vol_ord,
+                a_entry.l2p_shard_roots.clone(),
+                b_entry.l2p_shard_roots.clone(),
+            )
         };
-        self.diff_roots(&a_roots, &b_roots)
+        self.diff_roots(vol_ord, &a_roots, &b_roots)
     }
 
-    /// Diff a snapshot against the current tree.
+    /// Diff a snapshot against the owning volume's current tree.
     pub fn diff_with_current(&self, snap: SnapshotId) -> Result<Vec<DiffEntry>> {
         let _guard = self.snapshot_views.read();
-        let snap_roots = {
+        let (vol_ord, snap_roots) = {
             let manifest_state = self.manifest_state.lock();
-            manifest_state
+            let entry = manifest_state
                 .manifest
                 .find_snapshot(snap)
-                .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {snap}")))?
-                .l2p_shard_roots
-                .clone()
+                .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown snapshot id {snap}")))?;
+            (entry.vol_ord, entry.l2p_shard_roots.clone())
         };
 
-        let volumes = self.volumes_snapshot();
-        let mut guards = lock_all_l2p_shards_for(&volumes);
+        let volume = self.volume(vol_ord)?;
+        if snap_roots.len() != volume.shards.len() {
+            return Err(MetaDbError::Corruption(format!(
+                "snapshot {snap} has {} roots, volume {vol_ord} has {} shards",
+                snap_roots.len(),
+                volume.shards.len(),
+            )));
+        }
+        let mut guards: Vec<MutexGuard<'_, PagedL2p>> =
+            volume.shards.iter().map(|s| s.tree.lock()).collect();
         let mut out = Vec::new();
         for (tree, snap_root) in guards.iter_mut().zip(snap_roots.iter().copied()) {
             let current_root = tree.root();
@@ -1181,6 +1218,19 @@ impl Db {
             .clone()
     }
 
+    /// Look up volume `vol_ord` and clone its `Arc<Volume>` out of the
+    /// map. Unknown ordinals surface as `InvalidArgument` — commit 6's
+    /// apply path reports missing volumes as `Corruption` when they
+    /// come off the WAL, but the public read/write API treats them as a
+    /// caller error.
+    fn volume(&self, vol_ord: VolumeOrdinal) -> Result<Arc<Volume>> {
+        self.volumes
+            .read()
+            .get(&vol_ord)
+            .cloned()
+            .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown volume ord {vol_ord}")))
+    }
+
     fn refcount_shard_for(&self, pba: Pba) -> usize {
         debug_assert!(!self.refcount_shards.is_empty());
         (xxh3_64(&pba.to_be_bytes()) as usize) % self.refcount_shards.len()
@@ -1298,11 +1348,16 @@ impl Db {
         max_generation_from_two_groups(&l2p, &refcount)
     }
 
-    fn collect_range_for_roots(&self, roots: &[PageId], range: OwnedRange) -> Result<DbRangeIter> {
-        let volume = self.volume_zero();
+    fn collect_range_for_roots(
+        &self,
+        vol_ord: VolumeOrdinal,
+        roots: &[PageId],
+        range: OwnedRange,
+    ) -> Result<DbRangeIter> {
+        let volume = self.volume(vol_ord)?;
         if roots.len() != volume.shards.len() {
             return Err(MetaDbError::Corruption(format!(
-                "snapshot root count {} does not match shard count {}",
+                "snapshot root count {} does not match shard count {} for volume {vol_ord}",
                 roots.len(),
                 volume.shards.len(),
             )));
@@ -1319,11 +1374,16 @@ impl Db {
         Ok(DbRangeIter::new(items))
     }
 
-    fn diff_roots(&self, a: &[PageId], b: &[PageId]) -> Result<Vec<DiffEntry>> {
-        let volume = self.volume_zero();
+    fn diff_roots(
+        &self,
+        vol_ord: VolumeOrdinal,
+        a: &[PageId],
+        b: &[PageId],
+    ) -> Result<Vec<DiffEntry>> {
+        let volume = self.volume(vol_ord)?;
         if a.len() != volume.shards.len() || b.len() != volume.shards.len() {
             return Err(MetaDbError::Corruption(format!(
-                "diff root counts ({}, {}) do not match shard count {}",
+                "diff root counts ({}, {}) do not match shard count {} for volume {vol_ord}",
                 a.len(),
                 b.len(),
                 volume.shards.len(),
@@ -1371,21 +1431,28 @@ impl<'a> SnapshotView<'a> {
         self.entry.created_lsn
     }
 
-    /// Point lookup as of the snapshot's LSN.
-    pub fn get(&self, key: u64) -> Result<Option<L2pValue>> {
-        // Phase B commit 5 still keys snapshots off the bootstrap volume's
-        // shard layout. Commit 9 moves snapshots per-volume and this resolves
-        // via `self.entry.vol_ord` instead.
-        let volume = self.db.volume_zero();
-        let sid = shard_for_key_l2p(&volume.shards, key);
+    /// Ordinal of the volume this snapshot captures.
+    pub fn vol_ord(&self) -> VolumeOrdinal {
+        self.entry.vol_ord
+    }
+
+    /// Point lookup as of the snapshot's LSN. Routes through the
+    /// owning volume's shard layout — commit 6 always stamps
+    /// `vol_ord = 0`, commit 9 switches that to the real source.
+    pub fn get(&self, lba: Lba) -> Result<Option<L2pValue>> {
+        let volume = self.db.volume(self.entry.vol_ord)?;
+        let sid = shard_for_key_l2p(&volume.shards, lba);
         let mut tree = volume.shards[sid].tree.lock();
-        tree.get_at(self.entry.l2p_shard_roots[sid], key)
+        tree.get_at(self.entry.l2p_shard_roots[sid], lba)
     }
 
     /// Range scan as of the snapshot's LSN.
-    pub fn range<R: RangeBounds<u64>>(&self, range: R) -> Result<DbRangeIter> {
-        self.db
-            .collect_range_for_roots(&self.entry.l2p_shard_roots, OwnedRange::new(range))
+    pub fn range<R: RangeBounds<Lba>>(&self, range: R) -> Result<DbRangeIter> {
+        self.db.collect_range_for_roots(
+            self.entry.vol_ord,
+            &self.entry.l2p_shard_roots,
+            OwnedRange::new(range),
+        )
     }
 }
 
@@ -1779,7 +1846,7 @@ mod tests {
     #[test]
     fn fresh_db_is_empty() {
         let (_d, db) = mk_db();
-        assert_eq!(db.get(42).unwrap(), None);
+        assert_eq!(db.get(0,42).unwrap(), None);
         assert!(db.snapshots().is_empty());
         assert_eq!(db.manifest().next_snapshot_id, 1);
     }
@@ -1802,8 +1869,8 @@ mod tests {
     #[test]
     fn insert_get_round_trip() {
         let (_d, db) = mk_db();
-        db.insert(10, v(7)).unwrap();
-        assert_eq!(db.get(10).unwrap(), Some(v(7)));
+        db.insert(0,10, v(7)).unwrap();
+        assert_eq!(db.get(0,10).unwrap(), Some(v(7)));
     }
 
     #[test]
@@ -1812,13 +1879,13 @@ mod tests {
         {
             let db = Db::create(dir.path()).unwrap();
             for i in 0u64..500 {
-                db.insert(i, v(i as u8)).unwrap();
+                db.insert(0,i, v(i as u8)).unwrap();
             }
             db.flush().unwrap();
         }
         let db = Db::open(dir.path()).unwrap();
         for i in 0u64..500 {
-            assert_eq!(db.get(i).unwrap(), Some(v(i as u8)));
+            assert_eq!(db.get(0,i).unwrap(), Some(v(i as u8)));
         }
     }
 
@@ -1838,19 +1905,19 @@ mod tests {
     fn snapshot_view_sees_state_at_take_time() {
         let (_d, db) = mk_db();
         for i in 0u64..100 {
-            db.insert(i, v(1)).unwrap();
+            db.insert(0,i, v(1)).unwrap();
         }
         let snap = db.take_snapshot().unwrap();
 
         for i in 0u64..100 {
-            db.insert(i, v(2)).unwrap();
+            db.insert(0,i, v(2)).unwrap();
         }
-        db.insert(999, v(9)).unwrap();
-        db.delete(50).unwrap();
+        db.insert(0,999, v(9)).unwrap();
+        db.delete(0,50).unwrap();
 
-        assert_eq!(db.get(0).unwrap(), Some(v(2)));
-        assert_eq!(db.get(50).unwrap(), None);
-        assert_eq!(db.get(999).unwrap(), Some(v(9)));
+        assert_eq!(db.get(0,0).unwrap(), Some(v(2)));
+        assert_eq!(db.get(0,50).unwrap(), None);
+        assert_eq!(db.get(0,999).unwrap(), Some(v(9)));
 
         let view = db.snapshot_view(snap).unwrap();
         for i in 0u64..100 {
@@ -1863,11 +1930,11 @@ mod tests {
     fn snapshot_view_range_scan() {
         let (_d, db) = mk_db();
         for i in 0u64..50 {
-            db.insert(i, v(i as u8)).unwrap();
+            db.insert(0,i, v(i as u8)).unwrap();
         }
         let snap = db.take_snapshot().unwrap();
         for i in 0u64..50 {
-            db.insert(i, v(99)).unwrap();
+            db.insert(0,i, v(99)).unwrap();
         }
 
         let view = db.snapshot_view(snap).unwrap();
@@ -1888,11 +1955,11 @@ mod tests {
         let snap_id = {
             let db = Db::create(dir.path()).unwrap();
             for i in 0u64..200 {
-                db.insert(i, v(1)).unwrap();
+                db.insert(0,i, v(1)).unwrap();
             }
             let id = db.take_snapshot().unwrap();
             for i in 0u64..200 {
-                db.insert(i, v(2)).unwrap();
+                db.insert(0,i, v(2)).unwrap();
             }
             db.flush().unwrap();
             id
@@ -1908,7 +1975,7 @@ mod tests {
             assert_eq!(view.get(i).unwrap(), Some(v(1)));
         }
         for i in 0u64..200 {
-            assert_eq!(db.get(i).unwrap(), Some(v(2)));
+            assert_eq!(db.get(0,i).unwrap(), Some(v(2)));
         }
     }
 
@@ -1922,13 +1989,13 @@ mod tests {
     fn diff_detects_added_removed_changed() {
         let (_d, db) = mk_db();
         for i in 0u64..10 {
-            db.insert(i, v(1)).unwrap();
+            db.insert(0,i, v(1)).unwrap();
         }
         let a = db.take_snapshot().unwrap();
 
-        db.insert(5, v(99)).unwrap();
-        db.delete(3).unwrap();
-        db.insert(42, v(7)).unwrap();
+        db.insert(0,5, v(99)).unwrap();
+        db.delete(0,3).unwrap();
+        db.insert(0,42, v(7)).unwrap();
 
         let b = db.take_snapshot().unwrap();
         let diff = db.diff(a, b).unwrap();
@@ -1954,10 +2021,10 @@ mod tests {
     fn diff_with_current_reflects_unsaved_writes() {
         let (_d, db) = mk_db();
         for i in 0u64..10 {
-            db.insert(i, v(1)).unwrap();
+            db.insert(0,i, v(1)).unwrap();
         }
         let a = db.take_snapshot().unwrap();
-        db.insert(100, v(5)).unwrap();
+        db.insert(0,100, v(5)).unwrap();
         let diff = db.diff_with_current(a).unwrap();
         assert_eq!(diff.len(), 1);
         match diff[0] {
@@ -1976,14 +2043,14 @@ mod tests {
     fn drop_snapshot_reclaims_uniquely_owned_pages() {
         let (_d, db) = mk_db();
         for i in 0u64..1000 {
-            db.insert(i, v(1)).unwrap();
+            db.insert(0,i, v(1)).unwrap();
         }
         db.flush().unwrap();
         let free_before_snap = db.high_water();
         let s = db.take_snapshot().unwrap();
 
         for i in 0u64..1000 {
-            db.insert(i, v(2)).unwrap();
+            db.insert(0,i, v(2)).unwrap();
         }
         db.flush().unwrap();
         let hw_after_writes = db.high_water();
@@ -1994,7 +2061,7 @@ mod tests {
         assert_eq!(report.freed_leaf_values.len(), 1000);
         assert!(report.freed_leaf_values.iter().all(|val| *val == v(1)));
         for i in 0u64..1000 {
-            assert_eq!(db.get(i).unwrap(), Some(v(2)));
+            assert_eq!(db.get(0,i).unwrap(), Some(v(2)));
         }
     }
 
@@ -2002,15 +2069,15 @@ mod tests {
     fn multiple_snapshots_isolated() {
         let (_d, db) = mk_db();
         for i in 0u64..20 {
-            db.insert(i, v(1)).unwrap();
+            db.insert(0,i, v(1)).unwrap();
         }
         let s1 = db.take_snapshot().unwrap();
         for i in 0u64..20 {
-            db.insert(i, v(2)).unwrap();
+            db.insert(0,i, v(2)).unwrap();
         }
         let s2 = db.take_snapshot().unwrap();
         for i in 0u64..20 {
-            db.insert(i, v(3)).unwrap();
+            db.insert(0,i, v(3)).unwrap();
         }
 
         {
@@ -2021,7 +2088,7 @@ mod tests {
             let v2 = db.snapshot_view(s2).unwrap();
             assert_eq!(v2.get(5).unwrap(), Some(v(2)));
         }
-        assert_eq!(db.get(5).unwrap(), Some(v(3)));
+        assert_eq!(db.get(0,5).unwrap(), Some(v(3)));
     }
 
     // -------- phase 5e: refcount + dedup integration --------
@@ -2267,13 +2334,13 @@ mod tests {
         {
             let db = Db::create(dir.path()).unwrap();
             for i in 0u64..50 {
-                db.insert(i, v(i as u8)).unwrap();
+                db.insert(0,i, v(i as u8)).unwrap();
             }
             // NO flush() before drop — only WAL is durable.
         }
         let db = Db::open(dir.path()).unwrap();
         for i in 0u64..50 {
-            assert_eq!(db.get(i).unwrap(), Some(v(i as u8)));
+            assert_eq!(db.get(0,i).unwrap(), Some(v(i as u8)));
         }
     }
 
@@ -2311,14 +2378,14 @@ mod tests {
     fn multi_op_tx_commits_atomically_and_all_ops_visible() {
         let (_d, db) = mk_db();
         let mut tx = db.begin();
-        tx.insert(1, v(1));
-        tx.insert(2, v(2));
+        tx.insert(0,1, v(1));
+        tx.insert(0,2, v(2));
         tx.incref_pba(10, 3);
         tx.put_dedup(h(1), dv(9));
         let lsn = tx.commit().unwrap();
         assert!(lsn >= 1);
-        assert_eq!(db.get(1).unwrap(), Some(v(1)));
-        assert_eq!(db.get(2).unwrap(), Some(v(2)));
+        assert_eq!(db.get(0,1).unwrap(), Some(v(1)));
+        assert_eq!(db.get(0,2).unwrap(), Some(v(2)));
         assert_eq!(db.get_refcount(10).unwrap(), 3);
         assert_eq!(db.get_dedup(&h(1)).unwrap(), Some(dv(9)));
     }
@@ -2329,15 +2396,15 @@ mod tests {
         {
             let db = Db::create(dir.path()).unwrap();
             let mut tx = db.begin();
-            tx.insert(1, v(1));
-            tx.insert(2, v(2));
+            tx.insert(0,1, v(1));
+            tx.insert(0,2, v(2));
             tx.incref_pba(10, 3);
             tx.put_dedup(h(1), dv(9));
             tx.commit().unwrap();
         }
         let db = Db::open(dir.path()).unwrap();
-        assert_eq!(db.get(1).unwrap(), Some(v(1)));
-        assert_eq!(db.get(2).unwrap(), Some(v(2)));
+        assert_eq!(db.get(0,1).unwrap(), Some(v(1)));
+        assert_eq!(db.get(0,2).unwrap(), Some(v(2)));
         assert_eq!(db.get_refcount(10).unwrap(), 3);
         assert_eq!(db.get_dedup(&h(1)).unwrap(), Some(dv(9)));
     }
@@ -2346,7 +2413,7 @@ mod tests {
     fn last_applied_lsn_advances_per_commit() {
         let (_d, db) = mk_db();
         let before = db.last_applied_lsn();
-        db.insert(1, v(1)).unwrap();
+        db.insert(0,1, v(1)).unwrap();
         let after_one = db.last_applied_lsn();
         assert!(after_one > before);
         db.incref_pba(100, 1).unwrap();
@@ -2359,7 +2426,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::create(dir.path()).unwrap();
         for i in 0u64..10 {
-            db.insert(i, v(i as u8)).unwrap();
+            db.insert(0,i, v(i as u8)).unwrap();
         }
         let applied = db.last_applied_lsn();
         assert_eq!(db.manifest().checkpoint_lsn, 0);
@@ -2382,14 +2449,14 @@ mod tests {
         let committed_lsn = {
             let db = Db::create(dir.path()).unwrap();
             for i in 0u64..5 {
-                db.insert(i, v(i as u8)).unwrap();
+                db.insert(0,i, v(i as u8)).unwrap();
             }
             db.last_applied_lsn()
         };
         let db = Db::open(dir.path()).unwrap();
         assert_eq!(db.last_applied_lsn(), committed_lsn);
         // New commits after reopen start at committed_lsn + 1.
-        db.insert(100, v(0)).unwrap();
+        db.insert(0,100, v(0)).unwrap();
         assert_eq!(db.last_applied_lsn(), committed_lsn + 1);
     }
 
@@ -2505,7 +2572,7 @@ mod tests {
     #[test]
     fn multi_get_empty_input_returns_empty() {
         let (_d, db) = mk_db();
-        assert!(db.multi_get(&[]).unwrap().is_empty());
+        assert!(db.multi_get(0,&[]).unwrap().is_empty());
         assert!(db.multi_get_refcount(&[]).unwrap().is_empty());
         assert!(db.multi_get_dedup(&[]).unwrap().is_empty());
         assert!(db.multi_scan_dedup_reverse_for_pba(&[]).unwrap().is_empty());
@@ -2516,14 +2583,14 @@ mod tests {
         // 4 shards so we actually exercise the bucket + group logic.
         let (_d, db) = mk_db_with_shards(4);
         for i in 0u64..200 {
-            db.insert(i, v((i as u8).wrapping_mul(3))).unwrap();
+            db.insert(0,i, v((i as u8).wrapping_mul(3))).unwrap();
         }
         // Mix mapped + unmapped + duplicate keys, in non-sorted order.
         let keys = vec![199, 5000, 0, 199, 42, 10_000, 1, 42];
-        let got = db.multi_get(&keys).unwrap();
+        let got = db.multi_get(0,&keys).unwrap();
         assert_eq!(got.len(), keys.len());
         for (i, key) in keys.iter().enumerate() {
-            assert_eq!(got[i], db.get(*key).unwrap(), "key {key} mismatch");
+            assert_eq!(got[i], db.get(0,*key).unwrap(), "key {key} mismatch");
         }
     }
 

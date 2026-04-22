@@ -643,10 +643,10 @@ fn write_ack_line(writer: &mut impl Write, ack: &Ack) -> std::io::Result<()> {
 fn execute_worker_op(db: &Db, op: &WorkerOp) -> onyx_metadb::Result<()> {
     match op.kind {
         WorkerOpKind::Insert(byte) => {
-            db.insert(l2p_key(op.tid, op.slot), l2p_value(byte))?;
+            db.insert(0, l2p_key(op.tid, op.slot), l2p_value(byte))?;
         }
         WorkerOpKind::Delete => {
-            db.delete(l2p_key(op.tid, op.slot))?;
+            db.delete(0, l2p_key(op.tid, op.slot))?;
         }
         WorkerOpKind::PutDedup(byte) => {
             db.put_dedup(dedup_hash(op.tid, op.slot), dedup_value(byte))?;
@@ -661,7 +661,7 @@ fn execute_worker_op(db: &Db, op: &WorkerOp) -> onyx_metadb::Result<()> {
             let _ = db.decref_pba(refcount_pba(op.tid, op.slot), 1);
         }
         WorkerOpKind::Get => {
-            let _ = db.get(l2p_key(op.tid, op.slot))?;
+            let _ = db.get(0, l2p_key(op.tid, op.slot))?;
             let _ = db.get_dedup(&dedup_hash(op.tid, op.slot))?;
             let _ = db.get_refcount(refcount_pba(op.tid, op.slot))?;
         }
@@ -740,7 +740,9 @@ fn verify_reopened_db(
 }
 
 fn verify_live_db(db: &Db, model: &Model, threads: usize) -> onyx_metadb::Result<()> {
-    let got_l2p: Vec<(u64, L2pValue)> = db.range(..)?.collect::<onyx_metadb::Result<Vec<_>>>()?;
+    let got_l2p: Vec<(u64, L2pValue)> = db
+        .range(0, ..)?
+        .collect::<onyx_metadb::Result<Vec<_>>>()?;
     let want_l2p: Vec<(u64, L2pValue)> = model.l2p.iter().map(|(k, v)| (*k, *v)).collect();
     if got_l2p != want_l2p {
         return Err(onyx_metadb::MetaDbError::Corruption(
