@@ -240,6 +240,41 @@ impl PageStore {
         Ok(())
     }
 
+    /// Idempotent version of [`free`]. If `page_id` already decodes as a
+    /// `Free` page, no write happens and the free list is untouched —
+    /// returns `Ok(false)`. Otherwise behaves exactly like `free` and
+    /// returns `Ok(true)`.
+    ///
+    /// Used by WAL-replay paths (e.g. `DropSnapshot`) that may re-run
+    /// against pages a crashed predecessor already freed. Cross-process
+    /// correctness comes from [`open`] rebuilding `free_list` by scanning
+    /// Free-typed pages, so each Free page ends up on the list exactly
+    /// once regardless of how many times this was called before the
+    /// crash.
+    pub fn free_idempotent(&self, page_id: PageId, generation: Lsn) -> Result<bool> {
+        if page_id < FIRST_DATA_PAGE {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "page {page_id} is reserved (manifest slot)",
+            )));
+        }
+        self.check_in_range(page_id)?;
+        if let Ok(existing) = read_page_raw(&self.file, page_id) {
+            if let Ok(h) = existing.header() {
+                if h.page_type == PageType::Free {
+                    return Ok(false);
+                }
+            }
+        }
+        let mut page = Page::new(PageHeader::new(PageType::Free, generation));
+        page.set_refcount(0);
+        page.seal();
+        self.file
+            .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
+        let mut inner = self.inner.lock();
+        inner.free_list.push(page_id);
+        Ok(true)
+    }
+
     /// `fdatasync` the page file (content only).
     pub fn sync(&self) -> Result<()> {
         self.file.sync_data()?;

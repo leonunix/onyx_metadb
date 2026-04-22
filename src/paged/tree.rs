@@ -131,6 +131,11 @@ pub struct PagedL2p {
 }
 
 impl PagedL2p {
+    fn finish_op<T>(&mut self, result: Result<T>) -> Result<T> {
+        self.buf.evict_clean_pages();
+        result
+    }
+
     /// Fresh empty tree. Allocates one leaf as the root, level 0.
     pub fn create(page_store: Arc<PageStore>) -> Result<Self> {
         let page_cache = Arc::new(PageCache::new(page_store.clone(), DEFAULT_PAGE_CACHE_BYTES));
@@ -221,14 +226,16 @@ impl PagedL2p {
 
     /// Point lookup. `None` if `lba` is not mapped.
     pub fn get(&mut self, lba: u64) -> Result<Option<L2pValue>> {
-        self.get_at_level(self.root, self.root_level, lba)
+        let result = self.get_at_level(self.root, self.root_level, lba);
+        self.finish_op(result)
     }
 
     /// Point lookup against a snapshot's root. Reads the level from the
     /// root page header so callers don't need to track it separately.
     pub fn get_at(&mut self, root: PageId, lba: u64) -> Result<Option<L2pValue>> {
         let level = self.buf.read_level(root)?;
-        self.get_at_level(root, level, lba)
+        let result = self.get_at_level(root, level, lba);
+        self.finish_op(result)
     }
 
     fn get_at_level(&mut self, root: PageId, root_level: u8, lba: u64) -> Result<Option<L2pValue>> {
@@ -292,7 +299,7 @@ impl PagedL2p {
 
         let old = leaf_set(self.buf.modify(current, generation)?, bit, &value);
         self.root = new_root;
-        Ok(old)
+        self.finish_op(Ok(old))
     }
 
     /// Remove `lba`'s mapping. Returns the previous value, or `None` if
@@ -355,7 +362,7 @@ impl PagedL2p {
         }
 
         self.root = new_root;
-        Ok(old)
+        self.finish_op(Ok(old))
     }
 
     fn grow_root(&mut self, generation: Lsn) -> Result<()> {
@@ -393,7 +400,7 @@ impl PagedL2p {
         let root_level = self.buf.read_level(root)?;
         let mut items = Vec::new();
         self.collect_range(root, root_level, 0, &range, &mut items)?;
-        Ok(PagedRangeIter::new(items))
+        self.finish_op(Ok(PagedRangeIter::new(items)))
     }
 
     fn collect_range(
@@ -451,7 +458,7 @@ impl PagedL2p {
     pub fn incref_root_for_snapshot(&mut self) -> Result<()> {
         let generation = self.advance_gen();
         self.buf.incref(self.root, generation)?;
-        Ok(())
+        self.finish_op(Ok(()))
     }
 
     /// Decref `root` and cascade through any uniquely-owned subtree.
@@ -459,7 +466,7 @@ impl PagedL2p {
     pub fn decref_root(&mut self, root: PageId) -> Result<()> {
         let generation = self.advance_gen();
         self.buf.decref(root, generation)?;
-        Ok(())
+        self.finish_op(Ok(()))
     }
 
     /// Compute the diff between two subtrees. Onyx does not use this
@@ -471,7 +478,7 @@ impl PagedL2p {
         let b_items: Vec<(u64, L2pValue)> = self.range_at(b, ..)?.collect::<Result<Vec<_>>>()?;
         let mut out = Vec::new();
         merge_diff_into(&a_items, &b_items, &mut out);
-        Ok(out)
+        self.finish_op(Ok(out))
     }
 
     /// Release a subtree held by a snapshot, returning every leaf value
@@ -534,7 +541,68 @@ impl PagedL2p {
                 self.buf.free(pid, generation)?;
             }
         }
-        Ok(collected)
+        self.finish_op(Ok(collected))
+    }
+
+    /// Build an rc-dependent drop plan rooted at `snap_root`. The walk
+    /// mirrors [`drop_subtree`](Self::drop_subtree)'s cascading
+    /// decrement: the root always contributes, and a page's children
+    /// contribute only if the page's refcount would hit 0 after the
+    /// (hypothetical) decrement. No mutations happen — this is a
+    /// read-only simulation.
+    ///
+    /// Returns the ordered list of pages to decrement. Safe under
+    /// concurrent writers ONLY if the caller holds a lock that
+    /// excludes concurrent `cow_for_write`; a COW landing between plan
+    /// and apply can bump a shared page's rc and invalidate the
+    /// cascade decisions here. `Db::drop_snapshot` takes
+    /// `drop_gate.write()` for exactly that reason.
+    ///
+    /// `NULL_PAGE` input returns an empty vec (empty shard).
+    pub fn collect_drop_pages(&mut self, snap_root: PageId) -> Result<Vec<PageId>> {
+        use crate::page::PageType;
+        if snap_root == NULL_PAGE {
+            return self.finish_op(Ok(Vec::new()));
+        }
+        let mut out: Vec<PageId> = Vec::new();
+        let mut worklist: Vec<PageId> = vec![snap_root];
+        while let Some(pid) = worklist.pop() {
+            let (rc, page_type, children) = {
+                let page = self.buf.read(pid)?;
+                let header = page.header()?;
+                let children = match header.page_type {
+                    PageType::PagedIndex => crate::paged::format::index_collect_children(page),
+                    PageType::PagedLeaf => Vec::new(),
+                    other => {
+                        return self.finish_op(Err(MetaDbError::Corruption(format!(
+                            "paged::collect_drop_pages: unexpected page type {other:?} at {pid}"
+                        ))));
+                    }
+                };
+                (header.refcount, header.page_type, children)
+            };
+            if rc == 0 {
+                return self.finish_op(Err(MetaDbError::Corruption(format!(
+                    "paged::collect_drop_pages: page {pid} already at refcount 0"
+                ))));
+            }
+            out.push(pid);
+            // Only recurse into children if the decrement would free
+            // this page — matches `drop_subtree`'s cascade.
+            if rc == 1 && matches!(page_type, PageType::PagedIndex) {
+                worklist.extend(children);
+            }
+        }
+        self.finish_op(Ok(out))
+    }
+
+    /// Evict `pid` from this tree's local page buffer so the next
+    /// read goes back to the shared page cache / disk. Used by
+    /// `Db::drop_snapshot` after the WAL-apply path writes pages via
+    /// the bare `PageStore`, which bypasses `PageBuf`. If `pid` was
+    /// never cached here the call is a no-op.
+    pub fn forget_page(&mut self, pid: PageId) {
+        self.buf.forget(pid);
     }
 
     /// Replace the in-memory root pointer + level. Called by `Db`
@@ -552,7 +620,13 @@ impl PagedL2p {
     /// Persist all dirty pages. Must be called before the caller
     /// commits a new root pointer to the manifest.
     pub fn flush(&mut self) -> Result<()> {
-        self.buf.flush()
+        let result = self.buf.flush();
+        self.finish_op(result)
+    }
+
+    #[cfg(test)]
+    fn cached_pages_for_test(&self) -> usize {
+        self.buf.len()
     }
 
     fn advance_gen(&mut self) -> Lsn {
@@ -769,6 +843,23 @@ mod tests {
         assert_eq!(t.get(1).unwrap(), Some(v(11)));
         assert_eq!(t.get(500_000).unwrap(), Some(v(22)));
         assert_eq!(t.get(999).unwrap(), None);
+    }
+
+    #[test]
+    fn flush_and_reads_do_not_leave_private_clean_pages_resident() {
+        let (_d, ps) = mk_store();
+        let mut t = PagedL2p::create(ps).unwrap();
+        for i in 0..1024u64 {
+            t.insert(i * 1024, v((i % 255) as u8)).unwrap();
+        }
+        assert!(t.cached_pages_for_test() > 0);
+        t.flush().unwrap();
+        assert_eq!(t.cached_pages_for_test(), 0);
+
+        for i in 0..256u64 {
+            let _ = t.get(i * 1024).unwrap();
+            assert_eq!(t.cached_pages_for_test(), 0);
+        }
     }
 
     #[test]

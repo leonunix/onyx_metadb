@@ -770,9 +770,13 @@ Items that don't gate Phase 7 but do gate production.
   (currently ≈ 12 % on the dev host). The ≥ 150 k txns/s headline
   target is a hardware-bound follow-up — bench at integration time
   against real NVMe.
-- **Snapshot reads for dedup / refcount**: `SnapshotView::dedup_at`
-  / `refcount_at(SnapshotId)` using each snapshot's per-group
-  shard root.
+- ~~**Snapshot reads for dedup / refcount**~~ — **obsolete**,
+  closed by Phase 6.5b. Refcount is a running tally across all
+  volumes + snapshots, not a point-in-time value; dedup is a global
+  content-hash index with no per-snapshot state in the manifest.
+  Onyx's caller API only needs snapshot reads on L2P (already
+  delivered). See Phase 6.5b "Why refcount snapshot isn't needed"
+  for the full argument.
 - **Prometheus-compatible metrics exporter** for all subsystems.
 - **Operational tooling**: `metadb-dump`, `metadb-replay`,
   companion to `metadb-verify` from 8a.
@@ -791,8 +795,6 @@ Items that don't gate Phase 7 but do gate production.
   landed a smaller case count for realistic wall-clock; Phase 8a
   scales it up, but the full 1M × 1000 aspirational target lives
   here.
-- **SnapshotView dedup/refcount** — listed above; rolled forward
-  from the phase-6 exit-criteria checklist.
 
 ### Exit criteria
 

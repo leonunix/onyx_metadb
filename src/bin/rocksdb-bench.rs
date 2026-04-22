@@ -85,6 +85,7 @@ struct BenchConfig {
     key_space: u64,
     prefill_keys: u64,
     prefill_bytes: u64,
+    prefill_batch_size: usize,
     batch_size: usize,
     warmup_ops: u64,
     overwrite_pct: u8,
@@ -121,6 +122,7 @@ impl BenchConfig {
         let mut key_space = 100_000u64;
         let mut prefill_keys = 0u64;
         let mut prefill_bytes = 0u64;
+        let mut prefill_batch_size = 1024usize;
         let mut batch_size = 32usize;
         let mut warmup_ops = 10_000u64;
         let mut overwrite_pct = 30u8;
@@ -145,6 +147,10 @@ impl BenchConfig {
                 "--prefill-keys" => prefill_keys = parse_u64(args.next(), "--prefill-keys")?,
                 "--prefill-bytes" => {
                     prefill_bytes = parse_u64(args.next(), "--prefill-bytes")?
+                }
+                "--prefill-batch-size" => {
+                    prefill_batch_size =
+                        parse_u64(args.next(), "--prefill-batch-size")? as usize
                 }
                 "--batch-size" => batch_size = parse_u64(args.next(), "--batch-size")? as usize,
                 "--warmup-ops" => warmup_ops = parse_u64(args.next(), "--warmup-ops")?,
@@ -175,6 +181,7 @@ impl BenchConfig {
             key_space: key_space.max(1),
             prefill_keys,
             prefill_bytes,
+            prefill_batch_size: prefill_batch_size.max(1),
             batch_size: batch_size.max(1),
             warmup_ops,
             overwrite_pct,
@@ -265,7 +272,7 @@ fn run_benchmark(cfg: &BenchConfig) -> Result<BenchReport, String> {
 
 fn run_l2p_prefill(cfg: &BenchConfig, db: Arc<RocksDb>) -> Result<BenchReport, String> {
     let prefill_keys = effective_prefill_keys(cfg, cfg.key_space.max(cfg.ops).max(1), 28);
-    let prefill = prefill_l2p(&db, prefill_keys)?;
+    let prefill = prefill_l2p(&db, prefill_keys, cfg.prefill_batch_size)?;
     Ok(build_report(
         cfg,
         prefill,
@@ -313,7 +320,7 @@ fn run_l2p_get(cfg: &BenchConfig, db: Arc<RocksDb>) -> Result<BenchReport, Strin
     let prefill = if cfg.skip_prefill {
         PrefillStats::none()
     } else {
-        prefill_l2p(&db, prefill_keys)?
+        prefill_l2p(&db, prefill_keys, cfg.prefill_batch_size)?
     };
     if cfg.warmup_ops > 0 {
         warmup_l2p_reads(&db, cfg.threads, cfg.warmup_ops, cfg.key_space, cfg.seed)?;
@@ -358,7 +365,7 @@ fn run_l2p_multi_get(cfg: &BenchConfig, db: Arc<RocksDb>) -> Result<BenchReport,
     let prefill = if cfg.skip_prefill {
         PrefillStats::none()
     } else {
-        prefill_l2p(&db, prefill_keys)?
+        prefill_l2p(&db, prefill_keys, cfg.prefill_batch_size)?
     };
     if cfg.warmup_ops > 0 {
         warmup_l2p_multi_reads(
@@ -545,16 +552,26 @@ fn open_db(path: &Path, cache_bytes: usize) -> Result<RocksDb, String> {
     RocksDb::open_cf_descriptors(&db_opts, path, descriptors).map_err(|e| e.to_string())
 }
 
-fn prefill_l2p(db: &RocksDb, count: u64) -> Result<PrefillStats, String> {
+fn prefill_l2p(db: &RocksDb, count: u64, batch_size: usize) -> Result<PrefillStats, String> {
     let cf = db.cf_handle(CF_L2P).unwrap();
     let opts = write_opts_sync();
     let start = Instant::now();
     let progress_every = progress_interval(count);
-    for key in 0..count {
-        db.put_cf_opt(&cf, lba_key(key), l2p_value_from_pba(key), &opts)
-            .map_err(|e| e.to_string())?;
-        if progress_every > 0 && (key + 1) % progress_every == 0 {
-            print_prefill_progress("rocksdb", key + 1, count, start.elapsed());
+    let mut next_progress = progress_every;
+    let mut done = 0u64;
+    while done < count {
+        let end = (done + batch_size as u64).min(count);
+        let mut batch = WriteBatch::default();
+        for key in done..end {
+            batch.put_cf(&cf, lba_key(key), l2p_value_from_pba(key));
+        }
+        db.write_opt(batch, &opts).map_err(|e| e.to_string())?;
+        done = end;
+        if progress_every > 0 && (done >= next_progress || done == count) {
+            print_prefill_progress("rocksdb", done, count, start.elapsed());
+            while next_progress <= done {
+                next_progress = next_progress.saturating_add(progress_every);
+            }
         }
     }
     let elapsed_secs = start.elapsed().as_secs_f64().max(f64::EPSILON);
@@ -867,7 +884,7 @@ fn parse_pct(value: Option<String>, flag: &str) -> Result<u8, String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: rocksdb-bench <l2p-prefill|l2p-put|l2p-get|l2p-multi-get|meta-tx> [--path DIR] [--reset] [--reuse-existing] [--skip-prefill] [--ops N] [--threads N] [--key-space N] [--prefill-keys N] [--prefill-bytes N] [--batch-size N] [--warmup-ops N] [--overwrite-pct N] [--dedup-hit-pct N] [--cache-mb N] [--seed N] [--json]"
+        "usage: rocksdb-bench <l2p-prefill|l2p-put|l2p-get|l2p-multi-get|meta-tx> [--path DIR] [--reset] [--reuse-existing] [--skip-prefill] [--ops N] [--threads N] [--key-space N] [--prefill-keys N] [--prefill-bytes N] [--prefill-batch-size N] [--batch-size N] [--warmup-ops N] [--overwrite-pct N] [--dedup-hit-pct N] [--cache-mb N] [--seed N] [--json]"
     );
 }
 

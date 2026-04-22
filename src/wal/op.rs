@@ -1,34 +1,36 @@
 //! WAL operation record codec.
 //!
-//! One WAL record body is a concatenation of tagged fixed-size ops. The
-//! ops describe every mutation the `Db` can replay after a crash: L2P
-//! puts and deletes, dedup puts and deletes, and PBA refcount
-//! increments and decrements. Each op carries exactly the bytes needed
-//! to reproduce the mutation; there is no length prefix because the
-//! tag determines the payload size.
+//! One WAL record body is a concatenation of tagged ops. Most ops have
+//! a fixed payload size decided by the tag, so no length prefix is
+//! needed. `DROP_SNAPSHOT` is variable-length; its payload begins with
+//! a 4-byte count that tells the decoder how many page-ids follow.
 //!
-//! Snapshot take / drop deliberately do NOT live in the WAL: they are
-//! always committed by a manifest write that advances
-//! `checkpoint_lsn`, so recovery never needs to replay them.
+//! `TAKE_SNAPSHOT` still lives entirely in the manifest — a snapshot
+//! that didn't make it to a durable manifest commit simply never
+//! existed, so recovery has nothing to replay. `DROP_SNAPSHOT` is the
+//! exception: it mutates page refcounts *and* the snapshot list, and
+//! those two effects aren't atomic against a single manifest commit,
+//! so the drop is logged to the WAL and re-driven on recovery.
 //!
 //! # Body layout
 //!
 //! ```text
-//! [tag: 1B][payload: fixed per tag] × N
+//! [tag: 1B][payload: per tag] × N
 //! ```
 //!
 //! Tag table:
 //!
-//! | tag | mnemonic            | payload                                     | size |
-//! |-----|---------------------|---------------------------------------------|------|
-//! | 01  | `L2P_PUT`           | lba (8 B BE) + value (28 B)                 |  36  |
-//! | 02  | `L2P_DELETE`        | lba (8 B BE)                                |   8  |
-//! | 10  | `DEDUP_PUT`         | hash (32 B) + value (28 B)                  |  60  |
-//! | 11  | `DEDUP_DEL`         | hash (32 B)                                 |  32  |
-//! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                  |  40  |
-//! | 13  | `DEDUP_REVERSE_DEL` | pba (8 B BE) + hash (32 B)                  |  40  |
-//! | 20  | `INCREF`            | pba (8 B BE) + delta (4 B BE)               |  12  |
-//! | 21  | `DECREF`            | pba (8 B BE) + delta (4 B BE)               |  12  |
+//! | tag | mnemonic            | payload                                     |  size   |
+//! |-----|---------------------|---------------------------------------------|---------|
+//! | 01  | `L2P_PUT`           | lba (8 B BE) + value (28 B)                 |   36    |
+//! | 02  | `L2P_DELETE`        | lba (8 B BE)                                |    8    |
+//! | 10  | `DEDUP_PUT`         | hash (32 B) + value (28 B)                  |   60    |
+//! | 11  | `DEDUP_DEL`         | hash (32 B)                                 |   32    |
+//! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                  |   40    |
+//! | 13  | `DEDUP_REVERSE_DEL` | pba (8 B BE) + hash (32 B)                  |   40    |
+//! | 20  | `INCREF`            | pba (8 B BE) + delta (4 B BE)               |   12    |
+//! | 21  | `DECREF`            | pba (8 B BE) + delta (4 B BE)               |   12    |
+//! | 30  | `DROP_SNAPSHOT`     | id (8 B BE) + count (4 B BE) + pid×count    | 12+8n   |
 //!
 //! Keys use big-endian so byte order matches numeric order; that's
 //! consistent with the rest of metadb.
@@ -36,7 +38,7 @@
 use crate::error::{MetaDbError, Result};
 use crate::lsm::{DedupValue, Hash32};
 use crate::paged::L2pValue;
-use crate::types::{Lba, Pba};
+use crate::types::{Lba, PageId, Pba, SnapshotId};
 
 pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;
@@ -46,6 +48,7 @@ pub const TAG_DEDUP_REVERSE_PUT: u8 = 0x12;
 pub const TAG_DEDUP_REVERSE_DELETE: u8 = 0x13;
 pub const TAG_INCREF: u8 = 0x20;
 pub const TAG_DECREF: u8 = 0x21;
+pub const TAG_DROP_SNAPSHOT: u8 = 0x30;
 
 /// One mutation op as stored in a WAL record body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +86,22 @@ pub enum WalOp {
     Decref {
         pba: Pba,
         delta: u32,
+    },
+    /// Drop snapshot `id` by decrementing the header refcount of every
+    /// page reachable from the snapshot's shard roots (plus the
+    /// snapshot's `l2p_roots_page` metadata page). `pages` lists every
+    /// page to touch, enumerated via a read-only structural walk at
+    /// plan time. The walk is safe to pre-compute because the snapshot's
+    /// tree topology is immutable — COW copies pages, it never mutates
+    /// them in place.
+    ///
+    /// Apply semantics (see `apply_op_bare`): for each pid, read the
+    /// page, decrement rc by 1, stamp `generation = lsn`, rewrite as
+    /// Free if the new rc is 0. Idempotent on replay via the generation
+    /// check (`page.generation >= lsn ⇒ skip`).
+    DropSnapshot {
+        id: SnapshotId,
+        pages: Vec<PageId>,
     },
 }
 
@@ -128,6 +147,18 @@ impl WalOp {
                 out.extend_from_slice(&pba.to_be_bytes());
                 out.extend_from_slice(&delta.to_be_bytes());
             }
+            WalOp::DropSnapshot { id, pages } => {
+                out.push(TAG_DROP_SNAPSHOT);
+                out.extend_from_slice(&id.to_be_bytes());
+                let count: u32 = pages
+                    .len()
+                    .try_into()
+                    .expect("DropSnapshot page count fits in u32");
+                out.extend_from_slice(&count.to_be_bytes());
+                for pid in pages {
+                    out.extend_from_slice(&pid.to_be_bytes());
+                }
+            }
         }
     }
 
@@ -140,6 +171,7 @@ impl WalOp {
             WalOp::DedupDelete { .. } => 1 + 32,
             WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 32,
             WalOp::Incref { .. } | WalOp::Decref { .. } => 1 + 8 + 4,
+            WalOp::DropSnapshot { pages, .. } => 1 + 8 + 4 + pages.len() * 8,
         }
     }
 }
@@ -230,6 +262,23 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                 WalOp::Decref { pba, delta }
             };
             Ok((op, &payload[12..]))
+        }
+        TAG_DROP_SNAPSHOT => {
+            require_len(payload, 12, "DROP_SNAPSHOT header")?;
+            let id = u64::from_be_bytes(payload[..8].try_into().unwrap());
+            let count = u32::from_be_bytes(payload[8..12].try_into().unwrap()) as usize;
+            let pages_bytes = count
+                .checked_mul(8)
+                .ok_or_else(|| MetaDbError::Corruption("DROP_SNAPSHOT count overflow".into()))?;
+            require_len(&payload[12..], pages_bytes, "DROP_SNAPSHOT page list")?;
+            let mut pages = Vec::with_capacity(count);
+            let mut cursor = 12usize;
+            for _ in 0..count {
+                let pid = u64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap());
+                pages.push(pid);
+                cursor += 8;
+            }
+            Ok((WalOp::DropSnapshot { id, pages }, &payload[cursor..]))
         }
         other => Err(MetaDbError::Corruption(format!(
             "unknown WAL op tag 0x{other:02x}"
@@ -327,6 +376,72 @@ mod tests {
         let body = vec![TAG_L2P_PUT, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("L2P_PUT")),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn drop_snapshot_round_trip_empty_pages() {
+        let ops = vec![WalOp::DropSnapshot {
+            id: 42,
+            pages: Vec::new(),
+        }];
+        let body = encode_body(&ops);
+        assert_eq!(body.len(), 1 + 8 + 4);
+        let decoded = decode_body(&body).unwrap();
+        assert_eq!(decoded, ops);
+    }
+
+    #[test]
+    fn drop_snapshot_round_trip_many_pages() {
+        let pages: Vec<u64> = (100..200).collect();
+        let ops = vec![WalOp::DropSnapshot {
+            id: u64::MAX - 1,
+            pages: pages.clone(),
+        }];
+        let body = encode_body(&ops);
+        assert_eq!(body.len(), 1 + 8 + 4 + pages.len() * 8);
+        let decoded = decode_body(&body).unwrap();
+        assert_eq!(decoded, ops);
+    }
+
+    #[test]
+    fn drop_snapshot_survives_interleaving() {
+        let ops = vec![
+            WalOp::L2pPut {
+                lba: 1,
+                value: v(1),
+            },
+            WalOp::DropSnapshot {
+                id: 7,
+                pages: vec![10, 11, 12],
+            },
+            WalOp::Incref { pba: 20, delta: 1 },
+        ];
+        let body = encode_body(&ops);
+        let decoded = decode_body(&body).unwrap();
+        assert_eq!(decoded, ops);
+    }
+
+    #[test]
+    fn drop_snapshot_truncated_header_is_corruption() {
+        let body = vec![TAG_DROP_SNAPSHOT, 0, 0, 0, 0];
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(msg.contains("DROP_SNAPSHOT header")),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn drop_snapshot_truncated_page_list_is_corruption() {
+        // count=3 but only 2 pids worth of payload
+        let mut body = vec![TAG_DROP_SNAPSHOT];
+        body.extend_from_slice(&7u64.to_be_bytes());
+        body.extend_from_slice(&3u32.to_be_bytes());
+        body.extend_from_slice(&1u64.to_be_bytes());
+        body.extend_from_slice(&2u64.to_be_bytes());
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(msg.contains("DROP_SNAPSHOT page list")),
             e => panic!("{e}"),
         }
     }

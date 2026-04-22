@@ -16,10 +16,11 @@
 //! 5. Return the LSN (and, for auto-commit wrappers, any per-op
 //!    pre-image the caller expected).
 //!
-//! Phase 6 shipped this path under a single `commit_lock` around submit
-//! + apply for an MVP-simple "LSN order == apply order trivially" proof;
-//! Phase 8b replaced that with the LSN-ordered condvar queue described
-//! above so WAL group commit can actually form batches.
+//! Phase 6 shipped this path under a single `commit_lock` that wrapped
+//! both the WAL submit and the apply, giving an MVP-simple "LSN order
+//! == apply order trivially" proof. Phase 8b replaced that with the
+//! LSN-ordered condvar queue described above so WAL group commit can
+//! actually form batches.
 //!
 //! [`WalOp`]: crate::wal::WalOp
 
@@ -41,6 +42,17 @@ pub enum ApplyOutcome {
     /// Dedup put/delete; no pre-image surfaced (LSM reads are not
     /// constant-time, and callers don't need the old value).
     Dedup,
+    /// DropSnapshot result: every leaf value that was freed (i.e. whose
+    /// owning `PagedLeaf` page hit rc=0 during apply) and the number of
+    /// pages pushed onto the free list.
+    ///
+    /// Collected during the live apply only. Replay-path applies reuse
+    /// the same arm but the collected vec is discarded — the numbers
+    /// aren't load-bearing for recovery.
+    DropSnapshot {
+        freed_leaf_values: Vec<L2pValue>,
+        pages_freed: usize,
+    },
 }
 
 /// A batch of ops to be committed atomically.

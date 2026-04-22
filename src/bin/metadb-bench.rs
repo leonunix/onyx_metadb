@@ -75,6 +75,8 @@ struct BenchConfig {
     key_space: u64,
     prefill_keys: u64,
     prefill_bytes: u64,
+    prefill_batch_size: usize,
+    prefill_flush_keys: u64,
     batch_size: usize,
     warmup_ops: u64,
     overwrite_pct: u8,
@@ -112,6 +114,8 @@ impl BenchConfig {
         let mut key_space = 100_000u64;
         let mut prefill_keys = 0u64;
         let mut prefill_bytes = 0u64;
+        let mut prefill_batch_size = 1024usize;
+        let mut prefill_flush_keys = 8_000_000u64;
         let mut batch_size = 32usize;
         let mut warmup_ops = 10_000u64;
         let mut overwrite_pct = 30u8;
@@ -137,6 +141,13 @@ impl BenchConfig {
                 "--prefill-keys" => prefill_keys = parse_u64(args.next(), "--prefill-keys")?,
                 "--prefill-bytes" => {
                     prefill_bytes = parse_u64(args.next(), "--prefill-bytes")?
+                }
+                "--prefill-batch-size" => {
+                    prefill_batch_size =
+                        parse_u64(args.next(), "--prefill-batch-size")? as usize
+                }
+                "--prefill-flush-keys" => {
+                    prefill_flush_keys = parse_u64(args.next(), "--prefill-flush-keys")?
                 }
                 "--batch-size" => batch_size = parse_u64(args.next(), "--batch-size")? as usize,
                 "--warmup-ops" => warmup_ops = parse_u64(args.next(), "--warmup-ops")?,
@@ -170,6 +181,8 @@ impl BenchConfig {
             key_space: key_space.max(1),
             prefill_keys,
             prefill_bytes,
+            prefill_batch_size: prefill_batch_size.max(1),
+            prefill_flush_keys,
             batch_size: batch_size.max(1),
             warmup_ops,
             overwrite_pct,
@@ -276,7 +289,12 @@ fn run_benchmark(cfg: &BenchConfig) -> Result<BenchReport, String> {
 
 fn run_l2p_prefill(cfg: &BenchConfig, db_cfg: Config) -> Result<BenchReport, String> {
     let prefill_keys = effective_prefill_keys(cfg, cfg.key_space.max(cfg.ops).max(1), 28);
-    let prefill = prefill_l2p(&db_cfg, prefill_keys)?;
+    let prefill = prefill_l2p(
+        &db_cfg,
+        prefill_keys,
+        cfg.prefill_batch_size,
+        cfg.prefill_flush_keys,
+    )?;
     Ok(build_report(
         cfg,
         prefill,
@@ -332,7 +350,12 @@ fn run_l2p_get(cfg: &BenchConfig, db_cfg: Config) -> Result<BenchReport, String>
     let prefill = if cfg.skip_prefill {
         PrefillStats::none()
     } else {
-        prefill_l2p(&db_cfg, prefill_keys)?
+        prefill_l2p(
+            &db_cfg,
+            prefill_keys,
+            cfg.prefill_batch_size,
+            cfg.prefill_flush_keys,
+        )?
     };
     let db = Arc::new(Db::open_with_config(db_cfg).map_err(|e| e.to_string())?);
 
@@ -387,7 +410,12 @@ fn run_l2p_multi_get(cfg: &BenchConfig, db_cfg: Config) -> Result<BenchReport, S
     let prefill = if cfg.skip_prefill {
         PrefillStats::none()
     } else {
-        prefill_l2p(&db_cfg, prefill_keys)?
+        prefill_l2p(
+            &db_cfg,
+            prefill_keys,
+            cfg.prefill_batch_size,
+            cfg.prefill_flush_keys,
+        )?
     };
     let db = Arc::new(Db::open_with_config(db_cfg).map_err(|e| e.to_string())?);
 
@@ -584,19 +612,42 @@ fn db_config(path: &Path, shards: u32, page_cache_bytes: u64) -> Config {
     cfg
 }
 
-fn prefill_l2p(cfg: &Config, count: u64) -> Result<PrefillStats, String> {
+fn prefill_l2p(
+    cfg: &Config,
+    count: u64,
+    batch_size: usize,
+    flush_keys: u64,
+) -> Result<PrefillStats, String> {
     let db = Db::open_with_config(cfg.clone())
         .or_else(|_| Db::create_with_config(cfg.clone()))
         .map_err(|e| e.to_string())?;
     let start = Instant::now();
     let progress_every = progress_interval(count);
-    for key in 0..count {
-        db.insert(key, l2p_value_from_pba(key)).map_err(|e| e.to_string())?;
-        if progress_every > 0 && (key + 1) % progress_every == 0 {
-            print_prefill_progress("metadb", key + 1, count, start.elapsed());
+    let mut next_progress = progress_every;
+    let flush_every = if flush_keys == 0 { u64::MAX } else { flush_keys };
+    let mut next_flush = flush_every;
+    let mut done = 0u64;
+    while done < count {
+        let end = (done + batch_size as u64).min(count);
+        let mut tx = db.begin();
+        for key in done..end {
+            tx.insert(key, l2p_value_from_pba(key));
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        done = end;
+        if done >= next_flush || done == count {
+            db.flush().map_err(|e| e.to_string())?;
+            while next_flush <= done {
+                next_flush = next_flush.saturating_add(flush_every);
+            }
+        }
+        if progress_every > 0 && (done >= next_progress || done == count) {
+            print_prefill_progress("metadb", done, count, start.elapsed());
+            while next_progress <= done {
+                next_progress = next_progress.saturating_add(progress_every);
+            }
         }
     }
-    db.flush().map_err(|e| e.to_string())?;
     let elapsed_secs = start.elapsed().as_secs_f64().max(f64::EPSILON);
     Ok(PrefillStats {
         keys: count,
@@ -842,7 +893,7 @@ fn parse_pct(value: Option<String>, flag: &str) -> Result<u8, String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: metadb-bench <l2p-prefill|l2p-put|l2p-get|l2p-multi-get|meta-tx> [--path DIR] [--reset] [--reuse-existing] [--skip-prefill] [--ops N] [--threads N] [--shards N] [--key-space N] [--prefill-keys N] [--prefill-bytes N] [--batch-size N] [--warmup-ops N] [--overwrite-pct N] [--dedup-hit-pct N] [--cache-mb N] [--seed N] [--json]"
+        "usage: metadb-bench <l2p-prefill|l2p-put|l2p-get|l2p-multi-get|meta-tx> [--path DIR] [--reset] [--reuse-existing] [--skip-prefill] [--ops N] [--threads N] [--shards N] [--key-space N] [--prefill-keys N] [--prefill-bytes N] [--prefill-batch-size N] [--prefill-flush-keys N] [--batch-size N] [--warmup-ops N] [--overwrite-pct N] [--dedup-hit-pct N] [--cache-mb N] [--seed N] [--json]"
     );
 }
 

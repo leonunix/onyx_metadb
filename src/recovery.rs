@@ -49,20 +49,22 @@ pub struct ReplayOutcome {
 /// [`ReplayOutcome::torn_tail`]; a torn record in a *non-final* segment
 /// or any non-monotonic LSN is a hard corruption error.
 pub fn replay(dir: &Path, from_lsn: Lsn) -> Result<ReplayOutcome> {
-    replay_impl(dir, from_lsn, |_| Ok(()))
+    replay_impl(dir, from_lsn, |_, _| Ok(()))
 }
 
-/// Replay WAL records forward and invoke `apply_op` for each decoded
-/// op. Stops at the same points [`replay`] does (torn final tail, mid-
-/// log corruption). Used at `Db::open` to replay all committed ops onto
-/// in-memory state before resuming writes.
+/// Replay WAL records forward and invoke `apply_op(lsn, op)` for each
+/// decoded op. The `lsn` argument is the LSN of the enclosing record —
+/// every op in a batch shares the record's LSN. Stops at the same
+/// points [`replay`] does (torn final tail, mid-log corruption). Used
+/// at `Db::open` to replay all committed ops onto in-memory state
+/// before resuming writes.
 pub fn replay_into<F>(dir: &Path, from_lsn: Lsn, mut apply_op: F) -> Result<ReplayOutcome>
 where
-    F: FnMut(&WalOp) -> Result<ApplyOutcome>,
+    F: FnMut(Lsn, &WalOp) -> Result<ApplyOutcome>,
 {
-    replay_impl(dir, from_lsn, |body| {
+    replay_impl(dir, from_lsn, |lsn, body| {
         for op in decode_body(body)? {
-            apply_op(&op)?;
+            apply_op(lsn, &op)?;
         }
         Ok(())
     })
@@ -70,7 +72,7 @@ where
 
 fn replay_impl<F>(dir: &Path, from_lsn: Lsn, mut per_record: F) -> Result<ReplayOutcome>
 where
-    F: FnMut(&[u8]) -> Result<()>,
+    F: FnMut(Lsn, &[u8]) -> Result<()>,
 {
     let segments = list_segments(dir)?;
     let segment_count = segments.len();
@@ -100,7 +102,7 @@ where
                     )));
                 }
             }
-            per_record(rec.body)?;
+            per_record(rec.lsn, rec.body)?;
             if outcome.first_lsn.is_none() {
                 outcome.first_lsn = Some(rec.lsn);
             }
@@ -347,7 +349,7 @@ mod tests {
         }
 
         let mut seen = Vec::new();
-        let out = replay_into(dir.path(), 1, |op| {
+        let out = replay_into(dir.path(), 1, |_lsn, op| {
             seen.push(op.clone());
             Ok(ApplyOutcome::Dedup) // callback return is ignored
         })
@@ -387,7 +389,7 @@ mod tests {
         f.sync_all().unwrap();
 
         let mut applied = 0usize;
-        let out = replay_into(dir.path(), 1, |_op| {
+        let out = replay_into(dir.path(), 1, |_lsn, _op| {
             applied += 1;
             Ok(ApplyOutcome::Dedup)
         })
@@ -396,7 +398,8 @@ mod tests {
         assert!(out.torn_tail.is_some());
         truncate_torn_tail(dir.path(), &out).unwrap();
         // After truncation, re-running replay finds no torn tail.
-        let out2 = replay_into(dir.path(), 1, |_op| Ok(ApplyOutcome::Dedup)).unwrap();
+        let out2 =
+            replay_into(dir.path(), 1, |_lsn, _op| Ok(ApplyOutcome::Dedup)).unwrap();
         assert_eq!(out2.record_count, 5);
         assert!(out2.torn_tail.is_none());
     }

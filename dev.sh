@@ -22,6 +22,8 @@ BENCH_DEFAULT_THREADS="${METADB_BENCH_THREADS:-$(getconf _NPROCESSORS_ONLN 2>/de
 BENCH_DEFAULT_GET_OPS="${METADB_BENCH_GET_OPS:-200000}"
 BENCH_DEFAULT_MULTI_OPS="${METADB_BENCH_MULTI_OPS:-20000}"
 BENCH_DEFAULT_MULTI_BATCH_SIZE="${METADB_BENCH_MULTI_BATCH_SIZE:-64}"
+BENCH_DEFAULT_PREFILL_BATCH_SIZE="${METADB_BENCH_PREFILL_BATCH_SIZE:-1024}"
+BENCH_DEFAULT_PREFILL_FLUSH_KEYS="${METADB_BENCH_PREFILL_FLUSH_KEYS:-8000000}"
 BENCH_DEFAULT_META_OPS="${METADB_BENCH_META_OPS:-50000}"
 BENCH_DEFAULT_PUT_OPS="${METADB_BENCH_PUT_OPS:-20000}"
 BENCH_DEFAULT_GET_WARMUP="${METADB_BENCH_GET_WARMUP_OPS:-20000}"
@@ -349,9 +351,11 @@ run_bench_backend() {
         "$scenario_arg"
         "--path" "$bench_path"
         "--threads" "$BENCH_DEFAULT_THREADS"
+        "--prefill-batch-size" "$BENCH_DEFAULT_PREFILL_BATCH_SIZE"
         "--seed" "$BENCH_DEFAULT_SEED"
         "--json"
     )
+    [[ "$backend" == "metadb" ]] && cmd+=("--prefill-flush-keys" "$BENCH_DEFAULT_PREFILL_FLUSH_KEYS")
     if [[ "$reuse_existing" == "1" ]]; then
         cmd+=("--reuse-existing")
     else
@@ -492,7 +496,7 @@ cmd_bench() {
     esac
     mapfile -t scenarios < <(bench_scenarios "$scenario")
 
-    if [[ "$scenario" == "all" || "$scenario" == "get" || "$scenario" == "multi-get" ]]; then
+    if [[ "$scenario" == "all" || "$scenario" == "prefill" || "$scenario" == "get" || "$scenario" == "multi-get" ]]; then
         size_bytes="$(parse_size_bytes "$size_label")"
     elif ! bench_prefill_needed "$scenario"; then
         size_label="na"
@@ -600,6 +604,8 @@ usage() {
     echo "  METADB_BENCH_GET_OPS=$BENCH_DEFAULT_GET_OPS"
     echo "  METADB_BENCH_MULTI_OPS=$BENCH_DEFAULT_MULTI_OPS"
     echo "  METADB_BENCH_MULTI_BATCH_SIZE=$BENCH_DEFAULT_MULTI_BATCH_SIZE"
+    echo "  METADB_BENCH_PREFILL_BATCH_SIZE=$BENCH_DEFAULT_PREFILL_BATCH_SIZE"
+    echo "  METADB_BENCH_PREFILL_FLUSH_KEYS=$BENCH_DEFAULT_PREFILL_FLUSH_KEYS"
     echo "  METADB_BENCH_META_OPS=$BENCH_DEFAULT_META_OPS"
     echo "  METADB_BENCH_PUT_OPS=$BENCH_DEFAULT_PUT_OPS"
     echo "  METADB_BENCH_CACHE_MB=$BENCH_DEFAULT_CACHE_MB"

@@ -39,6 +39,11 @@ pub struct BTree {
 }
 
 impl BTree {
+    fn finish_op<T>(&mut self, result: Result<T>) -> Result<T> {
+        self.buf.evict_clean_pages();
+        result
+    }
+
     /// Fresh empty tree on `page_store`. Allocates one empty leaf as
     /// the root and persists it.
     pub fn create(page_store: Arc<PageStore>) -> Result<Self> {
@@ -108,35 +113,39 @@ impl BTree {
     /// Persist every dirty page. Must be called before committing a
     /// new root pointer to the manifest.
     pub fn flush(&mut self) -> Result<()> {
-        self.buf.flush()
+        let result = self.buf.flush();
+        self.finish_op(result)
     }
 
     // -------- read path --------------------------------------------------
 
     /// Point lookup. `None` if `key` is not present.
     pub fn get(&mut self, key: u64) -> Result<Option<u32>> {
-        let mut current = self.root;
-        loop {
-            let page = self.buf.read(current)?;
-            match page.header()?.page_type {
-                PageType::L2pLeaf => {
-                    return Ok(match leaf_search(page, key) {
-                        Ok(i) => Some(leaf_value_at(page, i)),
-                        Err(_) => None,
-                    });
-                }
-                PageType::L2pInternal => {
-                    let slot = internal_search(page, key);
-                    let child = internal_child_at(page, slot);
-                    current = child;
-                }
-                other => {
-                    return Err(MetaDbError::Corruption(format!(
-                        "btree::get: unexpected page type {other:?} at {current}"
-                    )));
+        let result = (|| {
+            let mut current = self.root;
+            loop {
+                let page = self.buf.read(current)?;
+                match page.header()?.page_type {
+                    PageType::L2pLeaf => {
+                        return Ok(match leaf_search(page, key) {
+                            Ok(i) => Some(leaf_value_at(page, i)),
+                            Err(_) => None,
+                        });
+                    }
+                    PageType::L2pInternal => {
+                        let slot = internal_search(page, key);
+                        let child = internal_child_at(page, slot);
+                        current = child;
+                    }
+                    other => {
+                        return Err(MetaDbError::Corruption(format!(
+                            "btree::get: unexpected page type {other:?} at {current}"
+                        )));
+                    }
                 }
             }
-        }
+        })();
+        self.finish_op(result)
     }
 
     /// Range scan. Materialises the matching (key, value) pairs up
@@ -147,9 +156,9 @@ impl BTree {
         let hi = bound_upper(range.end_bound());
         let mut items: Vec<(u64, u32)> = Vec::new();
         self.collect_range(self.root, lo, hi, &mut items)?;
-        Ok(RangeIter {
+        self.finish_op(Ok(RangeIter {
             inner: items.into_iter(),
-        })
+        }))
     }
 
     fn collect_range(
@@ -244,7 +253,7 @@ impl BTree {
             Ok(pos) => {
                 let old = leaf_value_at(self.buf.read(leaf)?, pos);
                 leaf_set_entry(self.buf.modify(leaf, generation)?, pos, key, value);
-                Ok(Some(old))
+                self.finish_op(Ok(Some(old)))
             }
             Err(pos) => {
                 let count = leaf_key_count(self.buf.read(leaf)?);
@@ -253,7 +262,7 @@ impl BTree {
                 } else {
                     self.split_leaf_and_insert(leaf, pos, key, value, generation, &mut path)?;
                 }
-                Ok(None)
+                self.finish_op(Ok(None))
             }
         }
     }
@@ -453,7 +462,7 @@ impl BTree {
         leaf_remove(self.buf.modify(leaf, generation)?, pos)?;
 
         self.rebalance_after_remove(leaf, generation, path)?;
-        Ok(Some(old))
+        self.finish_op(Ok(Some(old)))
     }
 
     /// After removing from a leaf, walk up the path and borrow / merge
@@ -721,7 +730,13 @@ impl BTree {
     /// Run the invariant checker over the whole tree. Used by
     /// property tests and the verifier tool.
     pub fn check_invariants(&mut self) -> Result<()> {
-        crate::btree::invariants::check_tree(&mut self.buf, self.root)
+        let result = crate::btree::invariants::check_tree(&mut self.buf, self.root);
+        self.finish_op(result)
+    }
+
+    #[cfg(test)]
+    fn cached_pages_for_test(&self) -> usize {
+        self.buf.len()
     }
 }
 
@@ -879,5 +894,21 @@ mod tests {
         let mut t = BTree::open(ps, root, 100).unwrap();
         assert_eq!(t.get(100).unwrap(), Some(500));
         assert_eq!(t.get(200).unwrap(), Some(600));
+    }
+
+    #[test]
+    fn flush_and_reads_do_not_leave_private_clean_pages_resident() {
+        let (_d, mut t) = mk_tree();
+        for i in 0..2048u64 {
+            t.insert(i, i as u32).unwrap();
+        }
+        assert!(t.cached_pages_for_test() > 0);
+        t.flush().unwrap();
+        assert_eq!(t.cached_pages_for_test(), 0);
+
+        for i in 0..256u64 {
+            let _ = t.get(i).unwrap();
+            assert_eq!(t.cached_pages_for_test(), 0);
+        }
     }
 }

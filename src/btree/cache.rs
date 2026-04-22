@@ -159,6 +159,14 @@ impl PageBuf {
         self.pages.values().filter(|s| s.is_dirty()).count()
     }
 
+    /// Drop every clean page from the private buffer. Clean state
+    /// remains available through the shared [`PageCache`]; this only
+    /// prevents the long-lived owning tree from keeping an unbounded
+    /// second copy in `self.pages`.
+    pub fn evict_clean_pages(&mut self) {
+        self.pages.retain(|_, slot| slot.is_dirty());
+    }
+
     /// Seal every dirty page, write through the page store in ascending
     /// page-id order, then fsync once at the end. Clean pages are left
     /// untouched. After this returns, all pages in the cache are clean.
