@@ -235,8 +235,15 @@ fn print_record_json(lsn: Lsn, ops: &[WalOp], include_ops: bool) {
 
 fn fmt_op(op: &WalOp) -> String {
     match op {
-        WalOp::L2pPut { lba, value } => format!("L2pPut lba={lba} value={}", hex(value.0)),
-        WalOp::L2pDelete { lba } => format!("L2pDelete lba={lba}"),
+        WalOp::L2pPut {
+            vol_ord,
+            lba,
+            value,
+        } => format!(
+            "L2pPut vol={vol_ord} lba={lba} value={}",
+            hex(value.0)
+        ),
+        WalOp::L2pDelete { vol_ord, lba } => format!("L2pDelete vol={vol_ord} lba={lba}"),
         WalOp::DedupPut { hash, value } => {
             format!("DedupPut hash={} value={}", hex(hash), hex(value.0))
         }
@@ -272,13 +279,19 @@ fn fmt_op(op: &WalOp) -> String {
 
 fn op_json(op: &WalOp) -> String {
     match op {
-        WalOp::L2pPut { lba, value } => {
+        WalOp::L2pPut {
+            vol_ord,
+            lba,
+            value,
+        } => {
             format!(
-                "{{\"op\":\"L2pPut\",\"lba\":{lba},\"value\":\"{}\"}}",
+                "{{\"op\":\"L2pPut\",\"vol_ord\":{vol_ord},\"lba\":{lba},\"value\":\"{}\"}}",
                 hex(value.0),
             )
         }
-        WalOp::L2pDelete { lba } => format!("{{\"op\":\"L2pDelete\",\"lba\":{lba}}}"),
+        WalOp::L2pDelete { vol_ord, lba } => format!(
+            "{{\"op\":\"L2pDelete\",\"vol_ord\":{vol_ord},\"lba\":{lba}}}"
+        ),
         WalOp::DedupPut { hash, value } => format!(
             "{{\"op\":\"DedupPut\",\"hash\":\"{}\",\"value\":\"{}\"}}",
             hex(hash),

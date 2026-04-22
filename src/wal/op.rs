@@ -22,8 +22,8 @@
 //!
 //! | tag | mnemonic            | payload                                                                             |   size   |
 //! |-----|---------------------|-------------------------------------------------------------------------------------|----------|
-//! | 01  | `L2P_PUT`           | lba (8 B BE) + value (28 B)                                                         |    36    |
-//! | 02  | `L2P_DELETE`        | lba (8 B BE)                                                                        |     8    |
+//! | 01  | `L2P_PUT`           | vol_ord (2 B BE) + lba (8 B BE) + value (28 B)                                      |    38    |
+//! | 02  | `L2P_DELETE`        | vol_ord (2 B BE) + lba (8 B BE)                                                     |    10    |
 //! | 10  | `DEDUP_PUT`         | hash (32 B) + value (28 B)                                                          |    60    |
 //! | 11  | `DEDUP_DEL`         | hash (32 B)                                                                         |    32    |
 //! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                                                          |    40    |
@@ -35,12 +35,14 @@
 //! | 41  | `DROP_VOLUME`       | ord (2 B BE) + count (4 B BE) + pid×count                                           |   6+8n   |
 //! | 42  | `CLONE_VOLUME`      | src_ord (2 B BE) + new_ord (2 B BE) + snap_id (8 B BE) + shard_count (4 B BE) + pid×shard_count | 16+8n |
 //!
-//! Tags 0x40+ are Phase 7 per-volume lifecycle ops. Their encode/decode
-//! landed in Phase A; the live `commit_ops` path does not emit them until
-//! Phase C. Decoding them is wired up now so a future Phase B/C-written
-//! WAL record can be read back by an older Phase A binary without
-//! returning `Corruption` — helpful for mixed-binary recovery during the
-//! cutover.
+//! Phase 7 commit 6 put `vol_ord` on L2P ops so apply can route them to
+//! the right per-volume shard group. `vol_ord = 0` is the bootstrap
+//! volume; until commit 8 introduces real volume creation the live
+//! `commit_ops` path only ever emits 0. Tags 0x40+ are per-volume
+//! lifecycle ops whose apply semantics land with commit 8 / 9; their
+//! encode/decode was wired up in Phase A, and the apply path currently
+//! returns `Corruption` for them because a Phase B binary should never
+//! see a record it didn't emit.
 //!
 //! Keys use big-endian so byte order matches numeric order; that's
 //! consistent with the rest of metadb.
@@ -66,11 +68,17 @@ pub const TAG_CLONE_VOLUME: u8 = 0x42;
 /// One mutation op as stored in a WAL record body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WalOp {
+    /// L2P put targeted at `vol_ord`. Phase B commit 6 always sets
+    /// `vol_ord = 0` (bootstrap volume); commit 7 exposes per-volume
+    /// write APIs that can emit non-zero ordinals.
     L2pPut {
+        vol_ord: VolumeOrdinal,
         lba: Lba,
         value: L2pValue,
     },
+    /// L2P delete, same `vol_ord` story as [`L2pPut`](Self::L2pPut).
     L2pDelete {
+        vol_ord: VolumeOrdinal,
         lba: Lba,
     },
     DedupPut {
@@ -154,13 +162,19 @@ impl WalOp {
     /// Append the encoded bytes of this op to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            WalOp::L2pPut { lba, value } => {
+            WalOp::L2pPut {
+                vol_ord,
+                lba,
+                value,
+            } => {
                 out.push(TAG_L2P_PUT);
+                out.extend_from_slice(&vol_ord.to_be_bytes());
                 out.extend_from_slice(&lba.to_be_bytes());
                 out.extend_from_slice(&value.0);
             }
-            WalOp::L2pDelete { lba } => {
+            WalOp::L2pDelete { vol_ord, lba } => {
                 out.push(TAG_L2P_DELETE);
+                out.extend_from_slice(&vol_ord.to_be_bytes());
                 out.extend_from_slice(&lba.to_be_bytes());
             }
             WalOp::DedupPut { hash, value } => {
@@ -246,8 +260,8 @@ impl WalOp {
     /// Serialized length of this op in bytes.
     pub fn encoded_len(&self) -> usize {
         match self {
-            WalOp::L2pPut { .. } => 1 + 8 + 28,
-            WalOp::L2pDelete { .. } => 1 + 8,
+            WalOp::L2pPut { .. } => 1 + 2 + 8 + 28,
+            WalOp::L2pDelete { .. } => 1 + 2 + 8,
             WalOp::DedupPut { .. } => 1 + 32 + 28,
             WalOp::DedupDelete { .. } => 1 + 32,
             WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 32,
@@ -289,22 +303,25 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
     let payload = &body[1..];
     match tag {
         TAG_L2P_PUT => {
-            require_len(payload, 36, "L2P_PUT")?;
-            let lba = u64::from_be_bytes(payload[..8].try_into().unwrap());
+            require_len(payload, 38, "L2P_PUT")?;
+            let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
+            let lba = u64::from_be_bytes(payload[2..10].try_into().unwrap());
             let mut v = [0u8; 28];
-            v.copy_from_slice(&payload[8..36]);
+            v.copy_from_slice(&payload[10..38]);
             Ok((
                 WalOp::L2pPut {
+                    vol_ord,
                     lba,
                     value: L2pValue(v),
                 },
-                &payload[36..],
+                &payload[38..],
             ))
         }
         TAG_L2P_DELETE => {
-            require_len(payload, 8, "L2P_DELETE")?;
-            let lba = u64::from_be_bytes(payload[..8].try_into().unwrap());
-            Ok((WalOp::L2pDelete { lba }, &payload[8..]))
+            require_len(payload, 10, "L2P_DELETE")?;
+            let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
+            let lba = u64::from_be_bytes(payload[2..10].try_into().unwrap());
+            Ok((WalOp::L2pDelete { vol_ord, lba }, &payload[10..]))
         }
         TAG_DEDUP_PUT => {
             require_len(payload, 60, "DEDUP_PUT")?;
@@ -462,11 +479,12 @@ mod tests {
     #[test]
     fn single_op_round_trip() {
         let ops = vec![WalOp::L2pPut {
+            vol_ord: 0,
             lba: 42,
             value: v(7),
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 8 + 28);
+        assert_eq!(body.len(), 1 + 2 + 8 + 28);
         let decoded = decode_body(&body).unwrap();
         assert_eq!(decoded, ops);
     }
@@ -475,6 +493,7 @@ mod tests {
     fn multi_op_round_trip_preserves_order() {
         let ops = vec![
             WalOp::L2pPut {
+                vol_ord: 0,
                 lba: 1,
                 value: v(1),
             },
@@ -485,7 +504,7 @@ mod tests {
             WalOp::Incref { pba: 4, delta: 5 },
             WalOp::DedupDelete { hash: h(6) },
             WalOp::Decref { pba: 7, delta: 1 },
-            WalOp::L2pDelete { lba: 8 },
+            WalOp::L2pDelete { vol_ord: 7, lba: 8 },
         ];
         let body = encode_body(&ops);
         let decoded = decode_body(&body).unwrap();
@@ -508,10 +527,51 @@ mod tests {
 
     #[test]
     fn truncated_payload_is_corruption() {
-        // A L2P_PUT expects 36 bytes but only 10 are present.
+        // L2P_PUT expects 38 bytes of payload (vol_ord + lba + value);
+        // a 10-byte tail is short.
         let body = vec![TAG_L2P_PUT, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("L2P_PUT")),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn l2p_put_vol_ord_round_trip_max_u16() {
+        // Explicitly exercise the 2-byte vol_ord field at the high end of
+        // u16 so a decoder that treats it as signed or narrows it to u8
+        // would fail here.
+        let ops = vec![
+            WalOp::L2pPut {
+                vol_ord: 0xABCD,
+                lba: 0xDEAD_BEEF_CAFE_F00D,
+                value: v(0xAB),
+            },
+            WalOp::L2pDelete {
+                vol_ord: u16::MAX - 1,
+                lba: 0x1234_5678_9ABC_DEF0,
+            },
+        ];
+        let body = encode_body(&ops);
+        assert_eq!(body.len(), (1 + 2 + 8 + 28) + (1 + 2 + 8));
+        assert_eq!(decode_body(&body).unwrap(), ops);
+    }
+
+    #[test]
+    fn l2p_put_truncated_vol_header_is_corruption() {
+        // Only 1 byte of payload — even the vol_ord isn't complete.
+        let body = vec![TAG_L2P_PUT, 0x00];
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(msg.contains("L2P_PUT")),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn l2p_delete_truncated_vol_header_is_corruption() {
+        let body = vec![TAG_L2P_DELETE, 0x00];
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(msg.contains("L2P_DELETE")),
             e => panic!("{e}"),
         }
     }
@@ -545,6 +605,7 @@ mod tests {
     fn drop_snapshot_survives_interleaving() {
         let ops = vec![
             WalOp::L2pPut {
+                vol_ord: 0,
                 lba: 1,
                 value: v(1),
             },
@@ -586,6 +647,7 @@ mod tests {
     fn encoded_len_matches_encode_output() {
         let ops = vec![
             WalOp::L2pPut {
+                vol_ord: 0,
                 lba: 1,
                 value: v(1),
             },
@@ -667,6 +729,7 @@ mod tests {
                 shard_count: 4,
             },
             WalOp::L2pPut {
+                vol_ord: 1,
                 lba: 100,
                 value: v(7),
             },

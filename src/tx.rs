@@ -84,15 +84,21 @@ impl<'db> Transaction<'db> {
         self.ops.is_empty()
     }
 
-    /// Buffer an L2P put.
+    /// Buffer an L2P put. Phase B commit 6 targets the bootstrap volume
+    /// unconditionally; commit 7 exposes an explicit `vol_ord` parameter.
     pub fn insert(&mut self, lba: Lba, value: L2pValue) -> &mut Self {
-        self.ops.push(WalOp::L2pPut { lba, value });
+        self.ops.push(WalOp::L2pPut {
+            vol_ord: 0,
+            lba,
+            value,
+        });
         self
     }
 
-    /// Buffer an L2P delete.
+    /// Buffer an L2P delete. Same `vol_ord = 0` note as
+    /// [`insert`](Self::insert).
     pub fn delete(&mut self, lba: Lba) -> &mut Self {
-        self.ops.push(WalOp::L2pDelete { lba });
+        self.ops.push(WalOp::L2pDelete { vol_ord: 0, lba });
         self
     }
 

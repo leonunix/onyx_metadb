@@ -333,17 +333,22 @@ mod tests {
             // Record 1: two ops.
             let body1 = encode_body(&[
                 WalOp::L2pPut {
+                    vol_ord: 0,
                     lba: 1,
                     value: L2pValue([1; 28]),
                 },
                 WalOp::L2pPut {
+                    vol_ord: 0,
                     lba: 2,
                     value: L2pValue([2; 28]),
                 },
             ]);
             wal.submit(body1).unwrap();
             // Record 2: one op.
-            let body2 = encode_body(&[WalOp::L2pDelete { lba: 1 }]);
+            let body2 = encode_body(&[WalOp::L2pDelete {
+                vol_ord: 0,
+                lba: 1,
+            }]);
             wal.submit(body2).unwrap();
             wal.shutdown().unwrap();
         }
@@ -359,7 +364,7 @@ mod tests {
         assert_eq!(seen.len(), 3);
         assert!(matches!(seen[0], WalOp::L2pPut { lba: 1, .. }));
         assert!(matches!(seen[1], WalOp::L2pPut { lba: 2, .. }));
-        assert!(matches!(seen[2], WalOp::L2pDelete { lba: 1 }));
+        assert!(matches!(seen[2], WalOp::L2pDelete { lba: 1, .. }));
     }
 
     #[test]
@@ -373,6 +378,7 @@ mod tests {
             let wal = Wal::create(dir.path(), &cfg(), 1, FaultController::new()).unwrap();
             for i in 0..5u64 {
                 wal.submit(encode_body(&[WalOp::L2pPut {
+                    vol_ord: 0,
                     lba: i,
                     value: L2pValue([i as u8; 28]),
                 }]))

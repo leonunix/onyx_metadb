@@ -196,14 +196,16 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
     let mut seen_ssts = HashSet::new();
     let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * PAGE_SIZE as u64));
 
-    for &root in manifest.shard_roots.iter() {
-        if root == NULL_PAGE {
-            continue;
+    for volume in &manifest.volumes {
+        for &root in volume.l2p_shard_roots.iter() {
+            if root == NULL_PAGE {
+                continue;
+            }
+            live.mark(root);
+            walk_paged_tree(page_store, root, &mut live, &mut seen_paged)?;
+            let tree = PagedL2p::open(page_store.clone(), root, 1)?;
+            tree.check_invariants()?;
         }
-        live.mark(root);
-        walk_paged_tree(page_store, root, &mut live, &mut seen_paged)?;
-        let tree = PagedL2p::open(page_store.clone(), root, 1)?;
-        tree.check_invariants()?;
     }
     for &root in manifest.refcount_shard_roots.iter() {
         if root == NULL_PAGE {
@@ -233,24 +235,8 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
             let tree = PagedL2p::open(page_store.clone(), root, 1)?;
             tree.check_invariants()?;
         }
-
-        let refcount_roots = snapshot_roots(
-            page_store,
-            snapshot.refcount_roots_page,
-            &snapshot.refcount_shard_roots,
-        )?;
-        if snapshot.refcount_roots_page != NULL_PAGE {
-            live.mark(snapshot.refcount_roots_page);
-        }
-        for &root in refcount_roots.iter() {
-            if root == NULL_PAGE {
-                continue;
-            }
-            live.mark(root);
-            walk_btree(page_store, root, &mut live, &mut seen_btree)?;
-            let mut tree = BTree::open(page_store.clone(), root, 1)?;
-            tree.check_invariants()?;
-        }
+        // v6 dropped per-snapshot refcount state; refcount tree is
+        // walked once at the top level above.
     }
 
     walk_lsm_heads(

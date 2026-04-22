@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::error::{MetaDbError, Result};
 use crate::lsm::{DedupValue, Hash32, Lsm, LsmConfig};
 use crate::manifest::{
-    MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, materialize_snapshot_root_pages,
+    MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VolumeEntry,
     write_snapshot_roots_page,
 };
 use crate::page_store::PageStore;
@@ -280,10 +280,19 @@ impl Db {
         let dedup_reverse =
             Lsm::create_with_cache(page_store.clone(), page_cache.clone(), lsm_config);
         manifest.body_version = MANIFEST_BODY_VERSION;
-        manifest.shard_roots = l2p_roots;
         manifest.refcount_shard_roots = refcount_roots;
         manifest.dedup_level_heads = Vec::new().into_boxed_slice();
         manifest.dedup_reverse_level_heads = Vec::new().into_boxed_slice();
+        // Seed the bootstrap volume so open() / flush() can route
+        // through the same volumes table the live `Db` manages.
+        manifest.volumes = vec![VolumeEntry {
+            ord: BOOTSTRAP_VOLUME_ORD,
+            shard_count: l2p_roots.len() as u32,
+            l2p_shard_roots: l2p_roots,
+            created_lsn: 0,
+            flags: 0,
+        }];
+        manifest.next_volume_ord = BOOTSTRAP_VOLUME_ORD + 1;
         manifest_store.commit(&manifest)?;
 
         let wal = Wal::create(
@@ -343,49 +352,41 @@ impl Db {
         let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_existing(page_store.clone(), faults.clone())?;
-        if manifest.shard_roots.is_empty() {
+        if manifest.volumes.is_empty() {
             return Err(MetaDbError::Corruption(
-                "manifest has no shard roots; database was not initialized".into(),
+                "manifest has no volume entries; database was not initialized".into(),
             ));
         }
+        let bootstrap_entry = manifest
+            .volumes
+            .iter()
+            .find(|v| v.ord == BOOTSTRAP_VOLUME_ORD)
+            .ok_or_else(|| {
+                MetaDbError::Corruption(
+                    "manifest is missing the bootstrap (ord=0) volume entry".into(),
+                )
+            })?
+            .clone();
 
         let next_gen = manifest.checkpoint_lsn.max(1) + 1;
 
-        // v3 upgrade: manifest didn't carry refcount / dedup state.
-        // Materialize them so open returns a fully-populated v4 layout.
-        let mut manifest_dirty = false;
-        if manifest.refcount_shard_roots.is_empty() {
-            let (_owned, roots) = create_shards(
-                page_store.clone(),
-                page_cache.clone(),
-                manifest.shard_count(),
-            )?;
-            manifest.refcount_shard_roots = roots;
-            manifest_dirty = true;
-            // Note: the Shard handles are discarded here; we rebuild
-            // them via `open_shards` below once the manifest is stable,
-            // to share the same codepath with normal opens.
-        }
-        if materialize_snapshot_root_pages(&page_store, &mut manifest, next_gen)? {
-            manifest_dirty = true;
-        }
-        if manifest_dirty {
-            manifest_store.commit(&manifest)?;
-        }
-
-        let l2p_shards = open_l2p_shards(
+        // Phase B commit 6: build the bootstrap volume directly from
+        // `manifest.volumes[ord=0]`. Earlier versions of the manifest
+        // (v3/v4/v5) are not readable — Phase 7 is fresh-install only,
+        // and `Manifest::decode` rejects them at the page-layer.
+        let bootstrap_shards = open_l2p_shards(
             page_store.clone(),
             page_cache.clone(),
-            &manifest.shard_roots,
+            &bootstrap_entry.l2p_shard_roots,
             next_gen,
         )?;
-        // Phase B commit 5: wrap the bootstrap volume early so replay can
-        // route through the same `Arc<Volume>` the live `Db` will own.
         let volume_zero = Arc::new(Volume::new(
             BOOTSTRAP_VOLUME_ORD,
-            l2p_shards,
-            manifest.checkpoint_lsn,
+            bootstrap_shards,
+            bootstrap_entry.created_lsn,
         ));
+        let mut volumes: HashMap<VolumeOrdinal, Arc<Volume>> = HashMap::with_capacity(1);
+        volumes.insert(BOOTSTRAP_VOLUME_ORD, volume_zero);
         let refcount_shards = open_shards(
             page_store.clone(),
             page_cache.clone(),
@@ -418,7 +419,7 @@ impl Db {
         let mut replayed_drop = false;
         let replay_outcome = crate::recovery::replay_into(&wal_path, from_lsn, |lsn, op| {
             let outcome = apply_op_bare(
-                &volume_zero.shards,
+                &volumes,
                 &refcount_shards,
                 &dedup_index,
                 &dedup_reverse,
@@ -459,9 +460,6 @@ impl Db {
         // traverse already-freed pages.
         let reclaim_generation = last_applied.max(manifest.checkpoint_lsn).max(1) + 1;
         verify::reclaim_orphan_pages(&page_store, &manifest, reclaim_generation)?;
-
-        let mut volumes = HashMap::with_capacity(1);
-        volumes.insert(BOOTSTRAP_VOLUME_ORD, volume_zero);
 
         Ok(Self {
             page_store,
@@ -541,9 +539,10 @@ impl Db {
 
         self.refresh_manifest_from_locked(
             &mut manifest_state.manifest,
+            &volumes,
             &l2p_guards,
             &refcount_guards,
-        );
+        )?;
         // The tree generation is a local monotonic counter; checkpoint
         // LSN must be the durable WAL LSN, not the tree counter.
         manifest_state.manifest.checkpoint_lsn = wal_checkpoint;
@@ -601,14 +600,15 @@ impl Db {
         }
 
         let apply_guard = self.apply_gate.read();
-        // Clone out the bootstrap volume once per commit — holding the
-        // `Arc` keeps its shards alive for the whole apply loop without
-        // pinning the `volumes` RwLock, so a concurrent volume-lifecycle
-        // writer (commit 8+) can still proceed if it ever arrives.
-        let volume = self.volume_zero();
+        // Clone out the volume map once per commit — HashMap + `Arc`
+        // clones are cheap, and keeping the Arcs live for the whole
+        // apply loop avoids holding `volumes.read()` across apply.
+        // That matters because commit 8+ will acquire `volumes.write()`
+        // on the lifecycle path, and a long-held reader would stall it.
+        let volumes = self.volumes.read().clone();
         let mut outcomes = Vec::with_capacity(ops.len());
         for op in ops {
-            outcomes.push(self.apply_op(&volume, lsn, op)?);
+            outcomes.push(self.apply_op(&volumes, lsn, op)?);
         }
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
@@ -626,9 +626,14 @@ impl Db {
         Ok((lsn, outcomes))
     }
 
-    fn apply_op(&self, volume: &Volume, lsn: Lsn, op: &WalOp) -> Result<ApplyOutcome> {
+    fn apply_op(
+        &self,
+        volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+        lsn: Lsn,
+        op: &WalOp,
+    ) -> Result<ApplyOutcome> {
         let outcome = apply_op_bare(
-            &volume.shards,
+            volumes,
             &self.refcount_shards,
             &self.dedup_index,
             &self.dedup_reverse,
@@ -915,17 +920,19 @@ impl Db {
             self.prepare_dedup_manifest_update(&mut manifest_state.manifest, created_lsn)?;
         self.refresh_manifest_from_locked(
             &mut manifest_state.manifest,
+            &volumes,
             &l2p_guards,
             &refcount_guards,
-        );
+        )?;
         manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
         manifest_state.manifest.snapshots.push(SnapshotEntry {
             id,
+            // Phase B commit 6: snapshots still come out of the bootstrap
+            // volume. Commit 9 will set this from the real source volume.
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
             l2p_roots_page,
-            refcount_roots_page: crate::types::NULL_PAGE,
             created_lsn,
             l2p_shard_roots: l2p_roots.into_boxed_slice(),
-            refcount_shard_roots: Vec::new().into_boxed_slice(),
         });
         manifest_state.manifest.next_snapshot_id = id
             .checked_add(1)
@@ -1038,10 +1045,8 @@ impl Db {
             };
             entry
         };
-        // Phase 6.5b: refcount is not snapshotted — we should never be
-        // looking at legacy snapshot entries with non-empty refcount
-        // roots, because the v4→v5 on-open upgrade path rejects them.
-        debug_assert!(entry.refcount_shard_roots.is_empty());
+        // v6 SnapshotEntry no longer carries refcount state (Phase 6.5b
+        // retired it), so there's nothing to assert about refcount here.
 
         let volumes = self.volumes_snapshot();
         let mut pages: Vec<PageId> = Vec::new();
@@ -1101,8 +1106,9 @@ impl Db {
         // only, so apply + cache invalidation target volume 0's shards.
         // Commit 9 widens this to per-volume snapshots.
         let volume_zero = self.volume_zero();
+        let volumes_map = self.volumes.read().clone();
         let outcome = apply_op_bare(
-            &volume_zero.shards,
+            &volumes_map,
             &self.refcount_shards,
             &self.dedup_index,
             &self.dedup_reverse,
@@ -1242,24 +1248,47 @@ impl Db {
     fn refresh_manifest_from_locked(
         &self,
         manifest: &mut Manifest,
+        volumes: &[Arc<Volume>],
         l2p_guards: &[MutexGuard<'_, PagedL2p>],
         refcount_guards: &[MutexGuard<'_, BTree>],
-    ) {
-        // Phase B commit 5 keeps the v5 manifest shape: `shard_roots` is the
-        // bootstrap volume's per-shard root list. `l2p_guards` is flat across
-        // volumes, but today only volume 0 exists so the length matches the
-        // legacy field.
+    ) -> Result<()> {
+        // v6: the manifest tracks L2P roots per volume. `volumes` is the
+        // sorted snapshot the caller took (matches the order of shard
+        // guards in `l2p_guards`), so we can walk both in lockstep.
         manifest.body_version = MANIFEST_BODY_VERSION;
-        manifest.shard_roots = l2p_guards
-            .iter()
-            .map(|tree| tree.root())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let expected_total: usize = volumes.iter().map(|v| v.shards.len()).sum();
+        if expected_total != l2p_guards.len() {
+            return Err(MetaDbError::Corruption(format!(
+                "refresh_manifest_from_locked: shard guard count {} does not match \
+                 sum of volume shard counts {expected_total}",
+                l2p_guards.len(),
+            )));
+        }
+        let mut guard_cursor = 0usize;
+        let mut new_entries = Vec::with_capacity(volumes.len());
+        for vol in volumes {
+            let mut roots = Vec::with_capacity(vol.shards.len());
+            for _ in 0..vol.shards.len() {
+                roots.push(l2p_guards[guard_cursor].root());
+                guard_cursor += 1;
+            }
+            new_entries.push(VolumeEntry {
+                ord: vol.ord,
+                shard_count: vol.shards.len() as u32,
+                l2p_shard_roots: roots.into_boxed_slice(),
+                created_lsn: vol.created_lsn,
+                flags: vol
+                    .flags
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            });
+        }
+        manifest.volumes = new_entries;
         manifest.refcount_shard_roots = refcount_guards
             .iter()
             .map(|tree| tree.root())
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        Ok(())
     }
 
     fn current_generation(&self) -> Lsn {
@@ -1547,7 +1576,7 @@ pub(crate) fn decode_reverse_hash(key: &Hash32, value: &DedupValue) -> Hash32 {
 /// `apply_op_bare` usable in the replay path (which owns a bare
 /// `Manifest`) and the live path (which owns a `Mutex<ManifestState>`).
 fn apply_op_bare(
-    l2p_shards: &[L2pShard],
+    volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     dedup_index: &Lsm,
     dedup_reverse: &Lsm,
@@ -1556,15 +1585,25 @@ fn apply_op_bare(
     op: &WalOp,
 ) -> Result<ApplyOutcome> {
     match op {
-        WalOp::L2pPut { lba, value } => {
-            let sid = shard_for_key_l2p(l2p_shards, *lba);
-            let mut tree = l2p_shards[sid].tree.lock();
+        WalOp::L2pPut {
+            vol_ord,
+            lba,
+            value,
+        } => {
+            let volume = volumes.get(vol_ord).ok_or_else(|| {
+                MetaDbError::Corruption(format!("L2pPut for unknown volume ord {vol_ord}"))
+            })?;
+            let sid = shard_for_key_l2p(&volume.shards, *lba);
+            let mut tree = volume.shards[sid].tree.lock();
             let prev = tree.insert(*lba, *value)?;
             Ok(ApplyOutcome::L2pPrev(prev))
         }
-        WalOp::L2pDelete { lba } => {
-            let sid = shard_for_key_l2p(l2p_shards, *lba);
-            let mut tree = l2p_shards[sid].tree.lock();
+        WalOp::L2pDelete { vol_ord, lba } => {
+            let volume = volumes.get(vol_ord).ok_or_else(|| {
+                MetaDbError::Corruption(format!("L2pDelete for unknown volume ord {vol_ord}"))
+            })?;
+            let sid = shard_for_key_l2p(&volume.shards, *lba);
+            let mut tree = volume.shards[sid].tree.lock();
             let prev = tree.delete(*lba)?;
             Ok(ApplyOutcome::L2pPrev(prev))
         }
@@ -1617,18 +1656,16 @@ fn apply_op_bare(
         WalOp::DropSnapshot { id: _, pages } => {
             apply_drop_snapshot_pages(page_store, lsn, pages)
         }
-        // Phase 7 per-volume lifecycle ops: decodable now (commit 3) but
-        // apply semantics land with the Phase B/C refactor. The live
-        // commit path never emits these in Phase A, so hitting them here
-        // means either a mixed-binary rollback or a bug in the caller.
-        // Replay would only trip this if a Phase B+ binary wrote the WAL
-        // and a Phase A binary is reading it, which we explicitly do
-        // NOT support in-flight.
+        // Phase 7 per-volume lifecycle ops: decodable since Phase A, but
+        // their apply semantics land with commit 8/9. Commit 6 still
+        // expects to see `vol_ord = 0` on L2P ops only; any of these
+        // three tags in the WAL means either a mixed-binary recovery
+        // attempt or a logic bug in the caller.
         WalOp::CreateVolume { ord, .. }
         | WalOp::DropVolume { ord, .. }
         | WalOp::CloneVolume { new_ord: ord, .. } => Err(MetaDbError::Corruption(format!(
-            "Phase 7 WAL op for volume ord {ord} encountered in Phase A apply path; \
-             binary is too old to apply this record"
+            "Phase 7 volume-lifecycle WAL op for ord {ord} hit the commit-6 apply path; \
+             commit 8/9 implements these — this binary is too old to replay it"
         ))),
     }
 }
@@ -1751,7 +1788,15 @@ mod tests {
     fn create_with_config_uses_requested_shards() {
         let (_d, db) = mk_db_with_shards(4);
         assert_eq!(db.shard_count(), 4);
-        assert_eq!(db.manifest().shard_roots.len(), 4);
+        let manifest = db.manifest();
+        assert_eq!(manifest.refcount_shard_roots.len(), 4);
+        let boot = manifest
+            .volumes
+            .iter()
+            .find(|v| v.ord == BOOTSTRAP_VOLUME_ORD)
+            .expect("bootstrap volume entry present");
+        assert_eq!(boot.shard_count, 4);
+        assert_eq!(boot.l2p_shard_roots.len(), 4);
     }
 
     #[test]
@@ -2155,13 +2200,12 @@ mod tests {
         for pba in 0u64..50 {
             assert_eq!(db.get_refcount(pba).unwrap(), 2);
         }
-        // Phase 6.5b: refcount is a running tally, not a point-in-time
-        // value — snapshots only capture L2P. The entry's refcount
-        // fields are empty / NULL by design.
+        // Phase 6.5b retired refcount snapshots; v6 SnapshotEntry no
+        // longer carries refcount fields at all. L2P roots page is still
+        // allocated because L2P tree IS snapshotted.
         let snap_entry = &db.snapshots()[0];
         assert_ne!(snap_entry.l2p_roots_page, crate::types::NULL_PAGE);
-        assert_eq!(snap_entry.refcount_roots_page, crate::types::NULL_PAGE);
-        assert!(snap_entry.refcount_shard_roots.is_empty());
+        assert_eq!(snap_entry.vol_ord, BOOTSTRAP_VOLUME_ORD);
     }
 
     #[test]

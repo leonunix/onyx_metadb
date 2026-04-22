@@ -94,10 +94,17 @@ fn print_manifest_human(path: &Path, m: &Manifest, high_water: u64, last_applied
     println!("last_applied_lsn: {last_applied}");
     println!("high_water: {high_water}");
     println!("free_list_head: {}", fmt_page(m.free_list_head));
-    println!("shard_roots ({}):", m.shard_roots.len());
-    for (i, p) in m.shard_roots.iter().enumerate() {
-        println!("  [{i}] {}", fmt_page(*p));
+    println!("volumes ({}):", m.volumes.len());
+    for entry in &m.volumes {
+        println!(
+            "  ord={} shard_count={} created_lsn={} flags={:#04x}",
+            entry.ord, entry.shard_count, entry.created_lsn, entry.flags,
+        );
+        for (i, p) in entry.l2p_shard_roots.iter().enumerate() {
+            println!("    [{i}] {}", fmt_page(*p));
+        }
     }
+    println!("next_volume_ord: {}", m.next_volume_ord);
     println!("refcount_shard_roots ({}):", m.refcount_shard_roots.len());
     for (i, p) in m.refcount_shard_roots.iter().enumerate() {
         println!("  [{i}] {}", fmt_page(*p));
@@ -131,7 +138,23 @@ fn print_manifest_json(path: &Path, m: &Manifest, high_water: u64, last_applied:
     println!("  \"last_applied_lsn\": {last_applied},");
     println!("  \"high_water\": {high_water},");
     println!("  \"free_list_head\": {},", page_json(m.free_list_head));
-    println!("  \"shard_roots\": {},", page_array_json(&m.shard_roots));
+    println!(
+        "  \"next_volume_ord\": {},",
+        m.next_volume_ord
+    );
+    println!("  \"volumes\": [");
+    for (i, vol) in m.volumes.iter().enumerate() {
+        let comma = if i + 1 < m.volumes.len() { "," } else { "" };
+        println!(
+            "    {{\"ord\":{},\"shard_count\":{},\"created_lsn\":{},\"flags\":{},\"l2p_shard_roots\":{}}}{comma}",
+            vol.ord,
+            vol.shard_count,
+            vol.created_lsn,
+            vol.flags,
+            page_array_json(&vol.l2p_shard_roots),
+        );
+    }
+    println!("  ],");
     println!(
         "  \"refcount_shard_roots\": {},",
         page_array_json(&m.refcount_shard_roots)
@@ -405,6 +428,7 @@ fn cmd_snapshots(args: &[String]) -> Result<ExitCode, String> {
 
 fn print_snapshot_entry_human(entry: &SnapshotEntry, indent: &str) {
     println!("{indent}id: {}", entry.id);
+    println!("{indent}  vol_ord: {}", entry.vol_ord);
     println!("{indent}  created_lsn: {}", entry.created_lsn);
     println!(
         "{indent}  l2p_shard_roots: [{}]",
@@ -415,30 +439,16 @@ fn print_snapshot_entry_human(entry: &SnapshotEntry, indent: &str) {
             .collect::<Vec<_>>()
             .join(", "),
     );
-    if !entry.refcount_shard_roots.is_empty() {
-        println!(
-            "{indent}  refcount_shard_roots: [{}]  (legacy pre-6.5b)",
-            entry
-                .refcount_shard_roots
-                .iter()
-                .map(|p| fmt_page(*p))
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-    }
 }
 
 fn print_snapshot_entry_json(entry: &SnapshotEntry, indent: &str, trailing: &str) {
     println!("{indent}{{");
     println!("{indent}  \"id\": {},", entry.id);
+    println!("{indent}  \"vol_ord\": {},", entry.vol_ord);
     println!("{indent}  \"created_lsn\": {},", entry.created_lsn);
     println!(
-        "{indent}  \"l2p_shard_roots\": {},",
+        "{indent}  \"l2p_shard_roots\": {}",
         page_array_json(&entry.l2p_shard_roots),
-    );
-    println!(
-        "{indent}  \"refcount_shard_roots\": {}",
-        page_array_json(&entry.refcount_shard_roots),
     );
     println!("{indent}}}{trailing}");
 }
