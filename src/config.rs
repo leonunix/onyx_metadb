@@ -21,7 +21,18 @@ pub struct Config {
 
     /// Number of shards per partition for the L2P B+tree. Consumed from
     /// phase 4 onward.
+    ///
+    /// Phase 7 renames the concept from "partition" to "volume". The field
+    /// still exists for transitional tests, but new code should read
+    /// [`Config::shards_per_volume`] — the two resolve to the same numeric
+    /// value. After Phase 7's commit-path reshape lands, `shards_per_partition`
+    /// becomes a deprecated alias.
     pub shards_per_partition: u32,
+
+    /// Upper bound on the number of volumes a single `Db` can hold. Used to
+    /// validate manifest capacity at create / open time; exceeding it is a
+    /// configuration error, not a runtime drift. Defaults to 1024.
+    pub max_volumes: u32,
 
     /// Size of a single WAL segment before rotation. Consumed from phase 1.
     pub wal_segment_bytes: u64,
@@ -57,12 +68,21 @@ pub struct Config {
 }
 
 impl Config {
+    /// Phase-7 accessor for the per-volume shard count. Reads from
+    /// [`Config::shards_per_partition`]; kept as a dedicated method so call
+    /// sites migrate to the new name without waiting for the field rename in
+    /// Phase B.
+    pub fn shards_per_volume(&self) -> u32 {
+        self.shards_per_partition
+    }
+
     /// Fresh config with every knob at its documented default and `path`
     /// pointing at the given directory.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             shards_per_partition: 16,
+            max_volumes: 1024,
             wal_segment_bytes: 64 * 1024 * 1024,
             group_commit_max_batch_bytes: 4 * 1024 * 1024,
             group_commit_timeout_us: 200,

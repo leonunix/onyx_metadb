@@ -25,6 +25,17 @@ pub type Pba = u64;
 /// Stable identifier for a partition. One partition maps to one Onyx volume.
 pub type PartitionId = u32;
 
+/// Stable 16-bit ordinal identifying a volume inside a `Db`. Adapter layers
+/// (onyx-storage) own the mapping from user-facing volume names to this
+/// ordinal; metadb only ever sees the ordinal. Phase 7 reserves `u16::MAX` as
+/// [`INVALID_VOLUME`]; valid ordinals are `[0, u16::MAX)`.
+pub type VolumeOrdinal = u16;
+
+/// Sentinel ordinal used to mean "no volume". Kept out-of-band of every real
+/// `VolumeOrdinal` so a stray zero-initialised ordinal cannot be mistaken for
+/// volume 0.
+pub const INVALID_VOLUME: VolumeOrdinal = u16::MAX;
+
 /// Snapshot identifier, unique per `Db`. Assigned monotonically at snapshot
 /// creation time.
 pub type SnapshotId = u64;
