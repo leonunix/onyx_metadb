@@ -133,6 +133,9 @@ struct OpCounts {
     incref: u64,
     decref: u64,
     drop_snapshot: u64,
+    create_volume: u64,
+    drop_volume: u64,
+    clone_volume: u64,
 }
 
 impl OpCounts {
@@ -147,6 +150,9 @@ impl OpCounts {
             WalOp::Incref { .. } => self.incref += 1,
             WalOp::Decref { .. } => self.decref += 1,
             WalOp::DropSnapshot { .. } => self.drop_snapshot += 1,
+            WalOp::CreateVolume { .. } => self.create_volume += 1,
+            WalOp::DropVolume { .. } => self.drop_volume += 1,
+            WalOp::CloneVolume { .. } => self.clone_volume += 1,
         }
     }
 }
@@ -246,6 +252,21 @@ fn fmt_op(op: &WalOp) -> String {
         WalOp::DropSnapshot { id, pages } => {
             format!("DropSnapshot id={id} pages={}", pages.len())
         }
+        WalOp::CreateVolume { ord, shard_count } => {
+            format!("CreateVolume ord={ord} shard_count={shard_count}")
+        }
+        WalOp::DropVolume { ord, pages } => {
+            format!("DropVolume ord={ord} pages={}", pages.len())
+        }
+        WalOp::CloneVolume {
+            src_ord,
+            new_ord,
+            src_snap_id,
+            src_shard_roots,
+        } => format!(
+            "CloneVolume src={src_ord} new={new_ord} snap={src_snap_id} shards={}",
+            src_shard_roots.len()
+        ),
     }
 }
 
@@ -286,6 +307,23 @@ fn op_json(op: &WalOp) -> String {
                 pages.len()
             )
         }
+        WalOp::CreateVolume { ord, shard_count } => format!(
+            "{{\"op\":\"CreateVolume\",\"ord\":{ord},\"shard_count\":{shard_count}}}"
+        ),
+        WalOp::DropVolume { ord, pages } => format!(
+            "{{\"op\":\"DropVolume\",\"ord\":{ord},\"pages\":{}}}",
+            pages.len()
+        ),
+        WalOp::CloneVolume {
+            src_ord,
+            new_ord,
+            src_snap_id,
+            src_shard_roots,
+        } => format!(
+            "{{\"op\":\"CloneVolume\",\"src_ord\":{src_ord},\"new_ord\":{new_ord},\
+             \"src_snap_id\":{src_snap_id},\"shards\":{}}}",
+            src_shard_roots.len()
+        ),
     }
 }
 
@@ -302,6 +340,9 @@ fn op_tag_list(ops: &[WalOp]) -> String {
             WalOp::Incref { .. } => "Incref",
             WalOp::Decref { .. } => "Decref",
             WalOp::DropSnapshot { .. } => "DropSnapshot",
+            WalOp::CreateVolume { .. } => "CreateVolume",
+            WalOp::DropVolume { .. } => "DropVolume",
+            WalOp::CloneVolume { .. } => "CloneVolume",
         })
         .collect();
     tags.dedup();

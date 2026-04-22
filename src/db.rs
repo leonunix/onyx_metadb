@@ -1501,6 +1501,19 @@ fn apply_op_bare(
         WalOp::DropSnapshot { id: _, pages } => {
             apply_drop_snapshot_pages(page_store, lsn, pages)
         }
+        // Phase 7 per-volume lifecycle ops: decodable now (commit 3) but
+        // apply semantics land with the Phase B/C refactor. The live
+        // commit path never emits these in Phase A, so hitting them here
+        // means either a mixed-binary rollback or a bug in the caller.
+        // Replay would only trip this if a Phase B+ binary wrote the WAL
+        // and a Phase A binary is reading it, which we explicitly do
+        // NOT support in-flight.
+        WalOp::CreateVolume { ord, .. }
+        | WalOp::DropVolume { ord, .. }
+        | WalOp::CloneVolume { new_ord: ord, .. } => Err(MetaDbError::Corruption(format!(
+            "Phase 7 WAL op for volume ord {ord} encountered in Phase A apply path; \
+             binary is too old to apply this record"
+        ))),
     }
 }
 
