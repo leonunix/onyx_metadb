@@ -57,6 +57,26 @@ pub struct PageBuf {
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     pages: HashMap<PageId, Slot>,
+    /// In-memory rc-delta accumulator for the current op.
+    ///
+    /// [`cow_for_write`](Self::cow_for_write) no longer mutates rc on
+    /// disk during the descent — it feeds a `(pid, delta)` entry here
+    /// instead, and a single batch commit at end-of-op
+    /// ([`commit_rc_deltas`](Self::commit_rc_deltas)) routes every
+    /// non-zero net delta through
+    /// [`PageStore::atomic_rc_delta_with_gen`]. This design:
+    ///
+    /// - cancels the `+1` (parent cow's incref) against the matching
+    ///   `-1` (child's own cow's decref) on pages the descent cow's
+    ///   multiple times in the same op — they net to zero and never
+    ///   hit disk, avoiding a gen-stamp false-skip that would otherwise
+    ///   corrupt rc;
+    /// - keeps cross-tree atomicity (the batch commit uses the
+    ///   disk-direct per-pid-locked RMW so a sibling tree's next op
+    ///   sees a consistent post-commit view);
+    /// - preserves WAL-replay idempotency (the commit's gen-stamp
+    ///   guard skips deltas the crashed prior attempt already landed).
+    pending_rc: HashMap<PageId, i32>,
 }
 
 impl PageBuf {
@@ -72,6 +92,7 @@ impl PageBuf {
             page_store,
             page_cache,
             pages: HashMap::new(),
+            pending_rc: HashMap::new(),
         }
     }
 
@@ -220,16 +241,62 @@ impl PageBuf {
         Ok(top.expect("worklist was non-empty"))
     }
 
+    /// Seal + write `pid` to disk if it is currently Dirty in this
+    /// buffer, leaving the PageBuf/PageCache entries untouched. Used by
+    /// [`cow_for_write`](Self::cow_for_write) before a disk-direct
+    /// atomic rc RMW so the read inside
+    /// [`PageStore::atomic_rc_delta_with_gen`] sees the latest bytes.
+    /// The RMW then overwrites the page with the post-delta state; the
+    /// caller is expected to drop `pid` from both `pages` and
+    /// `page_cache` afterwards so nothing observes the stale pre-RMW
+    /// copy.
+    fn persist_if_dirty(&mut self, pid: PageId) -> Result<()> {
+        if let Some(Slot::Dirty(page)) = self.pages.get_mut(&pid) {
+            page.seal();
+            self.page_store.write_page(pid, page)?;
+        }
+        Ok(())
+    }
+
     /// Copy-on-write: if `pid` has refcount 1, return `pid` unchanged.
     /// Otherwise allocate a fresh copy, decrement the original's rc,
     /// and bump each of the new copy's children's refcounts so the old
     /// tree is still internally consistent.
-    pub fn cow_for_write(&mut self, pid: PageId, generation: Lsn) -> Result<PageId> {
+    ///
+    /// For the shared-page case (rc > 1), rc mutations on the old
+    /// page and its children go through
+    /// [`PageStore::atomic_rc_delta_with_gen`] — disk-direct
+    /// read-modify-write under a per-pid mutex, gated by
+    /// `page.generation >= lsn` for WAL-replay idempotency. `lsn` is
+    /// the current WAL op's LSN; same stamp protocol as
+    /// [`crate::db::apply_drop_snapshot_pages`] and
+    /// [`crate::db::apply_clone_volume_incref`]. Without the disk-direct
+    /// path, two [`PagedL2p`](crate::paged::PagedL2p) instances sharing
+    /// `pid` post-`clone_volume` would each read the same pre-decrement
+    /// rc into their own `PageBuf` and lose one decrement when both
+    /// flush back.
+    pub fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
         debug_assert!(pid != NULL_PAGE, "cow_for_write called on NULL_PAGE");
-        let (current_rc, children, page_type) = {
+        let pending = self.pending_rc.get(&pid).copied().unwrap_or(0);
+        let (children, _page_type) = {
             let page = self.read(pid)?;
             let header = page.header()?;
-            if header.refcount <= 1 {
+            // Effective rc = disk rc + pending delta. The accumulator
+            // holds rc deltas that haven't been flushed to disk yet
+            // (batched for end-of-op commit); if an earlier cow in
+            // this op bumped `pid` the disk read wouldn't see it,
+            // so we fold the pending delta in before the sharedness
+            // check.
+            let effective_rc: i64 = i64::from(header.refcount) + i64::from(pending);
+            // Early return only when genuinely unshared. `effective_rc<=1`
+            // alone isn't enough under WAL replay: a crashed prior
+            // attempt of THIS op may have durably decremented rc on
+            // disk while leaving the manifest's pre-op root in place,
+            // so the page is still referenced by a sibling volume.
+            // The commit-time gen-stamp guard makes the re-run's rc
+            // deltas idempotent, so we proceed with cow any time this
+            // page's disk header already carries `lsn`.
+            if effective_rc <= 1 && header.generation < lsn {
                 return Ok(pid);
             }
             let children = match header.page_type {
@@ -241,35 +308,71 @@ impl PageBuf {
                     )));
                 }
             };
-            (header.refcount, children, header.page_type)
+            (children, header.page_type)
         };
 
-        // Allocate a fresh page and clone bytes.
+        // Allocate the clone and copy bytes. `page.generation = 0`: the
+        // new pid is untouched by any WAL op, and any future rc mutation
+        // on it will be stamped with the op's lsn at that point.
         let new_pid = self.page_store.allocate()?;
         let mut new_page = Page::zeroed();
         new_page
             .bytes_mut()
             .copy_from_slice(self.read(pid)?.bytes());
-        // Tree pages deliberately carry `generation = 0`; see
-        // [`modify`](Self::modify) for why WAL-apply is the only
-        // writer of this field.
         new_page.set_generation(0);
         new_page.set_refcount(1);
         self.pages.insert(new_pid, Slot::Dirty(new_page));
 
-        // The new copy is an additional parent of every non-null child.
+        // Queue rc deltas for end-of-op commit instead of hitting disk
+        // per-edge. Within one descent, a child is first incref'd here
+        // (gaining the clone as a second parent) and later decref'd by
+        // its own cow; those `+1` / `-1` entries net to zero in the
+        // accumulator and never touch disk.
         for c in &children {
-            self.incref(*c, generation)?;
+            *self.pending_rc.entry(*c).or_insert(0) += 1;
         }
+        *self.pending_rc.entry(pid).or_insert(0) -= 1;
 
-        // The original has one fewer parent.
-        {
-            let old = self.modify(pid, generation)?;
-            old.set_refcount(current_rc - 1);
-        }
-
-        let _ = page_type; // (kept in scope for potential debug assertions)
         Ok(new_pid)
+    }
+
+    /// Flush this op's accumulated rc deltas to disk, stamping each
+    /// touched page with `lsn` for WAL-replay idempotency. Entries
+    /// whose net delta is zero (e.g. a child that was both incref'd
+    /// by a parent cow and decref'd by its own cow in the same op)
+    /// are skipped without any disk write. Any Dirty in-memory copy
+    /// of a committed page is invalidated so subsequent reads pull
+    /// the post-commit bytes.
+    ///
+    /// Callers: [`crate::paged::PagedL2p`]'s write paths
+    /// (`insert_with_lsn`, `delete_with_lsn`) invoke this immediately
+    /// before `finish_op`.
+    pub fn commit_rc_deltas(&mut self, lsn: Lsn) -> Result<()> {
+        if self.pending_rc.is_empty() {
+            return Ok(());
+        }
+        // Drain into a sorted Vec so commit order is deterministic —
+        // reproduces cleanly across WAL replays and makes debugging
+        // easier. Sort by pid.
+        let mut entries: Vec<(PageId, i32)> = self.pending_rc.drain().collect();
+        entries.sort_unstable_by_key(|(pid, _)| *pid);
+        for (pid, delta) in entries {
+            if delta == 0 {
+                continue;
+            }
+            self.persist_if_dirty(pid)?;
+            self.page_store.atomic_rc_delta_with_gen(pid, delta, lsn)?;
+            self.pages.remove(&pid);
+            self.page_cache.invalidate(pid);
+        }
+        Ok(())
+    }
+
+    /// Forget any pending rc deltas without applying them. Used only
+    /// on error paths — a successful op must call
+    /// [`commit_rc_deltas`](Self::commit_rc_deltas).
+    pub fn clear_rc_deltas(&mut self) {
+        self.pending_rc.clear();
     }
 
     /// Whether `pid` is cached.
@@ -422,6 +525,9 @@ mod tests {
         index_set_child(buf.modify(idx, 1).unwrap(), 7, leaf);
         buf.incref(idx, 1).unwrap(); // rc(idx) = 2, rc(leaf) = 1
         let new_idx = buf.cow_for_write(idx, 2).unwrap();
+        // rc deltas are batched; apply them like the tree write path
+        // would so the assertions below see the post-commit state.
+        buf.commit_rc_deltas(2).unwrap();
         assert_ne!(new_idx, idx);
         assert_eq!(buf.read(idx).unwrap().refcount(), 1);
         assert_eq!(buf.read(new_idx).unwrap().refcount(), 1);

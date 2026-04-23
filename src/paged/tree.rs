@@ -265,19 +265,58 @@ impl PagedL2p {
     // -------- write path -------------------------------------------------
 
     /// Insert or overwrite `lba`. Returns the previous value if the
-    /// slot was mapped.
+    /// slot was mapped. Uses a tree-internal monotonic stamp for cow's
+    /// gen-guard; callers running under a WAL apply should prefer
+    /// [`insert_at_lsn`](Self::insert_at_lsn) so cross-tree cow on a
+    /// page shared post-`clone_volume` uses the op's real WAL LSN and
+    /// gets both cross-tree safety and replay idempotency.
     pub fn insert(&mut self, lba: u64, value: L2pValue) -> Result<Option<L2pValue>> {
         let generation = self.advance_gen();
+        self.insert_with_lsn(lba, value, generation)
+    }
+
+    /// Variant of [`insert`](Self::insert) that stamps cow rc deltas
+    /// with the given WAL LSN. Used by the WAL apply path so a replay
+    /// of the same op observes matching gen stamps and skips already-
+    /// applied deltas ([`PageStore::atomic_rc_delta_with_gen`]). The
+    /// tree's internal `next_gen` is bumped past `lsn` to keep the
+    /// manifest's `max_generation` invariant.
+    pub fn insert_at_lsn(
+        &mut self,
+        lba: u64,
+        value: L2pValue,
+        lsn: Lsn,
+    ) -> Result<Option<L2pValue>> {
+        self.advance_next_gen(lsn);
+        self.insert_with_lsn(lba, value, lsn)
+    }
+
+    fn insert_with_lsn(
+        &mut self,
+        lba: u64,
+        value: L2pValue,
+        lsn: Lsn,
+    ) -> Result<Option<L2pValue>> {
+        let result = self.insert_with_lsn_inner(lba, value, lsn);
+        self.finalize_rc_deltas(lsn, result)
+    }
+
+    fn insert_with_lsn_inner(
+        &mut self,
+        lba: u64,
+        value: L2pValue,
+        lsn: Lsn,
+    ) -> Result<Option<L2pValue>> {
         let leaf_idx = lba >> LEAF_SHIFT;
         let bit = (lba & LEAF_MASK) as usize;
 
         // Grow root up to whatever level covers `leaf_idx`.
         while leaf_idx > max_leaf_idx_at_level(self.root_level) {
-            self.grow_root(generation)?;
+            self.grow_root(lsn)?;
         }
 
         // COW walk down. Missing slots get freshly-allocated children.
-        let new_root = self.buf.cow_for_write(self.root, generation)?;
+        let new_root = self.buf.cow_for_write(self.root, lsn)?;
         let mut current = new_root;
         let mut level = self.root_level;
         while level > 0 {
@@ -285,39 +324,57 @@ impl PagedL2p {
             let child = index_child_at(self.buf.read(current)?, slot);
             let new_child = if child == NULL_PAGE {
                 if level == 1 {
-                    self.buf.alloc_leaf(generation)?
+                    self.buf.alloc_leaf(lsn)?
                 } else {
-                    self.buf.alloc_index(generation, level - 1)?
+                    self.buf.alloc_index(lsn, level - 1)?
                 }
             } else {
-                self.buf.cow_for_write(child, generation)?
+                self.buf.cow_for_write(child, lsn)?
             };
-            index_set_child(self.buf.modify(current, generation)?, slot, new_child);
+            index_set_child(self.buf.modify(current, lsn)?, slot, new_child);
             current = new_child;
             level -= 1;
         }
 
-        let old = leaf_set(self.buf.modify(current, generation)?, bit, &value);
+        let old = leaf_set(self.buf.modify(current, lsn)?, bit, &value);
         self.root = new_root;
-        self.finish_op(Ok(old))
+        Ok(old)
     }
 
     /// Remove `lba`'s mapping. Returns the previous value, or `None` if
     /// the slot was unmapped. Frees pages along the path that become
-    /// empty as a result.
+    /// empty as a result. See [`insert`](Self::insert) on why the WAL
+    /// apply path should call [`delete_at_lsn`](Self::delete_at_lsn)
+    /// instead.
     pub fn delete(&mut self, lba: u64) -> Result<Option<L2pValue>> {
-        // Pre-check before we start COW'ing: avoid allocating on misses.
-        // The read-only descent populates the page cache, so the
-        // subsequent COW walk hits warm pages either way.
         if self.get(lba)?.is_none() {
             return Ok(None);
         }
-
         let generation = self.advance_gen();
+        self.delete_with_lsn(lba, generation)
+    }
+
+    /// Variant of [`delete`](Self::delete) stamped with the WAL op's
+    /// LSN; see [`insert_at_lsn`](Self::insert_at_lsn) for the
+    /// replay-idempotency story.
+    pub fn delete_at_lsn(&mut self, lba: u64, lsn: Lsn) -> Result<Option<L2pValue>> {
+        if self.get(lba)?.is_none() {
+            return Ok(None);
+        }
+        self.advance_next_gen(lsn);
+        self.delete_with_lsn(lba, lsn)
+    }
+
+    fn delete_with_lsn(&mut self, lba: u64, lsn: Lsn) -> Result<Option<L2pValue>> {
+        let result = self.delete_with_lsn_inner(lba, lsn);
+        self.finalize_rc_deltas(lsn, result)
+    }
+
+    fn delete_with_lsn_inner(&mut self, lba: u64, lsn: Lsn) -> Result<Option<L2pValue>> {
         let leaf_idx = lba >> LEAF_SHIFT;
         let bit = (lba & LEAF_MASK) as usize;
 
-        let new_root = self.buf.cow_for_write(self.root, generation)?;
+        let new_root = self.buf.cow_for_write(self.root, lsn)?;
         let mut current = new_root;
         let mut level = self.root_level;
         // Record (parent_pid, slot_in_parent) for upward pruning.
@@ -329,14 +386,14 @@ impl PagedL2p {
                 child != NULL_PAGE,
                 "paged::delete: pre-check said key exists but slot is null"
             );
-            let new_child = self.buf.cow_for_write(child, generation)?;
-            index_set_child(self.buf.modify(current, generation)?, slot, new_child);
+            let new_child = self.buf.cow_for_write(child, lsn)?;
+            index_set_child(self.buf.modify(current, lsn)?, slot, new_child);
             path.push((current, slot));
             current = new_child;
             level -= 1;
         }
 
-        let old = leaf_clear(self.buf.modify(current, generation)?, bit);
+        let old = leaf_clear(self.buf.modify(current, lsn)?, bit);
         debug_assert!(old.is_some(), "paged::delete: pre-check said bit was set");
 
         // Prune upward. Stop at the root or at the first non-empty ancestor.
@@ -350,9 +407,9 @@ impl PagedL2p {
                 Some(p) => p,
                 None => break, // empty_id is the root; never freed.
             };
-            self.buf.decref(empty_id, generation)?;
+            self.buf.decref(empty_id, lsn)?;
             index_set_child(
-                self.buf.modify(parent, generation)?,
+                self.buf.modify(parent, lsn)?,
                 slot_in_parent,
                 NULL_PAGE,
             );
@@ -362,7 +419,25 @@ impl PagedL2p {
         }
 
         self.root = new_root;
-        self.finish_op(Ok(old))
+        Ok(old)
+    }
+
+    /// Commit the op's batched rc deltas on success, or drop them on
+    /// error. `result` is returned as-is (after `finish_op` bookkeeping).
+    /// If commit itself fails the commit error wins over a successful
+    /// `result`; any queued deltas for a failing op are discarded so a
+    /// retry won't double-apply.
+    fn finalize_rc_deltas<T>(&mut self, lsn: Lsn, result: Result<T>) -> Result<T> {
+        match result {
+            Ok(v) => {
+                let commit = self.buf.commit_rc_deltas(lsn);
+                self.finish_op(commit.map(|()| v))
+            }
+            Err(e) => {
+                self.buf.clear_rc_deltas();
+                self.finish_op(Err(e))
+            }
+        }
     }
 
     fn grow_root(&mut self, generation: Lsn) -> Result<()> {

@@ -220,6 +220,65 @@ impl PageStore {
         Ok(new_rc)
     }
 
+    /// Same as [`atomic_rc_delta`] but with WAL-replay idempotency: if
+    /// `page.generation >= lsn` the delta is treated as already-applied
+    /// by a prior attempt of the same op and the function returns the
+    /// current rc without mutating the page. On successful apply the
+    /// page's `generation` is stamped with `lsn`.
+    ///
+    /// Used by [`crate::paged::PageBuf::cow_for_write`] so that a WAL
+    /// op replayed after crash does not double-apply the rc delta on a
+    /// cross-tree shared page. Same `page.generation >= lsn` skip
+    /// pattern as [`crate::db::apply_drop_snapshot_pages`] and
+    /// [`crate::db::apply_clone_volume_incref`].
+    ///
+    /// `lsn` must be strictly greater than zero — tree pages
+    /// carry `generation = 0` for their entire unsnapped lifetime, so
+    /// `lsn = 0` would spuriously skip on every call. The function
+    /// rejects that case.
+    ///
+    /// The caller is responsible for invalidating any cached copies
+    /// of `page_id` in `PageCache` / `PageBuf` after this call so a
+    /// subsequent read observes the new rc + generation.
+    pub fn atomic_rc_delta_with_gen(
+        &self,
+        page_id: PageId,
+        delta: i32,
+        lsn: Lsn,
+    ) -> Result<u32> {
+        if lsn == 0 {
+            return Err(MetaDbError::InvalidArgument(
+                "atomic_rc_delta_with_gen: lsn must be > 0".into(),
+            ));
+        }
+        self.check_in_range(page_id)?;
+        let shard = (page_id as usize) % RC_LOCK_SHARDS;
+        let _guard = self.rc_locks[shard].lock();
+        let mut page = read_page_raw(&self.file, page_id)?;
+        page.verify(page_id)?;
+        let cur_gen = page.generation();
+        let cur_rc = page.refcount();
+        if cur_gen >= lsn {
+            return Ok(cur_rc);
+        }
+        let new_rc = if delta >= 0 {
+            cur_rc.checked_add(delta as u32)
+        } else {
+            cur_rc.checked_sub((-delta) as u32)
+        }
+        .ok_or_else(|| {
+            MetaDbError::Corruption(format!(
+                "atomic_rc_delta_with_gen: page {page_id} refcount {cur_rc} + {delta} out of range"
+            ))
+        })?;
+        page.set_refcount(new_rc);
+        page.set_generation(lsn);
+        page.seal();
+        self.file
+            .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
+        Ok(new_rc)
+    }
+
     /// Allocate a fresh page id. If the free list has entries, one is
     /// popped and returned; otherwise the file is extended by one page.
     /// The on-disk content is not initialized — the caller is expected to

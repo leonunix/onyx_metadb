@@ -2464,7 +2464,7 @@ fn apply_op_bare(
             })?;
             let sid = shard_for_key_l2p(&volume.shards, *lba);
             let mut tree = volume.shards[sid].tree.lock();
-            let prev = tree.insert(*lba, *value)?;
+            let prev = tree.insert_at_lsn(*lba, *value, lsn)?;
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::L2pDelete { vol_ord, lba } => {
@@ -2473,7 +2473,7 @@ fn apply_op_bare(
             })?;
             let sid = shard_for_key_l2p(&volume.shards, *lba);
             let mut tree = volume.shards[sid].tree.lock();
-            let prev = tree.delete(*lba)?;
+            let prev = tree.delete_at_lsn(*lba, lsn)?;
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::DedupPut { hash, value } => {
