@@ -646,24 +646,44 @@ Before 6.5 the phase-2–6 code bypassed any shared cache:
 
 ## Phase 7 — Integration with onyx-storage  (2 weeks)
 
-Replace RocksDB usage in onyx-storage.
+Replace RocksDB usage in onyx-storage. **一次切换，无过渡期**：RocksDB 直接从
+onyx 依赖里删除，不保留双栈、不做数据迁移（.dev/ 直接弃）。
 
-### Scope
+**对接规格**：[`docs/ONYX_INTEGRATION_SPEC.md`](ONYX_INTEGRATION_SPEC.md)。本 Phase
+按该文档 §9 验收清单逐条收尾。
 
-- `onyx-storage/src/meta` becomes a thin adapter over `onyx-metadb`.
-- Migration tool `metadb-import-rocks`: RocksDB CFs → metadb.
-- End-to-end: create volume → write → snapshot → overwrite → diff →
-  drop snapshot → reclaim.
-- Soak harness integration (onyx-storage's stability_harness points at
-  metadb).
+### Phase A — metadb 侧新增（先行，门控 Phase B）
+
+- **新 WalOp**：`L2pRemap { guard }` / `L2pRangeDelete { captured }` /
+  `DropSnapshot` 扩展 `pba_decrefs`
+- **新 Db API**：`Db::cleanup_dedup_for_dead_pbas` / `Transaction::commit_with_outcomes`
+  提 pub
+- **snapshot-aware refcount**：L2pRemap apply 里的 leaf-rc-suppress 规则 +
+  drop_snapshot 的 diff_with_current decref 级联
+- **L2pValue 布局契约**：头 8B BE = pba（metadb 放弃 "完全 opaque" 抽象）
+- **测试**：对 ONYX_INTEGRATION_SPEC §4 所有不变量落 proptest + reference model +
+  fault injection + 24h soak
+
+### Phase B — onyx 侧切换（metadb Phase A 全绿后）
+
+- `onyx-storage/src/meta` 全删，重建为 metadb 的薄 adapter
+  （`VolumeId: String → u32` / `BlockmapValue ↔ L2pValue` 互转 / 字符串化 vol_id 全链路消失）
+- writer / dedup worker / GC / DedupScanner / delete_volume / hole purge 全部重写为
+  metadb Transaction（单 WAL / fused ops）
+- 删掉 onyx 里 1024+1024 条 striped lock、async cleanup 线程的 per-PBA 验死循环
+- `Cargo.toml` 删 rocksdb 依赖；`tools/blockmap_probe.py` 等调试脚本改走 metadb CLI
+
+**不再有** migration tool `metadb-import-rocks`、**不再有** 双后端对比 perf report —
+都被"一次删掉 rocksdb"替代。
 
 ### Exit criteria
 
 - Full onyx-storage test suite passes with metadb backend.
-- Soak test 24h at target load, no corruption, no unbounded growth.
-- Perf comparison report committed: metadb vs. RocksDB on the same
-  workload, measuring put latency p50/p99, get latency p50/p99,
-  metadata commit fsync latency, space overhead, CPU, write amplification.
+- 24h soak at target load, no corruption, no unbounded growth（`metadb-verify`
+  无报错、`iter_refcounts` 与 reference 对账零偏差）。
+- `cargo tree` 无 `rocksdb`、`Cargo.lock` 无 `rocksdb`、`grep -r rocksdb src/` 无命中。
+- 性能基线：新路径的 writer / dedup hit / snapshot take 都不低于此前 RocksDB 实测值
+  （见 ONYX_INTEGRATION_SPEC §8）。
 
 ---
 
@@ -726,6 +746,12 @@ first.
   - Multi-threaded random mix of insert / delete / put_dedup /
     delete_dedup / incref / decref / snapshot / drop_snapshot /
     flush, against a reference model held in-memory.
+  - **Phase A 新增 op 一并纳入**（对接书 `docs/ONYX_INTEGRATION_SPEC.md`）：
+    `L2pRemap { guard }`（覆盖 hit 路径 + miss 路径）、`L2pRangeDelete`、
+    扩展版 `DropSnapshot`（带 `pba_decrefs`）、`cleanup_dedup_for_dead_pbas`。
+    op mix 按 onyx 真实比例：remap 60% / range_delete 5% / snapshot 1% /
+    dedup hit via guard 30% / cleanup 4%。reference model 同步扩展覆盖
+    leaf-rc-suppress + guard 拦截语义，对账零偏差。
   - Periodic process restart (simulated crash: `kill -9` + reopen)
     and reference replay.
   - Configurable fault-injection density via `FaultController`.

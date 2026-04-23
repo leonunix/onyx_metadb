@@ -121,8 +121,13 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
 
 ## 和 onyx-storage 的关系
 
-- onyx-storage 在 `/root/onyx_storage`，作为上层调用方。Phase 7 adapter 之前，不要
-  为 onyx 的具体使用方式改 metadb API 形状——先在 metadb 这边定最干净的接口，adapter
-  层承担语义映射。
+- onyx-storage 在 `/root/onyx_storage`，是 metadb 的**唯一 client**。metadb 就是
+  onyx 的定制元数据引擎，**接受为 onyx 语义下沉做 API 形状让步**（fused WalOp、
+  头 8B 即 pba 的 L2pValue 布局契约、snapshot-aware refcount 规则等），不再为
+  "抽象的通用 db" 保留中立接口。
+- **施工规格**：[`docs/ONYX_INTEGRATION_SPEC.md`](docs/ONYX_INTEGRATION_SPEC.md)。
+  这是 onyx 一次性切掉 RocksDB 的对接书，涵盖新增 WalOp / Db API、必须守住的
+  不变量、测试矩阵、性能目标、Phase A → Phase B 门控清单。API 演进遵照此文档，
+  不再"先做最干净的接口"。
 - 父项目的 CLAUDE.md 讲 ublk / buffer / packer / GC / dedup pipeline 等存储层面的东
   西，和 metadb 内部约束不重叠。切 `cd /root/onyx_storage` 工作时读那边的 CLAUDE.md。
