@@ -232,20 +232,13 @@ proptest! {
                     db.flush().unwrap();
                 }
                 Op::Reopen => {
-                    // A clean shutdown (flush + drop) sidesteps a known
-                    // pre-existing issue where a mid-session crash
-                    // immediately after `drop_snapshot` / `drop_volume`
-                    // leaves manifest roots pointing at pages the apply
-                    // freed, and the next open fails at
-                    // `open_l2p_shards`. That hole is orthogonal to the
-                    // Phase C commits — it's a cross-op
-                    // manifest-refresh gap in the existing snapshot
-                    // path — and will be addressed in a dedicated fix.
-                    // Forcing a flush here still exercises WAL replay
-                    // for whatever happened between the previous flush
-                    // and this one on non-lifecycle ops, which is what
-                    // the proptest is covering.
-                    db.flush().unwrap();
+                    // Crash-without-flush: the drop paths commit a
+                    // refreshed manifest before WAL submit + apply, and
+                    // `Db::open`'s WAL replay re-runs DropSnapshot /
+                    // DropVolume idempotently (gen-stamp guard) before
+                    // `reclaim_orphan_pages` walks the post-replay
+                    // manifest — so WAL replay alone recovers the
+                    // snapshot / volume lifecycle state.
                     drop(db);
                     db = reopen(&dir);
                 }
@@ -419,10 +412,10 @@ fn volume_lifecycle_matches_reference_long_run() {
                                 TestCaseError::fail(format!("{e:?}")))?;
                         }
                         Op::Reopen => {
-                            // See the shorter proptest above for why we
-                            // flush here.
-                            db.flush().map_err(|e|
-                                TestCaseError::fail(format!("{e:?}")))?;
+                            // See the shorter proptest above: crash-
+                            // without-flush is covered by the drop-
+                            // path's pre-apply manifest commit + WAL
+                            // replay idempotency. No flush needed.
                             drop(db);
                             db = reopen(&dir);
                         }

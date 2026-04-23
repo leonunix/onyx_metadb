@@ -3153,6 +3153,39 @@ mod tests {
     }
 
     #[test]
+    fn drop_snapshot_lifecycle_survives_reopen_without_flush() {
+        // Drop path commits manifest (with refreshed volume roots, snapshot
+        // still present) before WAL submit + apply; apply is idempotent via
+        // `page.generation >= lsn`; Db::open replays the DropSnapshot and
+        // removes the snapshot entry in the replay closure before
+        // `reclaim_orphan_pages` runs. Together these close the
+        // crash-without-flush window that previously forced
+        // `db_volume_proptest.rs::Op::Reopen` to pre-flush.
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            for lba in 0u64..16 {
+                db.insert(0, lba, v(lba as u8)).unwrap();
+            }
+            let snap = db.take_snapshot(0).unwrap();
+            // Cow the whole tree so the snapshot holds roots the live
+            // volume no longer owns — exactly the shape where a late
+            // manifest refresh on the snapshot entry would see Free pages.
+            for lba in 0u64..16 {
+                db.insert(0, lba, v((lba + 1) as u8)).unwrap();
+            }
+            db.drop_snapshot(snap).unwrap().unwrap();
+            // No flush — rely on WAL replay + the drop-path's pre-apply
+            // manifest commit.
+        }
+        let db = Db::open(dir.path()).unwrap();
+        assert!(db.snapshots().is_empty());
+        for lba in 0u64..16 {
+            assert_eq!(db.get(0, lba).unwrap(), Some(v((lba + 1) as u8)));
+        }
+    }
+
+    #[test]
     fn create_volume_persists_through_flush_and_reopen() {
         let dir = TempDir::new().unwrap();
         let ord;

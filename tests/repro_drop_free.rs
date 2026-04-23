@@ -8,6 +8,11 @@
 //! decrements rc to 0 and frees a page the surviving clone still points
 //! at — reopen then fails with
 //! `paged format: expected PagedLeaf/PagedIndex, got Free`.
+//!
+//! Crashes-without-flush variant: the same sequence, but without a
+//! pre-reopen flush. Exercises the drop-path's pre-apply manifest
+//! commit + WAL replay idempotency that closes the crash window the
+//! old `db_volume_proptest.rs::Op::Reopen` workaround used to dodge.
 
 use onyx_metadb::{Db, L2pValue};
 use tempfile::TempDir;
@@ -38,4 +43,27 @@ fn clone_snapshot_take_drop_then_reopen() {
     }
 
     Db::open(path).expect("reopen should succeed after drop_volume on a clone");
+}
+
+#[test]
+fn clone_snapshot_take_drop_then_crash_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path();
+
+    {
+        let db = Db::create(path).unwrap();
+        let s1 = db.take_snapshot(0).unwrap();
+        let c1 = db.clone_volume(s1).unwrap();
+        let _c2 = db.clone_volume(s1).unwrap();
+        let s2 = db.take_snapshot(c1).unwrap();
+        db.drop_snapshot(s1).unwrap().unwrap();
+        db.drop_snapshot(s2).unwrap().unwrap();
+        db.insert(0, 0, v(0)).unwrap();
+        db.insert(0, 0, v(0)).unwrap();
+        db.drop_volume(c1).unwrap().unwrap();
+        // No flush: drop the Db to simulate mid-session crash.
+    }
+
+    Db::open(path)
+        .expect("reopen after drop_volume on a clone must succeed without an intervening flush");
 }
