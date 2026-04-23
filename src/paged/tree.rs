@@ -407,7 +407,13 @@ impl PagedL2p {
                 Some(p) => p,
                 None => break, // empty_id is the root; never freed.
             };
-            self.buf.decref(empty_id, lsn)?;
+            // `empty_id` is exclusively owned by this op post-COW —
+            // either a fresh allocation with in-memory rc=1 (disk
+            // bytes stale) or an unshared original cow_for_write
+            // returned unchanged. Skip the 1→0 RMW and free directly;
+            // any upstream shared-page deltas flow through the
+            // pending_rc accumulator committed at op end.
+            self.buf.free(empty_id, lsn)?;
             index_set_child(
                 self.buf.modify(parent, lsn)?,
                 slot_in_parent,
@@ -530,17 +536,23 @@ impl PagedL2p {
     /// Bump the root's refcount so a caller (snapshot take) holds a
     /// separate reference. Idempotent in the sense that every call adds
     /// exactly one ref — pair it with a `decref` on snapshot drop.
+    ///
+    /// Routes through [`PageBuf::atomic_incref`]'s disk-direct
+    /// per-pid-locked RMW so a sibling volume's concurrent
+    /// `cow_for_write` against the same root (post-`clone_volume`)
+    /// can't race and drop the incref.
     pub fn incref_root_for_snapshot(&mut self) -> Result<()> {
-        let generation = self.advance_gen();
-        self.buf.incref(self.root, generation)?;
+        self.buf.atomic_incref(self.root)?;
         self.finish_op(Ok(()))
     }
 
     /// Decref `root` and cascade through any uniquely-owned subtree.
     /// Used by snapshot drop to release a snapshot's grip on a tree.
+    /// Routes through [`PageBuf::atomic_decref`] for the same
+    /// cross-tree safety reason as
+    /// [`incref_root_for_snapshot`](Self::incref_root_for_snapshot).
     pub fn decref_root(&mut self, root: PageId) -> Result<()> {
-        let generation = self.advance_gen();
-        self.buf.decref(root, generation)?;
+        self.buf.atomic_decref(root)?;
         self.finish_op(Ok(()))
     }
 
@@ -564,56 +576,42 @@ impl PagedL2p {
     /// The walk visits each page once, decrements rc by 1, and for
     /// pages that hit rc=0 collects leaf values (or recurses into index
     /// children). Pages still shared after the decrement are left alone.
+    ///
+    /// Rc mutations route through
+    /// [`PageStore::atomic_rc_delta`](crate::page_store::PageStore::atomic_rc_delta)'s
+    /// per-pid-locked disk-direct RMW so a sibling volume's concurrent
+    /// `cow_for_write` against a shared page can't race. Leaves
+    /// `page.generation` untouched — this path is not WAL-replayed.
     pub fn drop_subtree(&mut self, snap_root: PageId) -> Result<Vec<L2pValue>> {
-        let generation = self.advance_gen();
+        use crate::page::PageType;
+        use crate::paged::cache::DecrefOutcome;
         let mut collected: Vec<L2pValue> = Vec::new();
         let mut worklist: Vec<PageId> = vec![snap_root];
         while let Some(pid) = worklist.pop() {
-            let (new_rc, page_type, children, values) = {
-                let page = self.buf.modify(pid, generation)?;
-                let rc = page.refcount();
-                if rc == 0 {
-                    return Err(MetaDbError::Corruption(format!(
-                        "paged::drop_subtree: page {pid} already at refcount 0"
-                    )));
-                }
-                let new_rc = rc - 1;
-                page.set_refcount(new_rc);
-                let page_type = page.header()?.page_type;
-                if new_rc == 0 {
-                    use crate::page::PageType;
-                    match page_type {
-                        PageType::PagedLeaf => {
-                            let vs: Vec<L2pValue> = (0..LEAF_ENTRY_COUNT)
-                                .filter(|i| leaf_bit_set(page, *i))
-                                .map(|i| leaf_value_at(page, i))
-                                .collect();
-                            (new_rc, page_type, Vec::new(), vs)
-                        }
-                        PageType::PagedIndex => {
-                            let cs = crate::paged::format::index_collect_children(page);
-                            (new_rc, page_type, cs, Vec::new())
-                        }
-                        other => {
-                            return Err(MetaDbError::Corruption(format!(
-                                "paged::drop_subtree: unexpected page type {other:?} at {pid}"
-                            )));
-                        }
+            // If this page is a leaf that will be freed, we need its
+            // values *before* the atomic RMW clears the page from our
+            // cache. Index pages contribute no values; children come
+            // back from `atomic_decref_one` when rc hits 0.
+            let pending_values: Vec<L2pValue> = {
+                let page = self.buf.read(pid)?;
+                let header = page.header()?;
+                match header.page_type {
+                    PageType::PagedLeaf => (0..LEAF_ENTRY_COUNT)
+                        .filter(|i| leaf_bit_set(page, *i))
+                        .map(|i| leaf_value_at(page, i))
+                        .collect(),
+                    PageType::PagedIndex => Vec::new(),
+                    other => {
+                        return Err(MetaDbError::Corruption(format!(
+                            "paged::drop_subtree: unexpected page type {other:?} at {pid}"
+                        )));
                     }
-                } else {
-                    (new_rc, page_type, Vec::new(), Vec::new())
                 }
             };
-            if new_rc == 0 {
-                use crate::page::PageType;
-                if !matches!(page_type, PageType::PagedLeaf | PageType::PagedIndex) {
-                    return Err(MetaDbError::Corruption(format!(
-                        "paged::drop_subtree: refusing to free {pid} with type {page_type:?}"
-                    )));
-                }
-                collected.extend(values);
+            let (outcome, children) = self.buf.atomic_decref_one(pid)?;
+            if matches!(outcome, DecrefOutcome::Freed) {
+                collected.extend(pending_values);
                 worklist.extend(children);
-                self.buf.free(pid, generation)?;
             }
         }
         self.finish_op(Ok(collected))
@@ -1117,5 +1115,58 @@ mod tests {
             t.attach_subtree_root(42, bad_level),
             Err(MetaDbError::InvalidArgument(_))
         ));
+    }
+
+    /// Regression for the sibling-concurrent cross-tree race:
+    /// `incref_root_for_snapshot` must go through the per-pid-locked
+    /// disk-direct RMW (not the legacy PageBuf dirty-flush path). Shape
+    /// mirrors `tests/repro_clone_verify.rs::
+    /// clone_volume_cross_write_keeps_refcounts_clean` — two trees
+    /// share a root page; a snapshot-incref on one must survive a
+    /// cow_for_write on the other without the two paths racing on
+    /// their local PageBuf rc views.
+    #[test]
+    fn incref_root_for_snapshot_uses_disk_direct_rc() {
+        let (_d, ps) = mk_store();
+        let page_cache = Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES));
+        // Build the source tree and take a "snapshot" by bumping its
+        // root rc. Fresh root page → disk rc starts at 1, post-incref
+        // = 2.
+        let mut src = PagedL2p::create_with_cache(ps.clone(), page_cache.clone()).unwrap();
+        src.insert(1, v(10)).unwrap();
+        src.insert(300, v(20)).unwrap();
+        src.flush().unwrap();
+        let root_pid = src.root();
+        src.incref_root_for_snapshot().unwrap();
+
+        // Re-read disk refcount directly (atomic_rc_delta(_, 0) would
+        // work too but requires exposing arithmetic; read_page_unchecked
+        // is the simplest inspector).
+        let page = ps.read_page_unchecked(root_pid).unwrap();
+        let header = page.header().unwrap();
+        assert_eq!(header.refcount, 2, "snapshot incref must reach disk");
+
+        // Dst attaches the same root page — simulating a post-
+        // `clone_volume` sibling that shares the root.
+        let mut dst =
+            PagedL2p::create_with_cache(ps.clone(), page_cache.clone()).unwrap();
+        dst.attach_subtree_root(root_pid, src.root_level()).unwrap();
+        assert_eq!(dst.get(1).unwrap(), Some(v(10)));
+
+        // A write on dst triggers cow_for_write(root, lsn) which
+        // queues pending_rc[root] -= 1; commit routes through
+        // atomic_rc_delta_with_gen. Disk rc must go 2 → 1 — not
+        // 1 → 0 — proving the incref never raced with the cow.
+        dst.insert_at_lsn(42, v(99), 100).unwrap();
+        let page = ps.read_page_unchecked(root_pid).unwrap();
+        let header = page.header().unwrap();
+        assert_eq!(
+            header.refcount, 1,
+            "cross-tree cow must see disk-direct incref, not a stale PageBuf view"
+        );
+
+        // Snapshot root still readable; its stored mapping is preserved.
+        assert_eq!(src.get_at(root_pid, 1).unwrap(), Some(v(10)));
+        assert_eq!(src.get_at(root_pid, 300).unwrap(), Some(v(20)));
     }
 }

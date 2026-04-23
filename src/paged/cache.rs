@@ -182,61 +182,85 @@ impl PageBuf {
         Ok(())
     }
 
-    /// Increment the refcount on `pid`. Returns the new refcount.
-    pub fn incref(&mut self, pid: PageId, generation: Lsn) -> Result<u32> {
-        let page = self.modify(pid, generation)?;
-        let new_rc = page.refcount().checked_add(1).ok_or_else(|| {
-            MetaDbError::Corruption(format!("paged: refcount overflow on page {pid}"))
-        })?;
-        page.set_refcount(new_rc);
+    /// Cross-tree-safe incref via per-pid-locked disk-direct RMW.
+    /// Persists any Dirty copy of `pid` to disk first so
+    /// [`PageStore::atomic_rc_delta`] reads the latest bytes, then
+    /// invalidates both the local buffer and the shared [`PageCache`]
+    /// entry so subsequent reads pull the post-RMW bytes.
+    ///
+    /// Leaves `page.generation` untouched: snapshot take/drop callers
+    /// are not WAL-replayed and must not collide with a future WAL
+    /// op's LSN (using `atomic_rc_delta_with_gen` here with a
+    /// non-WAL stamp would spuriously skip a later op at the same LSN).
+    /// Cross-tree safety comes purely from the per-pid mutex, which
+    /// both `atomic_rc_delta` and `atomic_rc_delta_with_gen` hold.
+    pub fn atomic_incref(&mut self, pid: PageId) -> Result<u32> {
+        self.persist_if_dirty(pid)?;
+        let new_rc = self.page_store.atomic_rc_delta(pid, 1)?;
+        self.pages.remove(&pid);
+        self.page_cache.invalidate(pid);
         Ok(new_rc)
     }
 
-    /// Decrement the refcount on `pid`. If it hits zero, the page is
-    /// freed and — if it's a `PagedIndex` — its non-null children are
-    /// recursively decref'd via an explicit worklist.
-    pub fn decref(&mut self, pid: PageId, generation: Lsn) -> Result<DecrefOutcome> {
+    /// Non-cascading single-page cross-tree-safe decref. Decrements
+    /// `pid`'s refcount via the per-pid-locked disk-direct RMW; if the
+    /// new rc is zero, frees the page and returns its children (for
+    /// the caller to cascade into). On `Decremented` the second
+    /// element is empty.
+    ///
+    /// Callers that want automatic cascade should use
+    /// [`atomic_decref`](Self::atomic_decref) instead;
+    /// [`PagedL2p::drop_subtree`](crate::paged::PagedL2p::drop_subtree)
+    /// uses this variant so it can collect per-page leaf values before
+    /// the free.
+    pub fn atomic_decref_one(
+        &mut self,
+        pid: PageId,
+    ) -> Result<(DecrefOutcome, Vec<PageId>)> {
+        // Snapshot children + page type before the RMW — if rc hits
+        // zero we need them for cascade. Read via PageBuf so a Dirty
+        // copy wins; `persist_if_dirty` then flushes it to disk so
+        // the atomic RMW reads fresh bytes.
+        let children = {
+            let page = self.read(pid)?;
+            let header = page.header()?;
+            match header.page_type {
+                PageType::PagedIndex => index_collect_children(page),
+                PageType::PagedLeaf => Vec::new(),
+                other => {
+                    return Err(MetaDbError::Corruption(format!(
+                        "paged: atomic_decref_one on non-paged page type {other:?} at {pid}"
+                    )));
+                }
+            }
+        };
+        self.persist_if_dirty(pid)?;
+        let new_rc = self.page_store.atomic_rc_delta(pid, -1)?;
+        self.pages.remove(&pid);
+        self.page_cache.invalidate(pid);
+        if new_rc == 0 {
+            // Not `free_idempotent` — this path is not WAL-replayed,
+            // so a double-free is a genuine bug, not a re-apply.
+            self.page_store.free(pid, 0)?;
+            Ok((DecrefOutcome::Freed, children))
+        } else {
+            Ok((DecrefOutcome::Decremented, Vec::new()))
+        }
+    }
+
+    /// Cross-tree-safe decref with cascading free, peer of
+    /// [`atomic_incref`](Self::atomic_incref). Walks children through
+    /// an explicit worklist; every rc mutation and every free routes
+    /// through [`atomic_decref_one`](Self::atomic_decref_one).
+    pub fn atomic_decref(&mut self, pid: PageId) -> Result<DecrefOutcome> {
         let mut top: Option<DecrefOutcome> = None;
         let mut worklist: Vec<PageId> = vec![pid];
         while let Some(p) = worklist.pop() {
-            let (new_rc, children) = {
-                let page = self.modify(p, generation)?;
-                let rc = page.refcount();
-                if rc == 0 {
-                    return Err(MetaDbError::Corruption(format!(
-                        "paged: decref on page {p} with refcount 0"
-                    )));
-                }
-                let new_rc = rc - 1;
-                page.set_refcount(new_rc);
-                let children = if new_rc == 0 {
-                    match page.header()?.page_type {
-                        PageType::PagedIndex => index_collect_children(page),
-                        PageType::PagedLeaf => Vec::new(),
-                        other => {
-                            return Err(MetaDbError::Corruption(format!(
-                                "paged: decref on non-paged page type {other:?} at {p}"
-                            )));
-                        }
-                    }
-                } else {
-                    Vec::new()
-                };
-                (new_rc, children)
-            };
+            let (outcome, children) = self.atomic_decref_one(p)?;
             if top.is_none() {
-                top = Some(if new_rc == 0 {
-                    DecrefOutcome::Freed
-                } else {
-                    DecrefOutcome::Decremented
-                });
+                top = Some(outcome);
             }
-            if new_rc == 0 {
-                worklist.extend(children);
-                self.pages.remove(&p);
-                self.page_cache.invalidate(p);
-                self.page_store.free(p, generation)?;
-            }
+            worklist.extend(children);
         }
         Ok(top.expect("worklist was non-empty"))
     }
@@ -495,7 +519,7 @@ mod tests {
         buf.flush().unwrap();
 
         let before = ps.free_list_len();
-        let out = buf.decref(idx, 2).unwrap();
+        let out = buf.atomic_decref(idx).unwrap();
         assert_eq!(out, DecrefOutcome::Freed);
         // index + leaf0 + leaf1 all hit the free list.
         assert_eq!(ps.free_list_len(), before + 3);
@@ -508,8 +532,9 @@ mod tests {
         let leaf = buf.alloc_leaf(1).unwrap();
         let idx = buf.alloc_index(1, 1).unwrap();
         index_set_child(buf.modify(idx, 1).unwrap(), 0, leaf);
-        buf.incref(idx, 2).unwrap(); // rc = 2
-        let out = buf.decref(idx, 3).unwrap();
+        buf.flush().unwrap();
+        buf.atomic_incref(idx).unwrap(); // rc = 2
+        let out = buf.atomic_decref(idx).unwrap();
         assert_eq!(out, DecrefOutcome::Decremented);
         assert_eq!(buf.read(idx).unwrap().refcount(), 1);
         // Leaf is still reachable via the surviving reference.
@@ -523,7 +548,8 @@ mod tests {
         let leaf = buf.alloc_leaf(1).unwrap();
         let idx = buf.alloc_index(1, 1).unwrap();
         index_set_child(buf.modify(idx, 1).unwrap(), 7, leaf);
-        buf.incref(idx, 1).unwrap(); // rc(idx) = 2, rc(leaf) = 1
+        buf.flush().unwrap();
+        buf.atomic_incref(idx).unwrap(); // rc(idx) = 2, rc(leaf) = 1
         let new_idx = buf.cow_for_write(idx, 2).unwrap();
         // rc deltas are batched; apply them like the tree write path
         // would so the assertions below see the post-commit state.
