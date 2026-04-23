@@ -57,6 +57,13 @@ pub struct PageBuf {
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     pages: HashMap<PageId, Slot>,
+    /// Live count of `Slot::Clean` entries in `pages`. Updated in
+    /// lockstep with every mutation of `pages` so `evict_clean_pages`
+    /// can short-circuit the `HashMap::retain` scan when nothing is
+    /// clean. Prefill/write-heavy workloads leave every entry dirty
+    /// after each op, so without the short-circuit every insert pays
+    /// an O(N) scan over a thousands-large HashMap.
+    clean_count: usize,
     /// In-memory rc-delta accumulator for the current op.
     ///
     /// [`cow_for_write`](Self::cow_for_write) no longer mutates rc on
@@ -92,8 +99,34 @@ impl PageBuf {
             page_store,
             page_cache,
             pages: HashMap::new(),
+            clean_count: 0,
             pending_rc: HashMap::new(),
         }
+    }
+
+    /// Insert a slot, keeping `clean_count` consistent with the
+    /// Clean/Dirty delta relative to any existing entry at `pid`.
+    /// All mutation of `self.pages` must go through one of these
+    /// helpers; direct `.insert` / `.remove` calls on `self.pages`
+    /// will drift the counter.
+    fn pages_insert(&mut self, pid: PageId, slot: Slot) {
+        let is_clean = matches!(slot, Slot::Clean(_));
+        let old = self.pages.insert(pid, slot);
+        let was_clean = matches!(old, Some(Slot::Clean(_)));
+        match (was_clean, is_clean) {
+            (true, false) => self.clean_count -= 1,
+            (false, true) => self.clean_count += 1,
+            _ => {}
+        }
+    }
+
+    /// Remove a slot, keeping `clean_count` consistent.
+    fn pages_remove(&mut self, pid: PageId) -> Option<Slot> {
+        let old = self.pages.remove(&pid);
+        if matches!(old, Some(Slot::Clean(_))) {
+            self.clean_count -= 1;
+        }
+        old
     }
 
     /// Underlying page store handle.
@@ -125,7 +158,7 @@ impl PageBuf {
     /// make call-site LSN-awareness visible, but is intentionally
     /// ignored.
     pub fn modify(&mut self, pid: PageId, _generation: Lsn) -> Result<&mut Page> {
-        let page = match self.pages.remove(&pid) {
+        let page = match self.pages_remove(pid) {
             Some(Slot::Dirty(page)) => page,
             Some(Slot::Clean(page)) => {
                 self.page_cache.invalidate(pid);
@@ -133,7 +166,7 @@ impl PageBuf {
             }
             None => self.page_cache.get_for_modify(pid)?,
         };
-        self.pages.insert(pid, Slot::Dirty(page));
+        self.pages_insert(pid, Slot::Dirty(page));
         match self.pages.get_mut(&pid).unwrap() {
             Slot::Dirty(page) => Ok(page),
             Slot::Clean(_) => unreachable!("modify always stores a dirty page"),
@@ -147,7 +180,7 @@ impl PageBuf {
         let pid = self.page_store.allocate()?;
         let mut page = Page::zeroed();
         init_leaf(&mut page, 0);
-        self.pages.insert(pid, Slot::Dirty(page));
+        self.pages_insert(pid, Slot::Dirty(page));
         Ok(pid)
     }
 
@@ -158,7 +191,7 @@ impl PageBuf {
         let pid = self.page_store.allocate()?;
         let mut page = Page::zeroed();
         init_index(&mut page, 0, level);
-        self.pages.insert(pid, Slot::Dirty(page));
+        self.pages_insert(pid, Slot::Dirty(page));
         Ok(pid)
     }
 
@@ -166,7 +199,7 @@ impl PageBuf {
     /// to reclaim buffer memory for pages we know we won't touch again
     /// in this transaction.
     pub fn forget(&mut self, pid: PageId) {
-        self.pages.remove(&pid);
+        self.pages_remove(pid);
     }
 
     /// Drop every page from the local cache without touching the shared
@@ -177,13 +210,14 @@ impl PageBuf {
     /// responsible for making sure the old root was already flushed.
     pub fn forget_all(&mut self) {
         self.pages.clear();
+        self.clean_count = 0;
     }
 
     /// Return `pid` to the page store's free list, stamping with
     /// `generation`. Low-level — skips refcount accounting. Use
     /// [`decref`](Self::decref) instead for shared pages.
     pub fn free(&mut self, pid: PageId, generation: Lsn) -> Result<()> {
-        self.pages.remove(&pid);
+        self.pages_remove(pid);
         self.page_cache.invalidate(pid);
         self.page_store.free(pid, generation)?;
         Ok(())
@@ -204,7 +238,7 @@ impl PageBuf {
     pub fn atomic_incref(&mut self, pid: PageId) -> Result<u32> {
         self.persist_if_dirty(pid)?;
         let new_rc = self.page_store.atomic_rc_delta(pid, 1)?;
-        self.pages.remove(&pid);
+        self.pages_remove(pid);
         self.page_cache.invalidate(pid);
         Ok(new_rc)
     }
@@ -243,7 +277,7 @@ impl PageBuf {
         };
         self.persist_if_dirty(pid)?;
         let new_rc = self.page_store.atomic_rc_delta(pid, -1)?;
-        self.pages.remove(&pid);
+        self.pages_remove(pid);
         self.page_cache.invalidate(pid);
         if new_rc == 0 {
             // Not `free_idempotent` — this path is not WAL-replayed,
@@ -352,7 +386,7 @@ impl PageBuf {
             .copy_from_slice(self.read(pid)?.bytes());
         new_page.set_generation(0);
         new_page.set_refcount(1);
-        self.pages.insert(new_pid, Slot::Dirty(new_page));
+        self.pages_insert(new_pid, Slot::Dirty(new_page));
 
         // Queue rc deltas for end-of-op commit instead of hitting disk
         // per-edge. Within one descent, a child is first incref'd here
@@ -393,7 +427,7 @@ impl PageBuf {
             }
             self.persist_if_dirty(pid)?;
             self.page_store.atomic_rc_delta_with_gen(pid, delta, lsn)?;
-            self.pages.remove(&pid);
+            self.pages_remove(pid);
             self.page_cache.invalidate(pid);
         }
         Ok(())
@@ -430,8 +464,19 @@ impl PageBuf {
     /// [`PageCache`] still retains them; this just prevents a long-
     /// lived owner from keeping an unbounded duplicate copy of clean
     /// pages alongside the bounded shared cache.
+    ///
+    /// Fast-path: when `clean_count == 0` (every entry is Dirty, the
+    /// common case during write-heavy batches) the retain scan is
+    /// skipped outright. Without this guard every `insert` / `delete`
+    /// at the tree layer would walk the whole HashMap on every op
+    /// just to find nothing to drop — which is the dominant cost of
+    /// the apply phase once the tree has thousands of dirty pages.
     pub fn evict_clean_pages(&mut self) {
+        if self.clean_count == 0 {
+            return;
+        }
         self.pages.retain(|_, slot| slot.is_dirty());
+        self.clean_count = 0;
     }
 
     /// Seal + write + fsync every dirty page in ascending page-id order,
@@ -456,7 +501,7 @@ impl PageBuf {
         self.page_store.sync()?;
         for (pid, page) in flushed {
             self.page_cache.insert(pid, page.clone());
-            self.pages.insert(pid, Slot::Clean(page));
+            self.pages_insert(pid, Slot::Clean(page));
         }
         Ok(())
     }
@@ -473,7 +518,7 @@ impl PageBuf {
             return Ok(());
         }
         let page = self.page_cache.get(pid)?;
-        self.pages.insert(pid, Slot::Clean(page));
+        self.pages_insert(pid, Slot::Clean(page));
         Ok(())
     }
 }
