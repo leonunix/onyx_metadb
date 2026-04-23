@@ -118,14 +118,26 @@ old_pba 类似从 `L2pPrev` 的头 8 字节取。**metadb 此处放弃 "L2pValue
 1. 若 `guard = Some((gp, min))`：读 `refcount(gp)`，若 `< min` → **整条 op 视为 no-op**，
    ApplyOutcome = `L2pRemap { applied: false, .. }`，L2P 和 refcount **都不动**
 2. 执行 `tree.insert_at_lsn(lba, new_value, lsn)`，记下 `L2pPrev` 和 `leaf_was_shared`
-   （leaf rc > 1 即 shared，由 metadb 内部感知）
-3. 决定 decref：
-   - `L2pPrev = None` → 无 decref
-   - `L2pPrev = Some(old)` 且 `old.pba == new_pba` → 无 decref（同 pba，incref/decref 抵消）
-   - `L2pPrev = Some(old)` 且 `leaf_was_shared = true` → **抑制 decref（snapshot 持有）**
-   - 否则 → `decref(old.pba, 1)`
-4. `incref(new_pba, 1)`（无条件，即便 leaf shared —— 新版本独立计数）
-5. 收集 `freed_pba`：decref 后 refcount 到 0 的 pba（仅 step 3 执行了 decref 时可能有）
+   （**leaf page rc > 1 即 shared**；metadb CoW 路径本身就要判这条，没有额外开销）
+3. 决定 `decref(old.pba)` / `incref(new.pba)`（**按 "distinct leaf 引用该 pba 的数量" 是否变化**）：
+
+   | `L2pPrev` | new.pba vs old.pba | leaf_was_shared | decref(old.pba) | incref(new.pba) |
+   |---|---|---|---|---|
+   | None | — | — | 否 | **是** |
+   | Some | 相同 | false（原地改）| 否 | 否（net 0）|
+   | Some | 相同 | true（COW 出新 leaf）| 否 | **是**（多一个 leaf refs 该 pba）|
+   | Some | 不同 | false | **是** | **是** |
+   | Some | 不同 | true（snapshot 仍持有）| 否（leaf-rc-suppress）| **是** |
+
+   等价的布尔表达式：
+   - `do_decref = prev.is_some() && !leaf_was_shared && old.pba != new.pba`
+   - `do_incref = !(prev.is_some() && !leaf_was_shared && old.pba == new.pba)`
+
+   **原地改 same-pba 是 net 0**（leaf 仍然只有一条 entry 指这个 pba，不能 double-count）。
+   这是原 RocksDB `atomic_batch_write_packed` 里 `self_decrement` 补偿逻辑的 metadb 版。
+
+4. 收集 `freed_pba`：仅当 step 3 执行了 decref **且** 该 pba 的 refcount 因此从 >0 降为 0 时，
+   ApplyOutcome 带 `freed_pba = Some(old.pba)`；否则 None。
 
 **ApplyOutcome**：
 
@@ -143,6 +155,51 @@ pub enum ApplyOutcome {
 **WAL body 幂等性**：WAL 记录里存 `guard` 原值 + 原 `new_value`；replay 时 apply 对同一 op
 产生相同结果的前提是 refcount/L2P/leaf-rc 状态一致，由 `page.generation >= lsn` 守护
 （现有机制）。guard 拦截的结果在回放时也一致（同一个 refcount 值）。
+
+#### 3.1.1 onyx 如何从 ApplyOutcome 反推"释放多少物理块"
+
+metadb **不感知** packer / 压缩单元 / 4KB slot 打包。它只告诉 onyx "这个 pba 没人引用了"
+（`freed_pba = Some(pba)`）。**释放规模由 onyx 解码对应 `prev: L2pValue` 自己算**。
+
+`BlockmapValue` 布局里 onyx 要读的两个字段（从 `L2pPrev.0` 里按 Onyx 编码取）：
+
+- `slot_offset`（byte 25..27，`u16` BE）
+- `unit_compressed_size`（byte 9..13，`u32` BE）
+
+决定释放多少 block（每 block = 4096 字节）：
+
+| `slot_offset` | `unit_compressed_size` | 释放规模 |
+|---|---|---|
+| `> 0` | 任意 | 打包槽非首 fragment → **1 block**（整个 4KB 槽）|
+| `= 0` | `< 4096` | 打包槽首 fragment → **1 block** |
+| `= 0` | `≥ 4096` | passthrough 压缩单元 → `ceil(unit_compressed_size / 4096)` blocks，起始 = `pba` |
+
+onyx 侧实现骨架（伪码）：
+
+```rust
+for outcome in outcomes {
+    if let ApplyOutcome::L2pRemap { freed_pba: Some(pba), prev: Some(prev_value), .. } = outcome {
+        let bv = BlockmapValue::decode(&prev_value.0);
+        let nblocks = if bv.slot_offset > 0 || bv.unit_compressed_size < BLOCK_SIZE {
+            1                                                   // packed slot
+        } else {
+            (bv.unit_compressed_size as usize).div_ceil(BLOCK_SIZE)  // passthrough extent
+        };
+        space_allocator.free(pba, nblocks);
+    }
+}
+```
+
+**为什么这样行**：
+- 打包槽里 N 个 fragment 共享 pba，refcount(pba) = N。逐个 decref 直到 N→0，最后一次
+  decref 的 `prev` 里 `slot_offset` 和 `unit_compressed_size` 指向最后一个 fragment，
+  但判据 (`slot_offset > 0` 或 `size < 4KB`) 只用来**区分打包 vs passthrough**，不用于
+  计算释放大小 —— 打包槽永远释放 1 block（整个 4KB 物理槽）。
+- passthrough 单元的 N 个 LBA 条目共享 pba、共享同一个 `unit_compressed_size`（整个单元的
+  压缩长度），每条 LBA refcount 贡献 1。最后一次 decref 的 `prev.unit_compressed_size`
+  就是完整单元大小，直接算 extent。
+- metadb 保证 `freed_pba` 和 `prev` 在同一个 `ApplyOutcome` 里原子对应（同一次 remap 的前
+  后状态），onyx 不需要二次查询。
 
 ### 3.2 `WalOp::L2pRangeDelete`
 

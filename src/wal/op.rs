@@ -15,8 +15,21 @@
 //! # Body layout
 //!
 //! ```text
-//! [tag: 1B][payload: per tag] × N
+//! [schema_version: 1B][tag: 1B][payload: per tag] × N
 //! ```
+//!
+//! The first byte of every body is [`WAL_BODY_SCHEMA_VERSION`]. It is
+//! distinct from every op tag (all tags have the high bit clear; the
+//! schema byte has the high bit set), so a body written by an older
+//! metadb binary — which started directly with a tag byte — is rejected
+//! with [`MetaDbError::Corruption`] at decode time. The version is
+//! covered by the WAL record CRC like every other body byte, so a flip
+//! on the version byte is caught before recovery interprets it.
+//!
+//! Bump the version whenever the on-disk body shape changes (new op,
+//! changed field widths, etc.). There is no backward-compatible
+//! decoder — per SPEC §7 "不做 WAL 兼容", pre-bump WAL is a hard stop
+//! and must be drained via the prior binary before upgrading.
 //!
 //! Tag table:
 //!
@@ -51,6 +64,21 @@ use crate::error::{MetaDbError, Result};
 use crate::lsm::{DedupValue, Hash32};
 use crate::paged::L2pValue;
 use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
+
+/// On-disk body schema version. Written as the first byte of every
+/// WAL record body; decoders reject any other value.
+///
+/// Value `0xB1` was chosen for two properties:
+/// 1. The high bit is set, distinguishing it from every op tag (all
+///    tags are `≤ 0x42`). A legacy body that starts with a tag byte
+///    fails the version check deterministically rather than being
+///    silently reinterpreted.
+/// 2. The low nibble (`1`) encodes the human-readable version number,
+///    so a future bump becomes `0xB2`, `0xB3`, … and keeps the property
+///    above.
+///
+/// Phase A bumps the implicit pre-existing "no prefix" format to v1.
+pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB1;
 
 pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;
@@ -276,10 +304,14 @@ impl WalOp {
     }
 }
 
-/// Append many ops into a fresh body buffer.
+/// Append many ops into a fresh body buffer. The body is prefixed with
+/// [`WAL_BODY_SCHEMA_VERSION`]; empty `ops` still produces a 1-byte body
+/// (version byte only) so recovery distinguishes "a writer committed
+/// zero ops" from "body was never written".
 pub fn encode_body(ops: &[WalOp]) -> Vec<u8> {
-    let total = ops.iter().map(|op| op.encoded_len()).sum();
+    let total = 1 + ops.iter().map(|op| op.encoded_len()).sum::<usize>();
     let mut out = Vec::with_capacity(total);
+    out.push(WAL_BODY_SCHEMA_VERSION);
     for op in ops {
         op.encode(&mut out);
     }
@@ -287,8 +319,27 @@ pub fn encode_body(ops: &[WalOp]) -> Vec<u8> {
 }
 
 /// Decode a WAL record body back into a vector of ops. Fails with
-/// [`MetaDbError::Corruption`] on any short read or unknown tag.
-pub fn decode_body(mut body: &[u8]) -> Result<Vec<WalOp>> {
+/// [`MetaDbError::Corruption`] on missing/mismatched schema version,
+/// any short read, or any unknown tag.
+///
+/// A pre-v1 body starts with an op tag (`≤ 0x42`) rather than
+/// `WAL_BODY_SCHEMA_VERSION` (`0xB1`), so recovery from an old segment
+/// hits the "expected 0xB1" branch before it interprets any payload.
+pub fn decode_body(body: &[u8]) -> Result<Vec<WalOp>> {
+    let first = *body.first().ok_or_else(|| {
+        MetaDbError::Corruption(format!(
+            "WAL body truncated: expected {} bytes (schema version prefix), got 0",
+            1usize,
+        ))
+    })?;
+    if first != WAL_BODY_SCHEMA_VERSION {
+        return Err(MetaDbError::Corruption(format!(
+            "metadb WAL body version 0x{first:02x} found, expected 0x{:02x} \
+             — cross-check Phase A migration",
+            WAL_BODY_SCHEMA_VERSION,
+        )));
+    }
+    let mut body = &body[1..];
     let mut out = Vec::new();
     while !body.is_empty() {
         let (op, rest) = decode_one(body)?;
@@ -484,7 +535,9 @@ mod tests {
             value: v(7),
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 2 + 8 + 28);
+        // +1 for the schema version prefix
+        assert_eq!(body.len(), 1 + 1 + 2 + 8 + 28);
+        assert_eq!(body[0], WAL_BODY_SCHEMA_VERSION);
         let decoded = decode_body(&body).unwrap();
         assert_eq!(decoded, ops);
     }
@@ -513,12 +566,67 @@ mod tests {
 
     #[test]
     fn empty_body_decodes_as_empty_vec() {
-        assert!(decode_body(&[]).unwrap().is_empty());
+        // A v1 body with zero ops is still a 1-byte buffer (just the
+        // version prefix). A truly empty buffer hits the "truncated
+        // before the version byte" branch.
+        assert!(decode_body(&[WAL_BODY_SCHEMA_VERSION]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn completely_empty_body_is_corruption() {
+        match decode_body(&[]).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(
+                msg.contains("schema version prefix"),
+                "unexpected msg: {msg}",
+            ),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn legacy_body_without_schema_version_is_rejected() {
+        // Hand-craft a "pre-Phase-A" body: starts directly with the
+        // L2P_PUT tag (0x01). A modern decoder must refuse it loudly,
+        // not silently interpret the tag as a version byte.
+        let mut body = Vec::new();
+        body.push(TAG_L2P_PUT); // 0x01: not the schema version byte
+        body.extend_from_slice(&0u16.to_be_bytes()); // vol_ord
+        body.extend_from_slice(&42u64.to_be_bytes()); // lba
+        body.extend_from_slice(&[0u8; 28]); // value
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => {
+                assert!(msg.contains("body version"), "unexpected msg: {msg}");
+                assert!(
+                    msg.contains(&format!("0x{:02x}", WAL_BODY_SCHEMA_VERSION)),
+                    "expected version byte mentioned: {msg}",
+                );
+                assert!(
+                    msg.contains("Phase A migration"),
+                    "expected migration hint: {msg}",
+                );
+            }
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn future_body_version_is_rejected_loudly() {
+        // Simulate a WAL body written by a newer metadb that bumps the
+        // schema byte. Current binary must refuse rather than parse.
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION.wrapping_add(1)];
+        body.extend_from_slice(&[0u8; 4]);
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(
+                msg.contains("body version"),
+                "unexpected msg: {msg}",
+            ),
+            e => panic!("{e}"),
+        }
     }
 
     #[test]
     fn unknown_tag_is_corruption() {
-        let body = vec![0xFF, 0, 0, 0];
+        let body = vec![WAL_BODY_SCHEMA_VERSION, 0xFF, 0, 0, 0];
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("unknown WAL op tag")),
             e => panic!("{e}"),
@@ -529,7 +637,19 @@ mod tests {
     fn truncated_payload_is_corruption() {
         // L2P_PUT expects 38 bytes of payload (vol_ord + lba + value);
         // a 10-byte tail is short.
-        let body = vec![TAG_L2P_PUT, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let body = vec![
+            WAL_BODY_SCHEMA_VERSION,
+            TAG_L2P_PUT,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("L2P_PUT")),
             e => panic!("{e}"),
@@ -553,14 +673,23 @@ mod tests {
             },
         ];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), (1 + 2 + 8 + 28) + (1 + 2 + 8));
+        assert_eq!(body.len(), 1 + (1 + 2 + 8 + 28) + (1 + 2 + 8));
         assert_eq!(decode_body(&body).unwrap(), ops);
+    }
+
+    /// Helper: prepend the schema-version byte so the hand-crafted body
+    /// hits the targeted truncation branch in `decode_one` instead of
+    /// the version-rejection branch.
+    fn ver_prefix(tail: &[u8]) -> Vec<u8> {
+        let mut v = vec![WAL_BODY_SCHEMA_VERSION];
+        v.extend_from_slice(tail);
+        v
     }
 
     #[test]
     fn l2p_put_truncated_vol_header_is_corruption() {
         // Only 1 byte of payload — even the vol_ord isn't complete.
-        let body = vec![TAG_L2P_PUT, 0x00];
+        let body = ver_prefix(&[TAG_L2P_PUT, 0x00]);
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("L2P_PUT")),
             e => panic!("{e}"),
@@ -569,7 +698,7 @@ mod tests {
 
     #[test]
     fn l2p_delete_truncated_vol_header_is_corruption() {
-        let body = vec![TAG_L2P_DELETE, 0x00];
+        let body = ver_prefix(&[TAG_L2P_DELETE, 0x00]);
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("L2P_DELETE")),
             e => panic!("{e}"),
@@ -583,7 +712,7 @@ mod tests {
             pages: Vec::new(),
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 8 + 4);
+        assert_eq!(body.len(), 1 + 1 + 8 + 4);
         let decoded = decode_body(&body).unwrap();
         assert_eq!(decoded, ops);
     }
@@ -596,7 +725,7 @@ mod tests {
             pages: pages.clone(),
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 8 + 4 + pages.len() * 8);
+        assert_eq!(body.len(), 1 + 1 + 8 + 4 + pages.len() * 8);
         let decoded = decode_body(&body).unwrap();
         assert_eq!(decoded, ops);
     }
@@ -622,7 +751,7 @@ mod tests {
 
     #[test]
     fn drop_snapshot_truncated_header_is_corruption() {
-        let body = vec![TAG_DROP_SNAPSHOT, 0, 0, 0, 0];
+        let body = ver_prefix(&[TAG_DROP_SNAPSHOT, 0, 0, 0, 0]);
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("DROP_SNAPSHOT header")),
             e => panic!("{e}"),
@@ -632,7 +761,7 @@ mod tests {
     #[test]
     fn drop_snapshot_truncated_page_list_is_corruption() {
         // count=3 but only 2 pids worth of payload
-        let mut body = vec![TAG_DROP_SNAPSHOT];
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_DROP_SNAPSHOT];
         body.extend_from_slice(&7u64.to_be_bytes());
         body.extend_from_slice(&3u32.to_be_bytes());
         body.extend_from_slice(&1u64.to_be_bytes());
@@ -657,7 +786,7 @@ mod tests {
             },
             WalOp::Incref { pba: 4, delta: 5 },
         ];
-        let expected: usize = ops.iter().map(|op| op.encoded_len()).sum();
+        let expected: usize = 1 + ops.iter().map(|op| op.encoded_len()).sum::<usize>();
         assert_eq!(encode_body(&ops).len(), expected);
     }
 
@@ -668,7 +797,7 @@ mod tests {
             shard_count: 16,
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 2 + 4);
+        assert_eq!(body.len(), 1 + 1 + 2 + 4);
         assert_eq!(decode_body(&body).unwrap(), ops);
     }
 
@@ -679,7 +808,7 @@ mod tests {
             pages: (100..120).collect(),
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 2 + 4 + 20 * 8);
+        assert_eq!(body.len(), 1 + 1 + 2 + 4 + 20 * 8);
         assert_eq!(decode_body(&body).unwrap(), ops);
     }
 
@@ -690,7 +819,7 @@ mod tests {
             pages: Vec::new(),
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 2 + 4);
+        assert_eq!(body.len(), 1 + 1 + 2 + 4);
         assert_eq!(decode_body(&body).unwrap(), ops);
     }
 
@@ -703,7 +832,7 @@ mod tests {
             src_shard_roots: vec![100, 101, 102, 103, 104, 105, 106, 107],
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 2 + 2 + 8 + 4 + 8 * 8);
+        assert_eq!(body.len(), 1 + 1 + 2 + 2 + 8 + 4 + 8 * 8);
         assert_eq!(decode_body(&body).unwrap(), ops);
     }
 
@@ -752,7 +881,7 @@ mod tests {
 
     #[test]
     fn create_volume_truncated_is_corruption() {
-        let body = vec![TAG_CREATE_VOLUME, 0x00, 0x01];
+        let body = vec![WAL_BODY_SCHEMA_VERSION, TAG_CREATE_VOLUME, 0x00, 0x01];
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("CREATE_VOLUME")),
             e => panic!("{e}"),
@@ -761,7 +890,7 @@ mod tests {
 
     #[test]
     fn drop_volume_truncated_header_is_corruption() {
-        let body = vec![TAG_DROP_VOLUME, 0x00];
+        let body = vec![WAL_BODY_SCHEMA_VERSION, TAG_DROP_VOLUME, 0x00];
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("DROP_VOLUME header")),
             e => panic!("{e}"),
@@ -770,7 +899,7 @@ mod tests {
 
     #[test]
     fn drop_volume_truncated_page_list_is_corruption() {
-        let mut body = vec![TAG_DROP_VOLUME];
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_DROP_VOLUME];
         body.extend_from_slice(&7u16.to_be_bytes());
         body.extend_from_slice(&3u32.to_be_bytes());
         body.extend_from_slice(&1u64.to_be_bytes());
@@ -783,7 +912,14 @@ mod tests {
 
     #[test]
     fn clone_volume_truncated_header_is_corruption() {
-        let body = vec![TAG_CLONE_VOLUME, 0x00, 0x01, 0x00, 0x02];
+        let body = vec![
+            WAL_BODY_SCHEMA_VERSION,
+            TAG_CLONE_VOLUME,
+            0x00,
+            0x01,
+            0x00,
+            0x02,
+        ];
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("CLONE_VOLUME header")),
             e => panic!("{e}"),
@@ -792,7 +928,7 @@ mod tests {
 
     #[test]
     fn clone_volume_truncated_roots_is_corruption() {
-        let mut body = vec![TAG_CLONE_VOLUME];
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_CLONE_VOLUME];
         body.extend_from_slice(&1u16.to_be_bytes()); // src_ord
         body.extend_from_slice(&2u16.to_be_bytes()); // new_ord
         body.extend_from_slice(&3u64.to_be_bytes()); // src_snap_id

@@ -1758,6 +1758,11 @@ impl Db {
             ApplyOutcome::DropSnapshot {
                 freed_leaf_values,
                 pages_freed,
+                // `freed_pbas` is reserved in S1; populated once S4
+                // wires pba_decrefs into the drop_snapshot plan. Drop
+                // it on the floor for now — none of the live callers
+                // consume it yet.
+                freed_pbas: _,
             } => (freed_leaf_values, pages_freed),
             other => {
                 return Err(MetaDbError::Corruption(format!(
@@ -2814,7 +2819,7 @@ fn apply_drop_volume(
     pages: &[PageId],
 ) -> Result<usize> {
     match apply_drop_snapshot_pages(page_store, lsn, pages)? {
-        ApplyOutcome::DropSnapshot { pages_freed, .. } => Ok(pages_freed),
+        ApplyOutcome::DropSnapshot { pages_freed, .. } => Ok(pages_freed), // `freed_pbas` unused here
         other => Err(MetaDbError::Corruption(format!(
             "apply_drop_volume: unexpected outcome {other:?}"
         ))),
@@ -2959,6 +2964,10 @@ fn apply_drop_snapshot_pages(
     Ok(ApplyOutcome::DropSnapshot {
         freed_leaf_values,
         pages_freed,
+        // S1 reserves the slot; S4 fills it in once the `pba_decrefs`
+        // field is added to `WalOp::DropSnapshot`. Live callers today
+        // ignore this field entirely.
+        freed_pbas: Vec::new(),
     })
 }
 

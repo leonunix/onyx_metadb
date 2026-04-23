@@ -368,6 +368,41 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_pre_phase_a_wal_body_schema() {
+        // Simulate a WAL segment written by a binary that predates the
+        // Phase A body schema bump: bodies start directly with an op
+        // tag (0x01) rather than the WAL_BODY_SCHEMA_VERSION byte.
+        // Recovery must surface a clear Corruption, not panic or
+        // silently skip the record.
+        use crate::wal::TAG_L2P_PUT;
+
+        let dir = TempDir::new().unwrap();
+        let mut seg = SegmentFile::create(dir.path(), 1).unwrap();
+        // Hand-craft a legacy body: bare TAG_L2P_PUT + 38B of zeros.
+        let mut legacy_body = vec![TAG_L2P_PUT];
+        legacy_body.extend_from_slice(&[0u8; 38]); // vol_ord + lba + value
+        let mut framed = Vec::new();
+        encode(&mut framed, 1, &legacy_body);
+        seg.append(&framed).unwrap();
+        seg.sync_all().unwrap();
+        drop(seg);
+
+        let err = replay_into(dir.path(), 1, |_lsn, _op| {
+            Ok(ApplyOutcome::Dedup)
+        })
+        .unwrap_err();
+        match err {
+            MetaDbError::Corruption(msg) => {
+                assert!(
+                    msg.contains("body version"),
+                    "unexpected corruption msg: {msg}",
+                );
+            }
+            other => panic!("expected Corruption, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn replay_into_stops_and_truncates_torn_tail() {
         use crate::paged::L2pValue;
         use crate::wal::{WalOp, encode_body};

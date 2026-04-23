@@ -129,5 +129,8 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
   这是 onyx 一次性切掉 RocksDB 的对接书，涵盖新增 WalOp / Db API、必须守住的
   不变量、测试矩阵、性能目标、Phase A → Phase B 门控清单。API 演进遵照此文档，
   不再"先做最干净的接口"。
+- **Phase A 实施进度**：[`docs/ONYX_INTEGRATION_PLAN.md`](docs/ONYX_INTEGRATION_PLAN.md)
+  把 SPEC 拆成 S1~S6 session，每个 session 自带入口 / 交付物 / 退出判据。
+  当前进度表在 plan 文件里自维护。
 - 父项目的 CLAUDE.md 讲 ublk / buffer / packer / GC / dedup pipeline 等存储层面的东
   西，和 metadb 内部约束不重叠。切 `cd /root/onyx_storage` 工作时读那边的 CLAUDE.md。
