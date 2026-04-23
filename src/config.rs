@@ -65,6 +65,25 @@ pub struct Config {
     /// Use `O_DIRECT` on Linux (or `F_NOCACHE` on macOS) for page and WAL
     /// IO. Disable when running on tmpfs in tests.
     pub direct_io: bool,
+
+    /// How many 4 KiB pages to pre-extend the page file by on each
+    /// `set_len` call. `PageStore::allocate` maintains `file_size >=
+    /// high_water * PAGE_SIZE`; when `high_water` crosses a chunk
+    /// boundary, one syscall extends the file by `page_grow_chunk_pages`
+    /// pages instead of one page per allocation. Amortises the extend
+    /// cost during bulk ingest (prefill dominated by syscalls before
+    /// this knob landed). Must be `>= 1`. 512 pages = 2 MiB per extend.
+    pub page_grow_chunk_pages: u64,
+
+    /// Per-`Db` upper bound on bytes used to pin L2P index pages in the
+    /// page cache, so random L2P gets never miss on inner nodes.
+    /// Index pages are ~1/256 of leaf bytes (INDEX_FANOUT=256), so 512 MiB
+    /// covers ~130 GiB of leaf data, i.e. on the order of billions of
+    /// LBAs. Pinned pages live outside the LRU and do not compete with
+    /// leaf capacity. Set to 0 to disable; on large-memory deployments
+    /// (e.g. 512 GiB RAM) this can be raised to tens of GiB to cover
+    /// trillion-key datasets.
+    pub index_pin_bytes: u64,
 }
 
 impl Config {
@@ -93,6 +112,8 @@ impl Config {
             lsm_level_ratio: 10,
             checkpoint_bytes: 1024 * 1024 * 1024,
             direct_io: cfg!(target_os = "linux"),
+            page_grow_chunk_pages: 512,
+            index_pin_bytes: 512 * 1024 * 1024,
         }
     }
 }

@@ -299,7 +299,10 @@ impl Db {
         let shard_count = validate_shard_count(cfg.shards_per_partition)?;
         std::fs::create_dir_all(&cfg.path)?;
         let pages_path = page_file(&cfg.path);
-        let page_store = Arc::new(PageStore::create(&pages_path)?);
+        let page_store = Arc::new(PageStore::create_with_grow_chunk(
+            &pages_path,
+            cfg.page_grow_chunk_pages,
+        )?);
         let page_cache = Arc::new(PageCache::new(page_store.clone(), cfg.page_cache_bytes));
         let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
@@ -381,7 +384,10 @@ impl Db {
     /// injectable fault controller.
     pub fn open_with_config_and_faults(cfg: Config, faults: Arc<FaultController>) -> Result<Self> {
         let pages_path = page_file(&cfg.path);
-        let page_store = Arc::new(PageStore::open(&pages_path)?);
+        let page_store = Arc::new(PageStore::open_with_grow_chunk(
+            &pages_path,
+            cfg.page_grow_chunk_pages,
+        )?);
         let page_cache = Arc::new(PageCache::new(page_store.clone(), cfg.page_cache_bytes));
         let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =

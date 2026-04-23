@@ -13,12 +13,23 @@
 //! the free list in its own page chain to avoid the scan for large
 //! databases; v0 keeps it simple and correct.
 //!
+//! # File extension (batched)
+//!
+//! The on-disk invariant is `file_size == committed_file_pages * PAGE_SIZE`
+//! and `committed_file_pages >= high_water`. The single-page `allocate`
+//! path no longer calls `set_len` once per page; instead it bumps an
+//! in-memory `high_water`, and when that crosses the current committed
+//! file size it rounds up to the next `grow_chunk_pages` boundary and
+//! issues one `set_len`. The tail pages between `high_water` and
+//! `committed_file_pages` are zero-init and carry no headers, so they
+//! are recoverable as growth tail on crash (see `open`).
+//!
 //! # Concurrency
 //!
 //! `read_page` / `write_page` take a shared `&File` and issue positional IO
 //! (`pread` / `pwrite`) — safe under concurrent callers since each call
 //! is atomic at the kernel level. The mutex only protects metadata (free
-//! list, high-water mark).
+//! list, high-water mark, committed file size).
 
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
@@ -32,6 +43,11 @@ use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 
 const RC_LOCK_SHARDS: usize = 64;
 
+/// Default pre-extension chunk if the caller uses [`PageStore::create`]
+/// / [`PageStore::open`] without threading a `Config`. Must stay in
+/// sync with `Config::page_grow_chunk_pages`'s documented default.
+pub const DEFAULT_GROW_CHUNK_PAGES: u64 = 512;
+
 /// Flat page file.
 pub struct PageStore {
     path: PathBuf,
@@ -44,6 +60,9 @@ pub struct PageStore {
     /// rc and race their writes back to disk (last-writer-wins losing
     /// one decrement).
     rc_locks: Box<[Mutex<()>]>,
+    /// Batch size for pre-extending the backing file in `allocate` /
+    /// `allocate_run`. Frozen at construction; never mutated.
+    grow_chunk: u64,
 }
 
 fn new_rc_locks() -> Box<[Mutex<()>]> {
@@ -65,17 +84,41 @@ impl std::fmt::Debug for PageStore {
 }
 
 struct Inner {
-    /// Smallest page id that has *not* yet been allocated. File length is
-    /// always `high_water * PAGE_SIZE`.
+    /// Smallest page id that has *not* yet been allocated. Always
+    /// `<= committed_file_pages`; the gap between them is pre-extended
+    /// zero-init growth tail.
     high_water: u64,
+    /// File length in pages. `file.metadata().len() == committed_file_pages
+    /// * PAGE_SIZE` at all times outside `allocate` / `allocate_run` /
+    /// `open`, and `committed_file_pages >= high_water` always.
+    committed_file_pages: u64,
     /// Explicitly-freed pages available for reuse. LIFO.
     free_list: Vec<PageId>,
 }
 
 impl PageStore {
-    /// Create a brand-new page store at `path`. Fails if the file already
-    /// exists.
+    /// Create a brand-new page store at `path` with the default batch
+    /// grow chunk ([`DEFAULT_GROW_CHUNK_PAGES`]). Fails if the file
+    /// already exists.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        Self::create_with_grow_chunk(path, DEFAULT_GROW_CHUNK_PAGES)
+    }
+
+    /// Open an existing page store with the default batch grow chunk
+    /// ([`DEFAULT_GROW_CHUNK_PAGES`]).
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_grow_chunk(path, DEFAULT_GROW_CHUNK_PAGES)
+    }
+
+    /// Create a brand-new page store at `path`. `grow_chunk` sets how
+    /// many pages are pre-reserved on each file extension; see module
+    /// docs. Must be `>= 1`. Fails if the file already exists.
+    pub fn create_with_grow_chunk(path: impl AsRef<Path>, grow_chunk: u64) -> Result<Self> {
+        if grow_chunk == 0 {
+            return Err(MetaDbError::InvalidArgument(
+                "page store grow_chunk must be >= 1".into(),
+            ));
+        }
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .read(true)
@@ -84,22 +127,34 @@ impl PageStore {
             .open(&path)?;
         // Pre-size to FIRST_DATA_PAGE so the manifest slot offsets are
         // immediately addressable, even though we leave those pages zeroed
-        // (the manifest layer will populate them).
+        // (the manifest layer will populate them). First data allocation
+        // will pre-extend to FIRST_DATA_PAGE + grow_chunk.
         file.set_len(FIRST_DATA_PAGE * PAGE_SIZE as u64)?;
         Ok(Self {
             path,
             file,
             inner: Mutex::new(Inner {
                 high_water: FIRST_DATA_PAGE,
+                committed_file_pages: FIRST_DATA_PAGE,
                 free_list: Vec::new(),
             }),
             rc_locks: new_rc_locks(),
+            grow_chunk,
         })
     }
 
-    /// Open an existing page store.  Rebuilds the in-memory free list by
-    /// scanning pages from [`FIRST_DATA_PAGE`] to EOF.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    /// Open an existing page store. `grow_chunk` is the batch size used
+    /// for subsequent file extensions (does not affect the scan). The
+    /// scan rebuilds the in-memory free list by walking pages from
+    /// [`FIRST_DATA_PAGE`] to EOF; any contiguous zero-init tail left
+    /// over from a crashed pre-extend is truncated back before the
+    /// store is returned.
+    pub fn open_with_grow_chunk(path: impl AsRef<Path>, grow_chunk: u64) -> Result<Self> {
+        if grow_chunk == 0 {
+            return Err(MetaDbError::InvalidArgument(
+                "page store grow_chunk must be >= 1".into(),
+            ));
+        }
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let size = file.metadata()?.len();
@@ -113,27 +168,42 @@ impl PageStore {
                 "page file size {size} is shorter than the reserved manifest region",
             )));
         }
-        let high_water = size / PAGE_SIZE as u64;
+        let file_end_pages = size / PAGE_SIZE as u64;
+        // Walk every page in [FIRST_DATA_PAGE, file_end_pages). Any page
+        // whose header decodes (Free or typed) counts as live, extending
+        // the recovered `high_water`. Pages whose header fails to decode
+        // are either torn writes (middle of file) or zero-init growth
+        // tail (contiguous at end). Growth tail past the last valid page
+        // is truncated so the file invariant is restored.
+        let mut high_water = FIRST_DATA_PAGE;
         let mut free_list = Vec::new();
-        for page_id in FIRST_DATA_PAGE..high_water {
+        for page_id in FIRST_DATA_PAGE..file_end_pages {
             let page = read_page_raw(&file, page_id)?;
-            // Lenient scan: only pages whose header decodes AND declares
-            // itself `Free` go on the list. Bad / unknown pages are left
-            // alone for the verifier to flag.
             if let Ok(h) = page.header() {
+                high_water = page_id + 1;
                 if h.page_type == PageType::Free {
                     free_list.push(page_id);
                 }
             }
+            // Torn / uninitialised pages are left in place below
+            // high_water; the verifier flags them later. We cannot tell
+            // them apart from growth tail here without breaking that
+            // behaviour, so only the contiguous suffix past the last
+            // valid page is truncated below.
+        }
+        if high_water < file_end_pages {
+            file.set_len(high_water * PAGE_SIZE as u64)?;
         }
         Ok(Self {
             path,
             file,
             inner: Mutex::new(Inner {
                 high_water,
+                committed_file_pages: high_water,
                 free_list,
             }),
             rc_locks: new_rc_locks(),
+            grow_chunk,
         })
     }
 
@@ -280,20 +350,23 @@ impl PageStore {
     }
 
     /// Allocate a fresh page id. If the free list has entries, one is
-    /// popped and returned; otherwise the file is extended by one page.
-    /// The on-disk content is not initialized — the caller is expected to
-    /// write a sealed page at the returned id.
+    /// popped and returned; otherwise `high_water` advances by one and
+    /// the file is pre-extended in `grow_chunk` units so most calls
+    /// avoid a `set_len` syscall. The on-disk content is not
+    /// initialized — the caller is expected to write a sealed page at
+    /// the returned id.
     pub fn allocate(&self) -> Result<PageId> {
         let mut inner = self.inner.lock();
         if let Some(page_id) = inner.free_list.pop() {
             return Ok(page_id);
         }
         let page_id = inner.high_water;
-        inner.high_water = inner
+        let new_high = inner
             .high_water
             .checked_add(1)
             .ok_or(MetaDbError::OutOfSpace)?;
-        self.file.set_len(inner.high_water * PAGE_SIZE as u64)?;
+        self.ensure_file_covers(&mut inner, new_high)?;
+        inner.high_water = new_high;
         Ok(page_id)
     }
 
@@ -318,9 +391,38 @@ impl PageStore {
             .high_water
             .checked_add(count)
             .ok_or(MetaDbError::OutOfSpace)?;
-        self.file.set_len(new_high * PAGE_SIZE as u64)?;
+        self.ensure_file_covers(&mut inner, new_high)?;
         inner.high_water = new_high;
         Ok(start)
+    }
+
+    /// Ensure the backing file covers at least `target` pages. Rounds
+    /// up to the next `grow_chunk` boundary so subsequent allocations
+    /// within the chunk avoid `set_len`. Called with `inner` already
+    /// locked.
+    fn ensure_file_covers(&self, inner: &mut Inner, target: u64) -> Result<()> {
+        if target <= inner.committed_file_pages {
+            return Ok(());
+        }
+        // Round target up to the next grow_chunk boundary.
+        let chunk = self.grow_chunk;
+        let span = target
+            .checked_sub(inner.committed_file_pages)
+            .expect("target > committed by the early return above");
+        let chunks_needed = span.div_ceil(chunk);
+        let add = chunks_needed
+            .checked_mul(chunk)
+            .ok_or(MetaDbError::OutOfSpace)?;
+        let new_committed = inner
+            .committed_file_pages
+            .checked_add(add)
+            .ok_or(MetaDbError::OutOfSpace)?;
+        self.file
+            .set_len(new_committed.checked_mul(PAGE_SIZE as u64).ok_or(
+                MetaDbError::OutOfSpace,
+            )?)?;
+        inner.committed_file_pages = new_committed;
+        Ok(())
     }
 
     /// Free `count` pages starting at `start`, stamping each with
@@ -680,5 +782,174 @@ mod tests {
         }
         ps.free_run(start, 3, 99).unwrap();
         assert_eq!(ps.free_list_len(), 3);
+    }
+
+    #[test]
+    fn batched_allocate_extends_file_by_chunk_boundary() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let chunk: u64 = 8;
+        let ps = PageStore::create_with_grow_chunk(&path, chunk).unwrap();
+        // One allocate should pre-extend the file by the whole chunk.
+        let _ = ps.allocate().unwrap();
+        let expected_pages = FIRST_DATA_PAGE + chunk;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            expected_pages * PAGE_SIZE as u64,
+            "first allocate should pre-extend to the next chunk boundary",
+        );
+        // Fill the rest of the chunk; file size must not change.
+        for _ in 1..chunk {
+            let _ = ps.allocate().unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            expected_pages * PAGE_SIZE as u64,
+            "allocations within the committed chunk must not extend the file",
+        );
+        assert_eq!(ps.high_water(), FIRST_DATA_PAGE + chunk);
+        // One more allocate should roll into the next chunk.
+        let _ = ps.allocate().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (FIRST_DATA_PAGE + 2 * chunk) * PAGE_SIZE as u64,
+            "crossing a chunk boundary extends the file by exactly one more chunk",
+        );
+    }
+
+    #[test]
+    fn allocate_run_respects_grow_chunk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let chunk: u64 = 4;
+        let ps = PageStore::create_with_grow_chunk(&path, chunk).unwrap();
+        // Run of 6 with chunk 4 → file must cover >= 6 pages, rounded up
+        // to the next chunk boundary (8).
+        let start = ps.allocate_run(6).unwrap();
+        assert_eq!(start, FIRST_DATA_PAGE);
+        assert_eq!(ps.high_water(), FIRST_DATA_PAGE + 6);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (FIRST_DATA_PAGE + 2 * chunk) * PAGE_SIZE as u64,
+        );
+    }
+
+    #[test]
+    fn reject_zero_grow_chunk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        assert!(matches!(
+            PageStore::create_with_grow_chunk(&path, 0).unwrap_err(),
+            MetaDbError::InvalidArgument(_)
+        ));
+    }
+
+    #[test]
+    fn open_truncates_growth_tail() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let chunk: u64 = 64;
+        let last_valid_pid;
+        {
+            let ps = PageStore::create_with_grow_chunk(&path, chunk).unwrap();
+            // Allocate + write 3 pages. Pre-extend reserves `chunk`
+            // pages worth of growth tail on disk (pages 5..=66 zero-init).
+            for i in 0..3 {
+                let pid = ps.allocate().unwrap();
+                ps.write_page(pid, &mk_page(1, i as u8)).unwrap();
+            }
+            last_valid_pid = FIRST_DATA_PAGE + 2;
+            ps.sync_all().unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                (FIRST_DATA_PAGE + chunk) * PAGE_SIZE as u64,
+                "pre-extend must have reserved the whole chunk",
+            );
+        }
+        // Reopen: the growth tail (zero pages past the last valid one)
+        // should be truncated back.
+        let ps = PageStore::open_with_grow_chunk(&path, chunk).unwrap();
+        assert_eq!(ps.high_water(), last_valid_pid + 1);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (last_valid_pid + 1) * PAGE_SIZE as u64,
+            "open must truncate zero-init growth tail back to last valid page",
+        );
+    }
+
+    #[test]
+    fn open_keeps_valid_free_page_followed_by_growth_tail() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let chunk: u64 = 32;
+        let last_valid_pid;
+        {
+            let ps = PageStore::create_with_grow_chunk(&path, chunk).unwrap();
+            // Allocate 3, free the last: last valid page is the Free-typed one.
+            for _ in 0..3 {
+                let pid = ps.allocate().unwrap();
+                ps.write_page(pid, &mk_page(1, 0)).unwrap();
+            }
+            ps.free(FIRST_DATA_PAGE + 2, 42).unwrap();
+            last_valid_pid = FIRST_DATA_PAGE + 2;
+            ps.sync_all().unwrap();
+        }
+        let ps = PageStore::open_with_grow_chunk(&path, chunk).unwrap();
+        // The Free page counts as valid → high_water = last_valid + 1.
+        assert_eq!(ps.high_water(), last_valid_pid + 1);
+        // File truncated so growth tail is gone.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (last_valid_pid + 1) * PAGE_SIZE as u64,
+        );
+        // Free list should contain the freed page so allocate recycles it.
+        assert_eq!(ps.free_list_len(), 1);
+        assert_eq!(ps.allocate().unwrap(), FIRST_DATA_PAGE + 2);
+    }
+
+    #[test]
+    fn open_on_all_zero_growth_tail_recovers_as_empty_data_region() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        // Fabricate a file with a manifest region and pure zero growth tail
+        // past it, as if a crash happened after pre-extend but before any
+        // data page was written.
+        let pages_on_disk = FIRST_DATA_PAGE + 16;
+        std::fs::write(&path, vec![0u8; (pages_on_disk * PAGE_SIZE as u64) as usize])
+            .unwrap();
+        let ps = PageStore::open_with_grow_chunk(&path, 16).unwrap();
+        // No page past the manifest region decoded as valid → high_water
+        // sits at FIRST_DATA_PAGE, and the growth tail is truncated.
+        assert_eq!(ps.high_water(), FIRST_DATA_PAGE);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            FIRST_DATA_PAGE * PAGE_SIZE as u64,
+        );
+    }
+
+    #[test]
+    fn crash_safety_allocate_without_write_is_not_leaked_after_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let chunk: u64 = 16;
+        {
+            let ps = PageStore::create_with_grow_chunk(&path, chunk).unwrap();
+            // Write 2 pages then leak an allocation (simulating a crash
+            // between allocate and write_page, with WAL un-committed).
+            for i in 0..2 {
+                let pid = ps.allocate().unwrap();
+                ps.write_page(pid, &mk_page(1, i as u8)).unwrap();
+            }
+            let _leaked = ps.allocate().unwrap();
+            ps.sync_all().unwrap();
+        }
+        // Reopen: the leaked allocation becomes part of growth tail (the
+        // page is still zero on disk, so its header fails to decode).
+        let ps = PageStore::open_with_grow_chunk(&path, chunk).unwrap();
+        assert_eq!(ps.high_water(), FIRST_DATA_PAGE + 2);
+        // New allocations reuse page ids from where the recovered high
+        // water points, overwriting the zeroed leak in place.
+        let pid = ps.allocate().unwrap();
+        assert_eq!(pid, FIRST_DATA_PAGE + 2);
     }
 }
