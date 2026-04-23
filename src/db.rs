@@ -303,7 +303,11 @@ impl Db {
             &pages_path,
             cfg.page_grow_chunk_pages,
         )?);
-        let page_cache = Arc::new(PageCache::new(page_store.clone(), cfg.page_cache_bytes));
+        let page_cache = Arc::new(PageCache::new_with_pin_budget(
+            page_store.clone(),
+            cfg.page_cache_bytes,
+            cfg.index_pin_bytes,
+        ));
         let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
@@ -388,7 +392,11 @@ impl Db {
             &pages_path,
             cfg.page_grow_chunk_pages,
         )?);
-        let page_cache = Arc::new(PageCache::new(page_store.clone(), cfg.page_cache_bytes));
+        let page_cache = Arc::new(PageCache::new_with_pin_budget(
+            page_store.clone(),
+            cfg.page_cache_bytes,
+            cfg.index_pin_bytes,
+        ));
         let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_existing(page_store.clone(), faults.clone())?;
@@ -636,6 +644,21 @@ impl Db {
         // traverse already-freed pages.
         let reclaim_generation = last_applied.max(manifest.checkpoint_lsn).max(1) + 1;
         verify::reclaim_orphan_pages(&page_store, &manifest, reclaim_generation)?;
+
+        // Warm the pinned index-page set across every volume. Walks
+        // each shard's tree once; stops at the first pin refusal so a
+        // small `cfg.index_pin_bytes` does not end up scattered across
+        // disjoint subtrees. Runs after WAL replay so the index shape
+        // is final for this open — no subsequent COW needs to update
+        // the pinned set during bootstrap.
+        if cfg.index_pin_bytes > 0 {
+            for volume in volumes.values() {
+                for shard in &volume.shards {
+                    let mut tree = shard.tree.lock();
+                    tree.warmup_index_pages()?;
+                }
+            }
+        }
 
         Ok(Self {
             page_store,

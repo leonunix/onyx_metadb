@@ -28,6 +28,15 @@ use crate::paged::format::{
 };
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
+/// Counters returned by [`PagedL2p::warmup_index_pages`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WarmupStats {
+    /// Index pages successfully pinned. Leaf pages are never pinned.
+    pub pages_pinned: u64,
+    /// True if the walk was cut short by the cache's pin budget.
+    pub skipped_budget: bool,
+}
+
 /// Owned range for multi-root scans. Mirrors `db::OwnedRange` (kept
 /// crate-private there) so we can accept it in `range_at` without
 /// reaching into `Db`'s private types.
@@ -220,6 +229,56 @@ impl PagedL2p {
     /// Run the structural checker over the whole tree.
     pub fn check_invariants(&self) -> Result<()> {
         crate::paged::invariants::check_tree(self.buf.page_store(), self.root)
+    }
+
+    /// Walk every index page reachable from the current root and pin
+    /// it in the shared page cache. Leaves are skipped — their total
+    /// byte count typically exceeds available memory, and random-get
+    /// latency is bounded by index misses, not leaf misses.
+    ///
+    /// Warmup stops early and returns `skipped_budget = true` once
+    /// `PageCache::pin` refuses a pin (global budget exhausted). The
+    /// caller can inspect the returned stats to decide whether to
+    /// raise `Config::index_pin_bytes`.
+    ///
+    /// Idempotent: calling twice pins the same pages twice (the
+    /// second call is a no-op in `PageCache::pin` replace path). Cost
+    /// is `O(total_index_pages)` read IO — usually < 1/256 of the
+    /// tree's total bytes, so measured in tens of MiB for a 200M-key
+    /// tree.
+    pub fn warmup_index_pages(&mut self) -> Result<WarmupStats> {
+        let mut stats = WarmupStats::default();
+        if self.root == NULL_PAGE || self.root_level == 0 {
+            // Either no tree at all, or the root is a leaf and there
+            // are no index pages to pin.
+            return Ok(stats);
+        }
+        let cache = self.buf.page_cache().clone();
+        // BFS. A Vec acts as the frontier — we don't need FIFO order.
+        let mut frontier: Vec<(PageId, u8)> = Vec::with_capacity(64);
+        frontier.push((self.root, self.root_level));
+        while let Some((pid, level)) = frontier.pop() {
+            if level == 0 {
+                // Leaf — do not pin.
+                continue;
+            }
+            let page = cache.get(pid)?;
+            if !cache.pin(pid, page.clone()) {
+                stats.skipped_budget = true;
+                // Do not enqueue children once the budget is out: the
+                // whole point is to pin a dense reachable index set,
+                // not scatter pins across disconnected subtrees.
+                continue;
+            }
+            stats.pages_pinned += 1;
+            for slot in 0..INDEX_FANOUT {
+                let child = index_child_at(&page, slot);
+                if child != NULL_PAGE {
+                    frontier.push((child, level - 1));
+                }
+            }
+        }
+        Ok(stats)
     }
 
     // -------- read path --------------------------------------------------
@@ -828,6 +887,7 @@ fn overlaps(range: &OwnedRange, lo: u64, hi: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PAGE_SIZE;
     use tempfile::TempDir;
 
     fn mk_store() -> (TempDir, Arc<PageStore>) {
@@ -1168,5 +1228,93 @@ mod tests {
         // Snapshot root still readable; its stored mapping is preserved.
         assert_eq!(src.get_at(root_pid, 1).unwrap(), Some(v(10)));
         assert_eq!(src.get_at(root_pid, 300).unwrap(), Some(v(20)));
+    }
+
+    // -------- warmup_index_pages ---------------------------------------
+
+    fn mk_tree_with_pin(pin_pages: u64) -> (TempDir, PagedL2p) {
+        let dir = TempDir::new().unwrap();
+        let ps = Arc::new(PageStore::create(dir.path().join("p.onyx_meta")).unwrap());
+        let cache = Arc::new(PageCache::new_with_pin_budget(
+            ps.clone(),
+            64 * PAGE_SIZE as u64,
+            pin_pages * PAGE_SIZE as u64,
+        ));
+        let tree = PagedL2p::create_with_cache(ps, cache).unwrap();
+        (dir, tree)
+    }
+
+    #[test]
+    fn warmup_on_empty_leaf_root_pins_nothing() {
+        let (_d, mut t) = mk_tree_with_pin(16);
+        let stats = t.warmup_index_pages().unwrap();
+        assert_eq!(stats.pages_pinned, 0);
+        assert!(!stats.skipped_budget);
+        assert_eq!(t.buf.page_cache().pinned_pages(), 0);
+    }
+
+    #[test]
+    fn warmup_pins_all_index_pages_in_small_tree() {
+        let (_d, mut t) = mk_tree_with_pin(64);
+        // Force growth to level 2 by spreading inserts across >256 leaves.
+        for i in 0..300u64 {
+            t.insert(i << LEAF_SHIFT, v((i & 0xff) as u8)).unwrap();
+        }
+        assert!(t.root_level() >= 2);
+        // Warmup reads through the shared page cache, which only sees
+        // content that has been flushed to disk. Real callers (Db::open)
+        // run warmup after WAL replay + flush, so this mirrors the
+        // production sequence.
+        t.flush().unwrap();
+        let stats = t.warmup_index_pages().unwrap();
+        assert!(!stats.skipped_budget);
+        // At least the root must be pinned. An exact count depends on
+        // how sparsely the radix spreads the 300 inserts across level-1
+        // subtrees, so just assert non-zero and that cache agrees.
+        assert!(stats.pages_pinned > 0);
+        assert_eq!(
+            t.buf.page_cache().pinned_pages(),
+            stats.pages_pinned,
+        );
+    }
+
+    #[test]
+    fn warmup_respects_pin_budget() {
+        let (_d, mut t) = mk_tree_with_pin(1);
+        // Level-2 tree with multiple level-1 index pages under the
+        // root (> 256 leaves = 2+ level-1 pages + root).
+        for i in 0..400u64 {
+            t.insert(i << LEAF_SHIFT, v((i & 0xff) as u8)).unwrap();
+        }
+        assert!(t.root_level() >= 2);
+        t.flush().unwrap();
+        let stats = t.warmup_index_pages().unwrap();
+        assert!(stats.skipped_budget);
+        assert_eq!(t.buf.page_cache().pinned_pages(), 1);
+    }
+
+    #[test]
+    fn warmup_does_not_pin_leaves() {
+        let (_d, mut t) = mk_tree_with_pin(64);
+        // Single-leaf tree (root is a leaf). Warmup must not pin it.
+        t.insert(3, v(3)).unwrap();
+        assert_eq!(t.root_level(), 0);
+        t.flush().unwrap();
+        let stats = t.warmup_index_pages().unwrap();
+        assert_eq!(stats.pages_pinned, 0);
+        assert_eq!(t.buf.page_cache().pinned_pages(), 0);
+    }
+
+    #[test]
+    fn warmup_is_idempotent() {
+        let (_d, mut t) = mk_tree_with_pin(64);
+        for i in 0..300u64 {
+            t.insert(i << LEAF_SHIFT, v((i & 0xff) as u8)).unwrap();
+        }
+        t.flush().unwrap();
+        let a = t.warmup_index_pages().unwrap();
+        let b = t.warmup_index_pages().unwrap();
+        assert_eq!(a.pages_pinned, b.pages_pinned);
+        assert_eq!(t.buf.page_cache().pinned_pages(), a.pages_pinned);
     }
 }

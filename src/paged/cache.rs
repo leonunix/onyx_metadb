@@ -101,6 +101,13 @@ impl PageBuf {
         &self.page_store
     }
 
+    /// Shared page cache handle. Exposed so tree-level warmup paths
+    /// (`PagedL2p::warmup_index_pages`) can pin pages without
+    /// round-tripping through `PageBuf`'s per-op scratch storage.
+    pub fn page_cache(&self) -> &Arc<PageCache> {
+        &self.page_cache
+    }
+
     /// Read-only page access. Load from `PageCache` on miss.
     pub fn read(&mut self, pid: PageId) -> Result<&Page> {
         self.ensure_loaded(pid)?;
