@@ -12,7 +12,7 @@
 //! reopens force WAL replay for create/drop/clone volume + per-volume
 //! snapshot semantics.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use onyx_metadb::{Db, L2pValue, MetaDbError, SnapshotId, VolumeOrdinal};
@@ -128,7 +128,17 @@ proptest! {
                     prop_assert_eq!(tree_old, ref_old);
                 }
                 Op::CreateVolume => {
-                    let ord = db.create_volume().unwrap();
+                    // Growing the volume table shrinks the per-page
+                    // snapshot capacity, so `create_volume` can return
+                    // `InvalidArgument` once the manifest is tight. Treat
+                    // it as back-pressure and skip the op.
+                    let ord = match db.create_volume() {
+                        Ok(ord) => ord,
+                        Err(MetaDbError::InvalidArgument(_)) => continue,
+                        Err(e) => return Err(TestCaseError::fail(format!(
+                            "unexpected create_volume error: {e:?}"
+                        ))),
+                    };
                     prop_assert!(!model.volumes.contains(&ord));
                     model.volumes.push(ord);
                 }
@@ -153,7 +163,17 @@ proptest! {
                 }
                 Op::TakeSnapshot(slot) => {
                     let Some(ord) = model.vol_at(slot) else { continue; };
-                    let id = db.take_snapshot(ord).unwrap();
+                    // `InvalidArgument` at this call site means the manifest
+                    // snapshot table is full (capacity depends on shard /
+                    // dedup layout). That's a normal back-pressure signal,
+                    // not a bug — skip the op without updating the model.
+                    let id = match db.take_snapshot(ord) {
+                        Ok(id) => id,
+                        Err(MetaDbError::InvalidArgument(_)) => continue,
+                        Err(e) => return Err(TestCaseError::fail(format!(
+                            "unexpected take_snapshot error: {e:?}"
+                        ))),
+                    };
                     let frozen = model.vol_state(ord);
                     model.snapshots.insert(id, (ord, frozen));
                     model.snap_ids.push(id);
@@ -166,7 +186,15 @@ proptest! {
                 }
                 Op::CloneVolume(slot) => {
                     let Some(src_snap) = model.snap_at(slot) else { continue; };
-                    let new_ord = db.clone_volume(src_snap).unwrap();
+                    // `InvalidArgument` here means `max_volumes` is
+                    // reached — a capacity limit, not a bug. Skip the op.
+                    let new_ord = match db.clone_volume(src_snap) {
+                        Ok(ord) => ord,
+                        Err(MetaDbError::InvalidArgument(_)) => continue,
+                        Err(e) => return Err(TestCaseError::fail(format!(
+                            "unexpected clone_volume error: {e:?}"
+                        ))),
+                    };
                     prop_assert!(!model.volumes.contains(&new_ord));
                     model.volumes.push(new_ord);
                     // Seed clone state from the source snapshot.
@@ -296,8 +324,18 @@ fn volume_lifecycle_matches_reference_long_run() {
                             }
                         }
                         Op::CreateVolume => {
-                            let ord = db.create_volume().map_err(|e|
-                                TestCaseError::fail(format!("{e:?}")))?;
+                            // Same manifest-capacity back-pressure as
+                            // the short variant — skip on
+                            // `InvalidArgument`.
+                            let ord = match db.create_volume() {
+                                Ok(ord) => ord,
+                                Err(MetaDbError::InvalidArgument(_)) => continue,
+                                Err(e) => {
+                                    return Err(TestCaseError::fail(format!(
+                                        "unexpected create_volume error: {e:?}"
+                                    )));
+                                }
+                            };
                             model.volumes.push(ord);
                         }
                         Op::DropVolume(slot) => {
@@ -329,8 +367,21 @@ fn volume_lifecycle_matches_reference_long_run() {
                         }
                         Op::TakeSnapshot(slot) => {
                             let Some(ord) = model.vol_at(slot) else { continue; };
-                            let id = db.take_snapshot(ord).map_err(|e|
-                                TestCaseError::fail(format!("{e:?}")))?;
+                            // Manifest snapshot table has a capacity derived
+                            // from shard / dedup layout; once full,
+                            // `take_snapshot` returns `InvalidArgument`.
+                            // That's expected back-pressure under a
+                            // snapshot-heavy op sequence — skip without
+                            // touching the model.
+                            let id = match db.take_snapshot(ord) {
+                                Ok(id) => id,
+                                Err(MetaDbError::InvalidArgument(_)) => continue,
+                                Err(e) => {
+                                    return Err(TestCaseError::fail(format!(
+                                        "unexpected take_snapshot error: {e:?}"
+                                    )));
+                                }
+                            };
                             let frozen = model.vol_state(ord);
                             model.snapshots.insert(id, (ord, frozen));
                             model.snap_ids.push(id);
@@ -344,8 +395,18 @@ fn volume_lifecycle_matches_reference_long_run() {
                         }
                         Op::CloneVolume(slot) => {
                             let Some(src_snap) = model.snap_at(slot) else { continue; };
-                            let new_ord = db.clone_volume(src_snap).map_err(|e|
-                                TestCaseError::fail(format!("{e:?}")))?;
+                            // `max_volumes` cap: treat `InvalidArgument` as
+                            // "skip this op", matching the TakeSnapshot
+                            // handling above.
+                            let new_ord = match db.clone_volume(src_snap) {
+                                Ok(ord) => ord,
+                                Err(MetaDbError::InvalidArgument(_)) => continue,
+                                Err(e) => {
+                                    return Err(TestCaseError::fail(format!(
+                                        "unexpected clone_volume error: {e:?}"
+                                    )));
+                                }
+                            };
                             model.volumes.push(new_ord);
                             let (_, ref frozen) = model.snapshots[&src_snap];
                             for (lba, val) in frozen.iter() {

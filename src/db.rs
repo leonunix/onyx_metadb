@@ -486,7 +486,7 @@ impl Db {
                     Ok(ApplyOutcome::Dedup)
                 }
                 WalOp::CloneVolume {
-                    src_ord,
+                    src_ord: _,
                     new_ord,
                     src_snap_id: _,
                     src_shard_roots,
@@ -494,18 +494,19 @@ impl Db {
                     if !volumes.contains_key(new_ord) {
                         apply_clone_volume_incref(&page_store, &faults, lsn, src_shard_roots)?;
                         // Same stale-buffer hazard as `Db::clone_volume`:
-                        // the source volume's PagedL2p buffers (opened
-                        // above from the on-disk manifest) still hold
-                        // pre-incref Clean copies of these roots. Drop
-                        // them or a later `L2pPut` replay on the source
-                        // volume would cow from a stale refcount.
-                        let src_vol = volumes.get(src_ord).cloned();
+                        // every volume whose PagedL2p was opened above
+                        // may hold a pre-incref Clean copy of one of
+                        // these roots — not just the source. Sweep all
+                        // volumes so a later `incref_root_for_snapshot`
+                        // or `cow_for_write` during replay can't flush a
+                        // stale rc back over our disk-direct bump.
+                        let all_vols: Vec<Arc<Volume>> = volumes.values().cloned().collect();
                         for &pid in src_shard_roots {
                             if pid == crate::types::NULL_PAGE {
                                 continue;
                             }
                             page_cache.invalidate(pid);
-                            if let Some(vol) = &src_vol {
+                            for vol in &all_vols {
                                 for shard in &vol.shards {
                                     shard.tree.lock().forget_page(pid);
                                 }
@@ -1594,6 +1595,23 @@ impl Db {
             }
             let ord = mstate.manifest.next_volume_ord;
             let shard_count = self.volume_zero().shards.len() as u32;
+            // Probe encode: adding a volume shrinks the per-page snapshot
+            // budget. If the existing snapshot table no longer fits once
+            // we grow `volumes`, reject now — otherwise the overflow
+            // would surface at the next flush / snapshot commit with no
+            // way to roll back the intervening WAL ops. Matches the
+            // probe `take_snapshot` runs before its own irreversible
+            // side effects.
+            let mut probe = mstate.manifest.clone();
+            probe.volumes.push(VolumeEntry {
+                ord,
+                shard_count,
+                l2p_shard_roots: vec![crate::types::NULL_PAGE; shard_count as usize]
+                    .into_boxed_slice(),
+                created_lsn: 0,
+                flags: 0,
+            });
+            probe.check_encodable()?;
             (ord, shard_count)
         };
 
@@ -1882,6 +1900,20 @@ impl Db {
                 )));
             }
             let new_ord = mstate.manifest.next_volume_ord;
+            let shard_count = entry.l2p_shard_roots.len();
+            // Probe encode: same rationale as `create_volume` — growing
+            // the volume table can squeeze the snapshot table out of
+            // capacity, so reject before any irreversible WAL submit /
+            // page refcount bump.
+            let mut probe = mstate.manifest.clone();
+            probe.volumes.push(VolumeEntry {
+                ord: new_ord,
+                shard_count: shard_count as u32,
+                l2p_shard_roots: vec![crate::types::NULL_PAGE; shard_count].into_boxed_slice(),
+                created_lsn: 0,
+                flags: 0,
+            });
+            probe.check_encodable()?;
             (
                 entry.vol_ord,
                 entry.l2p_shard_roots.to_vec(),
@@ -1912,20 +1944,25 @@ impl Db {
         apply_clone_volume_incref(&self.page_store, &self.faults, lsn, &src_shard_roots)?;
         // `apply_clone_volume_incref` writes through `page_store`, so the
         // shared `page_cache` *and* every in-memory `PageBuf` that holds
-        // a stale pre-incref copy of one of these roots need to drop it
-        // or a subsequent `cow_for_write` on the source volume would
-        // read the wrong refcount (see `drop_snapshot` for the same
-        // invariant). The source volume is the only one that could have
-        // a stale buffer here — `build_clone_volume_shards` below opens
-        // fresh `PagedL2p`s for the clone, which read straight from
-        // disk.
-        let src_volume = self.volumes.read().get(&src_ord).cloned();
+        // a stale pre-incref copy of one of these roots need to drop it.
+        // It's not enough to invalidate only the source volume: every
+        // previously-created clone of the same snapshot already has its
+        // own PageBuf with the root cached at the pre-incref rc; that
+        // stale Clean copy can be dirtied by a later `incref_root_for_snapshot`
+        // (take_snapshot on a clone) or promoted to a `cow_for_write`
+        // fast-path decision, both of which would then flush an incorrect
+        // refcount back over the disk-direct rc we just wrote. Invalidate
+        // the page in every volume's PageBuf — `forget_page` is a no-op
+        // on volumes that don't share the pid, so the sweep is safe.
+        // `build_clone_volume_shards` below opens fresh `PagedL2p`s for
+        // the clone, which read straight from disk.
+        let all_volumes: Vec<Arc<Volume>> = self.volumes.read().values().cloned().collect();
         for &pid in &src_shard_roots {
             if pid == crate::types::NULL_PAGE {
                 continue;
             }
             self.page_cache.invalidate(pid);
-            if let Some(vol) = &src_volume {
+            for vol in &all_volumes {
                 for shard in &vol.shards {
                     shard.tree.lock().forget_page(pid);
                 }
