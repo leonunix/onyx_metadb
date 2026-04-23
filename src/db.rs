@@ -30,7 +30,7 @@ use crate::paged::PagedL2p;
 use crate::paged::{DiffEntry, L2pValue};
 use crate::testing::faults::{FaultController, FaultPoint};
 use crate::tx::{ApplyOutcome, Transaction};
-use crate::types::{Lba, Lsn, PageId, Pba, SnapshotId, VolumeOrdinal};
+use crate::types::{FIRST_DATA_PAGE, Lba, Lsn, PageId, Pba, SnapshotId, VolumeOrdinal};
 use crate::verify;
 use crate::wal::{Wal, WalOp, encode_body};
 
@@ -1183,21 +1183,29 @@ impl Db {
         let target_end = target_start + target.shards.len();
 
         let id = manifest_state.manifest.next_snapshot_id;
-        let mut l2p_roots = Vec::with_capacity(target.shards.len());
-        for tree in &mut l2p_guards[target_start..target_end] {
-            tree.incref_root_for_snapshot()?;
-            l2p_roots.push(tree.root());
-        }
+        let next_snapshot_id = id
+            .checked_add(1)
+            .ok_or_else(|| MetaDbError::Corruption("snapshot id overflow".into()))?;
+
+        // Sample roots without incref'ing. The actual incref lands only
+        // after the projected manifest passes a dry-run encode below —
+        // see commit-ordering rationale on the pre-check.
+        //
         // Phase 6.5b: refcount is a running tally, not point-in-time
         // state. Snapshots only capture L2P. We still hold refcount
-        // guards below for `max_generation_from_two_groups` and
+        // guards for `max_generation_from_two_groups` and
         // `refresh_manifest_from_locked`, but skip the per-tree
         // snapshot incref.
+        let l2p_roots: Vec<PageId> = l2p_guards[target_start..target_end]
+            .iter()
+            .map(|tree| tree.root())
+            .collect();
         let created_lsn = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
-        let l2p_roots_page = write_snapshot_roots_page(&self.page_store, &l2p_roots, created_lsn)?;
 
-        flush_locked_l2p_shards(&mut l2p_guards)?;
-        self.flush_locked_refcount_shards(&mut refcount_guards)?;
+        // Bring the manifest up to the version we intend to commit,
+        // minus the new snapshot entry. Running prepare/refresh first
+        // means the capacity pre-check below sees the exact dedup /
+        // volume layout `encode()` will see at commit time.
         let dedup_update =
             self.prepare_dedup_manifest_update(&mut manifest_state.manifest, created_lsn)?;
         self.refresh_manifest_from_locked(
@@ -1206,6 +1214,40 @@ impl Db {
             &l2p_guards,
             &refcount_guards,
         )?;
+
+        // Pre-check: does the projected manifest (with the new snapshot
+        // entry appended) still fit in one page? Failures after this
+        // point would persist shard-root refcount bumps without a
+        // matching snapshot entry — offline verify then reports
+        // orphan rc. Why: `manifest_state.store.commit(...)` below calls
+        // `Manifest::encode`, which rejects a too-full snapshot table
+        // with `InvalidArgument`. Running the same encode against a
+        // probe page here turns that failure into a clean early return
+        // before any irreversible side effect (incref / page write /
+        // shard flush). Use a non-NULL placeholder for `l2p_roots_page`
+        // — encode only rejects `NULL_PAGE`, any other value passes.
+        {
+            let mut probe = manifest_state.manifest.clone();
+            probe.checkpoint_lsn = *self.last_applied_lsn.lock();
+            probe.snapshots.push(SnapshotEntry {
+                id,
+                vol_ord,
+                l2p_roots_page: FIRST_DATA_PAGE,
+                created_lsn,
+                l2p_shard_roots: l2p_roots.clone().into_boxed_slice(),
+            });
+            probe.next_snapshot_id = next_snapshot_id;
+            probe.check_encodable()?;
+        }
+
+        // Pre-check passed; safe to make irreversible changes.
+        let l2p_roots_page = write_snapshot_roots_page(&self.page_store, &l2p_roots, created_lsn)?;
+        for tree in &mut l2p_guards[target_start..target_end] {
+            tree.incref_root_for_snapshot()?;
+        }
+        flush_locked_l2p_shards(&mut l2p_guards)?;
+        self.flush_locked_refcount_shards(&mut refcount_guards)?;
+
         manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
         manifest_state.manifest.snapshots.push(SnapshotEntry {
             id,
@@ -1214,9 +1256,7 @@ impl Db {
             created_lsn,
             l2p_shard_roots: l2p_roots.into_boxed_slice(),
         });
-        manifest_state.manifest.next_snapshot_id = id
-            .checked_add(1)
-            .ok_or_else(|| MetaDbError::Corruption("snapshot id overflow".into()))?;
+        manifest_state.manifest.next_snapshot_id = next_snapshot_id;
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
         self.finish_dedup_manifest_update(dedup_update, created_lsn)?;
@@ -1361,24 +1401,66 @@ impl Db {
                 source_volume.shards.len(),
             )));
         }
-        let mut pages: Vec<PageId> = Vec::new();
-        {
-            let mut guards: Vec<MutexGuard<'_, PagedL2p>> = source_volume
-                .shards
-                .iter()
-                .map(|s| s.tree.lock())
-                .collect();
-            // Flush any dirty tree pages (including the root's
-            // post-take_snapshot rc bump) so apply_op_bare reads the
-            // live values by pid via page_store.
-            flush_locked_l2p_shards(&mut guards)?;
-            for (tree, &root) in guards.iter_mut().zip(entry.l2p_shard_roots.iter()) {
-                if root == crate::types::NULL_PAGE {
-                    continue;
-                }
-                pages.extend(tree.collect_drop_pages(root)?);
+        // Lock ALL volumes' shards and refcount shards so we can flush +
+        // refresh manifest before the decref cascade.
+        //
+        // Refreshing the manifest here is load-bearing: prior
+        // `commit_ops` cows may have advanced each volume's root
+        // without updating `manifest.volumes`. If we went straight to
+        // the cascade and froze `rc(pid)=0` for any page that was
+        // already cow'd away from by a live volume but is still
+        // referenced by this snapshot, the on-disk manifest would
+        // still list that freed pid as the volume's root — the next
+        // open would then fail inside `open_l2p_shards` reading a
+        // Free page. Commit a refreshed manifest (snapshot still
+        // present) so reopen always finds current roots.
+        let volumes_snap = self.volumes_snapshot();
+        let mut l2p_guards = lock_all_l2p_shards_for(&volumes_snap);
+        let mut refcount_guards = self.lock_all_refcount_shards();
+        flush_locked_l2p_shards(&mut l2p_guards)?;
+        self.flush_locked_refcount_shards(&mut refcount_guards)?;
+
+        let checkpoint_lsn = *self.last_applied_lsn.lock();
+        let dedup_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        let dedup_update = {
+            let mut mstate = self.manifest_state.lock();
+            let dedup_update =
+                self.prepare_dedup_manifest_update(&mut mstate.manifest, dedup_generation)?;
+            self.refresh_manifest_from_locked(
+                &mut mstate.manifest,
+                &volumes_snap,
+                &l2p_guards,
+                &refcount_guards,
+            )?;
+            mstate.manifest.checkpoint_lsn = checkpoint_lsn;
+            let manifest = mstate.manifest.clone();
+            mstate.store.commit(&manifest)?;
+            dedup_update
+        };
+        self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
+
+        // Locate the source volume's shard range within l2p_guards.
+        let mut source_start = 0usize;
+        for vol in &volumes_snap {
+            if vol.ord == entry.vol_ord {
+                break;
             }
+            source_start += vol.shards.len();
         }
+        let source_end = source_start + source_volume.shards.len();
+
+        let mut pages: Vec<PageId> = Vec::new();
+        for (tree, &root) in l2p_guards[source_start..source_end]
+            .iter_mut()
+            .zip(entry.l2p_shard_roots.iter())
+        {
+            if root == crate::types::NULL_PAGE {
+                continue;
+            }
+            pages.extend(tree.collect_drop_pages(root)?);
+        }
+        drop(l2p_guards);
+        drop(refcount_guards);
         // NOTE on `entry.l2p_roots_page`: this SnapshotRoots page is
         // referenced only by the manifest's snapshot entry, so it
         // *logically* becomes unreferenced when we apply the drop.
@@ -1628,21 +1710,71 @@ impl Db {
             None => return Ok(None),
         };
 
-        let mut pages: Vec<PageId> = Vec::new();
-        {
-            let mut guards: Vec<MutexGuard<'_, PagedL2p>> =
-                volume.shards.iter().map(|s| s.tree.lock()).collect();
-            // Flush any dirty tree pages so apply_drop_snapshot_pages
-            // reads the live rcs by pid via page_store.
-            flush_locked_l2p_shards(&mut guards)?;
-            for tree in &mut guards {
-                let root = tree.root();
-                if root == crate::types::NULL_PAGE {
-                    continue;
-                }
-                pages.extend(tree.collect_drop_pages(root)?);
+        // Lock ALL volumes' shards + refcount shards so we can flush
+        // them and later commit a refreshed manifest.
+        let volumes_snap = self.volumes_snapshot();
+        let mut l2p_guards = lock_all_l2p_shards_for(&volumes_snap);
+        let mut refcount_guards = self.lock_all_refcount_shards();
+        flush_locked_l2p_shards(&mut l2p_guards)?;
+        self.flush_locked_refcount_shards(&mut refcount_guards)?;
+
+        // Locate the dying volume's shard range within l2p_guards.
+        let mut target_start = 0usize;
+        for vol in &volumes_snap {
+            if vol.ord == vol_ord {
+                break;
             }
+            target_start += vol.shards.len();
         }
+        let target_end = target_start + volume.shards.len();
+
+        let mut pages: Vec<PageId> = Vec::new();
+        for tree in &mut l2p_guards[target_start..target_end] {
+            let root = tree.root();
+            if root == crate::types::NULL_PAGE {
+                continue;
+            }
+            pages.extend(tree.collect_drop_pages(root)?);
+        }
+
+        // Commit a manifest that:
+        //   (a) reflects current roots for every surviving volume
+        //       (prior commit_ops cows may have moved their roots
+        //       without touching the on-disk manifest),
+        //   (b) no longer lists this volume, and
+        //   (c) has the dedup memtables flushed so the new
+        //       checkpoint_lsn doesn't skip in-RAM-only dedup rows
+        //       during WAL replay.
+        //
+        // Doing this BEFORE the page-freeing cascade is load-bearing:
+        // on crash between commit and cascade, reopen sees no vol_ord
+        // entry and simply leaves the tree pages as orphans for
+        // `reclaim_orphan_pages` to collect. If we instead committed
+        // with `vol_ord` still present (its roots about to be freed),
+        // a crash between cascade and a *later* commit would leave
+        // the on-disk manifest pointing at Free pages, and
+        // `open_l2p_shards` would fail at the next open.
+        let checkpoint_lsn = *self.last_applied_lsn.lock();
+        let dedup_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        let dedup_update = {
+            let mut mstate = self.manifest_state.lock();
+            let dedup_update =
+                self.prepare_dedup_manifest_update(&mut mstate.manifest, dedup_generation)?;
+            self.refresh_manifest_from_locked(
+                &mut mstate.manifest,
+                &volumes_snap,
+                &l2p_guards,
+                &refcount_guards,
+            )?;
+            mstate.manifest.volumes.retain(|v| v.ord != vol_ord);
+            mstate.manifest.checkpoint_lsn = checkpoint_lsn;
+            let manifest = mstate.manifest.clone();
+            mstate.store.commit(&manifest)?;
+            dedup_update
+        };
+        self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
+        drop(l2p_guards);
+        drop(refcount_guards);
 
         let op = WalOp::DropVolume {
             ord: vol_ord,

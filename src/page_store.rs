@@ -30,11 +30,27 @@ use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageHeader, PageType};
 use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 
+const RC_LOCK_SHARDS: usize = 64;
+
 /// Flat page file.
 pub struct PageStore {
     path: PathBuf,
     file: File,
     inner: Mutex<Inner>,
+    /// Per-pid sharded mutexes serialising [`atomic_rc_delta`]. Needed
+    /// because a page can be shared across multiple [`PagedL2p`]
+    /// instances after `clone_volume` — two trees each holding their
+    /// own `PageBuf` would otherwise each read the same pre-decrement
+    /// rc and race their writes back to disk (last-writer-wins losing
+    /// one decrement).
+    rc_locks: Box<[Mutex<()>]>,
+}
+
+fn new_rc_locks() -> Box<[Mutex<()>]> {
+    (0..RC_LOCK_SHARDS)
+        .map(|_| Mutex::new(()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
 }
 
 impl std::fmt::Debug for PageStore {
@@ -77,6 +93,7 @@ impl PageStore {
                 high_water: FIRST_DATA_PAGE,
                 free_list: Vec::new(),
             }),
+            rc_locks: new_rc_locks(),
         })
     }
 
@@ -116,6 +133,7 @@ impl PageStore {
                 high_water,
                 free_list,
             }),
+            rc_locks: new_rc_locks(),
         })
     }
 
@@ -159,6 +177,47 @@ impl PageStore {
         self.file
             .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
         Ok(())
+    }
+
+    /// Atomically mutate the refcount of `page_id` by `delta` (positive
+    /// for incref, negative for decref). Returns the post-delta rc.
+    ///
+    /// Bypasses [`PageCache`] and [`PageBuf`]: reads the authoritative
+    /// on-disk version inside a per-pid sharded mutex, mutates, writes
+    /// back. Used by [`crate::paged::PageBuf::cow_for_write`] when the
+    /// page is shared across multiple tree instances (post-`clone_volume`).
+    /// Without this, two trees each holding a Clean copy would race:
+    /// both read the same pre-decrement rc, both write rc-1 via flush,
+    /// losing one decrement.
+    ///
+    /// Leaves `page.generation` unchanged — that field is reserved for
+    /// WAL-apply idempotency markers and must not regress.
+    ///
+    /// The caller is responsible for invalidating any cached copies of
+    /// `page_id` in `PageCache` / `PageBuf` after this call so a
+    /// subsequent read observes the new rc.
+    pub fn atomic_rc_delta(&self, page_id: PageId, delta: i32) -> Result<u32> {
+        self.check_in_range(page_id)?;
+        let shard = (page_id as usize) % RC_LOCK_SHARDS;
+        let _guard = self.rc_locks[shard].lock();
+        let mut page = read_page_raw(&self.file, page_id)?;
+        page.verify(page_id)?;
+        let cur = page.refcount();
+        let new_rc = if delta >= 0 {
+            cur.checked_add(delta as u32)
+        } else {
+            cur.checked_sub((-delta) as u32)
+        }
+        .ok_or_else(|| {
+            MetaDbError::Corruption(format!(
+                "atomic_rc_delta: page {page_id} refcount {cur} + {delta} out of range"
+            ))
+        })?;
+        page.set_refcount(new_rc);
+        page.seal();
+        self.file
+            .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
+        Ok(new_rc)
     }
 
     /// Allocate a fresh page id. If the free list has entries, one is

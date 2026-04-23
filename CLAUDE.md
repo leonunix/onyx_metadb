@@ -28,17 +28,23 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
 | lsm | `src/lsm/` | 固定长度记录 LSM：dedup_index + dedup_reverse |
 | cache | `src/cache.rs` | 统一 16 shard page cache（LRU，scan-resistant） |
 | recovery | `src/recovery.rs` | 打开时 WAL replay |
-| verify | `src/verify.rs` | 结构校验器（`metadb-verify` CLI 的基础） |
+| verify | `src/verify.rs` | 结构校验器 + offline audit（`metadb-verify` 的核心） |
 | testing | `src/testing/` | 故障注入点 + 共享 test harness |
-| bin | `src/bin/` | CLI 二进制（8a 还要加 `metadb-verify` / `metadb-soak`） |
+| bin | `src/bin/` | CLI 二进制（`metadb-verify` / `metadb-soak`） |
 
 ## 关键不变式（非显而易见的，动之前先读）
 
 ### 锁序
 
-- `commit_lock`（`Db::commit_ops`）串行化 **WAL submit + apply**。LSN 顺序 ≡ apply
-  顺序，所以 recovery 重放必然和正常运行得到同一内存状态。未来 Phase 8b 要换成
-  LSN-ordered condvar，现在不要绕开。
+- commit path（`Db::commit_ops`）不再有全局 commit_lock。`wal.submit` 在无锁下
+  并发，WAL writer 负责 group commit；submit 返回拿到 LSN 后，通过
+  `last_applied_lsn` + `commit_cvar` 排队等 "我的 LSN - 1 已经 apply 完"，然后持
+  `apply_gate.read()` apply ops、bump `last_applied_lsn`、notify_all，**最后**才
+  drop read guard。LSN 顺序 ≡ apply 顺序依旧成立，但序列化的是 apply 阶段而不是
+  WAL fsync，所以 batch 重新形成。`flush` / `take_snapshot` / `drop_snapshot` 取
+  `apply_gate.write()` 排干所有 apply，保证采样的 `last_applied_lsn` 和 tree 状态
+  对齐。**bump 必须在 drop read gate 之前**，否则 flush 可能采到"tree 含 op N + 
+  checkpoint_lsn = N-1"的组合，recovery double-apply（refcount incref 非幂等）。
 - `Lsm::reader_drain`：read 侧给 `get` / `scan_prefix` 读 SST 期间用，write 侧是
   compaction 回收 victim page 前的 drain barrier。**先 read 侧、后 page IO、释放 read
   侧**；compaction 改完 levels 后必须 `drop(reader_drain.write())` 再 `free_victims`。
@@ -68,8 +74,15 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
 - WAL 记录体 = `encode_body(&[WalOp])`，CRC32C 覆盖 body。
 - recovery = 找到最新有效 manifest → 从 `checkpoint_lsn + 1` 回放 WAL → 截断撕裂的
   尾部。apply 必须**幂等**（apply_op 对同一 op 重放结果一致）。
-- 目前 WAL 有 `group_commit_max_batch_bytes` / 超时合批，但 commit path 被
-  `commit_lock` 串行了，所以 batch 形不起来。Phase 8b 才解开。
+- WAL 有 `group_commit_max_batch_bytes` / 超时合批，Phase 8b 把 commit path
+  的全局锁去掉后真正形成 batch：多 writer 场景下 fsync 数接近 `ceil(ops / batch)`，
+  不再是 1:1。单线程提交仍是 1 fsync/op，因为 writer 端没有并发 submit 可合。
+- **DropSnapshot 走 WAL**：`TakeSnapshot` 仍然只靠 manifest commit（没落盘的
+  snapshot 等同于没存在过），但 `DropSnapshot` 会同时改页 refcount 和 snapshot
+  列表，单次 manifest commit 无法把两者原子化。所以 drop 记录进 WAL，带 rc
+  级联算出来的 page 列表；apply 对每页做 `rc--`，靠 `page.generation >= lsn`
+  做重放幂等。`drop_snapshot` 取 `drop_gate.write()` 排他，确保 plan 期间无
+  并发 `cow_for_write` 改动共享页；commit 路径取 `drop_gate.read()` 共享。
 
 ### Manifest swap
 
@@ -103,7 +116,7 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
 - 模块顶部的 `//!` 说明**责任 + 并发模型**，别写"这个模块做 X"（代码已经告诉你了）。
 - 新增公共 API 要在 `README.md` 的 "Public API at a glance" 里顺手加一行。
 - 不要轻易引入新 crate。当前依赖：`parking_lot` / `xxhash-rust` / `lru` / `crc32c` /
-  `tempfile`（test）/ `proptest`（test）/ `rand`（test）。
+  `rand` / `rand_chacha` / `tempfile`（test）/ `proptest`（test）。
 - `unsafe` 需要写原因注释。目前只有 page_store / AlignedBuf 几处，边界明确。
 
 ## 和 onyx-storage 的关系

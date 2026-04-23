@@ -3,7 +3,7 @@
 //! drop-snapshot side effects staying scoped to the source volume, and
 //! crash recovery with snapshots on non-bootstrap volumes.
 
-use onyx_metadb::{Db, L2pValue};
+use onyx_metadb::{Config, Db, L2pValue, VerifyOptions, verify_path};
 use tempfile::TempDir;
 
 fn v(n: u8) -> L2pValue {
@@ -129,6 +129,63 @@ fn drop_volume_while_snapshot_exists_is_refused() {
 
     assert!(db.drop_volume(ord).is_err());
     assert_eq!(db.volumes(), vec![0, ord]);
+}
+
+/// Reproducer for the soak failure at cycle 2801 (20260422T145020Z):
+/// `take_snapshot` incref'd + flushed shard root refcounts before
+/// `store.commit(&manifest)` ran, so when the manifest encode failed
+/// the capacity check the refcount bumps stayed on disk as orphans.
+/// Offline verify then reported every L2P shard root as
+/// `header=N+1, expected=N`.
+///
+/// To trigger the capacity-check failure deterministically we dial
+/// `shards_per_partition` up to 240 — with one bootstrap volume that
+/// leaves room for exactly 4 snapshot entries in the v6 manifest.
+/// The 5th `take_snapshot` must fail *atomically*: page refcounts
+/// must not leak.
+#[test]
+fn take_snapshot_capacity_failure_does_not_leak_refcount() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.shards_per_partition = 240;
+    cfg.direct_io = false;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    // Take snapshots on the bootstrap volume (ord 0) until the cap is
+    // hit. With 240 shards and 1 volume, max_snapshots = 4.
+    let mut taken = 0usize;
+    let err = loop {
+        match db.take_snapshot(0) {
+            Ok(_) => {
+                taken += 1;
+                assert!(taken <= 64, "snapshot cap should trigger well before 64");
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        taken >= 1,
+        "should have taken at least one snapshot before hitting cap"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("snapshot count") && msg.contains("exceeds capacity"),
+        "expected capacity-exceeded error, got {msg:?}"
+    );
+
+    // Drop the db so verify_path can open the store cleanly.
+    drop(db);
+
+    let report = verify_path(dir.path(), VerifyOptions::default()).unwrap();
+    let rc_issues: Vec<&String> = report
+        .issues
+        .iter()
+        .filter(|i| i.contains("refcount mismatch"))
+        .collect();
+    assert!(
+        rc_issues.is_empty(),
+        "take_snapshot failed after flush — orphan refcount bumps on disk: {rc_issues:#?}"
+    );
 }
 
 #[test]

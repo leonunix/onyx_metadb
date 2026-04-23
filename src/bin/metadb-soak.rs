@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -9,11 +9,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
-use onyx_metadb::{Db, DedupValue, Hash32, L2pValue, SnapshotId, VerifyOptions, verify_path};
+use onyx_metadb::{
+    Db, DedupValue, Hash32, L2pValue, SnapshotId, VerifyOptions, VolumeOrdinal, verify_path,
+};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 const KEY_SLOTS_PER_THREAD: u64 = 256;
+const MAX_LIVE_VOLUMES: usize = 4;
+const BOOTSTRAP_VOL: VolumeOrdinal = 0;
 
 fn main() -> ExitCode {
     match run() {
@@ -238,11 +242,36 @@ struct Summary {
     last_error: Option<String>,
 }
 
-#[derive(Default)]
 struct Model {
-    l2p: BTreeMap<u64, L2pValue>,
+    l2p: BTreeMap<VolumeOrdinal, BTreeMap<u64, L2pValue>>,
     dedup: BTreeMap<Hash32, DedupValue>,
     refcount: BTreeMap<u64, u32>,
+}
+
+impl Default for Model {
+    fn default() -> Self {
+        let mut l2p = BTreeMap::new();
+        l2p.insert(BOOTSTRAP_VOL, BTreeMap::new());
+        Self {
+            l2p,
+            dedup: BTreeMap::new(),
+            refcount: BTreeMap::new(),
+        }
+    }
+}
+
+impl Model {
+    fn live_volumes(&self) -> Vec<VolumeOrdinal> {
+        self.l2p.keys().copied().collect()
+    }
+
+    fn drop_candidates(&self, pinned: &BTreeSet<VolumeOrdinal>) -> Vec<VolumeOrdinal> {
+        self.l2p
+            .keys()
+            .copied()
+            .filter(|ord| *ord != BOOTSTRAP_VOL && !pinned.contains(ord))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -259,14 +288,23 @@ enum WorkerOpKind {
 #[derive(Clone, Debug)]
 struct WorkerOp {
     tid: usize,
+    vol_ord: VolumeOrdinal,
     slot: u64,
     kind: WorkerOpKind,
+}
+
+#[derive(Clone, Debug)]
+struct ModelSnapshot {
+    id: SnapshotId,
+    vol_ord: VolumeOrdinal,
+    l2p: BTreeMap<u64, L2pValue>,
 }
 
 #[derive(Clone, Debug)]
 enum Ack {
     Ok(u64),
     Snapshot(u64, SnapshotId),
+    Volume(u64, VolumeOrdinal),
     Error(u64, String),
 }
 
@@ -290,7 +328,7 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
         .map(|tid| ChaCha8Rng::seed_from_u64(cfg.seed ^ ((tid as u64 + 1) << 20)))
         .collect();
     let mut cycle_rng = ChaCha8Rng::seed_from_u64(cfg.seed ^ 0xA11C_E001);
-    let mut snapshots: Vec<(SnapshotId, BTreeMap<u64, L2pValue>)> = Vec::new();
+    let mut snapshots: Vec<ModelSnapshot> = Vec::new();
     let mut total_ops = 0u64;
     let mut cycles = 0u64;
     let mut restarts = 0u64;
@@ -317,6 +355,7 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
             &mut child,
             &mut model,
             &mut rngs,
+            &mut cycle_rng,
             &mut snapshots,
             &mut total_ops,
             &mut events,
@@ -390,11 +429,17 @@ fn run_cycle(
     child: &mut ChildHandle,
     model: &mut Model,
     rngs: &mut [ChaCha8Rng],
-    snapshots: &mut Vec<(SnapshotId, BTreeMap<u64, L2pValue>)>,
+    admin_rng: &mut ChaCha8Rng,
+    snapshots: &mut Vec<ModelSnapshot>,
     total_ops: &mut u64,
     events: &mut EventLog,
 ) -> Result<(), String> {
     let mut next_id = 1u64;
+
+    // Phase 1: pre-worker volume admin (create / drop / clone).
+    next_id = run_volume_admin(child, cycle, model, admin_rng, snapshots, events, next_id)?;
+
+    // Phase 2: workers pounding across the live volume set.
     let mut sent_ops = 0usize;
     let mut free_tids: VecDeque<usize> = (0..cfg.threads).collect();
     let mut inflight: HashMap<u64, WorkerOp> = HashMap::new();
@@ -425,16 +470,26 @@ fn run_cycle(
                     .ok_or_else(|| format!("unknown error id {id}"))?;
                 events.write(
                     "worker_error",
-                    &format!("cycle={} tid={} err={}", cycle, op.tid, escape_json(&err)),
+                    &format!(
+                        "cycle={} tid={} vol={} err={}",
+                        cycle,
+                        op.tid,
+                        op.vol_ord,
+                        escape_json(&err)
+                    ),
                 )?;
                 free_tids.push_back(op.tid);
             }
             Ack::Snapshot(id, _) => {
                 return Err(format!("unexpected snapshot ack {id} in worker phase"));
             }
+            Ack::Volume(id, _) => {
+                return Err(format!("unexpected volume ack {id} in worker phase"));
+            }
         }
     }
 
+    // Phase 3: flush + per-volume snapshot on a random live vol.
     send_admin(child, next_id, "FLUSH")?;
     match recv_ack(child)? {
         Ack::Ok(id) if id == next_id => {
@@ -450,20 +505,35 @@ fn run_cycle(
     }
     next_id += 1;
 
-    let snapshot_model = model.l2p.clone();
-    send_admin(child, next_id, "SNAPSHOT")?;
+    let live = model.live_volumes();
+    let snap_vol = live[admin_rng.gen_range(0..live.len())];
+    let snapshot_model = model
+        .l2p
+        .get(&snap_vol)
+        .cloned()
+        .unwrap_or_default();
+    send_admin(child, next_id, &format!("SNAPSHOT {snap_vol}"))?;
     match recv_ack(child)? {
         Ack::Snapshot(id, snapshot_id) if id == next_id => {
-            snapshots.push((snapshot_id, snapshot_model));
+            snapshots.push(ModelSnapshot {
+                id: snapshot_id,
+                vol_ord: snap_vol,
+                l2p: snapshot_model,
+            });
             events.write(
                 "snapshot_ok",
-                &format!("cycle={} snapshot={snapshot_id}", cycle),
+                &format!("cycle={} vol={} snapshot={}", cycle, snap_vol, snapshot_id),
             )?;
         }
         Ack::Error(id, err) if id == next_id => {
             events.write(
                 "snapshot_err",
-                &format!("cycle={} err={}", cycle, escape_json(&err)),
+                &format!(
+                    "cycle={} vol={} err={}",
+                    cycle,
+                    snap_vol,
+                    escape_json(&err)
+                ),
             )?;
         }
         other => return Err(format!("unexpected snapshot ack: {other:?}")),
@@ -471,22 +541,23 @@ fn run_cycle(
     next_id += 1;
 
     if snapshots.len() > 4 {
-        let (snapshot_id, _) = snapshots.remove(0);
-        send_admin(child, next_id, &format!("DROP {snapshot_id}"))?;
+        let entry = snapshots.remove(0);
+        send_admin(child, next_id, &format!("DROP {}", entry.id))?;
         match recv_ack(child)? {
             Ack::Ok(id) if id == next_id => {
                 events.write(
                     "drop_snapshot_ok",
-                    &format!("cycle={} snapshot={snapshot_id}", cycle),
+                    &format!("cycle={} vol={} snapshot={}", cycle, entry.vol_ord, entry.id),
                 )?;
             }
             Ack::Error(id, err) if id == next_id => {
                 events.write(
                     "drop_snapshot_err",
                     &format!(
-                        "cycle={} snapshot={} err={}",
+                        "cycle={} vol={} snapshot={} err={}",
                         cycle,
-                        snapshot_id,
+                        entry.vol_ord,
+                        entry.id,
                         escape_json(&err)
                     ),
                 )?;
@@ -496,6 +567,100 @@ fn run_cycle(
     }
 
     Ok(())
+}
+
+/// Opportunistic create / drop / clone_volume run at the head of each
+/// cycle. Each branch fires with probability ~1/3 so cycles typically
+/// mutate the volume set exactly once and occasionally more.
+fn run_volume_admin(
+    child: &mut ChildHandle,
+    cycle: u64,
+    model: &mut Model,
+    rng: &mut ChaCha8Rng,
+    snapshots: &[ModelSnapshot],
+    events: &mut EventLog,
+    mut next_id: u64,
+) -> Result<u64, String> {
+    // Snapshots pin their source volume — we can't drop a vol if we
+    // still hold a snapshot entry over it.
+    let pinned: BTreeSet<VolumeOrdinal> = snapshots.iter().map(|s| s.vol_ord).collect();
+
+    // CREATE: cap total live volumes so ords don't explode.
+    if model.l2p.len() < MAX_LIVE_VOLUMES && rng.gen_bool(0.5) {
+        send_admin(child, next_id, "CREATE_VOLUME")?;
+        match recv_ack(child)? {
+            Ack::Volume(id, ord) if id == next_id => {
+                model.l2p.insert(ord, BTreeMap::new());
+                events.write(
+                    "create_volume_ok",
+                    &format!("cycle={cycle} ord={ord}"),
+                )?;
+            }
+            Ack::Error(id, err) if id == next_id => {
+                events.write(
+                    "create_volume_err",
+                    &format!("cycle={} err={}", cycle, escape_json(&err)),
+                )?;
+            }
+            other => return Err(format!("unexpected create-volume ack: {other:?}")),
+        }
+        next_id += 1;
+    }
+
+    // CLONE: roll a snapshot if we have any.
+    if model.l2p.len() < MAX_LIVE_VOLUMES && !snapshots.is_empty() && rng.gen_bool(0.4) {
+        let pick = rng.gen_range(0..snapshots.len());
+        let src = snapshots[pick].clone();
+        send_admin(child, next_id, &format!("CLONE_VOLUME {}", src.id))?;
+        match recv_ack(child)? {
+            Ack::Volume(id, ord) if id == next_id => {
+                model.l2p.insert(ord, src.l2p.clone());
+                events.write(
+                    "clone_volume_ok",
+                    &format!("cycle={} src_snap={} ord={}", cycle, src.id, ord),
+                )?;
+            }
+            Ack::Error(id, err) if id == next_id => {
+                events.write(
+                    "clone_volume_err",
+                    &format!(
+                        "cycle={} src_snap={} err={}",
+                        cycle,
+                        src.id,
+                        escape_json(&err)
+                    ),
+                )?;
+            }
+            other => return Err(format!("unexpected clone-volume ack: {other:?}")),
+        }
+        next_id += 1;
+    }
+
+    // DROP: only non-bootstrap, non-pinned volumes.
+    let candidates = model.drop_candidates(&pinned);
+    if !candidates.is_empty() && rng.gen_bool(0.35) {
+        let pick = candidates[rng.gen_range(0..candidates.len())];
+        send_admin(child, next_id, &format!("DROP_VOLUME {pick}"))?;
+        match recv_ack(child)? {
+            Ack::Ok(id) if id == next_id => {
+                model.l2p.remove(&pick);
+                events.write(
+                    "drop_volume_ok",
+                    &format!("cycle={} ord={}", cycle, pick),
+                )?;
+            }
+            Ack::Error(id, err) if id == next_id => {
+                events.write(
+                    "drop_volume_err",
+                    &format!("cycle={} ord={} err={}", cycle, pick, escape_json(&err)),
+                )?;
+            }
+            other => return Err(format!("unexpected drop-volume ack: {other:?}")),
+        }
+        next_id += 1;
+    }
+
+    Ok(next_id)
 }
 
 fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
@@ -552,12 +717,24 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
                     .ok_or_else(|| "missing admin verb".to_string())?;
                 let ack = match verb {
                     "FLUSH" => db.flush().map(|_| Ack::Ok(id)),
-                    "SNAPSHOT" => db
-                        .take_snapshot(0)
-                        .map(|snapshot| Ack::Snapshot(id, snapshot)),
+                    "SNAPSHOT" => {
+                        let vol_ord =
+                            parse_part_u64(parts.next(), "snapshot vol_ord")? as VolumeOrdinal;
+                        db.take_snapshot(vol_ord)
+                            .map(|snapshot| Ack::Snapshot(id, snapshot))
+                    }
                     "DROP" => {
                         let snap_id = parse_part_u64(parts.next(), "snapshot id")?;
                         db.drop_snapshot(snap_id).map(|_| Ack::Ok(id))
+                    }
+                    "CREATE_VOLUME" => db.create_volume().map(|ord| Ack::Volume(id, ord)),
+                    "DROP_VOLUME" => {
+                        let vol_ord = parse_part_u64(parts.next(), "drop vol_ord")? as VolumeOrdinal;
+                        db.drop_volume(vol_ord).map(|_| Ack::Ok(id))
+                    }
+                    "CLONE_VOLUME" => {
+                        let src_snap_id = parse_part_u64(parts.next(), "clone src_snap_id")?;
+                        db.clone_volume(src_snap_id).map(|ord| Ack::Volume(id, ord))
                     }
                     "QUIT" => {
                         for tx in &worker_txs {
@@ -635,6 +812,7 @@ fn write_ack_line(writer: &mut impl Write, ack: &Ack) -> std::io::Result<()> {
     match ack {
         Ack::Ok(id) => writeln!(writer, "OK {id}")?,
         Ack::Snapshot(id, snapshot_id) => writeln!(writer, "SNAP {id} {snapshot_id}")?,
+        Ack::Volume(id, ord) => writeln!(writer, "VOL {id} {ord}")?,
         Ack::Error(id, err) => writeln!(writer, "ERR {id} {}", escape_json(err))?,
     }
     writer.flush()
@@ -643,10 +821,10 @@ fn write_ack_line(writer: &mut impl Write, ack: &Ack) -> std::io::Result<()> {
 fn execute_worker_op(db: &Db, op: &WorkerOp) -> onyx_metadb::Result<()> {
     match op.kind {
         WorkerOpKind::Insert(byte) => {
-            db.insert(0, l2p_key(op.tid, op.slot), l2p_value(byte))?;
+            db.insert(op.vol_ord, l2p_key(op.tid, op.slot), l2p_value(byte))?;
         }
         WorkerOpKind::Delete => {
-            db.delete(0, l2p_key(op.tid, op.slot))?;
+            db.delete(op.vol_ord, l2p_key(op.tid, op.slot))?;
         }
         WorkerOpKind::PutDedup(byte) => {
             db.put_dedup(dedup_hash(op.tid, op.slot), dedup_value(byte))?;
@@ -661,7 +839,7 @@ fn execute_worker_op(db: &Db, op: &WorkerOp) -> onyx_metadb::Result<()> {
             let _ = db.decref_pba(refcount_pba(op.tid, op.slot), 1);
         }
         WorkerOpKind::Get => {
-            let _ = db.get(0, l2p_key(op.tid, op.slot))?;
+            let _ = db.get(op.vol_ord, l2p_key(op.tid, op.slot))?;
             let _ = db.get_dedup(&dedup_hash(op.tid, op.slot))?;
             let _ = db.get_refcount(refcount_pba(op.tid, op.slot))?;
         }
@@ -672,6 +850,8 @@ fn execute_worker_op(db: &Db, op: &WorkerOp) -> onyx_metadb::Result<()> {
 fn generate_worker_op(tid: usize, rng: &mut ChaCha8Rng, model: &Model) -> WorkerOp {
     let slot = rng.gen_range(0..KEY_SLOTS_PER_THREAD);
     let pba = refcount_pba(tid, slot);
+    let live = model.live_volumes();
+    let vol_ord = live[rng.gen_range(0..live.len())];
     let kind = match rng.gen_range(0..100) {
         0..=29 => WorkerOpKind::Insert(rng.r#gen()),
         30..=39 => WorkerOpKind::Delete,
@@ -682,16 +862,25 @@ fn generate_worker_op(tid: usize, rng: &mut ChaCha8Rng, model: &Model) -> Worker
         85..=94 => WorkerOpKind::Get,
         _ => WorkerOpKind::Get,
     };
-    WorkerOp { tid, slot, kind }
+    WorkerOp {
+        tid,
+        vol_ord,
+        slot,
+        kind,
+    }
 }
 
 fn apply_worker_op(model: &mut Model, op: &WorkerOp) -> Result<(), String> {
     match op.kind {
         WorkerOpKind::Insert(byte) => {
-            model.l2p.insert(l2p_key(op.tid, op.slot), l2p_value(byte));
+            if let Some(vol) = model.l2p.get_mut(&op.vol_ord) {
+                vol.insert(l2p_key(op.tid, op.slot), l2p_value(byte));
+            }
         }
         WorkerOpKind::Delete => {
-            model.l2p.remove(&l2p_key(op.tid, op.slot));
+            if let Some(vol) = model.l2p.get_mut(&op.vol_ord) {
+                vol.remove(&l2p_key(op.tid, op.slot));
+            }
         }
         WorkerOpKind::PutDedup(byte) => {
             model
@@ -727,27 +916,40 @@ fn apply_worker_op(model: &mut Model, op: &WorkerOp) -> Result<(), String> {
 fn verify_reopened_db(
     path: &Path,
     model: &Model,
-    snapshots: &[(SnapshotId, BTreeMap<u64, L2pValue>)],
+    snapshots: &[ModelSnapshot],
     threads: usize,
 ) -> onyx_metadb::Result<onyx_metadb::VerifyReport> {
     let db = Db::open(path)?;
     verify_live_db(&db, model, threads)?;
-    for (snapshot_id, snapshot_model) in snapshots {
-        verify_snapshot(&db, *snapshot_id, snapshot_model)?;
+    for snap in snapshots {
+        verify_snapshot(&db, snap.id, &snap.l2p)?;
     }
     drop(db);
     verify_path(path, VerifyOptions { strict: true })
 }
 
 fn verify_live_db(db: &Db, model: &Model, threads: usize) -> onyx_metadb::Result<()> {
-    let got_l2p: Vec<(u64, L2pValue)> = db
-        .range(0, ..)?
-        .collect::<onyx_metadb::Result<Vec<_>>>()?;
-    let want_l2p: Vec<(u64, L2pValue)> = model.l2p.iter().map(|(k, v)| (*k, *v)).collect();
-    if got_l2p != want_l2p {
-        return Err(onyx_metadb::MetaDbError::Corruption(
-            "L2P model diverged during soak".into(),
-        ));
+    // Volume set match: db.volumes() vs model.l2p keys.
+    let got_vols = db.volumes();
+    let want_vols: Vec<VolumeOrdinal> = model.l2p.keys().copied().collect();
+    if got_vols != want_vols {
+        return Err(onyx_metadb::MetaDbError::Corruption(format!(
+            "volume set diverged: got={got_vols:?} want={want_vols:?}"
+        )));
+    }
+
+    for (vol_ord, vol_model) in &model.l2p {
+        let got_l2p: Vec<(u64, L2pValue)> = db
+            .range(*vol_ord, ..)?
+            .collect::<onyx_metadb::Result<Vec<_>>>()?;
+        let want_l2p: Vec<(u64, L2pValue)> = vol_model.iter().map(|(k, v)| (*k, *v)).collect();
+        if got_l2p != want_l2p {
+            return Err(onyx_metadb::MetaDbError::Corruption(format!(
+                "L2P model diverged for vol {vol_ord} (got {} entries, want {} entries)",
+                got_l2p.len(),
+                want_l2p.len(),
+            )));
+        }
     }
 
     for tid in 0..threads {
@@ -851,10 +1053,11 @@ fn spawn_child(cfg: &ParentConfig, fault: Option<FaultSpec>) -> std::io::Result<
 fn send_worker_op(child: &mut ChildHandle, id: u64, op: &WorkerOp) -> Result<(), String> {
     writeln!(
         child.stdin,
-        "W {} {} {} {} {}",
+        "W {} {} {} {} {} {}",
         id,
         op.tid,
         worker_kind_name(&op.kind),
+        op.vol_ord,
         op.slot,
         worker_kind_arg(&op.kind)
     )
@@ -887,6 +1090,10 @@ fn parse_ack(line: &str) -> Result<Ack, String> {
         Some("SNAP") => Ok(Ack::Snapshot(
             parse_part_u64(parts.next(), "ack id")?,
             parse_part_u64(parts.next(), "snapshot id")?,
+        )),
+        Some("VOL") => Ok(Ack::Volume(
+            parse_part_u64(parts.next(), "ack id")?,
+            parse_part_u64(parts.next(), "volume ord")? as VolumeOrdinal,
         )),
         Some("ERR") => {
             let id = parse_part_u64(parts.next(), "ack id")?;
@@ -963,6 +1170,7 @@ where
     let kind = parts
         .next()
         .ok_or_else(|| "missing worker kind".to_string())?;
+    let vol_ord = parse_part_u64(parts.next(), "worker vol_ord")? as VolumeOrdinal;
     let slot = parse_part_u64(parts.next(), "worker slot")?;
     let arg = parse_part_u64(parts.next(), "worker arg")? as u8;
     let kind = match kind {
@@ -975,7 +1183,12 @@ where
         "get" => WorkerOpKind::Get,
         other => return Err(format!("unknown worker kind `{other}`")),
     };
-    Ok(WorkerOp { tid, slot, kind })
+    Ok(WorkerOp {
+        tid,
+        vol_ord,
+        slot,
+        kind,
+    })
 }
 
 fn worker_kind_name(kind: &WorkerOpKind) -> &'static str {

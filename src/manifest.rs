@@ -315,6 +315,17 @@ impl Manifest {
         self.snapshots.iter().find(|e| e.id == id)
     }
 
+    /// Dry-run [`encode`](Self::encode) against a scratch page. Returns
+    /// `Err` with the same diagnostic `encode` would have produced if
+    /// this manifest does not fit in a single page. Callers use this
+    /// before applying irreversible side effects (refcount bumps, page
+    /// writes) so a doomed commit surfaces as `Err` *before* leaking
+    /// refcount state on disk.
+    pub(crate) fn check_encodable(&self) -> Result<()> {
+        let mut probe = Page::new(PageHeader::new(PageType::Manifest, 0));
+        self.encode(&mut probe)
+    }
+
     fn encode(&self, page: &mut Page) -> Result<()> {
         let refcount_shard_count = self.refcount_shard_roots.len();
         if refcount_shard_count > MAX_SHARD_ROOTS_PER_PAGE {
