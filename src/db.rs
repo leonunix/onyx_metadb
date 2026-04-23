@@ -797,10 +797,7 @@ impl Db {
         // That matters because commit 8+ will acquire `volumes.write()`
         // on the lifecycle path, and a long-held reader would stall it.
         let volumes = self.volumes.read().clone();
-        let mut outcomes = Vec::with_capacity(ops.len());
-        for op in ops {
-            outcomes.push(self.apply_op(&volumes, lsn, op)?);
-        }
+        let outcomes = self.apply_commit_batch(&volumes, lsn, ops)?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
@@ -841,6 +838,195 @@ impl Db {
             mstate.manifest.snapshots.retain(|s| s.id != *id);
         }
         Ok(outcome)
+    }
+
+    /// Apply a commit batch under `apply_gate.read()`. Large batches
+    /// group ops by shard so each shard lock is taken once per (vol,
+    /// shard) rather than once per op. Small batches fall through to
+    /// the serial path — the bucketing overhead dominates below a
+    /// handful of ops.
+    ///
+    /// Correctness:
+    /// - Intra-bucket order is preserved (`Vec<usize>` of original op
+    ///   indices), so multiple ops to the same (vol, lba) or same pba
+    ///   apply in caller order.
+    /// - Cross-bucket order is relaxed: L2P shards and refcount shards
+    ///   live on disjoint trees, and same-LSN `cow_for_write` is
+    ///   idempotent via `page.generation >= lsn`, so reordering between
+    ///   two shards does not change the committed state.
+    /// - Each shard lock is held for the span of its bucket only;
+    ///   locks are taken one at a time in (vol_ord, shard_id) sorted
+    ///   order, so the CLAUDE-documented "cross-shard ops take locks
+    ///   in shard index order" invariant still holds.
+    ///
+    /// Defensive fallback: if the batch contains a lifecycle op
+    /// (DropSnapshot, CreateVolume, DropVolume, CloneVolume), we fall
+    /// back to serial apply. Those ops do not currently reach
+    /// `commit_ops` from any caller — they have their own entry points
+    /// with stronger locking — but the fallback keeps the bucketed
+    /// path safe if a future caller routes them through here.
+    fn apply_commit_batch(
+        &self,
+        volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+        lsn: Lsn,
+        ops: &[WalOp],
+    ) -> Result<Vec<ApplyOutcome>> {
+        const BUCKET_THRESHOLD: usize = 8;
+        if ops.len() < BUCKET_THRESHOLD || batch_contains_lifecycle_op(ops) {
+            let mut outcomes = Vec::with_capacity(ops.len());
+            for op in ops {
+                outcomes.push(self.apply_op(volumes, lsn, op)?);
+            }
+            return Ok(outcomes);
+        }
+        self.apply_ops_grouped(volumes, lsn, ops)
+    }
+
+    /// Bucketed batch-apply. Only invoked for sufficiently large
+    /// batches composed entirely of bucketable ops (L2P / refcount /
+    /// dedup). See [`apply_commit_batch`] for the dispatch rule.
+    fn apply_ops_grouped(
+        &self,
+        volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+        lsn: Lsn,
+        ops: &[WalOp],
+    ) -> Result<Vec<ApplyOutcome>> {
+        let mut outcomes: Vec<Option<ApplyOutcome>> = (0..ops.len()).map(|_| None).collect();
+        let mut l2p_buckets: HashMap<(VolumeOrdinal, usize), Vec<usize>> = HashMap::new();
+        let mut rc_buckets: Vec<Vec<usize>> = vec![Vec::new(); self.refcount_shards.len()];
+        let mut dedup_idxs: Vec<usize> = Vec::new();
+
+        for (idx, op) in ops.iter().enumerate() {
+            match op {
+                WalOp::L2pPut { vol_ord, lba, .. } | WalOp::L2pDelete { vol_ord, lba } => {
+                    let volume = volumes.get(vol_ord).ok_or_else(|| {
+                        MetaDbError::Corruption(format!(
+                            "L2P op for unknown volume ord {vol_ord}"
+                        ))
+                    })?;
+                    let sid = shard_for_key_l2p(&volume.shards, *lba);
+                    l2p_buckets.entry((*vol_ord, sid)).or_default().push(idx);
+                }
+                WalOp::Incref { pba, .. } | WalOp::Decref { pba, .. } => {
+                    let sid = shard_for_key(&self.refcount_shards, *pba);
+                    rc_buckets[sid].push(idx);
+                }
+                WalOp::DedupPut { .. }
+                | WalOp::DedupDelete { .. }
+                | WalOp::DedupReversePut { .. }
+                | WalOp::DedupReverseDelete { .. } => {
+                    dedup_idxs.push(idx);
+                }
+                WalOp::DropSnapshot { .. }
+                | WalOp::CreateVolume { .. }
+                | WalOp::DropVolume { .. }
+                | WalOp::CloneVolume { .. } => {
+                    // Already filtered out by `batch_contains_lifecycle_op`.
+                    unreachable!("lifecycle ops must not reach apply_ops_grouped");
+                }
+            }
+        }
+
+        // Apply L2P buckets in a deterministic (vol_ord, shard_id)
+        // order. One shard lock held at a time; no cross-shard
+        // simultaneous locking, so no deadlock risk.
+        let mut l2p_sorted: Vec<_> = l2p_buckets.into_iter().collect();
+        l2p_sorted.sort_by_key(|((vol, sid), _)| (*vol, *sid));
+        for ((vol_ord, sid), indices) in l2p_sorted {
+            let volume = volumes
+                .get(&vol_ord)
+                .expect("volume presence checked during bucketing");
+            let mut tree = volume.shards[sid].tree.lock();
+            for idx in indices {
+                let outcome = match &ops[idx] {
+                    WalOp::L2pPut { lba, value, .. } => {
+                        let prev = tree.insert_at_lsn(*lba, *value, lsn)?;
+                        ApplyOutcome::L2pPrev(prev)
+                    }
+                    WalOp::L2pDelete { lba, .. } => {
+                        let prev = tree.delete_at_lsn(*lba, lsn)?;
+                        ApplyOutcome::L2pPrev(prev)
+                    }
+                    other => unreachable!("L2P bucket holds only L2P ops; saw {other:?}"),
+                };
+                outcomes[idx] = Some(outcome);
+            }
+        }
+
+        // Apply refcount buckets in shard_id order.
+        for (sid, indices) in rc_buckets.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let mut tree = self.refcount_shards[sid].tree.lock();
+            for idx in indices {
+                let outcome = match &ops[idx] {
+                    WalOp::Incref { pba, delta } => {
+                        let current = tree.get(*pba)?.unwrap_or(0);
+                        let new = current.checked_add(*delta).ok_or_else(|| {
+                            MetaDbError::InvalidArgument(format!(
+                                "refcount overflow for pba {pba}"
+                            ))
+                        })?;
+                        if new != 0 {
+                            tree.insert(*pba, new)?;
+                        }
+                        ApplyOutcome::RefcountNew(new)
+                    }
+                    WalOp::Decref { pba, delta } => {
+                        let current = tree.get(*pba)?.unwrap_or(0);
+                        let new = current.checked_sub(*delta).ok_or_else(|| {
+                            MetaDbError::InvalidArgument(format!(
+                                "decref underflow for pba {pba}: {current} - {delta}",
+                            ))
+                        })?;
+                        if new == 0 {
+                            tree.delete(*pba)?;
+                        } else {
+                            tree.insert(*pba, new)?;
+                        }
+                        ApplyOutcome::RefcountNew(new)
+                    }
+                    other => {
+                        unreachable!("refcount bucket holds only rc ops; saw {other:?}")
+                    }
+                };
+                outcomes[idx] = Some(outcome);
+            }
+        }
+
+        // Dedup ops route through the LSM's own synchronisation; no
+        // shard lock needed. Apply in original order — LSM puts on the
+        // same key are last-write-wins, matching the serial path.
+        for idx in dedup_idxs {
+            let outcome = match &ops[idx] {
+                WalOp::DedupPut { hash, value } => {
+                    self.dedup_index.put(*hash, *value);
+                    ApplyOutcome::Dedup
+                }
+                WalOp::DedupDelete { hash } => {
+                    self.dedup_index.delete(*hash);
+                    ApplyOutcome::Dedup
+                }
+                WalOp::DedupReversePut { pba, hash } => {
+                    let (key, value) = encode_reverse_entry(*pba, hash);
+                    self.dedup_reverse.put(key, value);
+                    ApplyOutcome::Dedup
+                }
+                WalOp::DedupReverseDelete { pba, hash } => {
+                    let (key, _) = encode_reverse_entry(*pba, hash);
+                    self.dedup_reverse.delete(key);
+                    ApplyOutcome::Dedup
+                }
+                other => unreachable!("dedup bucket holds only dedup ops; saw {other:?}"),
+            };
+            outcomes[idx] = Some(outcome);
+        }
+
+        Ok(outcomes
+            .into_iter()
+            .map(|o| o.expect("every op index filled by exactly one bucket"))
+            .collect())
     }
 
     // -------- refcount + dedup ops --------------------------------------
@@ -2761,6 +2947,21 @@ fn shard_for_key_l2p(shards: &[L2pShard], key: u64) -> usize {
     (xxh3_64(&key.to_be_bytes()) as usize) % shards.len()
 }
 
+/// Returns true if the batch contains any op that `apply_ops_grouped`
+/// is not prepared to bucket — i.e. an op whose apply has manifest or
+/// volume-lifecycle side effects. Used to fall back to serial apply.
+fn batch_contains_lifecycle_op(ops: &[WalOp]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            op,
+            WalOp::DropSnapshot { .. }
+                | WalOp::CreateVolume { .. }
+                | WalOp::DropVolume { .. }
+                | WalOp::CloneVolume { .. }
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4193,5 +4394,173 @@ mod tests {
         assert_eq!(got[1], vec![p20_a]);
         assert!(got[2].is_empty());
         assert_eq!(got[3], vec![p10_b, p10_c]);
+    }
+
+    // -------- P1: bucketed batch apply ----------------------------------
+
+    fn hash_bytes(high: u64, low: u64) -> Hash32 {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&high.to_be_bytes());
+        h[24..].copy_from_slice(&low.to_be_bytes());
+        h
+    }
+
+    fn dedup_val(n: u8) -> DedupValue {
+        let mut d = [0u8; 28];
+        d[0] = n;
+        DedupValue(d)
+    }
+
+    /// Bucketed apply must produce the same per-op outcomes and the
+    /// same final state as the serial path, regardless of shard
+    /// routing. Batch is sized above BUCKET_THRESHOLD so the bucket
+    /// branch is exercised.
+    #[test]
+    fn bucketed_apply_matches_serial_for_mixed_batch() {
+        let (_d, db) = mk_db_with_shards(4);
+        let mut tx = db.begin();
+        // 16 L2P puts across likely many shards.
+        for i in 0..16u64 {
+            tx.insert(BOOTSTRAP_VOLUME_ORD, i * 37, v((i & 0xff) as u8));
+        }
+        // 12 refcount ops; Incref first so Decref has something to
+        // subtract from on the same pba.
+        for pba in 0..12u64 {
+            tx.incref_pba(pba, 3);
+        }
+        for pba in 0..6u64 {
+            tx.decref_pba(pba, 1);
+        }
+        // 4 dedup ops.
+        for i in 0..4u64 {
+            tx.put_dedup(hash_bytes(0xAAAA, i), dedup_val(i as u8));
+        }
+        let (_lsn, outcomes) = tx.commit_with_outcomes().unwrap();
+        // 16 L2P + 12 Incref + 6 Decref + 4 Dedup
+        assert_eq!(outcomes.len(), 16 + 18 + 4);
+        // Verify a representative subset of the resulting state.
+        for i in 0..16u64 {
+            assert_eq!(
+                db.get(BOOTSTRAP_VOLUME_ORD, i * 37).unwrap(),
+                Some(v((i & 0xff) as u8)),
+            );
+        }
+        for pba in 0..6u64 {
+            assert_eq!(db.get_refcount(pba).unwrap(), 2); // 3 - 1
+        }
+        for pba in 6..12u64 {
+            assert_eq!(db.get_refcount(pba).unwrap(), 3);
+        }
+    }
+
+    /// Same-shard puts in the same batch must apply in caller order,
+    /// not reordered. Two puts to the same (vol, lba) in order A, B
+    /// must leave the value = B.
+    #[test]
+    fn bucketed_apply_preserves_intra_bucket_order() {
+        let (_d, db) = mk_db_with_shards(2);
+        let mut tx = db.begin();
+        // Pad with other L2P ops so the batch size crosses the
+        // bucketing threshold.
+        for i in 0..12u64 {
+            tx.insert(BOOTSTRAP_VOLUME_ORD, i + 1_000, v(i as u8));
+        }
+        // Three puts to the same key in order.
+        tx.insert(BOOTSTRAP_VOLUME_ORD, 9_999, v(0x10));
+        tx.insert(BOOTSTRAP_VOLUME_ORD, 9_999, v(0x20));
+        tx.insert(BOOTSTRAP_VOLUME_ORD, 9_999, v(0x30));
+        tx.commit().unwrap();
+        assert_eq!(
+            db.get(BOOTSTRAP_VOLUME_ORD, 9_999).unwrap(),
+            Some(v(0x30)),
+            "intra-bucket order must preserve last-write-wins",
+        );
+    }
+
+    /// Same-pba incref/decref in the same batch must apply in caller
+    /// order. A decref before its paired incref would underflow.
+    #[test]
+    fn bucketed_apply_preserves_intra_bucket_rc_order() {
+        let (_d, db) = mk_db_with_shards(2);
+        let mut tx = db.begin();
+        // Pad so batch >= threshold.
+        for pba in 0..10u64 {
+            tx.incref_pba(pba + 100, 1);
+        }
+        // Incref then Decref same pba — ordering must be preserved.
+        tx.incref_pba(77, 5);
+        tx.decref_pba(77, 2);
+        tx.commit().unwrap();
+        assert_eq!(db.get_refcount(77).unwrap(), 3);
+    }
+
+    /// Batches smaller than the bucket threshold fall through to the
+    /// serial path. This test is a behavioural smoke check (the small
+    /// batch must still apply correctly).
+    #[test]
+    fn small_batch_falls_through_serial_path() {
+        let (_d, db) = mk_db_with_shards(2);
+        let mut tx = db.begin();
+        // Below BUCKET_THRESHOLD (= 8).
+        for i in 0..4u64 {
+            tx.insert(BOOTSTRAP_VOLUME_ORD, i, v(i as u8));
+        }
+        tx.commit().unwrap();
+        for i in 0..4u64 {
+            assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, i).unwrap(), Some(v(i as u8)));
+        }
+    }
+
+    /// Large pure-L2P batch — the main target of the optimisation.
+    /// Each shard is locked once per commit, not once per op.
+    #[test]
+    fn bucketed_apply_large_pure_l2p_batch() {
+        let (_d, db) = mk_db_with_shards(8);
+        let mut tx = db.begin();
+        // 1024 keys with a prime stride so shard routing (xxh3-based)
+        // is non-trivial while staying within the legal LBA range
+        // (paged tree caps at MAX_INDEX_LEVEL=4).
+        for i in 0..1024u64 {
+            let lba = i.wrapping_mul(7919);
+            tx.insert(BOOTSTRAP_VOLUME_ORD, lba, v((i & 0xff) as u8));
+        }
+        tx.commit().unwrap();
+        for i in 0..1024u64 {
+            let lba = i.wrapping_mul(7919);
+            assert_eq!(
+                db.get(BOOTSTRAP_VOLUME_ORD, lba).unwrap(),
+                Some(v((i & 0xff) as u8)),
+            );
+        }
+    }
+
+    /// Helper used by `batch_contains_lifecycle_op` covers every
+    /// lifecycle variant — spot-check via direct unit tests since
+    /// these ops cannot be pushed through Transaction.
+    #[test]
+    fn lifecycle_predicate_detects_every_lifecycle_variant() {
+        assert!(!batch_contains_lifecycle_op(&[WalOp::L2pPut {
+            vol_ord: 0,
+            lba: 0,
+            value: v(0),
+        }]));
+        assert!(batch_contains_lifecycle_op(&[WalOp::DropSnapshot {
+            id: 1,
+            pages: Vec::new(),
+        }]));
+        assert!(batch_contains_lifecycle_op(&[WalOp::CreateVolume {
+            ord: 1,
+            shard_count: 1,
+        }]));
+        assert!(batch_contains_lifecycle_op(&[WalOp::DropVolume {
+            ord: 1,
+            pages: Vec::new(),
+        }]));
+        assert!(batch_contains_lifecycle_op(&[WalOp::CloneVolume {
+            src_ord: 0,
+            new_ord: 1,
+            src_snap_id: 0,
+            src_shard_roots: Vec::new(),
+        }]));
     }
 }
