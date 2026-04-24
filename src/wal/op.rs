@@ -45,7 +45,7 @@
 //! | 13  | `DEDUP_REVERSE_DEL` | pba (8 B BE) + hash (32 B)                                                          |    40    |
 //! | 20  | `INCREF`            | pba (8 B BE) + delta (4 B BE)                                                       |    12    |
 //! | 21  | `DECREF`            | pba (8 B BE) + delta (4 B BE)                                                       |    12    |
-//! | 30  | `DROP_SNAPSHOT`     | id (8 B BE) + count (4 B BE) + pid×count                                            |  12+8n   |
+//! | 30  | `DROP_SNAPSHOT`     | id (8 B BE) + page_count (4 B BE) + pid×page_count + decref_count (4 B BE) + pba×decref_count | 16+8(n+m) |
 //! | 40  | `CREATE_VOLUME`     | ord (2 B BE) + shard_count (4 B BE)                                                 |     6    |
 //! | 41  | `DROP_VOLUME`       | ord (2 B BE) + count (4 B BE) + pid×count                                           |   6+8n   |
 //! | 42  | `CLONE_VOLUME`      | src_ord (2 B BE) + new_ord (2 B BE) + snap_id (8 B BE) + shard_count (4 B BE) + pid×shard_count | 16+8n |
@@ -216,9 +216,19 @@ pub enum WalOp {
     /// page, decrement rc by 1, stamp `generation = lsn`, rewrite as
     /// Free if the new rc is 0. Idempotent on replay via the generation
     /// check (`page.generation >= lsn ⇒ skip`).
+    ///
+    /// `pba_decrefs` is S4's leaf-rc-suppress compensation: every pba
+    /// the snapshot still referenced but the current tree has diverged
+    /// from (`DiffEntry::RemovedInB` / `DiffEntry::Changed` between
+    /// snap root and current root) — one `decref(pba, 1)` per entry
+    /// during apply (SPEC §3.3). Ordering doesn't matter (refcount is
+    /// commutative) but duplicates are retained: the same pba can
+    /// appear N times in the list and each produces one decref, same
+    /// as onyx's packed-slot multi-LBA share pattern.
     DropSnapshot {
         id: SnapshotId,
         pages: Vec<PageId>,
+        pba_decrefs: Vec<Pba>,
     },
     /// Register a fresh volume with `shard_count` empty shard roots. The
     /// apply path allocates the per-shard paged-tree roots; the manifest-
@@ -341,7 +351,11 @@ impl WalOp {
                 out.extend_from_slice(&pba.to_be_bytes());
                 out.extend_from_slice(&delta.to_be_bytes());
             }
-            WalOp::DropSnapshot { id, pages } => {
+            WalOp::DropSnapshot {
+                id,
+                pages,
+                pba_decrefs,
+            } => {
                 out.push(TAG_DROP_SNAPSHOT);
                 out.extend_from_slice(&id.to_be_bytes());
                 let count: u32 = pages
@@ -351,6 +365,14 @@ impl WalOp {
                 out.extend_from_slice(&count.to_be_bytes());
                 for pid in pages {
                     out.extend_from_slice(&pid.to_be_bytes());
+                }
+                let decref_count: u32 = pba_decrefs
+                    .len()
+                    .try_into()
+                    .expect("DropSnapshot pba_decrefs count fits in u32");
+                out.extend_from_slice(&decref_count.to_be_bytes());
+                for pba in pba_decrefs {
+                    out.extend_from_slice(&pba.to_be_bytes());
                 }
             }
             WalOp::CreateVolume { ord, shard_count } => {
@@ -406,7 +428,11 @@ impl WalOp {
             WalOp::DedupDelete { .. } => 1 + 32,
             WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 32,
             WalOp::Incref { .. } | WalOp::Decref { .. } => 1 + 8 + 4,
-            WalOp::DropSnapshot { pages, .. } => 1 + 8 + 4 + pages.len() * 8,
+            WalOp::DropSnapshot {
+                pages,
+                pba_decrefs,
+                ..
+            } => 1 + 8 + 4 + pages.len() * 8 + 4 + pba_decrefs.len() * 8,
             WalOp::CreateVolume { .. } => 1 + 2 + 4,
             WalOp::DropVolume { pages, .. } => 1 + 2 + 4 + pages.len() * 8,
             WalOp::CloneVolume {
@@ -612,7 +638,38 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                 pages.push(pid);
                 cursor += 8;
             }
-            Ok((WalOp::DropSnapshot { id, pages }, &payload[cursor..]))
+            // S4 appended a second count+pba list for the leaf-rc-suppress
+            // compensation decrefs (see SPEC §3.3). Phase A bumps the
+            // body schema version, so any pre-S4 body would have been
+            // rejected at the version byte; at this point we always
+            // expect the trailer.
+            require_len(&payload[cursor..], 4, "DROP_SNAPSHOT decref count")?;
+            let decref_count = u32::from_be_bytes(
+                payload[cursor..cursor + 4].try_into().unwrap(),
+            ) as usize;
+            cursor += 4;
+            let decref_bytes = decref_count.checked_mul(8).ok_or_else(|| {
+                MetaDbError::Corruption("DROP_SNAPSHOT pba_decrefs count overflow".into())
+            })?;
+            require_len(
+                &payload[cursor..],
+                decref_bytes,
+                "DROP_SNAPSHOT pba_decrefs list",
+            )?;
+            let mut pba_decrefs = Vec::with_capacity(decref_count);
+            for _ in 0..decref_count {
+                let pba = u64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap());
+                pba_decrefs.push(pba);
+                cursor += 8;
+            }
+            Ok((
+                WalOp::DropSnapshot {
+                    id,
+                    pages,
+                    pba_decrefs,
+                },
+                &payload[cursor..],
+            ))
         }
         TAG_CREATE_VOLUME => {
             require_len(payload, 6, "CREATE_VOLUME")?;
@@ -890,9 +947,11 @@ mod tests {
         let ops = vec![WalOp::DropSnapshot {
             id: 42,
             pages: Vec::new(),
+            pba_decrefs: Vec::new(),
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 1 + 8 + 4);
+        // schema(1) + tag(1) + id(8) + page_count(4) + decref_count(4)
+        assert_eq!(body.len(), 1 + 1 + 8 + 4 + 4);
         let decoded = decode_body(&body).unwrap();
         assert_eq!(decoded, ops);
     }
@@ -903,9 +962,31 @@ mod tests {
         let ops = vec![WalOp::DropSnapshot {
             id: u64::MAX - 1,
             pages: pages.clone(),
+            pba_decrefs: Vec::new(),
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 1 + 8 + 4 + pages.len() * 8);
+        assert_eq!(body.len(), 1 + 1 + 8 + 4 + pages.len() * 8 + 4);
+        let decoded = decode_body(&body).unwrap();
+        assert_eq!(decoded, ops);
+    }
+
+    #[test]
+    fn drop_snapshot_round_trip_with_pba_decrefs() {
+        // S4: the trailer list carries leaf-rc-suppress compensation
+        // decrefs. Encoding must preserve order and allow duplicates
+        // (onyx packed-slot scenario: same pba N times, each is one
+        // decref during apply).
+        let pba_decrefs = vec![100u64, 200, 100, 300];
+        let ops = vec![WalOp::DropSnapshot {
+            id: 9,
+            pages: vec![10, 11],
+            pba_decrefs: pba_decrefs.clone(),
+        }];
+        let body = encode_body(&ops);
+        assert_eq!(
+            body.len(),
+            1 + 1 + 8 + 4 + 2 * 8 + 4 + pba_decrefs.len() * 8,
+        );
         let decoded = decode_body(&body).unwrap();
         assert_eq!(decoded, ops);
     }
@@ -921,6 +1002,7 @@ mod tests {
             WalOp::DropSnapshot {
                 id: 7,
                 pages: vec![10, 11, 12],
+                pba_decrefs: vec![50, 51],
             },
             WalOp::Incref { pba: 20, delta: 1 },
         ];
@@ -948,6 +1030,40 @@ mod tests {
         body.extend_from_slice(&2u64.to_be_bytes());
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("DROP_SNAPSHOT page list")),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn drop_snapshot_truncated_pba_decrefs_count_is_corruption() {
+        // Pages present but the trailer's 4-byte decref_count is absent.
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_DROP_SNAPSHOT];
+        body.extend_from_slice(&1u64.to_be_bytes()); // id
+        body.extend_from_slice(&1u32.to_be_bytes()); // page_count=1
+        body.extend_from_slice(&42u64.to_be_bytes()); // single page
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(
+                msg.contains("DROP_SNAPSHOT decref count"),
+                "unexpected msg: {msg}",
+            ),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn drop_snapshot_truncated_pba_decrefs_list_is_corruption() {
+        // decref_count=3 but only 2 pbas follow.
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_DROP_SNAPSHOT];
+        body.extend_from_slice(&1u64.to_be_bytes()); // id
+        body.extend_from_slice(&0u32.to_be_bytes()); // no pages
+        body.extend_from_slice(&3u32.to_be_bytes()); // decref_count=3
+        body.extend_from_slice(&100u64.to_be_bytes());
+        body.extend_from_slice(&200u64.to_be_bytes());
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(
+                msg.contains("DROP_SNAPSHOT pba_decrefs list"),
+                "unexpected msg: {msg}",
+            ),
             e => panic!("{e}"),
         }
     }

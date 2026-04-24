@@ -587,3 +587,184 @@ fn crash_after_wal_with_rejecting_guard_stays_a_no_op_on_replay() {
         "no incref ran because the op was a no-op",
     );
 }
+
+// ---------------- S4 DropSnapshot + pba_decrefs crash-safety (SPEC §5.3) ----
+
+/// DropSnapshot's WAL record now carries a `pba_decrefs` list (SPEC §3.3).
+/// Crash right after the WAL fsync but before apply touched any page /
+/// refcount: replay must re-run both the page-refcount cascade *and* the
+/// leaf-rc-suppress compensation decrefs.
+#[test]
+fn drop_snapshot_crash_after_wal_before_apply_replays_pba_decrefs() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            // Seed rc(100)=1 via l2p_remap.
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 10, remap_val(100, 1), None);
+            tx.commit().unwrap();
+            let snap = db.take_snapshot(0).unwrap();
+            // Leaf-shared remap → decref(100) suppressed; rc(100) still 1.
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 10, remap_val(200, 1), None);
+            tx.commit().unwrap();
+            assert_eq!(db.get_refcount(100).unwrap(), 1);
+            assert_eq!(db.get_refcount(200).unwrap(), 1);
+            faults.install(FaultPoint::CommitPostWalBeforeApply, 1, FaultAction::Panic);
+            let _ = db.drop_snapshot(snap);
+            panic!("drop_snapshot returned but fault should have panicked");
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    // Replay must have re-driven the pba_decref(100) from the WAL record.
+    assert_eq!(
+        db.get_refcount(100).unwrap(),
+        0,
+        "replay ran pba_decrefs[100] to zero",
+    );
+    assert_eq!(db.get_refcount(200).unwrap(), 1);
+    assert_eq!(db.get(0, 10).unwrap(), Some(remap_val(200, 1)));
+    assert!(
+        db.snapshots().is_empty(),
+        "snapshot list empty after replay",
+    );
+    drop(db);
+    let report = verify_path(dir.path(), VerifyOptions::default()).unwrap();
+    assert!(
+        report.is_clean(),
+        "verifier issues after DropSnapshot crash: {:?}",
+        report.issues,
+    );
+}
+
+/// Crash between apply and last_applied_lsn bump for a DropSnapshot
+/// carrying pba_decrefs. Replay must not double-decref — the page-
+/// generation guard on L2P pages plus the `checkpoint_lsn` ordering
+/// rule must keep refcount consistent.
+#[test]
+fn drop_snapshot_crash_after_apply_before_lsn_bump_does_not_double_decref() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            // Seed rc(100)=2 via two independent l2p_remaps.
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 10, remap_val(100, 1), None);
+            tx.commit().unwrap();
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 11, remap_val(100, 2), None);
+            tx.commit().unwrap();
+            assert_eq!(db.get_refcount(100).unwrap(), 2);
+
+            let snap = db.take_snapshot(0).unwrap();
+            // After snapshot, remap just lba=10 to a new pba — leaf
+            // shared → decref(100) is suppressed. rc(100) stays at 2.
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 10, remap_val(200, 1), None);
+            tx.commit().unwrap();
+            assert_eq!(db.get_refcount(100).unwrap(), 2);
+
+            faults.install(
+                FaultPoint::CommitPostApplyBeforeLsnBump,
+                1,
+                FaultAction::Panic,
+            );
+            let _ = db.drop_snapshot(snap);
+            panic!("drop_snapshot returned but fault should have panicked");
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    // drop_snapshot emitted exactly one pba_decref(100). Replay must
+    // apply it once, not twice — so rc(100) ends at 1.
+    assert_eq!(
+        db.get_refcount(100).unwrap(),
+        1,
+        "replay must not double-decref; rc stays at 1",
+    );
+    assert_eq!(db.get_refcount(200).unwrap(), 1);
+    drop(db);
+    let report = verify_path(dir.path(), VerifyOptions::default()).unwrap();
+    assert!(
+        report.is_clean(),
+        "verifier issues after crash: {:?}",
+        report.issues,
+    );
+}
+
+/// SPEC §5.3: crash midway through the DropSnapshot apply (page
+/// cascade in progress). The `page.generation >= lsn` guard on free /
+/// refcount pages combined with the WAL record's durable pba_decrefs
+/// list must make the apply idempotent across replay.
+///
+/// We force a PageWrite fault mid-cascade: apply will PANIC after N
+/// pages are durable but before the rest. Reopen must re-drive the
+/// remainder without re-decrementing the ones the crash caught.
+#[test]
+fn drop_snapshot_crash_mid_page_cascade_recovers_consistent_refcounts() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            // Enough writes to guarantee multi-page L2P trees so the
+            // drop_snapshot page cascade is non-trivial.
+            for i in 0u64..256 {
+                let mut tx = db.begin();
+                tx.l2p_remap(0, i, remap_val(100 + i, 0), None);
+                tx.commit().unwrap();
+            }
+            db.flush().unwrap();
+            let snap = db.take_snapshot(0).unwrap();
+            // Remap half of them, snapshot-shared → decrefs suppressed
+            // on the live path. pba_decrefs will contain these 128 pbas.
+            for i in 0u64..128 {
+                let mut tx = db.begin();
+                tx.l2p_remap(0, i, remap_val(500 + i, 0), None);
+                tx.commit().unwrap();
+            }
+            // Force the panic midway through the page cascade.
+            faults.install(FaultPoint::PageWriteBefore, 8, FaultAction::Panic);
+            let _ = db.drop_snapshot(snap);
+            panic!("drop_snapshot returned but fault should have panicked");
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    // rc(100..128) must end at 0 — they were only referenced by the
+    // dropped snapshot after the post-snap remap redirected lba→500+i.
+    for i in 0u64..128 {
+        assert_eq!(
+            db.get_refcount(100 + i).unwrap(),
+            0,
+            "rc(100+{i}) not zero after replay of DropSnapshot cascade",
+        );
+    }
+    // rc(128..256) still reference the old pbas via both current and
+    // snapshot (they weren't remapped post-snap). After drop, rc stays
+    // at 1 (current tree's one reference).
+    for i in 128u64..256 {
+        assert_eq!(
+            db.get_refcount(100 + i).unwrap(),
+            1,
+            "rc(100+{i}) should be 1 — still referenced by current tree",
+        );
+    }
+    drop(db);
+    let report = verify_path(dir.path(), VerifyOptions::default()).unwrap();
+    assert!(
+        report.is_clean(),
+        "verifier issues after drop_snapshot page-cascade crash: {:?}",
+        report.issues,
+    );
+}

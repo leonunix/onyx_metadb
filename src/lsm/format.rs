@@ -78,6 +78,20 @@ impl DedupValue {
     pub const fn zero() -> Self {
         Self([0u8; DEDUP_VALUE_SIZE])
     }
+
+    /// Onyx encoding contract: the first 8 bytes of a `DedupValue`
+    /// encode the big-endian `Pba` the hash points at (head-8B PBA,
+    /// mirroring [`L2pValue::head_pba`](crate::paged::L2pValue::head_pba)).
+    ///
+    /// `Db::cleanup_dedup_for_dead_pbas` (SPEC §2.2) uses this to check
+    /// "did `hash` get re-registered against a different pba since the
+    /// plan ran" before emitting a `DedupDelete` tombstone. Breaking
+    /// the contract means losing dedup-cleanup race protection.
+    pub fn head_pba(&self) -> crate::types::Pba {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&self.0[..8]);
+        u64::from_be_bytes(buf)
+    }
 }
 
 /// One serialized 64-byte record.

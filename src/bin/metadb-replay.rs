@@ -284,8 +284,16 @@ fn fmt_op(op: &WalOp) -> String {
         }
         WalOp::Incref { pba, delta } => format!("Incref pba={pba} delta={delta}"),
         WalOp::Decref { pba, delta } => format!("Decref pba={pba} delta={delta}"),
-        WalOp::DropSnapshot { id, pages } => {
-            format!("DropSnapshot id={id} pages={}", pages.len())
+        WalOp::DropSnapshot {
+            id,
+            pages,
+            pba_decrefs,
+        } => {
+            format!(
+                "DropSnapshot id={id} pages={} pba_decrefs={}",
+                pages.len(),
+                pba_decrefs.len(),
+            )
         }
         WalOp::CreateVolume { ord, shard_count } => {
             format!("CreateVolume ord={ord} shard_count={shard_count}")
@@ -368,10 +376,15 @@ fn op_json(op: &WalOp) -> String {
         WalOp::Decref { pba, delta } => {
             format!("{{\"op\":\"Decref\",\"pba\":{pba},\"delta\":{delta}}}")
         }
-        WalOp::DropSnapshot { id, pages } => {
+        WalOp::DropSnapshot {
+            id,
+            pages,
+            pba_decrefs,
+        } => {
             format!(
-                "{{\"op\":\"DropSnapshot\",\"id\":{id},\"pages\":{}}}",
-                pages.len()
+                "{{\"op\":\"DropSnapshot\",\"id\":{id},\"pages\":{},\"pba_decrefs\":{}}}",
+                pages.len(),
+                pba_decrefs.len(),
             )
         }
         WalOp::CreateVolume { ord, shard_count } => format!(

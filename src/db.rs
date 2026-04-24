@@ -1202,6 +1202,61 @@ impl Db {
             .collect())
     }
 
+    /// Clean up dedup state for a batch of pbas whose refcount has
+    /// transitioned to zero (SPEC §2.2). Atomic: every `DedupDelete` +
+    /// `DedupReverseDelete` goes into a single [`Transaction`] and
+    /// commits as one WAL record.
+    ///
+    /// Semantics (1:1 with onyx's
+    /// [`cleanup_dedup_for_pbas_batch`](../../../src/meta/store/dedup.rs#L410)):
+    /// 1. [`multi_scan_dedup_reverse_for_pba`](Self::multi_scan_dedup_reverse_for_pba)
+    ///    collects `(pba, hash)` pairs from the reverse index under one
+    ///    LSM reader-drain.
+    /// 2. For each `hash`, [`get_dedup`](Self::get_dedup) checks the
+    ///    forward index: the tombstone is emitted only when the entry
+    ///    still points to the target pba. This handles the race where a
+    ///    concurrent writer re-registered `hash` against a different
+    ///    pba between `drop_snapshot` finishing and this cleanup
+    ///    running — deleting the forward entry there would lose the
+    ///    live mapping.
+    /// 3. A `DedupReverseDelete { pba, hash }` is unconditional: the
+    ///    reverse entry is always stale once `pba` is freed.
+    ///
+    /// Idempotent under replay — both ops are tombstones, and both
+    /// the `get_dedup` probe and the forward check re-read LSM state at
+    /// commit apply time, so running twice is a no-op if the first run
+    /// already landed.
+    ///
+    /// Empty `pbas` returns [`last_applied_lsn`](Self::last_applied_lsn)
+    /// without touching the WAL (mirrors [`range_delete`](Self::range_delete)).
+    pub fn cleanup_dedup_for_dead_pbas(&self, pbas: &[Pba]) -> Result<Lsn> {
+        if pbas.is_empty() {
+            return Ok(self.last_applied_lsn());
+        }
+        let hashes_per_pba = self.multi_scan_dedup_reverse_for_pba(pbas)?;
+        let mut tx = self.begin();
+        for (pba, hashes) in pbas.iter().copied().zip(hashes_per_pba.into_iter()) {
+            for hash in hashes {
+                // Only drop the forward entry if it still points at
+                // `pba`. Another writer may have re-registered `hash`
+                // against a newer pba in the interval between the
+                // plan-side scan and now — SPEC §4.5 race protection.
+                if let Some(entry) = self.get_dedup(&hash)? {
+                    if entry.head_pba() == pba {
+                        tx.delete_dedup(hash);
+                    }
+                }
+                // The reverse entry itself is always stale — regardless
+                // of the forward-index race outcome, the pba is freed.
+                tx.unregister_dedup_reverse(pba, hash);
+            }
+        }
+        if tx.is_empty() {
+            return Ok(self.last_applied_lsn());
+        }
+        tx.commit()
+    }
+
     /// `true` if the dedup memtable has reached its freeze threshold.
     pub fn dedup_should_flush(&self) -> bool {
         self.dedup_index.should_flush()
@@ -1668,14 +1723,56 @@ impl Db {
         let source_end = source_start + source_volume.shards.len();
 
         let mut pages: Vec<PageId> = Vec::new();
-        for (tree, &root) in l2p_guards[source_start..source_end]
+        // SPEC §3.3 pba_decrefs: for every lba where the snapshot has a
+        // value but the current tree diverged, emit one decref against
+        // the snap-side pba. Computed while we still hold the source
+        // volume's shard guards so `diff_subtrees` sees a coherent snap
+        // root vs current root pair. The `RemovedInB` / `Changed` arms
+        // cover "snap has it, current doesn't" and "snap has it, current
+        // has a different value" respectively; `AddedInB` is "current
+        // has it, snap doesn't" which has nothing for us to compensate.
+        let mut raw_pba_decrefs: Vec<Pba> = Vec::new();
+        for (tree, &snap_root) in l2p_guards[source_start..source_end]
             .iter_mut()
             .zip(entry.l2p_shard_roots.iter())
         {
-            if root == crate::types::NULL_PAGE {
+            if snap_root == crate::types::NULL_PAGE {
                 continue;
             }
-            pages.extend(tree.collect_drop_pages(root)?);
+            pages.extend(tree.collect_drop_pages(snap_root)?);
+            let current_root = tree.root();
+            for diff in tree.diff_subtrees(snap_root, current_root)? {
+                match diff {
+                    DiffEntry::RemovedInB { old, .. } | DiffEntry::Changed { old, .. } => {
+                        raw_pba_decrefs.push(old.head_pba());
+                    }
+                    DiffEntry::AddedInB { .. } => {}
+                }
+            }
+        }
+        // Filter out pbas whose refcount is already 0. This happens when
+        // the volume was written via raw `insert` / `delete` (no
+        // refcount tracking) — production flows via `l2p_remap` always
+        // maintain `rc(snap_pba) >= 1` for every lba the snapshot
+        // references, so the filter is a no-op there. Without this
+        // guard the apply decref would underflow and corrupt state.
+        //
+        // We hold `refcount_guards` here, so reads are consistent with
+        // the subsequent apply under `apply_gate.write()`. Pending
+        // decref entries on the same pba within this same diff are
+        // accounted for via `pending[pba]` so the N-th appearance only
+        // survives if `rc(pba) > pending` — matches the apply's
+        // sequential decrefs.
+        let mut pending: HashMap<Pba, u32> = HashMap::new();
+        let mut pba_decrefs: Vec<Pba> = Vec::with_capacity(raw_pba_decrefs.len());
+        for pba in raw_pba_decrefs {
+            let sid = shard_for_key(&self.refcount_shards, pba);
+            let rc = refcount_guards[sid].get(pba)?.unwrap_or(0);
+            let taken = pending.entry(pba).or_insert(0);
+            if *taken < rc {
+                *taken += 1;
+                pba_decrefs.push(pba);
+            }
         }
         drop(l2p_guards);
         drop(refcount_guards);
@@ -1701,6 +1798,7 @@ impl Db {
         let op = WalOp::DropSnapshot {
             id,
             pages: pages.clone(),
+            pba_decrefs: pba_decrefs.clone(),
         };
         let body = encode_body(std::slice::from_ref(&op));
         let lsn = self.wal.submit(body)?;
@@ -1756,16 +1854,12 @@ impl Db {
             self.commit_cvar.notify_all();
         }
 
-        let (freed_leaf_values, pages_freed) = match outcome {
+        let (freed_leaf_values, pages_freed, freed_pbas) = match outcome {
             ApplyOutcome::DropSnapshot {
                 freed_leaf_values,
                 pages_freed,
-                // `freed_pbas` is reserved in S1; populated once S4
-                // wires pba_decrefs into the drop_snapshot plan. Drop
-                // it on the floor for now — none of the live callers
-                // consume it yet.
-                freed_pbas: _,
-            } => (freed_leaf_values, pages_freed),
+                freed_pbas,
+            } => (freed_leaf_values, pages_freed, freed_pbas),
             other => {
                 return Err(MetaDbError::Corruption(format!(
                     "DropSnapshot apply returned unexpected outcome: {other:?}"
@@ -1777,6 +1871,7 @@ impl Db {
             snapshot_id: id,
             freed_leaf_values,
             pages_freed,
+            freed_pbas,
         }))
     }
 
@@ -2524,6 +2619,10 @@ pub struct DropReport {
     pub freed_leaf_values: Vec<L2pValue>,
     /// Number of metadb pages released back to the page store.
     pub pages_freed: usize,
+    /// SPEC §3.3 leaf-rc-suppress compensation output: every pba whose
+    /// refcount hit zero during the drop. Adapter hands these to
+    /// [`Db::cleanup_dedup_for_dead_pbas`] and its `SpaceAllocator`.
+    pub freed_pbas: Vec<Pba>,
 }
 
 /// Result of [`Db::drop_volume`].
@@ -2907,9 +3006,17 @@ fn apply_op_bare(
             end: _,
             captured,
         } => apply_l2p_range_delete(volumes, refcount_shards, lsn, *vol_ord, captured),
-        WalOp::DropSnapshot { id: _, pages } => {
-            apply_drop_snapshot_pages(page_store, lsn, pages)
-        }
+        WalOp::DropSnapshot {
+            id: _,
+            pages,
+            pba_decrefs,
+        } => apply_drop_snapshot_pages_and_decrefs(
+            page_store,
+            refcount_shards,
+            lsn,
+            pages,
+            pba_decrefs,
+        ),
         // Phase 7 per-volume lifecycle ops: decodable since Phase A, but
         // their apply semantics land with commit 8/9. Commit 6 still
         // expects to see `vol_ord = 0` on L2P ops only; any of these
@@ -3200,12 +3307,8 @@ fn apply_drop_volume(
     lsn: Lsn,
     pages: &[PageId],
 ) -> Result<usize> {
-    match apply_drop_snapshot_pages(page_store, lsn, pages)? {
-        ApplyOutcome::DropSnapshot { pages_freed, .. } => Ok(pages_freed), // `freed_pbas` unused here
-        other => Err(MetaDbError::Corruption(format!(
-            "apply_drop_volume: unexpected outcome {other:?}"
-        ))),
-    }
+    let (_leaf_values, pages_freed) = apply_drop_snapshot_pages(page_store, lsn, pages)?;
+    Ok(pages_freed)
 }
 
 /// Increment the on-disk refcount of each shard root that a cloned
@@ -3284,14 +3387,19 @@ fn build_clone_volume_shards(
     Ok((shards, actual_roots.into_boxed_slice()))
 }
 
-/// Core of the `DropSnapshot` apply. Iterates `pages`, decrements each
-/// page's refcount by 1, stamps `generation = lsn`, and frees any page
-/// that hits rc=0. Idempotent on replay via the generation check.
+/// Core of the `DropSnapshot` / `DropVolume` page-refcount cascade.
+/// Iterates `pages`, decrements each page's refcount by 1, stamps
+/// `generation = lsn`, and frees any page that hits rc=0. Idempotent
+/// on replay via the generation check.
+///
+/// Returns `(freed_leaf_values, pages_freed)` rather than a full
+/// `ApplyOutcome` so `DropVolume` (which doesn't care about leaf values)
+/// can reuse the function without unpacking a misnamed variant.
 fn apply_drop_snapshot_pages(
     page_store: &Arc<PageStore>,
     lsn: Lsn,
     pages: &[PageId],
-) -> Result<ApplyOutcome> {
+) -> Result<(Vec<L2pValue>, usize)> {
     use crate::page::PageType;
 
     let mut freed_leaf_values: Vec<L2pValue> = Vec::new();
@@ -3343,13 +3451,69 @@ fn apply_drop_snapshot_pages(
 
     page_store.sync()?;
 
+    Ok((freed_leaf_values, pages_freed))
+}
+
+/// Apply a full `WalOp::DropSnapshot`: the page-refcount cascade for
+/// `pages` followed by the SPEC §3.3 leaf-rc-suppress compensation —
+/// one `decref(pba, 1)` per entry in `pba_decrefs`, collected at plan
+/// time via `diff_with_current`.
+///
+/// `pba_decrefs` is walked in shard-sorted order; each shard mutex is
+/// taken once, mirroring `apply_l2p_range_delete`'s pattern. The
+/// returned `freed_pbas` lists every pba whose refcount transitioned
+/// from `>0` to `0` during this apply. Duplicates in `pba_decrefs`
+/// are intentional (packed-slot many-LBA-share-one-pba case) and each
+/// produces one decref; only the one that drives rc to 0 adds the pba
+/// to `freed_pbas`.
+///
+/// No leaf-rc-suppress logic here: `drop_snapshot` holds
+/// `drop_gate.write()` + `apply_gate.write()`, so there is no
+/// concurrent mutation, and "suppress because a live snapshot still
+/// pins it" cannot apply — we *are* dropping the snapshot.
+fn apply_drop_snapshot_pages_and_decrefs(
+    page_store: &Arc<PageStore>,
+    refcount_shards: &[Shard],
+    lsn: Lsn,
+    pages: &[PageId],
+    pba_decrefs: &[Pba],
+) -> Result<ApplyOutcome> {
+    let (freed_leaf_values, pages_freed) = apply_drop_snapshot_pages(page_store, lsn, pages)?;
+
+    let mut rc_bucket: Vec<Vec<usize>> = vec![Vec::new(); refcount_shards.len()];
+    for (idx, &pba) in pba_decrefs.iter().enumerate() {
+        rc_bucket[shard_for_key(refcount_shards, pba)].push(idx);
+    }
+
+    let mut freed_pbas: Vec<Pba> = Vec::new();
+    for (sid, indices) in rc_bucket.iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        let mut rc_tree = refcount_shards[sid].tree.lock();
+        for &idx in indices {
+            let pba = pba_decrefs[idx];
+            let cur = rc_tree.get(pba)?.unwrap_or(0);
+            let new = cur.checked_sub(1).ok_or_else(|| {
+                MetaDbError::InvalidArgument(format!(
+                    "DropSnapshot decref underflow for pba {pba}: {cur} - 1",
+                ))
+            })?;
+            if new == 0 {
+                rc_tree.delete(pba)?;
+                if cur > 0 {
+                    freed_pbas.push(pba);
+                }
+            } else {
+                rc_tree.insert(pba, new)?;
+            }
+        }
+    }
+
     Ok(ApplyOutcome::DropSnapshot {
         freed_leaf_values,
         pages_freed,
-        // S1 reserves the slot; S4 fills it in once the `pba_decrefs`
-        // field is added to `WalOp::DropSnapshot`. Live callers today
-        // ignore this field entirely.
-        freed_pbas: Vec::new(),
+        freed_pbas,
     })
 }
 
@@ -4974,6 +5138,7 @@ mod tests {
         assert!(batch_contains_lifecycle_op(&[WalOp::DropSnapshot {
             id: 1,
             pages: Vec::new(),
+            pba_decrefs: Vec::new(),
         }]));
         assert!(batch_contains_lifecycle_op(&[WalOp::CreateVolume {
             ord: 1,
@@ -5491,24 +5656,273 @@ mod tests {
 
     #[test]
     fn l2p_remap_leaf_shared_plus_drop_snapshot_ends_at_correct_refcount() {
-        // Symmetry check (SPEC §4.4): take → N writes → drop should
-        // leave refcount identical to "same N writes without
-        // snapshot". We approximate by checking that drop doesn't
-        // leak refs when a leaf-shared-suppress path ran earlier.
+        // SPEC §4.4 symmetry: take → N writes → drop must leave
+        // refcount identical to "same N writes without snapshot".
+        // S2's leaf-rc-suppress deliberately under-decrefs while the
+        // snapshot is live; S4's drop_snapshot pba_decrefs completes
+        // the balance.
         let (_d, db) = mk_db();
         remap(&db, 10, remap_val(100, 1), None); // rc(100)=1
         let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
         remap(&db, 10, remap_val(200, 1), None); // snapshot suppresses decref(100); rc(100)=1, rc(200)=1
         assert_eq!(db.get_refcount(100).unwrap(), 1);
         assert_eq!(db.get_refcount(200).unwrap(), 1);
-        // drop_snapshot currently only releases L2P pages; refcount
-        // cleanup for snapshot-owned pbas is S4's job. Verify
-        // behaviour is deterministic under current (S2) semantics.
-        db.drop_snapshot(snap).unwrap();
-        // rc(100) stays at 1 because S4 hasn't landed yet; S4 will
-        // switch this assertion to 0. Keeping the positive assertion
-        // pins down today's contract so we notice regressions.
-        assert_eq!(db.get_refcount(100).unwrap(), 1);
+        let report = db.drop_snapshot(snap).unwrap().unwrap();
+        // drop_snapshot compensates via pba_decrefs: snap had 100 at
+        // lba 10, current has 200 → decref(100) → refcount hits 0.
+        assert_eq!(db.get_refcount(100).unwrap(), 0);
         assert_eq!(db.get_refcount(200).unwrap(), 1);
+        assert_eq!(report.freed_pbas, vec![100]);
+    }
+
+    // ---------------- S4 drop_snapshot extended tests (SPEC §4.4 / §4.5) ---
+
+    #[test]
+    fn drop_snapshot_symmetric_with_no_snapshot_refcounts() {
+        // SPEC §4.4: "take → N writes → drop" ≡ "N writes without
+        // snapshot" on refcount. Build two identical DBs and compare
+        // refcount + L2P state after the snapshot dance.
+        let (_d1, db_snap) = mk_db();
+        let (_d2, db_plain) = mk_db();
+        // Both: initial writes.
+        for lba in 0..8u64 {
+            remap(&db_snap, lba, remap_val(100 + lba, 1), None);
+            remap(&db_plain, lba, remap_val(100 + lba, 1), None);
+        }
+        let s = db_snap.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+        // Current-tree writes: change half of them to new pbas.
+        for lba in 0..8u64 {
+            if lba % 2 == 0 {
+                remap(&db_snap, lba, remap_val(200 + lba, 1), None);
+                remap(&db_plain, lba, remap_val(200 + lba, 1), None);
+            }
+        }
+        // Before drop, refcount diverges: snap side has rc(100+even)=1
+        // from leaf-rc-suppress. After drop it should match plain.
+        db_snap.drop_snapshot(s).unwrap();
+        for lba in 0..8u64 {
+            assert_eq!(
+                db_snap.get_refcount(100 + lba).unwrap(),
+                db_plain.get_refcount(100 + lba).unwrap(),
+                "rc divergence for pba {} after drop_snapshot",
+                100 + lba,
+            );
+            assert_eq!(
+                db_snap.get_refcount(200 + lba).unwrap(),
+                db_plain.get_refcount(200 + lba).unwrap(),
+                "rc divergence for pba {} after drop_snapshot",
+                200 + lba,
+            );
+        }
+    }
+
+    #[test]
+    fn drop_snapshot_freed_pbas_covers_dedup_multi_lba_share() {
+        // Onyx packed-slot pattern: 4 lbas share pba=777 pre-snapshot.
+        // Post-snapshot, all 4 lbas are remapped away → rc(777) drops
+        // by 4, hitting zero. Report should list pba=777 exactly once
+        // (newly_zeroed strict semantics, SPEC §4.1).
+        let (_d, db) = mk_db();
+        for lba in 10u64..14 {
+            remap(&db, lba, remap_val(777, (lba - 10) as u8), None);
+        }
+        assert_eq!(db.get_refcount(777).unwrap(), 4);
+        let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+        for lba in 10u64..14 {
+            remap(&db, lba, remap_val(888 + lba, 0), None);
+        }
+        // Leaf shared: decrefs suppressed, rc(777) still 4.
+        assert_eq!(db.get_refcount(777).unwrap(), 4);
+        let report = db.drop_snapshot(snap).unwrap().unwrap();
+        assert_eq!(db.get_refcount(777).unwrap(), 0);
+        let freed: std::collections::HashSet<Pba> = report.freed_pbas.iter().copied().collect();
+        assert!(
+            freed.contains(&777),
+            "pba 777 should be in freed_pbas (hit zero)",
+        );
+        // The four new pbas still have rc=1 and are NOT in freed.
+        for lba in 10u64..14 {
+            let pba = 888 + lba;
+            assert_eq!(db.get_refcount(pba).unwrap(), 1);
+            assert!(!freed.contains(&pba));
+        }
+    }
+
+    #[test]
+    fn drop_snapshot_and_pages_commit_atomically_via_wal() {
+        // SPEC §3.3: pages release and pba_decrefs share one WAL record.
+        // Crash before apply → replay must reconstruct both effects.
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            remap(&db, 10, remap_val(100, 1), None);
+            let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+            remap(&db, 10, remap_val(200, 1), None);
+            assert_eq!(db.get_refcount(100).unwrap(), 1);
+            db.drop_snapshot(snap).unwrap();
+            assert_eq!(db.get_refcount(100).unwrap(), 0);
+            // Close without a flush — the drop is only in the WAL.
+        }
+        let db = Db::open(dir.path()).unwrap();
+        // Replay must re-run the pba_decref.
+        assert_eq!(db.get_refcount(100).unwrap(), 0);
+        assert_eq!(db.get_refcount(200).unwrap(), 1);
+        assert!(
+            db.snapshots().is_empty(),
+            "snapshot list must stay empty after replay",
+        );
+    }
+
+    #[test]
+    fn drop_snapshot_skips_decref_when_pba_refcount_already_zero() {
+        // Non-refcount path (raw `insert`, without incref): plan must
+        // filter these out so apply doesn't underflow. Already covered
+        // by `drop_snapshot_reclaims_uniquely_owned_pages`; this test
+        // asserts the filter directly.
+        let (_d, db) = mk_db();
+        // Raw inserts → no refcount touched.
+        db.insert(BOOTSTRAP_VOLUME_ORD, 10, remap_val(500, 1)).unwrap();
+        let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+        db.insert(BOOTSTRAP_VOLUME_ORD, 10, remap_val(600, 1)).unwrap();
+        assert_eq!(db.get_refcount(500).unwrap(), 0);
+        let report = db.drop_snapshot(snap).unwrap().unwrap();
+        assert!(
+            report.freed_pbas.is_empty(),
+            "filter dropped decrefs for rc=0 snap pba",
+        );
+    }
+
+    #[test]
+    fn cleanup_dedup_for_dead_pbas_empty_input_is_noop() {
+        let (_d, db) = mk_db();
+        let lsn_before = db.last_applied_lsn();
+        let lsn = db.cleanup_dedup_for_dead_pbas(&[]).unwrap();
+        assert_eq!(lsn, lsn_before);
+    }
+
+    #[test]
+    fn cleanup_dedup_for_dead_pbas_removes_reverse_and_forward() {
+        let (_d, db) = mk_db();
+        // Register hash→pba in both tables, as onyx does on dedup miss
+        // via a single Transaction.
+        let h = hash_bytes(1, 2);
+        let val = dedup_val_with_pba(500, 0xAB);
+        {
+            let mut tx = db.begin();
+            tx.put_dedup(h, val).register_dedup_reverse(500, h);
+            tx.commit().unwrap();
+        }
+        assert_eq!(db.get_dedup(&h).unwrap(), Some(val));
+        assert_eq!(db.scan_dedup_reverse_for_pba(500).unwrap(), vec![h]);
+
+        db.cleanup_dedup_for_dead_pbas(&[500]).unwrap();
+        assert_eq!(db.get_dedup(&h).unwrap(), None);
+        assert!(db.scan_dedup_reverse_for_pba(500).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cleanup_dedup_for_dead_pbas_race_preserves_new_registration() {
+        // SPEC §4.5 race protection: hash was re-registered to a
+        // different pba between the dedup miss and cleanup. Cleanup
+        // must not delete the forward entry that now points at pba=600.
+        let (_d, db) = mk_db();
+        let h = hash_bytes(7, 8);
+        // Initial registration: hash→pba=500.
+        {
+            let mut tx = db.begin();
+            tx.put_dedup(h, dedup_val_with_pba(500, 0))
+                .register_dedup_reverse(500, h);
+            tx.commit().unwrap();
+        }
+        // Concurrent writer re-registered to pba=600 (forward only
+        // — reverse index still carries the stale (500, h) entry).
+        {
+            let mut tx = db.begin();
+            tx.put_dedup(h, dedup_val_with_pba(600, 0))
+                .register_dedup_reverse(600, h);
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            db.get_dedup(&h).unwrap().unwrap().head_pba(),
+            600,
+            "forward index re-registered to pba=600",
+        );
+
+        // Cleanup for pba=500. Must leave the forward entry alone
+        // (it points at 600) and remove the reverse entry for 500.
+        db.cleanup_dedup_for_dead_pbas(&[500]).unwrap();
+        assert_eq!(
+            db.get_dedup(&h).unwrap().unwrap().head_pba(),
+            600,
+            "forward entry for 600 must survive cleanup of 500",
+        );
+        assert!(
+            db.scan_dedup_reverse_for_pba(500).unwrap().is_empty(),
+            "reverse entry (500, h) removed",
+        );
+        // Reverse entry for the new pba=600 is still there.
+        assert_eq!(db.scan_dedup_reverse_for_pba(600).unwrap(), vec![h]);
+    }
+
+    #[test]
+    fn cleanup_dedup_for_dead_pbas_is_idempotent() {
+        // Replay safety: running cleanup twice is a no-op the second
+        // time. Matches the tombstone-based design (SPEC §2.2).
+        let (_d, db) = mk_db();
+        let h = hash_bytes(9, 9);
+        {
+            let mut tx = db.begin();
+            tx.put_dedup(h, dedup_val_with_pba(555, 0))
+                .register_dedup_reverse(555, h);
+            tx.commit().unwrap();
+        }
+        db.cleanup_dedup_for_dead_pbas(&[555]).unwrap();
+        // Second run has nothing to do → WAL unchanged.
+        let lsn_before = db.last_applied_lsn();
+        db.cleanup_dedup_for_dead_pbas(&[555]).unwrap();
+        assert_eq!(
+            db.last_applied_lsn(),
+            lsn_before,
+            "replay is idempotent (no WAL record emitted)",
+        );
+        assert_eq!(db.get_dedup(&h).unwrap(), None);
+    }
+
+    #[test]
+    fn cleanup_dedup_for_dead_pbas_batches_multiple_pbas() {
+        // One WAL record per invocation — the batching contract from
+        // SPEC §2.2. Even when many (pba, hash) pairs are involved.
+        let (_d, db) = mk_db();
+        let mut pbas = Vec::new();
+        for i in 0..5u64 {
+            let pba = 1000 + i;
+            let h = hash_bytes(0, i);
+            let mut tx = db.begin();
+            tx.put_dedup(h, dedup_val_with_pba(pba, i as u8))
+                .register_dedup_reverse(pba, h);
+            tx.commit().unwrap();
+            pbas.push(pba);
+        }
+        let lsn_before = db.last_applied_lsn();
+        db.cleanup_dedup_for_dead_pbas(&pbas).unwrap();
+        assert_eq!(
+            db.last_applied_lsn(),
+            lsn_before + 1,
+            "all tombstones in one atomic WAL record",
+        );
+        for (i, pba) in pbas.iter().enumerate() {
+            let h = hash_bytes(0, i as u64);
+            assert_eq!(db.get_dedup(&h).unwrap(), None);
+            assert!(db.scan_dedup_reverse_for_pba(*pba).unwrap().is_empty());
+        }
+    }
+
+    /// Build a DedupValue whose head-8B PBA is `pba` (Onyx contract —
+    /// see `DedupValue::head_pba`).
+    fn dedup_val_with_pba(pba: Pba, tag: u8) -> DedupValue {
+        let mut v = [0u8; 28];
+        v[..8].copy_from_slice(&pba.to_be_bytes());
+        v[8] = tag;
+        DedupValue(v)
     }
 }
