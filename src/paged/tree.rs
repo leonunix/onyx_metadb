@@ -17,16 +17,16 @@
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
-use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
+use crate::cache::{PageCache, DEFAULT_PAGE_CACHE_BYTES};
 use crate::error::{MetaDbError, Result};
 use crate::page_store::PageStore;
 use crate::paged::cache::PageBuf;
 use crate::paged::format::{
-    INDEX_FANOUT, INDEX_SHIFT, L2pValue, LEAF_ENTRY_COUNT, LEAF_MASK, LEAF_SHIFT, MAX_INDEX_LEVEL,
     index_child_at, index_child_count, index_set_child, leaf_bit_set, leaf_clear, leaf_entry_count,
-    leaf_set, leaf_value_at, max_leaf_idx_at_level, slot_in_index,
+    leaf_set, leaf_value_at, max_leaf_idx_at_level, slot_in_index, L2pValue, INDEX_FANOUT,
+    INDEX_SHIFT, LEAF_ENTRY_COUNT, LEAF_MASK, LEAF_SHIFT, MAX_INDEX_LEVEL,
 };
-use crate::types::{Lsn, NULL_PAGE, PageId};
+use crate::types::{Lsn, PageId, NULL_PAGE};
 
 /// Counters returned by [`PagedL2p::warmup_index_pages`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -411,12 +411,7 @@ impl PagedL2p {
         self.finalize_rc_deltas(lsn, result)
     }
 
-    fn insert_with_lsn(
-        &mut self,
-        lba: u64,
-        value: L2pValue,
-        lsn: Lsn,
-    ) -> Result<Option<L2pValue>> {
+    fn insert_with_lsn(&mut self, lba: u64, value: L2pValue, lsn: Lsn) -> Result<Option<L2pValue>> {
         let result = self
             .insert_with_lsn_inner(lba, value, lsn)
             .map(|outcome| outcome.prev);
@@ -447,8 +442,7 @@ impl PagedL2p {
         // level==1 in this case, and by the time `grow_root` runs the
         // leaf's refcount has already been bumped by the newly-
         // allocated parent index.
-        let mut leaf_was_shared =
-            self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
+        let mut leaf_was_shared = self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
 
         // Grow root up to whatever level covers `leaf_idx`.
         while leaf_idx > max_leaf_idx_at_level(self.root_level) {
@@ -509,7 +503,7 @@ impl PagedL2p {
             return Ok(None);
         }
         let generation = self.advance_gen();
-        self.delete_with_lsn(lba, generation)
+        self.delete_with_lsn(lba, generation, true)
     }
 
     /// Variant of [`delete`](Self::delete) stamped with the WAL op's
@@ -520,7 +514,7 @@ impl PagedL2p {
             return Ok(None);
         }
         self.advance_next_gen(lsn);
-        self.delete_with_lsn(lba, lsn)
+        self.delete_with_lsn(lba, lsn, false)
     }
 
     /// Variant of [`delete_at_lsn`](Self::delete_at_lsn) that also
@@ -533,11 +527,7 @@ impl PagedL2p {
     /// Returns `DeleteOutcome { prev: None, leaf_was_shared: false }`
     /// when `lba` is unmapped; the caller should treat that as a
     /// no-op and not emit a refcount decref.
-    pub fn delete_at_lsn_with_share_info(
-        &mut self,
-        lba: u64,
-        lsn: Lsn,
-    ) -> Result<DeleteOutcome> {
+    pub fn delete_at_lsn_with_share_info(&mut self, lba: u64, lsn: Lsn) -> Result<DeleteOutcome> {
         if self.get(lba)?.is_none() {
             return Ok(DeleteOutcome {
                 prev: None,
@@ -545,13 +535,18 @@ impl PagedL2p {
             });
         }
         self.advance_next_gen(lsn);
-        let result = self.delete_with_lsn_inner_with_share(lba, lsn);
+        let result = self.delete_with_lsn_inner_with_share(lba, lsn, false);
         self.finalize_rc_deltas(lsn, result)
     }
 
-    fn delete_with_lsn(&mut self, lba: u64, lsn: Lsn) -> Result<Option<L2pValue>> {
+    fn delete_with_lsn(
+        &mut self,
+        lba: u64,
+        lsn: Lsn,
+        free_empty_pages: bool,
+    ) -> Result<Option<L2pValue>> {
         let result = self
-            .delete_with_lsn_inner_with_share(lba, lsn)
+            .delete_with_lsn_inner_with_share(lba, lsn, free_empty_pages)
             .map(|outcome| outcome.prev);
         self.finalize_rc_deltas(lsn, result)
     }
@@ -560,6 +555,7 @@ impl PagedL2p {
         &mut self,
         lba: u64,
         lsn: Lsn,
+        free_empty_pages: bool,
     ) -> Result<DeleteOutcome> {
         let leaf_idx = lba >> LEAF_SHIFT;
         let bit = (lba & LEAF_MASK) as usize;
@@ -569,8 +565,7 @@ impl PagedL2p {
         // `insert_with_lsn_inner`): when `root_level == 0` the leaf
         // about to be mutated IS the root, and the walk-down loop
         // never reaches `level == 1`.
-        let mut leaf_was_shared =
-            self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
+        let mut leaf_was_shared = self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
 
         let new_root = self.buf.cow_for_write(self.root, lsn)?;
         let mut current = new_root;
@@ -616,12 +611,10 @@ impl PagedL2p {
             // returned unchanged. Skip the 1→0 RMW and free directly;
             // any upstream shared-page deltas flow through the
             // pending_rc accumulator committed at op end.
-            self.buf.free(empty_id, lsn)?;
-            index_set_child(
-                self.buf.modify(parent, lsn)?,
-                slot_in_parent,
-                NULL_PAGE,
-            );
+            if free_empty_pages {
+                self.buf.free(empty_id, lsn)?;
+            }
+            index_set_child(self.buf.modify(parent, lsn)?, slot_in_parent, NULL_PAGE);
             if index_child_count(self.buf.read(parent)?) == 0 {
                 empty_child = Some(parent);
             }
@@ -1355,8 +1348,7 @@ mod tests {
 
         // Dst attaches the same root page — simulating a post-
         // `clone_volume` sibling that shares the root.
-        let mut dst =
-            PagedL2p::create_with_cache(ps.clone(), page_cache.clone()).unwrap();
+        let mut dst = PagedL2p::create_with_cache(ps.clone(), page_cache.clone()).unwrap();
         dst.attach_subtree_root(root_pid, src.root_level()).unwrap();
         assert_eq!(dst.get(1).unwrap(), Some(v(10)));
 
@@ -1419,10 +1411,7 @@ mod tests {
         // how sparsely the radix spreads the 300 inserts across level-1
         // subtrees, so just assert non-zero and that cache agrees.
         assert!(stats.pages_pinned > 0);
-        assert_eq!(
-            t.buf.page_cache().pinned_pages(),
-            stats.pages_pinned,
-        );
+        assert_eq!(t.buf.page_cache().pinned_pages(), stats.pages_pinned,);
     }
 
     #[test]

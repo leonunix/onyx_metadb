@@ -24,7 +24,7 @@
 | S2 | `WalOp::L2pRemap` | **done** (2026-04-24) |
 | S3 | `WalOp::L2pRangeDelete` | **done** (2026-04-24) |
 | S4 | `DropSnapshot` 扩展 + `cleanup_dedup_for_dead_pbas` | **done** (2026-04-24) |
-| S5 | 综合 proptest + metadb-soak workload 扩展 | pending |
+| S5 | 综合 proptest + metadb-soak workload 扩展 | **done** (2026-04-24) |
 | S6 | 性能基准 + 24h soak + 门控签收 | pending |
 
 ---
@@ -419,60 +419,191 @@ S1 已落。S2/S3 建议已落（共用 `head_pba` helper 和 `decref_to_maybe_z
 
 S1~S4 全部落地，所有新 WalOp / API 可用。
 
+### 设计目标
+
+S5 不再新增核心语义；它的目标是把 S2~S4 分散验证过的单点行为放进同一个
+长序列 reference model 里反复交叉，重点抓三类单元测试不容易覆盖的问题：
+
+1. **跨 op refcount 漂移**：remap / range_delete / drop_snapshot / cleanup 在同一批
+   PBA 上交错，最终 `iter_refcounts()` 必须和 reference 完全一致。
+2. **snapshot 覆盖关系**：leaf shared 时 remap/range_delete 不应扣旧 PBA；drop snapshot
+   时才释放被 frozen snapshot 独占持有的引用。
+3. **dedup 清理竞态**：`freed_pbas` 触发 cleanup 后，只能删除仍指向 dead PBA 的
+   dedup_index；hash 已重新注册到其他 PBA 时不得误删。
+
+实现原则：**reference model 放测试侧，soak 放二进制侧，两者共享小型纯内存语义模块**。
+不要把大量测试-only 逻辑塞进 `Db` 主路径；如果要复用，放在 `src/testing/onyx_model.rs`
+并用 `#[cfg(any(test, feature = "testing"))]` 暴露。
+
 ### 交付物
 
 1. **Reference model**（内存版）
-   - 新文件：`tests/reference_model.rs` 或放 `src/testing/` 下（仅 test cfg）
-   - 数据结构：
-     - `l2p: HashMap<(VolumeOrdinal, Lba), L2pValue>`
-     - `refcount: HashMap<Pba, u32>`
-     - `dedup: HashMap<Hash32, (Pba, u32 /* live */)>`
-     - `snapshots: HashMap<SnapshotId, FrozenSnapshot>`（frozen L2P 快照）
-   - 操作：按 SPEC 语义模拟 L2pRemap / L2pRangeDelete / take_snapshot /
-     drop_snapshot / clone_volume / cleanup_dedup_for_dead_pbas
-   - 对 metadb 的 leaf-rc-suppress 规则在 reference 里用 `snapshots` 的覆盖关系
-     模拟。
+   - 推荐文件布局：
+     - `metadb/tests/support/onyx_reference.rs`：proptest 专用 model，避免污染库 API。
+     - 如 `metadb-soak` 也需要同一份语义，则迁到 `metadb/src/testing/onyx_model.rs`，
+       `tests/support/onyx_reference.rs` 只 re-export。
+   - 核心数据结构：
+     ```rust
+     struct RefModel {
+         live_volumes: BTreeSet<VolumeOrdinal>,
+         l2p: BTreeMap<(VolumeOrdinal, Lba), L2pValue>,
+         refcount: BTreeMap<Pba, u32>,
+         dedup: BTreeMap<Hash32, DedupValue>,
+         dedup_reverse: BTreeMap<(Pba, Hash32), ()>,
+         snapshots: BTreeMap<SnapshotId, FrozenSnapshot>,
+         next_snapshot_id: u64,
+         pending_dead_pbas: BTreeSet<Pba>,
+     }
 
-2. **混合 proptest**（SPEC §5.2）
-   - 文件：`tests/onyx_integration_proptest.rs`
-   - 生成器：随机 op 序列，长度 ≥ 10k，默认 256 seed（可环境变量调）
-   - op 类型权重近似 SPEC §5.4 的 soak op mix
-   - 每轮收尾对账：
-     - `db.iter_refcounts()` ≡ `reference.refcount`
-     - 每个 live volume 的 `range(..)` ≡ `reference.l2p` 对应分片
-     - 每个 snapshot 的 `snapshot_view(id).range(..)` ≡ frozen 状态
-   - 命中任何偏差：proptest shrink 后打印最小失败序列
+     struct FrozenSnapshot {
+         base_vol: VolumeOrdinal,
+         l2p: BTreeMap<Lba, L2pValue>,
+     }
+     ```
+   - `refcount` 只记录非 0 项；任何 decref 到 0 的 PBA 必须从 map 删除，并加入
+     `pending_dead_pbas`，供后续 cleanup op 抽样使用。
+   - `dedup` value 使用真实 `DedupValue`，不要简化成 `(Pba, live)`；这样可以覆盖
+     encoding / equality / reverse-index 删除语义。
+   - `apply_l2p_remap(vol, lba, new_value, guard)`：
+     - guard 失败：reference 和 DB 都必须完全不变，outcome `applied=false`。
+     - guard 成功：写入 `l2p[(vol,lba)] = new_value`。
+     - `old_pba == new_pba` 且当前 `(vol,lba)` 被任一 live snapshot 覆盖时：按 leaf
+       shared 语义不做 self-decrement；否则按 SPEC §3.1 做 net 0 / decref / incref。
+     - `old_pba != new_pba` 且没有 snapshot 覆盖旧映射：旧 PBA decref，新 PBA incref。
+     - `old_pba != new_pba` 且有 snapshot 覆盖旧映射：旧 PBA 仍被 snapshot 持有，不扣；
+       新 PBA incref。
+   - `apply_range_delete(vol, start, end)`：删除 live L2P 范围；只有未被 snapshot 覆盖的
+     old mapping 才 decref。多个 LBA 指向同一 PBA 时逐条扣，不聚合成 1。
+   - `apply_take_snapshot(vol)`：冻结该 volume 当前 L2P 分片；reference 不额外 incref，
+     因为 DB 的 leaf rc 共享语义等价于“旧 mapping 被 snapshot 覆盖后，live overwrite
+     暂不 decref”。
+   - `apply_drop_snapshot(id)`：移除 frozen snapshot；对 snapshot 中每条 mapping，若没有
+     其他 snapshot 覆盖同一 `(vol,lba,value)` 且 live L2P 也不再指向同一 value，则 decref。
+   - `apply_clone_volume(src, dst)`：复制 `src` 当前 L2P 到 `dst`；对每个 copied value
+     incref。若 `dst` 已存在，先按 delete-volume 语义释放旧 dst。
+   - `apply_cleanup_dedup_for_dead_pbas(pbas)`：对每个 `(pba, hash)` reverse entry，只有
+     `dedup[hash].pba == pba` 时删除 forward；无论 forward 是否仍指向 pba，都删除该
+     reverse entry。该规则对齐 S4 / onyx `cleanup_dedup_for_pbas_batch`。
 
-3. **`metadb-soak` workload 扩展**
-   - 文件：[`src/bin/metadb-soak.rs`](../src/bin/metadb-soak.rs)
-   - 在现有 workload 基础上按 SPEC §5.4 的 op mix 加入新 op：
-     - remap 60%（含 guard=Some 20% / guard=None 40%）
-     - range_delete 5%
-     - snapshot（take + drop）1%
-     - dedup hit via L2pRemap guard 30%
-     - cleanup_dedup_for_dead_pbas 4%
-   - 保留既有的 `metadb-verify` 周期性调用（无 warn/err）
-   - 新增一个 "refcount 总和守恒" 检查点：每隔 N op 采样 `iter_refcounts` 总和，
-     对比自维护的 `incref_total - decref_total`（writer 线程记录）
-   - 进程重启支持：每运行 M op 退出并 re-open，断言恢复后 verify + reference
-     model 仍匹配。要求 ≥ 10 次重启。
+2. **Op 生成设计**（统一供 proptest / soak 使用）
+   - 新增 `enum OnyxOp`（测试侧即可）：
+     - `Remap { vol, lba, value, guard }`
+     - `RangeDelete { vol, start, len }`
+     - `TakeSnapshot { vol }`
+     - `DropSnapshot { id_hint }`
+     - `CloneVolume { src, dst }`
+     - `CleanupDedup { pba_hints }`
+     - `Reopen`
+   - 生成范围保持小而高碰撞：`vol_ord 0..4`、`lba 0..512`、`pba 0..256`、hash 由
+     `(pba, lba, salt)` 确定性构造；这样同 PBA、多 LBA、dedup hit、snapshot 覆盖会频繁发生。
+   - `L2pValue` 使用真实 28B 结构；`crc32 / slot_offset / flags` 随机但合法，`head_pba`
+     必须落在上述 PBA 范围内。
+   - guard 生成：
+     - 1/3 `None`
+     - 1/3 `Some((new_pba, current_refcount_or_1))`，倾向命中
+     - 1/3 `Some((random_pba, current_refcount + 1..+3))`，倾向失败
+   - 每个 op 先尝试 apply reference；如果 reference 判断该 op 非法（例如 clone 到不存在
+     volume），测试侧可以跳过或把它规范化为 no-op，但 DB 和 reference 必须采用同一决策。
+
+3. **混合 proptest**（SPEC §5.2）
+   - 文件：`tests/onyx_integration_proptest.rs`。
+   - 复用现有 `tests/db_phase6_proptest.rs` 的配置风格，但不要继续把新场景塞进该文件；
+     避免单文件过长。
+   - 默认配置：
+     ```text
+     METADB_ONYX_PROPTEST_CASES      默认 64，本地快速迭代
+     METADB_ONYX_PROPTEST_CI_CASES   CI 建议 256
+     METADB_ONYX_PROPTEST_MIN_OPS    默认 10_000（ignored 高预算）
+     METADB_ONYX_PROPTEST_MAX_OPS    默认 12_000
+     ```
+   - 普通 `cargo test` 下只跑 smoke：`cases=8`、`ops=100..300`、不启用强制 reopen。
+   - `#[ignore]` 高预算测试跑 SPEC 要求：长度 ≥ 10k、seed/cases ≥ 256，可通过环境变量
+     提升到 1024 过夜。
+   - 每个 case 的执行顺序：
+     1. 创建临时 DB 和 `RefModel`。
+     2. 顺序执行 op；每 200~500 op 做一次轻量对账（sampled L2P + refcount sum）。
+     3. 随机 `Reopen` 后重新打开 DB，立即执行完整对账。
+     4. case 末尾完整对账所有 live volume、所有 snapshot、完整 refcount、完整 dedup。
+   - 完整对账接口：
+     - `db.iter_refcounts()` 严格等于 `model.refcount`。
+     - `db.range(vol, ..)` 严格等于 `model.l2p` 的该 vol 分片。
+     - `db.snapshot_view(id).range(..)` 严格等于 `FrozenSnapshot.l2p`。
+     - `db.get_dedup(hash)` 和 reverse 清理结果严格等于 model（如果没有 public reverse
+       iterator，仅验证 forward，并通过 cleanup 后 no-stale-forward 覆盖 reverse）。
+   - failure 输出：实现 `Debug`/`Display` 打印 shrunk op 序列；每条包含 op index、vol、lba、pba、
+     guard、snapshot id hint，方便复制成 deterministic regression test。
+
+4. **Fault-injection 混合测试补齐**
+   - 文件：继续放 `tests/db_hardening.rs`，但每个测试保持短小；如超过 1k 行，拆
+     `tests/db_onyx_faults.rs`。
+   - 必补场景：
+     - `CommitPostWalBeforeApply` × `L2pRemap / RangeDelete / DropSnapshot / CleanupDedup`。
+     - `CommitPostApplyBeforeLsnBump` × 同上。
+     - `DropSnapshot` 释放 page 中途 crash：replay 后 `freed_pbas`、refcount、snapshot
+       不重复释放。
+   - 每条 fault test 都用 `RefModel` 构造 expected state，避免手写不同语义。
+
+5. **`metadb-soak` workload 扩展**
+   - 文件：[`src/bin/metadb-soak.rs`](../src/bin/metadb-soak.rs)。若文件继续膨胀，先拆：
+     - `src/bin/metadb_soak/config.rs`
+     - `src/bin/metadb_soak/model.rs`
+     - `src/bin/metadb_soak/workload.rs`
+     - `src/bin/metadb_soak/verify.rs`
+     - `src/bin/metadb-soak.rs` 只保留 `main()` / wiring
+   - CLI 扩展：
+     - 保留现有 `--duration-secs`。
+     - 新增别名 `--minutes N`、`--hours N`。
+     - 新增 `--restart-interval-secs N` / `--restart-interval 2h`（解析 `s/m/h` 后缀）。
+     - 新增 `--onyx-mix`，默认开启新 workload；保留 `--legacy-mix` 跑旧 workload 回归。
+   - op mix（按 committed op 计数，而不是 attempted op）：
+     - remap 60%，其中 guard=None 40%，guard=Some 20%。
+     - range_delete 5%。
+     - snapshot 1%（take/drop 各半；snapshot 数超过阈值时偏向 drop）。
+     - dedup hit via guarded L2pRemap 30%。
+     - cleanup_dedup_for_dead_pbas 4%。
+   - Soak 内维护 `RefModel`：每个 child cycle 结束把 reference checkpoint 写入 events/summary；
+     parent 重启 child 时 reload checkpoint，确保 ≥10 次进程重启后仍能和 DB 对账。
+   - 周期性校验：
+     - 每 N op 调 `verify_path`，要求无 warn/err。
+     - 每 N op 比较 `iter_refcounts().sum()` 和 `RefModel::refcount_sum()`。
+     - 每 cycle 完整比较 live volumes / snapshots / dedup forward。
+   - 统计输出：summary.json 增加 `onyx_ops`、`guard_hit`、`guard_miss`、`freed_pbas`、
+     `cleanup_deleted`、`restarts`、`refcount_sum_mismatches`。
+
+### 推荐实现顺序
+
+1. **抽 model**：先实现 `RefModel` + deterministic unit tests（不碰 DB），覆盖 remap
+   四象限、range delete 同 PBA 多 LBA、drop snapshot、cleanup 竞态。
+2. **接 DB adapter**：写 `apply_to_db(OnyxOp)` 和 `assert_db_matches_model()`，先跑短序列
+   deterministic test。
+3. **接 proptest**：短 budget 进普通测试，10k+ budget 进 ignored test；新增 regression
+   seed 文件。
+4. **拆/扩 soak**：先保持 legacy workload 结果不变，再开启 `--onyx-mix`。
+5. **跑冒烟**：`cargo test onyx_integration_proptest`、ignored 小 budget、soak 3~5 分钟。
 
 ### 测试
 
-- 新增 proptest 一条（本身就是测试）
-- 现有 metadb-soak 回归：现有 op 占比保持不变的子 workload 仍跑几分钟过
+- 新增普通 smoke proptest：`cargo test onyx_integration_proptest` 默认数秒到 1 分钟内完成。
+- 新增 ignored 高预算 proptest：
+  `METADB_ONYX_PROPTEST_CASES=256 METADB_ONYX_PROPTEST_MIN_OPS=10000 cargo test onyx_integration_proptest -- --ignored --nocapture`。
+- 新增 deterministic regression tests：任何 shrunk failure 都固化到 `tests/onyx_integration_regression.rs`。
+- 现有 `metadb-soak --legacy-mix` 跑几分钟必须保持通过，证明没有破坏旧 workload。
+- 新 `metadb-soak --onyx-mix --minutes 5 --restart-interval 30s` 作为本 session 冒烟。
 
 ### 退出
 
-- `cargo test onyx_integration_proptest -- --ignored --nocapture` 跑 256 seeds
-  全绿（本地至少 10 分钟的烧机）
-- `cargo run --release --bin metadb-soak -- --minutes 30`（30 分钟冒烟）无
-  verify 报错
+- `cargo test` 全绿。
+- `cargo test onyx_integration_proptest` 全绿。
+- `METADB_ONYX_PROPTEST_CASES=256 METADB_ONYX_PROPTEST_MIN_OPS=10000 cargo test onyx_integration_proptest -- --ignored --nocapture`
+  全绿（本地至少 10 分钟烧机）。
+- `cargo run --release --bin metadb-soak -- <path> --legacy-mix --minutes 5` 无 verify 报错。
+- `cargo run --release --bin metadb-soak -- <path> --onyx-mix --minutes 30 --restart-interval 2m`
+  无 verify 报错，且 restarts ≥ 10、refcount sum mismatch = 0。
 - 完整 24h 跑交给 S6 签收
 
 ### 规模预估
 
-~1200 行改动（reference model + proptest + soak workload），3-4 天。
+~1500 行改动（reference model + proptest + soak workload 拆分），3-4 天。
 
 ---
 

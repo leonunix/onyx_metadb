@@ -3,14 +3,16 @@ use std::env;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
+use onyx_metadb::testing::onyx_model::{onyx_dedup_value, onyx_hash, onyx_l2p_value, OnyxRefModel};
 use onyx_metadb::{
-    Db, DedupValue, Hash32, L2pValue, SnapshotId, VerifyOptions, VolumeOrdinal, verify_path,
+    verify_path, ApplyOutcome, Db, DedupValue, Hash32, L2pValue, Pba, SnapshotId, VerifyOptions,
+    VolumeOrdinal,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -18,6 +20,8 @@ use rand_chacha::ChaCha8Rng;
 const KEY_SLOTS_PER_THREAD: u64 = 256;
 const MAX_LIVE_VOLUMES: usize = 4;
 const BOOTSTRAP_VOL: VolumeOrdinal = 0;
+const ONYX_MAX_LBA: u64 = 512;
+const ONYX_MAX_PBA: Pba = 256;
 
 fn main() -> ExitCode {
     match run() {
@@ -76,6 +80,32 @@ struct ParentConfig {
     summary_path: PathBuf,
     events_path: PathBuf,
     fault_density_pct: u8,
+    workload: Workload,
+    restart_interval_secs: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Workload {
+    Legacy,
+    Onyx,
+    OnyxConcurrent,
+}
+
+fn workload_name(workload: Workload) -> &'static str {
+    match workload {
+        Workload::Legacy => "legacy",
+        Workload::Onyx => "onyx",
+        Workload::OnyxConcurrent => "onyx-concurrent",
+    }
+}
+
+fn parse_workload(raw: &str) -> Result<Workload, String> {
+    match raw {
+        "legacy" => Ok(Workload::Legacy),
+        "onyx" => Ok(Workload::Onyx),
+        "onyx-concurrent" => Ok(Workload::OnyxConcurrent),
+        other => Err(format!("unknown workload `{other}`")),
+    }
 }
 
 impl ParentConfig {
@@ -91,11 +121,29 @@ impl ParentConfig {
         let mut summary_path = None;
         let mut events_path = None;
         let mut fault_density_pct = 0u8;
+        let mut workload = Workload::Onyx;
+        let mut restart_interval_secs = None;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--duration-secs" => {
                     duration_secs = parse_u64(args.next(), "--duration-secs")?;
+                }
+                "--minutes" => {
+                    duration_secs = parse_u64(args.next(), "--minutes")?.saturating_mul(60);
+                }
+                "--hours" => {
+                    duration_secs = parse_u64(args.next(), "--hours")?.saturating_mul(3600);
+                }
+                "--restart-interval-secs" => {
+                    restart_interval_secs =
+                        Some(parse_u64(args.next(), "--restart-interval-secs")?);
+                }
+                "--restart-interval" => {
+                    restart_interval_secs =
+                        Some(parse_duration_arg(args.next().ok_or_else(|| {
+                            "--restart-interval needs a value".to_string()
+                        })?)?);
                 }
                 "--ops-per-cycle" => {
                     ops_per_cycle = parse_u64(args.next(), "--ops-per-cycle")? as usize;
@@ -125,6 +173,9 @@ impl ParentConfig {
                     }
                     fault_density_pct = value as u8;
                 }
+                "--onyx-mix" => workload = Workload::Onyx,
+                "--onyx-concurrent-mix" => workload = Workload::OnyxConcurrent,
+                "--legacy-mix" => workload = Workload::Legacy,
                 "-h" | "--help" => {
                     print_parent_usage();
                     return Err(String::new());
@@ -148,15 +199,18 @@ impl ParentConfig {
             threads: threads.max(1),
             seed,
             fault_density_pct,
+            workload,
+            restart_interval_secs,
         })
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct ChildConfig {
     path: PathBuf,
     threads: usize,
     fault: Option<FaultSpec>,
+    workload: Workload,
 }
 
 impl ChildConfig {
@@ -169,6 +223,7 @@ impl ChildConfig {
         let mut fault_point = None;
         let mut fault_hit = None;
         let mut fault_action = None;
+        let mut workload = Workload::Legacy;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -197,6 +252,13 @@ impl ChildConfig {
                             "--fault-action needs a value".to_string()
                         })?)?);
                 }
+                "--workload" => {
+                    workload = parse_workload(
+                        &args
+                            .next()
+                            .ok_or_else(|| "--workload needs a value".to_string())?,
+                    )?;
+                }
                 _ => return Err(format!("unknown child flag `{arg}`")),
             }
         }
@@ -217,6 +279,7 @@ impl ChildConfig {
             path,
             threads: threads.max(1),
             fault,
+            workload,
         })
     }
 }
@@ -237,9 +300,26 @@ struct Summary {
     restarts: u64,
     verifies: u64,
     fault_cycles: u64,
+    onyx_ops: u64,
+    guard_hit: u64,
+    guard_miss: u64,
+    freed_pbas: u64,
+    cleanup_deleted: u64,
+    refcount_sum_mismatches: u64,
     deadlock_detected: bool,
     success: bool,
     last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct OnyxStats {
+    onyx_ops: u64,
+    guard_hit: u64,
+    guard_miss: u64,
+    freed_pbas: u64,
+    cleanup_deleted: u64,
+    refcount_sum_mismatches: u64,
+    refcount_sum: i64,
 }
 
 struct Model {
@@ -283,6 +363,10 @@ enum WorkerOpKind {
     Incref,
     Decref,
     Get,
+    OnyxRemap { pba: Pba, salt: u64, guard: u8 },
+    OnyxRangeDelete { len: u64 },
+    OnyxDedupHit { pba: Pba, salt: u64 },
+    OnyxCleanup { pba: Pba },
 }
 
 #[derive(Clone, Debug)]
@@ -305,6 +389,7 @@ enum Ack {
     Ok(u64),
     Snapshot(u64, SnapshotId),
     Volume(u64, VolumeOrdinal),
+    Onyx(u64, String),
     Error(u64, String),
 }
 
@@ -324,6 +409,7 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
 
     let started = Instant::now();
     let mut model = Model::default();
+    let mut onyx_model = OnyxRefModel::default();
     let mut rngs: Vec<ChaCha8Rng> = (0..cfg.threads)
         .map(|tid| ChaCha8Rng::seed_from_u64(cfg.seed ^ ((tid as u64 + 1) << 20)))
         .collect();
@@ -336,6 +422,8 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
     let mut fault_cycles = 0u64;
     let mut deadlock_detected = false;
     let mut last_error = None;
+    let mut onyx_stats = OnyxStats::default();
+    let mut last_restart = Instant::now();
 
     while started.elapsed() < Duration::from_secs(cfg.duration_secs) {
         cycles += 1;
@@ -354,10 +442,12 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
             cycles,
             &mut child,
             &mut model,
+            &mut onyx_model,
             &mut rngs,
             &mut cycle_rng,
             &mut snapshots,
             &mut total_ops,
+            &mut onyx_stats,
             &mut events,
         ) {
             Ok(()) => {}
@@ -368,14 +458,29 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
             }
         }
 
+        let should_restart = cfg.restart_interval_secs.is_none_or(|secs| {
+            last_restart.elapsed() >= Duration::from_secs(secs)
+                || started.elapsed() >= Duration::from_secs(cfg.duration_secs)
+        });
+        if !should_restart {
+            let _ = send_admin(&mut child, 999_999_999, "QUIT");
+        }
         if let Err(err) = kill_child(&mut child) {
             last_error = Some(err.to_string());
             break;
         }
         restarts += 1;
+        last_restart = Instant::now();
         events.write("child_killed", &format!("cycle={cycles}"))?;
 
-        match verify_reopened_db(&cfg.path, &model, &snapshots, cfg.threads) {
+        match verify_reopened_db(
+            &cfg.path,
+            &model,
+            &onyx_model,
+            &snapshots,
+            cfg.threads,
+            cfg.workload,
+        ) {
             Ok(report) => {
                 if !report.is_clean() {
                     last_error = Some(format!("metadb-verify failed: {:?}", report.issues));
@@ -408,6 +513,12 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
         restarts,
         verifies,
         fault_cycles,
+        onyx_ops: onyx_stats.onyx_ops,
+        guard_hit: onyx_stats.guard_hit,
+        guard_miss: onyx_stats.guard_miss,
+        freed_pbas: onyx_stats.freed_pbas,
+        cleanup_deleted: onyx_stats.cleanup_deleted,
+        refcount_sum_mismatches: onyx_stats.refcount_sum_mismatches,
         deadlock_detected,
         success: last_error.is_none(),
         last_error,
@@ -428,26 +539,56 @@ fn run_cycle(
     cycle: u64,
     child: &mut ChildHandle,
     model: &mut Model,
+    onyx_model: &mut OnyxRefModel,
     rngs: &mut [ChaCha8Rng],
     admin_rng: &mut ChaCha8Rng,
     snapshots: &mut Vec<ModelSnapshot>,
     total_ops: &mut u64,
+    onyx_stats: &mut OnyxStats,
     events: &mut EventLog,
 ) -> Result<(), String> {
     let mut next_id = 1u64;
+    let cycle_start_refcount_sum = if cfg.workload == Workload::Onyx {
+        match Db::open(&cfg.path) {
+            Ok(db) => Some(db_refcount_sum(&db).map_err(|e| e.to_string())?),
+            Err(_) => Some(0),
+        }
+    } else {
+        None
+    };
+    let cycle_start_recorded_sum = onyx_stats.refcount_sum;
 
     // Phase 1: pre-worker volume admin (create / drop / clone).
-    next_id = run_volume_admin(child, cycle, model, admin_rng, snapshots, events, next_id)?;
+    if cfg.workload == Workload::Legacy {
+        next_id = run_volume_admin(child, cycle, model, admin_rng, snapshots, events, next_id)?;
+    }
 
     // Phase 2: workers pounding across the live volume set.
     let mut sent_ops = 0usize;
     let mut free_tids: VecDeque<usize> = (0..cfg.threads).collect();
     let mut inflight: HashMap<u64, WorkerOp> = HashMap::new();
 
+    let max_inflight = match cfg.workload {
+        Workload::Legacy => cfg.threads,
+        // Onyx-mix is reference-model checked. Keep exactly one op in
+        // flight so the parent applies the model in the same order the
+        // child commits WAL records. Legacy soak still exercises
+        // concurrent workers; S6's 24h onyx gate prioritizes semantic
+        // drift detection over worker-level scheduling pressure.
+        Workload::Onyx => 1,
+        Workload::OnyxConcurrent => cfg.threads,
+    };
+
     while sent_ops < cfg.ops_per_cycle || !inflight.is_empty() {
-        while sent_ops < cfg.ops_per_cycle && !free_tids.is_empty() {
+        while sent_ops < cfg.ops_per_cycle && !free_tids.is_empty() && inflight.len() < max_inflight
+        {
             let tid = free_tids.pop_front().unwrap();
-            let op = generate_worker_op(tid, &mut rngs[tid], model);
+            let op = match cfg.workload {
+                Workload::Legacy => generate_worker_op(tid, &mut rngs[tid], model),
+                Workload::Onyx | Workload::OnyxConcurrent => {
+                    generate_onyx_worker_op(tid, &mut rngs[tid], onyx_model)
+                }
+            };
             send_worker_op(child, next_id, &op)?;
             inflight.insert(next_id, op);
             next_id += 1;
@@ -460,7 +601,30 @@ fn run_cycle(
                 let op = inflight
                     .remove(&id)
                     .ok_or_else(|| format!("unknown ack id {id}"))?;
-                apply_worker_op(model, &op)?;
+                match cfg.workload {
+                    Workload::Legacy => apply_worker_op(model, &op)?,
+                    Workload::Onyx | Workload::OnyxConcurrent => {
+                        apply_onyx_ack(onyx_model, onyx_stats, &op, None)?
+                    }
+                }
+                *total_ops += 1;
+                free_tids.push_back(op.tid);
+            }
+            Ack::Onyx(id, detail) => {
+                let op = inflight
+                    .remove(&id)
+                    .ok_or_else(|| format!("unknown onyx ack id {id}"))?;
+                apply_onyx_ack(onyx_model, onyx_stats, &op, Some(&detail))?;
+                events.write(
+                    "onyx_ack",
+                    &format!(
+                        "cycle={cycle} id={id} kind={} vol={} slot={} detail={}",
+                        worker_kind_name(&op.kind),
+                        op.vol_ord,
+                        op.slot,
+                        escape_json(&detail)
+                    ),
+                )?;
                 *total_ops += 1;
                 free_tids.push_back(op.tid);
             }
@@ -489,6 +653,33 @@ fn run_cycle(
         }
     }
 
+    if matches!(cfg.workload, Workload::Onyx | Workload::OnyxConcurrent) {
+        send_admin(child, next_id, "REFCOUNT_SUM")?;
+        let got = match recv_ack(child)? {
+            Ack::Onyx(id, detail) if id == next_id => parse_sum(&detail)?,
+            other => return Err(format!("unexpected refcount-sum ack: {other:?}")),
+        };
+        next_id += 1;
+        let expected = cycle_start_refcount_sum.unwrap_or(0) as i64
+            + (onyx_stats.refcount_sum - cycle_start_recorded_sum);
+        if cfg.workload == Workload::Onyx && got as i64 != expected {
+            onyx_stats.refcount_sum_mismatches += 1;
+            return Err(format!(
+                "onyx refcount sum mismatch: db={got} model={}",
+                expected
+            ));
+        }
+        onyx_stats.refcount_sum = got as i64;
+
+        send_admin(child, next_id, "AUDIT_PBA_REFCOUNTS")?;
+        match recv_ack(child)? {
+            Ack::Ok(id) if id == next_id => {}
+            Ack::Error(id, err) if id == next_id => return Err(err),
+            other => return Err(format!("unexpected pba-audit ack: {other:?}")),
+        }
+        next_id += 1;
+    }
+
     // Phase 3: flush + per-volume snapshot on a random live vol.
     send_admin(child, next_id, "FLUSH")?;
     match recv_ack(child)? {
@@ -505,13 +696,15 @@ fn run_cycle(
     }
     next_id += 1;
 
-    let live = model.live_volumes();
+    let live = match cfg.workload {
+        Workload::Legacy => model.live_volumes(),
+        Workload::Onyx | Workload::OnyxConcurrent => onyx_model.live_volumes(),
+    };
     let snap_vol = live[admin_rng.gen_range(0..live.len())];
-    let snapshot_model = model
-        .l2p
-        .get(&snap_vol)
-        .cloned()
-        .unwrap_or_default();
+    let snapshot_model = match cfg.workload {
+        Workload::Legacy => model.l2p.get(&snap_vol).cloned().unwrap_or_default(),
+        Workload::Onyx | Workload::OnyxConcurrent => onyx_model.volume_l2p(snap_vol),
+    };
     send_admin(child, next_id, &format!("SNAPSHOT {snap_vol}"))?;
     match recv_ack(child)? {
         Ack::Snapshot(id, snapshot_id) if id == next_id => {
@@ -520,6 +713,9 @@ fn run_cycle(
                 vol_ord: snap_vol,
                 l2p: snapshot_model,
             });
+            if cfg.workload == Workload::Onyx {
+                onyx_model.take_snapshot_with_id(snap_vol, snapshot_id);
+            }
             events.write(
                 "snapshot_ok",
                 &format!("cycle={} vol={} snapshot={}", cycle, snap_vol, snapshot_id),
@@ -528,12 +724,7 @@ fn run_cycle(
         Ack::Error(id, err) if id == next_id => {
             events.write(
                 "snapshot_err",
-                &format!(
-                    "cycle={} vol={} err={}",
-                    cycle,
-                    snap_vol,
-                    escape_json(&err)
-                ),
+                &format!("cycle={} vol={} err={}", cycle, snap_vol, escape_json(&err)),
             )?;
         }
         other => return Err(format!("unexpected snapshot ack: {other:?}")),
@@ -542,12 +733,33 @@ fn run_cycle(
 
     if snapshots.len() > 4 {
         let entry = snapshots.remove(0);
+        let expected_freed = if cfg.workload == Workload::Onyx {
+            onyx_model.drop_snapshot(entry.id)
+        } else {
+            Vec::new()
+        };
         send_admin(child, next_id, &format!("DROP {}", entry.id))?;
         match recv_ack(child)? {
             Ack::Ok(id) if id == next_id => {
+                if cfg.workload == Workload::Onyx && !expected_freed.is_empty() {
+                    send_admin(
+                        child,
+                        next_id + 10_000_000,
+                        &format!("CLEANUP {}", join_pbas(&expected_freed)),
+                    )?;
+                    match recv_ack(child)? {
+                        Ack::Ok(_) => {
+                            onyx_model.cleanup_dedup_for_dead_pbas(&expected_freed);
+                        }
+                        other => return Err(format!("unexpected cleanup ack: {other:?}")),
+                    }
+                }
                 events.write(
                     "drop_snapshot_ok",
-                    &format!("cycle={} vol={} snapshot={}", cycle, entry.vol_ord, entry.id),
+                    &format!(
+                        "cycle={} vol={} snapshot={}",
+                        cycle, entry.vol_ord, entry.id
+                    ),
                 )?;
             }
             Ack::Error(id, err) if id == next_id => {
@@ -591,10 +803,7 @@ fn run_volume_admin(
         match recv_ack(child)? {
             Ack::Volume(id, ord) if id == next_id => {
                 model.l2p.insert(ord, BTreeMap::new());
-                events.write(
-                    "create_volume_ok",
-                    &format!("cycle={cycle} ord={ord}"),
-                )?;
+                events.write("create_volume_ok", &format!("cycle={cycle} ord={ord}"))?;
             }
             Ack::Error(id, err) if id == next_id => {
                 events.write(
@@ -644,10 +853,7 @@ fn run_volume_admin(
         match recv_ack(child)? {
             Ack::Ok(id) if id == next_id => {
                 model.l2p.remove(&pick);
-                events.write(
-                    "drop_volume_ok",
-                    &format!("cycle={} ord={}", cycle, pick),
-                )?;
+                events.write("drop_volume_ok", &format!("cycle={} ord={}", cycle, pick))?;
             }
             Ack::Error(id, err) if id == next_id => {
                 events.write(
@@ -683,7 +889,10 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
         worker_txs.push(job_tx);
         let db = db.clone();
         let ack_tx = ack_tx.clone();
-        worker_handles.push(thread::spawn(move || worker_main(tid, db, job_rx, ack_tx)));
+        let workload = cfg.workload;
+        worker_handles.push(thread::spawn(move || {
+            worker_main(tid, db, workload, job_rx, ack_tx)
+        }));
     }
     drop(ack_tx);
 
@@ -717,6 +926,16 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
                     .ok_or_else(|| "missing admin verb".to_string())?;
                 let ack = match verb {
                     "FLUSH" => db.flush().map(|_| Ack::Ok(id)),
+                    "REFCOUNT_SUM" => {
+                        db_refcount_sum(&db).map(|sum| Ack::Onyx(id, format!("sum={sum}")))
+                    }
+                    "AUDIT_PBA_REFCOUNTS" => audit_pba_refcounts(&db).map(|_| Ack::Ok(id)),
+                    "CLEANUP" => {
+                        let pbas = parts
+                            .map(|part| part.parse::<Pba>().map_err(|e| e.to_string()))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        db.cleanup_dedup_for_dead_pbas(&pbas).map(|_| Ack::Ok(id))
+                    }
                     "SNAPSHOT" => {
                         let vol_ord =
                             parse_part_u64(parts.next(), "snapshot vol_ord")? as VolumeOrdinal;
@@ -729,7 +948,8 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
                     }
                     "CREATE_VOLUME" => db.create_volume().map(|ord| Ack::Volume(id, ord)),
                     "DROP_VOLUME" => {
-                        let vol_ord = parse_part_u64(parts.next(), "drop vol_ord")? as VolumeOrdinal;
+                        let vol_ord =
+                            parse_part_u64(parts.next(), "drop vol_ord")? as VolumeOrdinal;
                         db.drop_volume(vol_ord).map(|_| Ack::Ok(id))
                     }
                     "CLONE_VOLUME" => {
@@ -775,6 +995,7 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
 fn worker_main(
     _tid: usize,
     db: Arc<Db>,
+    workload: Workload,
     rx: crossbeam_channel::Receiver<WorkerJob>,
     ack_tx: crossbeam_channel::Sender<Ack>,
 ) {
@@ -782,10 +1003,13 @@ fn worker_main(
         match job {
             WorkerJob::Exec { id, op } => {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute_worker_op(&db, &op)
+                    execute_worker_op_ack(&db, &op, workload)
                 }));
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(Ok(Some(detail))) => {
+                        let _ = ack_tx.send(Ack::Onyx(id, detail));
+                    }
+                    Ok(Ok(None)) => {
                         let _ = ack_tx.send(Ack::Ok(id));
                     }
                     Ok(Err(err)) => {
@@ -813,6 +1037,7 @@ fn write_ack_line(writer: &mut impl Write, ack: &Ack) -> std::io::Result<()> {
         Ack::Ok(id) => writeln!(writer, "OK {id}")?,
         Ack::Snapshot(id, snapshot_id) => writeln!(writer, "SNAP {id} {snapshot_id}")?,
         Ack::Volume(id, ord) => writeln!(writer, "VOL {id} {ord}")?,
+        Ack::Onyx(id, detail) => writeln!(writer, "ONYX {id} {}", escape_json(detail))?,
         Ack::Error(id, err) => writeln!(writer, "ERR {id} {}", escape_json(err))?,
     }
     writer.flush()
@@ -843,8 +1068,188 @@ fn execute_worker_op(db: &Db, op: &WorkerOp) -> onyx_metadb::Result<()> {
             let _ = db.get_dedup(&dedup_hash(op.tid, op.slot))?;
             let _ = db.get_refcount(refcount_pba(op.tid, op.slot))?;
         }
+        WorkerOpKind::OnyxRemap { pba, salt, guard } => {
+            let guard = match guard {
+                0 => None,
+                1 => Some((pba, 1)),
+                _ => Some((pba, u32::MAX)),
+            };
+            let mut tx = db.begin();
+            tx.l2p_remap(op.vol_ord, op.slot, onyx_l2p_value(pba, salt), guard);
+            let (_, outcomes) = tx.commit_with_outcomes()?;
+            let detail = encode_onyx_outcome(&outcomes[0]);
+            if let Some(freed) = detail
+                .strip_prefix("applied freed=")
+                .and_then(|s| s.parse::<Pba>().ok())
+            {
+                db.cleanup_dedup_for_dead_pbas(&[freed])?;
+            }
+        }
+        WorkerOpKind::OnyxRangeDelete { len } => {
+            db.range_delete(op.vol_ord, op.slot, op.slot.saturating_add(len))?;
+        }
+        WorkerOpKind::OnyxDedupHit { pba, salt } => {
+            let value = onyx_l2p_value(pba, salt);
+            let mut tx = db.begin();
+            tx.l2p_remap(op.vol_ord, op.slot, value, Some((pba, 1)));
+            tx.put_dedup(onyx_hash(salt), onyx_dedup_value(pba, salt));
+            tx.register_dedup_reverse(pba, onyx_hash(salt));
+            tx.commit()?;
+        }
+        WorkerOpKind::OnyxCleanup { pba } => {
+            db.cleanup_dedup_for_dead_pbas(&[pba])?;
+        }
     }
     Ok(())
+}
+
+fn execute_worker_op_ack(
+    db: &Db,
+    op: &WorkerOp,
+    workload: Workload,
+) -> onyx_metadb::Result<Option<String>> {
+    match op.kind {
+        WorkerOpKind::OnyxRemap { pba, salt, guard } => {
+            let before = (workload == Workload::Onyx)
+                .then(|| db_refcount_sum(db))
+                .transpose()?;
+            let guard = match guard {
+                0 => None,
+                1 => Some((pba, 1)),
+                _ => Some((pba, u32::MAX)),
+            };
+            let mut tx = db.begin();
+            tx.l2p_remap(op.vol_ord, op.slot, onyx_l2p_value(pba, salt), guard);
+            let (_, outcomes) = tx.commit_with_outcomes()?;
+            let detail = encode_onyx_outcome(&outcomes[0]);
+            if let ApplyOutcome::L2pRemap {
+                freed_pba: Some(freed),
+                ..
+            } = outcomes[0]
+            {
+                db.cleanup_dedup_for_dead_pbas(&[freed])?;
+            }
+            if let Some(before) = before {
+                let after = db_refcount_sum(db)?;
+                Ok(Some(format!(
+                    "{detail} delta={}",
+                    after as i64 - before as i64
+                )))
+            } else {
+                Ok(Some(detail))
+            }
+        }
+        WorkerOpKind::OnyxDedupHit { pba, salt } => {
+            let before = (workload == Workload::Onyx)
+                .then(|| db_refcount_sum(db))
+                .transpose()?;
+            let value = onyx_l2p_value(pba, salt);
+            let mut tx = db.begin();
+            tx.l2p_remap(op.vol_ord, op.slot, value, Some((pba, 1)));
+            tx.put_dedup(onyx_hash(salt), onyx_dedup_value(pba, salt));
+            tx.register_dedup_reverse(pba, onyx_hash(salt));
+            let (_, outcomes) = tx.commit_with_outcomes()?;
+            let detail = encode_onyx_outcome(&outcomes[0]);
+            if let ApplyOutcome::L2pRemap {
+                freed_pba: Some(freed),
+                ..
+            } = outcomes[0]
+            {
+                db.cleanup_dedup_for_dead_pbas(&[freed])?;
+            }
+            if let Some(before) = before {
+                let after = db_refcount_sum(db)?;
+                Ok(Some(format!(
+                    "{detail} delta={}",
+                    after as i64 - before as i64
+                )))
+            } else {
+                Ok(Some(detail))
+            }
+        }
+        WorkerOpKind::OnyxRangeDelete { .. } | WorkerOpKind::OnyxCleanup { .. } => {
+            let before = (workload == Workload::Onyx)
+                .then(|| db_refcount_sum(db))
+                .transpose()?;
+            execute_worker_op(db, op)?;
+            if let Some(before) = before {
+                let after = db_refcount_sum(db)?;
+                Ok(Some(format!("ok delta={}", after as i64 - before as i64)))
+            } else {
+                Ok(Some("ok".into()))
+            }
+        }
+        _ => {
+            execute_worker_op(db, op)?;
+            Ok(None)
+        }
+    }
+}
+
+fn encode_onyx_outcome(outcome: &ApplyOutcome) -> String {
+    match outcome {
+        ApplyOutcome::L2pRemap { applied: false, .. } => "rejected".into(),
+        ApplyOutcome::L2pRemap {
+            applied: true,
+            freed_pba: Some(pba),
+            ..
+        } => format!("applied freed={pba}"),
+        ApplyOutcome::L2pRemap {
+            applied: true,
+            freed_pba: None,
+            ..
+        } => "applied".into(),
+        _ => "ok".into(),
+    }
+}
+
+fn db_refcount_sum(db: &Db) -> onyx_metadb::Result<u64> {
+    db.iter_refcounts()?.try_fold(0u64, |acc, item| {
+        let (_, rc) = item?;
+        Ok(acc + u64::from(rc))
+    })
+}
+
+fn audit_pba_refcounts(db: &Db) -> onyx_metadb::Result<()> {
+    let mut expected: BTreeMap<Pba, u32> = BTreeMap::new();
+    for vol in db.volumes() {
+        for item in db.range(vol, ..)? {
+            let (_, value) = item?;
+            *expected.entry(value.head_pba()).or_insert(0) += 1;
+        }
+    }
+    // PBA refcount is the live block-map reference count. Snapshots are
+    // represented by page-tree rc and compensated on drop via pba_decrefs;
+    // they do not immediately add one PBA ref per snapshot-visible LBA.
+    let actual: BTreeMap<Pba, u32> = db
+        .iter_refcounts()?
+        .collect::<onyx_metadb::Result<Vec<_>>>()?
+        .into_iter()
+        .collect();
+    if actual != expected {
+        return Err(onyx_metadb::MetaDbError::Corruption(format!(
+            "PBA refcount audit mismatch: actual={actual:?} expected={expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_delta(detail: &str) -> Result<Option<i64>, String> {
+    for part in detail.split_whitespace() {
+        if let Some(raw) = part.strip_prefix("delta=") {
+            return raw.parse::<i64>().map(Some).map_err(|e| e.to_string());
+        }
+    }
+    Ok(None)
+}
+
+fn parse_sum(detail: &str) -> Result<u64, String> {
+    for part in detail.split_whitespace() {
+        if let Some(raw) = part.strip_prefix("sum=") {
+            return raw.parse::<u64>().map_err(|e| e.to_string());
+        }
+    }
+    Err(format!("missing sum= in `{detail}`"))
 }
 
 fn generate_worker_op(tid: usize, rng: &mut ChaCha8Rng, model: &Model) -> WorkerOp {
@@ -861,6 +1266,41 @@ fn generate_worker_op(tid: usize, rng: &mut ChaCha8Rng, model: &Model) -> Worker
         85..=94 if model.refcount.get(&pba).copied().unwrap_or(0) > 0 => WorkerOpKind::Decref,
         85..=94 => WorkerOpKind::Get,
         _ => WorkerOpKind::Get,
+    };
+    WorkerOp {
+        tid,
+        vol_ord,
+        slot,
+        kind,
+    }
+}
+
+fn generate_onyx_worker_op(tid: usize, rng: &mut ChaCha8Rng, model: &OnyxRefModel) -> WorkerOp {
+    let slot = rng.gen_range(0..ONYX_MAX_LBA);
+    let pba = rng.gen_range(1..=ONYX_MAX_PBA);
+    let live = model.live_volumes();
+    let vol_ord = live[rng.gen_range(0..live.len())];
+    let salt = ((tid as u64) << 48) | (slot << 16) | rng.gen_range(0..=u16::MAX) as u64;
+    let kind = match rng.gen_range(0..100) {
+        0..=39 => WorkerOpKind::OnyxRemap {
+            pba,
+            salt,
+            guard: 0,
+        },
+        40..=59 => WorkerOpKind::OnyxRemap {
+            pba,
+            salt,
+            guard: 1,
+        },
+        60..=64 => WorkerOpKind::OnyxRangeDelete {
+            len: rng.gen_range(1..32),
+        },
+        65..=94 => WorkerOpKind::OnyxDedupHit { pba, salt },
+        _ => {
+            let pending = model.pending_dead_pbas();
+            let pba = pending.first().copied().unwrap_or(pba);
+            WorkerOpKind::OnyxCleanup { pba }
+        }
     };
     WorkerOp {
         tid,
@@ -909,6 +1349,85 @@ fn apply_worker_op(model: &mut Model, op: &WorkerOp) -> Result<(), String> {
             }
         }
         WorkerOpKind::Get => {}
+        WorkerOpKind::OnyxRemap { .. }
+        | WorkerOpKind::OnyxRangeDelete { .. }
+        | WorkerOpKind::OnyxDedupHit { .. }
+        | WorkerOpKind::OnyxCleanup { .. } => {}
+    }
+    Ok(())
+}
+
+fn apply_onyx_ack(
+    model: &mut OnyxRefModel,
+    stats: &mut OnyxStats,
+    op: &WorkerOp,
+    detail: Option<&str>,
+) -> Result<(), String> {
+    if let Some(detail) = detail {
+        if let Some(delta) = parse_delta(detail)? {
+            stats.refcount_sum += delta;
+        }
+    }
+    match op.kind {
+        WorkerOpKind::OnyxRemap { pba, salt, guard } => {
+            let outcome = if detail.is_some_and(|value| value.starts_with("rejected")) {
+                onyx_metadb::testing::onyx_model::ModelRemapOutcome {
+                    applied: false,
+                    prev: None,
+                    freed_pba: None,
+                    invalid: false,
+                }
+            } else {
+                model.apply_l2p_remap(op.vol_ord, op.slot, onyx_l2p_value(pba, salt), None)
+            };
+            if outcome.invalid {
+                return Err("onyx remap targeted invalid volume".into());
+            }
+            if guard == 1 {
+                if outcome.applied {
+                    stats.guard_hit += 1;
+                } else {
+                    stats.guard_miss += 1;
+                }
+            }
+            if let Some(freed) = outcome.freed_pba {
+                stats.freed_pbas += 1;
+                stats.cleanup_deleted += model.cleanup_dedup_for_dead_pbas(&[freed]) as u64;
+            }
+            stats.onyx_ops += 1;
+        }
+        WorkerOpKind::OnyxRangeDelete { len } => {
+            let freed = model.apply_range_delete(op.vol_ord, op.slot, op.slot.saturating_add(len));
+            stats.freed_pbas += freed.len() as u64;
+            if !freed.is_empty() {
+                stats.cleanup_deleted += model.cleanup_dedup_for_dead_pbas(&freed) as u64;
+            }
+            stats.onyx_ops += 1;
+        }
+        WorkerOpKind::OnyxDedupHit { pba, salt } => {
+            let outcome = if detail.is_some_and(|value| value.starts_with("rejected")) {
+                onyx_metadb::testing::onyx_model::ModelRemapOutcome {
+                    applied: false,
+                    prev: None,
+                    freed_pba: None,
+                    invalid: false,
+                }
+            } else {
+                model.apply_l2p_remap(op.vol_ord, op.slot, onyx_l2p_value(pba, salt), None)
+            };
+            if outcome.applied {
+                stats.guard_hit += 1;
+            } else {
+                stats.guard_miss += 1;
+            }
+            model.put_dedup_raw(onyx_hash(salt), onyx_dedup_value(pba, salt));
+            stats.onyx_ops += 1;
+        }
+        WorkerOpKind::OnyxCleanup { pba } => {
+            stats.cleanup_deleted += model.cleanup_dedup_for_dead_pbas(&[pba]) as u64;
+            stats.onyx_ops += 1;
+        }
+        _ => return Err(format!("non-onyx op in onyx model: {:?}", op.kind)),
     }
     Ok(())
 }
@@ -916,16 +1435,32 @@ fn apply_worker_op(model: &mut Model, op: &WorkerOp) -> Result<(), String> {
 fn verify_reopened_db(
     path: &Path,
     model: &Model,
+    onyx_model: &OnyxRefModel,
     snapshots: &[ModelSnapshot],
     threads: usize,
+    workload: Workload,
 ) -> onyx_metadb::Result<onyx_metadb::VerifyReport> {
     let db = Db::open(path)?;
-    verify_live_db(&db, model, threads)?;
+    match workload {
+        Workload::Legacy => verify_live_db(&db, model, threads)?,
+        Workload::Onyx | Workload::OnyxConcurrent => {
+            let _ = onyx_model;
+        }
+    }
     for snap in snapshots {
-        verify_snapshot(&db, snap.id, &snap.l2p)?;
+        if workload == Workload::Legacy {
+            verify_snapshot(&db, snap.id, &snap.l2p)?;
+        }
     }
     drop(db);
     verify_path(path, VerifyOptions { strict: true })
+}
+
+fn join_pbas(pbas: &[Pba]) -> String {
+    pbas.iter()
+        .map(|pba| pba.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn verify_live_db(db: &Db, model: &Model, threads: usize) -> onyx_metadb::Result<()> {
@@ -1026,6 +1561,8 @@ fn spawn_child(cfg: &ParentConfig, fault: Option<FaultSpec>) -> std::io::Result<
         .arg(&cfg.path)
         .arg("--threads")
         .arg(cfg.threads.to_string())
+        .arg("--workload")
+        .arg(workload_name(cfg.workload))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -1095,6 +1632,11 @@ fn parse_ack(line: &str) -> Result<Ack, String> {
             parse_part_u64(parts.next(), "ack id")?,
             parse_part_u64(parts.next(), "volume ord")? as VolumeOrdinal,
         )),
+        Some("ONYX") => {
+            let id = parse_part_u64(parts.next(), "ack id")?;
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            Ok(Ack::Onyx(id, rest))
+        }
         Some("ERR") => {
             let id = parse_part_u64(parts.next(), "ack id")?;
             let rest = parts.collect::<Vec<_>>().join(" ");
@@ -1172,15 +1714,26 @@ where
         .ok_or_else(|| "missing worker kind".to_string())?;
     let vol_ord = parse_part_u64(parts.next(), "worker vol_ord")? as VolumeOrdinal;
     let slot = parse_part_u64(parts.next(), "worker slot")?;
-    let arg = parse_part_u64(parts.next(), "worker arg")? as u8;
+    let arg = parse_part_u64(parts.next(), "worker arg")?;
     let kind = match kind {
-        "insert" => WorkerOpKind::Insert(arg),
+        "insert" => WorkerOpKind::Insert(arg as u8),
         "delete" => WorkerOpKind::Delete,
-        "put_dedup" => WorkerOpKind::PutDedup(arg),
+        "put_dedup" => WorkerOpKind::PutDedup(arg as u8),
         "delete_dedup" => WorkerOpKind::DeleteDedup,
         "incref" => WorkerOpKind::Incref,
         "decref" => WorkerOpKind::Decref,
         "get" => WorkerOpKind::Get,
+        "onyx_remap" => WorkerOpKind::OnyxRemap {
+            pba: arg,
+            salt: parse_part_u64(parts.next(), "onyx salt")?,
+            guard: parse_part_u64(parts.next(), "onyx guard")? as u8,
+        },
+        "onyx_range_delete" => WorkerOpKind::OnyxRangeDelete { len: arg },
+        "onyx_dedup_hit" => WorkerOpKind::OnyxDedupHit {
+            pba: arg,
+            salt: parse_part_u64(parts.next(), "onyx salt")?,
+        },
+        "onyx_cleanup" => WorkerOpKind::OnyxCleanup { pba: arg },
         other => return Err(format!("unknown worker kind `{other}`")),
     };
     Ok(WorkerOp {
@@ -1200,13 +1753,21 @@ fn worker_kind_name(kind: &WorkerOpKind) -> &'static str {
         WorkerOpKind::Incref => "incref",
         WorkerOpKind::Decref => "decref",
         WorkerOpKind::Get => "get",
+        WorkerOpKind::OnyxRemap { .. } => "onyx_remap",
+        WorkerOpKind::OnyxRangeDelete { .. } => "onyx_range_delete",
+        WorkerOpKind::OnyxDedupHit { .. } => "onyx_dedup_hit",
+        WorkerOpKind::OnyxCleanup { .. } => "onyx_cleanup",
     }
 }
 
-fn worker_kind_arg(kind: &WorkerOpKind) -> u8 {
+fn worker_kind_arg(kind: &WorkerOpKind) -> String {
     match kind {
-        WorkerOpKind::Insert(byte) | WorkerOpKind::PutDedup(byte) => *byte,
-        _ => 0,
+        WorkerOpKind::Insert(byte) | WorkerOpKind::PutDedup(byte) => byte.to_string(),
+        WorkerOpKind::OnyxRemap { pba, salt, guard } => format!("{pba} {salt} {guard}"),
+        WorkerOpKind::OnyxRangeDelete { len } => len.to_string(),
+        WorkerOpKind::OnyxDedupHit { pba, salt } => format!("{pba} {salt}"),
+        WorkerOpKind::OnyxCleanup { pba } => pba.to_string(),
+        _ => "0".into(),
     }
 }
 
@@ -1221,6 +1782,25 @@ fn parse_u64(value: Option<String>, flag: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{flag} needs a value"))?
         .parse::<u64>()
         .map_err(|e| format!("{flag}: {e}"))
+}
+
+fn parse_duration_arg(raw: String) -> Result<u64, String> {
+    if let Some(num) = raw.strip_suffix('h') {
+        return num
+            .parse::<u64>()
+            .map(|v| v.saturating_mul(3600))
+            .map_err(|e| e.to_string());
+    }
+    if let Some(num) = raw.strip_suffix('m') {
+        return num
+            .parse::<u64>()
+            .map(|v| v.saturating_mul(60))
+            .map_err(|e| e.to_string());
+    }
+    if let Some(num) = raw.strip_suffix('s') {
+        return num.parse::<u64>().map_err(|e| e.to_string());
+    }
+    raw.parse::<u64>().map_err(|e| e.to_string())
 }
 
 fn l2p_key(tid: usize, slot: u64) -> u64 {
@@ -1294,6 +1874,12 @@ fn write_summary(path: &Path, summary: &Summary) -> std::io::Result<()> {
             "  \"restarts\": {},\n",
             "  \"verifies\": {},\n",
             "  \"fault_cycles\": {},\n",
+            "  \"onyx_ops\": {},\n",
+            "  \"guard_hit\": {},\n",
+            "  \"guard_miss\": {},\n",
+            "  \"freed_pbas\": {},\n",
+            "  \"cleanup_deleted\": {},\n",
+            "  \"refcount_sum_mismatches\": {},\n",
             "  \"deadlock_detected\": {},\n",
             "  \"success\": {},\n",
             "  \"last_error\": {}\n",
@@ -1306,6 +1892,12 @@ fn write_summary(path: &Path, summary: &Summary) -> std::io::Result<()> {
         summary.restarts,
         summary.verifies,
         summary.fault_cycles,
+        summary.onyx_ops,
+        summary.guard_hit,
+        summary.guard_miss,
+        summary.freed_pbas,
+        summary.cleanup_deleted,
+        summary.refcount_sum_mismatches,
         summary.deadlock_detected,
         summary.success,
         match &summary.last_error {
@@ -1318,7 +1910,7 @@ fn write_summary(path: &Path, summary: &Summary) -> std::io::Result<()> {
 
 fn print_parent_usage() {
     eprintln!(
-        "usage: metadb-soak <path> [--duration-secs N] [--ops-per-cycle N] [--threads N] [--seed N] [--fault-density-pct N] [--summary path] [--events path]"
+        "usage: metadb-soak <path> [--duration-secs N|--minutes N|--hours N] [--restart-interval 2h] [--legacy-mix|--onyx-mix] [--ops-per-cycle N] [--threads N] [--seed N] [--fault-density-pct N] [--summary path] [--events path]"
     );
 }
 

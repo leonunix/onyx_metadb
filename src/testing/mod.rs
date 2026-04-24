@@ -9,3 +9,4 @@
 //! tests can exercise crash / IO-error paths deterministically.
 
 pub mod faults;
+pub mod onyx_model;
