@@ -379,3 +379,134 @@ fn clone_volume_crash_mid_incref_completes_on_recovery() {
         report.issues
     );
 }
+
+// ----------------- L2pRemap crash-safety (SPEC §5.3) ---------------
+
+/// Encode a pba + tag into the 28-byte `L2pValue` the same way tests
+/// in `db::tests` do: head 8 bytes are the target pba BE (Onyx's
+/// `BlockmapValue` contract), byte 8 is a discriminator tag.
+fn remap_val(pba: u64, tag: u8) -> L2pValue {
+    let mut v = [0u8; 28];
+    v[..8].copy_from_slice(&pba.to_be_bytes());
+    v[8] = tag;
+    L2pValue(v)
+}
+
+/// Crash right after the WAL record landed but before apply ran.
+/// Recovery must replay the `L2pRemap` so both the L2P mapping and
+/// the refcount side-effects end up on disk. Regression test for the
+/// SPEC §4.3 guard-atomicity invariant: no half-applied state is
+/// allowed.
+#[test]
+fn crash_after_wal_before_apply_replays_l2p_remap() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            // Seed rc(100)=1 so guard tests observe a live target.
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 10, remap_val(100, 1), None);
+            tx.commit().unwrap();
+            faults.install(FaultPoint::CommitPostWalBeforeApply, 1, FaultAction::Panic);
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 11, remap_val(100, 2), Some((100, 1)));
+            let _ = tx.commit();
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(db.get(0, 10).unwrap(), Some(remap_val(100, 1)));
+    assert_eq!(
+        db.get(0, 11).unwrap(),
+        Some(remap_val(100, 2)),
+        "replayed L2pRemap restored the lba=11 mapping",
+    );
+    assert_eq!(
+        db.get_refcount(100).unwrap(),
+        2,
+        "refcount incref from replayed L2pRemap applied exactly once",
+    );
+}
+
+/// Crash between apply and last_applied_lsn bump. On replay metadb
+/// must not double-apply the refcount decref/incref embedded in the
+/// L2pRemap. The `page.generation >= lsn` guard on L2P pages plus the
+/// checkpoint-lsn ordering rule in `commit_ops` is what keeps the
+/// refcount side consistent.
+#[test]
+fn crash_after_apply_before_lsn_bump_l2p_remap_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            // Pre-seed rc(100)=2 via two independent remaps so the
+            // post-crash remap decrefs without reaching zero — this
+            // is the "decref not to zero" path where a double-apply
+            // would silently under-count.
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 10, remap_val(100, 1), None);
+            tx.commit().unwrap();
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 11, remap_val(100, 2), None);
+            tx.commit().unwrap();
+            assert_eq!(db.get_refcount(100).unwrap(), 2);
+
+            faults.install(
+                FaultPoint::CommitPostApplyBeforeLsnBump,
+                1,
+                FaultAction::Panic,
+            );
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 10, remap_val(200, 1), None);
+            let _ = tx.commit();
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(db.get(0, 10).unwrap(), Some(remap_val(200, 1)));
+    assert_eq!(db.get(0, 11).unwrap(), Some(remap_val(100, 2)));
+    assert_eq!(
+        db.get_refcount(100).unwrap(),
+        1,
+        "replay must not double-decref; rc should be 1 after one decref",
+    );
+    assert_eq!(db.get_refcount(200).unwrap(), 1);
+}
+
+/// Guard-reject path: the op's WAL record contains `guard = Some`
+/// with a threshold that isn't met. Live apply returns `applied =
+/// false` and leaves state untouched. A crash immediately after WAL
+/// fsync must replay the same decision — guard still rejects, no
+/// state change.
+#[test]
+fn crash_after_wal_with_rejecting_guard_stays_a_no_op_on_replay() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            // rc(100) stays 0: guard min_rc=1 must fail.
+            faults.install(FaultPoint::CommitPostWalBeforeApply, 1, FaultAction::Panic);
+            let mut tx = db.begin();
+            tx.l2p_remap(0, 10, remap_val(200, 1), Some((100, 1)));
+            let _ = tx.commit();
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(db.get(0, 10).unwrap(), None, "guard rejected op on replay");
+    assert_eq!(db.get_refcount(100).unwrap(), 0);
+    assert_eq!(
+        db.get_refcount(200).unwrap(),
+        0,
+        "no incref ran because the op was a no-op",
+    );
+}

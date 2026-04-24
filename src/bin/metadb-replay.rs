@@ -126,6 +126,7 @@ struct Summary {
 struct OpCounts {
     l2p_put: u64,
     l2p_delete: u64,
+    l2p_remap: u64,
     dedup_put: u64,
     dedup_delete: u64,
     dedup_reverse_put: u64,
@@ -143,6 +144,7 @@ impl OpCounts {
         match op {
             WalOp::L2pPut { .. } => self.l2p_put += 1,
             WalOp::L2pDelete { .. } => self.l2p_delete += 1,
+            WalOp::L2pRemap { .. } => self.l2p_remap += 1,
             WalOp::DedupPut { .. } => self.dedup_put += 1,
             WalOp::DedupDelete { .. } => self.dedup_delete += 1,
             WalOp::DedupReversePut { .. } => self.dedup_reverse_put += 1,
@@ -244,6 +246,21 @@ fn fmt_op(op: &WalOp) -> String {
             hex(value.0)
         ),
         WalOp::L2pDelete { vol_ord, lba } => format!("L2pDelete vol={vol_ord} lba={lba}"),
+        WalOp::L2pRemap {
+            vol_ord,
+            lba,
+            new_value,
+            guard,
+        } => match guard {
+            Some((pba, min_rc)) => format!(
+                "L2pRemap vol={vol_ord} lba={lba} new_value={} guard=(pba={pba}, min_rc={min_rc})",
+                hex(new_value.0)
+            ),
+            None => format!(
+                "L2pRemap vol={vol_ord} lba={lba} new_value={} guard=None",
+                hex(new_value.0)
+            ),
+        },
         WalOp::DedupPut { hash, value } => {
             format!("DedupPut hash={} value={}", hex(hash), hex(value.0))
         }
@@ -292,6 +309,23 @@ fn op_json(op: &WalOp) -> String {
         WalOp::L2pDelete { vol_ord, lba } => format!(
             "{{\"op\":\"L2pDelete\",\"vol_ord\":{vol_ord},\"lba\":{lba}}}"
         ),
+        WalOp::L2pRemap {
+            vol_ord,
+            lba,
+            new_value,
+            guard,
+        } => {
+            let guard_json = match guard {
+                Some((pba, min_rc)) => {
+                    format!("{{\"pba\":{pba},\"min_rc\":{min_rc}}}")
+                }
+                None => "null".to_string(),
+            };
+            format!(
+                "{{\"op\":\"L2pRemap\",\"vol_ord\":{vol_ord},\"lba\":{lba},\"new_value\":\"{}\",\"guard\":{guard_json}}}",
+                hex(new_value.0),
+            )
+        }
         WalOp::DedupPut { hash, value } => format!(
             "{{\"op\":\"DedupPut\",\"hash\":\"{}\",\"value\":\"{}\"}}",
             hex(hash),
@@ -346,6 +380,7 @@ fn op_tag_list(ops: &[WalOp]) -> String {
         .map(|op| match op {
             WalOp::L2pPut { .. } => "L2pPut",
             WalOp::L2pDelete { .. } => "L2pDelete",
+            WalOp::L2pRemap { .. } => "L2pRemap",
             WalOp::DedupPut { .. } => "DedupPut",
             WalOp::DedupDelete { .. } => "DedupDelete",
             WalOp::DedupReversePut { .. } => "DedupReversePut",

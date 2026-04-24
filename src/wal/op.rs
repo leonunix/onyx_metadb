@@ -37,6 +37,7 @@
 //! |-----|---------------------|-------------------------------------------------------------------------------------|----------|
 //! | 01  | `L2P_PUT`           | vol_ord (2 B BE) + lba (8 B BE) + value (28 B)                                      |    38    |
 //! | 02  | `L2P_DELETE`        | vol_ord (2 B BE) + lba (8 B BE)                                                     |    10    |
+//! | 03  | `L2P_REMAP`         | vol_ord (2 B BE) + lba (8 B BE) + new_value (28 B) + guard_tag (1 B) + [guard]      | 39 / 51  |
 //! | 10  | `DEDUP_PUT`         | hash (32 B) + value (28 B)                                                          |    60    |
 //! | 11  | `DEDUP_DEL`         | hash (32 B)                                                                         |    32    |
 //! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                                                          |    40    |
@@ -47,6 +48,14 @@
 //! | 40  | `CREATE_VOLUME`     | ord (2 B BE) + shard_count (4 B BE)                                                 |     6    |
 //! | 41  | `DROP_VOLUME`       | ord (2 B BE) + count (4 B BE) + pid×count                                           |   6+8n   |
 //! | 42  | `CLONE_VOLUME`      | src_ord (2 B BE) + new_ord (2 B BE) + snap_id (8 B BE) + shard_count (4 B BE) + pid×shard_count | 16+8n |
+//!
+//! `L2P_REMAP` guard: tag `0x00` = no guard (payload ends); tag `0x01`
+//! = guarded, followed by `pba (8 B BE) + min_rc (4 B BE)` — 12 more
+//! bytes. Apply reads `refcount(pba)` and skips the whole op if the
+//! value is `< min_rc` (SPEC §3.1). Guarded payload: 39 + 1 + 12 = 52
+//! bytes including the tag byte (1); unguarded: 39 + 1 = 40 bytes.
+//! SPEC v1 quotes 48 B / 60 B as the totals — the spec text's byte
+//! arithmetic was off by 8; the field layout there is what we match.
 //!
 //! Phase 7 commit 6 put `vol_ord` on L2P ops so apply can route them to
 //! the right per-volume shard group. `vol_ord = 0` is the bootstrap
@@ -82,6 +91,17 @@ pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB1;
 
 pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;
+pub const TAG_L2P_REMAP: u8 = 0x03;
+
+/// `L2P_REMAP` guard discriminator: no guard — apply runs
+/// unconditionally, matching `L2pPut + Incref + Decref` fused into one
+/// record.
+pub const L2P_REMAP_GUARD_NONE: u8 = 0x00;
+/// `L2P_REMAP` guard discriminator: guarded — apply reads
+/// `refcount(pba)` first and skips the op if `< min_rc`. Used by
+/// onyx's dedup hit path so a dedup target that was already freed
+/// between plan and apply cannot be re-linked.
+pub const L2P_REMAP_GUARD_SOME: u8 = 0x01;
 pub const TAG_DEDUP_PUT: u8 = 0x10;
 pub const TAG_DEDUP_DELETE: u8 = 0x11;
 pub const TAG_DEDUP_REVERSE_PUT: u8 = 0x12;
@@ -108,6 +128,28 @@ pub enum WalOp {
     L2pDelete {
         vol_ord: VolumeOrdinal,
         lba: Lba,
+    },
+    /// Onyx-adapter hot path: fuse L2P put + refcount decref(old) +
+    /// refcount incref(new) into a single WAL record. Replaces the
+    /// `L2pPut + Incref + Decref` triple that the pre-metadb onyx
+    /// writer would emit for every remap.
+    ///
+    /// `new_value`'s head 8 bytes are the target PBA (BE) by the
+    /// `BlockmapValue` contract (SPEC §3.1); the apply path uses
+    /// [`L2pValue::head_pba`](crate::paged::L2pValue::head_pba) on it
+    /// and on the previous value to drive the decref/incref decision
+    /// table.
+    ///
+    /// `guard`: `Some((pba, min_rc))` = apply reads `refcount(pba)`
+    /// first and returns an early `ApplyOutcome::L2pRemap { applied:
+    /// false, .. }` if the value is strictly less than `min_rc`.
+    /// `None` = unconditional apply. Used by dedup hit to refuse the
+    /// remap when the intended target was concurrently freed.
+    L2pRemap {
+        vol_ord: VolumeOrdinal,
+        lba: Lba,
+        new_value: L2pValue,
+        guard: Option<(Pba, u32)>,
     },
     DedupPut {
         hash: Hash32,
@@ -205,6 +247,25 @@ impl WalOp {
                 out.extend_from_slice(&vol_ord.to_be_bytes());
                 out.extend_from_slice(&lba.to_be_bytes());
             }
+            WalOp::L2pRemap {
+                vol_ord,
+                lba,
+                new_value,
+                guard,
+            } => {
+                out.push(TAG_L2P_REMAP);
+                out.extend_from_slice(&vol_ord.to_be_bytes());
+                out.extend_from_slice(&lba.to_be_bytes());
+                out.extend_from_slice(&new_value.0);
+                match guard {
+                    None => out.push(L2P_REMAP_GUARD_NONE),
+                    Some((pba, min_rc)) => {
+                        out.push(L2P_REMAP_GUARD_SOME);
+                        out.extend_from_slice(&pba.to_be_bytes());
+                        out.extend_from_slice(&min_rc.to_be_bytes());
+                    }
+                }
+            }
             WalOp::DedupPut { hash, value } => {
                 out.push(TAG_DEDUP_PUT);
                 out.extend_from_slice(hash);
@@ -290,6 +351,10 @@ impl WalOp {
         match self {
             WalOp::L2pPut { .. } => 1 + 2 + 8 + 28,
             WalOp::L2pDelete { .. } => 1 + 2 + 8,
+            WalOp::L2pRemap { guard, .. } => {
+                let base = 1 + 2 + 8 + 28 + 1;
+                base + if guard.is_some() { 8 + 4 } else { 0 }
+            }
             WalOp::DedupPut { .. } => 1 + 32 + 28,
             WalOp::DedupDelete { .. } => 1 + 32,
             WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 32,
@@ -373,6 +438,44 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
             let lba = u64::from_be_bytes(payload[2..10].try_into().unwrap());
             Ok((WalOp::L2pDelete { vol_ord, lba }, &payload[10..]))
+        }
+        TAG_L2P_REMAP => {
+            // Fixed header before the guard discriminator.
+            require_len(payload, 39, "L2P_REMAP header")?;
+            let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
+            let lba = u64::from_be_bytes(payload[2..10].try_into().unwrap());
+            let mut new_value = [0u8; 28];
+            new_value.copy_from_slice(&payload[10..38]);
+            let guard_tag = payload[38];
+            match guard_tag {
+                L2P_REMAP_GUARD_NONE => Ok((
+                    WalOp::L2pRemap {
+                        vol_ord,
+                        lba,
+                        new_value: L2pValue(new_value),
+                        guard: None,
+                    },
+                    &payload[39..],
+                )),
+                L2P_REMAP_GUARD_SOME => {
+                    require_len(&payload[39..], 12, "L2P_REMAP guard payload")?;
+                    let pba = u64::from_be_bytes(payload[39..47].try_into().unwrap());
+                    let min_rc = u32::from_be_bytes(payload[47..51].try_into().unwrap());
+                    Ok((
+                        WalOp::L2pRemap {
+                            vol_ord,
+                            lba,
+                            new_value: L2pValue(new_value),
+                            guard: Some((pba, min_rc)),
+                        },
+                        &payload[51..],
+                    ))
+                }
+                other => Err(MetaDbError::Corruption(format!(
+                    "L2P_REMAP: unknown guard tag 0x{other:02x} \
+                     (expected 0x{L2P_REMAP_GUARD_NONE:02x} or 0x{L2P_REMAP_GUARD_SOME:02x})"
+                ))),
+            }
         }
         TAG_DEDUP_PUT => {
             require_len(payload, 60, "DEDUP_PUT")?;
@@ -923,6 +1026,129 @@ mod tests {
         match decode_body(&body).unwrap_err() {
             MetaDbError::Corruption(msg) => assert!(msg.contains("CLONE_VOLUME header")),
             e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn l2p_remap_no_guard_round_trip() {
+        let ops = vec![WalOp::L2pRemap {
+            vol_ord: 0xABCD,
+            lba: 0xDEAD_BEEF_CAFE_F00D,
+            new_value: v(0x42),
+            guard: None,
+        }];
+        let body = encode_body(&ops);
+        // schema(1) + tag(1) + vol_ord(2) + lba(8) + value(28) + guard_tag(1)
+        assert_eq!(body.len(), 1 + 40);
+        assert_eq!(decode_body(&body).unwrap(), ops);
+    }
+
+    #[test]
+    fn l2p_remap_with_guard_round_trip() {
+        let ops = vec![WalOp::L2pRemap {
+            vol_ord: 7,
+            lba: 12345,
+            new_value: v(0xAB),
+            guard: Some((0x0123_4567_89AB_CDEF, 5)),
+        }];
+        let body = encode_body(&ops);
+        // schema(1) + base(40) + pba(8) + min_rc(4)
+        assert_eq!(body.len(), 1 + 52);
+        assert_eq!(decode_body(&body).unwrap(), ops);
+    }
+
+    #[test]
+    fn l2p_remap_interleaves_with_other_ops() {
+        let ops = vec![
+            WalOp::L2pRemap {
+                vol_ord: 1,
+                lba: 1,
+                new_value: v(1),
+                guard: None,
+            },
+            WalOp::Incref { pba: 99, delta: 3 },
+            WalOp::L2pRemap {
+                vol_ord: 2,
+                lba: 2,
+                new_value: v(2),
+                guard: Some((42, u32::MAX)),
+            },
+            WalOp::DedupDelete { hash: h(3) },
+            WalOp::L2pDelete { vol_ord: 1, lba: 1 },
+        ];
+        let body = encode_body(&ops);
+        assert_eq!(decode_body(&body).unwrap(), ops);
+    }
+
+    #[test]
+    fn l2p_remap_truncated_header_is_corruption() {
+        // Full 39-byte header, no guard tag yet.
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_L2P_REMAP];
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&0u64.to_be_bytes());
+        body.extend_from_slice(&[0u8; 20]); // only 20 of 28 new_value bytes
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => {
+                assert!(msg.contains("L2P_REMAP header"), "unexpected msg: {msg}")
+            }
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn l2p_remap_truncated_guard_payload_is_corruption() {
+        // Header + guard=Some tag but only 8/12 guard bytes.
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_L2P_REMAP];
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&2u64.to_be_bytes());
+        body.extend_from_slice(&[0u8; 28]);
+        body.push(L2P_REMAP_GUARD_SOME);
+        body.extend_from_slice(&10u64.to_be_bytes()); // pba — missing min_rc
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => {
+                assert!(msg.contains("L2P_REMAP guard"), "unexpected msg: {msg}")
+            }
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn l2p_remap_unknown_guard_tag_is_corruption() {
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_L2P_REMAP];
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&0u64.to_be_bytes());
+        body.extend_from_slice(&[0u8; 28]);
+        body.push(0x7F); // unrecognised guard discriminator
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(
+                msg.contains("unknown guard tag"),
+                "unexpected msg: {msg}"
+            ),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn l2p_remap_encoded_len_matches_encode_output() {
+        let cases = vec![
+            WalOp::L2pRemap {
+                vol_ord: 0,
+                lba: 0,
+                new_value: v(0),
+                guard: None,
+            },
+            WalOp::L2pRemap {
+                vol_ord: u16::MAX,
+                lba: u64::MAX,
+                new_value: v(0xFF),
+                guard: Some((u64::MAX, u32::MAX)),
+            },
+        ];
+        for op in cases {
+            let expected = op.encoded_len();
+            let mut buf = Vec::new();
+            op.encode(&mut buf);
+            assert_eq!(buf.len(), expected, "mismatch for {op:?}");
         }
     }
 

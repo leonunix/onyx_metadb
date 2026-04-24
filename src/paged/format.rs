@@ -145,6 +145,22 @@ impl L2pValue {
         v[..s.len()].copy_from_slice(s);
         Self(v)
     }
+
+    /// Onyx encoding contract: the first 8 bytes of an `L2pValue` are
+    /// the big-endian `Pba` that the mapping targets. This matches the
+    /// layout of `BlockmapValue` in onyx-storage; changing the L2pValue
+    /// header breaks the shared apply path in
+    /// [`Db::commit_ops`](crate::db::Db::commit_ops) for `WalOp::L2pRemap`.
+    ///
+    /// SPEC §3.1 (ONYX_INTEGRATION_SPEC.md) formalises this contract:
+    /// metadb is Onyx's only client and trades the "opaque L2pValue"
+    /// abstraction for a 16-byte WAL saving per remap. Anyone storing
+    /// a non-Onyx payload in `L2pValue` must avoid `L2pRemap`.
+    pub fn head_pba(&self) -> crate::types::Pba {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&self.0[..8]);
+        u64::from_be_bytes(buf)
+    }
 }
 
 /// Initialize a fresh empty leaf with `generation` stamped in the header.

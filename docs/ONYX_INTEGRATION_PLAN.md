@@ -21,7 +21,7 @@
 | Session | 内容 | 状态 |
 |---------|------|------|
 | S1 | commit_with_outcomes pub + WAL body schema bump + ApplyOutcome 槽位 | **done** (2026-04-23) |
-| S2 | `WalOp::L2pRemap` | pending |
+| S2 | `WalOp::L2pRemap` | **done** (2026-04-24) |
 | S3 | `WalOp::L2pRangeDelete` | pending |
 | S4 | `DropSnapshot` 扩展 + `cleanup_dedup_for_dead_pbas` | pending |
 | S5 | 综合 proptest + metadb-soak workload 扩展 | pending |

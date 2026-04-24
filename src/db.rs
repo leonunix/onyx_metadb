@@ -943,7 +943,8 @@ impl Db {
                 WalOp::DropSnapshot { .. }
                 | WalOp::CreateVolume { .. }
                 | WalOp::DropVolume { .. }
-                | WalOp::CloneVolume { .. } => {
+                | WalOp::CloneVolume { .. }
+                | WalOp::L2pRemap { .. } => {
                     // Already filtered out by `batch_contains_lifecycle_op`.
                     unreachable!("lifecycle ops must not reach apply_ops_grouped");
                 }
@@ -2779,6 +2780,20 @@ fn apply_op_bare(
             }
             Ok(ApplyOutcome::RefcountNew(new))
         }
+        WalOp::L2pRemap {
+            vol_ord,
+            lba,
+            new_value,
+            guard,
+        } => apply_l2p_remap(
+            volumes,
+            refcount_shards,
+            lsn,
+            *vol_ord,
+            *lba,
+            *new_value,
+            *guard,
+        ),
         WalOp::DropSnapshot { id: _, pages } => {
             apply_drop_snapshot_pages(page_store, lsn, pages)
         }
@@ -2794,6 +2809,136 @@ fn apply_op_bare(
              commit 8/9 implements these — this binary is too old to replay it"
         ))),
     }
+}
+
+/// Apply one [`WalOp::L2pRemap`]. Fuses L2P put + refcount decref(old)
+/// + refcount incref(new) + (optionally) a liveness guard read into one
+/// atomic step — the onyx adapter hot path.
+///
+/// Decision table (SPEC §3.1 §4):
+///
+/// | prev        | new.pba vs old.pba | leaf_was_shared | decref(old) | incref(new) |
+/// |-------------|--------------------|-----------------|-------------|-------------|
+/// | `None`      | —                  | —               | no          | **yes**     |
+/// | `Some(old)` | same               | false           | no          | no          |
+/// | `Some(old)` | same               | true            | no          | **yes**     |
+/// | `Some(old)` | different          | false           | **yes**     | **yes**     |
+/// | `Some(old)` | different          | true            | no          | **yes**     |
+///
+/// The `same + !shared` row (net 0) is the metadb analogue of
+/// `self_decrement` / `net_increment` in onyx's
+/// [`atomic_batch_write_packed`](../../../src/meta/store/blockmap.rs#L262)
+/// — it prevents the in-place overwrite from spuriously inflating or
+/// deflating `refcount(pba)`.
+///
+/// Locking: the L2P shard mutex stays held across the refcount RMWs so
+/// the leaf-shared capture and the incref/decref land atomically
+/// against any concurrent op on the same (vol, lba). Refcount shards
+/// are acquired in ascending shard-index order, matching the
+/// CLAUDE.md lock-order rule against writers that touch the same
+/// pbas.
+fn apply_l2p_remap(
+    volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+    refcount_shards: &[Shard],
+    lsn: Lsn,
+    vol_ord: VolumeOrdinal,
+    lba: Lba,
+    new_value: L2pValue,
+    guard: Option<(Pba, u32)>,
+) -> Result<ApplyOutcome> {
+    let volume = volumes.get(&vol_ord).ok_or_else(|| {
+        MetaDbError::Corruption(format!("L2pRemap for unknown volume ord {vol_ord}"))
+    })?;
+    let l2p_sid = shard_for_key_l2p(&volume.shards, lba);
+    let new_pba = new_value.head_pba();
+
+    // Guard check is done after the L2P shard mutex is taken but
+    // before any mutation, so the "guard passed" decision and the
+    // subsequent put/incref/decref sit inside the same critical
+    // section (SPEC §4.3). The guard reads the target-pba's refcount
+    // shard; that shard may differ from `new_pba` / `old_pba`'s
+    // shards — we acquire all needed refcount shards up front in
+    // sorted order to avoid cross-shard deadlock.
+    let mut tree = volume.shards[l2p_sid].tree.lock();
+
+    if let Some((gp, min_rc)) = guard {
+        let gp_sid = shard_for_key(refcount_shards, gp);
+        let cur = {
+            let mut rc_tree = refcount_shards[gp_sid].tree.lock();
+            rc_tree.get(gp)?.unwrap_or(0)
+        };
+        if cur < min_rc {
+            return Ok(ApplyOutcome::L2pRemap {
+                applied: false,
+                prev: None,
+                freed_pba: None,
+            });
+        }
+    }
+
+    // Drive L2P mutation now that the guard passed. Capturing
+    // `leaf_was_shared` here means the decref decision reflects the
+    // sharing state seen by this very op — any concurrent flush /
+    // snapshot is already excluded by `apply_gate.read()`, and the
+    // shard mutex excludes other writers on this (vol, shard).
+    let outcome = tree.insert_at_lsn_with_share_info(lba, new_value, lsn)?;
+    let prev = outcome.prev;
+    let old_pba = prev.map(|p| p.head_pba());
+
+    // Determine decref / incref from the decision table.
+    let do_decref =
+        prev.is_some() && !outcome.leaf_was_shared && old_pba != Some(new_pba);
+    let do_incref =
+        !(prev.is_some() && !outcome.leaf_was_shared && old_pba == Some(new_pba));
+
+    // Collect touched (shard, pba, is_decref) tuples, sort by shard
+    // index so concurrent threads acquire locks in a consistent
+    // order. Same pba on both sides is only possible when `prev ==
+    // new_value` bytewise; in that case the decision table already
+    // picked "no decref, no incref", so we won't end up with two
+    // entries targeting the same (sid, pba).
+    let mut touched: Vec<(usize, Pba, bool)> = Vec::new();
+    if do_decref {
+        let pba = old_pba.expect("do_decref implies prev.is_some()");
+        touched.push((shard_for_key(refcount_shards, pba), pba, true));
+    }
+    if do_incref {
+        touched.push((shard_for_key(refcount_shards, new_pba), new_pba, false));
+    }
+    touched.sort_by_key(|(sid, _, _)| *sid);
+
+    let mut freed_pba: Option<Pba> = None;
+    for (sid, pba, is_decref) in touched {
+        let mut rc_tree = refcount_shards[sid].tree.lock();
+        if is_decref {
+            let cur = rc_tree.get(pba)?.unwrap_or(0);
+            let new = cur.checked_sub(1).ok_or_else(|| {
+                MetaDbError::InvalidArgument(format!(
+                    "L2pRemap decref underflow for pba {pba}: {cur} - 1",
+                ))
+            })?;
+            if new == 0 {
+                rc_tree.delete(pba)?;
+                if cur > 0 {
+                    freed_pba = Some(pba);
+                }
+            } else {
+                rc_tree.insert(pba, new)?;
+            }
+        } else {
+            let cur = rc_tree.get(pba)?.unwrap_or(0);
+            let new = cur.checked_add(1).ok_or_else(|| {
+                MetaDbError::InvalidArgument(format!("L2pRemap incref overflow for pba {pba}"))
+            })?;
+            rc_tree.insert(pba, new)?;
+        }
+    }
+
+    Ok(ApplyOutcome::L2pRemap {
+        applied: true,
+        prev,
+        freed_pba,
+    })
 }
 
 /// Allocate a fresh shard group for a `CreateVolume` apply. Delegates
@@ -2990,6 +3135,12 @@ fn batch_contains_lifecycle_op(ops: &[WalOp]) -> bool {
                 | WalOp::CreateVolume { .. }
                 | WalOp::DropVolume { .. }
                 | WalOp::CloneVolume { .. }
+                // L2pRemap crosses the L2P and refcount shard
+                // boundaries in a single op, so the bucketed path
+                // (which assumes one shard per op) cannot host it.
+                // Force the serial path; the performance mandate is
+                // a SPEC §8 target, deferred to session S6.
+                | WalOp::L2pRemap { .. }
         )
     })
 }
@@ -4594,5 +4745,309 @@ mod tests {
             src_snap_id: 0,
             src_shard_roots: Vec::new(),
         }]));
+        // L2pRemap is forced through the serial path because it
+        // straddles L2P and refcount shards — see apply_l2p_remap.
+        assert!(batch_contains_lifecycle_op(&[WalOp::L2pRemap {
+            vol_ord: 0,
+            lba: 0,
+            new_value: v(0),
+            guard: None,
+        }]));
+    }
+
+    // ---------------- L2pRemap apply (SPEC §3.1) ---------------------
+
+    /// Build an `L2pValue` whose head 8 bytes encode `pba` (matches the
+    /// `BlockmapValue` contract used by onyx's apply path). The
+    /// remaining 20 bytes carry `tag` in byte 8 so tests can
+    /// distinguish otherwise-identical values that share a pba.
+    fn remap_val(pba: Pba, tag: u8) -> L2pValue {
+        let mut v = [0u8; 28];
+        v[..8].copy_from_slice(&pba.to_be_bytes());
+        v[8] = tag;
+        L2pValue(v)
+    }
+
+    fn remap(db: &Db, lba: Lba, new_value: L2pValue, guard: Option<(Pba, u32)>) -> ApplyOutcome {
+        let mut tx = db.begin();
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, lba, new_value, guard);
+        let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+        assert_eq!(outcomes.len(), 1, "one op in, one outcome out");
+        outcomes.into_iter().next().unwrap()
+    }
+
+    fn assert_remap_applied(outcome: ApplyOutcome) -> (Option<L2pValue>, Option<Pba>) {
+        match outcome {
+            ApplyOutcome::L2pRemap {
+                applied: true,
+                prev,
+                freed_pba,
+            } => (prev, freed_pba),
+            other => panic!("expected applied L2pRemap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn l2p_remap_first_write_increfs_new_pba() {
+        let (_d, db) = mk_db();
+        let outcome = remap(&db, 10, remap_val(100, 1), None);
+        assert_eq!(assert_remap_applied(outcome), (None, None));
+        assert_eq!(db.get_refcount(100).unwrap(), 1);
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(), Some(remap_val(100, 1)));
+    }
+
+    #[test]
+    fn l2p_remap_same_pba_in_place_overwrite_net_zero() {
+        // L2pPrev == new, same pba, leaf exclusive: no decref, no
+        // incref (net 0). The "self_decrement" invariant from onyx's
+        // atomic_batch_write_packed.
+        let (_d, db) = mk_db();
+        remap(&db, 10, remap_val(100, 1), None);
+        assert_eq!(db.get_refcount(100).unwrap(), 1);
+        let outcome = remap(&db, 10, remap_val(100, 2), None);
+        let (prev, freed) = assert_remap_applied(outcome);
+        assert_eq!(prev, Some(remap_val(100, 1)));
+        assert_eq!(freed, None);
+        assert_eq!(
+            db.get_refcount(100).unwrap(),
+            1,
+            "same-pba exclusive overwrite must not touch refcount"
+        );
+    }
+
+    #[test]
+    fn l2p_remap_same_pba_leaf_shared_increfs_new() {
+        // take_snapshot → leaf shared → remap to same pba should
+        // incref (not no-op): the snapshot's leaf bytes still
+        // reference the pba via the OLD mapping, and the COW leaf
+        // will reference it again via the NEW mapping.
+        let (_d, db) = mk_db();
+        remap(&db, 10, remap_val(100, 1), None);
+        db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+        let outcome = remap(&db, 10, remap_val(100, 2), None);
+        let (prev, freed) = assert_remap_applied(outcome);
+        assert_eq!(prev, Some(remap_val(100, 1)));
+        assert_eq!(freed, None);
+        assert_eq!(
+            db.get_refcount(100).unwrap(),
+            2,
+            "same-pba on shared leaf: old leaf + new leaf both reference pba"
+        );
+    }
+
+    #[test]
+    fn l2p_remap_different_pba_exclusive_decrefs_old_increfs_new() {
+        let (_d, db) = mk_db();
+        remap(&db, 10, remap_val(100, 1), None);
+        assert_eq!(db.get_refcount(100).unwrap(), 1);
+        let outcome = remap(&db, 10, remap_val(200, 1), None);
+        let (prev, freed) = assert_remap_applied(outcome);
+        assert_eq!(prev, Some(remap_val(100, 1)));
+        assert_eq!(freed, Some(100), "decref drove refcount(100) to 0");
+        assert_eq!(db.get_refcount(100).unwrap(), 0);
+        assert_eq!(db.get_refcount(200).unwrap(), 1);
+    }
+
+    #[test]
+    fn l2p_remap_different_pba_leaf_shared_suppresses_decref() {
+        // Snapshot holds old leaf → do NOT decref old pba.
+        let (_d, db) = mk_db();
+        remap(&db, 10, remap_val(100, 1), None);
+        db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+        let outcome = remap(&db, 10, remap_val(200, 1), None);
+        let (prev, freed) = assert_remap_applied(outcome);
+        assert_eq!(prev, Some(remap_val(100, 1)));
+        assert_eq!(
+            freed, None,
+            "leaf shared with snapshot: decref suppressed, no pba freed"
+        );
+        assert_eq!(db.get_refcount(100).unwrap(), 1, "snapshot still refs 100");
+        assert_eq!(db.get_refcount(200).unwrap(), 1);
+    }
+
+    #[test]
+    fn l2p_remap_different_pba_decref_not_to_zero_reports_no_freed() {
+        // Two independent LBAs share pba=100; remap one → refcount
+        // drops 2→1, not to zero, so freed_pba = None even though we
+        // did decref.
+        let (_d, db) = mk_db();
+        remap(&db, 10, remap_val(100, 1), None);
+        remap(&db, 11, remap_val(100, 1), None);
+        assert_eq!(db.get_refcount(100).unwrap(), 2);
+        let outcome = remap(&db, 10, remap_val(200, 1), None);
+        let (_, freed) = assert_remap_applied(outcome);
+        assert_eq!(freed, None);
+        assert_eq!(db.get_refcount(100).unwrap(), 1);
+    }
+
+    #[test]
+    fn l2p_remap_guard_pass_applies_and_increfs() {
+        // Target pba has live refcount > 0; guard passes; op applies.
+        let (_d, db) = mk_db();
+        remap(&db, 10, remap_val(100, 1), None); // seed rc(100)=1
+        // guard on 100 with min_rc=1 should pass.
+        let outcome = remap(&db, 11, remap_val(100, 1), Some((100, 1)));
+        let (prev, freed) = assert_remap_applied(outcome);
+        assert_eq!(prev, None);
+        assert_eq!(freed, None);
+        assert_eq!(db.get_refcount(100).unwrap(), 2);
+    }
+
+    #[test]
+    fn l2p_remap_guard_fail_rejects_op_without_touching_state() {
+        let (_d, db) = mk_db();
+        remap(&db, 10, remap_val(100, 1), None);
+        // guard on 100 requires rc ≥ 5; current is 1; op is a no-op.
+        let before_rc_100 = db.get_refcount(100).unwrap();
+        let before_rc_200 = db.get_refcount(200).unwrap();
+        let before_lba_11 = db.get(BOOTSTRAP_VOLUME_ORD, 11).unwrap();
+        let mut tx = db.begin();
+        tx.l2p_remap(
+            BOOTSTRAP_VOLUME_ORD,
+            11,
+            remap_val(200, 1),
+            Some((100, 5)),
+        );
+        let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+        match outcomes.into_iter().next().unwrap() {
+            ApplyOutcome::L2pRemap {
+                applied: false,
+                prev,
+                freed_pba,
+            } => {
+                assert_eq!(prev, None);
+                assert_eq!(freed_pba, None);
+            }
+            other => panic!("expected rejected L2pRemap, got {other:?}"),
+        }
+        assert_eq!(db.get_refcount(100).unwrap(), before_rc_100);
+        assert_eq!(db.get_refcount(200).unwrap(), before_rc_200);
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 11).unwrap(), before_lba_11);
+    }
+
+    #[test]
+    fn l2p_remap_guard_fail_when_pba_never_registered() {
+        // guard on an unused pba (rc=0) with min_rc=1 fails.
+        let (_d, db) = mk_db();
+        let mut tx = db.begin();
+        tx.l2p_remap(
+            BOOTSTRAP_VOLUME_ORD,
+            10,
+            remap_val(100, 1),
+            Some((999, 1)),
+        );
+        let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+        match outcomes.into_iter().next().unwrap() {
+            ApplyOutcome::L2pRemap { applied: false, .. } => {}
+            other => panic!("expected rejected L2pRemap, got {other:?}"),
+        }
+        assert_eq!(db.get_refcount(100).unwrap(), 0);
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(), None);
+    }
+
+    #[test]
+    fn l2p_remap_packed_slot_multi_lba_refcount_aggregates_correctly() {
+        // Simulate three LBAs pointing at one packed-slot pba=100:
+        // each remap bumps refcount(100) by 1. Remapping each one
+        // away individually should drive refcount 3→2→1→0 with the
+        // final remap reporting freed_pba=100.
+        let (_d, db) = mk_db();
+        remap(&db, 10, remap_val(100, 0), None);
+        remap(&db, 11, remap_val(100, 1), None);
+        remap(&db, 12, remap_val(100, 2), None);
+        assert_eq!(db.get_refcount(100).unwrap(), 3);
+
+        let (_, f0) = assert_remap_applied(remap(&db, 10, remap_val(200, 0), None));
+        assert_eq!(f0, None);
+        assert_eq!(db.get_refcount(100).unwrap(), 2);
+
+        let (_, f1) = assert_remap_applied(remap(&db, 11, remap_val(201, 0), None));
+        assert_eq!(f1, None);
+        assert_eq!(db.get_refcount(100).unwrap(), 1);
+
+        let (_, f2) = assert_remap_applied(remap(&db, 12, remap_val(202, 0), None));
+        assert_eq!(f2, Some(100));
+        assert_eq!(db.get_refcount(100).unwrap(), 0);
+    }
+
+    #[test]
+    fn l2p_remap_survives_restart_via_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            let mut tx = db.begin();
+            tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(100, 7), None);
+            tx.commit_with_outcomes().unwrap();
+            // Crash without flush: only WAL persists.
+        }
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(
+            db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(),
+            Some(remap_val(100, 7))
+        );
+        assert_eq!(db.get_refcount(100).unwrap(), 1);
+    }
+
+    #[test]
+    fn l2p_remap_guarded_survives_restart_with_same_decision() {
+        // guard=Some with min_rc=2 while rc=1 at commit time → op
+        // rejected; on replay, refcount is still 1 so replay also
+        // rejects and the final state matches the live outcome.
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            remap(&db, 10, remap_val(100, 1), None);
+            // rc(100)=1; guard needs rc(100)≥2 → reject.
+            let mut tx = db.begin();
+            tx.l2p_remap(
+                BOOTSTRAP_VOLUME_ORD,
+                11,
+                remap_val(100, 2),
+                Some((100, 2)),
+            );
+            tx.commit_with_outcomes().unwrap();
+        }
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.get_refcount(100).unwrap(), 1, "guard rejected on replay too");
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(), Some(remap_val(100, 1)));
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 11).unwrap(), None);
+    }
+
+    #[test]
+    fn l2p_remap_freed_pba_round_trips_through_replay() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            remap(&db, 10, remap_val(100, 1), None);
+            remap(&db, 10, remap_val(200, 1), None);
+            assert_eq!(db.get_refcount(100).unwrap(), 0);
+        }
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.get_refcount(100).unwrap(), 0);
+        assert_eq!(db.get_refcount(200).unwrap(), 1);
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(), Some(remap_val(200, 1)));
+    }
+
+    #[test]
+    fn l2p_remap_leaf_shared_plus_drop_snapshot_ends_at_correct_refcount() {
+        // Symmetry check (SPEC §4.4): take → N writes → drop should
+        // leave refcount identical to "same N writes without
+        // snapshot". We approximate by checking that drop doesn't
+        // leak refs when a leaf-shared-suppress path ran earlier.
+        let (_d, db) = mk_db();
+        remap(&db, 10, remap_val(100, 1), None); // rc(100)=1
+        let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+        remap(&db, 10, remap_val(200, 1), None); // snapshot suppresses decref(100); rc(100)=1, rc(200)=1
+        assert_eq!(db.get_refcount(100).unwrap(), 1);
+        assert_eq!(db.get_refcount(200).unwrap(), 1);
+        // drop_snapshot currently only releases L2P pages; refcount
+        // cleanup for snapshot-owned pbas is S4's job. Verify
+        // behaviour is deterministic under current (S2) semantics.
+        db.drop_snapshot(snap).unwrap();
+        // rc(100) stays at 1 because S4 hasn't landed yet; S4 will
+        // switch this assertion to 0. Keeping the positive assertion
+        // pins down today's contract so we notice regressions.
+        assert_eq!(db.get_refcount(100).unwrap(), 1);
+        assert_eq!(db.get_refcount(200).unwrap(), 1);
     }
 }

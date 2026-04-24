@@ -223,6 +223,25 @@ impl PageBuf {
         Ok(())
     }
 
+    /// Effective refcount of `pid` combining the on-disk header with
+    /// this op's queued [`pending_rc`](Self::pending_rc) delta. Used by
+    /// [`PagedL2p::insert_at_lsn_with_share_info`](crate::paged::PagedL2p::insert_at_lsn_with_share_info)
+    /// to capture whether a leaf page was shared before the current op
+    /// COW'd it — the check `effective_rc > 1` matches the same test
+    /// [`cow_for_write`](Self::cow_for_write) uses when deciding whether
+    /// to clone.
+    ///
+    /// Returning `i64` mirrors [`cow_for_write`]'s internal arithmetic:
+    /// pending deltas may temporarily push the effective count below 1
+    /// mid-op, and we forward the raw value so callers can `> 1` compare
+    /// against the same convention.
+    pub fn effective_rc(&mut self, pid: PageId) -> Result<i64> {
+        let pending = self.pending_rc.get(&pid).copied().unwrap_or(0);
+        let page = self.read(pid)?;
+        let header = page.header()?;
+        Ok(i64::from(header.refcount) + i64::from(pending))
+    }
+
     /// Cross-tree-safe incref via per-pid-locked disk-direct RMW.
     /// Persists any Dirty copy of `pid` to disk first so
     /// [`PageStore::atomic_rc_delta`] reads the latest bytes, then

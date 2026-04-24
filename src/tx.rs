@@ -143,6 +143,40 @@ impl<'db> Transaction<'db> {
         self
     }
 
+    /// Onyx adapter hot path: fused L2P put + refcount decref(old) +
+    /// refcount incref(new) as a single WAL record. The pre-metadb
+    /// onyx writer emitted `insert + incref + decref` for every remap;
+    /// this cuts that to one record, and the apply path enforces the
+    /// SPEC §3.1 "leaf-rc-suppress" decref decision table atomically.
+    ///
+    /// `new_value.head_pba()` is the PBA the mapping targets — metadb
+    /// reads the first 8 bytes of the payload to drive the decref /
+    /// incref decision, consistent with the `BlockmapValue` contract.
+    ///
+    /// `guard = Some((pba, min_rc))` reads `refcount(pba)` before
+    /// applying; if the value is `< min_rc` the whole op is a no-op
+    /// and `ApplyOutcome::L2pRemap { applied: false, .. }` is
+    /// reported. `None` applies unconditionally.
+    ///
+    /// `insert` / `delete` / `incref_pba` / `decref_pba` stay for
+    /// diagnostic / non-refcount paths; the remap primitive is the
+    /// canonical onyx write op.
+    pub fn l2p_remap(
+        &mut self,
+        vol_ord: VolumeOrdinal,
+        lba: Lba,
+        new_value: crate::paged::L2pValue,
+        guard: Option<(Pba, u32)>,
+    ) -> &mut Self {
+        self.ops.push(WalOp::L2pRemap {
+            vol_ord,
+            lba,
+            new_value,
+            guard,
+        });
+        self
+    }
+
     /// Buffer a dedup put.
     pub fn put_dedup(&mut self, hash: Hash32, value: DedupValue) -> &mut Self {
         self.ops.push(WalOp::DedupPut { hash, value });

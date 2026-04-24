@@ -80,6 +80,29 @@ fn ref_bound(b: &Bound<u64>) -> Bound<&u64> {
     }
 }
 
+/// Rich outcome returned by [`PagedL2p::insert_at_lsn_with_share_info`]
+/// and [`PagedL2p::delete_at_lsn_with_share_info`]. The onyx-adapter
+/// apply path (`WalOp::L2pRemap`, `WalOp::L2pRangeDelete`) uses
+/// `leaf_was_shared` together with `prev` to decide whether to
+/// suppress the paired refcount decref (see SPEC §3.1 decision
+/// table): if the leaf that held the old mapping was shared with a
+/// live snapshot, the snapshot's tree still references `prev.pba` via
+/// the old leaf bytes, and decrementing `prev.pba`'s refcount here
+/// would double-free it later when the snapshot drops.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct InsertOutcome {
+    /// Previous mapping at the key, or `None` if the slot was unset.
+    pub prev: Option<L2pValue>,
+    /// `true` iff the leaf page that contained this key was shared
+    /// with another tree (snapshot / clone) at the moment this op
+    /// reached it — i.e. the pre-COW effective refcount was `> 1`.
+    ///
+    /// For a freshly-allocated leaf (no prior mapping existed at all)
+    /// the value is `false`, matching the "not shared" semantics of
+    /// an exclusive page.
+    pub leaf_was_shared: bool,
+}
+
 /// One entry in the delta between two subtrees. Emitted by
 /// [`PagedL2p::diff_subtrees`] and surfaced via `Db::diff`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -350,14 +373,47 @@ impl PagedL2p {
         self.insert_with_lsn(lba, value, lsn)
     }
 
+    /// Variant of [`insert_at_lsn`](Self::insert_at_lsn) that also
+    /// reports whether the leaf holding `lba` was shared with another
+    /// tree (snapshot / clone) at the moment this op descended to it.
+    ///
+    /// Used exclusively by the onyx adapter apply path for
+    /// `WalOp::L2pRemap`: the decref decision table in SPEC §3.1
+    /// ("leaf-rc-suppress") depends on this bit to avoid double-freeing
+    /// a PBA that the snapshot still references. The flag is captured
+    /// before the leaf's `cow_for_write` runs, so it reflects the
+    /// pre-op sharing state regardless of how the op's own COW cascade
+    /// reshapes the tree afterwards.
+    pub fn insert_at_lsn_with_share_info(
+        &mut self,
+        lba: u64,
+        value: L2pValue,
+        lsn: Lsn,
+    ) -> Result<InsertOutcome> {
+        self.advance_next_gen(lsn);
+        let result = self.insert_with_lsn_and_share(lba, value, lsn);
+        self.finalize_rc_deltas(lsn, result)
+    }
+
     fn insert_with_lsn(
         &mut self,
         lba: u64,
         value: L2pValue,
         lsn: Lsn,
     ) -> Result<Option<L2pValue>> {
-        let result = self.insert_with_lsn_inner(lba, value, lsn);
+        let result = self
+            .insert_with_lsn_inner(lba, value, lsn)
+            .map(|outcome| outcome.prev);
         self.finalize_rc_deltas(lsn, result)
+    }
+
+    fn insert_with_lsn_and_share(
+        &mut self,
+        lba: u64,
+        value: L2pValue,
+        lsn: Lsn,
+    ) -> Result<InsertOutcome> {
+        self.insert_with_lsn_inner(lba, value, lsn)
     }
 
     fn insert_with_lsn_inner(
@@ -365,9 +421,18 @@ impl PagedL2p {
         lba: u64,
         value: L2pValue,
         lsn: Lsn,
-    ) -> Result<Option<L2pValue>> {
+    ) -> Result<InsertOutcome> {
         let leaf_idx = lba >> LEAF_SHIFT;
         let bit = (lba & LEAF_MASK) as usize;
+
+        // Root-is-leaf path: tree hasn't grown past level 0, so the
+        // leaf we're about to mutate IS the root. Capture its pre-COW
+        // effective rc here — the walk-down loop never reaches
+        // level==1 in this case, and by the time `grow_root` runs the
+        // leaf's refcount has already been bumped by the newly-
+        // allocated parent index.
+        let mut leaf_was_shared =
+            self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
 
         // Grow root up to whatever level covers `leaf_idx`.
         while leaf_idx > max_leaf_idx_at_level(self.root_level) {
@@ -382,12 +447,27 @@ impl PagedL2p {
             let slot = slot_in_index(leaf_idx, level);
             let child = index_child_at(self.buf.read(current)?, slot);
             let new_child = if child == NULL_PAGE {
+                // Missing slot: fabricated leaf has no pre-op reference
+                // from any tree, so `leaf_was_shared` stays at whatever
+                // the root-is-leaf branch set (it's only true when the
+                // ORIGINAL root was a shared leaf, which cannot coexist
+                // with a missing slot in an index that didn't exist
+                // yet — this branch therefore leaves the flag at false).
                 if level == 1 {
                     self.buf.alloc_leaf(lsn)?
                 } else {
                     self.buf.alloc_index(lsn, level - 1)?
                 }
             } else {
+                if level == 1 {
+                    // Capture the pre-COW effective rc so the caller
+                    // can distinguish "snapshot still references old
+                    // leaf via this page" from "op can safely mutate
+                    // in place". `cow_for_write` below may fold in
+                    // pending rc deltas and clone the page; we take
+                    // the decision before that mutation.
+                    leaf_was_shared = self.buf.effective_rc(child)? > 1;
+                }
                 self.buf.cow_for_write(child, lsn)?
             };
             index_set_child(self.buf.modify(current, lsn)?, slot, new_child);
@@ -397,7 +477,10 @@ impl PagedL2p {
 
         let old = leaf_set(self.buf.modify(current, lsn)?, bit, &value);
         self.root = new_root;
-        Ok(old)
+        Ok(InsertOutcome {
+            prev: old,
+            leaf_was_shared,
+        })
     }
 
     /// Remove `lba`'s mapping. Returns the previous value, or `None` if
