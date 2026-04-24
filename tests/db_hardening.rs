@@ -479,6 +479,83 @@ fn crash_after_apply_before_lsn_bump_l2p_remap_idempotent() {
     assert_eq!(db.get_refcount(200).unwrap(), 1);
 }
 
+/// L2pRangeDelete crashes right after WAL submit. Recovery must
+/// replay the captured list and end up at the same final state:
+/// every lba in the captured range gone, and every refcount on a
+/// non-shared leaf decremented exactly once.
+#[test]
+fn crash_after_wal_before_apply_replays_l2p_range_delete() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            // Seed 4 lbas at distinct pbas.
+            for i in 0..4u64 {
+                let mut tx = db.begin();
+                tx.l2p_remap(0, 10 + i, remap_val(100 + i, 0), None);
+                tx.commit().unwrap();
+            }
+            faults.install(FaultPoint::CommitPostWalBeforeApply, 1, FaultAction::Panic);
+            let _ = db.range_delete(0, 10, 14);
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0..4u64 {
+        assert_eq!(db.get(0, 10 + i).unwrap(), None);
+        assert_eq!(db.get_refcount(100 + i).unwrap(), 0);
+    }
+}
+
+/// L2pRangeDelete crashes between apply and lsn bump. Replay must
+/// not re-decref pbas that were already decremented to zero — the
+/// checkpoint_lsn ordering rule guards this path identically to the
+/// L2pRemap case.
+#[test]
+fn crash_after_apply_before_lsn_bump_l2p_range_delete_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    let _ = std::panic::catch_unwind(AssertUnwindSafe({
+        let faults = faults.clone();
+        let path = dir.path().to_path_buf();
+        move || {
+            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            // Seed lbas 0..6 with pbas 100..106. Split the range
+            // delete over two lbas only so replay has a non-trivial
+            // decref set to re-evaluate.
+            for i in 0..6u64 {
+                let mut tx = db.begin();
+                tx.l2p_remap(0, i, remap_val(100 + i, 0), None);
+                tx.commit().unwrap();
+            }
+            faults.install(
+                FaultPoint::CommitPostApplyBeforeLsnBump,
+                1,
+                FaultAction::Panic,
+            );
+            let _ = db.range_delete(0, 0, 3);
+        }
+    }));
+
+    let db = Db::open(dir.path()).unwrap();
+    // Deleted lbas gone, surviving lbas intact.
+    for i in 0..3u64 {
+        assert_eq!(db.get(0, i).unwrap(), None);
+        assert_eq!(
+            db.get_refcount(100 + i).unwrap(),
+            0,
+            "replay must not double-decref; rc should be exactly 0",
+        );
+    }
+    for i in 3..6u64 {
+        assert_eq!(db.get(0, i).unwrap(), Some(remap_val(100 + i, 0)));
+        assert_eq!(db.get_refcount(100 + i).unwrap(), 1);
+    }
+}
+
 /// Guard-reject path: the op's WAL record contains `guard = Some`
 /// with a threshold that isn't met. Live apply returns `applied =
 /// false` and leaves state untouched. A crash immediately after WAL

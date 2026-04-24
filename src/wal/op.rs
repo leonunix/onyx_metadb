@@ -38,6 +38,7 @@
 //! | 01  | `L2P_PUT`           | vol_ord (2 B BE) + lba (8 B BE) + value (28 B)                                      |    38    |
 //! | 02  | `L2P_DELETE`        | vol_ord (2 B BE) + lba (8 B BE)                                                     |    10    |
 //! | 03  | `L2P_REMAP`         | vol_ord (2 B BE) + lba (8 B BE) + new_value (28 B) + guard_tag (1 B) + [guard]      | 39 / 51  |
+//! | 04  | `L2P_RANGE_DELETE`  | vol_ord (2 B BE) + start (8 B BE) + end (8 B BE) + count (4 B BE) + (lba,pba)×count | 22+16n   |
 //! | 10  | `DEDUP_PUT`         | hash (32 B) + value (28 B)                                                          |    60    |
 //! | 11  | `DEDUP_DEL`         | hash (32 B)                                                                         |    32    |
 //! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                                                          |    40    |
@@ -92,6 +93,14 @@ pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB1;
 pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;
 pub const TAG_L2P_REMAP: u8 = 0x03;
+pub const TAG_L2P_RANGE_DELETE: u8 = 0x04;
+
+/// Maximum `captured` entries in a single `L2pRangeDelete` WAL record.
+/// Larger ranges are auto-split by [`Db::range_delete`] so the WAL
+/// body stays bounded (SPEC §3.2). The limit comes from the 4-byte
+/// count field in the on-disk encoding; 65536 is well below `u32::MAX`
+/// and keeps the largest body under ~1 MiB (`22 + 16*65536`).
+pub const MAX_RANGE_DELETE_CAPTURED: usize = 65536;
 
 /// `L2P_REMAP` guard discriminator: no guard — apply runs
 /// unconditionally, matching `L2pPut + Incref + Decref` fused into one
@@ -150,6 +159,23 @@ pub enum WalOp {
         lba: Lba,
         new_value: L2pValue,
         guard: Option<(Pba, u32)>,
+    },
+    /// Onyx-adapter bulk delete over `[start, end)` for one volume.
+    /// The `captured: Vec<(Lba, Pba)>` is the `(lba, head_pba(value))`
+    /// list scanned at plan time — the apply path walks it and emits
+    /// one refcount decref per entry (with SPEC §4.4 leaf-rc-suppress
+    /// applied when the leaf was shared with a live snapshot).
+    ///
+    /// The plan-time capture makes replay deterministic: on restart
+    /// the same decrefs fire regardless of what the L2P tree looks
+    /// like post-replay. `captured.len() ≤ MAX_RANGE_DELETE_CAPTURED`;
+    /// larger ranges are auto-split by [`Db::range_delete`] into
+    /// multiple consecutive records.
+    L2pRangeDelete {
+        vol_ord: VolumeOrdinal,
+        start: Lba,
+        end: Lba,
+        captured: Vec<(Lba, Pba)>,
     },
     DedupPut {
         hash: Hash32,
@@ -266,6 +292,26 @@ impl WalOp {
                     }
                 }
             }
+            WalOp::L2pRangeDelete {
+                vol_ord,
+                start,
+                end,
+                captured,
+            } => {
+                out.push(TAG_L2P_RANGE_DELETE);
+                out.extend_from_slice(&vol_ord.to_be_bytes());
+                out.extend_from_slice(&start.to_be_bytes());
+                out.extend_from_slice(&end.to_be_bytes());
+                let count: u32 = captured
+                    .len()
+                    .try_into()
+                    .expect("L2pRangeDelete captured count fits in u32");
+                out.extend_from_slice(&count.to_be_bytes());
+                for (lba, pba) in captured {
+                    out.extend_from_slice(&lba.to_be_bytes());
+                    out.extend_from_slice(&pba.to_be_bytes());
+                }
+            }
             WalOp::DedupPut { hash, value } => {
                 out.push(TAG_DEDUP_PUT);
                 out.extend_from_slice(hash);
@@ -355,6 +401,7 @@ impl WalOp {
                 let base = 1 + 2 + 8 + 28 + 1;
                 base + if guard.is_some() { 8 + 4 } else { 0 }
             }
+            WalOp::L2pRangeDelete { captured, .. } => 1 + 2 + 8 + 8 + 4 + captured.len() * 16,
             WalOp::DedupPut { .. } => 1 + 32 + 28,
             WalOp::DedupDelete { .. } => 1 + 32,
             WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 32,
@@ -476,6 +523,36 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                      (expected 0x{L2P_REMAP_GUARD_NONE:02x} or 0x{L2P_REMAP_GUARD_SOME:02x})"
                 ))),
             }
+        }
+        TAG_L2P_RANGE_DELETE => {
+            require_len(payload, 22, "L2P_RANGE_DELETE header")?;
+            let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
+            let start = u64::from_be_bytes(payload[2..10].try_into().unwrap());
+            let end = u64::from_be_bytes(payload[10..18].try_into().unwrap());
+            let count = u32::from_be_bytes(payload[18..22].try_into().unwrap()) as usize;
+            let body_bytes = count.checked_mul(16).ok_or_else(|| {
+                MetaDbError::Corruption("L2P_RANGE_DELETE count overflow".into())
+            })?;
+            require_len(&payload[22..], body_bytes, "L2P_RANGE_DELETE captured list")?;
+            let mut captured = Vec::with_capacity(count);
+            let mut cursor = 22usize;
+            for _ in 0..count {
+                let lba = u64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap());
+                let pba = u64::from_be_bytes(
+                    payload[cursor + 8..cursor + 16].try_into().unwrap(),
+                );
+                captured.push((lba, pba));
+                cursor += 16;
+            }
+            Ok((
+                WalOp::L2pRangeDelete {
+                    vol_ord,
+                    start,
+                    end,
+                    captured,
+                },
+                &payload[cursor..],
+            ))
         }
         TAG_DEDUP_PUT => {
             require_len(payload, 60, "DEDUP_PUT")?;
@@ -1150,6 +1227,114 @@ mod tests {
             op.encode(&mut buf);
             assert_eq!(buf.len(), expected, "mismatch for {op:?}");
         }
+    }
+
+    #[test]
+    fn l2p_range_delete_empty_captured_round_trip() {
+        let ops = vec![WalOp::L2pRangeDelete {
+            vol_ord: 0xABCD,
+            start: 100,
+            end: 200,
+            captured: Vec::new(),
+        }];
+        let body = encode_body(&ops);
+        // schema(1) + tag(1) + vol_ord(2) + start(8) + end(8) + count(4)
+        assert_eq!(body.len(), 1 + 1 + 22);
+        assert_eq!(decode_body(&body).unwrap(), ops);
+    }
+
+    #[test]
+    fn l2p_range_delete_round_trip_preserves_order_and_duplicates() {
+        // Dedup case: multiple lbas pointing at the same pba — order
+        // and duplicates must survive the codec because apply needs
+        // to emit one decref per entry (SPEC §4.7).
+        let captured = vec![(10u64, 100u64), (11, 100), (12, 100), (13, 200)];
+        let ops = vec![WalOp::L2pRangeDelete {
+            vol_ord: 7,
+            start: 10,
+            end: 14,
+            captured: captured.clone(),
+        }];
+        let body = encode_body(&ops);
+        assert_eq!(body.len(), 1 + 1 + 22 + captured.len() * 16);
+        match &decode_body(&body).unwrap()[0] {
+            WalOp::L2pRangeDelete { captured: c, .. } => assert_eq!(c, &captured),
+            other => panic!("expected L2pRangeDelete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn l2p_range_delete_interleaves_with_other_ops() {
+        let ops = vec![
+            WalOp::L2pRangeDelete {
+                vol_ord: 1,
+                start: 0,
+                end: 10,
+                captured: vec![(0, 100), (5, 200)],
+            },
+            WalOp::Incref { pba: 300, delta: 4 },
+            WalOp::L2pRangeDelete {
+                vol_ord: 2,
+                start: u64::MAX - 10,
+                end: u64::MAX,
+                captured: Vec::new(),
+            },
+            WalOp::L2pDelete { vol_ord: 3, lba: 42 },
+        ];
+        let body = encode_body(&ops);
+        assert_eq!(decode_body(&body).unwrap(), ops);
+    }
+
+    #[test]
+    fn l2p_range_delete_truncated_header_is_corruption() {
+        // Only 10 of 22 bytes of header present.
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_L2P_RANGE_DELETE];
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&[0u8; 8]); // start only
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(
+                msg.contains("L2P_RANGE_DELETE header"),
+                "unexpected msg: {msg}"
+            ),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn l2p_range_delete_truncated_captured_list_is_corruption() {
+        // count=3 but only 2 (lba,pba) pairs follow.
+        let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_L2P_RANGE_DELETE];
+        body.extend_from_slice(&1u16.to_be_bytes()); // vol_ord
+        body.extend_from_slice(&0u64.to_be_bytes()); // start
+        body.extend_from_slice(&10u64.to_be_bytes()); // end
+        body.extend_from_slice(&3u32.to_be_bytes()); // count=3
+        // Two pairs only:
+        body.extend_from_slice(&0u64.to_be_bytes());
+        body.extend_from_slice(&100u64.to_be_bytes());
+        body.extend_from_slice(&1u64.to_be_bytes());
+        body.extend_from_slice(&200u64.to_be_bytes());
+        match decode_body(&body).unwrap_err() {
+            MetaDbError::Corruption(msg) => assert!(
+                msg.contains("L2P_RANGE_DELETE captured list"),
+                "unexpected msg: {msg}"
+            ),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn l2p_range_delete_encoded_len_matches_encode_output() {
+        let captured: Vec<(u64, u64)> = (0..5000).map(|i| (i, i * 2)).collect();
+        let op = WalOp::L2pRangeDelete {
+            vol_ord: 0,
+            start: 0,
+            end: 5000,
+            captured,
+        };
+        let expected = op.encoded_len();
+        let mut buf = Vec::new();
+        op.encode(&mut buf);
+        assert_eq!(buf.len(), expected);
     }
 
     #[test]

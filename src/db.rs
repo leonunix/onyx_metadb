@@ -944,7 +944,8 @@ impl Db {
                 | WalOp::CreateVolume { .. }
                 | WalOp::DropVolume { .. }
                 | WalOp::CloneVolume { .. }
-                | WalOp::L2pRemap { .. } => {
+                | WalOp::L2pRemap { .. }
+                | WalOp::L2pRangeDelete { .. } => {
                     // Already filtered out by `batch_contains_lifecycle_op`.
                     unreachable!("lifecycle ops must not reach apply_ops_grouped");
                 }
@@ -1777,6 +1778,112 @@ impl Db {
             freed_leaf_values,
             pages_freed,
         }))
+    }
+
+    // -------- range delete (SPEC §3.2) ----------------------------------
+
+    /// Bulk L2P delete over `[start, end)` for one volume. The
+    /// plan-apply path mirrors [`drop_snapshot`](Self::drop_snapshot):
+    /// take `drop_gate.read()` + `apply_gate.write()`, scan the range
+    /// to build the `(lba, head_pba(value))` `captured` list, submit a
+    /// `WalOp::L2pRangeDelete` (auto-split when the scan exceeds
+    /// [`MAX_RANGE_DELETE_CAPTURED`]), and apply inline under the held
+    /// apply gate. Each apply emits one decref per captured entry
+    /// under SPEC §4.4 leaf-rc-suppress.
+    ///
+    /// Returns the LSN of the last submitted record. An empty range
+    /// (`start >= end`) or a range with no live mappings returns
+    /// [`last_applied_lsn`](Self::last_applied_lsn) without touching
+    /// the WAL — replay has nothing to do, and callers get the current
+    /// high-water LSN the same way [`commit`](Self::begin) does.
+    ///
+    /// Freed pba lists (for onyx's `SpaceAllocator` callback) are not
+    /// exposed on this return; callers that need them can route a
+    /// single-chunk range through a `Transaction::commit_with_outcomes`-
+    /// style helper in a later session. S3 keeps the entry-point
+    /// signature minimal; freed_pba observability is S6 / S3 follow-up.
+    pub fn range_delete(&self, vol_ord: VolumeOrdinal, start: Lba, end: Lba) -> Result<Lsn> {
+        if start >= end {
+            return Ok(self.last_applied_lsn());
+        }
+        let _drop_guard = self.drop_gate.read();
+        let _apply_guard = self.apply_gate.write();
+
+        let volume = self.volume(vol_ord)?;
+        // Clone volume map up front — apply_op_bare needs it, and we
+        // want to avoid holding `volumes.read()` across the WAL
+        // submit + cvar wait pair (mirrors `commit_ops`).
+        let volumes_map = self.volumes.read().clone();
+
+        // Phase 1: scan each shard under its own mutex, collect
+        // (lba, head_pba(value)) for every live mapping in the range.
+        // Locks are released before WAL submit so the submit path
+        // can rotate segments / fsync without the shard mutex held.
+        let captured: Vec<(Lba, Pba)> = {
+            let mut acc: Vec<(Lba, Pba)> = Vec::new();
+            for shard in &volume.shards {
+                let mut tree = shard.tree.lock();
+                let iter = tree.range(start..end)?;
+                for item in iter {
+                    let (lba, value) = item?;
+                    acc.push((lba, value.head_pba()));
+                }
+            }
+            acc.sort_unstable_by_key(|(lba, _)| *lba);
+            acc
+        };
+
+        if captured.is_empty() {
+            return Ok(self.last_applied_lsn());
+        }
+
+        // Phase 2: split into WAL records of at most
+        // MAX_RANGE_DELETE_CAPTURED entries. Each chunk gets its own
+        // WAL submit + apply, so a 100k-entry range becomes two
+        // consecutive records and replay sees them as two separate
+        // ops — both atomic on their own. Apply order is identical
+        // to submit order under the held apply gate.
+        let mut last_lsn = self.last_applied_lsn();
+        for chunk in captured.chunks(crate::wal::op::MAX_RANGE_DELETE_CAPTURED) {
+            let op = WalOp::L2pRangeDelete {
+                vol_ord,
+                start,
+                end,
+                captured: chunk.to_vec(),
+            };
+            let body = encode_body(std::slice::from_ref(&op));
+            let lsn = self.wal.submit(body)?;
+            self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
+
+            // Under apply_gate.write no one else can apply, so the
+            // cvar wait is defensive and usually passes immediately.
+            {
+                let mut applied = self.last_applied_lsn.lock();
+                while *applied + 1 < lsn {
+                    self.commit_cvar.wait(&mut applied);
+                }
+            }
+
+            let _outcome = apply_op_bare(
+                &volumes_map,
+                &self.refcount_shards,
+                &self.dedup_index,
+                &self.dedup_reverse,
+                &self.page_store,
+                lsn,
+                &op,
+            )?;
+            self.faults
+                .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
+
+            {
+                let mut applied = self.last_applied_lsn.lock();
+                *applied = lsn;
+                self.commit_cvar.notify_all();
+            }
+            last_lsn = lsn;
+        }
+        Ok(last_lsn)
     }
 
     // -------- volume lifecycle ------------------------------------------
@@ -2794,6 +2901,12 @@ fn apply_op_bare(
             *new_value,
             *guard,
         ),
+        WalOp::L2pRangeDelete {
+            vol_ord,
+            start: _,
+            end: _,
+            captured,
+        } => apply_l2p_range_delete(volumes, refcount_shards, lsn, *vol_ord, captured),
         WalOp::DropSnapshot { id: _, pages } => {
             apply_drop_snapshot_pages(page_store, lsn, pages)
         }
@@ -2939,6 +3052,130 @@ fn apply_l2p_remap(
         prev,
         freed_pba,
     })
+}
+
+/// Apply one [`WalOp::L2pRangeDelete`]. Walks the `captured` list,
+/// deleting each lba from its volume's L2P shard and emitting a
+/// decref against `old_pba` under SPEC §4.4 leaf-rc-suppress: if the
+/// leaf holding `lba` was shared with a live snapshot at this op's
+/// start, the snapshot still references `old_pba` via that leaf, so
+/// the decref is suppressed. `drop_snapshot` later compensates via
+/// its `pba_decrefs` list (landed in S4).
+///
+/// Replay safety: the captured list is authoritative — both live
+/// apply and replay consume the same (lba, pba) pairs, so the
+/// emitted refcount deltas match byte-for-byte across restarts.
+/// Range-delete's `Db::range_delete` caller uses apply_gate.write
+/// (same pattern as `drop_snapshot`) to exclude concurrent commits
+/// while plan + submit + apply run, so captured is consistent with
+/// the tree state at apply time.
+fn apply_l2p_range_delete(
+    volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+    refcount_shards: &[Shard],
+    lsn: Lsn,
+    vol_ord: VolumeOrdinal,
+    captured: &[(Lba, Pba)],
+) -> Result<ApplyOutcome> {
+    let volume = volumes.get(&vol_ord).ok_or_else(|| {
+        MetaDbError::Corruption(format!("L2pRangeDelete for unknown volume ord {vol_ord}"))
+    })?;
+
+    // Bucket captured entries by L2P shard so each tree mutex is
+    // taken once. Preserves the original index inside `captured` so
+    // per-shard iteration still sees the caller's emit order (the
+    // per-shard ordering doesn't matter for refcount — decrements
+    // are commutative — but keeping it simplifies debugging and
+    // matches the "preserve submit order" style of apply_ops_grouped).
+    let shard_count = volume.shards.len();
+    let mut shard_buckets: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
+    for (idx, (lba, _)) in captured.iter().enumerate() {
+        shard_buckets[shard_for_key_l2p(&volume.shards, *lba)].push(idx);
+    }
+
+    // For each captured lba, remember whether its pre-op leaf was
+    // shared. Populated during the L2P deletion pass (one per tree
+    // shard) and consumed during the refcount pass. We materialise
+    // this as a Vec<bool> indexed by `captured` position because the
+    // refcount pass runs after the L2P pass releases tree mutexes.
+    let mut suppress_decref: Vec<bool> = vec![false; captured.len()];
+    // Drive deletes first: take each L2P shard mutex in index
+    // order, run every captured lba that falls in it.
+    for (sid, indices) in shard_buckets.iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        let mut tree = volume.shards[sid].tree.lock();
+        // Cache per-leaf sharing decisions: two lbas in the same
+        // pre-op leaf must share the same suppress flag. Once the
+        // first delete COWs the leaf, the SECOND delete walks to a
+        // new leaf whose pre-COW rc is 1 (not shared), which would
+        // flip the answer. We pre-compute the shared bit from the
+        // FIRST-visited lba of each pre-op leaf and reuse it for
+        // subsequent lbas in the same leaf.
+        let mut first_outcome_by_leaf: HashMap<(u8, u64), bool> = HashMap::new();
+        for &idx in indices {
+            let (lba, _) = captured[idx];
+            // `lba >> LEAF_SHIFT` gives the leaf index in the tree,
+            // uniquely identifying the pre-op leaf independently of
+            // page ids. The `(root_level, leaf_idx)` key handles the
+            // extremely rare case of a tree that grew during this
+            // apply (it wouldn't, since we hold apply_gate.write,
+            // but the pair is cheap insurance).
+            let root_level = tree.root_level();
+            let leaf_idx = lba >> crate::paged::format::LEAF_SHIFT;
+            let outcome = tree.delete_at_lsn_with_share_info(lba, lsn)?;
+            let cache_key = (root_level, leaf_idx);
+            let shared = if outcome.prev.is_some() {
+                let first = first_outcome_by_leaf
+                    .entry(cache_key)
+                    .or_insert(outcome.leaf_was_shared);
+                *first
+            } else {
+                // Unmapped lba — leaf_was_shared is meaningless;
+                // treat as "no decref" by setting suppress=true.
+                true
+            };
+            suppress_decref[idx] = outcome.prev.is_none() || shared;
+        }
+    }
+
+    // Second pass: bucket surviving decrefs by refcount shard (for
+    // determinism under cross-thread contention, match the
+    // ascending-shard-index ordering used by apply_l2p_remap).
+    let mut rc_bucket: Vec<Vec<usize>> = vec![Vec::new(); refcount_shards.len()];
+    for (idx, (_, pba)) in captured.iter().enumerate() {
+        if suppress_decref[idx] {
+            continue;
+        }
+        rc_bucket[shard_for_key(refcount_shards, *pba)].push(idx);
+    }
+
+    let mut freed_pbas: Vec<Pba> = Vec::new();
+    for (sid, indices) in rc_bucket.iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        let mut rc_tree = refcount_shards[sid].tree.lock();
+        for &idx in indices {
+            let (_, pba) = captured[idx];
+            let cur = rc_tree.get(pba)?.unwrap_or(0);
+            let new = cur.checked_sub(1).ok_or_else(|| {
+                MetaDbError::InvalidArgument(format!(
+                    "L2pRangeDelete decref underflow for pba {pba}: {cur} - 1",
+                ))
+            })?;
+            if new == 0 {
+                rc_tree.delete(pba)?;
+                if cur > 0 {
+                    freed_pbas.push(pba);
+                }
+            } else {
+                rc_tree.insert(pba, new)?;
+            }
+        }
+    }
+
+    Ok(ApplyOutcome::RangeDelete { freed_pbas })
 }
 
 /// Allocate a fresh shard group for a `CreateVolume` apply. Delegates
@@ -3141,6 +3378,13 @@ fn batch_contains_lifecycle_op(ops: &[WalOp]) -> bool {
                 // Force the serial path; the performance mandate is
                 // a SPEC §8 target, deferred to session S6.
                 | WalOp::L2pRemap { .. }
+                // L2pRangeDelete has its own Db entry point
+                // (`Db::range_delete`) that submits + applies inline
+                // under apply_gate.write, mirroring drop_snapshot.
+                // It never reaches commit_ops; this arm just keeps
+                // the bucketed path safe if a future caller routes
+                // it through here by mistake.
+                | WalOp::L2pRangeDelete { .. }
         )
     })
 }
@@ -5026,6 +5270,223 @@ mod tests {
         assert_eq!(db.get_refcount(100).unwrap(), 0);
         assert_eq!(db.get_refcount(200).unwrap(), 1);
         assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(), Some(remap_val(200, 1)));
+    }
+
+    // ---------------- L2pRangeDelete apply (SPEC §3.2 / §4.7) -------
+
+    /// Helper that pre-seeds N consecutive lbas with the given pba.
+    /// Used to set up range_delete test fixtures without dragging in
+    /// the full remap decision table.
+    fn seed_remaps(db: &Db, start: Lba, count: usize, pba: Pba, tag: u8) {
+        for i in 0..count {
+            remap(db, start + i as u64, remap_val(pba, tag), None);
+        }
+    }
+
+    #[test]
+    fn range_delete_empty_range_is_noop() {
+        let (_d, db) = mk_db();
+        remap(&db, 5, remap_val(100, 1), None);
+        let rc_before = db.get_refcount(100).unwrap();
+        let lsn_before = db.last_applied_lsn();
+        // start >= end short-circuits.
+        let lsn = db.range_delete(BOOTSTRAP_VOLUME_ORD, 10, 10).unwrap();
+        assert_eq!(lsn, lsn_before);
+        assert_eq!(db.get_refcount(100).unwrap(), rc_before);
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 5).unwrap(), Some(remap_val(100, 1)));
+    }
+
+    #[test]
+    fn range_delete_with_no_live_mappings_is_noop() {
+        let (_d, db) = mk_db();
+        remap(&db, 100, remap_val(500, 1), None);
+        let lsn_before = db.last_applied_lsn();
+        // Live mapping at lba=100 is outside the deleted range.
+        let lsn = db.range_delete(BOOTSTRAP_VOLUME_ORD, 0, 10).unwrap();
+        assert_eq!(lsn, lsn_before, "scan found nothing → no WAL record");
+        assert_eq!(db.get_refcount(500).unwrap(), 1);
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 100).unwrap(), Some(remap_val(500, 1)));
+    }
+
+    #[test]
+    fn range_delete_removes_mappings_and_decrefs() {
+        let (_d, db) = mk_db();
+        // Three distinct pbas across three lbas.
+        remap(&db, 10, remap_val(100, 0), None);
+        remap(&db, 11, remap_val(200, 0), None);
+        remap(&db, 12, remap_val(300, 0), None);
+        db.range_delete(BOOTSTRAP_VOLUME_ORD, 10, 13).unwrap();
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(), None);
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 11).unwrap(), None);
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 12).unwrap(), None);
+        assert_eq!(db.get_refcount(100).unwrap(), 0);
+        assert_eq!(db.get_refcount(200).unwrap(), 0);
+        assert_eq!(db.get_refcount(300).unwrap(), 0);
+    }
+
+    #[test]
+    fn range_delete_half_open_interval_excludes_end() {
+        let (_d, db) = mk_db();
+        remap(&db, 10, remap_val(100, 0), None);
+        remap(&db, 11, remap_val(200, 0), None);
+        remap(&db, 12, remap_val(300, 0), None);
+        // Range [10, 12) keeps lba=12.
+        db.range_delete(BOOTSTRAP_VOLUME_ORD, 10, 12).unwrap();
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(), None);
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 11).unwrap(), None);
+        assert_eq!(
+            db.get(BOOTSTRAP_VOLUME_ORD, 12).unwrap(),
+            Some(remap_val(300, 0)),
+            "end-exclusive: lba=12 survives",
+        );
+        assert_eq!(db.get_refcount(100).unwrap(), 0);
+        assert_eq!(db.get_refcount(200).unwrap(), 0);
+        assert_eq!(db.get_refcount(300).unwrap(), 1);
+    }
+
+    #[test]
+    fn range_delete_dedup_multiple_lbas_same_pba_aggregates_decrefs() {
+        // SPEC §4.7: captured may have multiple (lba, pba) pairs with
+        // the same pba (dedup/packed-slot case). Apply must emit one
+        // decref per entry so refcount correctly hits zero.
+        let (_d, db) = mk_db();
+        seed_remaps(&db, 10, 4, 777, 0);
+        assert_eq!(db.get_refcount(777).unwrap(), 4);
+        db.range_delete(BOOTSTRAP_VOLUME_ORD, 10, 14).unwrap();
+        assert_eq!(db.get_refcount(777).unwrap(), 0);
+        for lba in 10..14 {
+            assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, lba).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn range_delete_with_live_snapshot_suppresses_decref() {
+        // Snapshot holds the pre-op leaf → all decrefs for shared
+        // leaves are suppressed. Refcount survives until S4's
+        // drop_snapshot compensates.
+        let (_d, db) = mk_db();
+        seed_remaps(&db, 10, 3, 500, 0);
+        assert_eq!(db.get_refcount(500).unwrap(), 3);
+        db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+        db.range_delete(BOOTSTRAP_VOLUME_ORD, 10, 13).unwrap();
+        for lba in 10..13 {
+            assert_eq!(
+                db.get(BOOTSTRAP_VOLUME_ORD, lba).unwrap(),
+                None,
+                "current tree no longer has lba={lba}"
+            );
+        }
+        assert_eq!(
+            db.get_refcount(500).unwrap(),
+            3,
+            "leaf shared with snapshot: all decrefs suppressed",
+        );
+    }
+
+    #[test]
+    fn range_delete_mixed_shared_and_exclusive_leaves() {
+        // Seed a wide range, then snapshot, then write more LBAs that
+        // are exclusive to the current tree. The second range_delete
+        // should suppress decrefs for shared-leaf entries but not for
+        // exclusive ones.
+        let (_d, db) = mk_db();
+        // LBA 10..13 exist pre-snapshot; pba=500.
+        seed_remaps(&db, 10, 3, 500, 0);
+        db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+        // A large gap so 10_000..10_003 land in a different leaf
+        // (LEAF_ENTRY_COUNT=128 → leaf_idx differs). Those lbas are
+        // fresh post-snapshot → leaf exclusive to current tree.
+        seed_remaps(&db, 10_000, 3, 600, 0);
+        assert_eq!(db.get_refcount(500).unwrap(), 3);
+        assert_eq!(db.get_refcount(600).unwrap(), 3);
+
+        // Delete both ranges together in one call.
+        db.range_delete(BOOTSTRAP_VOLUME_ORD, 10, 10_010).unwrap();
+        // Shared leaf: suppressed.
+        assert_eq!(db.get_refcount(500).unwrap(), 3);
+        // Exclusive leaf: decref went through.
+        assert_eq!(db.get_refcount(600).unwrap(), 0);
+    }
+
+    #[test]
+    fn range_delete_survives_restart_via_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create(dir.path()).unwrap();
+            seed_remaps(&db, 10, 4, 100, 0);
+            db.range_delete(BOOTSTRAP_VOLUME_ORD, 10, 14).unwrap();
+            // Crash without flush.
+        }
+        let db = Db::open(dir.path()).unwrap();
+        for lba in 10..14 {
+            assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, lba).unwrap(), None);
+        }
+        assert_eq!(db.get_refcount(100).unwrap(), 0);
+    }
+
+    #[test]
+    fn range_delete_auto_splits_above_cap() {
+        // Force captured.len() to exceed MAX_RANGE_DELETE_CAPTURED so
+        // the auto-split path runs. Seed 2 * MAX + 37 entries; expect
+        // three WAL records + three final applies.
+        let cap = crate::wal::op::MAX_RANGE_DELETE_CAPTURED;
+        let total = 2 * cap + 37;
+        let (_d, db) = mk_db();
+        for i in 0..total {
+            remap(&db, i as u64, remap_val(100 + i as u64, 0), None);
+        }
+        let pre_lsn = db.last_applied_lsn();
+        let lsn = db.range_delete(BOOTSTRAP_VOLUME_ORD, 0, total as u64).unwrap();
+        // Three chunks → three WAL records → LSN bumped by 3.
+        assert_eq!(
+            lsn,
+            pre_lsn + 3,
+            "auto-split emitted exactly three WAL records",
+        );
+        for i in 0..total {
+            assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, i as u64).unwrap(), None);
+        }
+        // Spot-check a few refcounts.
+        assert_eq!(db.get_refcount(100).unwrap(), 0);
+        assert_eq!(db.get_refcount(100 + cap as u64).unwrap(), 0);
+        assert_eq!(db.get_refcount(100 + (total - 1) as u64).unwrap(), 0);
+    }
+
+    #[test]
+    fn range_delete_crosses_shard_boundaries() {
+        // With the default shard count (> 1), a contiguous LBA range
+        // hits multiple shards. Make sure the apply path visits each
+        // shard's tree and every mapping in the range is removed.
+        let (_d, db) = mk_db_with_shards(8);
+        for i in 0..200u64 {
+            remap(&db, i, remap_val(1_000 + i, 0), None);
+        }
+        db.range_delete(BOOTSTRAP_VOLUME_ORD, 0, 200).unwrap();
+        for i in 0..200u64 {
+            assert_eq!(
+                db.get(BOOTSTRAP_VOLUME_ORD, i).unwrap(),
+                None,
+                "lba={i} should be unmapped after range_delete",
+            );
+            assert_eq!(db.get_refcount(1_000 + i).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn range_delete_dedup_with_snapshot_suppresses_all() {
+        // Combined SPEC §4.7 (dedup aggregation) + §4.4 (leaf shared).
+        // Four lbas on the same pba, then snapshot, then range_delete:
+        // all four should have their decrefs suppressed.
+        let (_d, db) = mk_db();
+        seed_remaps(&db, 10, 4, 777, 0);
+        assert_eq!(db.get_refcount(777).unwrap(), 4);
+        db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+        db.range_delete(BOOTSTRAP_VOLUME_ORD, 10, 14).unwrap();
+        assert_eq!(
+            db.get_refcount(777).unwrap(),
+            4,
+            "all four lbas under a shared leaf: every decref suppressed",
+        );
     }
 
     #[test]

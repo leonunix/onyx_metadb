@@ -103,6 +103,22 @@ pub struct InsertOutcome {
     pub leaf_was_shared: bool,
 }
 
+/// Delete-path analogue of [`InsertOutcome`]. Returned by
+/// [`PagedL2p::delete_at_lsn_with_share_info`]; consumed by the
+/// onyx-adapter `WalOp::L2pRangeDelete` apply path. `prev` is `None`
+/// when the lba was unmapped — the apply path short-circuits in that
+/// case and treats the op as a no-op for refcount accounting.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    /// Previous mapping at the key, or `None` if the slot was unset
+    /// and this call was a no-op.
+    pub prev: Option<L2pValue>,
+    /// `true` iff the leaf page that contained this key was shared
+    /// with another tree in the pre-op state — same semantics as
+    /// [`InsertOutcome::leaf_was_shared`].
+    pub leaf_was_shared: bool,
+}
+
 /// One entry in the delta between two subtrees. Emitted by
 /// [`PagedL2p::diff_subtrees`] and surfaced via `Db::diff`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -507,14 +523,54 @@ impl PagedL2p {
         self.delete_with_lsn(lba, lsn)
     }
 
-    fn delete_with_lsn(&mut self, lba: u64, lsn: Lsn) -> Result<Option<L2pValue>> {
-        let result = self.delete_with_lsn_inner(lba, lsn);
+    /// Variant of [`delete_at_lsn`](Self::delete_at_lsn) that also
+    /// reports whether the leaf holding `lba` was shared with another
+    /// tree in the pre-op state. Used by `WalOp::L2pRangeDelete`'s
+    /// apply path for the same leaf-rc-suppress decision
+    /// [`insert_at_lsn_with_share_info`](Self::insert_at_lsn_with_share_info)
+    /// serves on the write side (SPEC §4.4).
+    ///
+    /// Returns `DeleteOutcome { prev: None, leaf_was_shared: false }`
+    /// when `lba` is unmapped; the caller should treat that as a
+    /// no-op and not emit a refcount decref.
+    pub fn delete_at_lsn_with_share_info(
+        &mut self,
+        lba: u64,
+        lsn: Lsn,
+    ) -> Result<DeleteOutcome> {
+        if self.get(lba)?.is_none() {
+            return Ok(DeleteOutcome {
+                prev: None,
+                leaf_was_shared: false,
+            });
+        }
+        self.advance_next_gen(lsn);
+        let result = self.delete_with_lsn_inner_with_share(lba, lsn);
         self.finalize_rc_deltas(lsn, result)
     }
 
-    fn delete_with_lsn_inner(&mut self, lba: u64, lsn: Lsn) -> Result<Option<L2pValue>> {
+    fn delete_with_lsn(&mut self, lba: u64, lsn: Lsn) -> Result<Option<L2pValue>> {
+        let result = self
+            .delete_with_lsn_inner_with_share(lba, lsn)
+            .map(|outcome| outcome.prev);
+        self.finalize_rc_deltas(lsn, result)
+    }
+
+    fn delete_with_lsn_inner_with_share(
+        &mut self,
+        lba: u64,
+        lsn: Lsn,
+    ) -> Result<DeleteOutcome> {
         let leaf_idx = lba >> LEAF_SHIFT;
         let bit = (lba & LEAF_MASK) as usize;
+
+        // Root-is-leaf path: capture share-ness before any mutation
+        // advances the tree. Same rule as the insert side (see
+        // `insert_with_lsn_inner`): when `root_level == 0` the leaf
+        // about to be mutated IS the root, and the walk-down loop
+        // never reaches `level == 1`.
+        let mut leaf_was_shared =
+            self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
 
         let new_root = self.buf.cow_for_write(self.root, lsn)?;
         let mut current = new_root;
@@ -528,6 +584,11 @@ impl PagedL2p {
                 child != NULL_PAGE,
                 "paged::delete: pre-check said key exists but slot is null"
             );
+            if level == 1 {
+                // Pre-COW effective rc for the leaf — same capture
+                // point the insert path uses.
+                leaf_was_shared = self.buf.effective_rc(child)? > 1;
+            }
             let new_child = self.buf.cow_for_write(child, lsn)?;
             index_set_child(self.buf.modify(current, lsn)?, slot, new_child);
             path.push((current, slot));
@@ -567,7 +628,10 @@ impl PagedL2p {
         }
 
         self.root = new_root;
-        Ok(old)
+        Ok(DeleteOutcome {
+            prev: old,
+            leaf_was_shared,
+        })
     }
 
     /// Commit the op's batched rc deltas on success, or drop them on
