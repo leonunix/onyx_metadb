@@ -7,7 +7,7 @@
 //! - thread-safe point writes via one mutex per shard
 //! - fan-out range / diff / snapshot operations
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU8;
@@ -25,6 +25,7 @@ use crate::manifest::{
     write_snapshot_roots_page, Manifest, ManifestStore, SnapshotEntry, VolumeEntry,
     MANIFEST_BODY_VERSION,
 };
+use crate::page::PageType;
 use crate::page_store::PageStore;
 use crate::paged::PagedL2p;
 use crate::paged::{DiffEntry, L2pValue};
@@ -555,6 +556,7 @@ impl Db {
                 _ => {
                     let outcome = apply_op_bare(
                         &volumes,
+                        &manifest.snapshots,
                         &refcount_shards,
                         &dedup_index,
                         &dedup_reverse,
@@ -789,18 +791,13 @@ impl Db {
         if ops.is_empty() {
             return Ok((self.last_applied_lsn(), Vec::new()));
         }
-        // `drop_gate.read()` pairs with `drop_snapshot`'s write acquire.
-        // Held across submit + apply so a concurrent drop can't insert
-        // itself between our LSN assignment and our apply — its
-        // rc-dependent plan would otherwise be invalidated by our
-        // cow_for_write bumps, and vice versa.
-        // `range_delete` submits its own WAL record and then waits for
-        // all lower LSNs to apply while holding `apply_gate.write()`.
-        // Therefore it must take the write side of `drop_gate` (same
-        // as `drop_snapshot` / volume lifecycle) so no ordinary
-        // `commit_ops` caller can slip in, obtain a lower LSN, and then
-        // block forever trying to acquire `apply_gate.read()`.
-        let _drop_guard = self.drop_gate.write();
+        // `drop_gate.read()` pairs with lifecycle paths' write acquire.
+        // Hold it across submit + apply so `drop_snapshot` /
+        // `range_delete` cannot wedge themselves between our LSN
+        // assignment and apply. Using the read side is important:
+        // ordinary commits must still submit concurrently so the WAL
+        // writer can coalesce them into group commits.
+        let _drop_guard = self.drop_gate.read();
         let body = encode_body(ops);
         let lsn = self.wal.submit(body)?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
@@ -845,8 +842,10 @@ impl Db {
         lsn: Lsn,
         op: &WalOp,
     ) -> Result<ApplyOutcome> {
+        let snapshots = self.manifest_state.lock().manifest.snapshots.clone();
         let outcome = apply_op_bare(
             volumes,
+            &snapshots,
             &self.refcount_shards,
             &self.dedup_index,
             &self.dedup_reverse,
@@ -1628,7 +1627,7 @@ impl Db {
         let _apply_guard = self.apply_gate.write();
         let _view_guard = self.snapshot_views.write();
 
-        let entry = {
+        let (entry, other_snapshots, same_volume_other_snapshots) = {
             let manifest_state = self.manifest_state.lock();
             let Some(entry) = manifest_state
                 .manifest
@@ -1639,7 +1638,19 @@ impl Db {
             else {
                 return Ok(None);
             };
-            entry
+            let others = manifest_state
+                .manifest
+                .snapshots
+                .iter()
+                .filter(|snapshot| snapshot.id != id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let same_volume_others = others
+                .iter()
+                .filter(|snapshot| snapshot.vol_ord == entry.vol_ord)
+                .cloned()
+                .collect::<Vec<_>>();
+            (entry, others, same_volume_others)
         };
         // v6 SnapshotEntry no longer carries refcount state (Phase 6.5b
         // retired it), so there's nothing to assert about refcount here.
@@ -1711,7 +1722,7 @@ impl Db {
         }
         let source_end = source_start + source_volume.shards.len();
 
-        let mut pages: Vec<PageId> = Vec::new();
+        let all_current_roots: Vec<PageId> = l2p_guards.iter().map(|tree| tree.root()).collect();
         // SPEC §3.3 pba_decrefs: for every lba where the snapshot has a
         // value but the current tree diverged, emit one decref against
         // the snap-side pba. Computed while we still hold the source
@@ -1720,7 +1731,7 @@ impl Db {
         // cover "snap has it, current doesn't" and "snap has it, current
         // has a different value" respectively; `AddedInB` is "current
         // has it, snap doesn't" which has nothing for us to compensate.
-        let mut raw_pba_decrefs: Vec<Pba> = Vec::new();
+        let mut raw_pba_decrefs: Vec<(Lba, L2pValue)> = Vec::new();
         for (tree, &snap_root) in l2p_guards[source_start..source_end]
             .iter_mut()
             .zip(entry.l2p_shard_roots.iter())
@@ -1728,12 +1739,11 @@ impl Db {
             if snap_root == crate::types::NULL_PAGE {
                 continue;
             }
-            pages.extend(tree.collect_drop_pages(snap_root)?);
             let current_root = tree.root();
             for diff in tree.diff_subtrees(snap_root, current_root)? {
                 match diff {
-                    DiffEntry::RemovedInB { old, .. } | DiffEntry::Changed { old, .. } => {
-                        raw_pba_decrefs.push(old.head_pba());
+                    DiffEntry::RemovedInB { key, old } | DiffEntry::Changed { key, old, .. } => {
+                        raw_pba_decrefs.push((key, old));
                     }
                     DiffEntry::AddedInB { .. } => {}
                 }
@@ -1754,7 +1764,18 @@ impl Db {
         // sequential decrefs.
         let mut pending: HashMap<Pba, u32> = HashMap::new();
         let mut pba_decrefs: Vec<Pba> = Vec::with_capacity(raw_pba_decrefs.len());
-        for pba in raw_pba_decrefs {
+        for (lba, value) in raw_pba_decrefs {
+            if snapshot_still_maps_value_excluding(
+                &same_volume_other_snapshots,
+                &self.page_store,
+                id,
+                entry.vol_ord,
+                lba,
+                value,
+            )? {
+                continue;
+            }
+            let pba = value.head_pba();
             let sid = shard_for_key(&self.refcount_shards, pba);
             let rc = refcount_guards[sid].get(pba)?.unwrap_or(0);
             let taken = pending.entry(pba).or_insert(0);
@@ -1765,6 +1786,49 @@ impl Db {
         }
         drop(l2p_guards);
         drop(refcount_guards);
+
+        // Page refcounts are physical-page ownership counts, not
+        // per-volume logical counts. `clone_volume` can make any live
+        // volume (and snapshots of that volume) share the same paged L2P
+        // pages as the snapshot being dropped. Build the decrement plan
+        // from the complete manifest-visible page graph so a page is
+        // decremented exactly when removing this snapshot removes one
+        // physical incoming edge. The PBA compensation above stays
+        // volume-scoped because it reasons about this snapshot's logical
+        // LBA values, not page-parent edges.
+        let mut roots_before = all_current_roots.clone();
+        roots_before.extend(entry.l2p_shard_roots.iter().copied());
+        roots_before.extend(
+            other_snapshots
+                .iter()
+                .flat_map(|snapshot| snapshot.l2p_shard_roots.iter().copied()),
+        );
+        let mut roots_after = all_current_roots.clone();
+        roots_after.extend(
+            other_snapshots
+                .iter()
+                .flat_map(|snapshot| snapshot.l2p_shard_roots.iter().copied()),
+        );
+        let before_refs = collect_paged_refcounts_for_roots(&self.page_store, &roots_before)?;
+        let after_refs = collect_paged_refcounts_for_roots(&self.page_store, &roots_after)?;
+        let mut pages: Vec<PageId> = Vec::new();
+        for (&pid, &before) in &before_refs {
+            let after = after_refs.get(&pid).copied().unwrap_or(0);
+            match before.checked_sub(after) {
+                Some(1) => pages.push(pid),
+                Some(0) => {}
+                Some(delta) => {
+                    return Err(MetaDbError::Corruption(format!(
+                        "drop_snapshot page-ref delta for {pid} was {delta}, expected 0 or 1"
+                    )));
+                }
+                None => {
+                    return Err(MetaDbError::Corruption(format!(
+                        "drop_snapshot page-ref underflow for {pid}: before={before} after={after}"
+                    )));
+                }
+            }
+        }
         // NOTE on `entry.l2p_roots_page`: this SnapshotRoots page is
         // referenced only by the manifest's snapshot entry, so it
         // *logically* becomes unreferenced when we apply the drop.
@@ -1808,6 +1872,7 @@ impl Db {
         let volumes_map = self.volumes.read().clone();
         let outcome = apply_op_bare(
             &volumes_map,
+            &self.manifest_state.lock().manifest.snapshots.clone(),
             &self.refcount_shards,
             &self.dedup_index,
             &self.dedup_reverse,
@@ -1818,17 +1883,19 @@ impl Db {
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
-        // Apply's page writes went straight through page_store; the
-        // source volume's shards' PageBuf caches still hold stale
-        // refcounts for anything apply touched. Invalidate every one
-        // of those pids so the next cow_for_write / lookup pulls the
-        // fresh bytes from disk. Other volumes' PageBufs never cached
-        // these pages (COW ownership is per-tree), so skipping them is
-        // safe.
+        // Apply's page writes went straight through page_store; any
+        // PageBuf that cached one of these physical pages now has a
+        // stale refcount. Sweep every live volume, not just the source:
+        // clone_volume intentionally shares L2P pages across volumes,
+        // and a later write through a stale Clean copy can otherwise
+        // resurrect the pre-drop rc and leak a page ref.
+        let all_volumes: Vec<Arc<Volume>> = self.volumes.read().values().cloned().collect();
         for &pid in &pages {
             self.page_cache.invalidate(pid);
-            for shard in &source_volume.shards {
-                shard.tree.lock().forget_page(pid);
+            for volume in &all_volumes {
+                for shard in &volume.shards {
+                    shard.tree.lock().forget_page(pid);
+                }
             }
         }
 
@@ -1950,6 +2017,7 @@ impl Db {
 
             let _outcome = apply_op_bare(
                 &volumes_map,
+                &self.manifest_state.lock().manifest.snapshots.clone(),
                 &self.refcount_shards,
                 &self.dedup_index,
                 &self.dedup_reverse,
@@ -2890,6 +2958,7 @@ pub(crate) fn decode_reverse_hash(key: &Hash32, value: &DedupValue) -> Hash32 {
 /// `Manifest`) and the live path (which owns a `Mutex<ManifestState>`).
 fn apply_op_bare(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+    snapshots: &[SnapshotEntry],
     refcount_shards: &[Shard],
     dedup_index: &Lsm,
     dedup_reverse: &Lsm,
@@ -2973,7 +3042,9 @@ fn apply_op_bare(
             guard,
         } => apply_l2p_remap(
             volumes,
+            snapshots,
             refcount_shards,
+            page_store,
             lsn,
             *vol_ord,
             *lba,
@@ -2985,7 +3056,15 @@ fn apply_op_bare(
             start: _,
             end: _,
             captured,
-        } => apply_l2p_range_delete(volumes, refcount_shards, lsn, *vol_ord, captured),
+        } => apply_l2p_range_delete(
+            volumes,
+            snapshots,
+            refcount_shards,
+            page_store,
+            lsn,
+            *vol_ord,
+            captured,
+        ),
         WalOp::DropSnapshot {
             id: _,
             pages,
@@ -3039,7 +3118,9 @@ fn apply_op_bare(
 /// pbas.
 fn apply_l2p_remap(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+    snapshots: &[SnapshotEntry],
     refcount_shards: &[Shard],
+    page_store: &Arc<PageStore>,
     lsn: Lsn,
     vol_ord: VolumeOrdinal,
     lba: Lba,
@@ -3084,35 +3165,51 @@ fn apply_l2p_remap(
     let outcome = tree.insert_at_lsn_with_share_info(lba, new_value, lsn)?;
     let prev = outcome.prev;
     let old_pba = prev.map(|p| p.head_pba());
+    let prev_eq_new = prev.is_some_and(|value| value == new_value);
+    let snapshot_holds_prev = prev
+        .map(|value| snapshot_still_maps_value(snapshots, page_store, vol_ord, lba, value))
+        .transpose()?
+        .unwrap_or(false);
+    let snapshot_holds_new =
+        snapshot_still_maps_value(snapshots, page_store, vol_ord, lba, new_value)?;
 
-    // Determine decref / incref from the decision table.
-    let do_decref = prev.is_some() && !outcome.leaf_was_shared && old_pba != Some(new_pba);
-    let do_incref = !(prev.is_some() && !outcome.leaf_was_shared && old_pba == Some(new_pba));
+    // PBA refcount tracks unique byte-values per (vol,lba) across live
+    // and snapshots. Removing live's previous value decrefs only when
+    // no snapshot still maps that exact 28-byte value. Adding live's new
+    // value increfs only when it is not already represented by live's
+    // previous value and not already represented by a snapshot.
+    let do_decref = prev.is_some() && !prev_eq_new && !snapshot_holds_prev;
+    let do_incref = !prev_eq_new && !snapshot_holds_new;
 
-    // Collect touched (shard, pba, is_decref) tuples, sort by shard
-    // index so concurrent threads acquire locks in a consistent
-    // order. Same pba on both sides is only possible when `prev ==
-    // new_value` bytewise; in that case the decision table already
-    // picked "no decref, no incref", so we won't end up with two
-    // entries targeting the same (sid, pba).
-    let mut touched: Vec<(usize, Pba, bool)> = Vec::new();
+    // Collapse per-pba net delta before taking shard locks. Same-head-pba
+    // overwrites can legitimately add and remove one logical version in the
+    // same op; applying the decref and incref independently would transiently
+    // hit rc=0 and incorrectly surface `freed_pba` even though the net effect
+    // is zero.
+    let mut net_delta: HashMap<Pba, i32> = HashMap::new();
     if do_decref {
         let pba = old_pba.expect("do_decref implies prev.is_some()");
-        touched.push((shard_for_key(refcount_shards, pba), pba, true));
+        *net_delta.entry(pba).or_insert(0) -= 1;
     }
     if do_incref {
-        touched.push((shard_for_key(refcount_shards, new_pba), new_pba, false));
+        *net_delta.entry(new_pba).or_insert(0) += 1;
     }
+    let mut touched: Vec<(usize, Pba, i32)> = net_delta
+        .into_iter()
+        .filter(|(_, delta)| *delta != 0)
+        .map(|(pba, delta)| (shard_for_key(refcount_shards, pba), pba, delta))
+        .collect();
     touched.sort_by_key(|(sid, _, _)| *sid);
 
     let mut freed_pba: Option<Pba> = None;
-    for (sid, pba, is_decref) in touched {
+    for (sid, pba, delta) in touched {
         let mut rc_tree = refcount_shards[sid].tree.lock();
-        if is_decref {
+        if delta < 0 {
             let cur = rc_tree.get(pba)?.unwrap_or(0);
-            let new = cur.checked_sub(1).ok_or_else(|| {
+            let amount = (-delta) as u32;
+            let new = cur.checked_sub(amount).ok_or_else(|| {
                 MetaDbError::InvalidArgument(format!(
-                    "L2pRemap decref underflow for pba {pba}: {cur} - 1",
+                    "L2pRemap decref underflow for pba {pba}: {cur} - {amount}",
                 ))
             })?;
             if new == 0 {
@@ -3125,7 +3222,8 @@ fn apply_l2p_remap(
             }
         } else {
             let cur = rc_tree.get(pba)?.unwrap_or(0);
-            let new = cur.checked_add(1).ok_or_else(|| {
+            let amount = delta as u32;
+            let new = cur.checked_add(amount).ok_or_else(|| {
                 MetaDbError::InvalidArgument(format!("L2pRemap incref overflow for pba {pba}"))
             })?;
             rc_tree.insert(pba, new)?;
@@ -3156,7 +3254,9 @@ fn apply_l2p_remap(
 /// the tree state at apply time.
 fn apply_l2p_range_delete(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+    snapshots: &[SnapshotEntry],
     refcount_shards: &[Shard],
+    page_store: &Arc<PageStore>,
     lsn: Lsn,
     vol_ord: VolumeOrdinal,
     captured: &[(Lba, Pba)],
@@ -3220,7 +3320,12 @@ fn apply_l2p_range_delete(
                 // treat as "no decref" by setting suppress=true.
                 true
             };
-            suppress_decref[idx] = outcome.prev.is_none() || shared;
+            let snapshot_holds_old = if let Some(prev_value) = outcome.prev {
+                snapshot_still_maps_value(snapshots, page_store, vol_ord, lba, prev_value)?
+            } else {
+                false
+            };
+            suppress_decref[idx] = outcome.prev.is_none() || shared || snapshot_holds_old;
         }
     }
 
@@ -3261,6 +3366,106 @@ fn apply_l2p_range_delete(
     }
 
     Ok(ApplyOutcome::RangeDelete { freed_pbas })
+}
+
+fn snapshot_still_maps_value(
+    snapshots: &[SnapshotEntry],
+    page_store: &Arc<PageStore>,
+    vol_ord: VolumeOrdinal,
+    lba: Lba,
+    value: L2pValue,
+) -> Result<bool> {
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| snapshot.vol_ord == vol_ord)
+    {
+        if snapshot.l2p_shard_roots.is_empty() {
+            continue;
+        }
+        let sid = (xxh3_64(&lba.to_be_bytes()) as usize) % snapshot.l2p_shard_roots.len();
+        let root = snapshot.l2p_shard_roots[sid];
+        if root == crate::types::NULL_PAGE {
+            continue;
+        }
+        let mut tree = PagedL2p::open(page_store.clone(), root, 1)?;
+        if tree.get(lba)?.is_some_and(|candidate| candidate == value) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn snapshot_still_maps_value_excluding(
+    snapshots: &[SnapshotEntry],
+    page_store: &Arc<PageStore>,
+    excluded_id: SnapshotId,
+    vol_ord: VolumeOrdinal,
+    lba: Lba,
+    value: L2pValue,
+) -> Result<bool> {
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| snapshot.id != excluded_id && snapshot.vol_ord == vol_ord)
+    {
+        if snapshot.l2p_shard_roots.is_empty() {
+            continue;
+        }
+        let sid = (xxh3_64(&lba.to_be_bytes()) as usize) % snapshot.l2p_shard_roots.len();
+        let root = snapshot.l2p_shard_roots[sid];
+        if root == crate::types::NULL_PAGE {
+            continue;
+        }
+        let mut tree = PagedL2p::open(page_store.clone(), root, 1)?;
+        if tree.get(lba)?.is_some_and(|candidate| candidate == value) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn collect_paged_refcounts_for_roots(
+    page_store: &Arc<PageStore>,
+    roots: &[PageId],
+) -> Result<BTreeMap<PageId, u32>> {
+    fn walk(
+        page_store: &PageStore,
+        pid: PageId,
+        refs: &mut BTreeMap<PageId, u32>,
+        seen: &mut HashSet<PageId>,
+    ) -> Result<()> {
+        if !seen.insert(pid) {
+            return Ok(());
+        }
+        let page = page_store.read_page(pid)?;
+        match page.header()?.page_type {
+            PageType::PagedLeaf => Ok(()),
+            PageType::PagedIndex => {
+                for slot in 0..crate::paged::format::INDEX_FANOUT {
+                    let child = crate::paged::format::index_child_at(&page, slot);
+                    if child == crate::types::NULL_PAGE {
+                        continue;
+                    }
+                    *refs.entry(child).or_insert(0) += 1;
+                    walk(page_store, child, refs, seen)?;
+                }
+                Ok(())
+            }
+            other => Err(MetaDbError::Corruption(format!(
+                "page {pid} has unexpected type {other:?} in paged refcount walk"
+            ))),
+        }
+    }
+
+    let mut refs = BTreeMap::new();
+    let mut seen = HashSet::new();
+    for &root in roots {
+        if root == crate::types::NULL_PAGE {
+            continue;
+        }
+        *refs.entry(root).or_insert(0) += 1;
+        walk(page_store, root, &mut refs, &mut seen)?;
+    }
+    Ok(refs)
 }
 
 /// Allocate a fresh shard group for a `CreateVolume` apply. Delegates
@@ -4175,6 +4380,33 @@ mod tests {
             assert_eq!(db.get(clone, i).unwrap(), Some(v(i as u8)));
         }
         assert_eq!(db.snapshots(), Vec::<SnapshotEntry>::new());
+    }
+
+    #[test]
+    fn dropping_source_snapshot_after_clone_keeps_page_refcounts_balanced() {
+        let (dir, db) = mk_db();
+        let src = db.create_volume().unwrap();
+        for i in 0u64..256 {
+            db.insert(src, i, v((i % 251) as u8)).unwrap();
+        }
+        let snap = db.take_snapshot(src).unwrap();
+        let clone = db.clone_volume(snap).unwrap();
+
+        let _ = db.drop_snapshot(snap).unwrap().unwrap();
+        for i in 0u64..256 {
+            assert_eq!(db.get(clone, i).unwrap(), Some(v((i % 251) as u8)));
+        }
+
+        drop(db);
+        let db = Db::open(dir.path()).unwrap();
+        for i in 0u64..256 {
+            assert_eq!(db.get(clone, i).unwrap(), Some(v((i % 251) as u8)));
+        }
+        db.flush().unwrap();
+        let report =
+            crate::verify::verify_path(dir.path(), crate::verify::VerifyOptions { strict: true })
+                .unwrap();
+        assert!(report.is_clean(), "verify issues: {:?}", report.issues);
     }
 
     #[test]

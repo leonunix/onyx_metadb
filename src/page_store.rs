@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use crate::config::PAGE_SIZE;
 use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageHeader, PageType};
-use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
+use crate::types::{Lsn, PageId, FIRST_DATA_PAGE};
 
 const RC_LOCK_SHARDS: usize = 64;
 
@@ -290,17 +290,18 @@ impl PageStore {
         Ok(new_rc)
     }
 
-    /// Same as [`atomic_rc_delta`] but with WAL-replay idempotency: if
-    /// `page.generation >= lsn` the delta is treated as already-applied
-    /// by a prior attempt of the same op and the function returns the
-    /// current rc without mutating the page. On successful apply the
-    /// page's `generation` is stamped with `lsn`.
+    /// Same as [`atomic_rc_delta`] but with WAL-replay idempotency. The
+    /// `(lsn, ordinal)` pair identifies one rc-delta application within
+    /// a WAL record. If the page already carries a later marker, this
+    /// delta is treated as already applied and skipped. On successful
+    /// apply the page is stamped with `(lsn, ordinal)`.
     ///
     /// Used by [`crate::paged::PageBuf::cow_for_write`] so that a WAL
-    /// op replayed after crash does not double-apply the rc delta on a
-    /// cross-tree shared page. Same `page.generation >= lsn` skip
-    /// pattern as [`crate::db::apply_drop_snapshot_pages`] and
-    /// [`crate::db::apply_clone_volume_incref`].
+    /// op replayed after crash does not double-apply an already landed
+    /// delta. A single WAL record can contain multiple L2P ops with the
+    /// same LSN, so comparing only `generation >= lsn` is insufficient:
+    /// distinct same-LSN deltas on the same page must not swallow each
+    /// other. `ordinal` disambiguates those same-record applications.
     ///
     /// `lsn` must be strictly greater than zero — tree pages
     /// carry `generation = 0` for their entire unsnapped lifetime, so
@@ -315,6 +316,7 @@ impl PageStore {
         page_id: PageId,
         delta: i32,
         lsn: Lsn,
+        ordinal: u32,
     ) -> Result<u32> {
         if lsn == 0 {
             return Err(MetaDbError::InvalidArgument(
@@ -327,8 +329,9 @@ impl PageStore {
         let mut page = read_page_raw(&self.file, page_id)?;
         page.verify(page_id)?;
         let cur_gen = page.generation();
+        let cur_ordinal = page.flags();
         let cur_rc = page.refcount();
-        if cur_gen >= lsn {
+        if cur_gen > lsn || (cur_gen == lsn && cur_ordinal >= ordinal) {
             return Ok(cur_rc);
         }
         let new_rc = if delta >= 0 {
@@ -343,6 +346,7 @@ impl PageStore {
         })?;
         page.set_refcount(new_rc);
         page.set_generation(lsn);
+        page.set_flags(ordinal);
         page.seal();
         self.file
             .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
@@ -417,10 +421,11 @@ impl PageStore {
             .committed_file_pages
             .checked_add(add)
             .ok_or(MetaDbError::OutOfSpace)?;
-        self.file
-            .set_len(new_committed.checked_mul(PAGE_SIZE as u64).ok_or(
-                MetaDbError::OutOfSpace,
-            )?)?;
+        self.file.set_len(
+            new_committed
+                .checked_mul(PAGE_SIZE as u64)
+                .ok_or(MetaDbError::OutOfSpace)?,
+        )?;
         inner.committed_file_pages = new_committed;
         Ok(())
     }
@@ -915,8 +920,11 @@ mod tests {
         // past it, as if a crash happened after pre-extend but before any
         // data page was written.
         let pages_on_disk = FIRST_DATA_PAGE + 16;
-        std::fs::write(&path, vec![0u8; (pages_on_disk * PAGE_SIZE as u64) as usize])
-            .unwrap();
+        std::fs::write(
+            &path,
+            vec![0u8; (pages_on_disk * PAGE_SIZE as u64) as usize],
+        )
+        .unwrap();
         let ps = PageStore::open_with_grow_chunk(&path, 16).unwrap();
         // No page past the manifest region decoded as valid → high_water
         // sits at FIRST_DATA_PAGE, and the growth tail is truncated.

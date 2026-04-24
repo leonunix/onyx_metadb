@@ -1369,6 +1369,42 @@ mod tests {
         assert_eq!(src.get_at(root_pid, 300).unwrap(), Some(v(20)));
     }
 
+    #[test]
+    fn same_lsn_parent_then_child_cow_does_not_skip_child_decref() {
+        let (_d, ps) = mk_store();
+        let page_cache = Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES));
+
+        let mut src = PagedL2p::create_with_cache(ps.clone(), page_cache.clone()).unwrap();
+        src.insert(1, v(1)).unwrap();
+        src.insert(300, v(2)).unwrap();
+        src.flush().unwrap();
+        let shared_root = src.root();
+        let root_level = src.root_level();
+        assert_eq!(root_level, 1);
+
+        let root_page = ps.read_page_unchecked(shared_root).unwrap();
+        let child_pid = crate::paged::format::index_child_at(&root_page, 0);
+        assert_ne!(child_pid, crate::types::NULL_PAGE);
+        assert_eq!(ps.read_page_unchecked(child_pid).unwrap().refcount(), 1);
+
+        src.incref_root_for_snapshot().unwrap();
+
+        let mut writer = PagedL2p::create_with_cache(ps.clone(), page_cache.clone()).unwrap();
+        writer.attach_subtree_root(shared_root, root_level).unwrap();
+
+        writer
+            .insert_at_lsn(LEAF_ENTRY_COUNT as u64, v(10), 100)
+            .unwrap();
+        assert_eq!(ps.read_page_unchecked(child_pid).unwrap().refcount(), 2);
+
+        writer.insert_at_lsn(2, v(20), 100).unwrap();
+        assert_eq!(
+            ps.read_page_unchecked(child_pid).unwrap().refcount(),
+            1,
+            "same-LSN child COW must apply -1 after parent COW stamped the child"
+        );
+    }
+
     // -------- warmup_index_pages ---------------------------------------
 
     fn mk_tree_with_pin(pin_pages: u64) -> (TempDir, PagedL2p) {

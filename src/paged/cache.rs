@@ -84,6 +84,8 @@ pub struct PageBuf {
     /// - preserves WAL-replay idempotency (the commit's gen-stamp
     ///   guard skips deltas the crashed prior attempt already landed).
     pending_rc: HashMap<PageId, i32>,
+    rc_delta_lsn: Lsn,
+    rc_delta_ordinal: u32,
 }
 
 impl PageBuf {
@@ -101,6 +103,8 @@ impl PageBuf {
             pages: HashMap::new(),
             clean_count: 0,
             pending_rc: HashMap::new(),
+            rc_delta_lsn: 0,
+            rc_delta_ordinal: 0,
         }
     }
 
@@ -435,6 +439,10 @@ impl PageBuf {
         if self.pending_rc.is_empty() {
             return Ok(());
         }
+        if self.rc_delta_lsn != lsn {
+            self.rc_delta_lsn = lsn;
+            self.rc_delta_ordinal = 0;
+        }
         // Drain into a sorted Vec so commit order is deterministic —
         // reproduces cleanly across WAL replays and makes debugging
         // easier. Sort by pid.
@@ -445,7 +453,11 @@ impl PageBuf {
                 continue;
             }
             self.persist_if_dirty(pid)?;
-            self.page_store.atomic_rc_delta_with_gen(pid, delta, lsn)?;
+            self.rc_delta_ordinal = self.rc_delta_ordinal.checked_add(1).ok_or_else(|| {
+                MetaDbError::Corruption("paged: rc delta ordinal overflow".into())
+            })?;
+            self.page_store
+                .atomic_rc_delta_with_gen(pid, delta, lsn, self.rc_delta_ordinal)?;
             self.pages_remove(pid);
             self.page_cache.invalidate(pid);
         }

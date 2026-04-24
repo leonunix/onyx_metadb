@@ -16,6 +16,8 @@ DEFAULT_OPS_PER_CYCLE="${METADB_SOAK_OPS_PER_CYCLE:-10000}"
 DEFAULT_THREADS="${METADB_SOAK_THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 DEFAULT_FAULT_DENSITY_PCT="${METADB_SOAK_FAULT_DENSITY_PCT:-25}"
 DEFAULT_SEED="${METADB_SOAK_SEED:-1592625758}"
+DEFAULT_WORKLOAD="${METADB_SOAK_WORKLOAD:-onyx}"
+DEFAULT_EVENT_VERBOSITY="${METADB_SOAK_EVENT_VERBOSITY:-summary}"
 DEFAULT_EXTRA_ARGS="${METADB_SOAK_EXTRA_ARGS:-}"
 
 BENCH_DEFAULT_THREADS="${METADB_BENCH_THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
@@ -144,6 +146,29 @@ run_dir_for_start() {
     fi
 }
 
+workload_arg() {
+    case "$1" in
+        legacy) printf '%s\n' "--legacy-mix" ;;
+        onyx) printf '%s\n' "--onyx-mix" ;;
+        concurrent|onyx-concurrent) printf '%s\n' "--onyx-concurrent-mix" ;;
+        *)
+            echo "unknown soak workload: $1 (expected legacy, onyx, concurrent)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+event_verbosity_arg() {
+    case "$1" in
+        summary|quiet) printf '%s\n' "--events-summary" ;;
+        ops|verbose) printf '%s\n' "--events-ops" ;;
+        *)
+            echo "unknown event verbosity: $1 (expected summary or ops)" >&2
+            exit 1
+            ;;
+    esac
+}
+
 stop_process_group() {
     local pid="$1"
     local pgid
@@ -157,7 +182,8 @@ stop_process_group() {
 
 cmd_start() {
     local duration="${1:-$DEFAULT_DURATION}"
-    local duration_secs run_dir qroot qrun_dir qduration qops qthreads qfault qseed qextra cmd
+    local workload="${2:-$DEFAULT_WORKLOAD}"
+    local duration_secs run_dir workload_flag events_flag qroot qrun_dir qduration qops qthreads qfault qseed qextra cmd
 
     if is_running; then
         echo "soak already running (pid $(cat "$PID_FILE"))"
@@ -166,6 +192,8 @@ cmd_start() {
     fi
 
     duration_secs="$(parse_duration_secs "$duration")"
+    workload_flag="$(workload_arg "$workload")"
+    events_flag="$(event_verbosity_arg "$DEFAULT_EVENT_VERBOSITY")"
     run_dir="$(run_dir_for_start)"
     mkdir -p "$run_dir"
     save_run_dir "$run_dir"
@@ -180,7 +208,7 @@ cmd_start() {
     qseed="$(quote_shell_arg "$DEFAULT_SEED")"
     qextra="$DEFAULT_EXTRA_ARGS"
 
-    cmd="cd $qroot && exec target/release/metadb-soak $qrun_dir --duration-secs $qduration --ops-per-cycle $qops --threads $qthreads --fault-density-pct $qfault --seed $qseed"
+    cmd="cd $qroot && exec target/release/metadb-soak $qrun_dir --duration-secs $qduration --ops-per-cycle $qops --threads $qthreads --fault-density-pct $qfault --seed $qseed $workload_flag $events_flag"
     if [[ -n "$qextra" ]]; then
         cmd="$cmd $qextra"
     fi
@@ -198,6 +226,8 @@ cmd_start() {
     echo "  run dir:  $run_dir"
     echo "  log:      $LOG_FILE"
     echo "  duration: $duration ($duration_secs s)"
+    echo "  workload: $workload"
+    echo "  events:   $DEFAULT_EVENT_VERBOSITY"
 }
 
 cmd_stop() {
@@ -215,9 +245,10 @@ cmd_stop() {
 
 cmd_restart() {
     local duration="${1:-$DEFAULT_DURATION}"
+    local workload="${2:-$DEFAULT_WORKLOAD}"
     cmd_stop || true
     sleep 1
-    cmd_start "$duration"
+    cmd_start "$duration" "$workload"
 }
 
 cmd_status() {
@@ -569,9 +600,9 @@ cmd_bench() {
 usage() {
     echo "Usage: $0 {start|stop|restart|status|logs|events|summary|verify|bench} [...]"
     echo ""
-    echo "  start   [duration]  Start soak in background (default: $DEFAULT_DURATION)"
+    echo "  start   [duration] [workload]  Start soak in background (default: $DEFAULT_DURATION $DEFAULT_WORKLOAD)"
     echo "  stop                Stop the running soak"
-    echo "  restart [duration]  Restart the soak"
+    echo "  restart [duration] [workload]  Restart the soak"
     echo "  status              Show pid, run dir, summary path"
     echo "  logs                Tail the soak stdout/stderr log"
     echo "  events              Tail events.jsonl for the current run"
@@ -582,6 +613,7 @@ usage() {
     echo "Examples:"
     echo "  ./dev.sh start"
     echo "  ./dev.sh start 1h"
+    echo "  ./dev.sh start 2h concurrent"
     echo "  ./dev.sh restart 7d"
     echo "  ./dev.sh status"
     echo "  ./dev.sh logs"
@@ -597,6 +629,8 @@ usage() {
     echo "  METADB_SOAK_THREADS=$DEFAULT_THREADS"
     echo "  METADB_SOAK_FAULT_DENSITY_PCT=$DEFAULT_FAULT_DENSITY_PCT"
     echo "  METADB_SOAK_SEED=$DEFAULT_SEED"
+    echo "  METADB_SOAK_WORKLOAD=$DEFAULT_WORKLOAD        # legacy|onyx|concurrent"
+    echo "  METADB_SOAK_EVENT_VERBOSITY=$DEFAULT_EVENT_VERBOSITY  # summary|ops"
     echo "  METADB_SOAK_RUN_DIR=<explicit run dir>"
     echo "  METADB_SOAK_EXTRA_ARGS='<extra metadb-soak args>'"
     echo "  METADB_BENCH_THREADS=$BENCH_DEFAULT_THREADS"
@@ -612,9 +646,9 @@ usage() {
 }
 
 case "${1:-}" in
-    start)   cmd_start "${2:-$DEFAULT_DURATION}" ;;
+    start)   cmd_start "${2:-$DEFAULT_DURATION}" "${3:-$DEFAULT_WORKLOAD}" ;;
     stop)    cmd_stop ;;
-    restart) cmd_restart "${2:-$DEFAULT_DURATION}" ;;
+    restart) cmd_restart "${2:-$DEFAULT_DURATION}" "${3:-$DEFAULT_WORKLOAD}" ;;
     status)  cmd_status ;;
     logs)    cmd_logs ;;
     events)  cmd_events ;;

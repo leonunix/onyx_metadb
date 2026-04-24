@@ -293,6 +293,16 @@ impl Page {
         u64_le(&*self.bytes, OFF_GENERATION)
     }
 
+    /// Current header flags.
+    pub fn flags(&self) -> u32 {
+        u32_le(&*self.bytes, OFF_FLAGS)
+    }
+
+    /// Overwrite header flags. Does not reseal.
+    pub fn set_flags(&mut self, flags: u32) {
+        put_u32_le(&mut *self.bytes, OFF_FLAGS, flags);
+    }
+
     /// Overwrite `generation`. Does not reseal.
     pub fn set_generation(&mut self, lsn: Lsn) {
         put_u64_le(&mut *self.bytes, OFF_GENERATION, lsn);

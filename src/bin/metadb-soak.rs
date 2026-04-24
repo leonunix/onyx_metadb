@@ -79,6 +79,7 @@ struct ParentConfig {
     seed: u64,
     summary_path: PathBuf,
     events_path: PathBuf,
+    event_verbosity: EventVerbosity,
     fault_density_pct: u8,
     workload: Workload,
     restart_interval_secs: Option<u64>,
@@ -89,6 +90,20 @@ enum Workload {
     Legacy,
     Onyx,
     OnyxConcurrent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventVerbosity {
+    Summary,
+    Ops,
+}
+
+fn parse_event_verbosity(raw: &str) -> Result<EventVerbosity, String> {
+    match raw {
+        "summary" => Ok(EventVerbosity::Summary),
+        "ops" => Ok(EventVerbosity::Ops),
+        other => Err(format!("unknown event verbosity `{other}`")),
+    }
 }
 
 fn workload_name(workload: Workload) -> &'static str {
@@ -120,6 +135,7 @@ impl ParentConfig {
         let mut seed = 0x5EED_8A5Eu64;
         let mut summary_path = None;
         let mut events_path = None;
+        let mut event_verbosity = EventVerbosity::Summary;
         let mut fault_density_pct = 0u8;
         let mut workload = Workload::Onyx;
         let mut restart_interval_secs = None;
@@ -166,6 +182,15 @@ impl ParentConfig {
                             .ok_or_else(|| "--events needs a path".to_string())?,
                     ));
                 }
+                "--event-verbosity" => {
+                    event_verbosity = parse_event_verbosity(
+                        &args
+                            .next()
+                            .ok_or_else(|| "--event-verbosity needs a value".to_string())?,
+                    )?;
+                }
+                "--events-summary" => event_verbosity = EventVerbosity::Summary,
+                "--events-ops" => event_verbosity = EventVerbosity::Ops,
                 "--fault-density-pct" => {
                     let value = parse_u64(args.next(), "--fault-density-pct")?;
                     if value > 100 {
@@ -193,6 +218,7 @@ impl ParentConfig {
         Ok(Self {
             summary_path: summary_path.unwrap_or_else(|| path.join("summary.json")),
             events_path: events_path.unwrap_or_else(|| path.join("events.jsonl")),
+            event_verbosity,
             path,
             duration_secs,
             ops_per_cycle: ops_per_cycle.max(1),
@@ -615,16 +641,18 @@ fn run_cycle(
                     .remove(&id)
                     .ok_or_else(|| format!("unknown onyx ack id {id}"))?;
                 apply_onyx_ack(onyx_model, onyx_stats, &op, Some(&detail))?;
-                events.write(
-                    "onyx_ack",
-                    &format!(
-                        "cycle={cycle} id={id} kind={} vol={} slot={} detail={}",
-                        worker_kind_name(&op.kind),
-                        op.vol_ord,
-                        op.slot,
-                        escape_json(&detail)
-                    ),
-                )?;
+                if cfg.event_verbosity == EventVerbosity::Ops {
+                    events.write(
+                        "onyx_ack",
+                        &format!(
+                            "cycle={cycle} id={id} kind={} vol={} slot={} detail={}",
+                            worker_kind_name(&op.kind),
+                            op.vol_ord,
+                            op.slot,
+                            escape_json(&detail)
+                        ),
+                    )?;
+                }
                 *total_ops += 1;
                 free_tids.push_back(op.tid);
             }
@@ -678,6 +706,21 @@ fn run_cycle(
             other => return Err(format!("unexpected pba-audit ack: {other:?}")),
         }
         next_id += 1;
+    }
+
+    if matches!(cfg.workload, Workload::Onyx | Workload::OnyxConcurrent) {
+        events.write(
+            "onyx_cycle",
+            &format!(
+                "cycle={} ops={} guard_hit={} guard_miss={} freed_pbas={} cleanup_deleted={}",
+                cycle,
+                sent_ops,
+                onyx_stats.guard_hit,
+                onyx_stats.guard_miss,
+                onyx_stats.freed_pbas,
+                onyx_stats.cleanup_deleted,
+            ),
+        )?;
     }
 
     // Phase 3: flush + per-volume snapshot on a random live vol.
@@ -1211,24 +1254,74 @@ fn db_refcount_sum(db: &Db) -> onyx_metadb::Result<u64> {
 }
 
 fn audit_pba_refcounts(db: &Db) -> onyx_metadb::Result<()> {
-    let mut expected: BTreeMap<Pba, u32> = BTreeMap::new();
+    let mut versions: BTreeMap<(VolumeOrdinal, u64), BTreeSet<[u8; 28]>> = BTreeMap::new();
+    let mut evidence: BTreeMap<Pba, Vec<String>> = BTreeMap::new();
     for vol in db.volumes() {
         for item in db.range(vol, ..)? {
-            let (_, value) = item?;
-            *expected.entry(value.head_pba()).or_insert(0) += 1;
+            let (lba, value) = item?;
+            if versions.entry((vol, lba)).or_default().insert(value.0) {
+                evidence
+                    .entry(value.head_pba())
+                    .or_default()
+                    .push(format!("live vol={vol} lba={lba}"));
+            }
         }
     }
-    // PBA refcount is the live block-map reference count. Snapshots are
-    // represented by page-tree rc and compensated on drop via pba_decrefs;
-    // they do not immediately add one PBA ref per snapshot-visible LBA.
+    for snapshot in db.snapshots() {
+        let Some(view) = db.snapshot_view(snapshot.id) else {
+            return Err(onyx_metadb::MetaDbError::Corruption(format!(
+                "snapshot {} disappeared during audit",
+                snapshot.id
+            )));
+        };
+        for item in view.range(..)? {
+            let (lba, value) = item?;
+            if versions
+                .entry((snapshot.vol_ord, lba))
+                .or_default()
+                .insert(value.0)
+            {
+                evidence.entry(value.head_pba()).or_default().push(format!(
+                    "snapshot={} vol={} lba={lba}",
+                    snapshot.id, snapshot.vol_ord
+                ));
+            }
+        }
+    }
+
+    let mut expected: BTreeMap<Pba, u32> = BTreeMap::new();
+    for values in versions.values() {
+        for value in values {
+            *expected.entry(L2pValue(*value).head_pba()).or_insert(0) += 1;
+        }
+    }
     let actual: BTreeMap<Pba, u32> = db
         .iter_refcounts()?
         .collect::<onyx_metadb::Result<Vec<_>>>()?
         .into_iter()
         .collect();
     if actual != expected {
+        let mut diff = Vec::new();
+        let mut keys: BTreeSet<Pba> = actual.keys().copied().collect();
+        keys.extend(expected.keys().copied());
+        for pba in keys {
+            let actual_rc = actual.get(&pba).copied().unwrap_or(0);
+            let expected_rc = expected.get(&pba).copied().unwrap_or(0);
+            if actual_rc != expected_rc {
+                let why = evidence
+                    .get(&pba)
+                    .map(|items| items.join("; "))
+                    .unwrap_or_else(|| "<no live/snapshot witness>".into());
+                diff.push(format!(
+                    "pba={pba} actual={actual_rc} expected={expected_rc} witnesses=[{why}]"
+                ));
+                if diff.len() >= 8 {
+                    break;
+                }
+            }
+        }
         return Err(onyx_metadb::MetaDbError::Corruption(format!(
-            "PBA refcount audit mismatch: actual={actual:?} expected={expected:?}"
+            "PBA refcount audit mismatch: actual={actual:?} expected={expected:?} diffs={diff:?}"
         )));
     }
     Ok(())
@@ -1910,7 +2003,7 @@ fn write_summary(path: &Path, summary: &Summary) -> std::io::Result<()> {
 
 fn print_parent_usage() {
     eprintln!(
-        "usage: metadb-soak <path> [--duration-secs N|--minutes N|--hours N] [--restart-interval 2h] [--legacy-mix|--onyx-mix] [--ops-per-cycle N] [--threads N] [--seed N] [--fault-density-pct N] [--summary path] [--events path]"
+        "usage: metadb-soak <path> [--duration-secs N|--minutes N|--hours N] [--restart-interval 2h] [--legacy-mix|--onyx-mix|--onyx-concurrent-mix] [--ops-per-cycle N] [--threads N] [--seed N] [--fault-density-pct N] [--summary path] [--events path] [--events-summary|--events-ops]"
     );
 }
 
