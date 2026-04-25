@@ -16,6 +16,7 @@ use std::sync::Arc;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::btree::format::RcEntry;
 use crate::btree::BTree;
 use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
@@ -987,27 +988,11 @@ impl Db {
             for idx in indices {
                 let outcome = match &ops[idx] {
                     WalOp::Incref { pba, delta } => {
-                        let current = tree.get(*pba)?.unwrap_or(0);
-                        let new = current.checked_add(*delta).ok_or_else(|| {
-                            MetaDbError::InvalidArgument(format!("refcount overflow for pba {pba}"))
-                        })?;
-                        if new != 0 {
-                            tree.insert(*pba, new)?;
-                        }
+                        let new = refcount_apply_delta(&mut tree, *pba, i64::from(*delta), lsn)?;
                         ApplyOutcome::RefcountNew(new)
                     }
                     WalOp::Decref { pba, delta } => {
-                        let current = tree.get(*pba)?.unwrap_or(0);
-                        let new = current.checked_sub(*delta).ok_or_else(|| {
-                            MetaDbError::InvalidArgument(format!(
-                                "decref underflow for pba {pba}: {current} - {delta}",
-                            ))
-                        })?;
-                        if new == 0 {
-                            tree.delete(*pba)?;
-                        } else {
-                            tree.insert(*pba, new)?;
-                        }
+                        let new = refcount_apply_delta(&mut tree, *pba, -i64::from(*delta), lsn)?;
                         ApplyOutcome::RefcountNew(new)
                     }
                     other => {
@@ -1058,7 +1043,7 @@ impl Db {
     pub fn get_refcount(&self, pba: Pba) -> Result<u32> {
         let sid = self.refcount_shard_for(pba);
         let mut tree = self.refcount_shards[sid].tree.lock();
-        Ok(tree.get(pba)?.unwrap_or(0))
+        Ok(tree.get(pba)?.map(|e| e.rc).unwrap_or(0))
     }
 
     /// Batched refcount lookup. Groups `pbas` by shard, locks each shard
@@ -1081,7 +1066,7 @@ impl Db {
             }
             let mut tree = self.refcount_shards[sid].tree.lock();
             for idx in idxs {
-                out[idx] = tree.get(pbas[idx])?.unwrap_or(0);
+                out[idx] = tree.get(pbas[idx])?.map(|e| e.rc).unwrap_or(0);
             }
         }
         Ok(out)
@@ -1284,7 +1269,8 @@ impl Db {
         for shard in &self.refcount_shards {
             let mut tree = shard.tree.lock();
             for rec in tree.iter_stream()? {
-                all.push(rec?);
+                let (pba, entry) = rec?;
+                all.push((pba, entry.rc));
             }
         }
         all.sort_unstable_by_key(|(pba, _)| *pba);
@@ -1767,7 +1753,10 @@ impl Db {
         for (_lba, value) in raw_pba_decrefs {
             let pba = value.head_pba();
             let sid = shard_for_key(&self.refcount_shards, pba);
-            let rc = refcount_guards[sid].get(pba)?.unwrap_or(0);
+            let rc = refcount_guards[sid]
+                .get(pba)?
+                .map(|e| e.rc)
+                .unwrap_or(0);
             let taken = pending.entry(pba).or_insert(0);
             if *taken < rc {
                 *taken += 1;
@@ -3019,29 +3008,13 @@ fn apply_op_bare(
         WalOp::Incref { pba, delta } => {
             let sid = shard_for_key(refcount_shards, *pba);
             let mut tree = refcount_shards[sid].tree.lock();
-            let current = tree.get(*pba)?.unwrap_or(0);
-            let new = current.checked_add(*delta).ok_or_else(|| {
-                MetaDbError::InvalidArgument(format!("refcount overflow for pba {pba}"))
-            })?;
-            if new != 0 {
-                tree.insert(*pba, new)?;
-            }
+            let new = refcount_apply_delta(&mut tree, *pba, i64::from(*delta), lsn)?;
             Ok(ApplyOutcome::RefcountNew(new))
         }
         WalOp::Decref { pba, delta } => {
             let sid = shard_for_key(refcount_shards, *pba);
             let mut tree = refcount_shards[sid].tree.lock();
-            let current = tree.get(*pba)?.unwrap_or(0);
-            let new = current.checked_sub(*delta).ok_or_else(|| {
-                MetaDbError::InvalidArgument(format!(
-                    "decref underflow for pba {pba}: {current} - {delta}",
-                ))
-            })?;
-            if new == 0 {
-                tree.delete(*pba)?;
-            } else {
-                tree.insert(*pba, new)?;
-            }
+            let new = refcount_apply_delta(&mut tree, *pba, -i64::from(*delta), lsn)?;
             Ok(ApplyOutcome::RefcountNew(new))
         }
         WalOp::L2pRemap {
@@ -3143,7 +3116,7 @@ fn apply_l2p_remap(
         let gp_sid = shard_for_key(refcount_shards, gp);
         let cur = {
             let mut rc_tree = refcount_shards[gp_sid].tree.lock();
-            rc_tree.get(gp)?.unwrap_or(0)
+            rc_tree.get(gp)?.map(|e| e.rc).unwrap_or(0)
         };
         if cur < min_rc {
             return Ok(ApplyOutcome::L2pRemap {
@@ -3188,29 +3161,10 @@ fn apply_l2p_remap(
     let mut freed_pba: Option<Pba> = None;
     for (sid, pba, delta) in touched {
         let mut rc_tree = refcount_shards[sid].tree.lock();
-        if delta < 0 {
-            let cur = rc_tree.get(pba)?.unwrap_or(0);
-            let amount = (-delta) as u32;
-            let new = cur.checked_sub(amount).ok_or_else(|| {
-                MetaDbError::InvalidArgument(format!(
-                    "L2pRemap decref underflow for pba {pba}: {cur} - {amount}",
-                ))
-            })?;
-            if new == 0 {
-                rc_tree.delete(pba)?;
-                if cur > 0 {
-                    freed_pba = Some(pba);
-                }
-            } else {
-                rc_tree.insert(pba, new)?;
-            }
-        } else {
-            let cur = rc_tree.get(pba)?.unwrap_or(0);
-            let amount = delta as u32;
-            let new = cur.checked_add(amount).ok_or_else(|| {
-                MetaDbError::InvalidArgument(format!("L2pRemap incref overflow for pba {pba}"))
-            })?;
-            rc_tree.insert(pba, new)?;
+        let pre = rc_tree.get(pba)?.map(|e| e.rc).unwrap_or(0);
+        let new = refcount_apply_delta(&mut rc_tree, pba, i64::from(delta), lsn)?;
+        if new == 0 && pre > 0 {
+            freed_pba = Some(pba);
         }
     }
 
@@ -3325,19 +3279,10 @@ fn apply_l2p_range_delete(
         let mut rc_tree = refcount_shards[sid].tree.lock();
         for &idx in indices {
             let (_, pba) = captured[idx];
-            let cur = rc_tree.get(pba)?.unwrap_or(0);
-            let new = cur.checked_sub(1).ok_or_else(|| {
-                MetaDbError::InvalidArgument(format!(
-                    "L2pRangeDelete decref underflow for pba {pba}: {cur} - 1",
-                ))
-            })?;
-            if new == 0 {
-                rc_tree.delete(pba)?;
-                if cur > 0 {
-                    freed_pbas.push(pba);
-                }
-            } else {
-                rc_tree.insert(pba, new)?;
+            let pre = rc_tree.get(pba)?.map(|e| e.rc).unwrap_or(0);
+            let new = refcount_apply_delta(&mut rc_tree, pba, -1, lsn)?;
+            if new == 0 && pre > 0 {
+                freed_pbas.push(pba);
             }
         }
     }
@@ -3594,19 +3539,10 @@ fn apply_drop_snapshot_pages_and_decrefs(
         let mut rc_tree = refcount_shards[sid].tree.lock();
         for &idx in indices {
             let pba = pba_decrefs[idx];
-            let cur = rc_tree.get(pba)?.unwrap_or(0);
-            let new = cur.checked_sub(1).ok_or_else(|| {
-                MetaDbError::InvalidArgument(format!(
-                    "DropSnapshot decref underflow for pba {pba}: {cur} - 1",
-                ))
-            })?;
-            if new == 0 {
-                rc_tree.delete(pba)?;
-                if cur > 0 {
-                    freed_pbas.push(pba);
-                }
-            } else {
-                rc_tree.insert(pba, new)?;
+            let pre = rc_tree.get(pba)?.map(|e| e.rc).unwrap_or(0);
+            let new = refcount_apply_delta(&mut rc_tree, pba, -1, lsn)?;
+            if new == 0 && pre > 0 {
+                freed_pbas.push(pba);
             }
         }
     }
@@ -3620,6 +3556,55 @@ fn apply_drop_snapshot_pages_and_decrefs(
 
 fn shard_for_key(shards: &[Shard], key: u64) -> usize {
     (xxh3_64(&key.to_be_bytes()) as usize) % shards.len()
+}
+
+/// Apply a signed delta to `pba`'s refcount under the caller-held shard
+/// mutex. `lsn` stamps `birth_lsn` on a 0→1 transition; existing entries
+/// preserve their birth_lsn across rc changes. Returns the new rc.
+///
+/// The 0→1 birth_lsn stamp is what powers the birth/death LSN
+/// suppression in [`apply_l2p_remap`]: a pba's birth_lsn equals the lsn
+/// of the op that revived it from rc=0, so concurrent snapshots whose
+/// `created_lsn >= birth_lsn` can be ruled out as having pinned this
+/// pba's content.
+fn refcount_apply_delta(tree: &mut BTree, pba: Pba, delta: i64, lsn: Lsn) -> Result<u32> {
+    let cur = tree.get(pba)?.unwrap_or(RcEntry::ZERO);
+    let new_rc: u32 = if delta >= 0 {
+        let amount = u32::try_from(delta).map_err(|_| {
+            MetaDbError::InvalidArgument(format!("refcount delta {delta} exceeds u32"))
+        })?;
+        cur.rc.checked_add(amount).ok_or_else(|| {
+            MetaDbError::InvalidArgument(format!(
+                "refcount overflow for pba {pba}: {} + {amount}",
+                cur.rc,
+            ))
+        })?
+    } else {
+        let amount = u32::try_from(-delta).map_err(|_| {
+            MetaDbError::InvalidArgument(format!("refcount delta {delta} exceeds u32"))
+        })?;
+        cur.rc.checked_sub(amount).ok_or_else(|| {
+            MetaDbError::InvalidArgument(format!(
+                "refcount decref underflow for pba {pba}: {} - {amount}",
+                cur.rc,
+            ))
+        })?
+    };
+    if new_rc == 0 {
+        if cur.rc > 0 {
+            tree.delete(pba)?;
+        }
+    } else {
+        let birth_lsn = if cur.rc == 0 { lsn } else { cur.birth_lsn };
+        tree.insert(
+            pba,
+            RcEntry {
+                rc: new_rc,
+                birth_lsn,
+            },
+        )?;
+    }
+    Ok(new_rc)
 }
 
 fn shard_for_key_l2p(shards: &[L2pShard], key: u64) -> usize {

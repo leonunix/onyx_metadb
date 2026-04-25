@@ -1,10 +1,10 @@
 //! Refcount B+tree: single-writer, in-place, no snapshots.
 //!
-//! Phase 6.5b narrowed the B+tree to its one remaining role — PBA
-//! refcount (`u64 pba → u32 count`). Snapshots are an L2P concept, and
-//! L2P now lives in [`crate::paged`], so this tree does not need COW,
-//! per-page refcounts, or `drop_subtree`. Writes mutate pages in place;
-//! splits and merges run the standard B+tree way.
+//! Keys are pbas; values are [`RcEntry`] (rc + birth_lsn). Snapshots
+//! are an L2P concept, and L2P now lives in [`crate::paged`], so this
+//! tree does not need COW, per-page refcounts, or `drop_subtree`.
+//! Writes mutate pages in place; splits and merges run the standard
+//! B+tree way.
 //!
 //! Concurrency: `BTree` is `!Sync` in practice — its `PageBuf` is
 //! `&mut self` only. `Db` wraps one per shard in a `Mutex`.
@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use crate::btree::cache::PageBuf;
 use crate::btree::format::{
-    LEAF_ENTRY_SIZE, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, internal_child_at, internal_insert,
-    internal_key_at, internal_key_count, internal_pop_front, internal_push_front, internal_remove,
-    internal_search, internal_set_child, internal_set_first_child, internal_set_key_at,
-    leaf_insert, leaf_key_at, leaf_key_count, leaf_remove, leaf_search, leaf_set_entry,
-    leaf_value_at,
+    LEAF_ENTRY_SIZE, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, RcEntry, internal_child_at,
+    internal_insert, internal_key_at, internal_key_count, internal_pop_front, internal_push_front,
+    internal_remove, internal_search, internal_set_child, internal_set_first_child,
+    internal_set_key_at, leaf_insert, leaf_key_at, leaf_key_count, leaf_remove, leaf_search,
+    leaf_set_entry, leaf_value_at,
 };
 use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::{MetaDbError, Result};
@@ -192,7 +192,7 @@ impl BTree {
     // -------- read path --------------------------------------------------
 
     /// Point lookup. `None` if `key` is not present.
-    pub fn get(&mut self, key: u64) -> Result<Option<u32>> {
+    pub fn get(&mut self, key: u64) -> Result<Option<RcEntry>> {
         let result = (|| {
             let mut current = self.root;
             loop {
@@ -226,7 +226,7 @@ impl BTree {
     pub fn range<R: RangeBounds<u64>>(&mut self, range: R) -> Result<RangeIter> {
         let lo = bound_lower(range.start_bound());
         let hi = bound_upper(range.end_bound());
-        let mut items: Vec<(u64, u32)> = Vec::new();
+        let mut items: Vec<(u64, RcEntry)> = Vec::new();
         self.collect_range(self.root, lo, hi, &mut items)?;
         self.finish_op(Ok(RangeIter {
             inner: items.into_iter(),
@@ -246,7 +246,7 @@ impl BTree {
         pid: PageId,
         lo: Bound<u64>,
         hi: Bound<u64>,
-        out: &mut Vec<(u64, u32)>,
+        out: &mut Vec<(u64, RcEntry)>,
     ) -> Result<()> {
         let page_type = self.buf.read(pid)?.header()?.page_type;
         match page_type {
@@ -303,7 +303,7 @@ impl BTree {
 
     /// Insert or overwrite `(key, value)`. Returns the previous value
     /// if the key was already present.
-    pub fn insert(&mut self, key: u64, value: u32) -> Result<Option<u32>> {
+    pub fn insert(&mut self, key: u64, value: RcEntry) -> Result<Option<RcEntry>> {
         let generation = self.advance_gen();
         // Walk down from root, recording the path for upward split.
         let mut path: Vec<(PageId, usize, PageId)> = Vec::new();
@@ -354,7 +354,7 @@ impl BTree {
         leaf: PageId,
         insert_pos: usize,
         key: u64,
-        value: u32,
+        value: RcEntry,
         generation: Lsn,
         path: &mut Vec<(PageId, usize)>,
     ) -> Result<()> {
@@ -510,7 +510,7 @@ impl BTree {
     // -------- delete -----------------------------------------------------
 
     /// Remove `key`. Returns the previous value if it was present.
-    pub fn delete(&mut self, key: u64) -> Result<Option<u32>> {
+    pub fn delete(&mut self, key: u64) -> Result<Option<RcEntry>> {
         let generation = self.advance_gen();
         // Walk down to the leaf, recording the path.
         let mut path: Vec<(PageId, usize, PageId)> = Vec::new();
@@ -831,11 +831,11 @@ impl BTree {
 /// collected eagerly; the caller can call `.collect()` without
 /// worrying about partial iteration.
 pub struct RangeIter {
-    inner: std::vec::IntoIter<(u64, u32)>,
+    inner: std::vec::IntoIter<(u64, RcEntry)>,
 }
 
 impl Iterator for RangeIter {
-    type Item = Result<(u64, u32)>;
+    type Item = Result<(u64, RcEntry)>;
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(Ok)
     }
@@ -901,26 +901,30 @@ mod tests {
         (dir, tree)
     }
 
+    fn rc(rc: u32) -> RcEntry {
+        RcEntry { rc, birth_lsn: 1 }
+    }
+
     #[test]
     fn insert_then_get() {
         let (_d, mut t) = mk_tree();
-        assert_eq!(t.insert(42, 100).unwrap(), None);
-        assert_eq!(t.get(42).unwrap(), Some(100));
+        assert_eq!(t.insert(42, rc(100)).unwrap(), None);
+        assert_eq!(t.get(42).unwrap(), Some(rc(100)));
     }
 
     #[test]
     fn overwrite_returns_old_value() {
         let (_d, mut t) = mk_tree();
-        t.insert(1, 10).unwrap();
-        assert_eq!(t.insert(1, 20).unwrap(), Some(10));
-        assert_eq!(t.get(1).unwrap(), Some(20));
+        t.insert(1, rc(10)).unwrap();
+        assert_eq!(t.insert(1, rc(20)).unwrap(), Some(rc(10)));
+        assert_eq!(t.get(1).unwrap(), Some(rc(20)));
     }
 
     #[test]
     fn delete_returns_value_and_removes() {
         let (_d, mut t) = mk_tree();
-        t.insert(7, 77).unwrap();
-        assert_eq!(t.delete(7).unwrap(), Some(77));
+        t.insert(7, rc(77)).unwrap();
+        assert_eq!(t.delete(7).unwrap(), Some(rc(77)));
         assert_eq!(t.get(7).unwrap(), None);
         assert_eq!(t.delete(7).unwrap(), None);
     }
@@ -928,12 +932,12 @@ mod tests {
     #[test]
     fn many_inserts_cause_splits() {
         let (_d, mut t) = mk_tree();
-        // Enough to overflow one leaf (MAX_LEAF_ENTRIES = 336).
+        // Enough to overflow one leaf (MAX_LEAF_ENTRIES = 201).
         for i in 0..1_000u64 {
-            t.insert(i, i as u32 + 1).unwrap();
+            t.insert(i, rc(i as u32 + 1)).unwrap();
         }
         for i in 0..1_000u64 {
-            assert_eq!(t.get(i).unwrap(), Some(i as u32 + 1));
+            assert_eq!(t.get(i).unwrap(), Some(rc(i as u32 + 1)));
         }
     }
 
@@ -941,7 +945,7 @@ mod tests {
     fn many_deletes_cause_merges_without_losing_keys() {
         let (_d, mut t) = mk_tree();
         for i in 0..1_000u64 {
-            t.insert(i, 1).unwrap();
+            t.insert(i, rc(1)).unwrap();
         }
         // Delete half.
         for i in 0..1_000u64 {
@@ -950,7 +954,7 @@ mod tests {
             }
         }
         for i in 0..1_000u64 {
-            let expect = if i % 2 == 0 { None } else { Some(1u32) };
+            let expect = if i % 2 == 0 { None } else { Some(rc(1)) };
             assert_eq!(t.get(i).unwrap(), expect, "key {i}");
         }
     }
@@ -959,10 +963,10 @@ mod tests {
     fn range_returns_sorted_hits() {
         let (_d, mut t) = mk_tree();
         for i in 0..100u64 {
-            t.insert(i, i as u32).unwrap();
+            t.insert(i, rc(i as u32)).unwrap();
         }
-        let got: Vec<(u64, u32)> = t.range(10..=20).unwrap().map(|r| r.unwrap()).collect();
-        let expected: Vec<(u64, u32)> = (10..=20).map(|i| (i, i as u32)).collect();
+        let got: Vec<(u64, RcEntry)> = t.range(10..=20).unwrap().map(|r| r.unwrap()).collect();
+        let expected: Vec<(u64, RcEntry)> = (10..=20).map(|i| (i, rc(i as u32))).collect();
         assert_eq!(got, expected);
     }
 
@@ -973,21 +977,21 @@ mod tests {
         let root;
         {
             let mut t = BTree::create(ps.clone()).unwrap();
-            t.insert(100, 500).unwrap();
-            t.insert(200, 600).unwrap();
+            t.insert(100, rc(500)).unwrap();
+            t.insert(200, rc(600)).unwrap();
             t.flush().unwrap();
             root = t.root();
         }
         let mut t = BTree::open(ps, root, 100).unwrap();
-        assert_eq!(t.get(100).unwrap(), Some(500));
-        assert_eq!(t.get(200).unwrap(), Some(600));
+        assert_eq!(t.get(100).unwrap(), Some(rc(500)));
+        assert_eq!(t.get(200).unwrap(), Some(rc(600)));
     }
 
     #[test]
     fn flush_and_reads_do_not_leave_private_clean_pages_resident() {
         let (_d, mut t) = mk_tree();
         for i in 0..2048u64 {
-            t.insert(i, i as u32).unwrap();
+            t.insert(i, rc(i as u32)).unwrap();
         }
         assert!(t.cached_pages_for_test() > 0);
         t.flush().unwrap();
@@ -1004,10 +1008,10 @@ mod tests {
         let (_d, mut t) = mk_tree();
         let keys: Vec<u64> = (0..512u64).map(|i| i * 13).collect();
         for k in &keys {
-            t.insert(*k, *k as u32).unwrap();
+            t.insert(*k, rc(*k as u32)).unwrap();
         }
-        let got: Vec<(u64, u32)> = t.iter_stream().unwrap().map(|r| r.unwrap()).collect();
-        let mut expected: Vec<(u64, u32)> = keys.iter().map(|k| (*k, *k as u32)).collect();
+        let got: Vec<(u64, RcEntry)> = t.iter_stream().unwrap().map(|r| r.unwrap()).collect();
+        let mut expected: Vec<(u64, RcEntry)> = keys.iter().map(|k| (*k, rc(*k as u32))).collect();
         expected.sort_unstable_by_key(|(k, _)| *k);
         assert_eq!(got, expected);
     }
@@ -1016,7 +1020,7 @@ mod tests {
     fn iter_stream_matches_full_range() {
         let (_d, mut t) = mk_tree();
         for i in 0..128u64 {
-            t.insert(i * 7, i as u32).unwrap();
+            t.insert(i * 7, rc(i as u32)).unwrap();
         }
         let via_range: Vec<_> = t.range(..).unwrap().map(|r| r.unwrap()).collect();
         let via_iter: Vec<_> = t.iter_stream().unwrap().map(|r| r.unwrap()).collect();

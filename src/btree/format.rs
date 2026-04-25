@@ -1,24 +1,22 @@
 //! Refcount B+tree page formats: leaf + internal.
 //!
-//! Phase 6.5b specialized the tree to its only remaining use — PBA
-//! refcount — so the value type is `u32` (big-endian) instead of the
-//! 28 B opaque blob it carried when the tree also served as the L2P
-//! index. That gives leaves 3× the branching factor (336 entries vs
-//! 112), keeps the internal-node layout unchanged, and cuts refcount
-//! on-disk size roughly in half. L2P is now served by
-//! [`crate::paged::PagedL2p`].
+//! Value type is [`RcEntry`] = `(rc: u32, birth_lsn: u64)` = 12 B. The
+//! `birth_lsn` lets [`crate::db::apply_l2p_remap`] decide whether a
+//! still-live snapshot might pin the pba (birth/death LSN suppression,
+//! replacing the legacy "leaf-rc-suppress" rule). L2P lives in
+//! [`crate::paged::PagedL2p`] and never touches this tree.
 //!
 //! # Leaf layout (within the 4032 B payload)
 //!
 //! ```text
-//! entry 0:   [key:8B][value:4B]
-//! entry 1:   [key:8B][value:4B]
+//! entry 0:   [key:8B][rc:4B][birth_lsn:8B]
+//! entry 1:   [key:8B][rc:4B][birth_lsn:8B]
 //! ...
-//! entry N-1: [key:8B][value:4B]
+//! entry N-1: [key:8B][rc:4B][birth_lsn:8B]
 //! ```
 //!
-//! Each entry is 12 B; the payload fits exactly
-//! [`MAX_LEAF_ENTRIES`] = 336 entries with zero waste.
+//! Each entry is 20 B; the payload fits [`MAX_LEAF_ENTRIES`] = 201
+//! entries with 12 B slack at the tail.
 //!
 //! Keys are stored big-endian so a byte-wise `memcmp` over raw payload
 //! bytes would still match numeric order — useful for the verifier
@@ -67,15 +65,50 @@ use crate::types::{Lsn, PageId};
 /// Size of a key on disk (u64 PBA stored big-endian).
 pub const L2P_KEY_SIZE: usize = 8;
 
-/// Size of the leaf value on disk. A 4-byte big-endian `u32` refcount.
-pub const L2P_VALUE_SIZE: usize = 4;
+/// Size of the leaf value on disk. 4-byte big-endian `u32` refcount
+/// followed by 8-byte big-endian `Lsn` birth_lsn — see [`RcEntry`].
+pub const L2P_VALUE_SIZE: usize = 12;
+
+/// Byte offset of the rc field inside a leaf value.
+const RC_OFFSET: usize = 0;
+/// Byte offset of the birth_lsn field inside a leaf value.
+const BIRTH_LSN_OFFSET: usize = 4;
 
 /// Bytes per leaf entry (key + value).
 pub const LEAF_ENTRY_SIZE: usize = L2P_KEY_SIZE + L2P_VALUE_SIZE;
 
-/// Maximum entries that fit in one leaf page. Exactly 336 at 4 KiB
-/// page size with a 64 B header and 12 B entries (zero waste).
+/// Maximum entries that fit in one leaf page. 201 at 4 KiB page size
+/// with a 64 B header and 20 B entries (12 B slack at tail).
 pub const MAX_LEAF_ENTRIES: usize = PAGE_PAYLOAD_SIZE / LEAF_ENTRY_SIZE;
+
+/// Value stored at each refcount-tree leaf slot.
+///
+/// `rc` is the running tally of distinct (vol, lba, value) tuples that
+/// reference this pba (audit semantics). `birth_lsn` is the LSN at which
+/// the entry transitioned from rc=0 to rc=1 — i.e. when the current
+/// content of this pba was first incref'd. Birth/death LSN suppression
+/// in [`crate::db::apply_l2p_remap`] uses this to decide whether a
+/// concurrent snapshot might still pin the pba.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RcEntry {
+    pub rc: u32,
+    pub birth_lsn: Lsn,
+}
+
+impl RcEntry {
+    /// Sentinel for "no entry": rc=0, birth_lsn=0. Returned by callers
+    /// that fold a missing-key lookup into the same arithmetic path.
+    pub const ZERO: Self = Self {
+        rc: 0,
+        birth_lsn: 0,
+    };
+}
+
+impl std::fmt::Display for RcEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(rc={}, birth_lsn={})", self.rc, self.birth_lsn)
+    }
+}
 
 /// Maximum separator keys per internal page. 4032 B payload fits 251
 /// keys and 252 children (16 B per (key, child) pair plus 8 B for
@@ -95,9 +128,9 @@ const CHILDREN_REGION_OFFSET: usize = KEYS_REGION_SIZE;
 
 const _: () = {
     assert!(PAGE_PAYLOAD_SIZE == 4032);
-    assert!(LEAF_ENTRY_SIZE == 12);
-    assert!(MAX_LEAF_ENTRIES == 336);
-    assert!(LEAF_ENTRY_SIZE * MAX_LEAF_ENTRIES == PAGE_PAYLOAD_SIZE);
+    assert!(LEAF_ENTRY_SIZE == 20);
+    assert!(MAX_LEAF_ENTRIES == 201);
+    assert!(LEAF_ENTRY_SIZE * MAX_LEAF_ENTRIES <= PAGE_PAYLOAD_SIZE);
     assert!(MAX_INTERNAL_KEYS == 251);
     assert!(MAX_INTERNAL_CHILDREN == 252);
     assert!(MAX_INTERNAL_KEYS * 8 + MAX_INTERNAL_CHILDREN * 8 <= PAGE_PAYLOAD_SIZE);
@@ -129,24 +162,34 @@ pub fn leaf_key_at(page: &Page, i: usize) -> u64 {
     u64::from_be_bytes(p[off..off + L2P_KEY_SIZE].try_into().unwrap())
 }
 
-/// Value at leaf index `i`. Stored big-endian so a byte-wise memcmp
-/// over the payload mirrors numeric order (useful for the verifier).
-pub fn leaf_value_at(page: &Page, i: usize) -> u32 {
+/// Value at leaf index `i`. Each field stored big-endian so a byte-wise
+/// memcmp over the value bytes mirrors numeric order on the rc field
+/// (useful for the verifier).
+pub fn leaf_value_at(page: &Page, i: usize) -> RcEntry {
     debug_assert!(i < leaf_key_count(page), "leaf_value_at: out of range");
     let off = i * LEAF_ENTRY_SIZE + L2P_KEY_SIZE;
     let p = page.payload();
-    u32::from_be_bytes(p[off..off + L2P_VALUE_SIZE].try_into().unwrap())
+    let rc = u32::from_be_bytes(p[off + RC_OFFSET..off + RC_OFFSET + 4].try_into().unwrap());
+    let birth_lsn = u64::from_be_bytes(
+        p[off + BIRTH_LSN_OFFSET..off + BIRTH_LSN_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    RcEntry { rc, birth_lsn }
 }
 
 /// Overwrite the entry at index `i` without checking or bumping
 /// `key_count`. Use [`leaf_insert`] if you want shifting plus count
 /// bump; use this for in-place value updates on an existing key.
-pub fn leaf_set_entry(page: &mut Page, i: usize, key: u64, value: u32) {
+pub fn leaf_set_entry(page: &mut Page, i: usize, key: u64, value: RcEntry) {
     debug_assert!(i < MAX_LEAF_ENTRIES, "leaf_set_entry: index over capacity");
     let off = i * LEAF_ENTRY_SIZE;
     let p = page.payload_mut();
     p[off..off + L2P_KEY_SIZE].copy_from_slice(&key.to_be_bytes());
-    p[off + L2P_KEY_SIZE..off + LEAF_ENTRY_SIZE].copy_from_slice(&value.to_be_bytes());
+    let v_off = off + L2P_KEY_SIZE;
+    p[v_off + RC_OFFSET..v_off + RC_OFFSET + 4].copy_from_slice(&value.rc.to_be_bytes());
+    p[v_off + BIRTH_LSN_OFFSET..v_off + BIRTH_LSN_OFFSET + 8]
+        .copy_from_slice(&value.birth_lsn.to_be_bytes());
 }
 
 /// Binary search for `key` in the leaf. Returns `Ok(i)` on a hit,
@@ -171,7 +214,7 @@ pub fn leaf_search(page: &Page, key: u64) -> std::result::Result<usize, usize> {
 /// `pos..count` one slot to the right. Bumps `key_count` by one.
 /// Returns [`MetaDbError::InvalidArgument`] if the leaf is full or
 /// `pos > count`.
-pub fn leaf_insert(page: &mut Page, pos: usize, key: u64, value: u32) -> Result<()> {
+pub fn leaf_insert(page: &mut Page, pos: usize, key: u64, value: RcEntry) -> Result<()> {
     let n = leaf_key_count(page);
     if n >= MAX_LEAF_ENTRIES {
         return Err(MetaDbError::InvalidArgument(
@@ -466,16 +509,19 @@ mod tests {
         p
     }
 
-    fn v(i: u8) -> u32 {
-        i as u32
+    fn v(i: u8) -> RcEntry {
+        RcEntry {
+            rc: i as u32,
+            birth_lsn: 1,
+        }
     }
 
     // --- capacity sanity ---
 
     #[test]
     fn layout_constants() {
-        assert_eq!(LEAF_ENTRY_SIZE, 12);
-        assert_eq!(MAX_LEAF_ENTRIES, 336);
+        assert_eq!(LEAF_ENTRY_SIZE, 20);
+        assert_eq!(MAX_LEAF_ENTRIES, 201);
         assert_eq!(MAX_INTERNAL_KEYS, 251);
         assert_eq!(MAX_INTERNAL_CHILDREN, 252);
     }

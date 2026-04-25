@@ -175,11 +175,18 @@ mod tests {
         t.check_invariants().unwrap();
     }
 
+    fn rc_one() -> crate::btree::format::RcEntry {
+        crate::btree::format::RcEntry {
+            rc: 1,
+            birth_lsn: 1,
+        }
+    }
+
     #[test]
     fn populated_tree_passes() {
         let (_d, mut t) = mk_tree();
         for i in 0u64..2000 {
-            t.insert(i, 0).unwrap();
+            t.insert(i, rc_one()).unwrap();
         }
         t.check_invariants().unwrap();
     }
@@ -188,7 +195,7 @@ mod tests {
     fn invariants_hold_after_deletes() {
         let (_d, mut t) = mk_tree();
         for i in 0u64..1000 {
-            t.insert(i, 0).unwrap();
+            t.insert(i, rc_one()).unwrap();
         }
         for i in (0u64..1000).step_by(3) {
             t.delete(i).unwrap();

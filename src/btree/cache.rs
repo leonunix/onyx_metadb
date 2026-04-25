@@ -216,7 +216,7 @@ impl PageBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::btree::format::{leaf_insert, leaf_key_at, leaf_key_count, leaf_value_at};
+    use crate::btree::format::{RcEntry, leaf_insert, leaf_key_at, leaf_key_count, leaf_value_at};
     use crate::page::PageType;
     use tempfile::TempDir;
 
@@ -243,7 +243,16 @@ mod tests {
         let (_d, ps) = mk_store();
         let mut buf = PageBuf::new(ps.clone());
         let pid = buf.alloc_leaf(7).unwrap();
-        leaf_insert(buf.modify(pid, 7).unwrap(), 0, 42, 99).unwrap();
+        leaf_insert(
+            buf.modify(pid, 7).unwrap(),
+            0,
+            42,
+            RcEntry {
+                rc: 99,
+                birth_lsn: 7,
+            },
+        )
+        .unwrap();
         buf.flush().unwrap();
         assert_eq!(buf.dirty_count(), 0);
 
@@ -251,7 +260,13 @@ mod tests {
         let p = buf2.read(pid).unwrap();
         assert_eq!(leaf_key_count(p), 1);
         assert_eq!(leaf_key_at(p, 0), 42);
-        assert_eq!(leaf_value_at(p, 0), 99);
+        assert_eq!(
+            leaf_value_at(p, 0),
+            RcEntry {
+                rc: 99,
+                birth_lsn: 7,
+            },
+        );
     }
 
     #[test]
