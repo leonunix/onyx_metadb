@@ -161,10 +161,14 @@ pub enum WalOp {
         guard: Option<(Pba, u32)>,
     },
     /// Onyx-adapter bulk delete over `[start, end)` for one volume.
-    /// The `captured: Vec<(Lba, Pba)>` is the `(lba, head_pba(value))`
-    /// list scanned at plan time — the apply path walks it and emits
-    /// one refcount decref per entry (with SPEC §4.4 leaf-rc-suppress
-    /// applied when the leaf was shared with a live snapshot).
+    /// The `captured: Vec<(Lba, L2pValue)>` is the `(lba, full_value)`
+    /// list scanned at plan time — apply emits one refcount decref per
+    /// entry, suppressed when any live snap pins the *exact* full
+    /// 28-byte value at this lba (birth/death LSN + precise compare).
+    /// Carrying the full value (vs. just `head_pba`) lets the snap-pin
+    /// check match audit semantics: distinct `(V, lba, value_28B)`
+    /// tuples count separately even when they share `head_pba` (e.g.
+    /// salt differs).
     ///
     /// The plan-time capture makes replay deterministic: on restart
     /// the same decrefs fire regardless of what the L2P tree looks
@@ -175,7 +179,7 @@ pub enum WalOp {
         vol_ord: VolumeOrdinal,
         start: Lba,
         end: Lba,
-        captured: Vec<(Lba, Pba)>,
+        captured: Vec<(Lba, L2pValue)>,
     },
     DedupPut {
         hash: Hash32,
@@ -317,9 +321,9 @@ impl WalOp {
                     .try_into()
                     .expect("L2pRangeDelete captured count fits in u32");
                 out.extend_from_slice(&count.to_be_bytes());
-                for (lba, pba) in captured {
+                for (lba, value) in captured {
                     out.extend_from_slice(&lba.to_be_bytes());
-                    out.extend_from_slice(&pba.to_be_bytes());
+                    out.extend_from_slice(&value.0);
                 }
             }
             WalOp::DedupPut { hash, value } => {
@@ -423,7 +427,7 @@ impl WalOp {
                 let base = 1 + 2 + 8 + 28 + 1;
                 base + if guard.is_some() { 8 + 4 } else { 0 }
             }
-            WalOp::L2pRangeDelete { captured, .. } => 1 + 2 + 8 + 8 + 4 + captured.len() * 16,
+            WalOp::L2pRangeDelete { captured, .. } => 1 + 2 + 8 + 8 + 4 + captured.len() * (8 + 28),
             WalOp::DedupPut { .. } => 1 + 32 + 28,
             WalOp::DedupDelete { .. } => 1 + 32,
             WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 32,
@@ -556,7 +560,8 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             let start = u64::from_be_bytes(payload[2..10].try_into().unwrap());
             let end = u64::from_be_bytes(payload[10..18].try_into().unwrap());
             let count = u32::from_be_bytes(payload[18..22].try_into().unwrap()) as usize;
-            let body_bytes = count.checked_mul(16).ok_or_else(|| {
+            let entry_size = 8 + 28;
+            let body_bytes = count.checked_mul(entry_size).ok_or_else(|| {
                 MetaDbError::Corruption("L2P_RANGE_DELETE count overflow".into())
             })?;
             require_len(&payload[22..], body_bytes, "L2P_RANGE_DELETE captured list")?;
@@ -564,11 +569,10 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             let mut cursor = 22usize;
             for _ in 0..count {
                 let lba = u64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap());
-                let pba = u64::from_be_bytes(
-                    payload[cursor + 8..cursor + 16].try_into().unwrap(),
-                );
-                captured.push((lba, pba));
-                cursor += 16;
+                let mut value_bytes = [0u8; 28];
+                value_bytes.copy_from_slice(&payload[cursor + 8..cursor + 8 + 28]);
+                captured.push((lba, L2pValue(value_bytes)));
+                cursor += entry_size;
             }
             Ok((
                 WalOp::L2pRangeDelete {
@@ -1364,7 +1368,17 @@ mod tests {
         // Dedup case: multiple lbas pointing at the same pba — order
         // and duplicates must survive the codec because apply needs
         // to emit one decref per entry (SPEC §4.7).
-        let captured = vec![(10u64, 100u64), (11, 100), (12, 100), (13, 200)];
+        fn val(pba: u64) -> L2pValue {
+            let mut v = [0u8; 28];
+            v[..8].copy_from_slice(&pba.to_be_bytes());
+            L2pValue(v)
+        }
+        let captured = vec![
+            (10u64, val(100)),
+            (11, val(100)),
+            (12, val(100)),
+            (13, val(200)),
+        ];
         let ops = vec![WalOp::L2pRangeDelete {
             vol_ord: 7,
             start: 10,
@@ -1372,7 +1386,7 @@ mod tests {
             captured: captured.clone(),
         }];
         let body = encode_body(&ops);
-        assert_eq!(body.len(), 1 + 1 + 22 + captured.len() * 16);
+        assert_eq!(body.len(), 1 + 1 + 22 + captured.len() * (8 + 28));
         match &decode_body(&body).unwrap()[0] {
             WalOp::L2pRangeDelete { captured: c, .. } => assert_eq!(c, &captured),
             other => panic!("expected L2pRangeDelete, got {other:?}"),
@@ -1381,12 +1395,17 @@ mod tests {
 
     #[test]
     fn l2p_range_delete_interleaves_with_other_ops() {
+        fn val(pba: u64) -> L2pValue {
+            let mut v = [0u8; 28];
+            v[..8].copy_from_slice(&pba.to_be_bytes());
+            L2pValue(v)
+        }
         let ops = vec![
             WalOp::L2pRangeDelete {
                 vol_ord: 1,
                 start: 0,
                 end: 10,
-                captured: vec![(0, 100), (5, 200)],
+                captured: vec![(0, val(100)), (5, val(200))],
             },
             WalOp::Incref { pba: 300, delta: 4 },
             WalOp::L2pRangeDelete {
@@ -1440,7 +1459,12 @@ mod tests {
 
     #[test]
     fn l2p_range_delete_encoded_len_matches_encode_output() {
-        let captured: Vec<(u64, u64)> = (0..5000).map(|i| (i, i * 2)).collect();
+        fn val(pba: u64) -> L2pValue {
+            let mut v = [0u8; 28];
+            v[..8].copy_from_slice(&pba.to_be_bytes());
+            L2pValue(v)
+        }
+        let captured: Vec<(u64, L2pValue)> = (0..5000).map(|i| (i, val(i * 2))).collect();
         let op = WalOp::L2pRangeDelete {
             vol_ord: 0,
             start: 0,

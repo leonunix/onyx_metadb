@@ -119,15 +119,22 @@ pub struct Db {
     /// just long enough to clone the `Arc<Volume>` out so shard mutexes
     /// can be acquired without keeping the map guard alive.
     drop_gate: RwLock<()>,
-    /// Per-volume cache of the oldest live snapshot's `created_lsn`.
-    /// `apply_l2p_remap` reads this to decide whether decref of a pba
-    /// might unmap content a live snapshot still pins (birth/death LSN
-    /// suppression — replaces the legacy "leaf-rc-suppress" rule).
+    /// Per-volume cache of live snapshot info — `created_lsn` plus the
+    /// L2P shard roots needed to read the snapshot's value at any lba.
+    /// `apply_l2p_remap` consults this to decide whether decref of a
+    /// pba would orphan content a live snapshot still pins.
+    ///
+    /// Decision (per L2pRemap op overwriting `(V, lba, old_pba)`):
+    /// 1. Fast filter: if `old_pba.birth_lsn > min(snap.created_lsn for
+    ///    snap in cache[V])`, no snap can pin this content → decref.
+    /// 2. Otherwise read each snap's L2P at `(V, lba)`; suppress decref
+    ///    iff any snap has that lba mapping to `old_pba`.
+    ///
     /// Populated from `manifest.snapshots` at open and refreshed on
-    /// `take_snapshot` / `drop_snapshot` / `drop_volume`. A volume with
-    /// no live snapshot is absent from the map (sentinel for "no
-    /// suppression needed").
-    snap_lsn_cache: Mutex<BTreeMap<VolumeOrdinal, Lsn>>,
+    /// `take_snapshot` / `drop_snapshot` / `drop_volume`. Vec is empty
+    /// (or absent) when the volume has no live snapshot — fast filter
+    /// returns false in that case, hot path stays free of snap reads.
+    snap_info_cache: Mutex<BTreeMap<VolumeOrdinal, Vec<SnapInfo>>>,
     /// Runtime cap on the volumes table size. Seeded from
     /// [`Config::max_volumes`] at create / open. `create_volume` refuses
     /// to mint a new ordinal once the live volume count hits this value.
@@ -141,6 +148,19 @@ pub struct Db {
 struct ManifestState {
     store: ManifestStore,
     manifest: Manifest,
+}
+
+/// Snapshot view info cached per volume, used by `apply_l2p_remap` /
+/// `apply_l2p_range_delete` to decide whether decref of a pba would
+/// orphan content a live snapshot still pins. See [`Db::snap_info_cache`].
+#[derive(Clone, Debug)]
+struct SnapInfo {
+    created_lsn: Lsn,
+    /// Per-shard root page ids. Indexed by `shard_for_key_l2p(...)`,
+    /// matching the volume's live shard layout (snapshot's roots are
+    /// captured from the same shard group at take time, so the indices
+    /// align).
+    l2p_shard_roots: Box<[PageId]>,
 }
 
 struct Shard {
@@ -374,7 +394,7 @@ impl Db {
             commit_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             drop_gate: RwLock::new(()),
-            snap_lsn_cache: Mutex::new(BTreeMap::new()),
+            snap_info_cache: Mutex::new(BTreeMap::new()),
             max_volumes: cfg.max_volumes,
             faults,
             db_path: cfg.path,
@@ -565,6 +585,17 @@ impl Db {
                     Ok(ApplyOutcome::Dedup)
                 }
                 _ => {
+                    let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
+                        manifest
+                            .snapshots
+                            .iter()
+                            .filter(|s| s.vol_ord == vol)
+                            .map(|s| SnapInfo {
+                                created_lsn: s.created_lsn,
+                                l2p_shard_roots: s.l2p_shard_roots.clone(),
+                            })
+                            .collect()
+                    };
                     let outcome = apply_op_bare(
                         &volumes,
                         &refcount_shards,
@@ -573,6 +604,7 @@ impl Db {
                         &page_store,
                         lsn,
                         op,
+                        &snap_lookup,
                     )?;
                     if let WalOp::DropSnapshot { id, .. } = op {
                         manifest.snapshots.retain(|s| s.id != *id);
@@ -687,12 +719,12 @@ impl Db {
             commit_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             drop_gate: RwLock::new(()),
-            snap_lsn_cache: Mutex::new(BTreeMap::new()),
+            snap_info_cache: Mutex::new(BTreeMap::new()),
             max_volumes: cfg.max_volumes,
             faults,
             db_path: cfg.path,
         };
-        db.recompute_all_snap_lsns();
+        db.recompute_all_snap_infos();
         Ok(db)
     }
 
@@ -859,6 +891,7 @@ impl Db {
         lsn: Lsn,
         op: &WalOp,
     ) -> Result<ApplyOutcome> {
+        let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
         let outcome = apply_op_bare(
             volumes,
             &self.refcount_shards,
@@ -867,6 +900,7 @@ impl Db {
             &self.page_store,
             lsn,
             op,
+            &snap_lookup,
         )?;
         // DropSnapshot also mutates the in-memory manifest's snapshot
         // list; the page work lives in apply_op_bare so it can be
@@ -885,7 +919,7 @@ impl Db {
                 dropped
             };
             if let Some(vol) = dropped_vol {
-                self.recompute_snap_lsn(vol);
+                self.recompute_snap_info(vol);
             }
         }
         Ok(outcome)
@@ -1475,7 +1509,13 @@ impl Db {
             .iter()
             .map(|tree| tree.root())
             .collect();
-        let created_lsn = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        // `created_lsn` is the WAL lsn of the most recently applied op
+        // at snap time. Birth/death LSN suppression compares
+        // `pba.birth_lsn` (also WAL lsn) against this value, so both
+        // sides must live in the same monotonic space. Held under
+        // apply_gate.write so no concurrent commit advances
+        // `last_applied_lsn` mid-sample.
+        let created_lsn = *self.last_applied_lsn.lock();
 
         // Bring the manifest up to the version we intend to commit,
         // minus the new snapshot entry. Running prepare/refresh first
@@ -1524,12 +1564,13 @@ impl Db {
         self.flush_locked_refcount_shards(&mut refcount_guards)?;
 
         manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
+        let snap_roots: Box<[PageId]> = l2p_roots.into_boxed_slice();
         manifest_state.manifest.snapshots.push(SnapshotEntry {
             id,
             vol_ord,
             l2p_roots_page,
             created_lsn,
-            l2p_shard_roots: l2p_roots.into_boxed_slice(),
+            l2p_shard_roots: snap_roots.clone(),
         });
         manifest_state.manifest.next_snapshot_id = next_snapshot_id;
         let manifest = manifest_state.manifest.clone();
@@ -1537,19 +1578,15 @@ impl Db {
         commit_l2p_checkpoint(&mut l2p_guards, created_lsn)?;
         commit_refcount_checkpoint(&mut refcount_guards, created_lsn)?;
         self.finish_dedup_manifest_update(dedup_update, created_lsn)?;
-        // Refresh the per-volume oldest-snap-lsn cache with the new
-        // snapshot's `created_lsn`. Inline update — manifest_state is
-        // still held above, and `recompute_snap_lsn` would re-lock.
+        // Append the new snap to the per-volume cache. Inline update —
+        // manifest_state is still held above, and `recompute_snap_info`
+        // would re-lock.
         {
-            let mut cache = self.snap_lsn_cache.lock();
-            cache
-                .entry(vol_ord)
-                .and_modify(|l| {
-                    if created_lsn < *l {
-                        *l = created_lsn;
-                    }
-                })
-                .or_insert(created_lsn);
+            let mut cache = self.snap_info_cache.lock();
+            cache.entry(vol_ord).or_default().push(SnapInfo {
+                created_lsn,
+                l2p_shard_roots: snap_roots,
+            });
         }
         Ok(id)
     }
@@ -1888,6 +1925,7 @@ impl Db {
         }
 
         let volumes_map = self.volumes.read().clone();
+        let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
         let outcome = apply_op_bare(
             &volumes_map,
             &self.refcount_shards,
@@ -1896,6 +1934,7 @@ impl Db {
             &self.page_store,
             lsn,
             &op,
+            &snap_lookup,
         )?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
@@ -1923,7 +1962,7 @@ impl Db {
         // Source volume just lost a snap; recompute its oldest-snap-lsn
         // entry. May go from Some(lsn) to None (last snap on this vol)
         // or to a later lsn (the next-oldest survives).
-        self.recompute_snap_lsn(entry.vol_ord);
+        self.recompute_snap_info(entry.vol_ord);
 
         {
             let mut applied = self.last_applied_lsn.lock();
@@ -1988,17 +2027,19 @@ impl Db {
         let volumes_map = self.volumes.read().clone();
 
         // Phase 1: scan each shard under its own mutex, collect
-        // (lba, head_pba(value)) for every live mapping in the range.
-        // Locks are released before WAL submit so the submit path
-        // can rotate segments / fsync without the shard mutex held.
-        let captured: Vec<(Lba, Pba)> = {
-            let mut acc: Vec<(Lba, Pba)> = Vec::new();
+        // (lba, full_value) for every live mapping in the range. Full
+        // value is needed so the apply-time snap-pin check can match
+        // audit semantics (distinct (V, lba, value_28B) tuples). Locks
+        // are released before WAL submit so the submit path can rotate
+        // segments / fsync without the shard mutex held.
+        let captured: Vec<(Lba, L2pValue)> = {
+            let mut acc: Vec<(Lba, L2pValue)> = Vec::new();
             for shard in &volume.shards {
                 let mut tree = shard.tree.lock();
                 let iter = tree.range(start..end)?;
                 for item in iter {
                     let (lba, value) = item?;
-                    acc.push((lba, value.head_pba()));
+                    acc.push((lba, value));
                 }
             }
             acc.sort_unstable_by_key(|(lba, _)| *lba);
@@ -2036,6 +2077,7 @@ impl Db {
                 }
             }
 
+            let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
             let _outcome = apply_op_bare(
                 &volumes_map,
                 &self.refcount_shards,
@@ -2044,6 +2086,7 @@ impl Db {
                 &self.page_store,
                 lsn,
                 &op,
+                &snap_lookup,
             )?;
             self.faults
                 .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
@@ -2341,7 +2384,7 @@ impl Db {
         // `drop_volume` rejects volumes with live snapshots (checked at
         // entry), so the cache slot here is normally already empty —
         // this is just defensive cleanup.
-        self.forget_snap_lsn(vol_ord);
+        self.forget_snap_info(vol_ord);
 
         {
             let mut applied = self.last_applied_lsn.lock();
@@ -2550,61 +2593,63 @@ impl Db {
             .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown volume ord {vol_ord}")))
     }
 
-    /// Read-side: oldest live snapshot's `created_lsn` for `vol`, or
-    /// `None` if the volume has no live snapshot. Used by
-    /// [`apply_l2p_remap`] to gate decref decisions (birth/death LSN
-    /// suppression).
-    fn min_alive_snap_lsn(&self, vol: VolumeOrdinal) -> Option<Lsn> {
-        self.snap_lsn_cache.lock().get(&vol).copied()
+    /// Read-side: cloned snapshot info for `vol`. Empty Vec when no
+    /// snap is live on the volume. Used by [`apply_l2p_remap`] /
+    /// [`apply_l2p_range_delete`] to gate decref decisions.
+    fn snap_info_for_vol(&self, vol: VolumeOrdinal) -> Vec<SnapInfo> {
+        self.snap_info_cache
+            .lock()
+            .get(&vol)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Recompute the cache entry for `vol` from `manifest.snapshots`.
     /// Callers must already hold a manifest lock or be in a state where
     /// the snapshot list is stable for `vol` (typically `apply_gate` or
     /// `drop_gate` write-side).
-    fn recompute_snap_lsn(&self, vol: VolumeOrdinal) {
-        let min = self
+    fn recompute_snap_info(&self, vol: VolumeOrdinal) {
+        let infos: Vec<SnapInfo> = self
             .manifest_state
             .lock()
             .manifest
             .snapshots
             .iter()
             .filter(|s| s.vol_ord == vol)
-            .map(|s| s.created_lsn)
-            .min();
-        let mut cache = self.snap_lsn_cache.lock();
-        match min {
-            Some(l) => {
-                cache.insert(vol, l);
-            }
-            None => {
-                cache.remove(&vol);
-            }
+            .map(|s| SnapInfo {
+                created_lsn: s.created_lsn,
+                l2p_shard_roots: s.l2p_shard_roots.clone(),
+            })
+            .collect();
+        let mut cache = self.snap_info_cache.lock();
+        if infos.is_empty() {
+            cache.remove(&vol);
+        } else {
+            cache.insert(vol, infos);
         }
     }
 
     /// Bulk-rebuild the cache from the current manifest. Used at open /
     /// recovery and after batched lifecycle replay.
-    fn recompute_all_snap_lsns(&self) {
-        let mut by_vol: BTreeMap<VolumeOrdinal, Lsn> = BTreeMap::new();
+    fn recompute_all_snap_infos(&self) {
+        let mut by_vol: BTreeMap<VolumeOrdinal, Vec<SnapInfo>> = BTreeMap::new();
         for snap in &self.manifest_state.lock().manifest.snapshots {
             by_vol
                 .entry(snap.vol_ord)
-                .and_modify(|l| {
-                    if snap.created_lsn < *l {
-                        *l = snap.created_lsn;
-                    }
-                })
-                .or_insert(snap.created_lsn);
+                .or_default()
+                .push(SnapInfo {
+                    created_lsn: snap.created_lsn,
+                    l2p_shard_roots: snap.l2p_shard_roots.clone(),
+                });
         }
-        let mut cache = self.snap_lsn_cache.lock();
+        let mut cache = self.snap_info_cache.lock();
         cache.clear();
         cache.extend(by_vol);
     }
 
     /// Drop the cache entry for `vol` (used by `drop_volume`).
-    fn forget_snap_lsn(&self, vol: VolumeOrdinal) {
-        self.snap_lsn_cache.lock().remove(&vol);
+    fn forget_snap_info(&self, vol: VolumeOrdinal) {
+        self.snap_info_cache.lock().remove(&vol);
     }
 
     fn refcount_shard_for(&self, pba: Pba) -> usize {
@@ -3060,6 +3105,19 @@ pub(crate) fn decode_reverse_hash(key: &Hash32, value: &DedupValue) -> Hash32 {
 /// themselves after calling this function. This split keeps
 /// `apply_op_bare` usable in the replay path (which owns a bare
 /// `Manifest`) and the live path (which owns a `Mutex<ManifestState>`).
+///
+/// `snap_info_for_vol` is a per-volume callback returning the live
+/// snapshot view info for that volume (empty `Vec` for no-snap case).
+/// [`apply_l2p_remap`] / [`apply_l2p_range_delete`] consult it to gate
+/// decref decisions:
+///
+/// 1. Fast filter: if `old_pba.birth_lsn > min(snap.created_lsn)`,
+///    no live snap can pin this content → decref.
+/// 2. Otherwise read each snap's L2P at `(V, lba)`; suppress decref
+///    iff any snap has that lba mapping to `old_pba`.
+///
+/// Replaces the legacy `leaf_was_shared` proxy. Callers that don't
+/// have a snap-aware state (unit tests) can pass `&|_| Vec::new()`.
 fn apply_op_bare(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
@@ -3068,6 +3126,7 @@ fn apply_op_bare(
     page_store: &Arc<PageStore>,
     lsn: Lsn,
     op: &WalOp,
+    snap_info_for_vol: &dyn Fn(VolumeOrdinal) -> Vec<SnapInfo>,
 ) -> Result<ApplyOutcome> {
     match op {
         WalOp::L2pPut {
@@ -3135,13 +3194,21 @@ fn apply_op_bare(
             *lba,
             *new_value,
             *guard,
+            &snap_info_for_vol(*vol_ord),
         ),
         WalOp::L2pRangeDelete {
             vol_ord,
             start: _,
             end: _,
             captured,
-        } => apply_l2p_range_delete(volumes, refcount_shards, lsn, *vol_ord, captured),
+        } => apply_l2p_range_delete(
+            volumes,
+            refcount_shards,
+            lsn,
+            *vol_ord,
+            captured,
+            &snap_info_for_vol(*vol_ord),
+        ),
         WalOp::DropSnapshot {
             id: _,
             pages,
@@ -3171,28 +3238,32 @@ fn apply_op_bare(
 /// + refcount incref(new) + (optionally) a liveness guard read into one
 /// atomic step — the onyx adapter hot path.
 ///
-/// Decision table (SPEC §3.1 §4):
+/// Decision table (post birth/death LSN + precise snap-pin check):
 ///
-/// | prev        | new.pba vs old.pba | leaf_was_shared | decref(old) | incref(new) |
-/// |-------------|--------------------|-----------------|-------------|-------------|
-/// | `None`      | —                  | —               | no          | **yes**     |
-/// | `Some(old)` | same               | false           | no          | no          |
-/// | `Some(old)` | same               | true            | no          | **yes**     |
-/// | `Some(old)` | different          | false           | **yes**     | **yes**     |
-/// | `Some(old)` | different          | true            | no          | **yes**     |
+/// | prev        | new vs old | snap pins (V,lba,old)? | decref(old) | incref(new) |
+/// |-------------|------------|------------------------|-------------|-------------|
+/// | `None`      | —          | —                      | no          | **yes**     |
+/// | `Some(old)` | same       | —                      | no          | no          |
+/// | `Some(old)` | different  | no                     | **yes**     | **yes**     |
+/// | `Some(old)` | different  | yes (suppress)         | no          | **yes**     |
 ///
-/// The `same + !shared` row (net 0) is the metadb analogue of
-/// `self_decrement` / `net_increment` in onyx's
-/// [`atomic_batch_write_packed`](../../../src/meta/store/blockmap.rs#L262)
-/// — it prevents the in-place overwrite from spuriously inflating or
-/// deflating `refcount(pba)`.
+/// "Snap pins (V, lba, old)" = some live snap of V has lba mapped to
+/// old_pba in its L2P. Decided in two stages:
+///   1. Fast filter: `old_pba.birth_lsn > min(snap.created_lsn)` →
+///      content is younger than every snap → no snap can pin it → no.
+///   2. Otherwise read each snap's L2P at lba (cached after first
+///      access) → match against old_pba.
 ///
-/// Locking: the L2P shard mutex stays held across the refcount RMWs so
-/// the leaf-shared capture and the incref/decref land atomically
-/// against any concurrent op on the same (vol, lba). Refcount shards
-/// are acquired in ascending shard-index order, matching the
-/// CLAUDE.md lock-order rule against writers that touch the same
-/// pbas.
+/// Replaces the legacy `leaf_was_shared` proxy, which only fired on
+/// the *first* COW of a snapshot-shared leaf and missed subsequent
+/// overwrites in the same (now-private) leaf — see
+/// [`docs/ONYX_INTEGRATION_SPEC.md`](../../docs/ONYX_INTEGRATION_SPEC.md)
+/// §4.4.
+///
+/// Locking: the L2P shard mutex stays held across snap reads + refcount
+/// RMWs so the suppress decision and the incref/decref land atomically
+/// against any concurrent op on the same (vol, lba). Snap reads use
+/// the same `PagedL2p` instance (different root) so no extra locks.
 fn apply_l2p_remap(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
@@ -3201,6 +3272,7 @@ fn apply_l2p_remap(
     lba: Lba,
     new_value: L2pValue,
     guard: Option<(Pba, u32)>,
+    snap_infos: &[SnapInfo],
 ) -> Result<ApplyOutcome> {
     let volume = volumes.get(&vol_ord).ok_or_else(|| {
         MetaDbError::Corruption(format!("L2pRemap for unknown volume ord {vol_ord}"))
@@ -3232,16 +3304,76 @@ fn apply_l2p_remap(
         }
     }
 
-    // Drive L2P mutation now that the guard passed. Capturing
-    // `leaf_was_shared` here means the decref decision reflects the
-    // sharing state seen by this very op — any concurrent flush /
-    // snapshot is already excluded by `apply_gate.read()`, and the
-    // shard mutex excludes other writers on this (vol, shard).
-    let outcome = tree.insert_at_lsn_with_share_info(lba, new_value, lsn)?;
-    let prev = outcome.prev;
+    // Drive L2P mutation now that the guard passed.
+    let prev = tree.insert_at_lsn(lba, new_value, lsn)?;
     let old_pba = prev.map(|p| p.head_pba());
-    let do_decref = prev.is_some() && !outcome.leaf_was_shared && old_pba != Some(new_pba);
-    let do_incref = !(prev.is_some() && !outcome.leaf_was_shared && old_pba == Some(new_pba));
+
+    // Snapshot-pin check: does any live snap of `vol_ord` map `lba`
+    // to the FULL `L2pValue` we're about to lose / gain? Audit
+    // semantics count distinct `(V, lba, value_28B)` tuples — so two
+    // values that share head_pba but differ on later bytes (e.g.
+    // `salt`) are independently counted, and a snap pinning
+    // `(V, lba, old_value)` blocks decref of `head_pba(old_value)`
+    // only when the FULL value matches.
+    //
+    // Two-stage detection:
+    //   1. Fast filter via `pba.birth_lsn` vs oldest snap.created_lsn:
+    //      a pba younger than every snap can't appear in any snap's
+    //      L2P, so no need to walk.
+    //   2. Else walk each snap's `L2P[V][lba]` (single paged-tree get
+    //      per snap, hot pages cached) and compare full value.
+    // Reads use the same shard's `tree` instance via `get_at(snap_root,
+    // lba)` so no extra locking is needed.
+    let snap_sid = shard_for_key_l2p(&volume.shards, lba);
+    let any_snap_pins =
+        |target: L2pValue, target_birth: Option<Lsn>, tree: &mut PagedL2p| -> Result<bool> {
+            if snap_infos.is_empty() {
+                return Ok(false);
+            }
+            if let Some(b) = target_birth {
+                if !snap_infos.iter().any(|s| b <= s.created_lsn) {
+                    return Ok(false);
+                }
+            }
+            for s in snap_infos {
+                let snap_root = s.l2p_shard_roots[snap_sid];
+                if let Some(snap_val) = tree.get_at(snap_root, lba)? {
+                    if snap_val == target {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        };
+
+    let snap_pins_old = match prev {
+        Some(old_value) => {
+            let birth = {
+                let sid = shard_for_key(refcount_shards, old_value.head_pba());
+                let mut rc_tree = refcount_shards[sid].tree.lock();
+                rc_tree.get(old_value.head_pba())?.map(|e| e.birth_lsn)
+            };
+            any_snap_pins(old_value, birth, &mut tree)?
+        }
+        None => false,
+    };
+    let snap_pins_new = {
+        let birth = {
+            let sid = shard_for_key(refcount_shards, new_pba);
+            let mut rc_tree = refcount_shards[sid].tree.lock();
+            rc_tree.get(new_pba)?.map(|e| e.birth_lsn)
+        };
+        any_snap_pins(new_value, birth, &mut tree)?
+    };
+
+    // Decision: rc[head_pba] changes only when the tuple is gained /
+    // lost from the union of (live ∪ all snaps). `prev != Some(new)`
+    // captures "live's mapping at this lba changes value byte-for-byte".
+    let value_changed = prev != Some(new_value);
+    let live_loses_old = prev.is_some() && value_changed;
+    let live_gains_new = value_changed;
+    let do_decref = live_loses_old && !snap_pins_old;
+    let do_incref = live_gains_new && !snap_pins_new;
 
     // Collapse per-pba net delta before taking shard locks. Same-head-pba
     // overwrites can legitimately add and remove one logical version in the
@@ -3282,15 +3414,17 @@ fn apply_l2p_remap(
 
 /// Apply one [`WalOp::L2pRangeDelete`]. Walks the `captured` list,
 /// deleting each lba from its volume's L2P shard and emitting a
-/// decref against `old_pba` under SPEC §4.4 leaf-rc-suppress: if the
-/// leaf holding `lba` was shared with a live snapshot at this op's
-/// start, the snapshot still references `old_pba` via that leaf, so
-/// the decref is suppressed. `drop_snapshot` later compensates via
-/// its `pba_decrefs` list (landed in S4).
+/// decref against `old_pba` — modulo birth/death LSN suppression: if
+/// `min_alive_snap_lsn` is `Some(snap_lsn)` and `pba.birth_lsn <=
+/// snap_lsn`, the snapshot may still reference this pba and the
+/// decref is suppressed. `drop_snapshot` later compensates via the
+/// deadlist (next session) or via `diff_subtrees`-derived
+/// `pba_decrefs` (current).
 ///
 /// Replay safety: the captured list is authoritative — both live
-/// apply and replay consume the same (lba, pba) pairs, so the
-/// emitted refcount deltas match byte-for-byte across restarts.
+/// apply and replay consume the same (lba, pba) pairs, and birth_lsn
+/// is part of the rc tree's persistent state, so suppress decisions
+/// reproduce across restarts.
 /// Range-delete's `Db::range_delete` caller uses apply_gate.write
 /// (same pattern as `drop_snapshot`) to exclude concurrent commits
 /// while plan + submit + apply run, so captured is consistent with
@@ -3300,80 +3434,60 @@ fn apply_l2p_range_delete(
     refcount_shards: &[Shard],
     lsn: Lsn,
     vol_ord: VolumeOrdinal,
-    captured: &[(Lba, Pba)],
+    captured: &[(Lba, L2pValue)],
+    snap_infos: &[SnapInfo],
 ) -> Result<ApplyOutcome> {
     let volume = volumes.get(&vol_ord).ok_or_else(|| {
         MetaDbError::Corruption(format!("L2pRangeDelete for unknown volume ord {vol_ord}"))
     })?;
 
     // Bucket captured entries by L2P shard so each tree mutex is
-    // taken once. Preserves the original index inside `captured` so
-    // per-shard iteration still sees the caller's emit order (the
-    // per-shard ordering doesn't matter for refcount — decrements
-    // are commutative — but keeping it simplifies debugging and
-    // matches the "preserve submit order" style of apply_ops_grouped).
+    // taken once.
     let shard_count = volume.shards.len();
     let mut shard_buckets: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
     for (idx, (lba, _)) in captured.iter().enumerate() {
         shard_buckets[shard_for_key_l2p(&volume.shards, *lba)].push(idx);
     }
 
-    // For each captured lba, remember whether its pre-op leaf was
-    // shared. Populated during the L2P deletion pass (one per tree
-    // shard) and consumed during the refcount pass. We materialise
-    // this as a Vec<bool> indexed by `captured` position because the
-    // refcount pass runs after the L2P pass releases tree mutexes.
-    let mut suppress_decref: Vec<bool> = vec![false; captured.len()];
-    // Drive deletes first: take each L2P shard mutex in index
-    // order, run every captured lba that falls in it.
+    // For each captured (lba, value): did it have a live mapping? And
+    // if so, does any live snap of V still hold the *exact same* full
+    // value at that lba? Full-value compare matches audit semantics
+    // (distinct `(V, lba, value_28B)` tuples). Both determined while
+    // holding the L2P shard mutex; snap reads use `get_at` on the same
+    // tree instance, different root.
+    let mut was_mapped: Vec<bool> = vec![false; captured.len()];
+    let mut snap_pinned: Vec<bool> = vec![false; captured.len()];
     for (sid, indices) in shard_buckets.iter().enumerate() {
         if indices.is_empty() {
             continue;
         }
         let mut tree = volume.shards[sid].tree.lock();
-        // Cache per-leaf sharing decisions: two lbas in the same
-        // pre-op leaf must share the same suppress flag. Once the
-        // first delete COWs the leaf, the SECOND delete walks to a
-        // new leaf whose pre-COW rc is 1 (not shared), which would
-        // flip the answer. We pre-compute the shared bit from the
-        // FIRST-visited lba of each pre-op leaf and reuse it for
-        // subsequent lbas in the same leaf.
-        let mut first_outcome_by_leaf: HashMap<(u8, u64), bool> = HashMap::new();
         for &idx in indices {
-            let (lba, _) = captured[idx];
-            // `lba >> LEAF_SHIFT` gives the leaf index in the tree,
-            // uniquely identifying the pre-op leaf independently of
-            // page ids. The `(root_level, leaf_idx)` key handles the
-            // extremely rare case of a tree that grew during this
-            // apply (it wouldn't, since we hold apply_gate.write,
-            // but the pair is cheap insurance).
-            let root_level = tree.root_level();
-            let leaf_idx = lba >> crate::paged::format::LEAF_SHIFT;
-            let outcome = tree.delete_at_lsn_with_share_info(lba, lsn)?;
-            let cache_key = (root_level, leaf_idx);
-            let shared = if outcome.prev.is_some() {
-                let first = first_outcome_by_leaf
-                    .entry(cache_key)
-                    .or_insert(outcome.leaf_was_shared);
-                *first
-            } else {
-                // Unmapped lba — leaf_was_shared is meaningless;
-                // treat as "no decref" by setting suppress=true.
-                true
-            };
-            suppress_decref[idx] = outcome.prev.is_none() || shared;
+            let (lba, captured_value) = captured[idx];
+            let prev = tree.delete_at_lsn(lba, lsn)?;
+            was_mapped[idx] = prev.is_some();
+            if !snap_infos.is_empty() && was_mapped[idx] {
+                for s in snap_infos {
+                    let snap_root = s.l2p_shard_roots[sid];
+                    if let Some(snap_val) = tree.get_at(snap_root, lba)? {
+                        if snap_val == captured_value {
+                            snap_pinned[idx] = true;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 
-    // Second pass: bucket surviving decrefs by refcount shard (for
-    // determinism under cross-thread contention, match the
-    // ascending-shard-index ordering used by apply_l2p_remap).
+    // Second pass: precise snap-pin suppress + decref. Bucket by
+    // refcount shard so each shard mutex is taken at most once.
     let mut rc_bucket: Vec<Vec<usize>> = vec![Vec::new(); refcount_shards.len()];
-    for (idx, (_, pba)) in captured.iter().enumerate() {
-        if suppress_decref[idx] {
+    for (idx, (_, value)) in captured.iter().enumerate() {
+        if !was_mapped[idx] || snap_pinned[idx] {
             continue;
         }
-        rc_bucket[shard_for_key(refcount_shards, *pba)].push(idx);
+        rc_bucket[shard_for_key(refcount_shards, value.head_pba())].push(idx);
     }
 
     let mut freed_pbas: Vec<Pba> = Vec::new();
@@ -3383,7 +3497,8 @@ fn apply_l2p_range_delete(
         }
         let mut rc_tree = refcount_shards[sid].tree.lock();
         for &idx in indices {
-            let (_, pba) = captured[idx];
+            let (_, value) = captured[idx];
+            let pba = value.head_pba();
             let pre = rc_tree.get(pba)?.map(|e| e.rc).unwrap_or(0);
             let new = refcount_apply_delta(&mut rc_tree, pba, -1, lsn)?;
             if new == 0 && pre > 0 {
