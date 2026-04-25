@@ -3317,25 +3317,26 @@ fn apply_l2p_remap(
     // only when the FULL value matches.
     //
     // Two-stage detection:
-    //   1. Fast filter via `pba.birth_lsn` vs oldest snap.created_lsn:
-    //      a pba younger than every snap can't appear in any snap's
-    //      L2P, so no need to walk.
-    //   2. Else walk each snap's `L2P[V][lba]` (single paged-tree get
-    //      per snap, hot pages cached) and compare full value.
+    //   1. Per-snap fast filter: skip any snap whose `created_lsn` is
+    //      earlier than `target.head_pba`'s `birth_lsn` — that snap was
+    //      taken before the content existed and cannot reference it.
+    //      Saves 1 paged-tree walk per skippable snap.
+    //   2. For surviving candidates, walk `L2P[V][lba]` from each
+    //      snap's root (single paged-tree get, hot pages cached) and
+    //      compare full value.
     // Reads use the same shard's `tree` instance via `get_at(snap_root,
     // lba)` so no extra locking is needed.
     let snap_sid = shard_for_key_l2p(&volume.shards, lba);
     let any_snap_pins =
         |target: L2pValue, target_birth: Option<Lsn>, tree: &mut PagedL2p| -> Result<bool> {
-            if snap_infos.is_empty() {
-                return Ok(false);
-            }
-            if let Some(b) = target_birth {
-                if !snap_infos.iter().any(|s| b <= s.created_lsn) {
-                    return Ok(false);
-                }
-            }
             for s in snap_infos {
+                if let Some(b) = target_birth {
+                    if b > s.created_lsn {
+                        // pba content was born after this snap — snap
+                        // can't reference it via any lba.
+                        continue;
+                    }
+                }
                 let snap_root = s.l2p_shard_roots[snap_sid];
                 if let Some(snap_val) = tree.get_at(snap_root, lba)? {
                     if snap_val == target {
@@ -3467,7 +3468,21 @@ fn apply_l2p_range_delete(
             let prev = tree.delete_at_lsn(lba, lsn)?;
             was_mapped[idx] = prev.is_some();
             if !snap_infos.is_empty() && was_mapped[idx] {
+                // Per-snap fast filter via birth_lsn, same shape as
+                // apply_l2p_remap. Look up birth_lsn first under the
+                // rc shard mutex, then walk only candidate snaps.
+                let captured_birth = {
+                    let pba = captured_value.head_pba();
+                    let rc_sid = shard_for_key(refcount_shards, pba);
+                    let mut rc_tree = refcount_shards[rc_sid].tree.lock();
+                    rc_tree.get(pba)?.map(|e| e.birth_lsn)
+                };
                 for s in snap_infos {
+                    if let Some(b) = captured_birth {
+                        if b > s.created_lsn {
+                            continue;
+                        }
+                    }
                     let snap_root = s.l2p_shard_roots[sid];
                     if let Some(snap_val) = tree.get_at(snap_root, lba)? {
                         if snap_val == captured_value {
