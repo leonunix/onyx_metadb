@@ -18,6 +18,7 @@ DEFAULT_FAULT_DENSITY_PCT="${METADB_SOAK_FAULT_DENSITY_PCT:-25}"
 DEFAULT_SEED="${METADB_SOAK_SEED:-1592625758}"
 DEFAULT_WORKLOAD="${METADB_SOAK_WORKLOAD:-onyx}"
 DEFAULT_EVENT_VERBOSITY="${METADB_SOAK_EVENT_VERBOSITY:-summary}"
+DEFAULT_SNAPSHOTS_ENABLED="${METADB_SOAK_SNAPSHOTS:-1}"
 DEFAULT_EXTRA_ARGS="${METADB_SOAK_EXTRA_ARGS:-}"
 
 BENCH_DEFAULT_THREADS="${METADB_BENCH_THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
@@ -169,6 +170,17 @@ event_verbosity_arg() {
     esac
 }
 
+snapshots_arg() {
+    case "$1" in
+        1|true|yes|on) printf '%s\n' "" ;;
+        0|false|no|off) printf '%s\n' "--no-snapshots" ;;
+        *)
+            echo "unknown snapshots setting: $1 (expected 1/0 or true/false)" >&2
+            exit 1
+            ;;
+    esac
+}
+
 stop_process_group() {
     local pid="$1"
     local pgid
@@ -183,7 +195,7 @@ stop_process_group() {
 cmd_start() {
     local duration="${1:-$DEFAULT_DURATION}"
     local workload="${2:-$DEFAULT_WORKLOAD}"
-    local duration_secs run_dir workload_flag events_flag qroot qrun_dir qduration qops qthreads qfault qseed qextra cmd
+    local duration_secs run_dir workload_flag events_flag snapshots_flag qroot qrun_dir qduration qops qthreads qfault qseed qextra cmd
 
     if is_running; then
         echo "soak already running (pid $(cat "$PID_FILE"))"
@@ -194,6 +206,7 @@ cmd_start() {
     duration_secs="$(parse_duration_secs "$duration")"
     workload_flag="$(workload_arg "$workload")"
     events_flag="$(event_verbosity_arg "$DEFAULT_EVENT_VERBOSITY")"
+    snapshots_flag="$(snapshots_arg "$DEFAULT_SNAPSHOTS_ENABLED")"
     run_dir="$(run_dir_for_start)"
     mkdir -p "$run_dir"
     save_run_dir "$run_dir"
@@ -209,6 +222,9 @@ cmd_start() {
     qextra="$DEFAULT_EXTRA_ARGS"
 
     cmd="cd $qroot && exec target/release/metadb-soak $qrun_dir --duration-secs $qduration --ops-per-cycle $qops --threads $qthreads --fault-density-pct $qfault --seed $qseed $workload_flag $events_flag"
+    if [[ -n "$snapshots_flag" ]]; then
+        cmd="$cmd $snapshots_flag"
+    fi
     if [[ -n "$qextra" ]]; then
         cmd="$cmd $qextra"
     fi
@@ -228,6 +244,7 @@ cmd_start() {
     echo "  duration: $duration ($duration_secs s)"
     echo "  workload: $workload"
     echo "  events:   $DEFAULT_EVENT_VERBOSITY"
+    echo "  snapshots: $DEFAULT_SNAPSHOTS_ENABLED"
 }
 
 cmd_stop() {
@@ -631,6 +648,7 @@ usage() {
     echo "  METADB_SOAK_SEED=$DEFAULT_SEED"
     echo "  METADB_SOAK_WORKLOAD=$DEFAULT_WORKLOAD        # legacy|onyx|concurrent"
     echo "  METADB_SOAK_EVENT_VERBOSITY=$DEFAULT_EVENT_VERBOSITY  # summary|ops"
+    echo "  METADB_SOAK_SNAPSHOTS=$DEFAULT_SNAPSHOTS_ENABLED      # 1|0"
     echo "  METADB_SOAK_RUN_DIR=<explicit run dir>"
     echo "  METADB_SOAK_EXTRA_ARGS='<extra metadb-soak args>'"
     echo "  METADB_BENCH_THREADS=$BENCH_DEFAULT_THREADS"

@@ -82,6 +82,7 @@ struct ParentConfig {
     event_verbosity: EventVerbosity,
     fault_density_pct: u8,
     workload: Workload,
+    snapshots_enabled: bool,
     restart_interval_secs: Option<u64>,
 }
 
@@ -138,6 +139,7 @@ impl ParentConfig {
         let mut event_verbosity = EventVerbosity::Summary;
         let mut fault_density_pct = 0u8;
         let mut workload = Workload::Onyx;
+        let mut snapshots_enabled = true;
         let mut restart_interval_secs = None;
 
         while let Some(arg) = args.next() {
@@ -198,6 +200,7 @@ impl ParentConfig {
                     }
                     fault_density_pct = value as u8;
                 }
+                "--no-snapshots" => snapshots_enabled = false,
                 "--onyx-mix" => workload = Workload::Onyx,
                 "--onyx-concurrent-mix" => workload = Workload::OnyxConcurrent,
                 "--legacy-mix" => workload = Workload::Legacy,
@@ -226,6 +229,7 @@ impl ParentConfig {
             seed,
             fault_density_pct,
             workload,
+            snapshots_enabled,
             restart_interval_secs,
         })
     }
@@ -723,7 +727,7 @@ fn run_cycle(
         )?;
     }
 
-    // Phase 3: flush + per-volume snapshot on a random live vol.
+    // Phase 3: flush + optional snapshot churn.
     send_admin(child, next_id, "FLUSH")?;
     match recv_ack(child)? {
         Ack::Ok(id) if id == next_id => {
@@ -738,6 +742,10 @@ fn run_cycle(
         other => return Err(format!("unexpected flush ack: {other:?}")),
     }
     next_id += 1;
+
+    if !cfg.snapshots_enabled {
+        return Ok(());
+    }
 
     let live = match cfg.workload {
         Workload::Legacy => model.live_volumes(),
@@ -2003,7 +2011,7 @@ fn write_summary(path: &Path, summary: &Summary) -> std::io::Result<()> {
 
 fn print_parent_usage() {
     eprintln!(
-        "usage: metadb-soak <path> [--duration-secs N|--minutes N|--hours N] [--restart-interval 2h] [--legacy-mix|--onyx-mix|--onyx-concurrent-mix] [--ops-per-cycle N] [--threads N] [--seed N] [--fault-density-pct N] [--summary path] [--events path] [--events-summary|--events-ops]"
+        "usage: metadb-soak <path> [--duration-secs N|--minutes N|--hours N] [--restart-interval 2h] [--legacy-mix|--onyx-mix|--onyx-concurrent-mix] [--ops-per-cycle N] [--threads N] [--seed N] [--fault-density-pct N] [--summary path] [--events path] [--events-summary|--events-ops] [--no-snapshots]"
     );
 }
 

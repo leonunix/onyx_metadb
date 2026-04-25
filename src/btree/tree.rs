@@ -9,6 +9,7 @@
 //! Concurrency: `BTree` is `!Sync` in practice — its `PageBuf` is
 //! `&mut self` only. `Db` wraps one per shard in a `Mutex`.
 
+use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -16,8 +17,9 @@ use crate::btree::cache::PageBuf;
 use crate::btree::format::{
     LEAF_ENTRY_SIZE, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, internal_child_at, internal_insert,
     internal_key_at, internal_key_count, internal_pop_front, internal_push_front, internal_remove,
-    internal_search, internal_set_first_child, internal_set_key_at, leaf_insert, leaf_key_at,
-    leaf_key_count, leaf_remove, leaf_search, leaf_set_entry, leaf_value_at,
+    internal_search, internal_set_child, internal_set_first_child, internal_set_key_at,
+    leaf_insert, leaf_key_at, leaf_key_count, leaf_remove, leaf_search, leaf_set_entry,
+    leaf_value_at,
 };
 use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::{MetaDbError, Result};
@@ -36,6 +38,8 @@ pub struct BTree {
     buf: PageBuf,
     root: PageId,
     next_gen: Lsn,
+    private_pages: HashSet<PageId>,
+    retired_pages: HashSet<PageId>,
 }
 
 impl BTree {
@@ -63,6 +67,8 @@ impl BTree {
             buf,
             root,
             next_gen: 2,
+            private_pages: HashSet::new(),
+            retired_pages: HashSet::new(),
         })
     }
 
@@ -84,6 +90,8 @@ impl BTree {
             buf,
             root,
             next_gen,
+            private_pages: HashSet::new(),
+            retired_pages: HashSet::new(),
         })
     }
 
@@ -110,11 +118,75 @@ impl BTree {
         self.buf.page_store()
     }
 
+    fn alloc_leaf_private(&mut self, generation: Lsn) -> Result<PageId> {
+        let pid = self.buf.alloc_leaf(generation)?;
+        self.private_pages.insert(pid);
+        Ok(pid)
+    }
+
+    fn alloc_internal_private(&mut self, generation: Lsn, first_child: PageId) -> Result<PageId> {
+        let pid = self.buf.alloc_internal(generation, first_child)?;
+        self.private_pages.insert(pid);
+        Ok(pid)
+    }
+
+    fn ensure_private(&mut self, pid: PageId, generation: Lsn) -> Result<PageId> {
+        if self.private_pages.contains(&pid) {
+            return Ok(pid);
+        }
+        let new_pid = self.buf.clone_private(pid, generation)?;
+        self.private_pages.insert(new_pid);
+        self.retired_pages.insert(pid);
+        Ok(new_pid)
+    }
+
+    fn free_detached(&mut self, pid: PageId, generation: Lsn) -> Result<()> {
+        if self.private_pages.remove(&pid) {
+            self.buf.free(pid, generation)?;
+        } else {
+            self.retired_pages.insert(pid);
+            self.buf.forget(pid);
+        }
+        Ok(())
+    }
+
+    fn make_path_private(
+        &mut self,
+        path: &[(PageId, usize, PageId)],
+        generation: Lsn,
+    ) -> Result<(PageId, Vec<(PageId, usize)>)> {
+        let mut current = self.ensure_private(self.root, generation)?;
+        self.root = current;
+        let mut private_path = Vec::with_capacity(path.len());
+        for &(_, slot, child) in path {
+            let private_child = self.ensure_private(child, generation)?;
+            internal_set_child(self.buf.modify(current, generation)?, slot, private_child);
+            private_path.push((current, slot));
+            current = private_child;
+        }
+        Ok((current, private_path))
+    }
+
     /// Persist every dirty page. Must be called before committing a
     /// new root pointer to the manifest.
     pub fn flush(&mut self) -> Result<()> {
         let result = self.buf.flush();
         self.finish_op(result)
+    }
+
+    /// Called after the manifest that points at this tree's current
+    /// root is durable. Pages copied away during the checkpoint window
+    /// can now be released; on crash before this point they remain
+    /// reachable from the old manifest or are reclaimed as orphans at
+    /// next open.
+    pub fn checkpoint_committed(&mut self, generation: Lsn) -> Result<()> {
+        let retired: Vec<PageId> = self.retired_pages.iter().copied().collect();
+        for pid in retired {
+            self.buf.free(pid, generation)?;
+            self.retired_pages.remove(&pid);
+        }
+        self.private_pages.clear();
+        self.finish_op(Ok(()))
     }
 
     // -------- read path --------------------------------------------------
@@ -234,7 +306,7 @@ impl BTree {
     pub fn insert(&mut self, key: u64, value: u32) -> Result<Option<u32>> {
         let generation = self.advance_gen();
         // Walk down from root, recording the path for upward split.
-        let mut path: Vec<(PageId, usize)> = Vec::new();
+        let mut path: Vec<(PageId, usize, PageId)> = Vec::new();
         let mut current = self.root;
         loop {
             let page_type = self.buf.read(current)?.header()?.page_type;
@@ -243,7 +315,7 @@ impl BTree {
                 PageType::L2pInternal => {
                     let slot = internal_search(self.buf.read(current)?, key);
                     let child = internal_child_at(self.buf.read(current)?, slot);
-                    path.push((current, slot));
+                    path.push((current, slot, child));
                     current = child;
                 }
                 other => {
@@ -256,7 +328,7 @@ impl BTree {
 
         // `current` is a leaf. Either overwrite in place (return old)
         // or insert new entry (possibly triggering split).
-        let leaf = current;
+        let (leaf, mut path) = self.make_path_private(&path, generation)?;
         match leaf_search(self.buf.read(leaf)?, key) {
             Ok(pos) => {
                 let old = leaf_value_at(self.buf.read(leaf)?, pos);
@@ -290,7 +362,7 @@ impl BTree {
         // half it belongs to after the split.
         let split_source = MAX_LEAF_ENTRIES / 2;
         let source_count = MAX_LEAF_ENTRIES;
-        let new_leaf = self.buf.alloc_leaf(generation)?;
+        let new_leaf = self.alloc_leaf_private(generation)?;
         // Copy entries [split_source..source_count] from leaf to new_leaf.
         // Then insert the new entry either into leaf (left) or new_leaf (right).
         let src_bytes = {
@@ -363,7 +435,7 @@ impl BTree {
         }
         // Fell off the root: grow the tree by one level.
         let old_root = self.root;
-        let new_root = self.buf.alloc_internal(generation, old_root)?;
+        let new_root = self.alloc_internal_private(generation, old_root)?;
         internal_insert(
             self.buf.modify(new_root, generation)?,
             0,
@@ -423,7 +495,7 @@ impl BTree {
         }
 
         // Build a new internal with the right half.
-        let new_parent = self.buf.alloc_internal(generation, right_children[0])?;
+        let new_parent = self.alloc_internal_private(generation, right_children[0])?;
         for (i, k) in right_keys.iter().enumerate() {
             internal_insert(
                 self.buf.modify(new_parent, generation)?,
@@ -441,7 +513,7 @@ impl BTree {
     pub fn delete(&mut self, key: u64) -> Result<Option<u32>> {
         let generation = self.advance_gen();
         // Walk down to the leaf, recording the path.
-        let mut path: Vec<(PageId, usize)> = Vec::new();
+        let mut path: Vec<(PageId, usize, PageId)> = Vec::new();
         let mut current = self.root;
         loop {
             let page_type = self.buf.read(current)?.header()?.page_type;
@@ -450,7 +522,7 @@ impl BTree {
                 PageType::L2pInternal => {
                     let slot = internal_search(self.buf.read(current)?, key);
                     let child = internal_child_at(self.buf.read(current)?, slot);
-                    path.push((current, slot));
+                    path.push((current, slot, child));
                     current = child;
                 }
                 other => {
@@ -466,6 +538,7 @@ impl BTree {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
+        let (leaf, path) = self.make_path_private(&path, generation)?;
         let old = leaf_value_at(self.buf.read(leaf)?, pos);
         leaf_remove(self.buf.modify(leaf, generation)?, pos)?;
 
@@ -519,6 +592,8 @@ impl BTree {
             if let Some(lidx) = left_idx {
                 let left_sibling = internal_child_at(self.buf.read(parent)?, lidx);
                 if self.can_borrow_from(left_sibling, page_type)? {
+                    let left_sibling = self.ensure_private(left_sibling, generation)?;
+                    internal_set_child(self.buf.modify(parent, generation)?, lidx, left_sibling);
                     self.borrow_from_left(parent, child_slot, left_sibling, child, generation)?;
                     return Ok(());
                 }
@@ -526,6 +601,8 @@ impl BTree {
             if let Some(ridx) = right_idx {
                 let right_sibling = internal_child_at(self.buf.read(parent)?, ridx);
                 if self.can_borrow_from(right_sibling, page_type)? {
+                    let right_sibling = self.ensure_private(right_sibling, generation)?;
+                    internal_set_child(self.buf.modify(parent, generation)?, ridx, right_sibling);
                     self.borrow_from_right(parent, child_slot, child, right_sibling, generation)?;
                     return Ok(());
                 }
@@ -536,6 +613,8 @@ impl BTree {
                 let left_sibling = internal_child_at(self.buf.read(parent)?, lidx);
                 // Merge `child` into `left_sibling`, drop the separator
                 // at `lidx`, drop `child`'s slot from the parent.
+                let left_sibling = self.ensure_private(left_sibling, generation)?;
+                internal_set_child(self.buf.modify(parent, generation)?, lidx, left_sibling);
                 self.merge_into_left(parent, child_slot, left_sibling, child, generation)?;
             } else if let Some(ridx) = right_idx {
                 let right_sibling = internal_child_at(self.buf.read(parent)?, ridx);
@@ -563,7 +642,7 @@ impl BTree {
                 let only_child = internal_child_at(self.buf.read(self.root)?, 0);
                 let old_root = self.root;
                 self.root = only_child;
-                self.buf.free(old_root, generation)?;
+                self.free_detached(old_root, generation)?;
             }
         }
         Ok(())
@@ -719,7 +798,7 @@ impl BTree {
         }
         // Remove the separator and the right child pointer from parent.
         internal_remove(self.buf.modify(parent, generation)?, sep_idx)?;
-        self.buf.free(right_page, generation)?;
+        self.free_detached(right_page, generation)?;
         // `internal_set_first_child` is irrelevant: left_page is already
         // at the correct slot, we just shortened the parent by one.
         let _ = internal_set_first_child;

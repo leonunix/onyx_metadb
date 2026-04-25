@@ -14,6 +14,7 @@
 //! parent's slot is nulled out. Root is never freed — its level stays
 //! pinned for the lifetime of the tree.
 
+use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -176,6 +177,8 @@ pub struct PagedL2p {
     root: PageId,
     root_level: u8,
     next_gen: Lsn,
+    private_pages: HashSet<PageId>,
+    retired_pages: HashSet<PageId>,
 }
 
 impl PagedL2p {
@@ -202,6 +205,8 @@ impl PagedL2p {
             root,
             root_level: 0,
             next_gen: 2,
+            private_pages: HashSet::new(),
+            retired_pages: HashSet::new(),
         })
     }
 
@@ -230,6 +235,8 @@ impl PagedL2p {
             root,
             root_level,
             next_gen,
+            private_pages: HashSet::new(),
+            retired_pages: HashSet::new(),
         })
     }
 
@@ -263,6 +270,64 @@ impl PagedL2p {
     /// inspection, etc.).
     pub fn page_store(&self) -> &Arc<PageStore> {
         self.buf.page_store()
+    }
+
+    fn alloc_leaf_private(&mut self, generation: Lsn) -> Result<PageId> {
+        let pid = self.buf.alloc_leaf(generation)?;
+        self.private_pages.insert(pid);
+        Ok(pid)
+    }
+
+    fn alloc_index_private(&mut self, generation: Lsn, level: u8) -> Result<PageId> {
+        let pid = self.buf.alloc_index(generation, level)?;
+        self.private_pages.insert(pid);
+        Ok(pid)
+    }
+
+    fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
+        let effective_rc = self.buf.effective_rc(pid)?;
+        if self.private_pages.contains(&pid) && effective_rc <= 1 {
+            return Ok(pid);
+        }
+        if effective_rc <= 1 {
+            let already_touched_by_lsn = self.buf.read(pid)?.generation() >= lsn;
+            if already_touched_by_lsn {
+                let new_pid = self.buf.cow_for_write(pid, lsn)?;
+                if new_pid != pid {
+                    self.private_pages.insert(new_pid);
+                }
+                return Ok(new_pid);
+            }
+            let new_pid = self.buf.clone_private(pid, lsn)?;
+            self.private_pages.insert(new_pid);
+            self.retired_pages.insert(pid);
+            return Ok(new_pid);
+        }
+        let new_pid = self.buf.cow_for_write(pid, lsn)?;
+        if new_pid != pid {
+            self.private_pages.insert(new_pid);
+        }
+        Ok(new_pid)
+    }
+
+    fn free_detached(&mut self, pid: PageId, generation: Lsn) -> Result<()> {
+        if self.private_pages.remove(&pid) {
+            self.buf.free(pid, generation)?;
+        } else {
+            self.retired_pages.insert(pid);
+            self.buf.forget(pid);
+        }
+        Ok(())
+    }
+
+    pub fn checkpoint_committed(&mut self, generation: Lsn) -> Result<()> {
+        let retired: Vec<PageId> = self.retired_pages.iter().copied().collect();
+        for pid in retired {
+            self.buf.free(pid, generation)?;
+            self.retired_pages.remove(&pid);
+        }
+        self.private_pages.clear();
+        self.finish_op(Ok(()))
     }
 
     /// Run the structural checker over the whole tree.
@@ -450,7 +515,7 @@ impl PagedL2p {
         }
 
         // COW walk down. Missing slots get freshly-allocated children.
-        let new_root = self.buf.cow_for_write(self.root, lsn)?;
+        let new_root = self.cow_for_write(self.root, lsn)?;
         let mut current = new_root;
         let mut level = self.root_level;
         while level > 0 {
@@ -464,9 +529,9 @@ impl PagedL2p {
                 // with a missing slot in an index that didn't exist
                 // yet — this branch therefore leaves the flag at false).
                 if level == 1 {
-                    self.buf.alloc_leaf(lsn)?
+                    self.alloc_leaf_private(lsn)?
                 } else {
-                    self.buf.alloc_index(lsn, level - 1)?
+                    self.alloc_index_private(lsn, level - 1)?
                 }
             } else {
                 if level == 1 {
@@ -478,7 +543,7 @@ impl PagedL2p {
                     // the decision before that mutation.
                     leaf_was_shared = self.buf.effective_rc(child)? > 1;
                 }
-                self.buf.cow_for_write(child, lsn)?
+                self.cow_for_write(child, lsn)?
             };
             index_set_child(self.buf.modify(current, lsn)?, slot, new_child);
             current = new_child;
@@ -567,7 +632,7 @@ impl PagedL2p {
         // never reaches `level == 1`.
         let mut leaf_was_shared = self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
 
-        let new_root = self.buf.cow_for_write(self.root, lsn)?;
+        let new_root = self.cow_for_write(self.root, lsn)?;
         let mut current = new_root;
         let mut level = self.root_level;
         // Record (parent_pid, slot_in_parent) for upward pruning.
@@ -584,7 +649,7 @@ impl PagedL2p {
                 // point the insert path uses.
                 leaf_was_shared = self.buf.effective_rc(child)? > 1;
             }
-            let new_child = self.buf.cow_for_write(child, lsn)?;
+            let new_child = self.cow_for_write(child, lsn)?;
             index_set_child(self.buf.modify(current, lsn)?, slot, new_child);
             path.push((current, slot));
             current = new_child;
@@ -612,7 +677,9 @@ impl PagedL2p {
             // any upstream shared-page deltas flow through the
             // pending_rc accumulator committed at op end.
             if free_empty_pages {
-                self.buf.free(empty_id, lsn)?;
+                self.free_detached(empty_id, lsn)?;
+            } else if self.private_pages.contains(&empty_id) {
+                self.free_detached(empty_id, lsn)?;
             }
             index_set_child(self.buf.modify(parent, lsn)?, slot_in_parent, NULL_PAGE);
             if index_child_count(self.buf.read(parent)?) == 0 {
@@ -652,7 +719,7 @@ impl PagedL2p {
             )));
         }
         let new_level = self.root_level + 1;
-        let new_root = self.buf.alloc_index(generation, new_level)?;
+        let new_root = self.alloc_index_private(generation, new_level)?;
         // `index_set_child` doesn't touch refcounts; the old root moves
         // from being pointed to by "the live tree" to being pointed to
         // by the new root at slot 0 — same single live-tree parent.
@@ -885,6 +952,9 @@ impl PagedL2p {
     pub fn reset_root(&mut self, root: PageId, level: u8) {
         self.root = root;
         self.root_level = level;
+        self.private_pages.clear();
+        self.retired_pages.clear();
+        self.buf.forget_all();
     }
 
     /// Swap the tree's root to a foreign page that is already durable on
@@ -909,6 +979,8 @@ impl PagedL2p {
             )));
         }
         self.buf.forget_all();
+        self.private_pages.clear();
+        self.retired_pages.clear();
         self.root = pid;
         self.root_level = level;
         Ok(())

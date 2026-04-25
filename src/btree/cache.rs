@@ -96,6 +96,18 @@ impl PageBuf {
         }
     }
 
+    /// Allocate a fresh page id and copy `src` into it as a private
+    /// dirty page. The source page is left untouched; callers use this
+    /// to path-copy protected checkpoint pages before mutating them.
+    pub fn clone_private(&mut self, src: PageId, generation: Lsn) -> Result<PageId> {
+        let new_pid = self.page_store.allocate()?;
+        let mut page = self.read(src)?.clone();
+        page.set_generation(generation);
+        page.set_refcount(1);
+        self.pages.insert(new_pid, Slot::Dirty(page));
+        Ok(new_pid)
+    }
+
     /// Allocate a brand-new leaf page, initialize its header, cache as
     /// dirty, and return its page id. Stamps `page.generation = 0`;
     /// see [`modify`](Self::modify) for why.

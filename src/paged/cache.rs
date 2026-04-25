@@ -177,6 +177,18 @@ impl PageBuf {
         }
     }
 
+    /// Allocate a fresh page id and copy `src` into it as a private
+    /// dirty page. The source page and its on-disk refcount are left
+    /// untouched; the tree layer uses this for checkpoint shadowing.
+    pub fn clone_private(&mut self, src: PageId, generation: Lsn) -> Result<PageId> {
+        let new_pid = self.page_store.allocate()?;
+        let mut page = self.read(src)?.clone();
+        page.set_generation(generation);
+        page.set_refcount(1);
+        self.pages_insert(new_pid, Slot::Dirty(page));
+        Ok(new_pid)
+    }
+
     /// Allocate a fresh leaf, initialize it, cache as dirty. Stamps
     /// `page.generation = 0` so the WAL-apply idempotency guard treats
     /// newly-allocated tree pages as untouched by any WAL op.

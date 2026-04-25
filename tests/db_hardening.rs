@@ -142,6 +142,44 @@ fn manifest_swap_crash_reclaims_orphans_on_open() {
 }
 
 #[test]
+fn flush_before_manifest_fault_does_not_checkpoint_refcount_in_place() {
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    {
+        let db = Db::create_with_faults(dir.path(), faults.clone()).unwrap();
+
+        let mut tx = db.begin();
+        tx.l2p_remap(0, 0, remap_val(195, 1), None);
+        tx.commit().unwrap();
+        db.flush().unwrap();
+
+        db.range_delete(0, 0, 1).unwrap();
+        assert_eq!(db.get(0, 0).unwrap(), None);
+        assert_eq!(db.get_refcount(195).unwrap(), 0);
+
+        faults.install(
+            FaultPoint::FlushPostLevelRewriteBeforeManifest,
+            1,
+            FaultAction::Error,
+        );
+        assert!(db.flush().is_err());
+    }
+
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(db.get(0, 0).unwrap(), None);
+    assert_eq!(db.get_refcount(195).unwrap(), 0);
+    drop(db);
+
+    let report = verify_path(dir.path(), VerifyOptions { strict: true }).unwrap();
+    assert!(
+        report.is_clean(),
+        "verifier issues: {:?}, warnings: {:?}",
+        report.issues,
+        report.warnings
+    );
+}
+
+#[test]
 fn snapshot_checkpoint_does_not_drop_unflushed_dedup_rows() {
     let dir = TempDir::new().unwrap();
     {

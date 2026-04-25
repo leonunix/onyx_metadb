@@ -556,7 +556,6 @@ impl Db {
                 _ => {
                     let outcome = apply_op_bare(
                         &volumes,
-                        &manifest.snapshots,
                         &refcount_shards,
                         &dedup_index,
                         &dedup_reverse,
@@ -629,6 +628,8 @@ impl Db {
             refresh_manifest_entries(&mut manifest, &sorted, &l2p_guards, &refcount_guards)?;
             manifest.checkpoint_lsn = last_applied;
             manifest_store.commit(&manifest)?;
+            commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
+            commit_refcount_checkpoint(&mut refcount_guards, last_applied.max(1) + 1)?;
 
             dedup_index.free_old_level_heads(&old_dedup_heads, dedup_generation)?;
             dedup_reverse.free_old_level_heads(&old_dedup_reverse_heads, dedup_generation)?;
@@ -760,6 +761,8 @@ impl Db {
         manifest_state.manifest.checkpoint_lsn = wal_checkpoint;
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
+        commit_l2p_checkpoint(&mut l2p_guards, tree_generation)?;
+        commit_refcount_checkpoint(&mut refcount_guards, tree_generation)?;
         self.finish_dedup_manifest_update(dedup_update, tree_generation)?;
         Ok(())
     }
@@ -842,10 +845,8 @@ impl Db {
         lsn: Lsn,
         op: &WalOp,
     ) -> Result<ApplyOutcome> {
-        let snapshots = self.manifest_state.lock().manifest.snapshots.clone();
         let outcome = apply_op_bare(
             volumes,
-            &snapshots,
             &self.refcount_shards,
             &self.dedup_index,
             &self.dedup_reverse,
@@ -1522,6 +1523,8 @@ impl Db {
         manifest_state.manifest.next_snapshot_id = next_snapshot_id;
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
+        commit_l2p_checkpoint(&mut l2p_guards, created_lsn)?;
+        commit_refcount_checkpoint(&mut refcount_guards, created_lsn)?;
         self.finish_dedup_manifest_update(dedup_update, created_lsn)?;
         Ok(id)
     }
@@ -1627,7 +1630,7 @@ impl Db {
         let _apply_guard = self.apply_gate.write();
         let _view_guard = self.snapshot_views.write();
 
-        let (entry, other_snapshots, same_volume_other_snapshots) = {
+        let (entry, other_snapshots) = {
             let manifest_state = self.manifest_state.lock();
             let Some(entry) = manifest_state
                 .manifest
@@ -1645,12 +1648,7 @@ impl Db {
                 .filter(|snapshot| snapshot.id != id)
                 .cloned()
                 .collect::<Vec<_>>();
-            let same_volume_others = others
-                .iter()
-                .filter(|snapshot| snapshot.vol_ord == entry.vol_ord)
-                .cloned()
-                .collect::<Vec<_>>();
-            (entry, others, same_volume_others)
+            (entry, others)
         };
         // v6 SnapshotEntry no longer carries refcount state (Phase 6.5b
         // retired it), so there's nothing to assert about refcount here.
@@ -1710,6 +1708,8 @@ impl Db {
             mstate.store.commit(&manifest)?;
             dedup_update
         };
+        commit_l2p_checkpoint(&mut l2p_guards, dedup_generation)?;
+        commit_refcount_checkpoint(&mut refcount_guards, dedup_generation)?;
         self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
 
         // Locate the source volume's shard range within l2p_guards.
@@ -1764,17 +1764,7 @@ impl Db {
         // sequential decrefs.
         let mut pending: HashMap<Pba, u32> = HashMap::new();
         let mut pba_decrefs: Vec<Pba> = Vec::with_capacity(raw_pba_decrefs.len());
-        for (lba, value) in raw_pba_decrefs {
-            if snapshot_still_maps_value_excluding(
-                &same_volume_other_snapshots,
-                &self.page_store,
-                id,
-                entry.vol_ord,
-                lba,
-                value,
-            )? {
-                continue;
-            }
+        for (_lba, value) in raw_pba_decrefs {
             let pba = value.head_pba();
             let sid = shard_for_key(&self.refcount_shards, pba);
             let rc = refcount_guards[sid].get(pba)?.unwrap_or(0);
@@ -1872,7 +1862,6 @@ impl Db {
         let volumes_map = self.volumes.read().clone();
         let outcome = apply_op_bare(
             &volumes_map,
-            &self.manifest_state.lock().manifest.snapshots.clone(),
             &self.refcount_shards,
             &self.dedup_index,
             &self.dedup_reverse,
@@ -1935,7 +1924,7 @@ impl Db {
 
     /// Bulk L2P delete over `[start, end)` for one volume. The
     /// plan-apply path mirrors [`drop_snapshot`](Self::drop_snapshot):
-    /// take `drop_gate.read()` + `apply_gate.write()`, scan the range
+    /// take `drop_gate.write()` + `apply_gate.write()`, scan the range
     /// to build the `(lba, head_pba(value))` `captured` list, submit a
     /// `WalOp::L2pRangeDelete` (auto-split when the scan exceeds
     /// [`MAX_RANGE_DELETE_CAPTURED`]), and apply inline under the held
@@ -1957,7 +1946,7 @@ impl Db {
         if start >= end {
             return Ok(self.last_applied_lsn());
         }
-        let _drop_guard = self.drop_gate.read();
+        let _drop_guard = self.drop_gate.write();
         let _apply_guard = self.apply_gate.write();
 
         let volume = self.volume(vol_ord)?;
@@ -2017,7 +2006,6 @@ impl Db {
 
             let _outcome = apply_op_bare(
                 &volumes_map,
-                &self.manifest_state.lock().manifest.snapshots.clone(),
                 &self.refcount_shards,
                 &self.dedup_index,
                 &self.dedup_reverse,
@@ -2269,6 +2257,8 @@ impl Db {
             mstate.store.commit(&manifest)?;
             dedup_update
         };
+        commit_l2p_checkpoint(&mut l2p_guards, dedup_generation)?;
+        commit_refcount_checkpoint(&mut refcount_guards, dedup_generation)?;
         self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
         drop(l2p_guards);
         drop(refcount_guards);
@@ -2791,6 +2781,26 @@ fn flush_locked_l2p_shards(guards: &mut [MutexGuard<'_, PagedL2p>]) -> Result<()
     Ok(())
 }
 
+fn commit_l2p_checkpoint(
+    guards: &mut [MutexGuard<'_, PagedL2p>],
+    generation: Lsn,
+) -> Result<()> {
+    for tree in guards {
+        tree.checkpoint_committed(generation)?;
+    }
+    Ok(())
+}
+
+fn commit_refcount_checkpoint(
+    guards: &mut [MutexGuard<'_, BTree>],
+    generation: Lsn,
+) -> Result<()> {
+    for tree in guards {
+        tree.checkpoint_committed(generation)?;
+    }
+    Ok(())
+}
+
 fn validate_shard_count(shards_per_partition: u32) -> Result<usize> {
     let shard_count = usize::try_from(shards_per_partition)
         .map_err(|_| MetaDbError::InvalidArgument("shard count does not fit usize".into()))?;
@@ -2958,7 +2968,6 @@ pub(crate) fn decode_reverse_hash(key: &Hash32, value: &DedupValue) -> Hash32 {
 /// `Manifest`) and the live path (which owns a `Mutex<ManifestState>`).
 fn apply_op_bare(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
-    snapshots: &[SnapshotEntry],
     refcount_shards: &[Shard],
     dedup_index: &Lsm,
     dedup_reverse: &Lsm,
@@ -3042,9 +3051,7 @@ fn apply_op_bare(
             guard,
         } => apply_l2p_remap(
             volumes,
-            snapshots,
             refcount_shards,
-            page_store,
             lsn,
             *vol_ord,
             *lba,
@@ -3056,15 +3063,7 @@ fn apply_op_bare(
             start: _,
             end: _,
             captured,
-        } => apply_l2p_range_delete(
-            volumes,
-            snapshots,
-            refcount_shards,
-            page_store,
-            lsn,
-            *vol_ord,
-            captured,
-        ),
+        } => apply_l2p_range_delete(volumes, refcount_shards, lsn, *vol_ord, captured),
         WalOp::DropSnapshot {
             id: _,
             pages,
@@ -3118,9 +3117,7 @@ fn apply_op_bare(
 /// pbas.
 fn apply_l2p_remap(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
-    snapshots: &[SnapshotEntry],
     refcount_shards: &[Shard],
-    page_store: &Arc<PageStore>,
     lsn: Lsn,
     vol_ord: VolumeOrdinal,
     lba: Lba,
@@ -3165,21 +3162,8 @@ fn apply_l2p_remap(
     let outcome = tree.insert_at_lsn_with_share_info(lba, new_value, lsn)?;
     let prev = outcome.prev;
     let old_pba = prev.map(|p| p.head_pba());
-    let prev_eq_new = prev.is_some_and(|value| value == new_value);
-    let snapshot_holds_prev = prev
-        .map(|value| snapshot_still_maps_value(snapshots, page_store, vol_ord, lba, value))
-        .transpose()?
-        .unwrap_or(false);
-    let snapshot_holds_new =
-        snapshot_still_maps_value(snapshots, page_store, vol_ord, lba, new_value)?;
-
-    // PBA refcount tracks unique byte-values per (vol,lba) across live
-    // and snapshots. Removing live's previous value decrefs only when
-    // no snapshot still maps that exact 28-byte value. Adding live's new
-    // value increfs only when it is not already represented by live's
-    // previous value and not already represented by a snapshot.
-    let do_decref = prev.is_some() && !prev_eq_new && !snapshot_holds_prev;
-    let do_incref = !prev_eq_new && !snapshot_holds_new;
+    let do_decref = prev.is_some() && !outcome.leaf_was_shared && old_pba != Some(new_pba);
+    let do_incref = !(prev.is_some() && !outcome.leaf_was_shared && old_pba == Some(new_pba));
 
     // Collapse per-pba net delta before taking shard locks. Same-head-pba
     // overwrites can legitimately add and remove one logical version in the
@@ -3254,9 +3238,7 @@ fn apply_l2p_remap(
 /// the tree state at apply time.
 fn apply_l2p_range_delete(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
-    snapshots: &[SnapshotEntry],
     refcount_shards: &[Shard],
-    page_store: &Arc<PageStore>,
     lsn: Lsn,
     vol_ord: VolumeOrdinal,
     captured: &[(Lba, Pba)],
@@ -3320,12 +3302,7 @@ fn apply_l2p_range_delete(
                 // treat as "no decref" by setting suppress=true.
                 true
             };
-            let snapshot_holds_old = if let Some(prev_value) = outcome.prev {
-                snapshot_still_maps_value(snapshots, page_store, vol_ord, lba, prev_value)?
-            } else {
-                false
-            };
-            suppress_decref[idx] = outcome.prev.is_none() || shared || snapshot_holds_old;
+            suppress_decref[idx] = outcome.prev.is_none() || shared;
         }
     }
 
@@ -3366,61 +3343,6 @@ fn apply_l2p_range_delete(
     }
 
     Ok(ApplyOutcome::RangeDelete { freed_pbas })
-}
-
-fn snapshot_still_maps_value(
-    snapshots: &[SnapshotEntry],
-    page_store: &Arc<PageStore>,
-    vol_ord: VolumeOrdinal,
-    lba: Lba,
-    value: L2pValue,
-) -> Result<bool> {
-    for snapshot in snapshots
-        .iter()
-        .filter(|snapshot| snapshot.vol_ord == vol_ord)
-    {
-        if snapshot.l2p_shard_roots.is_empty() {
-            continue;
-        }
-        let sid = (xxh3_64(&lba.to_be_bytes()) as usize) % snapshot.l2p_shard_roots.len();
-        let root = snapshot.l2p_shard_roots[sid];
-        if root == crate::types::NULL_PAGE {
-            continue;
-        }
-        let mut tree = PagedL2p::open(page_store.clone(), root, 1)?;
-        if tree.get(lba)?.is_some_and(|candidate| candidate == value) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn snapshot_still_maps_value_excluding(
-    snapshots: &[SnapshotEntry],
-    page_store: &Arc<PageStore>,
-    excluded_id: SnapshotId,
-    vol_ord: VolumeOrdinal,
-    lba: Lba,
-    value: L2pValue,
-) -> Result<bool> {
-    for snapshot in snapshots
-        .iter()
-        .filter(|snapshot| snapshot.id != excluded_id && snapshot.vol_ord == vol_ord)
-    {
-        if snapshot.l2p_shard_roots.is_empty() {
-            continue;
-        }
-        let sid = (xxh3_64(&lba.to_be_bytes()) as usize) % snapshot.l2p_shard_roots.len();
-        let root = snapshot.l2p_shard_roots[sid];
-        if root == crate::types::NULL_PAGE {
-            continue;
-        }
-        let mut tree = PagedL2p::open(page_store.clone(), root, 1)?;
-        if tree.get(lba)?.is_some_and(|candidate| candidate == value) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn collect_paged_refcounts_for_roots(
