@@ -119,6 +119,15 @@ pub struct Db {
     /// just long enough to clone the `Arc<Volume>` out so shard mutexes
     /// can be acquired without keeping the map guard alive.
     drop_gate: RwLock<()>,
+    /// Per-volume cache of the oldest live snapshot's `created_lsn`.
+    /// `apply_l2p_remap` reads this to decide whether decref of a pba
+    /// might unmap content a live snapshot still pins (birth/death LSN
+    /// suppression — replaces the legacy "leaf-rc-suppress" rule).
+    /// Populated from `manifest.snapshots` at open and refreshed on
+    /// `take_snapshot` / `drop_snapshot` / `drop_volume`. A volume with
+    /// no live snapshot is absent from the map (sentinel for "no
+    /// suppression needed").
+    snap_lsn_cache: Mutex<BTreeMap<VolumeOrdinal, Lsn>>,
     /// Runtime cap on the volumes table size. Seeded from
     /// [`Config::max_volumes`] at create / open. `create_volume` refuses
     /// to mint a new ordinal once the live volume count hits this value.
@@ -365,6 +374,7 @@ impl Db {
             commit_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             drop_gate: RwLock::new(()),
+            snap_lsn_cache: Mutex::new(BTreeMap::new()),
             max_volumes: cfg.max_volumes,
             faults,
             db_path: cfg.path,
@@ -660,7 +670,7 @@ impl Db {
             }
         }
 
-        Ok(Self {
+        let db = Self {
             page_store,
             page_cache,
             manifest_state: Mutex::new(ManifestState {
@@ -677,10 +687,13 @@ impl Db {
             commit_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             drop_gate: RwLock::new(()),
+            snap_lsn_cache: Mutex::new(BTreeMap::new()),
             max_volumes: cfg.max_volumes,
             faults,
             db_path: cfg.path,
-        })
+        };
+        db.recompute_all_snap_lsns();
+        Ok(db)
     }
 
     /// Current cached manifest (as of the last durable manifest commit).
@@ -860,8 +873,20 @@ impl Db {
         // shared with the replay path. Lock order (apply_gate.read →
         // manifest_state) matches every other call site.
         if let WalOp::DropSnapshot { id, .. } = op {
-            let mut mstate = self.manifest_state.lock();
-            mstate.manifest.snapshots.retain(|s| s.id != *id);
+            let dropped_vol = {
+                let mut mstate = self.manifest_state.lock();
+                let dropped = mstate
+                    .manifest
+                    .snapshots
+                    .iter()
+                    .find(|s| s.id == *id)
+                    .map(|s| s.vol_ord);
+                mstate.manifest.snapshots.retain(|s| s.id != *id);
+                dropped
+            };
+            if let Some(vol) = dropped_vol {
+                self.recompute_snap_lsn(vol);
+            }
         }
         Ok(outcome)
     }
@@ -1512,6 +1537,20 @@ impl Db {
         commit_l2p_checkpoint(&mut l2p_guards, created_lsn)?;
         commit_refcount_checkpoint(&mut refcount_guards, created_lsn)?;
         self.finish_dedup_manifest_update(dedup_update, created_lsn)?;
+        // Refresh the per-volume oldest-snap-lsn cache with the new
+        // snapshot's `created_lsn`. Inline update — manifest_state is
+        // still held above, and `recompute_snap_lsn` would re-lock.
+        {
+            let mut cache = self.snap_lsn_cache.lock();
+            cache
+                .entry(vol_ord)
+                .and_modify(|l| {
+                    if created_lsn < *l {
+                        *l = created_lsn;
+                    }
+                })
+                .or_insert(created_lsn);
+        }
         Ok(id)
     }
 
@@ -1881,6 +1920,10 @@ impl Db {
             let mut mstate = self.manifest_state.lock();
             mstate.manifest.snapshots.retain(|s| s.id != id);
         }
+        // Source volume just lost a snap; recompute its oldest-snap-lsn
+        // entry. May go from Some(lsn) to None (last snap on this vol)
+        // or to a later lsn (the next-oldest survives).
+        self.recompute_snap_lsn(entry.vol_ord);
 
         {
             let mut applied = self.last_applied_lsn.lock();
@@ -2294,6 +2337,11 @@ impl Db {
             let mut mstate = self.manifest_state.lock();
             mstate.manifest.volumes.retain(|v| v.ord != vol_ord);
         }
+        // Volume is gone; drop any cached oldest-snap-lsn entry. Note:
+        // `drop_volume` rejects volumes with live snapshots (checked at
+        // entry), so the cache slot here is normally already empty —
+        // this is just defensive cleanup.
+        self.forget_snap_lsn(vol_ord);
 
         {
             let mut applied = self.last_applied_lsn.lock();
@@ -2500,6 +2548,63 @@ impl Db {
             .get(&vol_ord)
             .cloned()
             .ok_or_else(|| MetaDbError::InvalidArgument(format!("unknown volume ord {vol_ord}")))
+    }
+
+    /// Read-side: oldest live snapshot's `created_lsn` for `vol`, or
+    /// `None` if the volume has no live snapshot. Used by
+    /// [`apply_l2p_remap`] to gate decref decisions (birth/death LSN
+    /// suppression).
+    fn min_alive_snap_lsn(&self, vol: VolumeOrdinal) -> Option<Lsn> {
+        self.snap_lsn_cache.lock().get(&vol).copied()
+    }
+
+    /// Recompute the cache entry for `vol` from `manifest.snapshots`.
+    /// Callers must already hold a manifest lock or be in a state where
+    /// the snapshot list is stable for `vol` (typically `apply_gate` or
+    /// `drop_gate` write-side).
+    fn recompute_snap_lsn(&self, vol: VolumeOrdinal) {
+        let min = self
+            .manifest_state
+            .lock()
+            .manifest
+            .snapshots
+            .iter()
+            .filter(|s| s.vol_ord == vol)
+            .map(|s| s.created_lsn)
+            .min();
+        let mut cache = self.snap_lsn_cache.lock();
+        match min {
+            Some(l) => {
+                cache.insert(vol, l);
+            }
+            None => {
+                cache.remove(&vol);
+            }
+        }
+    }
+
+    /// Bulk-rebuild the cache from the current manifest. Used at open /
+    /// recovery and after batched lifecycle replay.
+    fn recompute_all_snap_lsns(&self) {
+        let mut by_vol: BTreeMap<VolumeOrdinal, Lsn> = BTreeMap::new();
+        for snap in &self.manifest_state.lock().manifest.snapshots {
+            by_vol
+                .entry(snap.vol_ord)
+                .and_modify(|l| {
+                    if snap.created_lsn < *l {
+                        *l = snap.created_lsn;
+                    }
+                })
+                .or_insert(snap.created_lsn);
+        }
+        let mut cache = self.snap_lsn_cache.lock();
+        cache.clear();
+        cache.extend(by_vol);
+    }
+
+    /// Drop the cache entry for `vol` (used by `drop_volume`).
+    fn forget_snap_lsn(&self, vol: VolumeOrdinal) {
+        self.snap_lsn_cache.lock().remove(&vol);
     }
 
     fn refcount_shard_for(&self, pba: Pba) -> usize {
