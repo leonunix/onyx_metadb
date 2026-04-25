@@ -26,7 +26,7 @@ use crate::testing::faults::{FaultController, FaultPoint};
 use crate::types::{Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, SnapshotId, VolumeOrdinal};
 
 /// Version of the current manifest body layout.
-pub const MANIFEST_BODY_VERSION: u32 = 6;
+pub const MANIFEST_BODY_VERSION: u32 = 7;
 
 // v6 body layout. The variable region begins at `OFF_V6_VARIABLE` and
 // holds, in order:
