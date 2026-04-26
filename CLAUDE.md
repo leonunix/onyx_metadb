@@ -27,10 +27,12 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
 | btree | `src/btree/` | COW B+tree，特化到 refcount（value = u32） |
 | lsm | `src/lsm/` | 固定长度记录 LSM：dedup_index + dedup_reverse |
 | cache | `src/cache.rs` | 统一 16 shard page cache（LRU，scan-resistant） |
+| metrics | `src/metrics.rs` | 运行时计数器/延迟累计，供 soak 和诊断脚本读取 |
 | recovery | `src/recovery.rs` | 打开时 WAL replay |
 | verify | `src/verify.rs` | 结构校验器 + offline audit（`metadb-verify` 的核心） |
 | testing | `src/testing/` | 故障注入点 + 共享 test harness |
-| bin | `src/bin/` | CLI 二进制（`metadb-verify` / `metadb-soak`） |
+| bin | `src/bin/` | CLI 二进制（verify / soak / bench / dump / replay） |
+| scripts | `scripts/` | 本地诊断脚本（如 `metadb_metrics_summary.py`） |
 
 ## 关键不变式（非显而易见的，动之前先读）
 
@@ -68,6 +70,9 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
   脏页不会被驱逐——因为它根本不在 cache 里。维护这条语义的是写路径和 flush 路径，
   别在读路径上加绕过。
 - 保持 **`get_bypass`** 给 LSM scan / compaction 用，避免热页被全表扫刷掉。
+- 当前只 pin L2P **index pages**（`cfg.index_pin_bytes`），leaf 仍走普通 LRU。不要把
+  leaf-pin 当作既定优化路线：除非 metrics 显示 leaf miss / leaf read latency 已经成为
+  主瓶颈，否则 leaf-pin 的生命周期复杂度通常大于收益。
 
 ### WAL / recovery
 
@@ -109,6 +114,18 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
   过几个小时**再 merge。怀疑 flaky 就停下来查根因，不要重跑看是否复现。
 - 新功能优先配一条 proptest 或 fault-injection 用例；没对应的测试，默认不接受。
 - 禁止为了让 soak 过去绕过校验（关 assert、放宽 invariant check）。
+
+### Soak / metrics 快速入口
+
+- `./dev.sh start 24h concurrent --restart-interval 2h --pipeline-depth 128`：
+  低频重启 + 高 pipeline 压力；`concurrent` 映射到 `--onyx-concurrent-mix`。
+- `METADB_SOAK_OPS_PER_CYCLE=1000000` 控制每个 cycle 的 op 数；`METADB_SOAK_THREADS`
+  控制 child worker 数；`METADB_SOAK_PIPELINE_DEPTH` 控制每 worker 预排队深度。
+- `./dev.sh metrics` tail 当前 run 的 `metrics.jsonl`。
+- `./dev.sh metrics-summary [run-dir|metrics.jsonl] [samples]` 把累计 counter 转成窗口内
+  `tx/s`、`logical ops/s`、WAL batch size、fsync、gate wait、cache hit/miss 和瓶颈提示。
+- 当前 small-tx soak 的主要用途是 crash / mutex / WAL 串行点暴露，不代表 Onyx flusher
+  批量 metadata commit 的最终吞吐上限。评估 30w IOPS 需要 batch metadata workload。
 
 ## 代码风格
 

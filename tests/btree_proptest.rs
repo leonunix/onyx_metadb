@@ -10,14 +10,17 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use onyx_metadb::btree::BTree;
+use onyx_metadb::btree::{BTree, RcEntry};
 use onyx_metadb::page_store::PageStore;
 use proptest::prelude::*;
 use tempfile::TempDir;
 
 #[allow(dead_code)]
-fn v_of(n: u8) -> u32 {
-    n as u32
+fn v_of(n: u8) -> RcEntry {
+    RcEntry {
+        rc: n as u32,
+        birth_lsn: 1,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -55,12 +58,12 @@ proptest! {
     #[test]
     fn tree_matches_btreemap(ops in proptest::collection::vec(arb_op(), 1..500)) {
         let (_d, mut tree) = mk_tree();
-        let mut reference: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut reference: BTreeMap<u64, RcEntry> = BTreeMap::new();
 
         for op in ops {
             match op {
                 Op::Insert(k, v) => {
-                    let value = v as u32;
+                    let value = v_of(v);
                     let tree_old = tree.insert(k, value).unwrap();
                     let ref_old = reference.insert(k, value);
                     prop_assert_eq!(tree_old, ref_old);
@@ -76,12 +79,12 @@ proptest! {
                     prop_assert_eq!(tree_got, ref_got);
                 }
                 Op::Range(lo, hi) => {
-                    let tree_range: Vec<(u64, u32)> = tree
+                    let tree_range: Vec<(u64, RcEntry)> = tree
                         .range(lo..hi)
                         .unwrap()
                         .collect::<Result<Vec<_>, _>>()
                         .unwrap();
-                    let ref_range: Vec<(u64, u32)> = reference
+                    let ref_range: Vec<(u64, RcEntry)> = reference
                         .range(lo..hi)
                         .map(|(k, v)| (*k, *v))
                         .collect();
@@ -95,12 +98,12 @@ proptest! {
         }
 
         // Final comparison of full state.
-        let tree_items: Vec<(u64, u32)> = tree
+        let tree_items: Vec<(u64, RcEntry)> = tree
             .range(..)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let ref_items: Vec<(u64, u32)> = reference.iter().map(|(k, v)| (*k, *v)).collect();
+        let ref_items: Vec<(u64, RcEntry)> = reference.iter().map(|(k, v)| (*k, *v)).collect();
         prop_assert_eq!(tree_items, ref_items);
     }
 }
@@ -119,7 +122,7 @@ proptest! {
         let path = dir.path().join("p.onyx_meta");
         let mut ps = Arc::new(PageStore::create(&path).unwrap());
         let mut tree = BTree::create(Arc::clone(&ps)).unwrap();
-        let mut reference: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut reference: BTreeMap<u64, RcEntry> = BTreeMap::new();
 
         for (i, op) in ops.into_iter().enumerate() {
             // Every 30 ops, force a flush + close + reopen.
@@ -135,18 +138,18 @@ proptest! {
                     TestCaseError::fail(format!("post-reopen invariants: {e}"))
                 })?;
                 // Full contents cross-check.
-                let items: Vec<(u64, u32)> = tree
+                let items: Vec<(u64, RcEntry)> = tree
                     .range(..)
                     .unwrap()
                     .collect::<Result<Vec<_>, _>>()
                     .unwrap();
-                let ref_items: Vec<(u64, u32)> =
+                let ref_items: Vec<(u64, RcEntry)> =
                     reference.iter().map(|(k, v)| (*k, *v)).collect();
                 prop_assert_eq!(items, ref_items);
             }
             match op {
                 Op::Insert(k, v) => {
-                    let value = v as u32;
+                    let value = v_of(v);
                     let tree_old = tree.insert(k, value).unwrap();
                     let ref_old = reference.insert(k, value);
                     prop_assert_eq!(tree_old, ref_old);
@@ -160,12 +163,12 @@ proptest! {
                     prop_assert_eq!(tree.get(k).unwrap(), reference.get(&k).copied());
                 }
                 Op::Range(lo, hi) => {
-                    let got: Vec<(u64, u32)> = tree
+                    let got: Vec<(u64, RcEntry)> = tree
                         .range(lo..hi)
                         .unwrap()
                         .collect::<Result<Vec<_>, _>>()
                         .unwrap();
-                    let want: Vec<(u64, u32)> =
+                    let want: Vec<(u64, RcEntry)> =
                         reference.range(lo..hi).map(|(k, v)| (*k, *v)).collect();
                     prop_assert_eq!(got, want);
                 }
@@ -180,12 +183,12 @@ proptest! {
         drop(ps);
         ps = Arc::new(PageStore::open(&path).unwrap());
         tree = BTree::open(Arc::clone(&ps), root, ng).unwrap();
-        let items: Vec<(u64, u32)> = tree
+        let items: Vec<(u64, RcEntry)> = tree
             .range(..)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let ref_items: Vec<(u64, u32)> =
+        let ref_items: Vec<(u64, RcEntry)> =
             reference.iter().map(|(k, v)| (*k, *v)).collect();
         prop_assert_eq!(items, ref_items);
         let _ = ps; // silence "unused assignment" warning on the final bind
@@ -209,7 +212,7 @@ fn deterministic_stress_matches_btreemap() {
         match choice {
             0 | 1 => {
                 let k: u64 = rng.r#gen::<u64>() % 1_000;
-                let v = rng.r#gen::<u8>() as u32;
+                let v = v_of(rng.r#gen::<u8>());
                 let tree_old = tree.insert(k, v).unwrap();
                 let ref_old = reference.insert(k, v);
                 assert_eq!(tree_old, ref_old);
@@ -231,11 +234,11 @@ fn deterministic_stress_matches_btreemap() {
 
     tree.check_invariants().unwrap();
 
-    let tree_items: Vec<(u64, u32)> = tree
+    let tree_items: Vec<(u64, RcEntry)> = tree
         .range(..)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let ref_items: Vec<(u64, u32)> = reference.iter().map(|(k, v)| (*k, *v)).collect();
+    let ref_items: Vec<(u64, RcEntry)> = reference.iter().map(|(k, v)| (*k, *v)).collect();
     assert_eq!(tree_items, ref_items);
 }

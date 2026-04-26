@@ -45,7 +45,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full rationale and architecture.
 | 6.5   | Bounded page cache (paged + LSM) | landed |
 | 8a    | Pre-integration hardening (crash injection + proptest scale-up + week-long `metadb-soak`) — **gates Phase 7** | in progress |
 | 7     | Integration with onyx-storage (adapter + migration tool) | blocked on 8a |
-| 8b    | Production polish (metrics, dumps, real-hardware soak) | parallel with / after 7 |
+| 8b    | Production polish (metrics, dumps, real-hardware soak) | initial runtime metrics landed; broader polish parallel with / after 7 |
 
 Current commits land on `main`. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for
 entry / exit criteria per phase.
@@ -58,31 +58,35 @@ into one WAL record + one fsync.
 ```rust
 let db = Db::create(path)?;                  // or Db::open
 let mut tx = db.begin();
-tx.insert(lba, l2p_value);
+tx.insert(0, lba, l2p_value);
 tx.incref_pba(pba, 1);
 tx.put_dedup(hash, dedup_value);
 tx.register_dedup_reverse(pba, hash);
 let lsn = tx.commit()?;                      // one WAL record, one fsync
 
 // Point reads
-let val: Option<L2pValue>   = db.get(lba)?;
+let val: Option<L2pValue>   = db.get(0, lba)?;
 let rc:  u32                = db.get_refcount(pba)?;
 let d:   Option<DedupValue> = db.get_dedup(&hash)?;
 
 // Batched reads (shard-aware / shared LSM drain + levels snapshot)
-let vals  = db.multi_get(&lbas)?;
+let vals  = db.multi_get(0, &lbas)?;
 let rcs   = db.multi_get_refcount(&pbas)?;
 let hits  = db.multi_get_dedup(&hashes)?;
 let revs  = db.multi_scan_dedup_reverse_for_pba(&dead_pbas)?;
 
 // Range scan (L2P only)
-for item in db.range(lba_lo..lba_hi)? { let (k, v) = item?; }
+for item in db.range(0, lba_lo..lba_hi)? { let (k, v) = item?; }
 
 // Snapshots (L2P only)
 let snap = db.take_snapshot(0)?;
 let view = db.snapshot_view(snap).unwrap();
 let diff = db.diff_with_current(snap)?;
 db.drop_snapshot(snap)?;
+
+// Diagnostics
+let cache = db.cache_stats();
+let metrics = db.metrics_snapshot();
 ```
 
 ## Layout
@@ -98,10 +102,14 @@ src/
   btree/            COW B+tree specialized to refcount (u32 value)
   lsm/              Fixed-record LSM (dedup_index + dedup_reverse)
   cache.rs          Unified 16-shard page cache (LRU, scan-resistant)
+  metrics.rs        Runtime counters and latency accumulators
   recovery.rs       WAL replay on open
   verify.rs         Structural verifier + offline audit backing metadb-verify
   testing/          Fault injection + shared test harness
-  bin/              CLI binaries (metadb-verify, metadb-soak, metadb-bench)
+  bin/              CLI binaries (verify, soak, bench, dump, replay)
+
+scripts/
+  metadb_metrics_summary.py  Summarize soak metrics.jsonl into rates / latency / hints
 
 docs/
   DESIGN.md         Architecture, on-disk formats, recovery semantics
@@ -121,6 +129,34 @@ cargo build --release
 
 Fault-injection tests and longer proptests are behind `#[ignore]`; run with
 `cargo test -- --ignored` when preparing a release.
+
+## Soak & diagnostics
+
+`dev.sh` wraps the standalone soak harness and keeps run artifacts under
+`.dev/soak/<timestamp>/`.
+
+```bash
+./dev.sh start 24h concurrent --restart-interval 2h --pipeline-depth 128
+./dev.sh metrics
+./dev.sh metrics-summary
+./dev.sh verify
+```
+
+Useful environment overrides:
+
+```bash
+METADB_SOAK_OPS_PER_CYCLE=1000000
+METADB_SOAK_THREADS=16
+METADB_SOAK_PIPELINE_DEPTH=128
+METADB_SOAK_FAULT_DENSITY_PCT=0
+METADB_SOAK_SNAPSHOTS=0
+```
+
+The small-transaction soak stresses crash safety, WAL group commit, lock
+ordering, and restart verification. It is intentionally not a substitute for
+the future Onyx flusher-style batch metadata workload; 30w-class frontend IOPS
+must be evaluated with batched metadata transactions on the target NVMe class
+hardware.
 
 ## License
 
