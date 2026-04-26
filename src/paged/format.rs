@@ -21,22 +21,37 @@
 //! an index page (or a leaf, if the tree only has one leaf's worth of
 //! data); its level lives in [`type_header_level`].
 //!
-//! # Leaf page layout (4 KiB)
+//! # Leaf page layout (4 KiB) — Onyx-aware compact format
+//!
+//! Onyx's packer puts consecutive LBAs into the same compression unit,
+//! so 8 of the 9 fields in `BlockmapValue` (everything except
+//! `offset_in_unit`) repeat across all LBAs in a unit. We exploit that
+//! by storing each unit's shared bytes once and a 3 B per-slot record
+//! that names the unit and the per-slot offset. See
+//! [`crate::paged::leaf_compact`] for the full scheme and rationale.
 //!
 //! ```text
-//!   [ 0.. 64]  shared page header (64 B; type = PagedLeaf)
-//!               - type_header[0]   level = 0
-//!               - key_count        number of set bits in bitmap
-//!   [64.. 80]  presence bitmap: 128 bits, little-endian within each byte
-//!                bit `i` is set ↔ entry `i` is populated
-//!   [80..3664] entries: 128 × 28 B = 3584 B
-//!                entry `i` lives at payload offset 16 + i*28
-//!   [3664..4032] padding (zeros; covered by CRC)
+//!   [  0.. 64]  shared page header (64 B; type = PagedLeaf)
+//!                 - type_header[0]   level = 0
+//!                 - key_count        number of set bits in bitmap
+//!   [ 64.. 80]  presence bitmap: 128 bits, LE within each byte
+//!                 bit `i` set ↔ slot `i` is populated
+//!   [ 80.. 81]  unit_count        u8 (live entries in unit dict)
+//!   [ 81.. 82]  format_version    u8 (= COMPACT_VERSION)
+//!   [ 82..466]  entries           128 × 3 B (slot-indexed dense array)
+//!                 entry @ slot s lives at payload offset 18 + s*3
+//!                   [0..1] unit_idx        u8
+//!                   [1..3] offset_in_unit  u16 BE
+//!                 unset slots are zero (caller must check bitmap)
+//!   [466..XXXX] unit dict         N × 26 B (variable, up to 139 units)
+//!   [XXXX..4032] padding (zeros; covered by CRC)
 //! ```
 //!
-//! Unset entries have their bitmap bit clear. Their 28-byte slot is
-//! zero-filled by invariant (we explicitly zero on delete and at
-//! allocation), which keeps the CRC story simple.
+//! Unset entry slots are zero by invariant: `leaf_clear` zeroes the 3 B
+//! record. Dead unit-dict entries (units no longer referenced by any
+//! live entry) accumulate until the dict fills up; at that point
+//! `leaf_set` triggers an in-place compaction that rebuilds the dict
+//! tightly. See [`leaf_compact::compact_in_place`].
 //!
 //! # Index page layout (4 KiB)
 //!
@@ -65,10 +80,14 @@
 use crate::config::PAGE_SIZE;
 use crate::error::{MetaDbError, Result};
 use crate::page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
+use crate::paged::leaf_compact;
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
-/// Bytes per entry in a leaf page. Matches `btree::L2P_VALUE_SIZE` on
-/// purpose so we can share the 28 B `L2pValue` type.
+/// Bytes per logical L2P value. Matches `btree::L2P_VALUE_SIZE` so the
+/// 28 B `L2pValue` byte buffer is shared. NOTE: in the compact leaf
+/// format an entry on disk is **3 B** (slot record) + a slice of the
+/// 26 B unit-dict entry — `LEAF_VALUE_SIZE` is the *logical* size of
+/// the reconstituted value, not the per-slot on-disk size.
 pub const LEAF_VALUE_SIZE: usize = 28;
 
 /// Entries per leaf. Chosen as a power of two so addressing is a pair
@@ -86,9 +105,6 @@ pub const LEAF_BITMAP_BYTES: usize = LEAF_ENTRY_COUNT / 8;
 
 /// Offset inside the payload where the bitmap starts.
 pub const LEAF_BITMAP_OFFSET: usize = 0;
-
-/// Offset inside the payload where the entries array starts.
-pub const LEAF_ENTRIES_OFFSET: usize = LEAF_BITMAP_OFFSET + LEAF_BITMAP_BYTES;
 
 /// Children per index page. Also a power of two; each level consumes
 /// 8 LBA-bits.
@@ -114,8 +130,12 @@ const _: () = {
     assert!(PAGE_PAYLOAD_SIZE == 4032);
     assert!(LEAF_ENTRY_COUNT == 128);
     assert!(LEAF_BITMAP_BYTES == 16);
-    assert!(LEAF_ENTRIES_OFFSET == 16);
-    assert!(LEAF_ENTRIES_OFFSET + LEAF_ENTRY_COUNT * LEAF_VALUE_SIZE <= PAGE_PAYLOAD_SIZE);
+    // Compact format invariants: bitmap+unit_count+version+entries fit
+    // and the worst-case unit dict (all 128 entries distinct) still
+    // leaves headroom inside the payload.
+    assert!(leaf_compact::COMPACT_HEADER_BYTES == 18);
+    assert!(leaf_compact::COMPACT_UNIT_DICT_OFFSET == 402);
+    assert!(leaf_compact::compact_size(LEAF_ENTRY_COUNT) <= PAGE_PAYLOAD_SIZE);
     assert!(INDEX_FANOUT == 256);
     assert!(INDEX_FANOUT * INDEX_CHILD_SIZE <= PAGE_PAYLOAD_SIZE);
     assert!(1u64.wrapping_shl(LEAF_SHIFT) == LEAF_ENTRY_COUNT as u64);
@@ -164,10 +184,13 @@ impl L2pValue {
 }
 
 /// Initialize a fresh empty leaf with `generation` stamped in the header.
-/// Caller must `seal()` before persisting.
+/// Caller must `seal()` before persisting. The compact-format version
+/// byte is written into the payload so a freshly-allocated leaf
+/// already passes `decode_at`'s version check.
 pub fn init_leaf(page: &mut Page, generation: Lsn) {
     page.bytes_mut().fill(0);
     page.write_header(&PageHeader::new(PageType::PagedLeaf, generation));
+    leaf_compact::init_payload(page.payload_mut());
     // Level byte is already zero after the fill; no extra write needed.
 }
 
@@ -228,31 +251,22 @@ pub fn leaf_bit_clear(page: &mut Page, i: usize) {
 }
 
 /// Read the value at entry `i` without consulting the bitmap. Returns
-/// `ZERO` for unset slots by invariant (delete zeroes the slot).
+/// `ZERO` for unset slots by invariant (clear zeroes the slot record).
+///
+/// O(1): one fixed-offset entry read + one fixed-offset unit-dict read.
 #[inline]
 pub fn leaf_value_at(page: &Page, i: usize) -> L2pValue {
     debug_assert!(i < LEAF_ENTRY_COUNT);
-    let off = LEAF_ENTRIES_OFFSET + i * LEAF_VALUE_SIZE;
-    let mut v = [0u8; LEAF_VALUE_SIZE];
-    v.copy_from_slice(&page.payload()[off..off + LEAF_VALUE_SIZE]);
-    L2pValue(v)
+    L2pValue(leaf_compact::payload_decode_at(page.payload(), i))
 }
 
-/// Overwrite the value at entry `i`. Does not touch the bitmap.
-#[inline]
-pub fn leaf_set_value(page: &mut Page, i: usize, v: &L2pValue) {
-    debug_assert!(i < LEAF_ENTRY_COUNT);
-    let off = LEAF_ENTRIES_OFFSET + i * LEAF_VALUE_SIZE;
-    page.payload_mut()[off..off + LEAF_VALUE_SIZE].copy_from_slice(&v.0);
-}
-
-/// Zero the value bytes at entry `i`. Called on delete so a CRC over the
-/// page doesn't capture stale content.
+/// Zero the 3 B entry record at slot `i`. Does not touch the bitmap or
+/// the unit dictionary. Called from `leaf_clear` so a CRC over the page
+/// doesn't capture stale entry bytes.
 #[inline]
 pub fn leaf_zero_value(page: &mut Page, i: usize) {
     debug_assert!(i < LEAF_ENTRY_COUNT);
-    let off = LEAF_ENTRIES_OFFSET + i * LEAF_VALUE_SIZE;
-    page.payload_mut()[off..off + LEAF_VALUE_SIZE].fill(0);
+    leaf_compact::zero_entry(page.payload_mut(), i);
 }
 
 /// Number of set bits, read from the page header. Maintained by
@@ -263,18 +277,41 @@ pub fn leaf_entry_count(page: &Page) -> u16 {
 }
 
 /// Set entry `i` to `v`. Returns the previous value if the slot was
-/// set, `None` otherwise. Updates the bitmap and the header counter.
+/// set, `None` otherwise. Updates the bitmap and the page header
+/// counter; finds or appends the unit-dict record matching `v` and
+/// writes the 3 B per-slot record.
+///
+/// If the unit dict is full when a new unit would be appended, this
+/// function runs `compact_in_place` to drop dead unit entries and
+/// retries. In the worst case (every live entry references a distinct
+/// unit and the dict is already at the payload ceiling) the retry will
+/// also fail; this can only happen if the leaf has more than 139 live
+/// distinct units, which exceeds the 128-slot leaf invariant — so the
+/// retry is guaranteed to succeed and we panic on failure as a hard
+/// invariant violation.
 pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Option<L2pValue> {
     debug_assert!(i < LEAF_ENTRY_COUNT);
-    let was_set = leaf_bit_set(page, i);
+    let was_set = leaf_compact::payload_bit_set(page.payload(), i);
     let old = if was_set {
-        Some(leaf_value_at(page, i))
+        Some(L2pValue(leaf_compact::payload_decode_at(page.payload(), i)))
     } else {
         None
     };
-    leaf_set_value(page, i, v);
+
+    let (unit, entry) = leaf_compact::decompose_value(&v.0);
+    let unit_idx = match leaf_compact::find_or_append_unit(page.payload_mut(), &unit) {
+        Some(idx) => idx,
+        None => {
+            // Dict is full of (mostly dead) entries. Reclaim and retry.
+            leaf_compact::compact_in_place(page.payload_mut());
+            leaf_compact::find_or_append_unit(page.payload_mut(), &unit)
+                .expect("compact_in_place freed enough room for one unit")
+        }
+    };
+    leaf_compact::write_entry(page.payload_mut(), i, unit_idx, &entry);
+
     if !was_set {
-        leaf_bit_set_true(page, i);
+        leaf_compact::payload_bit_set_true(page.payload_mut(), i);
         let n = page.key_count().wrapping_add(1);
         page.set_key_count(n);
     }
@@ -282,15 +319,21 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Option<L2pValue> {
 }
 
 /// Clear entry `i`. Returns the previous value if the slot was set,
-/// `None` otherwise. Updates the bitmap and the header counter.
+/// `None` otherwise. Updates the bitmap and the page header counter.
+///
+/// The unit dict is intentionally **not** modified — orphaning the unit
+/// would require renumbering every other entry that shares it. Dead
+/// units accumulate until the dict fills up; `leaf_set` then runs
+/// `compact_in_place` to reclaim them. This keeps the common-case
+/// clear path O(1).
 pub fn leaf_clear(page: &mut Page, i: usize) -> Option<L2pValue> {
     debug_assert!(i < LEAF_ENTRY_COUNT);
-    if !leaf_bit_set(page, i) {
+    if !leaf_compact::payload_bit_set(page.payload(), i) {
         return None;
     }
-    let old = leaf_value_at(page, i);
-    leaf_bit_clear(page, i);
-    leaf_zero_value(page, i);
+    let old = L2pValue(leaf_compact::payload_decode_at(page.payload(), i));
+    leaf_compact::payload_bit_clear(page.payload_mut(), i);
+    leaf_compact::zero_entry(page.payload_mut(), i);
     let n = page.key_count().saturating_sub(1);
     page.set_key_count(n);
     Some(old)
