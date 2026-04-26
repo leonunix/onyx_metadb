@@ -28,7 +28,7 @@ fn clean_db_passes_verifier() {
     let dir = TempDir::new().unwrap();
     let db = Db::create(dir.path()).unwrap();
     for i in 0..32u64 {
-        db.insert(0,i, l2p(i as u8)).unwrap();
+        db.insert(0, i, l2p(i as u8)).unwrap();
         db.put_dedup(h(10_000 + i), dval(i as u8)).unwrap();
         db.incref_pba(20_000 + i, 1).unwrap();
     }
@@ -55,7 +55,7 @@ fn crash_after_wal_before_apply_recovers_committed_tx() {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
             faults.install(FaultPoint::CommitPostWalBeforeApply, 1, FaultAction::Panic);
             let mut tx = db.begin();
-            tx.insert(0,1, l2p(9));
+            tx.insert(0, 1, l2p(9));
             tx.put_dedup(h(7), dval(7));
             tx.incref_pba(42, 2);
             let _ = tx.commit();
@@ -63,7 +63,7 @@ fn crash_after_wal_before_apply_recovers_committed_tx() {
     }));
 
     let db = Db::open(dir.path()).unwrap();
-    assert_eq!(db.get(0,1).unwrap(), Some(l2p(9)));
+    assert_eq!(db.get(0, 1).unwrap(), Some(l2p(9)));
     assert_eq!(db.get_dedup(&h(7)).unwrap(), Some(dval(7)));
     assert_eq!(db.get_refcount(42).unwrap(), 2);
 }
@@ -84,7 +84,7 @@ fn crash_after_apply_before_lsn_bump_does_not_double_apply_on_reopen() {
                 FaultAction::Panic,
             );
             let mut tx = db.begin();
-            tx.insert(0,1, l2p(1));
+            tx.insert(0, 1, l2p(1));
             tx.put_dedup(h(99), dval(9));
             tx.incref_pba(100, 2);
             let _ = tx.commit();
@@ -92,7 +92,7 @@ fn crash_after_apply_before_lsn_bump_does_not_double_apply_on_reopen() {
     }));
 
     let db = Db::open(dir.path()).unwrap();
-    assert_eq!(db.get(0,1).unwrap(), Some(l2p(1)));
+    assert_eq!(db.get(0, 1).unwrap(), Some(l2p(1)));
     assert_eq!(db.get_dedup(&h(99)).unwrap(), Some(dval(9)));
     assert_eq!(db.get_refcount(100).unwrap(), 7);
 }
@@ -108,12 +108,12 @@ fn manifest_swap_crash_reclaims_orphans_on_open() {
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
             for i in 0..64u64 {
-                db.insert(0,i, l2p(i as u8)).unwrap();
+                db.insert(0, i, l2p(i as u8)).unwrap();
                 db.put_dedup(h(i), dval(i as u8)).unwrap();
             }
             db.flush().unwrap();
             for i in 64..128u64 {
-                db.insert(0,i, l2p(i as u8)).unwrap();
+                db.insert(0, i, l2p(i as u8)).unwrap();
                 db.put_dedup(h(i), dval(i as u8)).unwrap();
             }
             faults.install(
@@ -127,7 +127,7 @@ fn manifest_swap_crash_reclaims_orphans_on_open() {
 
     let db = Db::open(dir.path()).unwrap();
     for i in 0..128u64 {
-        assert_eq!(db.get(0,i).unwrap(), Some(l2p(i as u8)));
+        assert_eq!(db.get(0, i).unwrap(), Some(l2p(i as u8)));
         assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dval(i as u8)));
     }
     drop(db);
@@ -234,7 +234,7 @@ fn drop_snapshot_crash_at_manifest_commit_preserves_refcount_consistency() {
             // multiple index/leaf pages so the snapshot genuinely shares
             // pages with the current tree (not just a single root).
             for i in 0..512u64 {
-                db.insert(0,i, l2p(i as u8)).unwrap();
+                db.insert(0, i, l2p(i as u8)).unwrap();
             }
             db.flush().unwrap();
 
@@ -262,7 +262,7 @@ fn drop_snapshot_crash_at_manifest_commit_preserves_refcount_consistency() {
     // tree structure implies.
     let db = Db::open(dir.path()).unwrap();
     for i in 0..512u64 {
-        assert_eq!(db.get(0,i).unwrap(), Some(l2p(i as u8)));
+        assert_eq!(db.get(0, i).unwrap(), Some(l2p(i as u8)));
     }
     drop(db);
 
@@ -353,7 +353,11 @@ fn drop_volume_crash_after_wal_before_apply_recovers() {
     }));
 
     let db = Db::open(dir.path()).unwrap();
-    assert_eq!(db.volumes(), vec![0], "dropped volume must be gone after recovery");
+    assert_eq!(
+        db.volumes(),
+        vec![0],
+        "dropped volume must be gone after recovery"
+    );
     drop(db);
 
     let report = verify_path(dir.path(), VerifyOptions::default()).unwrap();

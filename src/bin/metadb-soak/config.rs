@@ -42,6 +42,7 @@ struct ParentConfig {
     workload: Workload,
     snapshots_enabled: bool,
     restart_interval_secs: Option<u64>,
+    cleanup_batch_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +103,7 @@ impl ParentConfig {
         let mut workload = Workload::Onyx;
         let mut snapshots_enabled = true;
         let mut restart_interval_secs = None;
+        let mut cleanup_batch_size = DEFAULT_CLEANUP_BATCH_SIZE;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -157,6 +159,9 @@ impl ParentConfig {
                 "--metrics-interval-secs" => {
                     metrics_interval_secs = parse_u64(args.next(), "--metrics-interval-secs")?;
                 }
+                "--cleanup-batch-size" => {
+                    cleanup_batch_size = parse_u64(args.next(), "--cleanup-batch-size")? as usize;
+                }
                 "--event-verbosity" => {
                     event_verbosity = parse_event_verbosity(
                         &args
@@ -207,6 +212,7 @@ impl ParentConfig {
             workload,
             snapshots_enabled,
             restart_interval_secs,
+            cleanup_batch_size: cleanup_batch_size.max(1),
         })
     }
 }
@@ -219,6 +225,7 @@ struct ChildConfig {
     workload: Workload,
     metrics_path: Option<PathBuf>,
     metrics_interval_secs: u64,
+    cleanup_batch_size: usize,
 }
 
 impl ChildConfig {
@@ -234,6 +241,7 @@ impl ChildConfig {
         let mut workload = Workload::Legacy;
         let mut metrics_path = None;
         let mut metrics_interval_secs = 5u64;
+        let mut cleanup_batch_size = DEFAULT_CLEANUP_BATCH_SIZE;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -278,6 +286,9 @@ impl ChildConfig {
                 "--metrics-interval-secs" => {
                     metrics_interval_secs = parse_u64(args.next(), "--metrics-interval-secs")?;
                 }
+                "--cleanup-batch-size" => {
+                    cleanup_batch_size = parse_u64(args.next(), "--cleanup-batch-size")? as usize;
+                }
                 _ => return Err(format!("unknown child flag `{arg}`")),
             }
         }
@@ -301,6 +312,7 @@ impl ChildConfig {
             workload,
             metrics_path,
             metrics_interval_secs,
+            cleanup_batch_size: cleanup_batch_size.max(1),
         })
     }
 }

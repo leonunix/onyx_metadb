@@ -138,10 +138,7 @@ fn print_manifest_json(path: &Path, m: &Manifest, high_water: u64, last_applied:
     println!("  \"last_applied_lsn\": {last_applied},");
     println!("  \"high_water\": {high_water},");
     println!("  \"free_list_head\": {},", page_json(m.free_list_head));
-    println!(
-        "  \"next_volume_ord\": {},",
-        m.next_volume_ord
-    );
+    println!("  \"next_volume_ord\": {},", m.next_volume_ord);
     println!("  \"volumes\": [");
     for (i, vol) in m.volumes.iter().enumerate() {
         let comma = if i + 1 < m.volumes.len() { "," } else { "" };
@@ -565,9 +562,10 @@ fn parse_u64(arg: Option<&String>, name: &str) -> Result<u64, String> {
     let s = arg.ok_or_else(|| format!("missing `{name}` argument"))?;
     let trimmed = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
     match trimmed {
-        Some(hex) => u64::from_str_radix(hex, 16)
+        Some(hex) => u64::from_str_radix(hex, 16).map_err(|e| format!("invalid {name} `{s}`: {e}")),
+        None => s
+            .parse::<u64>()
             .map_err(|e| format!("invalid {name} `{s}`: {e}")),
-        None => s.parse::<u64>().map_err(|e| format!("invalid {name} `{s}`: {e}")),
     }
 }
 

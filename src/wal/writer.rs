@@ -36,7 +36,7 @@ use crate::error::{MetaDbError, Result};
 use crate::metrics::MetaMetrics;
 use crate::testing::faults::{FaultController, FaultPoint};
 use crate::types::Lsn;
-use crate::wal::record::{encode, WAL_HEADER_SIZE};
+use crate::wal::record::{WAL_HEADER_SIZE, encode};
 use crate::wal::segment::SegmentFile;
 
 /// Handle to the WAL writer thread. Clone-free by design — hand it

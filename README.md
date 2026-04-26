@@ -112,6 +112,7 @@ scripts/
   metadb_metrics_summary.py  Summarize soak metrics.jsonl into rates / latency / hints
 
 docs/
+  ASYNC_RECLAIM_PLAN.md  Post-soak plan for async discard / reclaim coalescing
   DESIGN.md         Architecture, on-disk formats, recovery semantics
   ROADMAP.md        Phased plan + per-phase exit criteria
   TESTING.md        Test strategy: proptest, invariants, fault injection

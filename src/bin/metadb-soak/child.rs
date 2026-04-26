@@ -19,6 +19,7 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
             )
         })
     });
+    let cleanup_batcher = Arc::new(CleanupBatcher::new(cfg.cleanup_batch_size));
 
     let (ack_tx, ack_rx) = crossbeam_channel::unbounded::<Ack>();
     let admin_ack_tx = ack_tx.clone();
@@ -30,8 +31,9 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
         let db = db.clone();
         let ack_tx = ack_tx.clone();
         let workload = cfg.workload;
+        let cleanup_batcher = cleanup_batcher.clone();
         worker_handles.push(thread::spawn(move || {
-            worker_main(tid, db, workload, job_rx, ack_tx)
+            worker_main(tid, db, workload, cleanup_batcher, job_rx, ack_tx)
         }));
     }
     drop(ack_tx);
@@ -64,6 +66,14 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
                 let verb = parts
                     .next()
                     .ok_or_else(|| "missing admin verb".to_string())?;
+                if verb != "METRICS" {
+                    if let Err(err) = cleanup_batcher.flush(&db) {
+                        admin_ack_tx
+                            .send(Ack::Error(id, err.to_string()))
+                            .map_err(|e| e.to_string())?;
+                        continue;
+                    }
+                }
                 let ack = match verb {
                     "FLUSH" => db.flush().map(|_| Ack::Ok(id)),
                     "REFCOUNT_SUM" => {
@@ -193,6 +203,7 @@ fn worker_main(
     _tid: usize,
     db: Arc<Db>,
     workload: Workload,
+    cleanup_batcher: Arc<CleanupBatcher>,
     rx: crossbeam_channel::Receiver<WorkerJob>,
     ack_tx: crossbeam_channel::Sender<Ack>,
 ) {
@@ -200,7 +211,7 @@ fn worker_main(
         match job {
             WorkerJob::Exec { id, op } => {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute_worker_op_ack(&db, &op, workload)
+                    execute_worker_op_ack(&db, &cleanup_batcher, &op, workload)
                 }));
                 match result {
                     Ok(Ok(Some(detail))) => {
@@ -240,7 +251,55 @@ fn write_ack_line(writer: &mut impl Write, ack: &Ack) -> std::io::Result<()> {
     writer.flush()
 }
 
-fn execute_worker_op(db: &Db, op: &WorkerOp) -> onyx_metadb::Result<()> {
+struct CleanupBatcher {
+    pending: Mutex<Vec<Pba>>,
+    batch_size: usize,
+}
+
+impl CleanupBatcher {
+    fn new(batch_size: usize) -> Self {
+        Self {
+            pending: Mutex::new(Vec::with_capacity(batch_size.min(4096))),
+            batch_size: batch_size.max(1),
+        }
+    }
+
+    fn push(&self, db: &Db, pba: Pba) -> onyx_metadb::Result<()> {
+        let batch = {
+            let mut pending = self.pending.lock();
+            pending.push(pba);
+            if pending.len() < self.batch_size {
+                return Ok(());
+            }
+            std::mem::take(&mut *pending)
+        };
+        self.cleanup(db, batch)
+    }
+
+    fn flush(&self, db: &Db) -> onyx_metadb::Result<()> {
+        let batch = {
+            let mut pending = self.pending.lock();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut *pending)
+        };
+        self.cleanup(db, batch)
+    }
+
+    fn cleanup(&self, db: &Db, mut batch: Vec<Pba>) -> onyx_metadb::Result<()> {
+        batch.sort_unstable();
+        batch.dedup();
+        db.cleanup_dedup_for_dead_pbas(&batch)?;
+        Ok(())
+    }
+}
+
+fn execute_worker_op(
+    db: &Db,
+    cleanup_batcher: &CleanupBatcher,
+    op: &WorkerOp,
+) -> onyx_metadb::Result<()> {
     match op.kind {
         WorkerOpKind::Insert(byte) => {
             db.insert(op.vol_ord, l2p_key(op.tid, op.slot), l2p_value(byte))?;
@@ -279,7 +338,7 @@ fn execute_worker_op(db: &Db, op: &WorkerOp) -> onyx_metadb::Result<()> {
                 .strip_prefix("applied freed=")
                 .and_then(|s| s.parse::<Pba>().ok())
             {
-                db.cleanup_dedup_for_dead_pbas(&[freed])?;
+                cleanup_batcher.push(db, freed)?;
             }
         }
         WorkerOpKind::OnyxRangeDelete { len } => {
@@ -294,7 +353,7 @@ fn execute_worker_op(db: &Db, op: &WorkerOp) -> onyx_metadb::Result<()> {
             tx.commit()?;
         }
         WorkerOpKind::OnyxCleanup { pba } => {
-            db.cleanup_dedup_for_dead_pbas(&[pba])?;
+            cleanup_batcher.push(db, pba)?;
         }
     }
     Ok(())
@@ -302,6 +361,7 @@ fn execute_worker_op(db: &Db, op: &WorkerOp) -> onyx_metadb::Result<()> {
 
 fn execute_worker_op_ack(
     db: &Db,
+    cleanup_batcher: &CleanupBatcher,
     op: &WorkerOp,
     workload: Workload,
 ) -> onyx_metadb::Result<Option<String>> {
@@ -324,7 +384,7 @@ fn execute_worker_op_ack(
                 ..
             } = outcomes[0]
             {
-                db.cleanup_dedup_for_dead_pbas(&[freed])?;
+                cleanup_batcher.push(db, freed)?;
             }
             if let Some(before) = before {
                 let after = db_refcount_sum(db)?;
@@ -352,7 +412,7 @@ fn execute_worker_op_ack(
                 ..
             } = outcomes[0]
             {
-                db.cleanup_dedup_for_dead_pbas(&[freed])?;
+                cleanup_batcher.push(db, freed)?;
             }
             if let Some(before) = before {
                 let after = db_refcount_sum(db)?;
@@ -368,7 +428,7 @@ fn execute_worker_op_ack(
             let before = (workload == Workload::Onyx)
                 .then(|| db_refcount_sum(db))
                 .transpose()?;
-            execute_worker_op(db, op)?;
+            execute_worker_op(db, cleanup_batcher, op)?;
             if let Some(before) = before {
                 let after = db_refcount_sum(db)?;
                 Ok(Some(format!("ok delta={}", after as i64 - before as i64)))
@@ -377,7 +437,7 @@ fn execute_worker_op_ack(
             }
         }
         _ => {
-            execute_worker_op(db, op)?;
+            execute_worker_op(db, cleanup_batcher, op)?;
             Ok(None)
         }
     }

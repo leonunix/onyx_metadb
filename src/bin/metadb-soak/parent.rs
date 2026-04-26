@@ -4,8 +4,8 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
     events.write(
         "start",
         &format!(
-            "seed={} threads={} pipeline_depth={}",
-            cfg.seed, cfg.threads, cfg.pipeline_depth
+            "seed={} threads={} pipeline_depth={} cleanup_batch_size={}",
+            cfg.seed, cfg.threads, cfg.pipeline_depth, cfg.cleanup_batch_size
         ),
     )?;
 

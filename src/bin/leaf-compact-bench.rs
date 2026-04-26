@@ -23,9 +23,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use onyx_metadb::paged::format::{LEAF_BITMAP_BYTES, LEAF_ENTRY_COUNT, LEAF_VALUE_SIZE};
-use onyx_metadb::paged::leaf_compact::{
-    DENSE_FOOTPRINT_BYTES, decode_all, decode_at, encode,
-};
+use onyx_metadb::paged::leaf_compact::{DENSE_FOOTPRINT_BYTES, decode_all, decode_at, encode};
 
 /// Build a 28 B `BlockmapValue` matching `onyx_storage::meta::schema::
 /// encode_blockmap_value`. Kept here because the production helper lives
@@ -257,12 +255,12 @@ fn main() {
     let sparse = build_sparse_leaf();
     let pathological = build_pathological_leaf();
 
-    bench_one_shape("uniform/1-unit",   &leaf1, iters);
-    bench_one_shape("uniform/2-unit",   &leaf2, iters);
-    bench_one_shape("uniform/4-unit",   &leaf4, iters);
-    bench_one_shape("uniform/8-unit",   &leaf8, iters);
-    bench_one_shape("uniform/16-unit",  &leaf16, iters);
-    bench_one_shape("uniform/32-unit",  &leaf32, iters);
+    bench_one_shape("uniform/1-unit", &leaf1, iters);
+    bench_one_shape("uniform/2-unit", &leaf2, iters);
+    bench_one_shape("uniform/4-unit", &leaf4, iters);
+    bench_one_shape("uniform/8-unit", &leaf8, iters);
+    bench_one_shape("uniform/16-unit", &leaf16, iters);
+    bench_one_shape("uniform/32-unit", &leaf32, iters);
     bench_one_shape("sparse/4-unit-50%", &sparse, iters);
     bench_one_shape("pathological/128", &pathological, iters);
 }

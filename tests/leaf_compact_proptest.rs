@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 use onyx_metadb::page::Page;
 use onyx_metadb::paged::format::{
-    LEAF_BITMAP_BYTES, LEAF_ENTRY_COUNT, LEAF_VALUE_SIZE, L2pValue, init_leaf, leaf_bit_set,
+    L2pValue, LEAF_BITMAP_BYTES, LEAF_ENTRY_COUNT, LEAF_VALUE_SIZE, init_leaf, leaf_bit_set,
     leaf_clear, leaf_entry_count, leaf_set, leaf_value_at,
 };
 use proptest::prelude::*;
@@ -126,8 +126,14 @@ fn check_against_oracle(
 
 #[derive(Debug, Clone)]
 enum Op {
-    Set { slot: usize, unit_id: u32, offset: u16 },
-    Clear { slot: usize },
+    Set {
+        slot: usize,
+        unit_id: u32,
+        offset: u16,
+    },
+    Clear {
+        slot: usize,
+    },
 }
 
 /// Pool size for unit IDs. Small enough that dedup hits dominate;

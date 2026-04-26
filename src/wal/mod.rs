@@ -26,7 +26,8 @@ pub use record::{
     DecodeError, WAL_HEADER_SIZE, WAL_MAX_BODY, WalRecordIter, WalRecordRef, decode, encode,
 };
 pub use segment::{
-    SegmentFile, list_segments, parse_segment_filename, read_segment, segment_filename,
+    SegmentFile, list_segments, parse_segment_filename, prune_segments, read_segment,
+    segment_filename,
 };
 pub use writer::Wal;
 

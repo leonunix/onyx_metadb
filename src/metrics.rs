@@ -35,6 +35,45 @@ pub struct MetaMetrics {
     wal_fsync_max_us: AtomicU64,
     wal_batch_records_max: AtomicU64,
     wal_batch_bytes_max: AtomicU64,
+
+    range_delete_calls: AtomicU64,
+    range_delete_success: AtomicU64,
+    range_delete_errors: AtomicU64,
+    range_delete_noop: AtomicU64,
+    range_delete_captured_entries: AtomicU64,
+    range_delete_chunks: AtomicU64,
+    range_delete_total_us: AtomicU64,
+    range_delete_total_max_us: AtomicU64,
+    range_delete_scan_us: AtomicU64,
+    range_delete_scan_max_us: AtomicU64,
+    range_delete_wal_us: AtomicU64,
+    range_delete_wal_max_us: AtomicU64,
+    range_delete_apply_wait_us: AtomicU64,
+    range_delete_apply_wait_max_us: AtomicU64,
+    range_delete_apply_us: AtomicU64,
+    range_delete_apply_max_us: AtomicU64,
+    range_delete_drop_gate_wait_us: AtomicU64,
+    range_delete_drop_gate_wait_max_us: AtomicU64,
+    range_delete_apply_gate_wait_us: AtomicU64,
+    range_delete_apply_gate_wait_max_us: AtomicU64,
+
+    cleanup_calls: AtomicU64,
+    cleanup_success: AtomicU64,
+    cleanup_errors: AtomicU64,
+    cleanup_noop: AtomicU64,
+    cleanup_pbas: AtomicU64,
+    cleanup_hashes_found: AtomicU64,
+    cleanup_forward_checks: AtomicU64,
+    cleanup_tombstones_emitted: AtomicU64,
+    cleanup_tx_ops: AtomicU64,
+    cleanup_total_us: AtomicU64,
+    cleanup_total_max_us: AtomicU64,
+    cleanup_scan_us: AtomicU64,
+    cleanup_scan_max_us: AtomicU64,
+    cleanup_forward_check_us: AtomicU64,
+    cleanup_forward_check_max_us: AtomicU64,
+    cleanup_commit_us: AtomicU64,
+    cleanup_commit_max_us: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -70,6 +109,43 @@ pub struct MetaMetricsSnapshot {
     pub wal_fsync_max_us: u64,
     pub wal_batch_records_max: u64,
     pub wal_batch_bytes_max: u64,
+    pub range_delete_calls: u64,
+    pub range_delete_success: u64,
+    pub range_delete_errors: u64,
+    pub range_delete_noop: u64,
+    pub range_delete_captured_entries: u64,
+    pub range_delete_chunks: u64,
+    pub range_delete_total_us: u64,
+    pub range_delete_total_max_us: u64,
+    pub range_delete_scan_us: u64,
+    pub range_delete_scan_max_us: u64,
+    pub range_delete_wal_us: u64,
+    pub range_delete_wal_max_us: u64,
+    pub range_delete_apply_wait_us: u64,
+    pub range_delete_apply_wait_max_us: u64,
+    pub range_delete_apply_us: u64,
+    pub range_delete_apply_max_us: u64,
+    pub range_delete_drop_gate_wait_us: u64,
+    pub range_delete_drop_gate_wait_max_us: u64,
+    pub range_delete_apply_gate_wait_us: u64,
+    pub range_delete_apply_gate_wait_max_us: u64,
+    pub cleanup_calls: u64,
+    pub cleanup_success: u64,
+    pub cleanup_errors: u64,
+    pub cleanup_noop: u64,
+    pub cleanup_pbas: u64,
+    pub cleanup_hashes_found: u64,
+    pub cleanup_forward_checks: u64,
+    pub cleanup_tombstones_emitted: u64,
+    pub cleanup_tx_ops: u64,
+    pub cleanup_total_us: u64,
+    pub cleanup_total_max_us: u64,
+    pub cleanup_scan_us: u64,
+    pub cleanup_scan_max_us: u64,
+    pub cleanup_forward_check_us: u64,
+    pub cleanup_forward_check_max_us: u64,
+    pub cleanup_commit_us: u64,
+    pub cleanup_commit_max_us: u64,
 }
 
 impl MetaMetrics {
@@ -110,6 +186,43 @@ impl MetaMetrics {
             wal_fsync_max_us: load(&self.wal_fsync_max_us),
             wal_batch_records_max: load(&self.wal_batch_records_max),
             wal_batch_bytes_max: load(&self.wal_batch_bytes_max),
+            range_delete_calls: load(&self.range_delete_calls),
+            range_delete_success: load(&self.range_delete_success),
+            range_delete_errors: load(&self.range_delete_errors),
+            range_delete_noop: load(&self.range_delete_noop),
+            range_delete_captured_entries: load(&self.range_delete_captured_entries),
+            range_delete_chunks: load(&self.range_delete_chunks),
+            range_delete_total_us: load(&self.range_delete_total_us),
+            range_delete_total_max_us: load(&self.range_delete_total_max_us),
+            range_delete_scan_us: load(&self.range_delete_scan_us),
+            range_delete_scan_max_us: load(&self.range_delete_scan_max_us),
+            range_delete_wal_us: load(&self.range_delete_wal_us),
+            range_delete_wal_max_us: load(&self.range_delete_wal_max_us),
+            range_delete_apply_wait_us: load(&self.range_delete_apply_wait_us),
+            range_delete_apply_wait_max_us: load(&self.range_delete_apply_wait_max_us),
+            range_delete_apply_us: load(&self.range_delete_apply_us),
+            range_delete_apply_max_us: load(&self.range_delete_apply_max_us),
+            range_delete_drop_gate_wait_us: load(&self.range_delete_drop_gate_wait_us),
+            range_delete_drop_gate_wait_max_us: load(&self.range_delete_drop_gate_wait_max_us),
+            range_delete_apply_gate_wait_us: load(&self.range_delete_apply_gate_wait_us),
+            range_delete_apply_gate_wait_max_us: load(&self.range_delete_apply_gate_wait_max_us),
+            cleanup_calls: load(&self.cleanup_calls),
+            cleanup_success: load(&self.cleanup_success),
+            cleanup_errors: load(&self.cleanup_errors),
+            cleanup_noop: load(&self.cleanup_noop),
+            cleanup_pbas: load(&self.cleanup_pbas),
+            cleanup_hashes_found: load(&self.cleanup_hashes_found),
+            cleanup_forward_checks: load(&self.cleanup_forward_checks),
+            cleanup_tombstones_emitted: load(&self.cleanup_tombstones_emitted),
+            cleanup_tx_ops: load(&self.cleanup_tx_ops),
+            cleanup_total_us: load(&self.cleanup_total_us),
+            cleanup_total_max_us: load(&self.cleanup_total_max_us),
+            cleanup_scan_us: load(&self.cleanup_scan_us),
+            cleanup_scan_max_us: load(&self.cleanup_scan_max_us),
+            cleanup_forward_check_us: load(&self.cleanup_forward_check_us),
+            cleanup_forward_check_max_us: load(&self.cleanup_forward_check_max_us),
+            cleanup_commit_us: load(&self.cleanup_commit_us),
+            cleanup_commit_max_us: load(&self.cleanup_commit_max_us),
         }
     }
 
@@ -198,6 +311,136 @@ impl MetaMetrics {
         self.wal_fsyncs.fetch_add(1, Ordering::Relaxed);
         record_duration(&self.wal_fsync_us, &self.wal_fsync_max_us, elapsed);
     }
+
+    pub(crate) fn record_range_delete_call(&self) {
+        self.range_delete_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_range_delete_success(&self, total: Duration) {
+        self.range_delete_success.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.range_delete_total_us,
+            &self.range_delete_total_max_us,
+            total,
+        );
+    }
+
+    pub(crate) fn record_range_delete_error(&self, total: Duration) {
+        self.range_delete_errors.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.range_delete_total_us,
+            &self.range_delete_total_max_us,
+            total,
+        );
+    }
+
+    pub(crate) fn record_range_delete_noop(&self) {
+        self.range_delete_noop.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_range_delete_scan(&self, elapsed: Duration, captured: usize) {
+        self.range_delete_captured_entries
+            .fetch_add(captured as u64, Ordering::Relaxed);
+        record_duration(
+            &self.range_delete_scan_us,
+            &self.range_delete_scan_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_range_delete_chunks(&self, chunks: usize) {
+        self.range_delete_chunks
+            .fetch_add(chunks as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_range_delete_wal(&self, elapsed: Duration) {
+        record_duration(
+            &self.range_delete_wal_us,
+            &self.range_delete_wal_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_range_delete_apply_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.range_delete_apply_wait_us,
+            &self.range_delete_apply_wait_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_range_delete_apply(&self, elapsed: Duration) {
+        record_duration(
+            &self.range_delete_apply_us,
+            &self.range_delete_apply_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_range_delete_drop_gate_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.range_delete_drop_gate_wait_us,
+            &self.range_delete_drop_gate_wait_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_range_delete_apply_gate_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.range_delete_apply_gate_wait_us,
+            &self.range_delete_apply_gate_wait_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_cleanup_call(&self, pbas: usize) {
+        self.cleanup_calls.fetch_add(1, Ordering::Relaxed);
+        self.cleanup_pbas.fetch_add(pbas as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cleanup_success(&self, total: Duration) {
+        self.cleanup_success.fetch_add(1, Ordering::Relaxed);
+        record_duration(&self.cleanup_total_us, &self.cleanup_total_max_us, total);
+    }
+
+    pub(crate) fn record_cleanup_error(&self, total: Duration) {
+        self.cleanup_errors.fetch_add(1, Ordering::Relaxed);
+        record_duration(&self.cleanup_total_us, &self.cleanup_total_max_us, total);
+    }
+
+    pub(crate) fn record_cleanup_noop(&self) {
+        self.cleanup_noop.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cleanup_scan(&self, elapsed: Duration, hashes_found: usize) {
+        self.cleanup_hashes_found
+            .fetch_add(hashes_found as u64, Ordering::Relaxed);
+        record_duration(&self.cleanup_scan_us, &self.cleanup_scan_max_us, elapsed);
+    }
+
+    pub(crate) fn record_cleanup_forward_check(&self, elapsed: Duration) {
+        self.cleanup_forward_checks.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.cleanup_forward_check_us,
+            &self.cleanup_forward_check_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_cleanup_tombstones(&self, forward_tombstones: usize, tx_ops: usize) {
+        self.cleanup_tombstones_emitted
+            .fetch_add(forward_tombstones as u64, Ordering::Relaxed);
+        self.cleanup_tx_ops
+            .fetch_add(tx_ops as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cleanup_commit(&self, elapsed: Duration) {
+        record_duration(
+            &self.cleanup_commit_us,
+            &self.cleanup_commit_max_us,
+            elapsed,
+        );
+    }
 }
 
 impl MetaMetricsSnapshot {
@@ -235,7 +478,44 @@ impl MetaMetricsSnapshot {
                 "\"wal_fsync_us\":{},",
                 "\"wal_fsync_max_us\":{},",
                 "\"wal_batch_records_max\":{},",
-                "\"wal_batch_bytes_max\":{}",
+                "\"wal_batch_bytes_max\":{},",
+                "\"range_delete_calls\":{},",
+                "\"range_delete_success\":{},",
+                "\"range_delete_errors\":{},",
+                "\"range_delete_noop\":{},",
+                "\"range_delete_captured_entries\":{},",
+                "\"range_delete_chunks\":{},",
+                "\"range_delete_total_us\":{},",
+                "\"range_delete_total_max_us\":{},",
+                "\"range_delete_scan_us\":{},",
+                "\"range_delete_scan_max_us\":{},",
+                "\"range_delete_wal_us\":{},",
+                "\"range_delete_wal_max_us\":{},",
+                "\"range_delete_apply_wait_us\":{},",
+                "\"range_delete_apply_wait_max_us\":{},",
+                "\"range_delete_apply_us\":{},",
+                "\"range_delete_apply_max_us\":{},",
+                "\"range_delete_drop_gate_wait_us\":{},",
+                "\"range_delete_drop_gate_wait_max_us\":{},",
+                "\"range_delete_apply_gate_wait_us\":{},",
+                "\"range_delete_apply_gate_wait_max_us\":{},",
+                "\"cleanup_calls\":{},",
+                "\"cleanup_success\":{},",
+                "\"cleanup_errors\":{},",
+                "\"cleanup_noop\":{},",
+                "\"cleanup_pbas\":{},",
+                "\"cleanup_hashes_found\":{},",
+                "\"cleanup_forward_checks\":{},",
+                "\"cleanup_tombstones_emitted\":{},",
+                "\"cleanup_tx_ops\":{},",
+                "\"cleanup_total_us\":{},",
+                "\"cleanup_total_max_us\":{},",
+                "\"cleanup_scan_us\":{},",
+                "\"cleanup_scan_max_us\":{},",
+                "\"cleanup_forward_check_us\":{},",
+                "\"cleanup_forward_check_max_us\":{},",
+                "\"cleanup_commit_us\":{},",
+                "\"cleanup_commit_max_us\":{}",
                 "}}"
             ),
             self.commit_attempts,
@@ -269,6 +549,43 @@ impl MetaMetricsSnapshot {
             self.wal_fsync_max_us,
             self.wal_batch_records_max,
             self.wal_batch_bytes_max,
+            self.range_delete_calls,
+            self.range_delete_success,
+            self.range_delete_errors,
+            self.range_delete_noop,
+            self.range_delete_captured_entries,
+            self.range_delete_chunks,
+            self.range_delete_total_us,
+            self.range_delete_total_max_us,
+            self.range_delete_scan_us,
+            self.range_delete_scan_max_us,
+            self.range_delete_wal_us,
+            self.range_delete_wal_max_us,
+            self.range_delete_apply_wait_us,
+            self.range_delete_apply_wait_max_us,
+            self.range_delete_apply_us,
+            self.range_delete_apply_max_us,
+            self.range_delete_drop_gate_wait_us,
+            self.range_delete_drop_gate_wait_max_us,
+            self.range_delete_apply_gate_wait_us,
+            self.range_delete_apply_gate_wait_max_us,
+            self.cleanup_calls,
+            self.cleanup_success,
+            self.cleanup_errors,
+            self.cleanup_noop,
+            self.cleanup_pbas,
+            self.cleanup_hashes_found,
+            self.cleanup_forward_checks,
+            self.cleanup_tombstones_emitted,
+            self.cleanup_tx_ops,
+            self.cleanup_total_us,
+            self.cleanup_total_max_us,
+            self.cleanup_scan_us,
+            self.cleanup_scan_max_us,
+            self.cleanup_forward_check_us,
+            self.cleanup_forward_check_max_us,
+            self.cleanup_commit_us,
+            self.cleanup_commit_max_us,
         )
     }
 }

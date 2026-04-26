@@ -123,13 +123,33 @@ impl Db {
     /// style helper in a later session. S3 keeps the entry-point
     /// signature minimal; freed_pba observability is S6 / S3 follow-up.
     pub fn range_delete(&self, vol_ord: VolumeOrdinal, start: Lba, end: Lba) -> Result<Lsn> {
+        let total_started = std::time::Instant::now();
+        self.metrics.record_range_delete_call();
         if start >= end {
+            self.metrics.record_range_delete_noop();
+            self.metrics
+                .record_range_delete_success(total_started.elapsed());
             return Ok(self.last_applied_lsn());
         }
-        let _drop_guard = self.drop_gate.write();
-        let _apply_guard = self.apply_gate.write();
 
-        let volume = self.volume(vol_ord)?;
+        let drop_gate_started = std::time::Instant::now();
+        let _drop_guard = self.drop_gate.write();
+        self.metrics
+            .record_range_delete_drop_gate_wait(drop_gate_started.elapsed());
+
+        let apply_gate_started = std::time::Instant::now();
+        let _apply_guard = self.apply_gate.write();
+        self.metrics
+            .record_range_delete_apply_gate_wait(apply_gate_started.elapsed());
+
+        let volume = match self.volume(vol_ord) {
+            Ok(volume) => volume,
+            Err(err) => {
+                self.metrics
+                    .record_range_delete_error(total_started.elapsed());
+                return Err(err);
+            }
+        };
         // Clone volume map up front — apply_op_bare needs it, and we
         // want to avoid holding `volumes.read()` across the WAL
         // submit + cvar wait pair (mirrors `commit_ops`).
@@ -141,7 +161,8 @@ impl Db {
         // audit semantics (distinct (V, lba, value_28B) tuples). Locks
         // are released before WAL submit so the submit path can rotate
         // segments / fsync without the shard mutex held.
-        let captured: Vec<(Lba, L2pValue)> = {
+        let scan_started = std::time::Instant::now();
+        let captured_result: Result<Vec<(Lba, L2pValue)>> = {
             let mut acc: Vec<(Lba, L2pValue)> = Vec::new();
             for shard in &volume.shards {
                 let mut tree = shard.tree.lock();
@@ -152,12 +173,31 @@ impl Db {
                 }
             }
             acc.sort_unstable_by_key(|(lba, _)| *lba);
-            acc
+            Ok(acc)
+        };
+        let captured_len = captured_result.as_ref().map_or(0, Vec::len);
+        self.metrics
+            .record_range_delete_scan(scan_started.elapsed(), captured_len);
+        let captured = match captured_result {
+            Ok(captured) => captured,
+            Err(err) => {
+                self.metrics
+                    .record_range_delete_error(total_started.elapsed());
+                return Err(err);
+            }
         };
 
         if captured.is_empty() {
+            self.metrics.record_range_delete_noop();
+            self.metrics
+                .record_range_delete_success(total_started.elapsed());
             return Ok(self.last_applied_lsn());
         }
+        self.metrics.record_range_delete_chunks(
+            captured
+                .chunks(crate::wal::op::MAX_RANGE_DELETE_CAPTURED)
+                .len(),
+        );
 
         // Phase 2: split into WAL records of at most
         // MAX_RANGE_DELETE_CAPTURED entries. Each chunk gets its own
@@ -174,20 +214,40 @@ impl Db {
                 captured: chunk.to_vec(),
             };
             let body = encode_body(std::slice::from_ref(&op));
-            let lsn = self.wal.submit(body)?;
-            self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
+            let wal_started = std::time::Instant::now();
+            let lsn = match self.wal.submit(body) {
+                Ok(lsn) => {
+                    self.metrics.record_range_delete_wal(wal_started.elapsed());
+                    lsn
+                }
+                Err(err) => {
+                    self.metrics.record_range_delete_wal(wal_started.elapsed());
+                    self.metrics
+                        .record_range_delete_error(total_started.elapsed());
+                    return Err(err);
+                }
+            };
+            if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
+                self.metrics
+                    .record_range_delete_error(total_started.elapsed());
+                return Err(err);
+            }
 
             // Under apply_gate.write no one else can apply, so the
             // cvar wait is defensive and usually passes immediately.
+            let wait_started = std::time::Instant::now();
             {
                 let mut applied = self.last_applied_lsn.lock();
                 while *applied + 1 < lsn {
                     self.commit_cvar.wait(&mut applied);
                 }
             }
+            self.metrics
+                .record_range_delete_apply_wait(wait_started.elapsed());
 
             let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
-            let _outcome = apply_op_bare(
+            let apply_started = std::time::Instant::now();
+            let apply_result = apply_op_bare(
                 &volumes_map,
                 &self.refcount_shards,
                 &self.dedup_index,
@@ -196,9 +256,24 @@ impl Db {
                 lsn,
                 &op,
                 &snap_lookup,
-            )?;
-            self.faults
-                .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
+            );
+            match apply_result {
+                Ok(_outcome) => self
+                    .metrics
+                    .record_range_delete_apply(apply_started.elapsed()),
+                Err(err) => {
+                    self.metrics
+                        .record_range_delete_apply(apply_started.elapsed());
+                    self.metrics
+                        .record_range_delete_error(total_started.elapsed());
+                    return Err(err);
+                }
+            }
+            if let Err(err) = self.faults.inject(FaultPoint::CommitPostApplyBeforeLsnBump) {
+                self.metrics
+                    .record_range_delete_error(total_started.elapsed());
+                return Err(err);
+            }
 
             {
                 let mut applied = self.last_applied_lsn.lock();
@@ -207,6 +282,8 @@ impl Db {
             }
             last_lsn = lsn;
         }
+        self.metrics
+            .record_range_delete_success(total_started.elapsed());
         Ok(last_lsn)
     }
 }

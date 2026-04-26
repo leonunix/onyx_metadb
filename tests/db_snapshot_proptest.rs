@@ -226,12 +226,12 @@ fn deterministic_snapshot_stress() {
             0..=9 => {
                 let k = rng.r#gen::<u64>() % 500;
                 let v = v_of(rng.r#gen::<u8>());
-                db.insert(0,k, v).unwrap();
+                db.insert(0, k, v).unwrap();
                 current.insert(k, v);
             }
             10..=13 => {
                 let k = rng.r#gen::<u64>() % 500;
-                let a = db.delete(0,k).unwrap();
+                let a = db.delete(0, k).unwrap();
                 let b = current.remove(&k);
                 assert_eq!(a, b);
             }

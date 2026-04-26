@@ -174,20 +174,54 @@ impl Db {
     /// Empty `pbas` returns [`last_applied_lsn`](Self::last_applied_lsn)
     /// without touching the WAL (mirrors [`range_delete`](Self::range_delete)).
     pub fn cleanup_dedup_for_dead_pbas(&self, pbas: &[Pba]) -> Result<Lsn> {
+        let total_started = std::time::Instant::now();
+        self.metrics.record_cleanup_call(pbas.len());
         if pbas.is_empty() {
+            self.metrics.record_cleanup_noop();
+            self.metrics.record_cleanup_success(total_started.elapsed());
             return Ok(self.last_applied_lsn());
         }
-        let hashes_per_pba = self.multi_scan_dedup_reverse_for_pba(pbas)?;
+
+        let scan_started = std::time::Instant::now();
+        let hashes_per_pba = match self.multi_scan_dedup_reverse_for_pba(pbas) {
+            Ok(hashes_per_pba) => {
+                let hashes_found = hashes_per_pba.iter().map(Vec::len).sum();
+                self.metrics
+                    .record_cleanup_scan(scan_started.elapsed(), hashes_found);
+                hashes_per_pba
+            }
+            Err(err) => {
+                self.metrics.record_cleanup_scan(scan_started.elapsed(), 0);
+                self.metrics.record_cleanup_error(total_started.elapsed());
+                return Err(err);
+            }
+        };
         let mut tx = self.begin();
+        let mut forward_tombstones = 0usize;
         for (pba, hashes) in pbas.iter().copied().zip(hashes_per_pba.into_iter()) {
             for hash in hashes {
                 // Only drop the forward entry if it still points at
                 // `pba`. Another writer may have re-registered `hash`
                 // against a newer pba in the interval between the
                 // plan-side scan and now — SPEC §4.5 race protection.
-                if let Some(entry) = self.get_dedup(&hash)? {
+                let check_started = std::time::Instant::now();
+                let entry = match self.get_dedup(&hash) {
+                    Ok(entry) => {
+                        self.metrics
+                            .record_cleanup_forward_check(check_started.elapsed());
+                        entry
+                    }
+                    Err(err) => {
+                        self.metrics
+                            .record_cleanup_forward_check(check_started.elapsed());
+                        self.metrics.record_cleanup_error(total_started.elapsed());
+                        return Err(err);
+                    }
+                };
+                if let Some(entry) = entry {
                     if entry.head_pba() == pba {
                         tx.delete_dedup(hash);
+                        forward_tombstones += 1;
                     }
                 }
                 // The reverse entry itself is always stale — regardless
@@ -195,10 +229,26 @@ impl Db {
                 tx.unregister_dedup_reverse(pba, hash);
             }
         }
+        self.metrics
+            .record_cleanup_tombstones(forward_tombstones, tx.len());
         if tx.is_empty() {
+            self.metrics.record_cleanup_noop();
+            self.metrics.record_cleanup_success(total_started.elapsed());
             return Ok(self.last_applied_lsn());
         }
-        tx.commit()
+        let commit_started = std::time::Instant::now();
+        match tx.commit() {
+            Ok(lsn) => {
+                self.metrics.record_cleanup_commit(commit_started.elapsed());
+                self.metrics.record_cleanup_success(total_started.elapsed());
+                Ok(lsn)
+            }
+            Err(err) => {
+                self.metrics.record_cleanup_commit(commit_started.elapsed());
+                self.metrics.record_cleanup_error(total_started.elapsed());
+                Err(err)
+            }
+        }
     }
 
     /// `true` if the dedup memtable has reached its freeze threshold.

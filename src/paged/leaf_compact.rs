@@ -595,8 +595,7 @@ pub fn decode_all(encoded: &[u8]) -> [Option<[u8; LEAF_VALUE_SIZE]>; LEAF_ENTRY_
             continue;
         }
         let off = entry_offset(slot);
-        let (unit_idx, entry) =
-            EntryDelta::read_from(&encoded[off..off + COMPACT_ENTRY_BYTES]);
+        let (unit_idx, entry) = EntryDelta::read_from(&encoded[off..off + COMPACT_ENTRY_BYTES]);
         if (unit_idx as usize) < units.len() {
             out[slot] = Some(compose(&units[unit_idx as usize], &entry));
         }
@@ -634,8 +633,14 @@ mod tests {
         v
     }
 
-    fn empty_leaf_input() -> ([u8; LEAF_BITMAP_BYTES], [[u8; LEAF_VALUE_SIZE]; LEAF_ENTRY_COUNT]) {
-        ([0u8; LEAF_BITMAP_BYTES], [[0u8; LEAF_VALUE_SIZE]; LEAF_ENTRY_COUNT])
+    fn empty_leaf_input() -> (
+        [u8; LEAF_BITMAP_BYTES],
+        [[u8; LEAF_VALUE_SIZE]; LEAF_ENTRY_COUNT],
+    ) {
+        (
+            [0u8; LEAF_BITMAP_BYTES],
+            [[0u8; LEAF_VALUE_SIZE]; LEAF_ENTRY_COUNT],
+        )
     }
 
     fn set(
@@ -756,17 +761,7 @@ mod tests {
         // well within the 4032 B leaf payload.
         let (mut bm, mut vals) = empty_leaf_input();
         for i in 0..LEAF_ENTRY_COUNT {
-            let v = bv(
-                0x3000 + i as u64,
-                1,
-                500,
-                4096,
-                1,
-                0,
-                i as u32,
-                0,
-                0,
-            );
+            let v = bv(0x3000 + i as u64, 1, 500, 4096, 1, 0, i as u32, 0, 0);
             set(&mut bm, &mut vals, i, v);
         }
         let enc = encode(&bm, &vals);
@@ -931,8 +926,14 @@ mod tests {
         let v1 = payload_decode_at(&p, 1);
         let v3 = payload_decode_at(&p, 3);
         // base_pba is the first 8 bytes of the value.
-        assert_eq!(u64::from_be_bytes(v1[0..8].try_into().unwrap()), 0x2000 + 0x100);
-        assert_eq!(u64::from_be_bytes(v3[0..8].try_into().unwrap()), 0x2000 + 0x300);
+        assert_eq!(
+            u64::from_be_bytes(v1[0..8].try_into().unwrap()),
+            0x2000 + 0x100
+        );
+        assert_eq!(
+            u64::from_be_bytes(v3[0..8].try_into().unwrap()),
+            0x2000 + 0x300
+        );
     }
 
     #[test]
@@ -1006,7 +1007,10 @@ mod tests {
         // a 129th *new* unit (must be done by re-using a slot we'll
         // first clear so we have a place to write). Skip the overflow
         // step if cap < LEAF_ENTRY_COUNT (impossible at PAGE_PAYLOAD_SIZE).
-        assert!(cap >= LEAF_ENTRY_COUNT, "regression: dict capacity dropped below 128");
+        assert!(
+            cap >= LEAF_ENTRY_COUNT,
+            "regression: dict capacity dropped below 128"
+        );
 
         // Now delete half the slots' entries. Their units stay in the
         // dict (dead). Then attempt to reuse those slots with NEW units.

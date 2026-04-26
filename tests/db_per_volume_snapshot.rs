@@ -58,11 +58,7 @@ fn snapshot_on_non_bootstrap_survives_reopen() {
 
     let db = Db::open(dir.path()).unwrap();
     assert_eq!(db.volumes(), vec![0, a]);
-    let entry = db
-        .snapshots()
-        .into_iter()
-        .find(|s| s.id == snap)
-        .unwrap();
+    let entry = db.snapshots().into_iter().find(|s| s.id == snap).unwrap();
     assert_eq!(entry.vol_ord, a);
 
     let view = db.snapshot_view(snap).unwrap();
@@ -114,7 +110,10 @@ fn snapshots_for_reports_only_target_volume() {
     on_a.sort_unstable();
     assert_eq!(on_a, vec![sa1, sa2]);
     assert_eq!(
-        db.snapshots_for(b).into_iter().map(|e| e.id).collect::<Vec<_>>(),
+        db.snapshots_for(b)
+            .into_iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>(),
         vec![sb1]
     );
 }

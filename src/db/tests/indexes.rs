@@ -93,6 +93,35 @@ fn iter_dedup_survives_flush_and_reopen() {
 }
 
 #[test]
+fn flush_prunes_checkpointed_wal_segments() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.wal_segment_bytes = 512;
+    let wal_dir = dir.path().join("wal");
+
+    {
+        let db = Db::create_with_config(cfg.clone()).unwrap();
+        for lba in 0..100u64 {
+            db.insert(0, lba, v(lba as u8)).unwrap();
+        }
+
+        let before = crate::wal::list_segments(&wal_dir).unwrap();
+        assert!(
+            before.len() > 1,
+            "small WAL segment size should force rotation"
+        );
+
+        db.flush().unwrap();
+
+        let after = crate::wal::list_segments(&wal_dir).unwrap();
+        assert_eq!(after.len(), 1, "checkpointed WAL segments should be pruned");
+    }
+
+    let db = Db::open_with_config(cfg).unwrap();
+    assert_eq!(db.get(0, 99).unwrap(), Some(v(99)));
+}
+
+#[test]
 fn range_stream_matches_range() {
     let (_d, db) = mk_db();
     for i in 0u64..20 {

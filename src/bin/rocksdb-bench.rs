@@ -137,7 +137,8 @@ impl BenchConfig {
             match arg.as_str() {
                 "--path" => {
                     path = Some(PathBuf::from(
-                        args.next().ok_or_else(|| "--path needs a value".to_string())?,
+                        args.next()
+                            .ok_or_else(|| "--path needs a value".to_string())?,
                     ));
                 }
                 "--reset" => reset = true,
@@ -145,20 +146,17 @@ impl BenchConfig {
                 "--threads" => threads = parse_u64(args.next(), "--threads")? as usize,
                 "--key-space" => key_space = parse_u64(args.next(), "--key-space")?,
                 "--prefill-keys" => prefill_keys = parse_u64(args.next(), "--prefill-keys")?,
-                "--prefill-bytes" => {
-                    prefill_bytes = parse_u64(args.next(), "--prefill-bytes")?
-                }
+                "--prefill-bytes" => prefill_bytes = parse_u64(args.next(), "--prefill-bytes")?,
                 "--prefill-batch-size" => {
-                    prefill_batch_size =
-                        parse_u64(args.next(), "--prefill-batch-size")? as usize
+                    prefill_batch_size = parse_u64(args.next(), "--prefill-batch-size")? as usize
                 }
                 "--batch-size" => batch_size = parse_u64(args.next(), "--batch-size")? as usize,
                 "--warmup-ops" => warmup_ops = parse_u64(args.next(), "--warmup-ops")?,
                 "--overwrite-pct" => overwrite_pct = parse_pct(args.next(), "--overwrite-pct")?,
-                "--dedup-hit-pct" => {
-                    dedup_hit_pct = parse_pct(args.next(), "--dedup-hit-pct")?
+                "--dedup-hit-pct" => dedup_hit_pct = parse_pct(args.next(), "--dedup-hit-pct")?,
+                "--cache-mb" => {
+                    cache_bytes = parse_u64(args.next(), "--cache-mb")? as usize * 1024 * 1024
                 }
-                "--cache-mb" => cache_bytes = parse_u64(args.next(), "--cache-mb")? as usize * 1024 * 1024,
                 "--seed" => seed = parse_u64(args.next(), "--seed")?,
                 "--reuse-existing" => reuse_existing = true,
                 "--skip-prefill" => skip_prefill = true,
@@ -472,8 +470,8 @@ fn run_meta_tx(cfg: &BenchConfig, db: Arc<RocksDb>) -> Result<BenchReport, Strin
                     }
                 }
 
-                let use_dedup_hit = !active_dedup.is_empty()
-                    && rng.gen_range(0..100u8) < thread_cfg.dedup_hit_pct;
+                let use_dedup_hit =
+                    !active_dedup.is_empty() && rng.gen_range(0..100u8) < thread_cfg.dedup_hit_pct;
 
                 let mapping = if use_dedup_hit {
                     let idx = active_dedup[rng.gen_range(0..active_dedup.len())];
@@ -501,7 +499,10 @@ fn run_meta_tx(cfg: &BenchConfig, db: Arc<RocksDb>) -> Result<BenchReport, Strin
                     });
                     let idx = dedup_entries.len() - 1;
                     active_dedup.push(idx);
-                    Mapping { pba, dedup_idx: idx }
+                    Mapping {
+                        pba,
+                        dedup_idx: idx,
+                    }
                 };
 
                 let start = Instant::now();
@@ -583,11 +584,7 @@ fn prefill_l2p(db: &RocksDb, count: u64, batch_size: usize) -> Result<PrefillSta
 }
 
 fn progress_interval(total: u64) -> u64 {
-    if total < 10 {
-        0
-    } else {
-        (total / 20).max(1)
-    }
+    if total < 10 { 0 } else { (total / 20).max(1) }
 }
 
 fn print_prefill_progress(backend: &str, done: u64, total: u64, elapsed: Duration) {
@@ -620,13 +617,17 @@ fn warmup_l2p_reads(
             let cf = db.cf_handle(CF_L2P).unwrap();
             barrier.wait();
             for _ in 0..warmup_ops {
-                let _ = db.get_pinned_cf(&cf, lba_key(rng.gen_range(0..key_space))).unwrap();
+                let _ = db
+                    .get_pinned_cf(&cf, lba_key(rng.gen_range(0..key_space)))
+                    .unwrap();
             }
         }));
     }
     barrier.wait();
     for handle in handles {
-        handle.join().map_err(|_| "warmup thread panicked".to_string())?;
+        handle
+            .join()
+            .map_err(|_| "warmup thread panicked".to_string())?;
     }
     Ok(())
 }
@@ -659,7 +660,9 @@ fn warmup_l2p_multi_reads(
     }
     barrier.wait();
     for handle in handles {
-        handle.join().map_err(|_| "warmup thread panicked".to_string())?;
+        handle
+            .join()
+            .map_err(|_| "warmup thread panicked".to_string())?;
     }
     Ok(())
 }
@@ -740,10 +743,14 @@ fn prepare_dir(path: &Path, reset: bool, _reuse_existing: bool) -> Result<(), St
     Ok(())
 }
 
-fn merge_worker_results(handles: Vec<thread::JoinHandle<WorkerResult>>) -> Result<WorkerResult, String> {
+fn merge_worker_results(
+    handles: Vec<thread::JoinHandle<WorkerResult>>,
+) -> Result<WorkerResult, String> {
     let mut merged = WorkerResult::default();
     for handle in handles {
-        let result = handle.join().map_err(|_| "benchmark worker panicked".to_string())?;
+        let result = handle
+            .join()
+            .map_err(|_| "benchmark worker panicked".to_string())?;
         merged.ops += result.ops;
         merged.items += result.items;
         merged.latencies_us.extend(result.latencies_us);
@@ -927,8 +934,14 @@ fn print_json(report: &BenchReport) {
     println!("  \"threads\": {},", report.threads);
     println!("  \"prefill_keys\": {},", report.prefill_keys);
     println!("  \"prefill_bytes\": {},", report.prefill_bytes);
-    println!("  \"prefill_elapsed_secs\": {:.6},", report.prefill_elapsed_secs);
-    println!("  \"prefill_ops_per_sec\": {:.6},", report.prefill_ops_per_sec);
+    println!(
+        "  \"prefill_elapsed_secs\": {:.6},",
+        report.prefill_elapsed_secs
+    );
+    println!(
+        "  \"prefill_ops_per_sec\": {:.6},",
+        report.prefill_ops_per_sec
+    );
     println!(
         "  \"prefill_bytes_per_sec\": {:.6},",
         report.prefill_bytes_per_sec

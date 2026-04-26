@@ -345,10 +345,7 @@ mod tests {
             ]);
             wal.submit(body1).unwrap();
             // Record 2: one op.
-            let body2 = encode_body(&[WalOp::L2pDelete {
-                vol_ord: 0,
-                lba: 1,
-            }]);
+            let body2 = encode_body(&[WalOp::L2pDelete { vol_ord: 0, lba: 1 }]);
             wal.submit(body2).unwrap();
             wal.shutdown().unwrap();
         }
@@ -387,10 +384,7 @@ mod tests {
         seg.sync_all().unwrap();
         drop(seg);
 
-        let err = replay_into(dir.path(), 1, |_lsn, _op| {
-            Ok(ApplyOutcome::Dedup)
-        })
-        .unwrap_err();
+        let err = replay_into(dir.path(), 1, |_lsn, _op| Ok(ApplyOutcome::Dedup)).unwrap_err();
         match err {
             MetaDbError::Corruption(msg) => {
                 assert!(
@@ -439,8 +433,7 @@ mod tests {
         assert!(out.torn_tail.is_some());
         truncate_torn_tail(dir.path(), &out).unwrap();
         // After truncation, re-running replay finds no torn tail.
-        let out2 =
-            replay_into(dir.path(), 1, |_lsn, _op| Ok(ApplyOutcome::Dedup)).unwrap();
+        let out2 = replay_into(dir.path(), 1, |_lsn, _op| Ok(ApplyOutcome::Dedup)).unwrap();
         assert_eq!(out2.record_count, 5);
         assert!(out2.torn_tail.is_none());
     }

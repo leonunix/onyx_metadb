@@ -16,6 +16,7 @@ DEFAULT_OPS_PER_CYCLE="${METADB_SOAK_OPS_PER_CYCLE:-10000}"
 DEFAULT_PIPELINE_DEPTH="${METADB_SOAK_PIPELINE_DEPTH:-1}"
 DEFAULT_THREADS="${METADB_SOAK_THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 DEFAULT_METRICS_INTERVAL_SECS="${METADB_SOAK_METRICS_INTERVAL_SECS:-5}"
+DEFAULT_CLEANUP_BATCH_SIZE="${METADB_SOAK_CLEANUP_BATCH_SIZE:-1024}"
 DEFAULT_FAULT_DENSITY_PCT="${METADB_SOAK_FAULT_DENSITY_PCT:-25}"
 DEFAULT_SEED="${METADB_SOAK_SEED:-1592625758}"
 DEFAULT_WORKLOAD="${METADB_SOAK_WORKLOAD:-onyx}"
@@ -201,6 +202,7 @@ parse_soak_run_args() {
     PARSED_RESTART_INTERVAL="$DEFAULT_RESTART_INTERVAL"
     PARSED_PIPELINE_DEPTH="$DEFAULT_PIPELINE_DEPTH"
     PARSED_METRICS_INTERVAL_SECS="$DEFAULT_METRICS_INTERVAL_SECS"
+    PARSED_CLEANUP_BATCH_SIZE="$DEFAULT_CLEANUP_BATCH_SIZE"
 
     local positional=()
     while [[ $# -gt 0 ]]; do
@@ -237,6 +239,17 @@ parse_soak_run_args() {
                 ;;
             --metrics-interval-secs=*)
                 PARSED_METRICS_INTERVAL_SECS="${1#*=}"
+                ;;
+            --cleanup-batch-size)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    echo "--cleanup-batch-size needs a value" >&2
+                    exit 1
+                fi
+                PARSED_CLEANUP_BATCH_SIZE="$1"
+                ;;
+            --cleanup-batch-size=*)
+                PARSED_CLEANUP_BATCH_SIZE="${1#*=}"
                 ;;
             -h|--help)
                 usage
@@ -276,7 +289,8 @@ cmd_start() {
     local restart_interval="${3:-$DEFAULT_RESTART_INTERVAL}"
     local pipeline_depth="${4:-$DEFAULT_PIPELINE_DEPTH}"
     local metrics_interval_secs="${5:-$DEFAULT_METRICS_INTERVAL_SECS}"
-    local duration_secs run_dir workload_flag events_flag snapshots_flag qroot qrun_dir qduration qops qpipeline qthreads qmetrics_interval qfault qseed qrestart qextra cmd
+    local cleanup_batch_size="${6:-$DEFAULT_CLEANUP_BATCH_SIZE}"
+    local duration_secs run_dir workload_flag events_flag snapshots_flag qroot qrun_dir qduration qops qpipeline qthreads qmetrics_interval qcleanup_batch qfault qseed qrestart qextra cmd
 
     if is_running; then
         echo "soak already running (pid $(cat "$PID_FILE"))"
@@ -300,12 +314,13 @@ cmd_start() {
     qpipeline="$(quote_shell_arg "$pipeline_depth")"
     qthreads="$(quote_shell_arg "$DEFAULT_THREADS")"
     qmetrics_interval="$(quote_shell_arg "$metrics_interval_secs")"
+    qcleanup_batch="$(quote_shell_arg "$cleanup_batch_size")"
     qfault="$(quote_shell_arg "$DEFAULT_FAULT_DENSITY_PCT")"
     qseed="$(quote_shell_arg "$DEFAULT_SEED")"
     qrestart="$(quote_shell_arg "$restart_interval")"
     qextra="$DEFAULT_EXTRA_ARGS"
 
-    cmd="cd $qroot && exec target/release/metadb-soak $qrun_dir --duration-secs $qduration --ops-per-cycle $qops --pipeline-depth $qpipeline --threads $qthreads --metrics-interval-secs $qmetrics_interval --fault-density-pct $qfault --seed $qseed $workload_flag $events_flag"
+    cmd="cd $qroot && exec target/release/metadb-soak $qrun_dir --duration-secs $qduration --ops-per-cycle $qops --pipeline-depth $qpipeline --threads $qthreads --metrics-interval-secs $qmetrics_interval --cleanup-batch-size $qcleanup_batch --fault-density-pct $qfault --seed $qseed $workload_flag $events_flag"
     if [[ -n "$snapshots_flag" ]]; then
         cmd="$cmd $snapshots_flag"
     fi
@@ -332,6 +347,7 @@ cmd_start() {
     echo "  workload: $workload"
     echo "  ops/cycle: $DEFAULT_OPS_PER_CYCLE"
     echo "  pipeline depth: $pipeline_depth"
+    echo "  cleanup batch: $cleanup_batch_size"
     echo "  metrics:  $run_dir/metrics.jsonl (${metrics_interval_secs}s)"
     echo "  events:   $DEFAULT_EVENT_VERBOSITY"
     echo "  snapshots: $DEFAULT_SNAPSHOTS_ENABLED"
@@ -359,9 +375,10 @@ cmd_restart() {
     local restart_interval="${3:-$DEFAULT_RESTART_INTERVAL}"
     local pipeline_depth="${4:-$DEFAULT_PIPELINE_DEPTH}"
     local metrics_interval_secs="${5:-$DEFAULT_METRICS_INTERVAL_SECS}"
+    local cleanup_batch_size="${6:-$DEFAULT_CLEANUP_BATCH_SIZE}"
     cmd_stop || true
     sleep 1
-    cmd_start "$duration" "$workload" "$restart_interval" "$pipeline_depth" "$metrics_interval_secs"
+    cmd_start "$duration" "$workload" "$restart_interval" "$pipeline_depth" "$metrics_interval_secs" "$cleanup_batch_size"
 }
 
 cmd_status() {
@@ -753,9 +770,9 @@ cmd_bench() {
 usage() {
     echo "Usage: $0 {start|stop|restart|status|logs|events|summary|verify|bench} [...]"
     echo ""
-    echo "  start   [duration] [workload] [--restart-interval 2h] [--pipeline-depth N] [--metrics-interval-secs N]  Start soak in background"
+    echo "  start   [duration] [workload] [--restart-interval 2h] [--pipeline-depth N] [--cleanup-batch-size N]  Start soak in background"
     echo "  stop                Stop the running soak"
-    echo "  restart [duration] [workload] [--restart-interval 2h] [--pipeline-depth N] [--metrics-interval-secs N]  Restart the soak"
+    echo "  restart [duration] [workload] [--restart-interval 2h] [--pipeline-depth N] [--cleanup-batch-size N]  Restart the soak"
     echo "  status              Show pid, run dir, summary path"
     echo "  logs                Tail the soak stdout/stderr log"
     echo "  events              Tail events.jsonl for the current run"
@@ -769,8 +786,8 @@ usage() {
     echo "  ./dev.sh start"
     echo "  ./dev.sh start 1h"
     echo "  ./dev.sh start 2h concurrent"
-    echo "  ./dev.sh start 24h concurrent --restart-interval 2h --pipeline-depth 128"
-    echo "  METADB_SOAK_RESTART_INTERVAL=2h METADB_SOAK_OPS_PER_CYCLE=1000000 METADB_SOAK_PIPELINE_DEPTH=128 ./dev.sh start 24h concurrent"
+    echo "  ./dev.sh start 24h concurrent --restart-interval 2h --pipeline-depth 128 --cleanup-batch-size 1024"
+    echo "  METADB_SOAK_RESTART_INTERVAL=2h METADB_SOAK_OPS_PER_CYCLE=1000000 METADB_SOAK_PIPELINE_DEPTH=128 METADB_SOAK_CLEANUP_BATCH_SIZE=1024 ./dev.sh start 24h concurrent"
     echo "  ./dev.sh restart 7d"
     echo "  ./dev.sh status"
     echo "  ./dev.sh logs"
@@ -789,6 +806,7 @@ usage() {
     echo "  METADB_SOAK_PIPELINE_DEPTH=$DEFAULT_PIPELINE_DEPTH"
     echo "  METADB_SOAK_THREADS=$DEFAULT_THREADS"
     echo "  METADB_SOAK_METRICS_INTERVAL_SECS=$DEFAULT_METRICS_INTERVAL_SECS"
+    echo "  METADB_SOAK_CLEANUP_BATCH_SIZE=$DEFAULT_CLEANUP_BATCH_SIZE"
     echo "  METADB_SOAK_FAULT_DENSITY_PCT=$DEFAULT_FAULT_DENSITY_PCT"
     echo "  METADB_SOAK_SEED=$DEFAULT_SEED"
     echo "  METADB_SOAK_WORKLOAD=$DEFAULT_WORKLOAD        # legacy|onyx|concurrent"
@@ -813,13 +831,13 @@ case "${1:-}" in
     start)
         shift
         parse_soak_run_args "$@"
-        cmd_start "$PARSED_DURATION" "$PARSED_WORKLOAD" "$PARSED_RESTART_INTERVAL" "$PARSED_PIPELINE_DEPTH" "$PARSED_METRICS_INTERVAL_SECS"
+        cmd_start "$PARSED_DURATION" "$PARSED_WORKLOAD" "$PARSED_RESTART_INTERVAL" "$PARSED_PIPELINE_DEPTH" "$PARSED_METRICS_INTERVAL_SECS" "$PARSED_CLEANUP_BATCH_SIZE"
         ;;
     stop)    cmd_stop ;;
     restart)
         shift
         parse_soak_run_args "$@"
-        cmd_restart "$PARSED_DURATION" "$PARSED_WORKLOAD" "$PARSED_RESTART_INTERVAL" "$PARSED_PIPELINE_DEPTH" "$PARSED_METRICS_INTERVAL_SECS"
+        cmd_restart "$PARSED_DURATION" "$PARSED_WORKLOAD" "$PARSED_RESTART_INTERVAL" "$PARSED_PIPELINE_DEPTH" "$PARSED_METRICS_INTERVAL_SECS" "$PARSED_CLEANUP_BATCH_SIZE"
         ;;
     status)  cmd_status ;;
     logs)    cmd_logs ;;

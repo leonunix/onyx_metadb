@@ -289,10 +289,7 @@ impl PageBuf {
     /// [`PagedL2p::drop_subtree`](crate::paged::PagedL2p::drop_subtree)
     /// uses this variant so it can collect per-page leaf values before
     /// the free.
-    pub fn atomic_decref_one(
-        &mut self,
-        pid: PageId,
-    ) -> Result<(DecrefOutcome, Vec<PageId>)> {
+    pub fn atomic_decref_one(&mut self, pid: PageId) -> Result<(DecrefOutcome, Vec<PageId>)> {
         // Snapshot children + page type before the RMW — if rc hits
         // zero we need them for cascade. Read via PageBuf so a Dirty
         // copy wins; `persist_if_dirty` then flushes it to disk so

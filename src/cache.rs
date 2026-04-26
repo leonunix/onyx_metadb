@@ -494,10 +494,7 @@ mod tests {
 
     // -------- P2: pinned pages ------------------------------------------
 
-    fn mk_cache_with_pin(
-        cache_pages: u64,
-        pin_pages: u64,
-    ) -> (TempDir, Arc<PageStore>, PageCache) {
+    fn mk_cache_with_pin(cache_pages: u64, pin_pages: u64) -> (TempDir, Arc<PageStore>, PageCache) {
         let dir = TempDir::new().unwrap();
         let ps = Arc::new(PageStore::create(dir.path().join("p.onyx_meta")).unwrap());
         let cache = PageCache::new_with_pin_budget(
@@ -653,6 +650,10 @@ mod tests {
         let page = Arc::new(ps.read_page(pid).unwrap());
         cache.pin(pid, page);
         let _owned = cache.get_for_modify(pid).unwrap();
-        assert_eq!(cache.stats().pinned_pages, 1, "pin must survive get_for_modify");
+        assert_eq!(
+            cache.stats().pinned_pages,
+            1,
+            "pin must survive get_for_modify"
+        );
     }
 }

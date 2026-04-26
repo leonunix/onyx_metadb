@@ -55,8 +55,8 @@ pub use lsm::{
 };
 pub use manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VOLUME_ENTRY_FIXED_SIZE,
-    VOLUME_FLAG_DROP_PENDING, VolumeEntry, decode_volume_entry_inline,
-    encode_volume_entry_inline, max_snapshots_for_shards, volume_entry_inline_size,
+    VOLUME_FLAG_DROP_PENDING, VolumeEntry, decode_volume_entry_inline, encode_volume_entry_inline,
+    max_snapshots_for_shards, volume_entry_inline_size,
 };
 pub use metrics::{MetaMetrics, MetaMetricsSnapshot};
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};

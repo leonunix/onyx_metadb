@@ -1,6 +1,6 @@
 //! Mixed Onyx integration property test for Phase A S5.
 
-use onyx_metadb::testing::onyx_model::{onyx_dedup_value, onyx_hash, onyx_l2p_value, OnyxRefModel};
+use onyx_metadb::testing::onyx_model::{OnyxRefModel, onyx_dedup_value, onyx_hash, onyx_l2p_value};
 use onyx_metadb::{ApplyOutcome, Config, Db, Pba, VolumeOrdinal};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestRunner};

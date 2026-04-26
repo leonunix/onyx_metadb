@@ -11,6 +11,8 @@ fn spawn_child(cfg: &ParentConfig, fault: Option<FaultSpec>) -> std::io::Result<
         .arg(&cfg.metrics_path)
         .arg("--metrics-interval-secs")
         .arg(cfg.metrics_interval_secs.to_string())
+        .arg("--cleanup-batch-size")
+        .arg(cfg.cleanup_batch_size.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());

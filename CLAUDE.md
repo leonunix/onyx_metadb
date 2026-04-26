@@ -126,6 +126,9 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
   `tx/s`、`logical ops/s`、WAL batch size、fsync、gate wait、cache hit/miss 和瓶颈提示。
 - 当前 small-tx soak 的主要用途是 crash / mutex / WAL 串行点暴露，不代表 Onyx flusher
   批量 metadata commit 的最终吞吐上限。评估 30w IOPS 需要 batch metadata workload。
+- 2026-04-26 soak 显示小 `range_delete` 的 scan/apply 只有几十微秒，主要成本是
+  `drop_gate` 等待 + WAL/fsync；discard / reclaim 后续按
+  [`docs/ASYNC_RECLAIM_PLAN.md`](docs/ASYNC_RECLAIM_PLAN.md) 分阶段异步化。
 
 ## 代码风格
 

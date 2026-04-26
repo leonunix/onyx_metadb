@@ -27,13 +27,13 @@ fn v(n: u8) -> L2pValue {
 
 #[derive(Clone, Debug)]
 enum Op {
-    Insert(u16, u64, u8),   // vol_slot, lba, value
+    Insert(u16, u64, u8), // vol_slot, lba, value
     Delete(u16, u64),
     CreateVolume,
     DropVolume(u16),
     TakeSnapshot(u16),
-    DropSnapshot(u16),      // snap_slot
-    CloneVolume(u16),       // snap_slot
+    DropSnapshot(u16), // snap_slot
+    CloneVolume(u16),  // snap_slot
     VerifyRange(u16),
     VerifySnapshot(u16),
     Flush,
@@ -58,7 +58,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
 
 #[derive(Default)]
 struct Model {
-    volumes: Vec<VolumeOrdinal>,                                 // live ords
+    volumes: Vec<VolumeOrdinal>, // live ords
     state: HashMap<(VolumeOrdinal, u64), L2pValue>,
     snapshots: HashMap<SnapshotId, (VolumeOrdinal, BTreeMap<u64, L2pValue>)>,
     snap_ids: Vec<SnapshotId>,
@@ -280,155 +280,168 @@ fn volume_lifecycle_matches_reference_long_run() {
     use proptest::test_runner::TestRunner;
     let cfg = ProptestConfig {
         cases: 500,
-        .. ProptestConfig::default()
+        ..ProptestConfig::default()
     };
     let mut runner = TestRunner::new(cfg);
     runner
-        .run(
-            &proptest::collection::vec(arb_op(), 1..400),
-            |ops| {
-                let dir = TempDir::new().unwrap();
-                let mut db = Db::create(path_of(&dir)).unwrap();
-                let mut model = Model::new();
+        .run(&proptest::collection::vec(arb_op(), 1..400), |ops| {
+            let dir = TempDir::new().unwrap();
+            let mut db = Db::create(path_of(&dir)).unwrap();
+            let mut model = Model::new();
 
-                for op in ops {
-                    match op {
-                        Op::Insert(slot, lba, val) => {
-                            let Some(ord) = model.vol_at(slot) else { continue; };
-                            let value = v(val);
-                            let tree_old = db.insert(ord, lba, value).map_err(|e|
-                                TestCaseError::fail(format!("{e:?}")))?;
-                            let ref_old = model.state.insert((ord, lba), value);
-                            if tree_old != ref_old {
-                                return Err(TestCaseError::fail(format!(
-                                    "insert divergence: {tree_old:?} vs {ref_old:?}"
-                                )));
-                            }
-                        }
-                        Op::Delete(slot, lba) => {
-                            let Some(ord) = model.vol_at(slot) else { continue; };
-                            let tree_old = db.delete(ord, lba).map_err(|e|
-                                TestCaseError::fail(format!("{e:?}")))?;
-                            let ref_old = model.state.remove(&(ord, lba));
-                            if tree_old != ref_old {
-                                return Err(TestCaseError::fail(format!(
-                                    "delete divergence: {tree_old:?} vs {ref_old:?}"
-                                )));
-                            }
-                        }
-                        Op::CreateVolume => {
-                            // Same manifest-capacity back-pressure as
-                            // the short variant — skip on
-                            // `InvalidArgument`.
-                            let ord = match db.create_volume() {
-                                Ok(ord) => ord,
-                                Err(MetaDbError::InvalidArgument(_)) => continue,
-                                Err(e) => {
-                                    return Err(TestCaseError::fail(format!(
-                                        "unexpected create_volume error: {e:?}"
-                                    )));
-                                }
-                            };
-                            model.volumes.push(ord);
-                        }
-                        Op::DropVolume(slot) => {
-                            let Some(ord) = model.vol_at(slot) else { continue; };
-                            if ord == 0 { continue; }
-                            let pinned = model.snapshots.values().any(|(v, _)| *v == ord);
-                            match db.drop_volume(ord) {
-                                Ok(Some(_)) => {
-                                    if pinned {
-                                        return Err(TestCaseError::fail(
-                                            "drop_volume succeeded on pinned volume".to_string()
-                                        ));
-                                    }
-                                    model.volumes.retain(|o| *o != ord);
-                                    model.state.retain(|(o, _), _| *o != ord);
-                                }
-                                Ok(None) => unreachable!(),
-                                Err(MetaDbError::InvalidArgument(_)) => {
-                                    if !pinned {
-                                        return Err(TestCaseError::fail(
-                                            "drop_volume failed on unpinned volume".to_string()
-                                        ));
-                                    }
-                                }
-                                Err(e) => {
-                                    return Err(TestCaseError::fail(format!("{e:?}")));
-                                }
-                            }
-                        }
-                        Op::TakeSnapshot(slot) => {
-                            let Some(ord) = model.vol_at(slot) else { continue; };
-                            // Manifest snapshot table has a capacity derived
-                            // from shard / dedup layout; once full,
-                            // `take_snapshot` returns `InvalidArgument`.
-                            // That's expected back-pressure under a
-                            // snapshot-heavy op sequence — skip without
-                            // touching the model.
-                            let id = match db.take_snapshot(ord) {
-                                Ok(id) => id,
-                                Err(MetaDbError::InvalidArgument(_)) => continue,
-                                Err(e) => {
-                                    return Err(TestCaseError::fail(format!(
-                                        "unexpected take_snapshot error: {e:?}"
-                                    )));
-                                }
-                            };
-                            let frozen = model.vol_state(ord);
-                            model.snapshots.insert(id, (ord, frozen));
-                            model.snap_ids.push(id);
-                        }
-                        Op::DropSnapshot(slot) => {
-                            let Some(id) = model.snap_at(slot) else { continue; };
-                            db.drop_snapshot(id).map_err(|e|
-                                TestCaseError::fail(format!("{e:?}")))?;
-                            model.snapshots.remove(&id);
-                            model.snap_ids.retain(|s| *s != id);
-                        }
-                        Op::CloneVolume(slot) => {
-                            let Some(src_snap) = model.snap_at(slot) else { continue; };
-                            // `max_volumes` cap: treat `InvalidArgument` as
-                            // "skip this op", matching the TakeSnapshot
-                            // handling above.
-                            let new_ord = match db.clone_volume(src_snap) {
-                                Ok(ord) => ord,
-                                Err(MetaDbError::InvalidArgument(_)) => continue,
-                                Err(e) => {
-                                    return Err(TestCaseError::fail(format!(
-                                        "unexpected clone_volume error: {e:?}"
-                                    )));
-                                }
-                            };
-                            model.volumes.push(new_ord);
-                            let (_, ref frozen) = model.snapshots[&src_snap];
-                            for (lba, val) in frozen.iter() {
-                                model.state.insert((new_ord, *lba), *val);
-                            }
-                        }
-                        Op::VerifyRange(_) | Op::VerifySnapshot(_) => {}
-                        Op::Flush => {
-                            db.flush().map_err(|e|
-                                TestCaseError::fail(format!("{e:?}")))?;
-                        }
-                        Op::Reopen => {
-                            // See the shorter proptest above: crash-
-                            // without-flush is covered by the drop-
-                            // path's pre-apply manifest commit + WAL
-                            // replay idempotency. No flush needed.
-                            drop(db);
-                            db = reopen(&dir);
+            for op in ops {
+                match op {
+                    Op::Insert(slot, lba, val) => {
+                        let Some(ord) = model.vol_at(slot) else {
+                            continue;
+                        };
+                        let value = v(val);
+                        let tree_old = db
+                            .insert(ord, lba, value)
+                            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+                        let ref_old = model.state.insert((ord, lba), value);
+                        if tree_old != ref_old {
+                            return Err(TestCaseError::fail(format!(
+                                "insert divergence: {tree_old:?} vs {ref_old:?}"
+                            )));
                         }
                     }
+                    Op::Delete(slot, lba) => {
+                        let Some(ord) = model.vol_at(slot) else {
+                            continue;
+                        };
+                        let tree_old = db
+                            .delete(ord, lba)
+                            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+                        let ref_old = model.state.remove(&(ord, lba));
+                        if tree_old != ref_old {
+                            return Err(TestCaseError::fail(format!(
+                                "delete divergence: {tree_old:?} vs {ref_old:?}"
+                            )));
+                        }
+                    }
+                    Op::CreateVolume => {
+                        // Same manifest-capacity back-pressure as
+                        // the short variant — skip on
+                        // `InvalidArgument`.
+                        let ord = match db.create_volume() {
+                            Ok(ord) => ord,
+                            Err(MetaDbError::InvalidArgument(_)) => continue,
+                            Err(e) => {
+                                return Err(TestCaseError::fail(format!(
+                                    "unexpected create_volume error: {e:?}"
+                                )));
+                            }
+                        };
+                        model.volumes.push(ord);
+                    }
+                    Op::DropVolume(slot) => {
+                        let Some(ord) = model.vol_at(slot) else {
+                            continue;
+                        };
+                        if ord == 0 {
+                            continue;
+                        }
+                        let pinned = model.snapshots.values().any(|(v, _)| *v == ord);
+                        match db.drop_volume(ord) {
+                            Ok(Some(_)) => {
+                                if pinned {
+                                    return Err(TestCaseError::fail(
+                                        "drop_volume succeeded on pinned volume".to_string(),
+                                    ));
+                                }
+                                model.volumes.retain(|o| *o != ord);
+                                model.state.retain(|(o, _), _| *o != ord);
+                            }
+                            Ok(None) => unreachable!(),
+                            Err(MetaDbError::InvalidArgument(_)) => {
+                                if !pinned {
+                                    return Err(TestCaseError::fail(
+                                        "drop_volume failed on unpinned volume".to_string(),
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                return Err(TestCaseError::fail(format!("{e:?}")));
+                            }
+                        }
+                    }
+                    Op::TakeSnapshot(slot) => {
+                        let Some(ord) = model.vol_at(slot) else {
+                            continue;
+                        };
+                        // Manifest snapshot table has a capacity derived
+                        // from shard / dedup layout; once full,
+                        // `take_snapshot` returns `InvalidArgument`.
+                        // That's expected back-pressure under a
+                        // snapshot-heavy op sequence — skip without
+                        // touching the model.
+                        let id = match db.take_snapshot(ord) {
+                            Ok(id) => id,
+                            Err(MetaDbError::InvalidArgument(_)) => continue,
+                            Err(e) => {
+                                return Err(TestCaseError::fail(format!(
+                                    "unexpected take_snapshot error: {e:?}"
+                                )));
+                            }
+                        };
+                        let frozen = model.vol_state(ord);
+                        model.snapshots.insert(id, (ord, frozen));
+                        model.snap_ids.push(id);
+                    }
+                    Op::DropSnapshot(slot) => {
+                        let Some(id) = model.snap_at(slot) else {
+                            continue;
+                        };
+                        db.drop_snapshot(id)
+                            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+                        model.snapshots.remove(&id);
+                        model.snap_ids.retain(|s| *s != id);
+                    }
+                    Op::CloneVolume(slot) => {
+                        let Some(src_snap) = model.snap_at(slot) else {
+                            continue;
+                        };
+                        // `max_volumes` cap: treat `InvalidArgument` as
+                        // "skip this op", matching the TakeSnapshot
+                        // handling above.
+                        let new_ord = match db.clone_volume(src_snap) {
+                            Ok(ord) => ord,
+                            Err(MetaDbError::InvalidArgument(_)) => continue,
+                            Err(e) => {
+                                return Err(TestCaseError::fail(format!(
+                                    "unexpected clone_volume error: {e:?}"
+                                )));
+                            }
+                        };
+                        model.volumes.push(new_ord);
+                        let (_, ref frozen) = model.snapshots[&src_snap];
+                        for (lba, val) in frozen.iter() {
+                            model.state.insert((new_ord, *lba), *val);
+                        }
+                    }
+                    Op::VerifyRange(_) | Op::VerifySnapshot(_) => {}
+                    Op::Flush => {
+                        db.flush()
+                            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+                    }
+                    Op::Reopen => {
+                        // See the shorter proptest above: crash-
+                        // without-flush is covered by the drop-
+                        // path's pre-apply manifest commit + WAL
+                        // replay idempotency. No flush needed.
+                        drop(db);
+                        db = reopen(&dir);
+                    }
                 }
-                // Final reconciliation.
-                let mut live_ords = model.volumes.clone();
-                live_ords.sort_unstable();
-                if db.volumes() != live_ords {
-                    return Err(TestCaseError::fail("final volumes mismatch".to_string()));
-                }
-                Ok(())
-            },
-        )
+            }
+            // Final reconciliation.
+            let mut live_ords = model.volumes.clone();
+            live_ords.sort_unstable();
+            if db.volumes() != live_ords {
+                return Err(TestCaseError::fail("final volumes mismatch".to_string()));
+            }
+            Ok(())
+        })
         .unwrap();
 }

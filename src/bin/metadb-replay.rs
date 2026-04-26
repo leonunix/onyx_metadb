@@ -243,10 +243,7 @@ fn fmt_op(op: &WalOp) -> String {
             vol_ord,
             lba,
             value,
-        } => format!(
-            "L2pPut vol={vol_ord} lba={lba} value={}",
-            hex(value.0)
-        ),
+        } => format!("L2pPut vol={vol_ord} lba={lba} value={}", hex(value.0)),
         WalOp::L2pDelete { vol_ord, lba } => format!("L2pDelete vol={vol_ord} lba={lba}"),
         WalOp::L2pRemap {
             vol_ord,
@@ -325,9 +322,9 @@ fn op_json(op: &WalOp) -> String {
                 hex(value.0),
             )
         }
-        WalOp::L2pDelete { vol_ord, lba } => format!(
-            "{{\"op\":\"L2pDelete\",\"vol_ord\":{vol_ord},\"lba\":{lba}}}"
-        ),
+        WalOp::L2pDelete { vol_ord, lba } => {
+            format!("{{\"op\":\"L2pDelete\",\"vol_ord\":{vol_ord},\"lba\":{lba}}}")
+        }
         WalOp::L2pRemap {
             vol_ord,
             lba,
@@ -387,9 +384,9 @@ fn op_json(op: &WalOp) -> String {
                 pba_decrefs.len(),
             )
         }
-        WalOp::CreateVolume { ord, shard_count } => format!(
-            "{{\"op\":\"CreateVolume\",\"ord\":{ord},\"shard_count\":{shard_count}}}"
-        ),
+        WalOp::CreateVolume { ord, shard_count } => {
+            format!("{{\"op\":\"CreateVolume\",\"ord\":{ord},\"shard_count\":{shard_count}}}")
+        }
         WalOp::DropVolume { ord, pages } => format!(
             "{{\"op\":\"DropVolume\",\"ord\":{ord},\"pages\":{}}}",
             pages.len()
@@ -528,9 +525,10 @@ fn parse_u64(arg: Option<String>, name: &str) -> Result<u64, String> {
     let s = arg.ok_or_else(|| format!("missing `{name}` argument"))?;
     let trimmed = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
     match trimmed {
-        Some(hex) => u64::from_str_radix(hex, 16)
+        Some(hex) => u64::from_str_radix(hex, 16).map_err(|e| format!("invalid {name} `{s}`: {e}")),
+        None => s
+            .parse::<u64>()
             .map_err(|e| format!("invalid {name} `{s}`: {e}")),
-        None => s.parse::<u64>().map_err(|e| format!("invalid {name} `{s}`: {e}")),
     }
 }
 
@@ -558,4 +556,3 @@ fn escape_json(input: &str) -> String {
     }
     out
 }
-

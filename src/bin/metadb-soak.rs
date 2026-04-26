@@ -14,6 +14,7 @@ use onyx_metadb::{
     ApplyOutcome, Db, DedupValue, Hash32, L2pValue, Pba, SnapshotId, VerifyOptions, VolumeOrdinal,
     verify_path,
 };
+use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -22,6 +23,7 @@ const MAX_LIVE_VOLUMES: usize = 4;
 const BOOTSTRAP_VOL: VolumeOrdinal = 0;
 const ONYX_MAX_LBA: u64 = 512;
 const ONYX_MAX_PBA: Pba = 256;
+const DEFAULT_CLEANUP_BATCH_SIZE: usize = 1024;
 
 fn main() -> ExitCode {
     match run() {

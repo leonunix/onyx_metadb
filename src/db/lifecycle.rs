@@ -557,6 +557,7 @@ impl Db {
         commit_l2p_checkpoint(&mut l2p_guards, tree_generation)?;
         commit_refcount_checkpoint(&mut refcount_guards, tree_generation)?;
         self.finish_dedup_manifest_update(dedup_update, tree_generation)?;
+        crate::wal::prune_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
         Ok(())
     }
 }

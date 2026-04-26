@@ -55,6 +55,46 @@ pub fn list_segments(dir: &Path) -> Result<Vec<(Lsn, PathBuf)>> {
     Ok(out)
 }
 
+/// Delete WAL segments that are wholly covered by `checkpoint_lsn`.
+///
+/// Recovery starts at `checkpoint_lsn + 1`, and segment filenames give us the
+/// first LSN in each segment. A segment can be deleted only when the next
+/// segment starts no later than that replay start, proving this whole segment
+/// contains checkpointed records. The newest segment is always retained because
+/// it may still be open by the writer.
+pub fn prune_segments(dir: &Path, checkpoint_lsn: Lsn) -> Result<usize> {
+    let segments = list_segments(dir)?;
+    let replay_start = checkpoint_lsn.saturating_add(1);
+    let mut removed = 0usize;
+
+    for pair in segments.windows(2) {
+        let [(_, path), (next_start, _)] = pair else {
+            unreachable!("windows(2) always yields pairs");
+        };
+        if *next_start > replay_start {
+            break;
+        }
+        std::fs::remove_file(path)?;
+        removed += 1;
+    }
+
+    if removed > 0 {
+        sync_dir(dir)?;
+    }
+    Ok(removed)
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Append-only WAL segment owned by the writer thread.
 pub struct SegmentFile {
     path: PathBuf,
@@ -226,6 +266,32 @@ mod tests {
         let missing = dir.path().join("does_not_exist");
         let segs = list_segments(&missing).unwrap();
         assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn prune_segments_keeps_segment_that_may_contain_replay_start() {
+        let dir = TempDir::new().unwrap();
+        for lsn in [1, 10, 20, 30] {
+            SegmentFile::create(dir.path(), lsn).unwrap();
+        }
+
+        let removed = prune_segments(dir.path(), 18).unwrap();
+        assert_eq!(removed, 1);
+        let lsns: Vec<_> = list_segments(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|(lsn, _)| lsn)
+            .collect();
+        assert_eq!(lsns, vec![10, 20, 30]);
+
+        let removed = prune_segments(dir.path(), 29).unwrap();
+        assert_eq!(removed, 2);
+        let lsns: Vec<_> = list_segments(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|(lsn, _)| lsn)
+            .collect();
+        assert_eq!(lsns, vec![30]);
     }
 
     #[test]

@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use crate::config::PAGE_SIZE;
 use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageHeader, PageType};
-use crate::types::{Lsn, PageId, FIRST_DATA_PAGE};
+use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 
 const RC_LOCK_SHARDS: usize = 64;
 
