@@ -2,6 +2,10 @@
 
 Phased plan to reach a v0.1 that onyx-storage can depend on in production.
 
+Related planning documents:
+- [`HUGEPAGE_MEMORY_PLAN.md`](HUGEPAGE_MEMORY_PLAN.md): HugeTLB-backed memory
+  plan for the L2P and dedup metadata working set.
+
 Each phase has:
 - **Scope**: what gets built.
 - **Entry criteria**: what must be true before starting.
