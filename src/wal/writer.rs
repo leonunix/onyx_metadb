@@ -33,9 +33,10 @@ use parking_lot::Mutex;
 
 use crate::config::Config;
 use crate::error::{MetaDbError, Result};
+use crate::metrics::MetaMetrics;
 use crate::testing::faults::{FaultController, FaultPoint};
 use crate::types::Lsn;
-use crate::wal::record::{WAL_HEADER_SIZE, encode};
+use crate::wal::record::{encode, WAL_HEADER_SIZE};
 use crate::wal::segment::SegmentFile;
 
 /// Handle to the WAL writer thread. Clone-free by design — hand it
@@ -43,6 +44,7 @@ use crate::wal::segment::SegmentFile;
 pub struct Wal {
     sender: Sender<Op>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    metrics: Arc<MetaMetrics>,
 }
 
 enum Op {
@@ -66,9 +68,25 @@ impl Wal {
         start_lsn: Lsn,
         faults: Arc<FaultController>,
     ) -> Result<Self> {
+        Self::create_with_metrics(dir, config, start_lsn, faults, Arc::new(MetaMetrics::new()))
+    }
+
+    pub(crate) fn create_with_metrics(
+        dir: &Path,
+        config: &Config,
+        start_lsn: Lsn,
+        faults: Arc<FaultController>,
+        metrics: Arc<MetaMetrics>,
+    ) -> Result<Self> {
         assert!(start_lsn >= 1, "start_lsn must be >= 1");
         std::fs::create_dir_all(dir)?;
-        let state = WriterState::init(dir.to_path_buf(), config, start_lsn, faults)?;
+        let state = WriterState::init(
+            dir.to_path_buf(),
+            config,
+            start_lsn,
+            faults,
+            metrics.clone(),
+        )?;
         let (sender, receiver) = crossbeam_channel::unbounded();
         let thread = std::thread::Builder::new()
             .name("onyx-metadb-wal".to_string())
@@ -76,6 +94,7 @@ impl Wal {
         Ok(Self {
             sender,
             thread: Mutex::new(Some(thread)),
+            metrics,
         })
     }
 
@@ -84,11 +103,14 @@ impl Wal {
     /// not guaranteed, but LSN ordering always matches the order in
     /// which the writer thread dequeued the messages.
     pub fn submit(&self, body: Vec<u8>) -> Result<Lsn> {
+        let started = Instant::now();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.sender
             .send(Op::Submit { body, ack: ack_tx })
             .map_err(|_| writer_exited())?;
-        ack_rx.recv().map_err(|_| writer_exited())?
+        let result = ack_rx.recv().map_err(|_| writer_exited())?;
+        self.metrics.record_wal_submit_wait(started.elapsed());
+        result
     }
 
     /// Drain any in-flight batch and stop the writer thread. After
@@ -136,6 +158,7 @@ struct WriterState {
     max_batch_bytes: usize,
     timeout: Duration,
     faults: Arc<FaultController>,
+    metrics: Arc<MetaMetrics>,
 }
 
 impl WriterState {
@@ -144,6 +167,7 @@ impl WriterState {
         config: &Config,
         start_lsn: Lsn,
         faults: Arc<FaultController>,
+        metrics: Arc<MetaMetrics>,
     ) -> Result<Self> {
         // If the directory already has segments (e.g., from a previous
         // open that was recovered up to `start_lsn - 1`), append to the
@@ -172,6 +196,7 @@ impl WriterState {
             max_batch_bytes: config.group_commit_max_batch_bytes,
             timeout: Duration::from_micros(config.group_commit_timeout_us),
             faults,
+            metrics,
         })
     }
 
@@ -305,6 +330,7 @@ fn commit_batch(
     };
     if need_rotate {
         state.rotate()?;
+        state.metrics.record_wal_rotate();
     }
 
     // Encode into a single buffer so the write is one syscall.
@@ -327,10 +353,15 @@ fn commit_batch(
         .current
         .as_mut()
         .expect("writer has no current segment");
+    let write_started = Instant::now();
     seg.append(&buf)?;
+    state.metrics.record_wal_write(write_started.elapsed());
     state.faults.inject(FaultPoint::WalFsyncBefore)?;
+    let fsync_started = Instant::now();
     seg.sync()?;
+    state.metrics.record_wal_fsync(fsync_started.elapsed());
     state.faults.inject(FaultPoint::WalFsyncAfter)?;
+    state.metrics.record_wal_batch(assigned.len(), buf.len());
     Ok(assigned)
 }
 

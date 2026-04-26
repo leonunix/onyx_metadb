@@ -34,6 +34,7 @@ impl Db {
             cfg.page_cache_bytes,
             cfg.index_pin_bytes,
         ));
+        let metrics = Arc::new(MetaMetrics::new());
         let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
@@ -61,11 +62,12 @@ impl Db {
         manifest.next_volume_ord = BOOTSTRAP_VOLUME_ORD + 1;
         manifest_store.commit(&manifest)?;
 
-        let wal = Wal::create(
+        let wal = Wal::create_with_metrics(
             &wal_dir(&cfg.path),
             &cfg,
             manifest.checkpoint_lsn + 1,
             faults.clone(),
+            metrics.clone(),
         )?;
 
         let volume_zero = Arc::new(Volume::new(BOOTSTRAP_VOLUME_ORD, l2p_shards, 0));
@@ -75,6 +77,7 @@ impl Db {
         Ok(Self {
             page_store,
             page_cache,
+            metrics,
             manifest_state: Mutex::new(ManifestState {
                 store: manifest_store,
                 manifest,
@@ -124,6 +127,7 @@ impl Db {
             cfg.page_cache_bytes,
             cfg.index_pin_bytes,
         ));
+        let metrics = Arc::new(MetaMetrics::new());
         let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_existing(page_store.clone(), faults.clone())?;
@@ -313,7 +317,13 @@ impl Db {
         // If the last segment ended torn, truncate it to the last clean
         // record before handing the directory to the new Wal.
         crate::recovery::truncate_torn_tail(&wal_path, &replay_outcome)?;
-        let wal = Wal::create(&wal_path, &cfg, last_applied + 1, faults.clone())?;
+        let wal = Wal::create_with_metrics(
+            &wal_path,
+            &cfg,
+            last_applied + 1,
+            faults.clone(),
+            metrics.clone(),
+        )?;
 
         // If anything was replayed, flush every tree + dedup memtable,
         // refresh the manifest from the post-replay in-memory roots,
@@ -400,6 +410,7 @@ impl Db {
         let db = Self {
             page_store,
             page_cache,
+            metrics,
             manifest_state: Mutex::new(ManifestState {
                 store: manifest_store,
                 manifest,
@@ -463,6 +474,47 @@ impl Db {
     /// Snapshot shared page-cache counters.
     pub fn cache_stats(&self) -> PageCacheStats {
         self.page_cache.stats()
+    }
+
+    pub fn metrics_snapshot(&self) -> MetaMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub fn metrics_json(&self) -> String {
+        let cache = self.cache_stats();
+        let metrics = self.metrics_snapshot();
+        format!(
+            concat!(
+                "{{",
+                "\"last_applied_lsn\":{},",
+                "\"high_water\":{},",
+                "\"cache\":{{",
+                "\"hits\":{},",
+                "\"misses\":{},",
+                "\"evictions\":{},",
+                "\"current_pages\":{},",
+                "\"current_bytes\":{},",
+                "\"capacity_bytes\":{},",
+                "\"pinned_pages\":{},",
+                "\"pinned_bytes\":{},",
+                "\"pin_budget_bytes\":{}",
+                "}},",
+                "\"meta\":{}",
+                "}}"
+            ),
+            self.last_applied_lsn(),
+            self.high_water(),
+            cache.hits,
+            cache.misses,
+            cache.evictions,
+            cache.current_pages,
+            cache.current_bytes,
+            cache.capacity_bytes,
+            cache.pinned_pages,
+            cache.pinned_bytes,
+            cache.pin_budget_bytes,
+            metrics.to_json(),
+        )
     }
 
     /// Persist dirty shard pages and commit a fresh manifest with the

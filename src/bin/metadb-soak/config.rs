@@ -30,10 +30,13 @@ struct ParentConfig {
     path: PathBuf,
     duration_secs: u64,
     ops_per_cycle: usize,
+    pipeline_depth: usize,
     threads: usize,
     seed: u64,
     summary_path: PathBuf,
     events_path: PathBuf,
+    metrics_path: PathBuf,
+    metrics_interval_secs: u64,
     event_verbosity: EventVerbosity,
     fault_density_pct: u8,
     workload: Workload,
@@ -87,10 +90,13 @@ impl ParentConfig {
         let mut path = None;
         let mut duration_secs = 300u64;
         let mut ops_per_cycle = 2_000usize;
+        let mut pipeline_depth = 1usize;
         let mut threads = 4usize;
         let mut seed = 0x5EED_8A5Eu64;
         let mut summary_path = None;
         let mut events_path = None;
+        let mut metrics_path = None;
+        let mut metrics_interval_secs = 5u64;
         let mut event_verbosity = EventVerbosity::Summary;
         let mut fault_density_pct = 0u8;
         let mut workload = Workload::Onyx;
@@ -121,6 +127,9 @@ impl ParentConfig {
                 "--ops-per-cycle" => {
                     ops_per_cycle = parse_u64(args.next(), "--ops-per-cycle")? as usize;
                 }
+                "--pipeline-depth" => {
+                    pipeline_depth = parse_u64(args.next(), "--pipeline-depth")? as usize;
+                }
                 "--threads" => {
                     threads = parse_u64(args.next(), "--threads")? as usize;
                 }
@@ -138,6 +147,15 @@ impl ParentConfig {
                         args.next()
                             .ok_or_else(|| "--events needs a path".to_string())?,
                     ));
+                }
+                "--metrics" => {
+                    metrics_path = Some(PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| "--metrics needs a path".to_string())?,
+                    ));
+                }
+                "--metrics-interval-secs" => {
+                    metrics_interval_secs = parse_u64(args.next(), "--metrics-interval-secs")?;
                 }
                 "--event-verbosity" => {
                     event_verbosity = parse_event_verbosity(
@@ -176,10 +194,13 @@ impl ParentConfig {
         Ok(Self {
             summary_path: summary_path.unwrap_or_else(|| path.join("summary.json")),
             events_path: events_path.unwrap_or_else(|| path.join("events.jsonl")),
+            metrics_path: metrics_path.unwrap_or_else(|| path.join("metrics.jsonl")),
+            metrics_interval_secs,
             event_verbosity,
             path,
             duration_secs,
             ops_per_cycle: ops_per_cycle.max(1),
+            pipeline_depth: pipeline_depth.max(1),
             threads: threads.max(1),
             seed,
             fault_density_pct,
@@ -196,6 +217,8 @@ struct ChildConfig {
     threads: usize,
     fault: Option<FaultSpec>,
     workload: Workload,
+    metrics_path: Option<PathBuf>,
+    metrics_interval_secs: u64,
 }
 
 impl ChildConfig {
@@ -209,6 +232,8 @@ impl ChildConfig {
         let mut fault_hit = None;
         let mut fault_action = None;
         let mut workload = Workload::Legacy;
+        let mut metrics_path = None;
+        let mut metrics_interval_secs = 5u64;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -244,6 +269,15 @@ impl ChildConfig {
                             .ok_or_else(|| "--workload needs a value".to_string())?,
                     )?;
                 }
+                "--metrics" => {
+                    metrics_path = Some(PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| "--metrics needs a path".to_string())?,
+                    ));
+                }
+                "--metrics-interval-secs" => {
+                    metrics_interval_secs = parse_u64(args.next(), "--metrics-interval-secs")?;
+                }
                 _ => return Err(format!("unknown child flag `{arg}`")),
             }
         }
@@ -265,6 +299,8 @@ impl ChildConfig {
             threads: threads.max(1),
             fault,
             workload,
+            metrics_path,
+            metrics_interval_secs,
         })
     }
 }

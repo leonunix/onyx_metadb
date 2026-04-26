@@ -13,12 +13,15 @@ BENCH_RUN_DIR_FILE="$STATE_DIR/bench-run-dir"
 
 DEFAULT_DURATION="${METADB_SOAK_DURATION:-24h}"
 DEFAULT_OPS_PER_CYCLE="${METADB_SOAK_OPS_PER_CYCLE:-10000}"
+DEFAULT_PIPELINE_DEPTH="${METADB_SOAK_PIPELINE_DEPTH:-1}"
 DEFAULT_THREADS="${METADB_SOAK_THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+DEFAULT_METRICS_INTERVAL_SECS="${METADB_SOAK_METRICS_INTERVAL_SECS:-5}"
 DEFAULT_FAULT_DENSITY_PCT="${METADB_SOAK_FAULT_DENSITY_PCT:-25}"
 DEFAULT_SEED="${METADB_SOAK_SEED:-1592625758}"
 DEFAULT_WORKLOAD="${METADB_SOAK_WORKLOAD:-onyx}"
 DEFAULT_EVENT_VERBOSITY="${METADB_SOAK_EVENT_VERBOSITY:-summary}"
 DEFAULT_SNAPSHOTS_ENABLED="${METADB_SOAK_SNAPSHOTS:-1}"
+DEFAULT_RESTART_INTERVAL="${METADB_SOAK_RESTART_INTERVAL:-}"
 DEFAULT_EXTRA_ARGS="${METADB_SOAK_EXTRA_ARGS:-}"
 
 BENCH_DEFAULT_THREADS="${METADB_BENCH_THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
@@ -192,10 +195,88 @@ stop_process_group() {
     fi
 }
 
+parse_soak_run_args() {
+    PARSED_DURATION="$DEFAULT_DURATION"
+    PARSED_WORKLOAD="$DEFAULT_WORKLOAD"
+    PARSED_RESTART_INTERVAL="$DEFAULT_RESTART_INTERVAL"
+    PARSED_PIPELINE_DEPTH="$DEFAULT_PIPELINE_DEPTH"
+    PARSED_METRICS_INTERVAL_SECS="$DEFAULT_METRICS_INTERVAL_SECS"
+
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --restart-interval)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    echo "--restart-interval needs a value" >&2
+                    exit 1
+                fi
+                PARSED_RESTART_INTERVAL="$1"
+                ;;
+            --restart-interval=*)
+                PARSED_RESTART_INTERVAL="${1#*=}"
+                ;;
+            --pipeline-depth)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    echo "--pipeline-depth needs a value" >&2
+                    exit 1
+                fi
+                PARSED_PIPELINE_DEPTH="$1"
+                ;;
+            --pipeline-depth=*)
+                PARSED_PIPELINE_DEPTH="${1#*=}"
+                ;;
+            --metrics-interval-secs)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    echo "--metrics-interval-secs needs a value" >&2
+                    exit 1
+                fi
+                PARSED_METRICS_INTERVAL_SECS="$1"
+                ;;
+            --metrics-interval-secs=*)
+                PARSED_METRICS_INTERVAL_SECS="${1#*=}"
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --*)
+                echo "unknown soak option: $1" >&2
+                exit 1
+                ;;
+            *)
+                positional+=("$1")
+                ;;
+        esac
+        shift
+    done
+
+    if [[ ${#positional[@]} -gt 3 ]]; then
+        echo "too many soak arguments" >&2
+        exit 1
+    fi
+    if [[ ${#positional[@]} -ge 1 ]]; then
+        PARSED_DURATION="${positional[0]}"
+    fi
+    if [[ ${#positional[@]} -ge 2 ]]; then
+        PARSED_WORKLOAD="${positional[1]}"
+    fi
+    if [[ ${#positional[@]} -eq 3 ]]; then
+        # Compatibility for the briefly-supported positional form:
+        # ./dev.sh start 24h concurrent 2h
+        PARSED_RESTART_INTERVAL="${positional[2]}"
+    fi
+}
+
 cmd_start() {
     local duration="${1:-$DEFAULT_DURATION}"
     local workload="${2:-$DEFAULT_WORKLOAD}"
-    local duration_secs run_dir workload_flag events_flag snapshots_flag qroot qrun_dir qduration qops qthreads qfault qseed qextra cmd
+    local restart_interval="${3:-$DEFAULT_RESTART_INTERVAL}"
+    local pipeline_depth="${4:-$DEFAULT_PIPELINE_DEPTH}"
+    local metrics_interval_secs="${5:-$DEFAULT_METRICS_INTERVAL_SECS}"
+    local duration_secs run_dir workload_flag events_flag snapshots_flag qroot qrun_dir qduration qops qpipeline qthreads qmetrics_interval qfault qseed qrestart qextra cmd
 
     if is_running; then
         echo "soak already running (pid $(cat "$PID_FILE"))"
@@ -216,14 +297,20 @@ cmd_start() {
     qrun_dir="$(quote_shell_arg "$run_dir")"
     qduration="$(quote_shell_arg "$duration_secs")"
     qops="$(quote_shell_arg "$DEFAULT_OPS_PER_CYCLE")"
+    qpipeline="$(quote_shell_arg "$pipeline_depth")"
     qthreads="$(quote_shell_arg "$DEFAULT_THREADS")"
+    qmetrics_interval="$(quote_shell_arg "$metrics_interval_secs")"
     qfault="$(quote_shell_arg "$DEFAULT_FAULT_DENSITY_PCT")"
     qseed="$(quote_shell_arg "$DEFAULT_SEED")"
+    qrestart="$(quote_shell_arg "$restart_interval")"
     qextra="$DEFAULT_EXTRA_ARGS"
 
-    cmd="cd $qroot && exec target/release/metadb-soak $qrun_dir --duration-secs $qduration --ops-per-cycle $qops --threads $qthreads --fault-density-pct $qfault --seed $qseed $workload_flag $events_flag"
+    cmd="cd $qroot && exec target/release/metadb-soak $qrun_dir --duration-secs $qduration --ops-per-cycle $qops --pipeline-depth $qpipeline --threads $qthreads --metrics-interval-secs $qmetrics_interval --fault-density-pct $qfault --seed $qseed $workload_flag $events_flag"
     if [[ -n "$snapshots_flag" ]]; then
         cmd="$cmd $snapshots_flag"
+    fi
+    if [[ -n "$restart_interval" ]]; then
+        cmd="$cmd --restart-interval $qrestart"
     fi
     if [[ -n "$qextra" ]]; then
         cmd="$cmd $qextra"
@@ -243,15 +330,21 @@ cmd_start() {
     echo "  log:      $LOG_FILE"
     echo "  duration: $duration ($duration_secs s)"
     echo "  workload: $workload"
+    echo "  ops/cycle: $DEFAULT_OPS_PER_CYCLE"
+    echo "  pipeline depth: $pipeline_depth"
+    echo "  metrics:  $run_dir/metrics.jsonl (${metrics_interval_secs}s)"
     echo "  events:   $DEFAULT_EVENT_VERBOSITY"
     echo "  snapshots: $DEFAULT_SNAPSHOTS_ENABLED"
+    if [[ -n "$restart_interval" ]]; then
+        echo "  restart interval: $restart_interval"
+    fi
 }
 
 cmd_stop() {
     if ! is_running; then
         echo "soak not running"
         rm -f "$PID_FILE"
-        exit 0
+        return 0
     fi
     local pid
     pid="$(cat "$PID_FILE")"
@@ -263,9 +356,12 @@ cmd_stop() {
 cmd_restart() {
     local duration="${1:-$DEFAULT_DURATION}"
     local workload="${2:-$DEFAULT_WORKLOAD}"
+    local restart_interval="${3:-$DEFAULT_RESTART_INTERVAL}"
+    local pipeline_depth="${4:-$DEFAULT_PIPELINE_DEPTH}"
+    local metrics_interval_secs="${5:-$DEFAULT_METRICS_INTERVAL_SECS}"
     cmd_stop || true
     sleep 1
-    cmd_start "$duration" "$workload"
+    cmd_start "$duration" "$workload" "$restart_interval" "$pipeline_depth" "$metrics_interval_secs"
 }
 
 cmd_status() {
@@ -302,6 +398,46 @@ cmd_events() {
     fi
     touch "$run_dir/events.jsonl"
     tail -f "$run_dir/events.jsonl"
+}
+
+cmd_metrics() {
+    local run_dir metrics_path
+    run_dir="$(saved_run_dir || true)"
+    if [[ -z "$run_dir" ]]; then
+        echo "no saved soak run dir"
+        exit 1
+    fi
+    metrics_path="$run_dir/metrics.jsonl"
+    if [[ ! -f "$metrics_path" ]]; then
+        echo "metrics file not found: $metrics_path"
+        exit 1
+    fi
+    tail -f "$metrics_path"
+}
+
+cmd_metrics_summary() {
+    local metrics_path samples
+    samples="${2:-12}"
+    if [[ -n "${1:-}" ]]; then
+        if [[ -d "$1" ]]; then
+            metrics_path="$1/metrics.jsonl"
+        else
+            metrics_path="$1"
+        fi
+    else
+        local run_dir
+        run_dir="$(saved_run_dir || true)"
+        if [[ -z "$run_dir" ]]; then
+            echo "no saved soak run dir"
+            exit 1
+        fi
+        metrics_path="$run_dir/metrics.jsonl"
+    fi
+    if [[ ! -f "$metrics_path" ]]; then
+        echo "metrics file not found: $metrics_path"
+        exit 1
+    fi
+    python3 "$PROJ_ROOT/scripts/metadb_metrics_summary.py" "$metrics_path" --samples "$samples"
 }
 
 cmd_summary() {
@@ -617,12 +753,14 @@ cmd_bench() {
 usage() {
     echo "Usage: $0 {start|stop|restart|status|logs|events|summary|verify|bench} [...]"
     echo ""
-    echo "  start   [duration] [workload]  Start soak in background (default: $DEFAULT_DURATION $DEFAULT_WORKLOAD)"
+    echo "  start   [duration] [workload] [--restart-interval 2h] [--pipeline-depth N] [--metrics-interval-secs N]  Start soak in background"
     echo "  stop                Stop the running soak"
-    echo "  restart [duration] [workload]  Restart the soak"
+    echo "  restart [duration] [workload] [--restart-interval 2h] [--pipeline-depth N] [--metrics-interval-secs N]  Restart the soak"
     echo "  status              Show pid, run dir, summary path"
     echo "  logs                Tail the soak stdout/stderr log"
     echo "  events              Tail events.jsonl for the current run"
+    echo "  metrics             Tail metrics.jsonl for the current run"
+    echo "  metrics-summary [path|run-dir] [samples]  Summarize metrics rates and bottlenecks"
     echo "  summary             Print summary.json for the current run"
     echo "  verify              Run metadb-verify --strict on the current run dir"
     echo "  bench               Run metadb / rocksdb / compare benchmark"
@@ -631,9 +769,14 @@ usage() {
     echo "  ./dev.sh start"
     echo "  ./dev.sh start 1h"
     echo "  ./dev.sh start 2h concurrent"
+    echo "  ./dev.sh start 24h concurrent --restart-interval 2h --pipeline-depth 128"
+    echo "  METADB_SOAK_RESTART_INTERVAL=2h METADB_SOAK_OPS_PER_CYCLE=1000000 METADB_SOAK_PIPELINE_DEPTH=128 ./dev.sh start 24h concurrent"
     echo "  ./dev.sh restart 7d"
     echo "  ./dev.sh status"
     echo "  ./dev.sh logs"
+    echo "  ./dev.sh metrics"
+    echo "  ./dev.sh metrics-summary"
+    echo "  ./dev.sh metrics-summary .dev/soak/20260425T235719Z 24"
     echo "  ./dev.sh bench compare get 1g"
     echo "  ./dev.sh bench compare all 10g"
     echo "  ./dev.sh bench compare put"
@@ -643,12 +786,15 @@ usage() {
     echo "Environment overrides:"
     echo "  METADB_SOAK_DURATION=$DEFAULT_DURATION"
     echo "  METADB_SOAK_OPS_PER_CYCLE=$DEFAULT_OPS_PER_CYCLE"
+    echo "  METADB_SOAK_PIPELINE_DEPTH=$DEFAULT_PIPELINE_DEPTH"
     echo "  METADB_SOAK_THREADS=$DEFAULT_THREADS"
+    echo "  METADB_SOAK_METRICS_INTERVAL_SECS=$DEFAULT_METRICS_INTERVAL_SECS"
     echo "  METADB_SOAK_FAULT_DENSITY_PCT=$DEFAULT_FAULT_DENSITY_PCT"
     echo "  METADB_SOAK_SEED=$DEFAULT_SEED"
     echo "  METADB_SOAK_WORKLOAD=$DEFAULT_WORKLOAD        # legacy|onyx|concurrent"
     echo "  METADB_SOAK_EVENT_VERBOSITY=$DEFAULT_EVENT_VERBOSITY  # summary|ops"
     echo "  METADB_SOAK_SNAPSHOTS=$DEFAULT_SNAPSHOTS_ENABLED      # 1|0"
+    echo "  METADB_SOAK_RESTART_INTERVAL=$DEFAULT_RESTART_INTERVAL  # e.g. 2h; empty means every cycle"
     echo "  METADB_SOAK_RUN_DIR=<explicit run dir>"
     echo "  METADB_SOAK_EXTRA_ARGS='<extra metadb-soak args>'"
     echo "  METADB_BENCH_THREADS=$BENCH_DEFAULT_THREADS"
@@ -664,12 +810,22 @@ usage() {
 }
 
 case "${1:-}" in
-    start)   cmd_start "${2:-$DEFAULT_DURATION}" "${3:-$DEFAULT_WORKLOAD}" ;;
+    start)
+        shift
+        parse_soak_run_args "$@"
+        cmd_start "$PARSED_DURATION" "$PARSED_WORKLOAD" "$PARSED_RESTART_INTERVAL" "$PARSED_PIPELINE_DEPTH" "$PARSED_METRICS_INTERVAL_SECS"
+        ;;
     stop)    cmd_stop ;;
-    restart) cmd_restart "${2:-$DEFAULT_DURATION}" "${3:-$DEFAULT_WORKLOAD}" ;;
+    restart)
+        shift
+        parse_soak_run_args "$@"
+        cmd_restart "$PARSED_DURATION" "$PARSED_WORKLOAD" "$PARSED_RESTART_INTERVAL" "$PARSED_PIPELINE_DEPTH" "$PARSED_METRICS_INTERVAL_SECS"
+        ;;
     status)  cmd_status ;;
     logs)    cmd_logs ;;
     events)  cmd_events ;;
+    metrics) cmd_metrics ;;
+    metrics-summary) cmd_metrics_summary "${2:-}" "${3:-12}" ;;
     summary) cmd_summary ;;
     verify)  cmd_verify ;;
     bench)   cmd_bench "${2:-compare}" "${3:-multi-get}" "${4:-$BENCH_DEFAULT_SIZE}" ;;

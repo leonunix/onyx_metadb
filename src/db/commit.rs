@@ -26,39 +26,78 @@ impl Db {
     /// state is ahead of `last_applied_lsn`.
     pub(crate) fn commit_ops(&self, ops: &[WalOp]) -> Result<(Lsn, Vec<ApplyOutcome>)> {
         if ops.is_empty() {
+            self.metrics.record_commit_empty();
             return Ok((self.last_applied_lsn(), Vec::new()));
         }
+        let commit_started = std::time::Instant::now();
+        self.metrics.record_commit_attempt(ops.len());
         // `drop_gate.read()` pairs with lifecycle paths' write acquire.
         // Hold it across submit + apply so `drop_snapshot` /
         // `range_delete` cannot wedge themselves between our LSN
         // assignment and apply. Using the read side is important:
         // ordinary commits must still submit concurrently so the WAL
         // writer can coalesce them into group commits.
+        let drop_gate_started = std::time::Instant::now();
         let _drop_guard = self.drop_gate.read();
+        self.metrics
+            .record_commit_drop_gate_wait(drop_gate_started.elapsed());
         let body = encode_body(ops);
-        let lsn = self.wal.submit(body)?;
-        self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
+        let wal_started = std::time::Instant::now();
+        let lsn = match self.wal.submit(body) {
+            Ok(lsn) => {
+                self.metrics.record_commit_wal_submit(wal_started.elapsed());
+                lsn
+            }
+            Err(err) => {
+                self.metrics.record_commit_wal_submit(wal_started.elapsed());
+                self.metrics.record_commit_error(commit_started.elapsed());
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
+            self.metrics.record_commit_error(commit_started.elapsed());
+            return Err(err);
+        }
 
         // Wait until every lower LSN has applied. LSNs are unique and
         // assigned in submit order by the WAL writer, so exactly one
         // waiter is unblocked by each bump.
+        let wait_started = std::time::Instant::now();
         {
             let mut applied = self.last_applied_lsn.lock();
             while *applied + 1 < lsn {
                 self.commit_cvar.wait(&mut applied);
             }
         }
+        self.metrics
+            .record_commit_apply_wait(wait_started.elapsed());
 
+        let apply_gate_started = std::time::Instant::now();
         let apply_guard = self.apply_gate.read();
+        self.metrics
+            .record_commit_apply_gate_wait(apply_gate_started.elapsed());
         // Clone out the volume map once per commit — HashMap + `Arc`
         // clones are cheap, and keeping the Arcs live for the whole
         // apply loop avoids holding `volumes.read()` across apply.
         // That matters because commit 8+ will acquire `volumes.write()`
         // on the lifecycle path, and a long-held reader would stall it.
         let volumes = self.volumes.read().clone();
-        let outcomes = self.apply_commit_batch(&volumes, lsn, ops)?;
-        self.faults
-            .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
+        let apply_started = std::time::Instant::now();
+        let outcomes = match self.apply_commit_batch(&volumes, lsn, ops) {
+            Ok(outcomes) => {
+                self.metrics.record_commit_apply(apply_started.elapsed());
+                outcomes
+            }
+            Err(err) => {
+                self.metrics.record_commit_apply(apply_started.elapsed());
+                self.metrics.record_commit_error(commit_started.elapsed());
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.faults.inject(FaultPoint::CommitPostApplyBeforeLsnBump) {
+            self.metrics.record_commit_error(commit_started.elapsed());
+            return Err(err);
+        }
 
         // Bump BEFORE dropping the gate: if we released the gate first
         // a concurrent flush could observe `last_applied_lsn = lsn - 1`
@@ -70,6 +109,7 @@ impl Db {
             self.commit_cvar.notify_all();
         }
         drop(apply_guard);
+        self.metrics.record_commit_success(commit_started.elapsed());
         Ok((lsn, outcomes))
     }
 

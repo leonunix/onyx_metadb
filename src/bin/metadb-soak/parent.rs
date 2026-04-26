@@ -3,7 +3,10 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
     let mut events = EventLog::open(&cfg.events_path).map_err(|e| e.to_string())?;
     events.write(
         "start",
-        &format!("seed={} threads={}", cfg.seed, cfg.threads),
+        &format!(
+            "seed={} threads={} pipeline_depth={}",
+            cfg.seed, cfg.threads, cfg.pipeline_depth
+        ),
     )?;
 
     let started = Instant::now();
@@ -22,24 +25,34 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
     let mut deadlock_detected = false;
     let mut last_error = None;
     let mut onyx_stats = OnyxStats::default();
+    let mut child = None;
+    let mut child_fault = None;
     let mut last_restart = Instant::now();
 
     while started.elapsed() < Duration::from_secs(cfg.duration_secs) {
         cycles += 1;
-        let fault = choose_fault(&mut cycle_rng, cfg.fault_density_pct);
-        if fault.is_some() {
-            fault_cycles += 1;
+        if child.is_none() {
+            child_fault = choose_fault(&mut cycle_rng, cfg.fault_density_pct);
+            if child_fault.is_some() {
+                fault_cycles += 1;
+            }
+            events.write(
+                "child_spawn",
+                &format!("cycle={} fault={}", cycles, fault_label(child_fault)),
+            )?;
+            child = Some(spawn_child(&cfg, child_fault).map_err(|e| e.to_string())?);
+            last_restart = Instant::now();
         }
         events.write(
             "cycle_start",
-            &format!("cycle={} fault={}", cycles, fault_label(fault)),
+            &format!("cycle={} fault={}", cycles, fault_label(child_fault)),
         )?;
-        let mut child = spawn_child(&cfg, fault).map_err(|e| e.to_string())?;
+        let running_child = child.as_mut().expect("child spawned before cycle");
 
         match run_cycle(
             &cfg,
             cycles,
-            &mut child,
+            running_child,
             &mut model,
             &mut onyx_model,
             &mut rngs,
@@ -52,7 +65,9 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
             Ok(()) => {}
             Err(err) => {
                 last_error = Some(err);
-                let _ = kill_child(&mut child);
+                if let Some(mut running_child) = child.take() {
+                    let _ = kill_child(&mut running_child);
+                }
                 break;
             }
         }
@@ -62,44 +77,48 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
                 || started.elapsed() >= Duration::from_secs(cfg.duration_secs)
         });
         if !should_restart {
-            let _ = send_admin(&mut child, 999_999_999, "QUIT");
+            events.write("child_kept", &format!("cycle={cycles}"))?;
+            continue;
         }
-        if let Err(err) = kill_child(&mut child) {
-            last_error = Some(err.to_string());
-            break;
-        }
-        restarts += 1;
-        last_restart = Instant::now();
-        events.write("child_killed", &format!("cycle={cycles}"))?;
 
-        match verify_reopened_db(
-            &cfg.path,
+        let mut running_child = child.take().expect("child exists when restart is due");
+        if let Err(err) = kill_and_verify_child(
+            &cfg,
+            &mut running_child,
+            cycles,
             &model,
             &onyx_model,
             &snapshots,
-            cfg.threads,
-            cfg.workload,
+            &mut restarts,
+            &mut verifies,
+            &mut events,
         ) {
-            Ok(report) => {
-                if !report.is_clean() {
-                    last_error = Some(format!("metadb-verify failed: {:?}", report.issues));
-                    break;
-                }
-                verifies += 1;
-                events.write(
-                    "verify_ok",
-                    &format!(
-                        "cycle={} live_pages={} free_pages={}",
-                        cycles, report.live_pages, report.free_pages
-                    ),
-                )?;
+            if err.contains("deadlock") {
+                deadlock_detected = true;
             }
-            Err(err) => {
-                if err.to_string().contains("deadlock") {
+            last_error = Some(err);
+            break;
+        }
+        child_fault = None;
+    }
+
+    if last_error.is_none() {
+        if let Some(mut running_child) = child.take() {
+            if let Err(err) = kill_and_verify_child(
+                &cfg,
+                &mut running_child,
+                cycles,
+                &model,
+                &onyx_model,
+                &snapshots,
+                &mut restarts,
+                &mut verifies,
+                &mut events,
+            ) {
+                if err.contains("deadlock") {
                     deadlock_detected = true;
                 }
-                last_error = Some(err.to_string());
-                break;
+                last_error = Some(err);
             }
         }
     }
@@ -130,6 +149,50 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
     } else {
         ExitCode::from(1)
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kill_and_verify_child(
+    cfg: &ParentConfig,
+    child: &mut ChildHandle,
+    cycle: u64,
+    model: &Model,
+    onyx_model: &OnyxRefModel,
+    snapshots: &[ModelSnapshot],
+    restarts: &mut u64,
+    verifies: &mut u64,
+    events: &mut EventLog,
+) -> Result<(), String> {
+    if let Err(err) = kill_child(child) {
+        return Err(err.to_string());
+    }
+    *restarts += 1;
+    events.write("child_killed", &format!("cycle={cycle}"))?;
+
+    match verify_reopened_db(
+        &cfg.path,
+        model,
+        onyx_model,
+        snapshots,
+        cfg.threads,
+        cfg.workload,
+    ) {
+        Ok(report) => {
+            if !report.is_clean() {
+                return Err(format!("metadb-verify failed: {:?}", report.issues));
+            }
+            *verifies += 1;
+            events.write(
+                "verify_ok",
+                &format!(
+                    "cycle={} live_pages={} free_pages={}",
+                    cycle, report.live_pages, report.free_pages
+                ),
+            )?;
+            Ok(())
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -164,18 +227,22 @@ fn run_cycle(
 
     // Phase 2: workers pounding across the live volume set.
     let mut sent_ops = 0usize;
-    let mut free_tids: VecDeque<usize> = (0..cfg.threads).collect();
+    let effective_pipeline_depth = match cfg.workload {
+        // Onyx-mix is reference-model checked. Keep exactly one op in
+        // flight so the parent applies the model in the same order the
+        // child commits WAL records. Legacy and concurrent modes can
+        // pipeline per-worker jobs to keep the child saturated.
+        Workload::Onyx => 1,
+        Workload::Legacy | Workload::OnyxConcurrent => cfg.pipeline_depth,
+    };
+    let mut free_tids: VecDeque<usize> = (0..cfg.threads)
+        .flat_map(|tid| (0..effective_pipeline_depth).map(move |_| tid))
+        .collect();
     let mut inflight: HashMap<u64, WorkerOp> = HashMap::new();
 
     let max_inflight = match cfg.workload {
-        Workload::Legacy => cfg.threads,
-        // Onyx-mix is reference-model checked. Keep exactly one op in
-        // flight so the parent applies the model in the same order the
-        // child commits WAL records. Legacy soak still exercises
-        // concurrent workers; S6's 24h onyx gate prioritizes semantic
-        // drift detection over worker-level scheduling pressure.
+        Workload::Legacy | Workload::OnyxConcurrent => cfg.threads * effective_pipeline_depth,
         Workload::Onyx => 1,
-        Workload::OnyxConcurrent => cfg.threads,
     };
 
     while sent_ops < cfg.ops_per_cycle || !inflight.is_empty() {

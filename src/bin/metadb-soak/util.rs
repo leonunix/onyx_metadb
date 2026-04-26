@@ -233,7 +233,7 @@ fn write_summary(path: &Path, summary: &Summary) -> std::io::Result<()> {
 
 fn print_parent_usage() {
     eprintln!(
-        "usage: metadb-soak <path> [--duration-secs N|--minutes N|--hours N] [--restart-interval 2h] [--legacy-mix|--onyx-mix|--onyx-concurrent-mix] [--ops-per-cycle N] [--threads N] [--seed N] [--fault-density-pct N] [--summary path] [--events path] [--events-summary|--events-ops] [--no-snapshots]"
+        "usage: metadb-soak <path> [--duration-secs N|--minutes N|--hours N] [--restart-interval 2h] [--legacy-mix|--onyx-mix|--onyx-concurrent-mix] [--ops-per-cycle N] [--pipeline-depth N] [--threads N] [--metrics path] [--metrics-interval-secs N] [--seed N] [--fault-density-pct N] [--summary path] [--events path] [--events-summary|--events-ops] [--no-snapshots]"
     );
 }
 

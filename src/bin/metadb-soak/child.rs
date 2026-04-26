@@ -8,6 +8,17 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
     let deadlock_seen = Arc::new(AtomicBool::new(false));
     let deadlock_stop = Arc::new(AtomicBool::new(false));
     let monitor = spawn_deadlock_monitor(deadlock_stop.clone(), deadlock_seen.clone());
+    let metrics_stop = Arc::new(AtomicBool::new(false));
+    let metrics_reporter = cfg.metrics_path.as_ref().and_then(|path| {
+        (cfg.metrics_interval_secs > 0).then(|| {
+            spawn_metrics_reporter(
+                db.clone(),
+                path.clone(),
+                Duration::from_secs(cfg.metrics_interval_secs),
+                metrics_stop.clone(),
+            )
+        })
+    });
 
     let (ack_tx, ack_rx) = crossbeam_channel::unbounded::<Ack>();
     let admin_ack_tx = ack_tx.clone();
@@ -58,6 +69,7 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
                     "REFCOUNT_SUM" => {
                         db_refcount_sum(&db).map(|sum| Ack::Onyx(id, format!("sum={sum}")))
                     }
+                    "METRICS" => Ok(Ack::Onyx(id, db.metrics_json())),
                     "AUDIT_PBA_REFCOUNTS" => audit_pba_refcounts(&db).map(|_| Ack::Ok(id)),
                     "CLEANUP" => {
                         let pbas = parts
@@ -106,7 +118,11 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
     }
 
     deadlock_stop.store(true, Ordering::Release);
+    metrics_stop.store(true, Ordering::Release);
     let _ = monitor.join();
+    if let Some(handle) = metrics_reporter {
+        let _ = handle.join();
+    }
     if deadlock_seen.load(Ordering::Acquire) {
         return Err("deadlock detected in child monitor".into());
     }
@@ -119,6 +135,58 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
     drop(admin_ack_tx);
     let _ = writer.join();
     Ok(ExitCode::SUCCESS)
+}
+
+fn spawn_metrics_reporter(
+    db: Arc<Db>,
+    path: PathBuf,
+    interval: Duration,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path);
+        let Ok(file) = file else {
+            return;
+        };
+        let mut writer = BufWriter::new(file);
+        while !stop.load(Ordering::Acquire) {
+            let ts_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(
+                writer,
+                "{{\"ts_ms\":{},\"metrics\":{}}}",
+                ts_ms,
+                db.metrics_json()
+            );
+            let _ = writer.flush();
+
+            let mut slept = Duration::ZERO;
+            while slept < interval && !stop.load(Ordering::Acquire) {
+                let step = (interval - slept).min(Duration::from_millis(200));
+                thread::sleep(step);
+                slept += step;
+            }
+        }
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(
+            writer,
+            "{{\"ts_ms\":{},\"metrics\":{}}}",
+            ts_ms,
+            db.metrics_json()
+        );
+        let _ = writer.flush();
+    })
 }
 
 fn worker_main(

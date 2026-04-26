@@ -26,6 +26,7 @@ use crate::manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VolumeEntry,
     write_snapshot_roots_page,
 };
+use crate::metrics::{MetaMetrics, MetaMetricsSnapshot};
 use crate::page::PageType;
 use crate::page_store::PageStore;
 use crate::paged::PagedL2p;
@@ -46,6 +47,7 @@ const BOOTSTRAP_VOLUME_ORD: VolumeOrdinal = 0;
 pub struct Db {
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
+    metrics: Arc<MetaMetrics>,
     manifest_state: Mutex<ManifestState>,
     /// Per-volume L2P paged radix-tree shard groups. Phase B commit 5 always
     /// contains exactly one entry for [`BOOTSTRAP_VOLUME_ORD`]; commit 6/7

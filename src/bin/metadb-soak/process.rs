@@ -7,6 +7,10 @@ fn spawn_child(cfg: &ParentConfig, fault: Option<FaultSpec>) -> std::io::Result<
         .arg(cfg.threads.to_string())
         .arg("--workload")
         .arg(workload_name(cfg.workload))
+        .arg("--metrics")
+        .arg(&cfg.metrics_path)
+        .arg("--metrics-interval-secs")
+        .arg(cfg.metrics_interval_secs.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
