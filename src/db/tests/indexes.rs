@@ -97,6 +97,7 @@ fn flush_prunes_checkpointed_wal_segments() {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
     cfg.wal_segment_bytes = 512;
+    cfg.wal_lanes = 1;
     let wal_dir = dir.path().join("wal");
 
     {

@@ -6,9 +6,10 @@
 //! 1. Serialize the ops into a record body.
 //! 2. Submit the body to the WAL (no Db-level lock held). Multiple
 //!    concurrent submits coalesce into one group-commit fsync.
-//! 3. Wait on `commit_cvar` until every lower LSN has applied, then
-//!    apply our ops under `apply_gate.read()`.
-//! 4. Bump `last_applied_lsn` to our LSN and `notify_all`, **before**
+//! 3. Wait for global-LSN dispatch order, enqueue bucketable work into
+//!    per-shard apply lanes, then apply under `apply_gate.read()`.
+//! 4. After all touched lanes finish, wait only for the contiguous
+//!    global completion point and bump `last_applied_lsn` before
 //!    dropping the apply gate — otherwise a concurrent flush could
 //!    observe trees whose state is ahead of `last_applied_lsn` and
 //!    recovery would double-apply on restart (refcount incref is not

@@ -363,11 +363,7 @@ impl MetaMetrics {
 
     pub(crate) fn record_apply_l2p_put(&self, elapsed: Duration) {
         self.apply_l2p_put_count.fetch_add(1, Ordering::Relaxed);
-        record_duration(
-            &self.apply_l2p_put_us,
-            &self.apply_l2p_put_max_us,
-            elapsed,
-        );
+        record_duration(&self.apply_l2p_put_us, &self.apply_l2p_put_max_us, elapsed);
     }
 
     pub(crate) fn record_apply_l2p_delete(&self, elapsed: Duration) {

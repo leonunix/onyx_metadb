@@ -110,7 +110,8 @@ pub(super) fn create_shards(
         let tree = BTree::create_with_cache(page_store.clone(), page_cache.clone())?;
         roots.push(tree.root());
         shards.push(Shard {
-            tree: Mutex::new(tree),
+            tree: Arc::new(Mutex::new(tree)),
+            apply_lane: ApplyLane::new(0),
         });
     }
     Ok((shards, roots.into_boxed_slice()))
@@ -125,12 +126,13 @@ pub(super) fn open_shards(
     let mut shards = Vec::with_capacity(roots.len());
     for &root in roots {
         shards.push(Shard {
-            tree: Mutex::new(BTree::open_with_cache(
+            tree: Arc::new(Mutex::new(BTree::open_with_cache(
                 page_store.clone(),
                 page_cache.clone(),
                 root,
                 next_gen,
-            )?),
+            )?)),
+            apply_lane: ApplyLane::new(0),
         });
     }
     Ok(shards)
@@ -150,6 +152,7 @@ pub(super) fn make_l2p_shard(tree: PagedL2p, page_cache: &Arc<PageCache>) -> L2p
     L2pShard {
         tree: RwLock::new(tree),
         read_view: RwLock::new(Arc::new(view)),
+        apply_lane: ApplyLane::new(0),
     }
 }
 
@@ -176,12 +179,8 @@ pub(super) fn open_l2p_shards(
 ) -> Result<Vec<L2pShard>> {
     let mut shards = Vec::with_capacity(roots.len());
     for &root in roots {
-        let tree = PagedL2p::open_with_cache(
-            page_store.clone(),
-            page_cache.clone(),
-            root,
-            next_gen,
-        )?;
+        let tree =
+            PagedL2p::open_with_cache(page_store.clone(), page_cache.clone(), root, next_gen)?;
         shards.push(make_l2p_shard(tree, &page_cache));
     }
     Ok(shards)

@@ -289,32 +289,7 @@ impl<'a> SstReader<'a> {
         page_cache: &'a PageCache,
         handle: SstHandle,
     ) -> Result<Self> {
-        let header_page = page_cache.get(handle.head_page)?;
-        let header = decode_header(&header_page, handle.head_page)?;
-
-        // Cross-check: the handle and header must agree.
-        if header.record_count != handle.record_count
-            || header.bloom_page_count != handle.bloom_page_count
-            || header.body_page_count != handle.body_page_count
-            || header.min_hash != handle.min_hash
-            || header.max_hash != handle.max_hash
-        {
-            return Err(MetaDbError::Corruption(format!(
-                "SST header at page {} disagrees with handle",
-                handle.head_page,
-            )));
-        }
-
-        // Read bloom filter bytes.
-        let mut bloom_bytes = Vec::with_capacity((header.bloom_bit_count / 8) as usize);
-        for i in 0..header.bloom_page_count as u64 {
-            let page = page_cache.get(handle.head_page + 1 + i)?;
-            let remaining = (header.bloom_bit_count as usize / 8) - bloom_bytes.len();
-            let take = remaining.min(PAGE_PAYLOAD_SIZE);
-            bloom_bytes.extend_from_slice(&page.payload()[..take]);
-        }
-        let bloom =
-            BloomFilter::from_parts(bloom_bytes, header.bloom_bit_count, header.bloom_hash_count);
+        let (header, bloom) = load_header_and_bloom(page_cache, handle)?;
 
         Ok(Self {
             page_cache,
@@ -337,43 +312,13 @@ impl<'a> SstReader<'a> {
     /// - `Miss`       — the SST does not contain this hash. Older SSTs
     ///   may.
     pub fn get(&self, hash: &Hash32) -> Result<LookupResult> {
-        if hash < &self.handle.min_hash || hash > &self.handle.max_hash {
-            return Ok(LookupResult::Miss);
-        }
-        if !self.bloom.maybe_contains(hash) {
-            return Ok(LookupResult::Miss);
-        }
-        // Binary search across the body: treat records as one flat
-        // sorted array indexed 0..record_count. Each read fetches one
-        // page and does an intra-page binary search. With ~log2(N/63)
-        // outer steps and constant inner work, a 1 M-record SST costs
-        // ~14 page reads at the absolute worst case.
-        let mut lo = 0u64;
-        let mut hi = self.header.record_count; // exclusive
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let page_idx = (mid as usize) / RECORDS_PER_PAGE;
-            let page = self
-                .page_cache
-                .get(self.handle.body_start_page() + page_idx as u64)?;
-            let page_records = page.key_count() as usize;
-            match self.search_page(&page, page_records, hash)? {
-                IntraPageResult::Found(kind, value) => {
-                    return Ok(match kind {
-                        super::format::KIND_PUT => LookupResult::Hit(value),
-                        super::format::KIND_DELETE => LookupResult::Tombstone,
-                        other => {
-                            return Err(MetaDbError::Corruption(format!(
-                                "unknown SST record kind byte {other}",
-                            )));
-                        }
-                    });
-                }
-                IntraPageResult::TooLow => lo = (page_idx + 1) as u64 * RECORDS_PER_PAGE as u64,
-                IntraPageResult::TooHigh => hi = page_idx as u64 * RECORDS_PER_PAGE as u64,
-            }
-        }
-        Ok(LookupResult::Miss)
+        get_from_sst(
+            self.page_cache,
+            self.handle,
+            &self.header,
+            &self.bloom,
+            hash,
+        )
     }
 
     /// Iterator over every record in hash order. Used by compaction.
@@ -387,57 +332,168 @@ impl<'a> SstReader<'a> {
             buffered_off: 0,
         }
     }
+}
 
-    fn search_page(
-        &self,
-        page: &Page,
-        page_records: usize,
-        hash: &Hash32,
-    ) -> Result<IntraPageResult> {
-        let p = page.payload();
-        if page_records == 0 {
-            return Err(MetaDbError::Corruption(
-                "SST body page has zero records".into(),
-            ));
-        }
-        // Quick rejection: if page's range does not cover the hash, we
-        // can narrow the outer search in one side or the other.
-        let first_hash: &Hash32 = (&p[0..32]).try_into().unwrap();
-        let last_off = (page_records - 1) * LSM_RECORD_SIZE;
-        let last_hash: &Hash32 = (&p[last_off..last_off + 32]).try_into().unwrap();
-        if hash < first_hash {
-            return Ok(IntraPageResult::TooHigh);
-        }
-        if hash > last_hash {
-            return Ok(IntraPageResult::TooLow);
-        }
-        // In range: binary-search inside the page.
-        let mut lo = 0usize;
-        let mut hi = page_records;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let off = mid * LSM_RECORD_SIZE;
-            let mid_hash: &Hash32 = (&p[off..off + 32]).try_into().unwrap();
-            match hash.cmp(mid_hash) {
-                std::cmp::Ordering::Equal => {
-                    let kind = p[off + 32];
-                    let mut value_bytes = [0u8; super::format::DEDUP_VALUE_SIZE];
-                    value_bytes
-                        .copy_from_slice(&p[off + 33..off + 33 + super::format::DEDUP_VALUE_SIZE]);
-                    return Ok(IntraPageResult::Found(
-                        kind,
-                        super::format::DedupValue(value_bytes),
-                    ));
-                }
-                std::cmp::Ordering::Less => hi = mid,
-                std::cmp::Ordering::Greater => lo = mid + 1,
-            }
-        }
-        // Key falls between this page's bounds but no record matches →
-        // miss entirely. Signal by narrowing the outer search to an
-        // empty interval at this page.
-        Ok(IntraPageResult::TooHigh)
+/// Owning read-side accessor intended for LSM point-lookup caching.
+#[derive(Debug)]
+pub struct CachedSstReader {
+    page_cache: Arc<PageCache>,
+    handle: SstHandle,
+    header: SstHeader,
+    bloom: BloomFilter,
+}
+
+impl CachedSstReader {
+    /// Open an SST and keep the immutable header + bloom filter in this
+    /// reader. Body pages still flow through the shared `PageCache`.
+    pub fn open(page_cache: Arc<PageCache>, handle: SstHandle) -> Result<Self> {
+        let (header, bloom) = load_header_and_bloom(&page_cache, handle)?;
+        Ok(Self {
+            page_cache,
+            handle,
+            header,
+            bloom,
+        })
     }
+
+    /// Handle that was used to open this reader.
+    pub fn handle(&self) -> SstHandle {
+        self.handle
+    }
+
+    /// Point lookup using the cached bloom filter.
+    pub fn get(&self, hash: &Hash32) -> Result<LookupResult> {
+        get_from_sst(
+            &self.page_cache,
+            self.handle,
+            &self.header,
+            &self.bloom,
+            hash,
+        )
+    }
+}
+
+fn load_header_and_bloom(
+    page_cache: &PageCache,
+    handle: SstHandle,
+) -> Result<(SstHeader, BloomFilter)> {
+    let header_page = page_cache.get(handle.head_page)?;
+    let header = decode_header(&header_page, handle.head_page)?;
+
+    // Cross-check: the handle and header must agree.
+    if header.record_count != handle.record_count
+        || header.bloom_page_count != handle.bloom_page_count
+        || header.body_page_count != handle.body_page_count
+        || header.min_hash != handle.min_hash
+        || header.max_hash != handle.max_hash
+    {
+        return Err(MetaDbError::Corruption(format!(
+            "SST header at page {} disagrees with handle",
+            handle.head_page,
+        )));
+    }
+
+    // Read bloom filter bytes once per cached reader.
+    let mut bloom_bytes = Vec::with_capacity((header.bloom_bit_count / 8) as usize);
+    for i in 0..header.bloom_page_count as u64 {
+        let page = page_cache.get(handle.head_page + 1 + i)?;
+        let remaining = (header.bloom_bit_count as usize / 8) - bloom_bytes.len();
+        let take = remaining.min(PAGE_PAYLOAD_SIZE);
+        bloom_bytes.extend_from_slice(&page.payload()[..take]);
+    }
+    let bloom =
+        BloomFilter::from_parts(bloom_bytes, header.bloom_bit_count, header.bloom_hash_count);
+    Ok((header, bloom))
+}
+
+fn get_from_sst(
+    page_cache: &PageCache,
+    handle: SstHandle,
+    header: &SstHeader,
+    bloom: &BloomFilter,
+    hash: &Hash32,
+) -> Result<LookupResult> {
+    if hash < &handle.min_hash || hash > &handle.max_hash {
+        return Ok(LookupResult::Miss);
+    }
+    if !bloom.maybe_contains(hash) {
+        return Ok(LookupResult::Miss);
+    }
+    // Binary search across the body: treat records as one flat
+    // sorted array indexed 0..record_count. Each read fetches one
+    // page and does an intra-page binary search. With ~log2(N/63)
+    // outer steps and constant inner work, a 1 M-record SST costs
+    // ~14 page reads at the absolute worst case.
+    let mut lo = 0u64;
+    let mut hi = header.record_count; // exclusive
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let page_idx = (mid as usize) / RECORDS_PER_PAGE;
+        let page = page_cache.get(handle.body_start_page() + page_idx as u64)?;
+        let page_records = page.key_count() as usize;
+        match search_page(&page, page_records, hash)? {
+            IntraPageResult::Found(kind, value) => {
+                return Ok(match kind {
+                    super::format::KIND_PUT => LookupResult::Hit(value),
+                    super::format::KIND_DELETE => LookupResult::Tombstone,
+                    other => {
+                        return Err(MetaDbError::Corruption(format!(
+                            "unknown SST record kind byte {other}",
+                        )));
+                    }
+                });
+            }
+            IntraPageResult::TooLow => lo = (page_idx + 1) as u64 * RECORDS_PER_PAGE as u64,
+            IntraPageResult::TooHigh => hi = page_idx as u64 * RECORDS_PER_PAGE as u64,
+        }
+    }
+    Ok(LookupResult::Miss)
+}
+
+fn search_page(page: &Page, page_records: usize, hash: &Hash32) -> Result<IntraPageResult> {
+    let p = page.payload();
+    if page_records == 0 {
+        return Err(MetaDbError::Corruption(
+            "SST body page has zero records".into(),
+        ));
+    }
+    // Quick rejection: if page's range does not cover the hash, we
+    // can narrow the outer search in one side or the other.
+    let first_hash: &Hash32 = (&p[0..32]).try_into().unwrap();
+    let last_off = (page_records - 1) * LSM_RECORD_SIZE;
+    let last_hash: &Hash32 = (&p[last_off..last_off + 32]).try_into().unwrap();
+    if hash < first_hash {
+        return Ok(IntraPageResult::TooHigh);
+    }
+    if hash > last_hash {
+        return Ok(IntraPageResult::TooLow);
+    }
+    // In range: binary-search inside the page.
+    let mut lo = 0usize;
+    let mut hi = page_records;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let off = mid * LSM_RECORD_SIZE;
+        let mid_hash: &Hash32 = (&p[off..off + 32]).try_into().unwrap();
+        match hash.cmp(mid_hash) {
+            std::cmp::Ordering::Equal => {
+                let kind = p[off + 32];
+                let mut value_bytes = [0u8; super::format::DEDUP_VALUE_SIZE];
+                value_bytes
+                    .copy_from_slice(&p[off + 33..off + 33 + super::format::DEDUP_VALUE_SIZE]);
+                return Ok(IntraPageResult::Found(
+                    kind,
+                    super::format::DedupValue(value_bytes),
+                ));
+            }
+            std::cmp::Ordering::Less => hi = mid,
+            std::cmp::Ordering::Greater => lo = mid + 1,
+        }
+    }
+    // Key falls between this page's bounds but no record matches →
+    // miss entirely. Signal by narrowing the outer search to an
+    // empty interval at this page.
+    Ok(IntraPageResult::TooHigh)
 }
 
 enum IntraPageResult {

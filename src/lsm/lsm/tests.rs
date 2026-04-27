@@ -70,6 +70,23 @@ fn flush_creates_l0_sst_and_clears_active() {
 }
 
 #[test]
+fn point_lookup_reuses_cached_sst_reader() {
+    let (_d, _ps, lsm) = mk_lsm();
+    for i in 0..100u64 {
+        lsm.put(h(i), v(i as u8));
+    }
+    let handle = lsm.flush_memtable(1).unwrap().unwrap();
+    assert_eq!(lsm.debug_reader_cache_len(), 0);
+
+    assert_eq!(lsm.get(&h(42)).unwrap(), Some(v(42)));
+    assert_eq!(lsm.debug_reader_cache_len(), 1);
+    assert!(lsm.debug_reader_cache_contains(handle.head_page));
+
+    assert_eq!(lsm.get(&h(43)).unwrap(), Some(v(43)));
+    assert_eq!(lsm.debug_reader_cache_len(), 1);
+}
+
+#[test]
 fn newer_l0_sst_shadows_older() {
     let (_d, _ps, lsm) = mk_lsm();
     lsm.put(h(1), v(1));
@@ -221,6 +238,37 @@ fn compact_l0_to_l1_merges_disjoint_ssts() {
             assert_eq!(lsm.get(&h(key)).unwrap(), Some(v(key as u8)));
         }
     }
+}
+
+#[test]
+fn compact_invalidates_victim_sst_reader_cache() {
+    let (_d, _ps, lsm) = mk_lsm_small();
+    for round in 0..3u64 {
+        for i in 0..20u64 {
+            let key = round * 100 + i;
+            lsm.put(h(key), v(key as u8));
+        }
+        lsm.flush_memtable(round as Lsn + 1).unwrap().unwrap();
+    }
+
+    let victims = lsm.levels_snapshot()[0].clone();
+    assert_eq!(victims.len(), 3);
+    for round in 0..3u64 {
+        assert_eq!(
+            lsm.get(&h(round * 100)).unwrap(),
+            Some(v((round * 100) as u8))
+        );
+    }
+    assert_eq!(lsm.debug_reader_cache_len(), victims.len());
+    for victim in &victims {
+        assert!(lsm.debug_reader_cache_contains(victim.head_page));
+    }
+
+    lsm.compact_once(10).unwrap().unwrap();
+    for victim in &victims {
+        assert!(!lsm.debug_reader_cache_contains(victim.head_page));
+    }
+    assert_eq!(lsm.debug_reader_cache_len(), 0);
 }
 
 #[test]

@@ -205,11 +205,10 @@ fn bucketed_apply_preserves_intra_bucket_rc_order() {
     assert_eq!(db.get_refcount(77).unwrap(), 3);
 }
 
-/// Batches smaller than the bucket threshold fall through to the
-/// serial path. This test is a behavioural smoke check (the small
-/// batch must still apply correctly).
+/// Small batches also use the lane path now; this is a behavioural
+/// smoke check that the low-overhead path still applies correctly.
 #[test]
-fn small_batch_falls_through_serial_path() {
+fn small_batch_lane_path_applies_correctly() {
     let (_d, db) = mk_db_with_shards(2);
     let mut tx = db.begin();
     // Below BUCKET_THRESHOLD (= 8).

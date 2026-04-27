@@ -237,7 +237,7 @@ impl Db {
             };
             let body = encode_body(std::slice::from_ref(&op));
             let wal_started = std::time::Instant::now();
-            let lsn = match self.wal.submit(body) {
+            let lsn = match self.submit_wal_ops(std::slice::from_ref(&op), body) {
                 Ok(lsn) => {
                     self.metrics.record_range_delete_wal(wal_started.elapsed());
                     lsn
@@ -246,24 +246,21 @@ impl Db {
                     self.metrics.record_range_delete_wal(wal_started.elapsed());
                     self.metrics
                         .record_range_delete_error(total_started.elapsed());
+                    self.poison_commit_waiters(&err);
                     return Err(err);
                 }
             };
             if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
                 self.metrics
                     .record_range_delete_error(total_started.elapsed());
+                self.poison_commit_waiters(&err);
                 return Err(err);
             }
 
             // Under apply_gate.write no one else can apply, so the
             // cvar wait is defensive and usually passes immediately.
             let wait_started = std::time::Instant::now();
-            {
-                let mut applied = self.last_applied_lsn.lock();
-                while *applied + 1 < lsn {
-                    self.commit_cvar.wait(&mut applied);
-                }
-            }
+            self.wait_for_global_apply_turn(lsn)?;
             self.metrics
                 .record_range_delete_apply_wait(wait_started.elapsed());
 
@@ -288,20 +285,19 @@ impl Db {
                         .record_range_delete_apply(apply_started.elapsed());
                     self.metrics
                         .record_range_delete_error(total_started.elapsed());
+                    self.poison_commit_waiters(&err);
                     return Err(err);
                 }
             }
             if let Err(err) = self.faults.inject(FaultPoint::CommitPostApplyBeforeLsnBump) {
                 self.metrics
                     .record_range_delete_error(total_started.elapsed());
+                self.poison_commit_waiters(&err);
                 return Err(err);
             }
 
-            {
-                let mut applied = self.last_applied_lsn.lock();
-                *applied = lsn;
-                self.commit_cvar.notify_all();
-            }
+            self.finish_global_apply(lsn)?;
+            self.advance_dispatch_lsn(lsn);
             last_lsn = lsn;
         }
         self.metrics
@@ -309,4 +305,3 @@ impl Db {
         Ok(last_lsn)
     }
 }
-

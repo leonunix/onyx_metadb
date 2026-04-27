@@ -37,6 +37,12 @@ pub struct Config {
     /// Size of a single WAL segment before rotation. Consumed from phase 1.
     pub wal_segment_bytes: u64,
 
+    /// Number of WAL writer lanes used by `Db`. Each lane has its own
+    /// writer thread, segment directory, and fsync stream. Global LSNs
+    /// are still assigned from one short critical section so recovery
+    /// can merge lanes into the existing total order.
+    pub wal_lanes: u32,
+
     /// Upper bound on a single group-commit batch, in bytes.
     pub group_commit_max_batch_bytes: usize,
 
@@ -103,8 +109,9 @@ impl Config {
             shards_per_partition: 16,
             max_volumes: 1024,
             wal_segment_bytes: 64 * 1024 * 1024,
+            wal_lanes: 4,
             group_commit_max_batch_bytes: 4 * 1024 * 1024,
-            group_commit_timeout_us: 200,
+            group_commit_timeout_us: 500,
             page_cache_bytes: 512 * 1024 * 1024,
             lsm_memtable_bytes: 64 * 1024 * 1024,
             lsm_bloom_bits_per_entry: 10,

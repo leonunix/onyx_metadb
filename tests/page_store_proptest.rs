@@ -125,6 +125,13 @@ proptest! {
                     prop_assert_eq!(actual, expected, "read mismatch at {}", pid);
                 }
                 Op::Reopen => {
+                    // `free` is deferred under the epoch reclaim model
+                    // (see `EpochManager` in src/epoch.rs); the on-disk
+                    // Free-stamp + free-list push only happens when
+                    // `try_reclaim` runs. The reference model treats
+                    // Free as immediately durable, so drain before the
+                    // sync_all/reopen round-trip to honor that contract.
+                    ps.try_reclaim().unwrap();
                     ps.sync_all().unwrap();
                     ps = Arc::new(PageStore::open(&path).unwrap());
                     // Re-read every live page and check the content.
@@ -151,7 +158,9 @@ proptest! {
         }
 
         // Final end-to-end: one more sync+reopen, then every contents
-        // entry must read back.
+        // entry must read back. Drain deferred-free first for the same
+        // reason as the in-loop Reopen branch.
+        ps.try_reclaim().unwrap();
         ps.sync_all().unwrap();
         ps = Arc::new(PageStore::open(&path).unwrap());
         for (&pid, &expected) in &contents {

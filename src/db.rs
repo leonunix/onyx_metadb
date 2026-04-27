@@ -7,11 +7,13 @@
 //! - thread-safe point writes via one mutex per shard
 //! - fan-out range / diff / snapshot operations
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::{Bound, RangeBounds};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
+use std::thread::JoinHandle;
 
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use xxhash_rust::xxh3::xxh3_64;
@@ -35,7 +37,7 @@ use crate::testing::faults::{FaultController, FaultPoint};
 use crate::tx::{ApplyOutcome, Transaction};
 use crate::types::{FIRST_DATA_PAGE, Lba, Lsn, PageId, Pba, SnapshotId, VolumeOrdinal};
 use crate::verify;
-use crate::wal::{Wal, WalOp, encode_body};
+use crate::wal::{WalOp, WalSet, encode_body};
 
 /// Ordinal of the always-present bootstrap volume. Phase B commit 5 keeps the
 /// surface API single-volume, so every L2P routing decision lands here. Later
@@ -67,16 +69,20 @@ pub struct Db {
     refcount_shards: Vec<Shard>,
     /// Global dedup index: 32-byte SHA-256 content hash → 28-byte opaque
     /// `DedupValue`.
-    dedup_index: Lsm,
+    dedup_index: Arc<Lsm>,
     /// Reverse index: key = `[pba: 8B BE][hash_first_24B]`, value =
     /// `[hash_last_8B | zero padding]`. Used by PBA refcount → 0 to
     /// discover and clean up the `dedup_index` entries whose PBA is
     /// going away. Prefix-scan by 8-byte PBA locates every matching
     /// row.
-    dedup_reverse: Lsm,
+    dedup_reverse: Arc<Lsm>,
+    /// FIFO lane for the global dedup LSMs. The LSM internals are
+    /// synchronised, but same-key last-write-wins semantics still need
+    /// WAL-order apply across commits.
+    dedup_lane: ApplyLane,
     /// Write-ahead log. All mutations route through here so they survive
     /// crash between checkpoints.
-    wal: Wal,
+    wal: WalSet,
     /// Excludes apply phases from flush / snapshot. Commit takes
     /// `.read()` across the apply + bump; flush / take_snapshot /
     /// drop_snapshot take `.write()` so they observe a quiescent tree
@@ -98,6 +104,16 @@ pub struct Db {
     /// LSN is unique, so at most one thread waits for any given
     /// predecessor value.
     commit_cvar: Condvar,
+    /// Sticky failure used to wake LSN-ordered waiters if a lower-LSN
+    /// commit fails after a higher-LSN commit has already been durably
+    /// acked by another WAL lane.
+    commit_poison: Mutex<Option<String>>,
+    /// LSN of the most recent WAL record dispatched into per-shard apply
+    /// lanes. Dispatch remains global-LSN FIFO and does only the short
+    /// enqueue work; expensive tree/LSM apply happens after this advances.
+    last_dispatched_lsn: Mutex<Lsn>,
+    /// Notified whenever `last_dispatched_lsn` advances.
+    dispatch_cvar: Condvar,
     /// Snapshot readers hold a shared guard; `drop_snapshot` takes the
     /// exclusive side so it can't free pages still visible to a live view.
     snapshot_views: RwLock<()>,
@@ -165,8 +181,182 @@ struct SnapInfo {
     l2p_shard_roots: Box<[PageId]>,
 }
 
+type ApplyWork = Box<dyn FnOnce() + Send + 'static>;
+
+struct ApplyLane {
+    inner: Arc<ApplyLaneInner>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct ApplyLaneInner {
+    state: Mutex<ApplyLaneState>,
+    cvar: Condvar,
+}
+
+struct ApplyLaneState {
+    queue: VecDeque<ApplyLaneTask>,
+    last_enqueued_lsn: Lsn,
+    last_applied_lsn: Lsn,
+    shutdown: bool,
+}
+
+struct ApplyLaneTask {
+    lsn: Lsn,
+    slot: Arc<ApplyLaneTaskSlot>,
+}
+
+struct ApplyLaneTaskSlot {
+    work: Mutex<Option<ApplyWork>>,
+    cvar: Condvar,
+}
+
+struct PendingApplyWork {
+    slot: Option<Arc<ApplyLaneTaskSlot>>,
+}
+
+impl ApplyLane {
+    fn new(last_applied_lsn: Lsn) -> Self {
+        let inner = Arc::new(ApplyLaneInner {
+            state: Mutex::new(ApplyLaneState {
+                queue: VecDeque::new(),
+                last_enqueued_lsn: last_applied_lsn,
+                last_applied_lsn,
+                shutdown: false,
+            }),
+            cvar: Condvar::new(),
+        });
+        let worker_inner = inner.clone();
+        let worker = std::thread::Builder::new()
+            .name("onyx-metadb-apply-lane".to_string())
+            .spawn(move || apply_lane_worker(worker_inner))
+            .expect("failed to spawn metadb apply lane worker");
+        Self {
+            inner,
+            worker: Mutex::new(Some(worker)),
+        }
+    }
+
+    fn enqueue_ready(&self, lsn: Lsn, work: ApplyWork) {
+        self.enqueue_task(lsn, ApplyLaneTaskSlot::ready(work));
+    }
+
+    fn enqueue_pending(&self, lsn: Lsn) -> PendingApplyWork {
+        let slot = ApplyLaneTaskSlot::pending();
+        self.enqueue_task(lsn, slot.clone());
+        PendingApplyWork { slot: Some(slot) }
+    }
+
+    fn enqueue_task(&self, lsn: Lsn, slot: Arc<ApplyLaneTaskSlot>) {
+        let mut state = self.inner.state.lock();
+        debug_assert!(
+            state.last_enqueued_lsn < lsn,
+            "apply lane enqueue order violated: last={}, new={lsn}",
+            state.last_enqueued_lsn
+        );
+        state.last_enqueued_lsn = lsn;
+        state.queue.push_back(ApplyLaneTask { lsn, slot });
+        self.inner.cvar.notify_one();
+    }
+
+    #[allow(dead_code)]
+    fn last_applied_lsn(&self) -> Lsn {
+        self.inner.state.lock().last_applied_lsn
+    }
+}
+
+impl Drop for ApplyLane {
+    fn drop(&mut self) {
+        {
+            let mut state = self.inner.state.lock();
+            state.shutdown = true;
+            self.inner.cvar.notify_all();
+        }
+        if let Some(worker) = self.worker.get_mut().take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl ApplyLaneTaskSlot {
+    fn ready(work: ApplyWork) -> Arc<Self> {
+        Arc::new(Self {
+            work: Mutex::new(Some(work)),
+            cvar: Condvar::new(),
+        })
+    }
+
+    fn pending() -> Arc<Self> {
+        Arc::new(Self {
+            work: Mutex::new(None),
+            cvar: Condvar::new(),
+        })
+    }
+
+    fn set(&self, work: ApplyWork) {
+        let mut guard = self.work.lock();
+        debug_assert!(guard.is_none(), "apply lane task filled twice");
+        *guard = Some(work);
+        self.cvar.notify_one();
+    }
+
+    fn take(&self) -> ApplyWork {
+        let mut guard = self.work.lock();
+        while guard.is_none() {
+            self.cvar.wait(&mut guard);
+        }
+        guard.take().expect("apply lane task disappeared")
+    }
+}
+
+impl PendingApplyWork {
+    fn set(mut self, work: ApplyWork) {
+        if let Some(slot) = self.slot.take() {
+            slot.set(work);
+        }
+    }
+}
+
+impl Drop for PendingApplyWork {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.set(Box::new(|| {}));
+        }
+    }
+}
+
+fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
+    loop {
+        let task = {
+            let mut state = inner.state.lock();
+            loop {
+                if let Some(task) = state.queue.pop_front() {
+                    break task;
+                }
+                if state.shutdown {
+                    return;
+                }
+                inner.cvar.wait(&mut state);
+            }
+        };
+
+        let work = task.slot.take();
+        let _ = catch_unwind(AssertUnwindSafe(work));
+
+        let mut state = inner.state.lock();
+        debug_assert!(
+            state.last_applied_lsn < task.lsn,
+            "apply lane finished out of order: last={}, done={}",
+            state.last_applied_lsn,
+            task.lsn
+        );
+        state.last_applied_lsn = task.lsn;
+        inner.cvar.notify_all();
+    }
+}
+
 struct Shard {
-    tree: Mutex<BTree>,
+    tree: Arc<Mutex<BTree>>,
+    apply_lane: ApplyLane,
 }
 
 struct L2pShard {
@@ -175,6 +365,7 @@ struct L2pShard {
     /// path.
     tree: RwLock<PagedL2p>,
     read_view: RwLock<Arc<crate::paged::ReadView>>,
+    apply_lane: ApplyLane,
 }
 
 /// L2P home for one user-facing volume. Owns its own shard group; shard

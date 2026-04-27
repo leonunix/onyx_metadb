@@ -43,6 +43,16 @@ pub struct ReplayOutcome {
     pub final_segment: Option<PathBuf>,
 }
 
+/// Replay result for a multi-lane WAL. `merged` describes the global
+/// LSN stream after lane records have been sorted; `lanes` holds each
+/// underlying directory's tail information so torn tails can be
+/// truncated before writers reopen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayWalSetOutcome {
+    pub merged: ReplayOutcome,
+    pub lanes: Vec<ReplayOutcome>,
+}
+
 /// Walk every WAL segment in `dir` in LSN order, decoding records. Any
 /// record with `lsn < from_lsn` is skipped silently (already applied).
 /// A torn tail in the final segment is recorded in
@@ -68,6 +78,61 @@ where
         }
         Ok(())
     })
+}
+
+/// Replay a multi-lane WAL rooted at `dir`. Legacy single-lane segments
+/// directly under `dir` are included, followed by every `lane-####`
+/// subdirectory. Records from all lanes are merged by their global LSN
+/// before `apply_op` runs.
+pub fn replay_wal_set_into<F>(
+    dir: &Path,
+    from_lsn: Lsn,
+    mut apply_op: F,
+) -> Result<ReplayWalSetOutcome>
+where
+    F: FnMut(Lsn, &WalOp) -> Result<ApplyOutcome>,
+{
+    let dirs = crate::wal::set::replay_dirs(dir)?;
+    let mut records: Vec<(Lsn, Vec<u8>)> = Vec::new();
+    let mut lanes = Vec::with_capacity(dirs.len());
+
+    for lane_dir in dirs {
+        let outcome = replay_impl(&lane_dir, from_lsn, |lsn, body| {
+            records.push((lsn, body.to_vec()));
+            Ok(())
+        })?;
+        lanes.push(outcome);
+    }
+
+    records.sort_by_key(|(lsn, _)| *lsn);
+    let mut merged = ReplayOutcome {
+        first_lsn: None,
+        last_lsn: None,
+        record_count: 0,
+        torn_tail: None,
+        tail_offset_bytes: 0,
+        final_segment: None,
+    };
+
+    for (lsn, body) in records {
+        if let Some(prev) = merged.last_lsn {
+            if lsn <= prev {
+                return Err(MetaDbError::Corruption(format!(
+                    "wal set lsn non-monotonic: saw {lsn} after {prev}",
+                )));
+            }
+        }
+        for op in decode_body(&body)? {
+            apply_op(lsn, &op)?;
+        }
+        if merged.first_lsn.is_none() {
+            merged.first_lsn = Some(lsn);
+        }
+        merged.last_lsn = Some(lsn);
+        merged.record_count += 1;
+    }
+
+    Ok(ReplayWalSetOutcome { merged, lanes })
 }
 
 fn replay_impl<F>(dir: &Path, from_lsn: Lsn, mut per_record: F) -> Result<ReplayOutcome>
@@ -145,6 +210,13 @@ pub fn truncate_torn_tail(_dir: &Path, outcome: &ReplayOutcome) -> Result<()> {
         return Ok(());
     };
     SegmentFile::truncate_to(path, outcome.tail_offset_bytes)?;
+    Ok(())
+}
+
+pub fn truncate_wal_set_torn_tails(outcome: &ReplayWalSetOutcome) -> Result<()> {
+    for lane in &outcome.lanes {
+        truncate_torn_tail(Path::new(""), lane)?;
+    }
     Ok(())
 }
 

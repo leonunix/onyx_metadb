@@ -42,10 +42,16 @@ impl Db {
             create_l2p_shards(page_store.clone(), page_cache.clone(), shard_count)?;
         let (refcount_shards, refcount_roots) =
             create_shards(page_store.clone(), page_cache.clone(), shard_count)?;
-        let dedup_index =
-            Lsm::create_with_cache(page_store.clone(), page_cache.clone(), lsm_config.clone());
-        let dedup_reverse =
-            Lsm::create_with_cache(page_store.clone(), page_cache.clone(), lsm_config);
+        let dedup_index = Arc::new(Lsm::create_with_cache(
+            page_store.clone(),
+            page_cache.clone(),
+            lsm_config.clone(),
+        ));
+        let dedup_reverse = Arc::new(Lsm::create_with_cache(
+            page_store.clone(),
+            page_cache.clone(),
+            lsm_config,
+        ));
         manifest.body_version = MANIFEST_BODY_VERSION;
         manifest.refcount_shard_roots = refcount_roots;
         manifest.dedup_level_heads = Vec::new().into_boxed_slice();
@@ -62,7 +68,7 @@ impl Db {
         manifest.next_volume_ord = BOOTSTRAP_VOLUME_ORD + 1;
         manifest_store.commit(&manifest)?;
 
-        let wal = Wal::create_with_metrics(
+        let wal = WalSet::create_with_metrics(
             &wal_dir(&cfg.path),
             &cfg,
             manifest.checkpoint_lsn + 1,
@@ -86,10 +92,14 @@ impl Db {
             refcount_shards,
             dedup_index,
             dedup_reverse,
+            dedup_lane: ApplyLane::new(0),
             wal,
             apply_gate: RwLock::new(()),
             last_applied_lsn: Mutex::new(0),
             commit_cvar: Condvar::new(),
+            commit_poison: Mutex::new(None),
+            last_dispatched_lsn: Mutex::new(0),
+            dispatch_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             drop_gate: RwLock::new(()),
             snap_info_cache: Mutex::new(BTreeMap::new()),
@@ -172,18 +182,18 @@ impl Db {
             &manifest.refcount_shard_roots,
             next_gen,
         )?;
-        let dedup_index = Lsm::open_with_cache(
+        let dedup_index = Arc::new(Lsm::open_with_cache(
             page_store.clone(),
             page_cache.clone(),
             lsm_config.clone(),
             &manifest.dedup_level_heads,
-        )?;
-        let dedup_reverse = Lsm::open_with_cache(
+        )?);
+        let dedup_reverse = Arc::new(Lsm::open_with_cache(
             page_store.clone(),
             page_cache.clone(),
             lsm_config,
             &manifest.dedup_reverse_level_heads,
-        )?;
+        )?);
 
         // Replay WAL segments forward from checkpoint_lsn+1 onto the
         // freshly-opened in-memory state. Applies every op exactly the
@@ -204,120 +214,124 @@ impl Db {
         let from_lsn = manifest.checkpoint_lsn + 1;
         let mut replayed_drop = false;
         let mut mutated_volumes = false;
-        let replay_outcome = crate::recovery::replay_into(&wal_path, from_lsn, |lsn, op| {
-            match op {
-                WalOp::CreateVolume { ord, shard_count } => {
-                    if !volumes.contains_key(ord) {
-                        let (shards, roots) =
-                            apply_create_volume(&page_store, &page_cache, *shard_count)?;
-                        volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
-                        manifest.volumes.push(VolumeEntry {
-                            ord: *ord,
-                            shard_count: *shard_count,
-                            l2p_shard_roots: roots,
-                            created_lsn: lsn,
-                            flags: 0,
-                        });
-                        mutated_volumes = true;
+        let replay_outcome =
+            crate::recovery::replay_wal_set_into(&wal_path, from_lsn, |lsn, op| {
+                match op {
+                    WalOp::CreateVolume { ord, shard_count } => {
+                        if !volumes.contains_key(ord) {
+                            let (shards, roots) =
+                                apply_create_volume(&page_store, &page_cache, *shard_count)?;
+                            volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
+                            manifest.volumes.push(VolumeEntry {
+                                ord: *ord,
+                                shard_count: *shard_count,
+                                l2p_shard_roots: roots,
+                                created_lsn: lsn,
+                                flags: 0,
+                            });
+                            mutated_volumes = true;
+                        }
+                        manifest.next_volume_ord = manifest
+                            .next_volume_ord
+                            .max(ord.checked_add(1).unwrap_or(u16::MAX));
+                        Ok(ApplyOutcome::Dedup)
                     }
-                    manifest.next_volume_ord = manifest
-                        .next_volume_ord
-                        .max(ord.checked_add(1).unwrap_or(u16::MAX));
-                    Ok(ApplyOutcome::Dedup)
-                }
-                WalOp::DropVolume { ord, pages } => {
-                    if volumes.contains_key(ord) {
-                        apply_drop_volume(&page_store, lsn, pages)?;
-                        volumes.remove(ord);
-                        manifest.volumes.retain(|v| v.ord != *ord);
-                        mutated_volumes = true;
+                    WalOp::DropVolume { ord, pages } => {
+                        if volumes.contains_key(ord) {
+                            apply_drop_volume(&page_store, lsn, pages)?;
+                            volumes.remove(ord);
+                            manifest.volumes.retain(|v| v.ord != *ord);
+                            mutated_volumes = true;
+                        }
+                        Ok(ApplyOutcome::Dedup)
                     }
-                    Ok(ApplyOutcome::Dedup)
-                }
-                WalOp::CloneVolume {
-                    src_ord: _,
-                    new_ord,
-                    src_snap_id: _,
-                    src_shard_roots,
-                } => {
-                    if !volumes.contains_key(new_ord) {
-                        apply_clone_volume_incref(&page_store, &faults, lsn, src_shard_roots)?;
-                        // Same stale-buffer hazard as `Db::clone_volume`:
-                        // every volume whose PagedL2p was opened above
-                        // may hold a pre-incref Clean copy of one of
-                        // these roots — not just the source. Sweep all
-                        // volumes so a later `incref_root_for_snapshot`
-                        // or `cow_for_write` during replay can't flush a
-                        // stale rc back over our disk-direct bump.
-                        let all_vols: Vec<Arc<Volume>> = volumes.values().cloned().collect();
-                        for &pid in src_shard_roots {
-                            if pid == crate::types::NULL_PAGE {
-                                continue;
-                            }
-                            page_cache.invalidate(pid);
-                            for vol in &all_vols {
-                                for shard in &vol.shards {
-                                    shard.tree.write().forget_page(pid);
+                    WalOp::CloneVolume {
+                        src_ord: _,
+                        new_ord,
+                        src_snap_id: _,
+                        src_shard_roots,
+                    } => {
+                        if !volumes.contains_key(new_ord) {
+                            apply_clone_volume_incref(&page_store, &faults, lsn, src_shard_roots)?;
+                            // Same stale-buffer hazard as `Db::clone_volume`:
+                            // every volume whose PagedL2p was opened above
+                            // may hold a pre-incref Clean copy of one of
+                            // these roots — not just the source. Sweep all
+                            // volumes so a later `incref_root_for_snapshot`
+                            // or `cow_for_write` during replay can't flush a
+                            // stale rc back over our disk-direct bump.
+                            let all_vols: Vec<Arc<Volume>> = volumes.values().cloned().collect();
+                            for &pid in src_shard_roots {
+                                if pid == crate::types::NULL_PAGE {
+                                    continue;
+                                }
+                                page_cache.invalidate(pid);
+                                for vol in &all_vols {
+                                    for shard in &vol.shards {
+                                        shard.tree.write().forget_page(pid);
+                                    }
                                 }
                             }
+                            let (shards, actual_roots) = build_clone_volume_shards(
+                                src_shard_roots,
+                                &page_store,
+                                &page_cache,
+                                lsn,
+                            )?;
+                            let shard_count = shards.len() as u32;
+                            volumes.insert(*new_ord, Arc::new(Volume::new(*new_ord, shards, lsn)));
+                            manifest.volumes.push(VolumeEntry {
+                                ord: *new_ord,
+                                shard_count,
+                                l2p_shard_roots: actual_roots,
+                                created_lsn: lsn,
+                                flags: 0,
+                            });
+                            mutated_volumes = true;
                         }
-                        let (shards, actual_roots) = build_clone_volume_shards(
-                            src_shard_roots,
+                        manifest.next_volume_ord = manifest
+                            .next_volume_ord
+                            .max(new_ord.checked_add(1).unwrap_or(u16::MAX));
+                        Ok(ApplyOutcome::Dedup)
+                    }
+                    _ => {
+                        let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
+                            manifest
+                                .snapshots
+                                .iter()
+                                .filter(|s| s.vol_ord == vol)
+                                .map(|s| SnapInfo {
+                                    created_lsn: s.created_lsn,
+                                    l2p_shard_roots: s.l2p_shard_roots.clone(),
+                                })
+                                .collect()
+                        };
+                        let outcome = apply_op_bare(
+                            &volumes,
+                            &refcount_shards,
+                            &dedup_index,
+                            &dedup_reverse,
                             &page_store,
-                            &page_cache,
                             lsn,
+                            op,
+                            &snap_lookup,
                         )?;
-                        let shard_count = shards.len() as u32;
-                        volumes.insert(*new_ord, Arc::new(Volume::new(*new_ord, shards, lsn)));
-                        manifest.volumes.push(VolumeEntry {
-                            ord: *new_ord,
-                            shard_count,
-                            l2p_shard_roots: actual_roots,
-                            created_lsn: lsn,
-                            flags: 0,
-                        });
-                        mutated_volumes = true;
+                        if let WalOp::DropSnapshot { id, .. } = op {
+                            manifest.snapshots.retain(|s| s.id != *id);
+                            replayed_drop = true;
+                        }
+                        Ok(outcome)
                     }
-                    manifest.next_volume_ord = manifest
-                        .next_volume_ord
-                        .max(new_ord.checked_add(1).unwrap_or(u16::MAX));
-                    Ok(ApplyOutcome::Dedup)
                 }
-                _ => {
-                    let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
-                        manifest
-                            .snapshots
-                            .iter()
-                            .filter(|s| s.vol_ord == vol)
-                            .map(|s| SnapInfo {
-                                created_lsn: s.created_lsn,
-                                l2p_shard_roots: s.l2p_shard_roots.clone(),
-                            })
-                            .collect()
-                    };
-                    let outcome = apply_op_bare(
-                        &volumes,
-                        &refcount_shards,
-                        &dedup_index,
-                        &dedup_reverse,
-                        &page_store,
-                        lsn,
-                        op,
-                        &snap_lookup,
-                    )?;
-                    if let WalOp::DropSnapshot { id, .. } = op {
-                        manifest.snapshots.retain(|s| s.id != *id);
-                        replayed_drop = true;
-                    }
-                    Ok(outcome)
-                }
-            }
-        })?;
-        let last_applied = replay_outcome.last_lsn.unwrap_or(manifest.checkpoint_lsn);
+            })?;
+        let last_applied = replay_outcome
+            .merged
+            .last_lsn
+            .unwrap_or(manifest.checkpoint_lsn);
         // If the last segment ended torn, truncate it to the last clean
         // record before handing the directory to the new Wal.
-        crate::recovery::truncate_torn_tail(&wal_path, &replay_outcome)?;
-        let wal = Wal::create_with_metrics(
+        crate::recovery::truncate_wal_set_torn_tails(&replay_outcome)?;
+        let wal = WalSet::create_with_metrics(
             &wal_path,
             &cfg,
             last_applied + 1,
@@ -344,7 +358,7 @@ impl Db {
         //
         // Skipping this block when nothing was replayed keeps the
         // common "close + reopen with no WAL tail" path zero-cost.
-        let replayed_anything = replay_outcome.last_lsn.is_some();
+        let replayed_anything = replay_outcome.merged.last_lsn.is_some();
         if replayed_anything || replayed_drop || mutated_volumes {
             let sorted: Vec<Arc<Volume>> = {
                 let mut v: Vec<Arc<Volume>> = volumes.values().cloned().collect();
@@ -435,10 +449,14 @@ impl Db {
             refcount_shards,
             dedup_index,
             dedup_reverse,
+            dedup_lane: ApplyLane::new(last_applied),
             wal,
             apply_gate: RwLock::new(()),
             last_applied_lsn: Mutex::new(last_applied),
             commit_cvar: Condvar::new(),
+            commit_poison: Mutex::new(None),
+            last_dispatched_lsn: Mutex::new(last_applied),
+            dispatch_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             drop_gate: RwLock::new(()),
             snap_info_cache: Mutex::new(BTreeMap::new()),
@@ -580,7 +598,7 @@ impl Db {
         drop(manifest_state);
         drop(_apply_guard);
         self.reclaim_freed_pages()?;
-        crate::wal::prune_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
+        crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
         Ok(())
     }
 

@@ -22,6 +22,7 @@
 //!   waiting on this lock will find the frozen slot already handled by
 //!   the first and no-op out.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -34,7 +35,7 @@ use crate::types::{Lsn, PageId};
 use super::format::{DedupValue, Hash32};
 use super::memtable::{DedupOp, LookupResult, Memtable, MemtableStats};
 use super::persist::{free_level, read_levels, rewrite_levels};
-use super::sst::{SstHandle, SstReader, SstWriter};
+use super::sst::{CachedSstReader, SstHandle, SstReader, SstWriter};
 
 /// Static tunables for one `Lsm` instance.
 #[derive(Clone, Debug)]
@@ -82,6 +83,7 @@ pub struct Lsm {
     page_cache: Arc<PageCache>,
     memtable: Memtable,
     levels: RwLock<Vec<Vec<SstHandle>>>,
+    sst_reader_cache: RwLock<HashMap<PageId, Arc<CachedSstReader>>>,
     /// Serialises flush + compaction. Either path mutates `levels`, so
     /// they must not run concurrently.
     modify_lock: Mutex<()>,
@@ -109,6 +111,7 @@ impl Lsm {
             page_cache,
             memtable: Memtable::new(config.memtable_bytes),
             levels: RwLock::new(vec![Vec::new()]),
+            sst_reader_cache: RwLock::new(HashMap::new()),
             modify_lock: Mutex::new(()),
             reader_drain: RwLock::new(()),
             config,
@@ -145,6 +148,7 @@ impl Lsm {
             page_cache,
             memtable: Memtable::new(config.memtable_bytes),
             levels: RwLock::new(levels),
+            sst_reader_cache: RwLock::new(HashMap::new()),
             modify_lock: Mutex::new(()),
             reader_drain: RwLock::new(()),
             config,
@@ -326,6 +330,7 @@ impl Lsm {
         let victims_count = plan.from_victims.len() + plan.to_victims.len();
         let mut all_victims = plan.from_victims.clone();
         all_victims.extend(plan.to_victims.iter().copied());
+        self.invalidate_cached_readers(&all_victims);
         super::compact::free_victims(&self.page_store, &self.page_cache, generation, &all_victims)?;
 
         Ok(Some(super::CompactionReport {
@@ -502,9 +507,45 @@ impl Lsm {
     #[cfg(test)]
     pub(crate) fn debug_replace_levels(&self, new_levels: Vec<Vec<SstHandle>>) {
         *self.levels.write() = new_levels;
+        self.sst_reader_cache.write().clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_reader_cache_len(&self) -> usize {
+        self.sst_reader_cache.read().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_reader_cache_contains(&self, head_page: PageId) -> bool {
+        self.sst_reader_cache.read().contains_key(&head_page)
     }
 
     // -------- internal --------------------------------------------------
+
+    fn get_cached_reader(&self, handle: SstHandle) -> Result<Arc<CachedSstReader>> {
+        if let Some(reader) = self.sst_reader_cache.read().get(&handle.head_page).cloned() {
+            return Ok(reader);
+        }
+
+        let mut cache = self.sst_reader_cache.write();
+        if let Some(reader) = cache.get(&handle.head_page).cloned() {
+            return Ok(reader);
+        }
+
+        let reader = Arc::new(CachedSstReader::open(self.page_cache.clone(), handle)?);
+        cache.insert(handle.head_page, reader.clone());
+        Ok(reader)
+    }
+
+    fn invalidate_cached_readers(&self, handles: &[SstHandle]) {
+        if handles.is_empty() {
+            return;
+        }
+        let mut cache = self.sst_reader_cache.write();
+        for handle in handles {
+            cache.remove(&handle.head_page);
+        }
+    }
 
     fn find_in_overlapping<'a, I>(&self, handles: I, hash: &Hash32) -> Result<LookupResult>
     where
@@ -514,7 +555,7 @@ impl Lsm {
             if hash < &handle.min_hash || hash > &handle.max_hash {
                 continue;
             }
-            let reader = SstReader::open(&self.page_store, &self.page_cache, *handle)?;
+            let reader = self.get_cached_reader(*handle)?;
             match reader.get(hash)? {
                 LookupResult::Hit(v) => return Ok(LookupResult::Hit(v)),
                 LookupResult::Tombstone => return Ok(LookupResult::Tombstone),
@@ -533,7 +574,7 @@ impl Lsm {
             if hash < &handle.min_hash || hash > &handle.max_hash {
                 continue;
             }
-            let reader = SstReader::open(&self.page_store, &self.page_cache, *handle)?;
+            let reader = self.get_cached_reader(*handle)?;
             return reader.get(hash);
         }
         Ok(LookupResult::Miss)

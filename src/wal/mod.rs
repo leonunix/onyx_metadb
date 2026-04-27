@@ -16,6 +16,7 @@
 pub mod op;
 pub mod record;
 pub mod segment;
+pub mod set;
 pub mod writer;
 
 pub use op::{
@@ -29,6 +30,7 @@ pub use segment::{
     SegmentFile, list_segments, parse_segment_filename, prune_segments, read_segment,
     segment_filename,
 };
+pub use set::WalSet;
 pub use writer::Wal;
 
 use crate::error::Result;

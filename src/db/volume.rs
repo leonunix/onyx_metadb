@@ -60,18 +60,13 @@ impl Db {
 
         let op = WalOp::CreateVolume { ord, shard_count };
         let body = encode_body(std::slice::from_ref(&op));
-        let lsn = self.wal.submit(body)?;
+        let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body)?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Under our two write gates no other commit is between submit
         // and apply, so last_applied_lsn + 1 == lsn already. The cvar
         // wait keeps the pattern symmetric with `drop_snapshot`.
-        {
-            let mut applied = self.last_applied_lsn.lock();
-            while *applied + 1 < lsn {
-                self.commit_cvar.wait(&mut applied);
-            }
-        }
+        self.wait_for_global_apply_turn(lsn)?;
 
         let (shards, roots) = apply_create_volume(&self.page_store, &self.page_cache, shard_count)?;
         self.faults
@@ -108,11 +103,8 @@ impl Db {
                 .ok_or_else(|| MetaDbError::Corruption("volume ord overflow".into()))?;
         }
 
-        {
-            let mut applied = self.last_applied_lsn.lock();
-            *applied = lsn;
-            self.commit_cvar.notify_all();
-        }
+        self.finish_global_apply(lsn)?;
+        self.advance_dispatch_lsn(lsn);
 
         Ok(ord)
     }
@@ -243,19 +235,14 @@ impl Db {
             pages: pages.clone(),
         };
         let body = encode_body(std::slice::from_ref(&op));
-        let lsn = self.wal.submit(body)?;
+        let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body)?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
         // Fault window specific to drop_volume: WAL record durable, no
         // page decref has touched disk yet. Recovery re-drives the full
         // cascade from the WAL op's inlined `pages` list.
         self.faults
             .inject(FaultPoint::DropVolumePostWalBeforeApply)?;
-        {
-            let mut applied = self.last_applied_lsn.lock();
-            while *applied + 1 < lsn {
-                self.commit_cvar.wait(&mut applied);
-            }
-        }
+        self.wait_for_global_apply_turn(lsn)?;
 
         let pages_freed = apply_drop_volume(&self.page_store, lsn, &pages)?;
         self.faults
@@ -286,11 +273,8 @@ impl Db {
         // this is just defensive cleanup.
         self.forget_snap_info(vol_ord);
 
-        {
-            let mut applied = self.last_applied_lsn.lock();
-            *applied = lsn;
-            self.commit_cvar.notify_all();
-        }
+        self.finish_global_apply(lsn)?;
+        self.advance_dispatch_lsn(lsn);
 
         // Drain everything apply_drop_volume queued for deferred reclaim.
         // Snapshot views are excluded above (`snapshot_views.write()`),
@@ -380,18 +364,13 @@ impl Db {
             src_shard_roots: src_shard_roots.clone(),
         };
         let body = encode_body(std::slice::from_ref(&op));
-        let lsn = self.wal.submit(body)?;
+        let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body)?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Under our two write gates no other commit sits between submit
         // and apply; the cvar wait is defensive and matches
         // `create_volume` / `drop_snapshot`.
-        {
-            let mut applied = self.last_applied_lsn.lock();
-            while *applied + 1 < lsn {
-                self.commit_cvar.wait(&mut applied);
-            }
-        }
+        self.wait_for_global_apply_turn(lsn)?;
 
         apply_clone_volume_incref(&self.page_store, &self.faults, lsn, &src_shard_roots)?;
         // `apply_clone_volume_incref` writes through `page_store`, so the
@@ -451,11 +430,8 @@ impl Db {
                 .ok_or_else(|| MetaDbError::Corruption("volume ord overflow".into()))?;
         }
 
-        {
-            let mut applied = self.last_applied_lsn.lock();
-            *applied = lsn;
-            self.commit_cvar.notify_all();
-        }
+        self.finish_global_apply(lsn)?;
+        self.advance_dispatch_lsn(lsn);
 
         Ok(new_ord)
     }

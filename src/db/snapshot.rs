@@ -457,7 +457,7 @@ impl Db {
             pba_decrefs: pba_decrefs.clone(),
         };
         let body = encode_body(std::slice::from_ref(&op));
-        let lsn = self.wal.submit(body)?;
+        let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body)?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Block until every prior LSN has applied. Under our locks,
@@ -465,12 +465,7 @@ impl Db {
         // completes — and since we hold drop_gate.write, no new
         // commits have entered, so this wait is bounded by whatever
         // was in flight at the moment we took the gate.
-        {
-            let mut applied = self.last_applied_lsn.lock();
-            while *applied + 1 < lsn {
-                self.commit_cvar.wait(&mut applied);
-            }
-        }
+        self.wait_for_global_apply_turn(lsn)?;
 
         let volumes_map = self.volumes.read().clone();
         let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
@@ -512,11 +507,8 @@ impl Db {
         // or to a later lsn (the next-oldest survives).
         self.recompute_snap_info(entry.vol_ord);
 
-        {
-            let mut applied = self.last_applied_lsn.lock();
-            *applied = lsn;
-            self.commit_cvar.notify_all();
-        }
+        self.finish_global_apply(lsn)?;
+        self.advance_dispatch_lsn(lsn);
 
         let (freed_leaf_values, pages_freed, freed_pbas) = match outcome {
             ApplyOutcome::DropSnapshot {

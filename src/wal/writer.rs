@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use parking_lot::Mutex;
 
 use crate::config::Config;
@@ -47,8 +47,23 @@ pub struct Wal {
     metrics: Arc<MetaMetrics>,
 }
 
+pub(crate) struct PendingWalAck {
+    ack: Receiver<Result<Lsn>>,
+    started: Instant,
+    metrics: Arc<MetaMetrics>,
+}
+
+impl PendingWalAck {
+    pub(crate) fn wait(self) -> Result<Lsn> {
+        let result = self.ack.recv().map_err(|_| writer_exited())?;
+        self.metrics.record_wal_submit_wait(self.started.elapsed());
+        result
+    }
+}
+
 enum Op {
     Submit {
+        assigned_lsn: Option<Lsn>,
         body: Vec<u8>,
         ack: Sender<Result<Lsn>>,
     },
@@ -106,11 +121,36 @@ impl Wal {
         let started = Instant::now();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.sender
-            .send(Op::Submit { body, ack: ack_tx })
+            .send(Op::Submit {
+                assigned_lsn: None,
+                body,
+                ack: ack_tx,
+            })
             .map_err(|_| writer_exited())?;
         let result = ack_rx.recv().map_err(|_| writer_exited())?;
         self.metrics.record_wal_submit_wait(started.elapsed());
         result
+    }
+
+    /// Enqueue an already-assigned record and return an ack handle.
+    /// `WalSet` calls this while holding its short LSN/order mutex so
+    /// same-lane enqueue order matches global LSN order, then waits for
+    /// the fsync ack outside that mutex.
+    pub(crate) fn submit_assigned_async(&self, lsn: Lsn, body: Vec<u8>) -> Result<PendingWalAck> {
+        let started = Instant::now();
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        self.sender
+            .send(Op::Submit {
+                assigned_lsn: Some(lsn),
+                body,
+                ack: ack_tx,
+            })
+            .map_err(|_| writer_exited())?;
+        Ok(PendingWalAck {
+            ack: ack_rx,
+            started,
+            metrics: Arc::clone(&self.metrics),
+        })
     }
 
     /// Drain any in-flight batch and stop the writer thread. After
@@ -161,6 +201,12 @@ struct WriterState {
     metrics: Arc<MetaMetrics>,
 }
 
+struct PendingSubmit {
+    assigned_lsn: Option<Lsn>,
+    body: Vec<u8>,
+    ack: Sender<Result<Lsn>>,
+}
+
 impl WriterState {
     fn init(
         dir: PathBuf,
@@ -207,11 +253,11 @@ impl WriterState {
         Ok(())
     }
 
-    fn rotate(&mut self) -> Result<()> {
+    fn rotate_to(&mut self, start_lsn: Lsn) -> Result<()> {
         if let Some(mut old) = self.current.take() {
             old.sync_all()?;
         }
-        let seg = SegmentFile::create(&self.dir, self.next_lsn)?;
+        let seg = SegmentFile::create(&self.dir, start_lsn)?;
         self.current = Some(seg);
         Ok(())
     }
@@ -240,9 +286,17 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
             Op::Submit { body, .. } => body.len() + WAL_HEADER_SIZE,
             Op::Shutdown { .. } => unreachable!(),
         };
-        let mut submits: Vec<(Vec<u8>, Sender<Result<Lsn>>)> = Vec::new();
+        let mut submits: Vec<PendingSubmit> = Vec::new();
         match first {
-            Op::Submit { body, ack } => submits.push((body, ack)),
+            Op::Submit {
+                assigned_lsn,
+                body,
+                ack,
+            } => submits.push(PendingSubmit {
+                assigned_lsn,
+                body,
+                ack,
+            }),
             Op::Shutdown { .. } => unreachable!(),
         }
         let mut batch_bytes = first_len;
@@ -256,9 +310,17 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
                 break;
             }
             match receiver.recv_timeout(remaining) {
-                Ok(Op::Submit { body, ack }) => {
+                Ok(Op::Submit {
+                    assigned_lsn,
+                    body,
+                    ack,
+                }) => {
                     batch_bytes += body.len() + WAL_HEADER_SIZE;
-                    submits.push((body, ack));
+                    submits.push(PendingSubmit {
+                        assigned_lsn,
+                        body,
+                        ack,
+                    });
                 }
                 Ok(Op::Shutdown { ack }) => {
                     pending_shutdown = Some(ack);
@@ -281,8 +343,8 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
             }
             Err(e) => {
                 let msg = e.to_string();
-                for (_, ack) in submits.drain(..) {
-                    let _ = ack.send(Err(MetaDbError::Corruption(format!(
+                for pending in submits.drain(..) {
+                    let _ = pending.ack.send(Err(MetaDbError::Corruption(format!(
                         "wal commit failed: {msg}"
                     ))));
                 }
@@ -309,7 +371,7 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
 /// is left intact so the caller can iterate and send error acks.
 fn commit_batch(
     state: &mut WriterState,
-    submits: &mut Vec<(Vec<u8>, Sender<Result<Lsn>>)>,
+    submits: &mut Vec<PendingSubmit>,
 ) -> Result<Vec<(Sender<Result<Lsn>>, Lsn)>> {
     if submits.is_empty() {
         return Ok(Vec::new());
@@ -317,7 +379,8 @@ fn commit_batch(
 
     // Estimated byte count for the rotation check. Accurate because the
     // record header is fixed size.
-    let batch_bytes: usize = submits.iter().map(|(b, _)| b.len() + WAL_HEADER_SIZE).sum();
+    let batch_bytes: usize = submits.iter().map(|s| s.body.len() + WAL_HEADER_SIZE).sum();
+    let first_lsn = submits[0].assigned_lsn.unwrap_or(state.next_lsn);
 
     // Rotate BEFORE assigning LSNs so the new segment's start_lsn
     // matches the LSN of the first record it will contain.
@@ -329,21 +392,28 @@ fn commit_batch(
         None => true,
     };
     if need_rotate {
-        state.rotate()?;
+        state.rotate_to(first_lsn)?;
         state.metrics.record_wal_rotate();
     }
 
     // Encode into a single buffer so the write is one syscall.
     let mut buf = Vec::with_capacity(batch_bytes);
     let mut assigned = Vec::with_capacity(submits.len());
-    for (body, ack) in submits.drain(..) {
-        let lsn = state.next_lsn;
+    for pending in submits.drain(..) {
+        let lsn = pending.assigned_lsn.unwrap_or(state.next_lsn);
+        if lsn < state.next_lsn {
+            return Err(MetaDbError::Corruption(format!(
+                "wal assigned lsn {} is behind writer cursor {}",
+                lsn, state.next_lsn
+            )));
+        }
         state.next_lsn = state
             .next_lsn
+            .max(lsn)
             .checked_add(1)
             .ok_or(MetaDbError::OutOfSpace)?;
-        encode(&mut buf, lsn, &body);
-        assigned.push((ack, lsn));
+        encode(&mut buf, lsn, &pending.body);
+        assigned.push((pending.ack, lsn));
     }
 
     // Write + fsync. Fault points straddle the fsync so tests can
@@ -376,7 +446,7 @@ mod tests {
 
     fn cfg_fast_batch() -> Config {
         let mut c = Config::new("unused");
-        // Short timeout so tests don't idle for 200 µs per commit.
+        // Short timeout so tests don't idle for the production group window.
         c.group_commit_timeout_us = 50;
         c
     }

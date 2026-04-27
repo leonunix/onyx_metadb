@@ -145,12 +145,7 @@ mod tests {
     }
 
     fn empty_view(tree: &PagedL2p, pc: Arc<PageCache>) -> ReadView {
-        ReadView::new(
-            tree.root(),
-            tree.root_level(),
-            Arc::new(HashMap::new()),
-            pc,
-        )
+        ReadView::new(tree.root(), tree.root_level(), Arc::new(HashMap::new()), pc)
     }
 
     fn val(byte: u8) -> L2pValue {

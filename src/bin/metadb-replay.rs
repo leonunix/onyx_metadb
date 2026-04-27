@@ -9,7 +9,7 @@
 //! already does that at startup.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use onyx_metadb::Lsn;
@@ -162,50 +162,100 @@ impl OpCounts {
 }
 
 fn walk_wal(cfg: &Config) -> Result<Summary, String> {
-    let segments = list_segments(&cfg.wal_dir).map_err(|e| e.to_string())?;
-    let segment_count = segments.len();
+    let dirs = wal_dirs(&cfg.wal_dir)?;
+    let mut records = Vec::new();
     let mut summary = Summary::default();
 
-    for (idx, (_seg_start, path)) in segments.into_iter().enumerate() {
-        let is_final = idx + 1 == segment_count;
-        let buf = read_segment(&path).map_err(|e| e.to_string())?;
-        let mut iter = WalRecordIter::new(&buf);
-        for rec in iter.by_ref() {
-            if let Some(min) = cfg.from_lsn {
-                if rec.lsn < min {
-                    continue;
+    for dir in dirs {
+        let segments = list_segments(&dir).map_err(|e| e.to_string())?;
+        let segment_count = segments.len();
+        for (idx, (_seg_start, path)) in segments.into_iter().enumerate() {
+            let is_final = idx + 1 == segment_count;
+            let buf = read_segment(&path).map_err(|e| e.to_string())?;
+            let mut iter = WalRecordIter::new(&buf);
+            for rec in iter.by_ref() {
+                if let Some(min) = cfg.from_lsn {
+                    if rec.lsn < min {
+                        continue;
+                    }
                 }
-            }
-            if let Some(max) = cfg.to_lsn {
-                if rec.lsn > max {
-                    break;
+                if let Some(max) = cfg.to_lsn {
+                    if rec.lsn > max {
+                        continue;
+                    }
                 }
+                let ops = decode_body(rec.body).map_err(|e| e.to_string())?;
+                records.push((rec.lsn, ops));
             }
-            let ops = decode_body(rec.body).map_err(|e| e.to_string())?;
-            if !cfg.summary {
-                if cfg.json {
-                    print_record_json(rec.lsn, &ops, cfg.print_ops);
-                } else {
-                    print_record_human(rec.lsn, &ops, cfg.print_ops);
-                }
-            }
-            if summary.first_lsn.is_none() {
-                summary.first_lsn = Some(rec.lsn);
-            }
-            summary.last_lsn = Some(rec.lsn);
-            summary.records += 1;
-            summary.ops += ops.len() as u64;
-            for op in &ops {
-                summary.counts.bump(op);
+            if is_final && summary.torn_tail.is_none() {
+                summary.tail_offset = iter.consumed() as u64;
+                summary.final_segment = Some(path.clone());
+                summary.torn_tail = iter.stopped();
             }
         }
-        if is_final {
-            summary.tail_offset = iter.consumed() as u64;
-            summary.final_segment = Some(path.clone());
-            summary.torn_tail = iter.stopped();
+    }
+
+    records.sort_by_key(|(lsn, _)| *lsn);
+    for (lsn, ops) in records {
+        if let Some(prev) = summary.last_lsn {
+            if lsn <= prev {
+                return Err(format!(
+                    "non-monotonic or duplicate WAL LSN: {lsn} after {prev}"
+                ));
+            }
+        }
+        if !cfg.summary {
+            if cfg.json {
+                print_record_json(lsn, &ops, cfg.print_ops);
+            } else {
+                print_record_human(lsn, &ops, cfg.print_ops);
+            }
+        }
+        if summary.first_lsn.is_none() {
+            summary.first_lsn = Some(lsn);
+        }
+        summary.last_lsn = Some(lsn);
+        summary.records += 1;
+        summary.ops += ops.len() as u64;
+        for op in &ops {
+            summary.counts.bump(op);
         }
     }
     Ok(summary)
+}
+
+fn wal_dirs(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = Vec::new();
+    if !list_segments(root).map_err(|e| e.to_string())?.is_empty() {
+        dirs.push(root.to_path_buf());
+    }
+
+    let rd = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(dirs),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut lane_dirs = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix("lane-") else {
+            continue;
+        };
+        if let Ok(lane) = suffix.parse::<usize>() {
+            lane_dirs.push((lane, entry.path()));
+        }
+    }
+    lane_dirs.sort_by_key(|(lane, _)| *lane);
+    dirs.extend(lane_dirs.into_iter().map(|(_, path)| path));
+    Ok(dirs)
 }
 
 // -------- printing -------------------------------------------------------
