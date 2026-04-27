@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use onyx_metadb::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use onyx_metadb::page_store::PageStore;
-use onyx_metadb::types::PageId;
+use onyx_metadb::types::{FIRST_DATA_PAGE, PageId};
 use proptest::prelude::*;
 use tempfile::TempDir;
 
@@ -132,9 +132,20 @@ proptest! {
                         let page = ps.read_page(pid).unwrap();
                         prop_assert_eq!(extract_sample(&page), expected);
                     }
-                    // Free list must list exactly the pages we freed
-                    // (set-equality, not list-equality — order can drift).
-                    prop_assert_eq!(ps.free_list_len(), freed.len());
+                    // Freed tail pages may be represented as sparse growth
+                    // tail and recovered via high_water rather than the free
+                    // list. Middle holes below high_water must remain
+                    // reusable through the rebuilt free list.
+                    let recovered_high_water = contents
+                        .keys()
+                        .copied()
+                        .max()
+                        .map_or(FIRST_DATA_PAGE, |pid| pid + 1);
+                    let expected_free = freed
+                        .iter()
+                        .filter(|pid| **pid < recovered_high_water)
+                        .count();
+                    prop_assert_eq!(ps.free_list_len(), expected_free);
                 }
             }
         }

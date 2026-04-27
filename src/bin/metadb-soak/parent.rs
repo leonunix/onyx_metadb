@@ -4,8 +4,8 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
     events.write(
         "start",
         &format!(
-            "seed={} threads={} pipeline_depth={} cleanup_batch_size={}",
-            cfg.seed, cfg.threads, cfg.pipeline_depth, cfg.cleanup_batch_size
+            "seed={} threads={} pipeline_depth={} cleanup_batch_size={} onyx_max_pba={}",
+            cfg.seed, cfg.threads, cfg.pipeline_depth, cfg.cleanup_batch_size, cfg.onyx_max_pba
         ),
     )?;
 
@@ -252,7 +252,7 @@ fn run_cycle(
             let op = match cfg.workload {
                 Workload::Legacy => generate_worker_op(tid, &mut rngs[tid], model),
                 Workload::Onyx | Workload::OnyxConcurrent => {
-                    generate_onyx_worker_op(tid, &mut rngs[tid], onyx_model)
+                    generate_onyx_worker_op(tid, &mut rngs[tid], onyx_model, cfg.onyx_max_pba)
                 }
             };
             send_worker_op(child, next_id, &op)?;

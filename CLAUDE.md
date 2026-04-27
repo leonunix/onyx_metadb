@@ -121,6 +121,8 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
   低频重启 + 高 pipeline 压力；`concurrent` 映射到 `--onyx-concurrent-mix`。
 - `METADB_SOAK_OPS_PER_CYCLE=1000000` 控制每个 cycle 的 op 数；`METADB_SOAK_THREADS`
   控制 child worker 数；`METADB_SOAK_PIPELINE_DEPTH` 控制每 worker 预排队深度。
+- `METADB_SOAK_ONYX_MAX_PBA=100000000` 控制 Onyx-mix 的随机 PBA 空间；小值（如
+  256）只用于 pathological dedup_reverse 热点压力。
 - `./dev.sh metrics` tail 当前 run 的 `metrics.jsonl`。
 - `./dev.sh metrics-summary [run-dir|metrics.jsonl] [samples]` 把累计 counter 转成窗口内
   `tx/s`、`logical ops/s`、WAL batch size、fsync、gate wait、cache hit/miss 和瓶颈提示。

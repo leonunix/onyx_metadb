@@ -43,6 +43,7 @@ struct ParentConfig {
     snapshots_enabled: bool,
     restart_interval_secs: Option<u64>,
     cleanup_batch_size: usize,
+    onyx_max_pba: Pba,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +105,7 @@ impl ParentConfig {
         let mut snapshots_enabled = true;
         let mut restart_interval_secs = None;
         let mut cleanup_batch_size = DEFAULT_CLEANUP_BATCH_SIZE;
+        let mut onyx_max_pba = DEFAULT_ONYX_MAX_PBA;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -162,6 +164,9 @@ impl ParentConfig {
                 "--cleanup-batch-size" => {
                     cleanup_batch_size = parse_u64(args.next(), "--cleanup-batch-size")? as usize;
                 }
+                "--onyx-max-pba" => {
+                    onyx_max_pba = parse_u64(args.next(), "--onyx-max-pba")?;
+                }
                 "--event-verbosity" => {
                     event_verbosity = parse_event_verbosity(
                         &args
@@ -213,6 +218,7 @@ impl ParentConfig {
             snapshots_enabled,
             restart_interval_secs,
             cleanup_batch_size: cleanup_batch_size.max(1),
+            onyx_max_pba: onyx_max_pba.max(1),
         })
     }
 }

@@ -9,9 +9,10 @@
 //! The in-memory free list is a `Vec<PageId>`, popped LIFO for cache
 //! locality. On `create`, it starts empty. On `open`, we scan pages from
 //! [`FIRST_DATA_PAGE`] to the file's high-water mark and collect every page
-//! whose header decodes as [`PageType::Free`]. A later phase will persist
-//! the free list in its own page chain to avoid the scan for large
-//! databases; v0 keeps it simple and correct.
+//! whose header decodes as [`PageType::Free`] or whose bytes are all zero.
+//! The all-zero case lets filesystems represent freed pages as sparse holes.
+//! A later phase will persist the free list in its own page chain to avoid
+//! the scan for large databases; v0 keeps it simple and correct.
 //!
 //! # File extension (batched)
 //!
@@ -34,6 +35,8 @@
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::config::PAGE_SIZE;
@@ -169,12 +172,10 @@ impl PageStore {
             )));
         }
         let file_end_pages = size / PAGE_SIZE as u64;
-        // Walk every page in [FIRST_DATA_PAGE, file_end_pages). Any page
-        // whose header decodes (Free or typed) counts as live, extending
-        // the recovered `high_water`. Pages whose header fails to decode
-        // are either torn writes (middle of file) or zero-init growth
-        // tail (contiguous at end). Growth tail past the last valid page
-        // is truncated so the file invariant is restored.
+        // Walk every page in [FIRST_DATA_PAGE, file_end_pages). Typed pages
+        // extend the recovered `high_water`; Free pages and all-zero punched
+        // holes are reusable. A zero suffix past the last typed page is
+        // growth tail and is truncated below.
         let mut high_water = FIRST_DATA_PAGE;
         let mut free_list = Vec::new();
         for page_id in FIRST_DATA_PAGE..file_end_pages {
@@ -184,16 +185,16 @@ impl PageStore {
                 if h.page_type == PageType::Free {
                     free_list.push(page_id);
                 }
+            } else if is_zero_page(&page) {
+                free_list.push(page_id);
             }
-            // Torn / uninitialised pages are left in place below
-            // high_water; the verifier flags them later. We cannot tell
-            // them apart from growth tail here without breaking that
-            // behaviour, so only the contiguous suffix past the last
-            // valid page is truncated below.
+            // Torn pages are left in place below high_water; the verifier
+            // flags them later.
         }
         if high_water < file_end_pages {
             file.set_len(high_water * PAGE_SIZE as u64)?;
         }
+        free_list.retain(|pid| *pid < high_water);
         Ok(Self {
             path,
             file,
@@ -460,6 +461,7 @@ impl PageStore {
         page.seal();
         self.file
             .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
+        self.punch_free_page(page_id)?;
         let mut inner = self.inner.lock();
         inner.free_list.push(page_id);
         Ok(())
@@ -484,6 +486,9 @@ impl PageStore {
         }
         self.check_in_range(page_id)?;
         if let Ok(existing) = read_page_raw(&self.file, page_id) {
+            if is_zero_page(&existing) {
+                return Ok(false);
+            }
             if let Ok(h) = existing.header() {
                 if h.page_type == PageType::Free {
                     return Ok(false);
@@ -495,6 +500,7 @@ impl PageStore {
         page.seal();
         self.file
             .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
+        self.punch_free_page(page_id)?;
         let mut inner = self.inner.lock();
         inner.free_list.push(page_id);
         Ok(true)
@@ -519,12 +525,45 @@ impl PageStore {
         }
         Ok(())
     }
+
+    fn punch_free_page(&self, page_id: PageId) -> Result<()> {
+        punch_hole(&self.file, page_id * PAGE_SIZE as u64, PAGE_SIZE as u64)
+    }
 }
 
 fn read_page_raw(file: &File, page_id: PageId) -> Result<Page> {
     let mut page = Page::zeroed();
     file.read_exact_at(page.bytes_mut(), page_id * PAGE_SIZE as u64)?;
     Ok(page)
+}
+
+fn is_zero_page(page: &Page) -> bool {
+    page.bytes().iter().all(|b| *b == 0)
+}
+
+#[cfg(target_os = "linux")]
+fn punch_hole(file: &File, offset: u64, len: u64) -> Result<()> {
+    let rc = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            len as libc::off_t,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(()),
+        _ => Err(err.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn punch_hole(_file: &File, _offset: u64, _len: u64) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -883,32 +922,31 @@ mod tests {
     }
 
     #[test]
-    fn open_keeps_valid_free_page_followed_by_growth_tail() {
+    fn open_truncates_punched_tail_free_page() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pages.onyx_meta");
         let chunk: u64 = 32;
         let last_valid_pid;
         {
             let ps = PageStore::create_with_grow_chunk(&path, chunk).unwrap();
-            // Allocate 3, free the last: last valid page is the Free-typed one.
+            // Allocate 3, free the last: hole punching turns that page into
+            // zero tail, so reopen can truncate it and hand the id out again
+            // from high_water.
             for _ in 0..3 {
                 let pid = ps.allocate().unwrap();
                 ps.write_page(pid, &mk_page(1, 0)).unwrap();
             }
             ps.free(FIRST_DATA_PAGE + 2, 42).unwrap();
-            last_valid_pid = FIRST_DATA_PAGE + 2;
+            last_valid_pid = FIRST_DATA_PAGE + 1;
             ps.sync_all().unwrap();
         }
         let ps = PageStore::open_with_grow_chunk(&path, chunk).unwrap();
-        // The Free page counts as valid → high_water = last_valid + 1.
         assert_eq!(ps.high_water(), last_valid_pid + 1);
-        // File truncated so growth tail is gone.
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             (last_valid_pid + 1) * PAGE_SIZE as u64,
         );
-        // Free list should contain the freed page so allocate recycles it.
-        assert_eq!(ps.free_list_len(), 1);
+        assert_eq!(ps.free_list_len(), 0);
         assert_eq!(ps.allocate().unwrap(), FIRST_DATA_PAGE + 2);
     }
 

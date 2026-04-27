@@ -22,7 +22,7 @@ const KEY_SLOTS_PER_THREAD: u64 = 256;
 const MAX_LIVE_VOLUMES: usize = 4;
 const BOOTSTRAP_VOL: VolumeOrdinal = 0;
 const ONYX_MAX_LBA: u64 = 512;
-const ONYX_MAX_PBA: Pba = 256;
+const DEFAULT_ONYX_MAX_PBA: Pba = 100_000_000;
 const DEFAULT_CLEANUP_BATCH_SIZE: usize = 1024;
 
 fn main() -> ExitCode {

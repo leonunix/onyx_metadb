@@ -94,6 +94,10 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
                 continue;
             }
         };
+        if raw.bytes().iter().all(|b| *b == 0) {
+            free_pages.insert(pid);
+            continue;
+        }
         if let Err(err) = raw.verify(pid) {
             report
                 .issues
@@ -175,7 +179,10 @@ pub(crate) fn reclaim_orphan_pages(
             continue;
         }
         let is_free = match page_store.read_page_unchecked(pid) {
-            Ok(page) => matches!(page.header(), Ok(header) if header.page_type == PageType::Free),
+            Ok(page) => {
+                page.bytes().iter().all(|b| *b == 0)
+                    || matches!(page.header(), Ok(header) if header.page_type == PageType::Free)
+            }
             Err(_) => false,
         };
         if is_free {

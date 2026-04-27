@@ -21,9 +21,14 @@ fn generate_worker_op(tid: usize, rng: &mut ChaCha8Rng, model: &Model) -> Worker
     }
 }
 
-fn generate_onyx_worker_op(tid: usize, rng: &mut ChaCha8Rng, model: &OnyxRefModel) -> WorkerOp {
+fn generate_onyx_worker_op(
+    tid: usize,
+    rng: &mut ChaCha8Rng,
+    model: &OnyxRefModel,
+    onyx_max_pba: Pba,
+) -> WorkerOp {
     let slot = rng.gen_range(0..ONYX_MAX_LBA);
-    let pba = rng.gen_range(1..=ONYX_MAX_PBA);
+    let pba = rng.gen_range(1..=onyx_max_pba);
     let live = model.live_volumes();
     let vol_ord = live[rng.gen_range(0..live.len())];
     let salt = ((tid as u64) << 48) | (slot << 16) | rng.gen_range(0..=u16::MAX) as u64;
