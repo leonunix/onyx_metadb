@@ -140,6 +140,7 @@ impl Db {
         op: &WalOp,
     ) -> Result<ApplyOutcome> {
         let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
+        let op_started = std::time::Instant::now();
         let outcome = apply_op_bare(
             volumes,
             &self.refcount_shards,
@@ -150,6 +151,7 @@ impl Db {
             op,
             &snap_lookup,
         )?;
+        record_per_op_apply(&self.metrics, op, op_started.elapsed());
         // DropSnapshot also mutates the in-memory manifest's snapshot
         // list; the page work lives in apply_op_bare so it can be
         // shared with the replay path. Lock order (apply_gate.read →
@@ -242,18 +244,22 @@ impl Db {
         indices: Vec<usize>,
         lsn: Lsn,
         ops: &[WalOp],
+        metrics: &MetaMetrics,
     ) -> Result<L2pBucketApplyResult> {
         let mut outcomes = Vec::with_capacity(indices.len());
         let mut rc_actions = Vec::new();
         let mut tree = volume.shards[sid].tree.write();
         for idx in indices {
+            let op_started = std::time::Instant::now();
             let outcome = match &ops[idx] {
                 WalOp::L2pPut { lba, value, .. } => {
                     let prev = tree.insert_at_lsn(*lba, *value, lsn)?;
+                    metrics.record_apply_l2p_put(op_started.elapsed());
                     ApplyOutcome::L2pPrev(prev)
                 }
                 WalOp::L2pDelete { lba, .. } => {
                     let prev = tree.delete_at_lsn(*lba, lsn)?;
+                    metrics.record_apply_l2p_delete(op_started.elapsed());
                     ApplyOutcome::L2pPrev(prev)
                 }
                 WalOp::L2pRemap { lba, new_value, .. } => {
@@ -292,6 +298,7 @@ impl Db {
                             }
                         }
                     }
+                    metrics.record_apply_l2p_remap(op_started.elapsed());
                     ApplyOutcome::L2pRemap {
                         applied: true,
                         prev,
@@ -316,6 +323,7 @@ impl Db {
         l2p_sorted: Vec<((VolumeOrdinal, usize), Vec<usize>)>,
     ) -> Result<Vec<L2pBucketApplyResult>> {
         const PARALLEL_BUCKET_THRESHOLD: usize = 64;
+        let metrics = self.metrics.as_ref();
         if l2p_sorted.len() <= 1 || ops.len() < PARALLEL_BUCKET_THRESHOLD {
             let mut results = Vec::with_capacity(l2p_sorted.len());
             for ((vol_ord, sid), indices) in l2p_sorted {
@@ -323,7 +331,7 @@ impl Db {
                     .get(&vol_ord)
                     .expect("volume presence checked during bucketing")
                     .clone();
-                results.push(Self::apply_l2p_bucket(volume, sid, indices, lsn, ops)?);
+                results.push(Self::apply_l2p_bucket(volume, sid, indices, lsn, ops, metrics)?);
             }
             return Ok(results);
         }
@@ -335,9 +343,9 @@ impl Db {
                     .get(&vol_ord)
                     .expect("volume presence checked during bucketing")
                     .clone();
-                handles.push(
-                    scope.spawn(move || Self::apply_l2p_bucket(volume, sid, indices, lsn, ops)),
-                );
+                handles.push(scope.spawn(move || {
+                    Self::apply_l2p_bucket(volume, sid, indices, lsn, ops, metrics)
+                }));
             }
 
             let mut results = Vec::with_capacity(handles.len());
@@ -382,7 +390,9 @@ impl Db {
                 } else {
                     0
                 };
+                let op_started = std::time::Instant::now();
                 let new = refcount_apply_delta(&mut tree, pba, delta, lsn)?;
+                self.metrics.record_apply_refcount(op_started.elapsed());
                 if new == 0 && pre > 0 {
                     if let Some(action) = group
                         .iter()
@@ -401,7 +411,9 @@ impl Db {
                 } else {
                     0
                 };
+                let op_started = std::time::Instant::now();
                 let new = refcount_apply_delta(&mut tree, action.pba, action.delta, lsn)?;
+                self.metrics.record_apply_refcount(op_started.elapsed());
                 if action.remap_freed_candidate {
                     if new == 0 && pre > 0 {
                         result.remap_freed.push((action.op_idx, action.pba));
@@ -552,6 +564,7 @@ impl Db {
         // shard lock needed. Apply in original order — LSM puts on the
         // same key are last-write-wins, matching the serial path.
         for idx in dedup_idxs {
+            let op_started = std::time::Instant::now();
             let outcome = match &ops[idx] {
                 WalOp::DedupPut { hash, value } => {
                     self.dedup_index.put(*hash, *value);
@@ -573,6 +586,7 @@ impl Db {
                 }
                 other => unreachable!("dedup bucket holds only dedup ops; saw {other:?}"),
             };
+            self.metrics.record_apply_dedup(op_started.elapsed());
             outcomes[idx] = Some(outcome);
         }
 
@@ -580,5 +594,26 @@ impl Db {
             .into_iter()
             .map(|o| o.expect("every op index filled by exactly one bucket"))
             .collect())
+    }
+}
+
+/// Record per-op-type apply latency for the serial fallback path.
+/// Lifecycle ops (DropSnapshot / CreateVolume / DropVolume / CloneVolume) are
+/// rare and self-instrument elsewhere, so they're skipped here.
+fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Duration) {
+    match op {
+        WalOp::L2pPut { .. } => metrics.record_apply_l2p_put(elapsed),
+        WalOp::L2pDelete { .. } => metrics.record_apply_l2p_delete(elapsed),
+        WalOp::L2pRemap { .. } => metrics.record_apply_l2p_remap(elapsed),
+        WalOp::L2pRangeDelete { .. } => metrics.record_apply_l2p_range_delete(elapsed),
+        WalOp::Incref { .. } | WalOp::Decref { .. } => metrics.record_apply_refcount(elapsed),
+        WalOp::DedupPut { .. }
+        | WalOp::DedupDelete { .. }
+        | WalOp::DedupReversePut { .. }
+        | WalOp::DedupReverseDelete { .. } => metrics.record_apply_dedup(elapsed),
+        WalOp::DropSnapshot { .. }
+        | WalOp::CreateVolume { .. }
+        | WalOp::DropVolume { .. }
+        | WalOp::CloneVolume { .. } => {}
     }
 }

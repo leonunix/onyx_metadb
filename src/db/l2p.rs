@@ -7,8 +7,14 @@ impl Db {
     pub fn get(&self, vol_ord: VolumeOrdinal, lba: Lba) -> Result<Option<L2pValue>> {
         let volume = self.volume(vol_ord)?;
         let sid = shard_for_key_l2p(&volume.shards, lba);
+        let lock_started = std::time::Instant::now();
         let tree = volume.shards[sid].tree.read();
-        tree.get_read_only(lba)
+        let lock_wait = lock_started.elapsed();
+        let walk_started = std::time::Instant::now();
+        let result = tree.get_read_only(lba);
+        let tree_walk = walk_started.elapsed();
+        self.metrics.record_l2p_get(lock_wait, tree_walk);
+        result
     }
 
     /// Batched L2P lookup inside volume `vol_ord`. Groups `lbas` by shard,
@@ -38,11 +44,17 @@ impl Db {
                 let Some(idxs) = idxs_slot.take() else {
                     continue;
                 };
+                let lock_started = std::time::Instant::now();
                 let Some(tree) = volume.shards[sid].tree.try_read() else {
                     *idxs_slot = Some(idxs);
                     continue;
                 };
-                fill_multi_get_bucket(&tree, idxs, lbas, &mut out)?;
+                let lock_wait = lock_started.elapsed();
+                let walk_started = std::time::Instant::now();
+                let res = fill_multi_get_bucket(&tree, idxs, lbas, &mut out);
+                let tree_walk = walk_started.elapsed();
+                self.metrics.record_l2p_get(lock_wait, tree_walk);
+                res?;
                 remaining -= 1;
                 progressed = true;
             }
@@ -55,8 +67,14 @@ impl Db {
                 .position(|idxs| idxs.is_some())
                 .expect("remaining > 0 implies a pending shard");
             let idxs = pending[sid].take().unwrap();
+            let lock_started = std::time::Instant::now();
             let tree = volume.shards[sid].tree.read();
-            fill_multi_get_bucket(&tree, idxs, lbas, &mut out)?;
+            let lock_wait = lock_started.elapsed();
+            let walk_started = std::time::Instant::now();
+            let res = fill_multi_get_bucket(&tree, idxs, lbas, &mut out);
+            let tree_walk = walk_started.elapsed();
+            self.metrics.record_l2p_get(lock_wait, tree_walk);
+            res?;
             remaining -= 1;
         }
         Ok(out)

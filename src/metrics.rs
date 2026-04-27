@@ -74,6 +74,40 @@ pub struct MetaMetrics {
     cleanup_forward_check_max_us: AtomicU64,
     cleanup_commit_us: AtomicU64,
     cleanup_commit_max_us: AtomicU64,
+
+    // Per-WalOp-variant apply timing. `commit_apply_us` is the sum of
+    // these (plus the bucket bookkeeping in `apply_ops_grouped`); the
+    // per-variant breakdown lets callers see whether L2P, refcount, or
+    // dedup is dominating apply growth as state size grows.
+    apply_l2p_put_count: AtomicU64,
+    apply_l2p_put_us: AtomicU64,
+    apply_l2p_put_max_us: AtomicU64,
+    apply_l2p_delete_count: AtomicU64,
+    apply_l2p_delete_us: AtomicU64,
+    apply_l2p_delete_max_us: AtomicU64,
+    apply_l2p_remap_count: AtomicU64,
+    apply_l2p_remap_us: AtomicU64,
+    apply_l2p_remap_max_us: AtomicU64,
+    apply_l2p_range_delete_count: AtomicU64,
+    apply_l2p_range_delete_us: AtomicU64,
+    apply_l2p_range_delete_max_us: AtomicU64,
+    apply_refcount_count: AtomicU64,
+    apply_refcount_us: AtomicU64,
+    apply_refcount_max_us: AtomicU64,
+    apply_dedup_count: AtomicU64,
+    apply_dedup_us: AtomicU64,
+    apply_dedup_max_us: AtomicU64,
+
+    // L2P read-path split. `l2p_get_lock_wait_us` is time spent blocked
+    // acquiring the shard tree read lock (i.e. an apply or another writer
+    // holds it); `l2p_get_tree_walk_us` is time spent inside the tree
+    // traversal itself once the lock is held. Used to prove or rule out
+    // apply-vs-read lock contention.
+    l2p_get_calls: AtomicU64,
+    l2p_get_lock_wait_us: AtomicU64,
+    l2p_get_lock_wait_max_us: AtomicU64,
+    l2p_get_tree_walk_us: AtomicU64,
+    l2p_get_tree_walk_max_us: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -146,6 +180,29 @@ pub struct MetaMetricsSnapshot {
     pub cleanup_forward_check_max_us: u64,
     pub cleanup_commit_us: u64,
     pub cleanup_commit_max_us: u64,
+    pub apply_l2p_put_count: u64,
+    pub apply_l2p_put_us: u64,
+    pub apply_l2p_put_max_us: u64,
+    pub apply_l2p_delete_count: u64,
+    pub apply_l2p_delete_us: u64,
+    pub apply_l2p_delete_max_us: u64,
+    pub apply_l2p_remap_count: u64,
+    pub apply_l2p_remap_us: u64,
+    pub apply_l2p_remap_max_us: u64,
+    pub apply_l2p_range_delete_count: u64,
+    pub apply_l2p_range_delete_us: u64,
+    pub apply_l2p_range_delete_max_us: u64,
+    pub apply_refcount_count: u64,
+    pub apply_refcount_us: u64,
+    pub apply_refcount_max_us: u64,
+    pub apply_dedup_count: u64,
+    pub apply_dedup_us: u64,
+    pub apply_dedup_max_us: u64,
+    pub l2p_get_calls: u64,
+    pub l2p_get_lock_wait_us: u64,
+    pub l2p_get_lock_wait_max_us: u64,
+    pub l2p_get_tree_walk_us: u64,
+    pub l2p_get_tree_walk_max_us: u64,
 }
 
 impl MetaMetrics {
@@ -223,6 +280,29 @@ impl MetaMetrics {
             cleanup_forward_check_max_us: load(&self.cleanup_forward_check_max_us),
             cleanup_commit_us: load(&self.cleanup_commit_us),
             cleanup_commit_max_us: load(&self.cleanup_commit_max_us),
+            apply_l2p_put_count: load(&self.apply_l2p_put_count),
+            apply_l2p_put_us: load(&self.apply_l2p_put_us),
+            apply_l2p_put_max_us: load(&self.apply_l2p_put_max_us),
+            apply_l2p_delete_count: load(&self.apply_l2p_delete_count),
+            apply_l2p_delete_us: load(&self.apply_l2p_delete_us),
+            apply_l2p_delete_max_us: load(&self.apply_l2p_delete_max_us),
+            apply_l2p_remap_count: load(&self.apply_l2p_remap_count),
+            apply_l2p_remap_us: load(&self.apply_l2p_remap_us),
+            apply_l2p_remap_max_us: load(&self.apply_l2p_remap_max_us),
+            apply_l2p_range_delete_count: load(&self.apply_l2p_range_delete_count),
+            apply_l2p_range_delete_us: load(&self.apply_l2p_range_delete_us),
+            apply_l2p_range_delete_max_us: load(&self.apply_l2p_range_delete_max_us),
+            apply_refcount_count: load(&self.apply_refcount_count),
+            apply_refcount_us: load(&self.apply_refcount_us),
+            apply_refcount_max_us: load(&self.apply_refcount_max_us),
+            apply_dedup_count: load(&self.apply_dedup_count),
+            apply_dedup_us: load(&self.apply_dedup_us),
+            apply_dedup_max_us: load(&self.apply_dedup_max_us),
+            l2p_get_calls: load(&self.l2p_get_calls),
+            l2p_get_lock_wait_us: load(&self.l2p_get_lock_wait_us),
+            l2p_get_lock_wait_max_us: load(&self.l2p_get_lock_wait_max_us),
+            l2p_get_tree_walk_us: load(&self.l2p_get_tree_walk_us),
+            l2p_get_tree_walk_max_us: load(&self.l2p_get_tree_walk_max_us),
         }
     }
 
@@ -279,6 +359,71 @@ impl MetaMetrics {
 
     pub(crate) fn record_commit_apply(&self, elapsed: Duration) {
         record_duration(&self.commit_apply_us, &self.commit_apply_max_us, elapsed);
+    }
+
+    pub(crate) fn record_apply_l2p_put(&self, elapsed: Duration) {
+        self.apply_l2p_put_count.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.apply_l2p_put_us,
+            &self.apply_l2p_put_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_apply_l2p_delete(&self, elapsed: Duration) {
+        self.apply_l2p_delete_count.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.apply_l2p_delete_us,
+            &self.apply_l2p_delete_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_apply_l2p_remap(&self, elapsed: Duration) {
+        self.apply_l2p_remap_count.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.apply_l2p_remap_us,
+            &self.apply_l2p_remap_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_apply_l2p_range_delete(&self, elapsed: Duration) {
+        self.apply_l2p_range_delete_count
+            .fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.apply_l2p_range_delete_us,
+            &self.apply_l2p_range_delete_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_apply_refcount(&self, elapsed: Duration) {
+        self.apply_refcount_count.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.apply_refcount_us,
+            &self.apply_refcount_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_apply_dedup(&self, elapsed: Duration) {
+        self.apply_dedup_count.fetch_add(1, Ordering::Relaxed);
+        record_duration(&self.apply_dedup_us, &self.apply_dedup_max_us, elapsed);
+    }
+
+    pub(crate) fn record_l2p_get(&self, lock_wait: Duration, tree_walk: Duration) {
+        self.l2p_get_calls.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.l2p_get_lock_wait_us,
+            &self.l2p_get_lock_wait_max_us,
+            lock_wait,
+        );
+        record_duration(
+            &self.l2p_get_tree_walk_us,
+            &self.l2p_get_tree_walk_max_us,
+            tree_walk,
+        );
     }
 
     pub(crate) fn record_wal_submit_wait(&self, elapsed: Duration) {
@@ -515,7 +660,30 @@ impl MetaMetricsSnapshot {
                 "\"cleanup_forward_check_us\":{},",
                 "\"cleanup_forward_check_max_us\":{},",
                 "\"cleanup_commit_us\":{},",
-                "\"cleanup_commit_max_us\":{}",
+                "\"cleanup_commit_max_us\":{},",
+                "\"apply_l2p_put_count\":{},",
+                "\"apply_l2p_put_us\":{},",
+                "\"apply_l2p_put_max_us\":{},",
+                "\"apply_l2p_delete_count\":{},",
+                "\"apply_l2p_delete_us\":{},",
+                "\"apply_l2p_delete_max_us\":{},",
+                "\"apply_l2p_remap_count\":{},",
+                "\"apply_l2p_remap_us\":{},",
+                "\"apply_l2p_remap_max_us\":{},",
+                "\"apply_l2p_range_delete_count\":{},",
+                "\"apply_l2p_range_delete_us\":{},",
+                "\"apply_l2p_range_delete_max_us\":{},",
+                "\"apply_refcount_count\":{},",
+                "\"apply_refcount_us\":{},",
+                "\"apply_refcount_max_us\":{},",
+                "\"apply_dedup_count\":{},",
+                "\"apply_dedup_us\":{},",
+                "\"apply_dedup_max_us\":{},",
+                "\"l2p_get_calls\":{},",
+                "\"l2p_get_lock_wait_us\":{},",
+                "\"l2p_get_lock_wait_max_us\":{},",
+                "\"l2p_get_tree_walk_us\":{},",
+                "\"l2p_get_tree_walk_max_us\":{}",
                 "}}"
             ),
             self.commit_attempts,
@@ -586,6 +754,29 @@ impl MetaMetricsSnapshot {
             self.cleanup_forward_check_max_us,
             self.cleanup_commit_us,
             self.cleanup_commit_max_us,
+            self.apply_l2p_put_count,
+            self.apply_l2p_put_us,
+            self.apply_l2p_put_max_us,
+            self.apply_l2p_delete_count,
+            self.apply_l2p_delete_us,
+            self.apply_l2p_delete_max_us,
+            self.apply_l2p_remap_count,
+            self.apply_l2p_remap_us,
+            self.apply_l2p_remap_max_us,
+            self.apply_l2p_range_delete_count,
+            self.apply_l2p_range_delete_us,
+            self.apply_l2p_range_delete_max_us,
+            self.apply_refcount_count,
+            self.apply_refcount_us,
+            self.apply_refcount_max_us,
+            self.apply_dedup_count,
+            self.apply_dedup_us,
+            self.apply_dedup_max_us,
+            self.l2p_get_calls,
+            self.l2p_get_lock_wait_us,
+            self.l2p_get_lock_wait_max_us,
+            self.l2p_get_tree_walk_us,
+            self.l2p_get_tree_walk_max_us,
         )
     }
 }
