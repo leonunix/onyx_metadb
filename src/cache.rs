@@ -1,9 +1,13 @@
 //! Shared page cache for B+tree and LSM reads.
 //!
 //! The cache is sharded to keep mutex contention low and uses a simple
-//! per-shard LRU eviction policy. Every cached object is one sealed
+//! per-shard LRU-ish eviction policy. Every cached object is one sealed
 //! 4 KiB [`Page`], so capacity accounting is page-count-based even
 //! though the public config is expressed in bytes.
+//!
+//! Hot read hits intentionally do not promote LRU position. This lets
+//! read hits take only a shard read lock; cache mutation is reserved for
+//! misses, insertions, pin/unpin, invalidation, and get-for-modify.
 //!
 //! # Pinned pages
 //!
@@ -21,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use lru::LruCache;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 
 use crate::config::PAGE_SIZE;
 use crate::error::Result;
@@ -52,7 +56,7 @@ pub struct PageCacheStats {
 /// Shared cache over one [`PageStore`].
 pub struct PageCache {
     page_store: Arc<PageStore>,
-    shards: Vec<Mutex<Shard>>,
+    shards: Vec<RwLock<Shard>>,
     capacity_bytes: u64,
     pin_budget_bytes: u64,
     hits: AtomicU64,
@@ -111,11 +115,11 @@ impl Shard {
         }
     }
 
-    fn get(&mut self, page_id: PageId) -> Option<Arc<Page>> {
+    fn get(&self, page_id: PageId) -> Option<Arc<Page>> {
         if let Some(page) = self.pinned.get(&page_id) {
             return Some(page.clone());
         }
-        self.lru.as_mut()?.get(&page_id).cloned()
+        self.lru.as_ref()?.peek(&page_id).cloned()
     }
 
     /// Pinned-table peek without LRU promotion. Returns a clone of
@@ -213,7 +217,7 @@ impl PageCache {
         let mut shards = Vec::with_capacity(CACHE_SHARDS);
         for i in 0..CACHE_SHARDS {
             let cap = base + usize::from(i < remainder);
-            shards.push(Mutex::new(Shard::new(cap)));
+            shards.push(RwLock::new(Shard::new(cap)));
         }
         Self {
             page_store,
@@ -236,7 +240,7 @@ impl PageCache {
     /// Read `page_id` through the shared LRU.
     pub fn get(&self, page_id: PageId) -> Result<Arc<Page>> {
         let shard_idx = self.shard_idx(page_id);
-        if let Some(page) = self.shards[shard_idx].lock().get(page_id) {
+        if let Some(page) = self.shards[shard_idx].read().get(page_id) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(page);
         }
@@ -244,7 +248,7 @@ impl PageCache {
         self.misses.fetch_add(1, Ordering::Relaxed);
         let page = Arc::new(self.page_store.read_page(page_id)?);
 
-        let mut shard = self.shards[shard_idx].lock();
+        let mut shard = self.shards[shard_idx].write();
         if let Some(existing) = shard.get(page_id) {
             return Ok(existing);
         }
@@ -262,18 +266,17 @@ impl PageCache {
     /// entry is refreshed in place.
     pub fn get_for_modify(&self, page_id: PageId) -> Result<Page> {
         let shard_idx = self.shard_idx(page_id);
-        {
-            let shard = self.shards[shard_idx].lock();
-            if let Some(page) = shard.get_pinned(page_id) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok((*page).clone());
-            }
+        let mut shard = self.shards[shard_idx].write();
+        if let Some(page) = shard.get_pinned(page_id) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok((*page).clone());
         }
-        if let Some(page) = self.shards[shard_idx].lock().pop_lru(page_id) {
+        if let Some(page) = shard.pop_lru(page_id) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.current_pages.fetch_sub(1, Ordering::Relaxed);
             return Ok((*page).clone());
         }
+        drop(shard);
         self.misses.fetch_add(1, Ordering::Relaxed);
         self.page_store.read_page(page_id)
     }
@@ -287,7 +290,7 @@ impl PageCache {
     /// Insert or refresh a clean page in the cache.
     pub fn insert(&self, page_id: PageId, page: Arc<Page>) {
         let shard_idx = self.shard_idx(page_id);
-        let outcome = self.shards[shard_idx].lock().insert(page_id, page);
+        let outcome = self.shards[shard_idx].write().insert(page_id, page);
         self.apply_insert_outcome(outcome);
     }
 
@@ -297,7 +300,7 @@ impl PageCache {
     /// pid).
     pub fn invalidate(&self, page_id: PageId) {
         let shard_idx = self.shard_idx(page_id);
-        let (was_pinned, was_in_lru) = self.shards[shard_idx].lock().invalidate(page_id);
+        let (was_pinned, was_in_lru) = self.shards[shard_idx].write().invalidate(page_id);
         if was_pinned {
             self.pinned_pages.fetch_sub(1, Ordering::Relaxed);
         }
@@ -325,7 +328,7 @@ impl PageCache {
         }
         let budget_pages = self.pin_budget_bytes / PAGE_SIZE as u64;
         let shard_idx = self.shard_idx(page_id);
-        let mut shard = self.shards[shard_idx].lock();
+        let mut shard = self.shards[shard_idx].write();
         let already_pinned = shard.pinned.contains_key(&page_id);
         if !already_pinned {
             // Budget is a snapshot read under the shard lock — any
@@ -354,7 +357,7 @@ impl PageCache {
     /// populates naturally if the page is still live on disk.
     pub fn unpin(&self, page_id: PageId) {
         let shard_idx = self.shard_idx(page_id);
-        if self.shards[shard_idx].lock().unpin(page_id).is_some() {
+        if self.shards[shard_idx].write().unpin(page_id).is_some() {
             self.pinned_pages.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -464,6 +467,37 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.current_pages, 1);
         assert_eq!(stats.evictions, 1);
+    }
+
+    #[test]
+    fn read_hits_do_not_promote_lru_position() {
+        // 32 total pages = 2 pages per cache shard. Allocate pages 16
+        // apart so all three land in the same shard.
+        let (_dir, ps, cache) = mk_cache(32);
+        let p0 = ps.allocate().unwrap();
+        for _ in 0..15 {
+            let _ = ps.allocate().unwrap();
+        }
+        let p1 = ps.allocate().unwrap();
+        for _ in 0..15 {
+            let _ = ps.allocate().unwrap();
+        }
+        let p2 = ps.allocate().unwrap();
+        write_page(&ps, p0, 1);
+        write_page(&ps, p1, 2);
+        write_page(&ps, p2, 3);
+
+        let _ = cache.get(p0).unwrap();
+        let _ = cache.get(p1).unwrap();
+        let _ = cache.get(p0).unwrap(); // hit, but intentionally no LRU promotion
+        let _ = cache.get(p2).unwrap(); // evicts p0, not p1
+        let _ = cache.get(p0).unwrap(); // miss again if hit did not promote
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 4);
+        assert_eq!(stats.evictions, 2);
+        assert_eq!(stats.current_pages, 2);
     }
 
     #[test]

@@ -245,6 +245,87 @@ fn bucketed_apply_large_pure_l2p_batch() {
     }
 }
 
+fn rv(pba: Pba, tag: u8) -> L2pValue {
+    let mut raw = [0u8; 28];
+    raw[..8].copy_from_slice(&pba.to_be_bytes());
+    raw[8] = tag;
+    L2pValue(raw)
+}
+
+#[test]
+fn bucketed_apply_large_remap_batch_updates_refcounts_and_freed_outcome() {
+    let (_d, db) = mk_db_with_shards(8);
+    for i in 0..16u64 {
+        let mut tx = db.begin();
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, i * 37, rv(100, i as u8), None);
+        tx.commit().unwrap();
+    }
+    assert_eq!(db.get_refcount(100).unwrap(), 16);
+
+    let mut tx = db.begin();
+    for i in 0..16u64 {
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, i * 37, rv(1_000 + i, i as u8), None);
+    }
+    let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+    assert_eq!(outcomes.len(), 16);
+
+    let mut freed = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            ApplyOutcome::L2pRemap {
+                applied, freed_pba, ..
+            } => {
+                assert!(applied);
+                if let Some(pba) = freed_pba {
+                    freed.push(pba);
+                }
+            }
+            other => panic!("expected L2pRemap outcome, got {other:?}"),
+        }
+    }
+    assert_eq!(freed, vec![100]);
+    assert_eq!(db.get_refcount(100).unwrap(), 0);
+    for i in 0..16u64 {
+        assert_eq!(db.get_refcount(1_000 + i).unwrap(), 1);
+    }
+}
+
+#[test]
+fn bucketed_apply_remap_preserves_same_lba_order() {
+    let (_d, db) = mk_db_with_shards(4);
+    let mut tx = db.begin();
+    for i in 0..8u64 {
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10_000 + i, rv(10_000 + i, 0), None);
+    }
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 7, rv(10, 1), None);
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 7, rv(20, 1), None);
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 7, rv(30, 1), None);
+    tx.commit().unwrap();
+
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 7).unwrap(), Some(rv(30, 1)));
+    assert_eq!(db.get_refcount(10).unwrap(), 0);
+    assert_eq!(db.get_refcount(20).unwrap(), 0);
+    assert_eq!(db.get_refcount(30).unwrap(), 1);
+}
+
+#[test]
+fn bucketed_apply_remap_batch_handles_shared_new_pba() {
+    let (_d, db) = mk_db_with_shards(8);
+    let mut tx = db.begin();
+    for i in 0..32u64 {
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, i * 101, rv(777, i as u8), None);
+    }
+    tx.commit().unwrap();
+
+    assert_eq!(db.get_refcount(777).unwrap(), 32);
+    for i in 0..32u64 {
+        assert_eq!(
+            db.get(BOOTSTRAP_VOLUME_ORD, i * 101).unwrap(),
+            Some(rv(777, i as u8))
+        );
+    }
+}
+
 /// Helper used by `batch_contains_lifecycle_op` covers every
 /// lifecycle variant — spot-check via direct unit tests since
 /// these ops cannot be pushed through Transaction.
@@ -274,9 +355,7 @@ fn lifecycle_predicate_detects_every_lifecycle_variant() {
         src_snap_id: 0,
         src_shard_roots: Vec::new(),
     }]));
-    // L2pRemap is forced through the serial path because it
-    // straddles L2P and refcount shards — see apply_l2p_remap.
-    assert!(batch_contains_lifecycle_op(&[WalOp::L2pRemap {
+    assert!(!batch_contains_lifecycle_op(&[WalOp::L2pRemap {
         vol_ord: 0,
         lba: 0,
         new_value: v(0),

@@ -1,18 +1,18 @@
 use super::*;
 
-/// Lock every L2P shard mutex across the given volume set, in
+/// Lock every L2P shard for write across the given volume set, in
 /// (`volumes` order, shard index) order. Callers that reach multiple
 /// volumes pass the sorted output of `Db::volumes_snapshot` so every
-/// caller agrees on a single lock order, preventing the shard mutexes
+/// caller agrees on a single lock order, preventing the shard locks
 /// from deadlocking against each other. Volumes are passed in as a slice
-/// of `Arc<Volume>` so the clones keep the mutexes alive for the guard
+/// of `Arc<Volume>` so the clones keep the locks alive for the guard
 /// lifetime.
 pub(super) fn lock_all_l2p_shards_for<'v>(
     volumes: &'v [Arc<Volume>],
-) -> Vec<MutexGuard<'v, PagedL2p>> {
+) -> Vec<RwLockWriteGuard<'v, PagedL2p>> {
     volumes
         .iter()
-        .flat_map(|vol| vol.shards.iter().map(|shard| shard.tree.lock()))
+        .flat_map(|vol| vol.shards.iter().map(|shard| shard.tree.write()))
         .collect()
 }
 
@@ -24,7 +24,7 @@ pub(super) fn lock_all_l2p_shards_for<'v>(
 pub(super) fn refresh_manifest_entries(
     manifest: &mut Manifest,
     volumes: &[Arc<Volume>],
-    l2p_guards: &[MutexGuard<'_, PagedL2p>],
+    l2p_guards: &[RwLockWriteGuard<'_, PagedL2p>],
     refcount_guards: &[MutexGuard<'_, BTree>],
 ) -> Result<()> {
     manifest.body_version = MANIFEST_BODY_VERSION;
@@ -61,7 +61,7 @@ pub(super) fn refresh_manifest_entries(
     Ok(())
 }
 
-pub(super) fn flush_locked_l2p_shards(guards: &mut [MutexGuard<'_, PagedL2p>]) -> Result<()> {
+pub(super) fn flush_locked_l2p_shards(guards: &mut [RwLockWriteGuard<'_, PagedL2p>]) -> Result<()> {
     for tree in guards {
         tree.flush()?;
     }
@@ -69,7 +69,7 @@ pub(super) fn flush_locked_l2p_shards(guards: &mut [MutexGuard<'_, PagedL2p>]) -
 }
 
 pub(super) fn commit_l2p_checkpoint(
-    guards: &mut [MutexGuard<'_, PagedL2p>],
+    guards: &mut [RwLockWriteGuard<'_, PagedL2p>],
     generation: Lsn,
 ) -> Result<()> {
     for tree in guards {
@@ -147,7 +147,7 @@ pub(super) fn create_l2p_shards(
         let tree = PagedL2p::create_with_cache(page_store.clone(), page_cache.clone())?;
         roots.push(tree.root());
         shards.push(L2pShard {
-            tree: Mutex::new(tree),
+            tree: RwLock::new(tree),
         });
     }
     Ok((shards, roots.into_boxed_slice()))
@@ -162,7 +162,7 @@ pub(super) fn open_l2p_shards(
     let mut shards = Vec::with_capacity(roots.len());
     for &root in roots {
         shards.push(L2pShard {
-            tree: Mutex::new(PagedL2p::open_with_cache(
+            tree: RwLock::new(PagedL2p::open_with_cache(
                 page_store.clone(),
                 page_cache.clone(),
                 root,
@@ -193,7 +193,7 @@ pub(super) fn max_generation_from_locked(guards: &[MutexGuard<'_, BTree>]) -> Ls
         .unwrap_or(0)
 }
 
-pub(super) fn max_generation_from_locked_l2p(guards: &[MutexGuard<'_, PagedL2p>]) -> Lsn {
+pub(super) fn max_generation_from_locked_l2p(guards: &[RwLockWriteGuard<'_, PagedL2p>]) -> Lsn {
     guards
         .iter()
         .map(|tree| tree.next_generation())
@@ -202,7 +202,7 @@ pub(super) fn max_generation_from_locked_l2p(guards: &[MutexGuard<'_, PagedL2p>]
 }
 
 pub(super) fn max_generation_from_two_groups(
-    a: &[MutexGuard<'_, PagedL2p>],
+    a: &[RwLockWriteGuard<'_, PagedL2p>],
     b: &[MutexGuard<'_, BTree>],
 ) -> Lsn {
     max_generation_from_locked_l2p(a).max(max_generation_from_locked(b))

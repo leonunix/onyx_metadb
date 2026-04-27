@@ -53,7 +53,7 @@ pub(super) fn apply_op_bare(
                 MetaDbError::Corruption(format!("L2pPut for unknown volume ord {vol_ord}"))
             })?;
             let sid = shard_for_key_l2p(&volume.shards, *lba);
-            let mut tree = volume.shards[sid].tree.lock();
+            let mut tree = volume.shards[sid].tree.write();
             let prev = tree.insert_at_lsn(*lba, *value, lsn)?;
             Ok(ApplyOutcome::L2pPrev(prev))
         }
@@ -62,7 +62,7 @@ pub(super) fn apply_op_bare(
                 MetaDbError::Corruption(format!("L2pDelete for unknown volume ord {vol_ord}"))
             })?;
             let sid = shard_for_key_l2p(&volume.shards, *lba);
-            let mut tree = volume.shards[sid].tree.lock();
+            let mut tree = volume.shards[sid].tree.write();
             let prev = tree.delete_at_lsn(*lba, lsn)?;
             Ok(ApplyOutcome::L2pPrev(prev))
         }
@@ -202,7 +202,7 @@ pub(super) fn apply_l2p_remap(
     // shard; that shard may differ from `new_pba` / `old_pba`'s
     // shards — we acquire all needed refcount shards up front in
     // sorted order to avoid cross-shard deadlock.
-    let mut tree = volume.shards[l2p_sid].tree.lock();
+    let mut tree = volume.shards[l2p_sid].tree.write();
 
     if let Some((gp, min_rc)) = guard {
         let gp_sid = shard_for_key(refcount_shards, gp);
@@ -377,7 +377,7 @@ pub(super) fn apply_l2p_range_delete(
         if indices.is_empty() {
             continue;
         }
-        let mut tree = volume.shards[sid].tree.lock();
+        let mut tree = volume.shards[sid].tree.write();
         for &idx in indices {
             let (lba, captured_value) = captured[idx];
             let prev = tree.delete_at_lsn(lba, lsn)?;
@@ -581,7 +581,7 @@ pub(super) fn build_clone_volume_shards(
         };
         actual_roots.push(tree.root());
         shards.push(L2pShard {
-            tree: Mutex::new(tree),
+            tree: RwLock::new(tree),
         });
     }
     Ok((shards, actual_roots.into_boxed_slice()))
@@ -607,6 +607,14 @@ pub(super) fn apply_drop_snapshot_pages(
 
     for &pid in pages {
         let mut page = page_store.read_page_unchecked(pid)?;
+        if page.bytes().iter().all(|b| *b == 0) {
+            // `free_idempotent` punches freed pages after writing the
+            // Free header. On reopen, a page already processed by a
+            // crashed prior apply can therefore read back as all zeroes
+            // rather than as a decodable Free page.
+            pages_freed += 1;
+            continue;
+        }
         // verify before we do anything; `read_page_unchecked` skipped it
         page.verify(pid)?;
         let header = page.header()?;
@@ -770,9 +778,8 @@ pub(super) fn shard_for_key_l2p(shards: &[L2pShard], key: u64) -> usize {
     (xxh3_64(&key.to_be_bytes()) as usize) % shards.len()
 }
 
-/// Returns true if the batch contains any op that `apply_ops_grouped`
-/// is not prepared to bucket — i.e. an op whose apply has manifest or
-/// volume-lifecycle side effects. Used to fall back to serial apply.
+/// Returns true if the batch contains any op whose apply has manifest
+/// or volume-lifecycle side effects. Used to fall back to serial apply.
 pub(super) fn batch_contains_lifecycle_op(ops: &[WalOp]) -> bool {
     ops.iter().any(|op| {
         matches!(
@@ -781,12 +788,6 @@ pub(super) fn batch_contains_lifecycle_op(ops: &[WalOp]) -> bool {
                 | WalOp::CreateVolume { .. }
                 | WalOp::DropVolume { .. }
                 | WalOp::CloneVolume { .. }
-                // L2pRemap crosses the L2P and refcount shard
-                // boundaries in a single op, so the bucketed path
-                // (which assumes one shard per op) cannot host it.
-                // Force the serial path; the performance mandate is
-                // a SPEC §8 target, deferred to session S6.
-                | WalOp::L2pRemap { .. }
                 // L2pRangeDelete has its own Db entry point
                 // (`Db::range_delete`) that submits + applies inline
                 // under apply_gate.write, mirroring drop_snapshot.

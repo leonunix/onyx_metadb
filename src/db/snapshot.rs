@@ -205,8 +205,7 @@ impl Db {
                 volume.shards.len(),
             )));
         }
-        let mut guards: Vec<MutexGuard<'_, PagedL2p>> =
-            volume.shards.iter().map(|s| s.tree.lock()).collect();
+        let mut guards: Vec<_> = volume.shards.iter().map(|s| s.tree.write()).collect();
         let mut out = Vec::new();
         for (tree, snap_root) in guards.iter_mut().zip(snap_roots.iter().copied()) {
             let current_root = tree.root();
@@ -499,7 +498,7 @@ impl Db {
             self.page_cache.invalidate(pid);
             for volume in &all_volumes {
                 for shard in &volume.shards {
-                    shard.tree.lock().forget_page(pid);
+                    shard.tree.write().forget_page(pid);
                 }
             }
         }
@@ -586,8 +585,8 @@ impl<'a> SnapshotView<'a> {
     pub fn get(&self, lba: Lba) -> Result<Option<L2pValue>> {
         let volume = self.db.volume(self.entry.vol_ord)?;
         let sid = shard_for_key_l2p(&volume.shards, lba);
-        let mut tree = volume.shards[sid].tree.lock();
-        tree.get_at(self.entry.l2p_shard_roots[sid], lba)
+        let tree = volume.shards[sid].tree.read();
+        tree.get_at_read_only(self.entry.l2p_shard_roots[sid], lba)
     }
 
     /// Range scan as of the snapshot's LSN.

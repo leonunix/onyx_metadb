@@ -151,6 +151,24 @@ impl PageBuf {
         Ok(self.pages[&pid].page())
     }
 
+    /// Read a page without mutating this per-tree buffer.
+    ///
+    /// This is used by the DB hot read path while holding only a shard
+    /// read lock. Dirty pages already present in the tree buffer must
+    /// win over the shared cache, because they may contain committed
+    /// in-memory state that has not been checkpointed yet.
+    pub fn with_page_read_only<T>(
+        &self,
+        pid: PageId,
+        f: impl FnOnce(&Page) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(slot) = self.pages.get(&pid) {
+            return f(slot.page());
+        }
+        let page = self.page_cache.get(pid)?;
+        f(&page)
+    }
+
     /// Mutable page access. Loads the page if not cached and marks it
     /// dirty. **Does not stamp `page.generation`** — that field is
     /// reserved for WAL-apply idempotency markers

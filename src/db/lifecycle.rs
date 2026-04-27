@@ -257,7 +257,7 @@ impl Db {
                             page_cache.invalidate(pid);
                             for vol in &all_vols {
                                 for shard in &vol.shards {
-                                    shard.tree.lock().forget_page(pid);
+                                    shard.tree.write().forget_page(pid);
                                 }
                             }
                         }
@@ -401,7 +401,7 @@ impl Db {
         if cfg.index_pin_bytes > 0 {
             for volume in volumes.values() {
                 for shard in &volume.shards {
-                    let mut tree = shard.tree.lock();
+                    let mut tree = shard.tree.write();
                     tree.warmup_index_pages()?;
                 }
             }

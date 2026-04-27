@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 
-use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::btree::BTree;
@@ -170,7 +170,7 @@ struct Shard {
 }
 
 struct L2pShard {
-    tree: Mutex<PagedL2p>,
+    tree: RwLock<PagedL2p>,
 }
 
 /// L2P home for one user-facing volume. Owns its own shard group; shard

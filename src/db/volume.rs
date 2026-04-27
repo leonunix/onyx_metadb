@@ -267,7 +267,7 @@ impl Db {
         for &pid in &pages {
             self.page_cache.invalidate(pid);
             for shard in &volume.shards {
-                shard.tree.lock().forget_page(pid);
+                shard.tree.write().forget_page(pid);
             }
         }
         drop(volume);
@@ -409,7 +409,7 @@ impl Db {
             self.page_cache.invalidate(pid);
             for vol in &all_volumes {
                 for shard in &vol.shards {
-                    shard.tree.lock().forget_page(pid);
+                    shard.tree.write().forget_page(pid);
                 }
             }
         }
@@ -620,7 +620,7 @@ impl Db {
         &self,
         manifest: &mut Manifest,
         volumes: &[Arc<Volume>],
-        l2p_guards: &[MutexGuard<'_, PagedL2p>],
+        l2p_guards: &[RwLockWriteGuard<'_, PagedL2p>],
         refcount_guards: &[MutexGuard<'_, BTree>],
     ) -> Result<()> {
         refresh_manifest_entries(manifest, volumes, l2p_guards, refcount_guards)
@@ -649,7 +649,7 @@ impl Db {
         }
         let mut items = Vec::new();
         for (root, shard) in roots.iter().copied().zip(&volume.shards) {
-            let mut tree = shard.tree.lock();
+            let mut tree = shard.tree.write();
             items.extend(
                 tree.range_at(root, range.clone())?
                     .collect::<Result<Vec<_>>>()?,
@@ -678,7 +678,7 @@ impl Db {
         for ((a_root, b_root), shard) in
             a.iter().copied().zip(b.iter().copied()).zip(&volume.shards)
         {
-            let mut tree = shard.tree.lock();
+            let mut tree = shard.tree.write();
             out.extend(tree.diff_subtrees(a_root, b_root)?);
         }
         out.sort_unstable_by_key(DiffEntry::key);

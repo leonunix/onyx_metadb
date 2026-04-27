@@ -7,8 +7,8 @@ impl Db {
     pub fn get(&self, vol_ord: VolumeOrdinal, lba: Lba) -> Result<Option<L2pValue>> {
         let volume = self.volume(vol_ord)?;
         let sid = shard_for_key_l2p(&volume.shards, lba);
-        let mut tree = volume.shards[sid].tree.lock();
-        tree.get(lba)
+        let tree = volume.shards[sid].tree.read();
+        tree.get_read_only(lba)
     }
 
     /// Batched L2P lookup inside volume `vol_ord`. Groups `lbas` by shard,
@@ -26,14 +26,38 @@ impl Db {
             buckets[shard_for_key_l2p(&volume.shards, *lba)].push(idx);
         }
         let mut out: Vec<Option<L2pValue>> = vec![None; lbas.len()];
-        for (sid, idxs) in buckets.into_iter().enumerate() {
-            if idxs.is_empty() {
+        let mut pending: Vec<Option<Vec<usize>>> = buckets
+            .into_iter()
+            .map(|idxs| if idxs.is_empty() { None } else { Some(idxs) })
+            .collect();
+        let mut remaining = pending.iter().filter(|idxs| idxs.is_some()).count();
+
+        while remaining > 0 {
+            let mut progressed = false;
+            for (sid, idxs_slot) in pending.iter_mut().enumerate() {
+                let Some(idxs) = idxs_slot.take() else {
+                    continue;
+                };
+                let Some(tree) = volume.shards[sid].tree.try_read() else {
+                    *idxs_slot = Some(idxs);
+                    continue;
+                };
+                fill_multi_get_bucket(&tree, idxs, lbas, &mut out)?;
+                remaining -= 1;
+                progressed = true;
+            }
+            if progressed {
                 continue;
             }
-            let mut tree = volume.shards[sid].tree.lock();
-            for idx in idxs {
-                out[idx] = tree.get(lbas[idx])?;
-            }
+
+            let sid = pending
+                .iter()
+                .position(|idxs| idxs.is_some())
+                .expect("remaining > 0 implies a pending shard");
+            let idxs = pending[sid].take().unwrap();
+            let tree = volume.shards[sid].tree.read();
+            fill_multi_get_bucket(&tree, idxs, lbas, &mut out)?;
+            remaining -= 1;
         }
         Ok(out)
     }
@@ -77,8 +101,7 @@ impl Db {
     ) -> Result<DbRangeIter> {
         let range = OwnedRange::new(range);
         let volume = self.volume(vol_ord)?;
-        let mut guards: Vec<MutexGuard<'_, PagedL2p>> =
-            volume.shards.iter().map(|s| s.tree.lock()).collect();
+        let mut guards: Vec<_> = volume.shards.iter().map(|s| s.tree.write()).collect();
         let mut items = Vec::new();
         for tree in &mut guards {
             items.extend(tree.range(range.clone())?.collect::<Result<Vec<_>>>()?);
@@ -165,7 +188,7 @@ impl Db {
         let captured_result: Result<Vec<(Lba, L2pValue)>> = {
             let mut acc: Vec<(Lba, L2pValue)> = Vec::new();
             for shard in &volume.shards {
-                let mut tree = shard.tree.lock();
+                let mut tree = shard.tree.write();
                 let iter = tree.range(start..end)?;
                 for item in iter {
                     let (lba, value) = item?;
@@ -286,4 +309,20 @@ impl Db {
             .record_range_delete_success(total_started.elapsed());
         Ok(last_lsn)
     }
+}
+
+fn fill_multi_get_bucket(
+    tree: &PagedL2p,
+    idxs: Vec<usize>,
+    lbas: &[Lba],
+    out: &mut [Option<L2pValue>],
+) -> Result<()> {
+    let shard_lbas: Vec<Lba> = idxs.iter().map(|&idx| lbas[idx]).collect();
+    for (idx, value) in idxs
+        .into_iter()
+        .zip(tree.multi_get_read_only(&shard_lbas)?.into_iter())
+    {
+        out[idx] = value;
+    }
+    Ok(())
 }

@@ -25,7 +25,7 @@ use crate::paged::cache::PageBuf;
 use crate::paged::format::{
     INDEX_FANOUT, INDEX_SHIFT, L2pValue, LEAF_ENTRY_COUNT, LEAF_MASK, LEAF_SHIFT, MAX_INDEX_LEVEL,
     index_child_at, index_child_count, index_set_child, leaf_bit_set, leaf_clear, leaf_entry_count,
-    leaf_set, leaf_value_at, max_leaf_idx_at_level, slot_in_index,
+    leaf_set, leaf_value_at, max_leaf_idx_at_level, page_level, slot_in_index,
 };
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
@@ -259,12 +259,40 @@ impl PagedL2p {
         self.finish_op(result)
     }
 
+    /// Point lookup that does not mutate the tree-local page buffer.
+    ///
+    /// Unlike a pure page-cache read, this still observes dirty pages
+    /// already held by the tree, so callers see committed in-memory
+    /// state before the next checkpoint flushes it.
+    pub fn get_read_only(&self, lba: u64) -> Result<Option<L2pValue>> {
+        self.get_at_level_read_only(self.root, self.root_level, lba)
+    }
+
+    /// Batched point lookup for read-side callers. Keeps the shard on
+    /// a shared lock and avoids one local-buffer cleanup per LBA.
+    pub fn multi_get_read_only(&self, lbas: &[u64]) -> Result<Vec<Option<L2pValue>>> {
+        let mut out = Vec::with_capacity(lbas.len());
+        for &lba in lbas {
+            out.push(self.get_at_level_read_only(self.root, self.root_level, lba)?);
+        }
+        Ok(out)
+    }
+
     /// Point lookup against a snapshot's root. Reads the level from the
     /// root page header so callers don't need to track it separately.
     pub fn get_at(&mut self, root: PageId, lba: u64) -> Result<Option<L2pValue>> {
         let level = self.buf.read_level(root)?;
         let result = self.get_at_level(root, level, lba);
         self.finish_op(result)
+    }
+
+    /// Point lookup against a snapshot root without mutating the
+    /// tree-local page buffer.
+    pub fn get_at_read_only(&self, root: PageId, lba: u64) -> Result<Option<L2pValue>> {
+        let level = self
+            .buf
+            .with_page_read_only(root, |page| page_level(page))?;
+        self.get_at_level_read_only(root, level, lba)
     }
 
     fn get_at_level(&mut self, root: PageId, root_level: u8, lba: u64) -> Result<Option<L2pValue>> {
@@ -289,6 +317,38 @@ impl PagedL2p {
             return Ok(None);
         }
         Ok(Some(leaf_value_at(leaf, bit)))
+    }
+
+    fn get_at_level_read_only(
+        &self,
+        root: PageId,
+        root_level: u8,
+        lba: u64,
+    ) -> Result<Option<L2pValue>> {
+        let leaf_idx = lba >> LEAF_SHIFT;
+        let bit = (lba & LEAF_MASK) as usize;
+        if leaf_idx > max_leaf_idx_at_level(root_level) {
+            return Ok(None);
+        }
+        let mut current = root;
+        let mut level = root_level;
+        while level > 0 {
+            let slot = slot_in_index(leaf_idx, level);
+            let child = self
+                .buf
+                .with_page_read_only(current, |page| Ok(index_child_at(page, slot)))?;
+            if child == NULL_PAGE {
+                return Ok(None);
+            }
+            current = child;
+            level -= 1;
+        }
+        self.buf.with_page_read_only(current, |leaf| {
+            if !leaf_bit_set(leaf, bit) {
+                return Ok(None);
+            }
+            Ok(Some(leaf_value_at(leaf, bit)))
+        })
     }
 
     // -------- write path -------------------------------------------------
