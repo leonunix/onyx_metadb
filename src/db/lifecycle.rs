@@ -558,48 +558,141 @@ impl Db {
     /// applied commit, so after `open` replay can correctly begin at
     /// `checkpoint_lsn + 1`.
     pub fn flush(&self) -> Result<()> {
-        // Exclude every in-flight apply phase: after `apply_gate.write()`
-        // returns, no commit is between "touched a tree" and "bumped
-        // last_applied_lsn", so the LSN we sample below matches exactly
-        // the state the trees will have when we flush them.
-        let _apply_guard = self.apply_gate.write();
-        let mut manifest_state = self.manifest_state.lock();
+        // Exclude every in-flight apply phase only while sampling the
+        // checkpoint boundary. Each tree protects the private pages in
+        // the sampled roots before we drop its shard lock; later commits
+        // COW away from those pages, so dirty page IO can run without
+        // holding either the global gate or every shard lock.
+        let apply_guard = self.apply_gate.write();
         let volumes = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
         let mut refcount_guards = self.lock_all_refcount_shards();
-        flush_locked_l2p_shards(&mut l2p_guards)?;
-        self.flush_locked_refcount_shards(&mut refcount_guards)?;
-
         let tree_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
         let wal_checkpoint = *self.last_applied_lsn.lock();
-        let dedup_update =
-            self.prepare_dedup_manifest_update(&mut manifest_state.manifest, tree_generation)?;
-        self.faults
-            .inject(FaultPoint::FlushPostLevelRewriteBeforeManifest)?;
+        let mut l2p_checkpoints = Vec::with_capacity(volumes.len());
+        for volume in &volumes {
+            let mut checkpoints = Vec::with_capacity(volume.shards.len());
+            for _ in 0..volume.shards.len() {
+                checkpoints.push(l2p_guards.remove(0).begin_checkpoint());
+            }
+            l2p_checkpoints.push(checkpoints);
+        }
+        let refcount_checkpoints: Vec<_> = refcount_guards
+            .iter_mut()
+            .map(|tree| tree.begin_checkpoint())
+            .collect();
+        drop(refcount_guards);
+        drop(l2p_guards);
+        drop(apply_guard);
 
-        self.refresh_manifest_from_locked(
+        let mut flushed_l2p = Vec::with_capacity(l2p_checkpoints.len());
+        for checkpoints in &l2p_checkpoints {
+            let mut flushed = Vec::with_capacity(checkpoints.len());
+            for checkpoint in checkpoints {
+                match checkpoint.write_dirty_pages() {
+                    Ok(pages) => flushed.push(pages),
+                    Err(err) => {
+                        self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+                        return Err(err);
+                    }
+                }
+            }
+            flushed_l2p.push(flushed);
+        }
+        let mut flushed_refcount = Vec::with_capacity(refcount_checkpoints.len());
+        for checkpoint in &refcount_checkpoints {
+            match checkpoint.write_dirty_pages() {
+                Ok(pages) => flushed_refcount.push(pages),
+                Err(err) => {
+                    self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+                    return Err(err);
+                }
+            }
+        }
+
+        let mut manifest_state = self.manifest_state.lock();
+        let dedup_update = match self
+            .prepare_dedup_manifest_update(&mut manifest_state.manifest, tree_generation)
+        {
+            Ok(update) => update,
+            Err(err) => {
+                self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+                return Err(err);
+            }
+        };
+        if let Err(err) = self
+            .faults
+            .inject(FaultPoint::FlushPostLevelRewriteBeforeManifest)
+        {
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+            return Err(err);
+        }
+
+        if let Err(err) = refresh_manifest_from_checkpoints(
             &mut manifest_state.manifest,
             &volumes,
-            &l2p_guards,
-            &refcount_guards,
-        )?;
+            &l2p_checkpoints,
+            &refcount_checkpoints,
+        ) {
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+            return Err(err);
+        }
         // The tree generation is a local monotonic counter; checkpoint
         // LSN must be the durable WAL LSN, not the tree counter.
         manifest_state.manifest.checkpoint_lsn = wal_checkpoint;
         let manifest = manifest_state.manifest.clone();
-        manifest_state.store.commit(&manifest)?;
-        commit_l2p_checkpoint(&mut l2p_guards, tree_generation)?;
-        commit_refcount_checkpoint(&mut refcount_guards, tree_generation)?;
+        if let Err(err) = manifest_state.store.commit(&manifest) {
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+            return Err(err);
+        }
+
+        for (volume, (checkpoints, flushed)) in volumes
+            .iter()
+            .zip(l2p_checkpoints.into_iter().zip(flushed_l2p.into_iter()))
+        {
+            for (shard, (checkpoint, flushed)) in volume
+                .shards
+                .iter()
+                .zip(checkpoints.into_iter().zip(flushed.into_iter()))
+            {
+                shard
+                    .tree
+                    .write()
+                    .checkpoint_snapshot_committed(checkpoint, flushed, tree_generation)?;
+            }
+        }
+        for (shard, (checkpoint, flushed)) in self
+            .refcount_shards
+            .iter()
+            .zip(refcount_checkpoints.into_iter().zip(flushed_refcount.into_iter()))
+        {
+            shard
+                .tree
+                .lock()
+                .checkpoint_snapshot_committed(checkpoint, flushed, tree_generation)?;
+        }
         self.finish_dedup_manifest_update(dedup_update, tree_generation)?;
-        // Drop locks before reclaiming so concurrent readers (which
-        // hold no apply guard in the epoch design) can keep walking.
-        drop(l2p_guards);
-        drop(refcount_guards);
         drop(manifest_state);
-        drop(_apply_guard);
+
         self.reclaim_freed_pages()?;
         crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
         Ok(())
+    }
+
+    fn abort_checkpoints(
+        &self,
+        volumes: &[Arc<Volume>],
+        l2p_checkpoints: &[Vec<crate::paged::tree::Checkpoint>],
+        refcount_checkpoints: &[crate::btree::tree::Checkpoint],
+    ) {
+        for (volume, checkpoints) in volumes.iter().zip(l2p_checkpoints.iter()) {
+            for (shard, checkpoint) in volume.shards.iter().zip(checkpoints.iter()) {
+                shard.tree.write().abort_checkpoint(checkpoint);
+            }
+        }
+        for (shard, checkpoint) in self.refcount_shards.iter().zip(refcount_checkpoints.iter()) {
+            shard.tree.lock().abort_checkpoint(checkpoint);
+        }
     }
 
     /// Drain everything currently safe to physically free (i.e. tagged
@@ -618,4 +711,49 @@ impl Db {
         }
         Ok(())
     }
+}
+
+fn refresh_manifest_from_checkpoints(
+    manifest: &mut Manifest,
+    volumes: &[Arc<Volume>],
+    l2p_checkpoints: &[Vec<crate::paged::tree::Checkpoint>],
+    refcount_checkpoints: &[crate::btree::tree::Checkpoint],
+) -> Result<()> {
+    manifest.body_version = MANIFEST_BODY_VERSION;
+    if volumes.len() != l2p_checkpoints.len() {
+        return Err(MetaDbError::Corruption(format!(
+            "checkpoint volume count {} does not match checkpoint groups {}",
+            volumes.len(),
+            l2p_checkpoints.len()
+        )));
+    }
+    let mut new_entries = Vec::with_capacity(volumes.len());
+    for (volume, checkpoints) in volumes.iter().zip(l2p_checkpoints.iter()) {
+        if volume.shards.len() != checkpoints.len() {
+            return Err(MetaDbError::Corruption(format!(
+                "checkpoint shard count {} does not match volume {} shard count {}",
+                checkpoints.len(),
+                volume.ord,
+                volume.shards.len()
+            )));
+        }
+        new_entries.push(VolumeEntry {
+            ord: volume.ord,
+            shard_count: volume.shards.len() as u32,
+            l2p_shard_roots: checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.root)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            created_lsn: volume.created_lsn,
+            flags: volume.flags.load(std::sync::atomic::Ordering::Relaxed),
+        });
+    }
+    manifest.volumes = new_entries;
+    manifest.refcount_shard_roots = refcount_checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.root)
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    Ok(())
 }

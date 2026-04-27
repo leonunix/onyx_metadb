@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
-use crate::btree::cache::PageBuf;
+use crate::btree::cache::{DirtySnapshot, FlushedSnapshot, PageBuf};
 use crate::btree::format::{
     LEAF_ENTRY_SIZE, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, RcEntry, internal_child_at,
     internal_insert, internal_key_at, internal_key_count, internal_pop_front, internal_push_front,
@@ -40,6 +40,20 @@ pub struct BTree {
     next_gen: Lsn,
     private_pages: HashSet<PageId>,
     retired_pages: HashSet<PageId>,
+    checkpoint_protected: HashSet<PageId>,
+}
+
+pub(crate) struct Checkpoint {
+    pub(crate) root: PageId,
+    dirty: DirtySnapshot,
+    private_pages: HashSet<PageId>,
+    retired_pages: HashSet<PageId>,
+}
+
+impl Checkpoint {
+    pub(crate) fn write_dirty_pages(&self) -> Result<FlushedSnapshot> {
+        self.dirty.write()
+    }
 }
 
 impl BTree {
@@ -69,6 +83,7 @@ impl BTree {
             next_gen: 2,
             private_pages: HashSet::new(),
             retired_pages: HashSet::new(),
+            checkpoint_protected: HashSet::new(),
         })
     }
 
@@ -92,6 +107,7 @@ impl BTree {
             next_gen,
             private_pages: HashSet::new(),
             retired_pages: HashSet::new(),
+            checkpoint_protected: HashSet::new(),
         })
     }
 
@@ -131,10 +147,11 @@ impl BTree {
     }
 
     fn ensure_private(&mut self, pid: PageId, generation: Lsn) -> Result<PageId> {
-        if self.private_pages.contains(&pid) {
+        if self.private_pages.contains(&pid) && !self.checkpoint_protected.contains(&pid) {
             return Ok(pid);
         }
         let new_pid = self.buf.clone_private(pid, generation)?;
+        self.private_pages.remove(&pid);
         self.private_pages.insert(new_pid);
         self.retired_pages.insert(pid);
         Ok(new_pid)
@@ -187,6 +204,43 @@ impl BTree {
         }
         self.private_pages.clear();
         self.finish_op(Ok(()))
+    }
+
+    pub(crate) fn begin_checkpoint(&mut self) -> Checkpoint {
+        let private_pages = self.private_pages.clone();
+        let retired_pages = self.retired_pages.clone();
+        self.checkpoint_protected.extend(private_pages.iter().copied());
+        Checkpoint {
+            root: self.root,
+            dirty: self.buf.dirty_snapshot(),
+            private_pages,
+            retired_pages,
+        }
+    }
+
+    pub(crate) fn checkpoint_snapshot_committed(
+        &mut self,
+        checkpoint: Checkpoint,
+        flushed: FlushedSnapshot,
+        generation: Lsn,
+    ) -> Result<()> {
+        self.buf.install_flushed_snapshot(flushed);
+        for pid in &checkpoint.retired_pages {
+            if self.retired_pages.remove(pid) {
+                self.buf.free(*pid, generation)?;
+            }
+        }
+        for pid in &checkpoint.private_pages {
+            self.private_pages.remove(pid);
+            self.checkpoint_protected.remove(pid);
+        }
+        self.finish_op(Ok(()))
+    }
+
+    pub(crate) fn abort_checkpoint(&mut self, checkpoint: &Checkpoint) {
+        for pid in &checkpoint.private_pages {
+            self.checkpoint_protected.remove(pid);
+        }
     }
 
     // -------- read path --------------------------------------------------

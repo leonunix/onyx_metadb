@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::{MetaDbError, Result};
 use crate::page_store::PageStore;
-use crate::paged::cache::PageBuf;
+use crate::paged::cache::{DirtySnapshot, FlushedSnapshot, PageBuf};
 use crate::paged::format::{
     INDEX_FANOUT, INDEX_SHIFT, L2pValue, LEAF_ENTRY_COUNT, LEAF_MASK, LEAF_SHIFT, MAX_INDEX_LEVEL,
     index_child_at, index_child_count, index_set_child, leaf_bit_set, leaf_clear, leaf_entry_count,
@@ -45,6 +45,21 @@ pub struct PagedL2p {
     next_gen: Lsn,
     private_pages: HashSet<PageId>,
     retired_pages: HashSet<PageId>,
+    checkpoint_protected: HashSet<PageId>,
+}
+
+pub(crate) struct Checkpoint {
+    pub(crate) root: PageId,
+    dirty: DirtySnapshot,
+    private_pages: HashSet<PageId>,
+    retired_pages: HashSet<PageId>,
+}
+
+impl Checkpoint {
+    pub(crate) fn write_dirty_pages(&self) -> Result<FlushedSnapshot> {
+        let flushed = self.dirty.write()?;
+        Ok(flushed)
+    }
 }
 
 impl PagedL2p {
@@ -73,6 +88,7 @@ impl PagedL2p {
             next_gen: 2,
             private_pages: HashSet::new(),
             retired_pages: HashSet::new(),
+            checkpoint_protected: HashSet::new(),
         })
     }
 
@@ -103,6 +119,7 @@ impl PagedL2p {
             next_gen,
             private_pages: HashSet::new(),
             retired_pages: HashSet::new(),
+            checkpoint_protected: HashSet::new(),
         })
     }
 
@@ -174,7 +191,8 @@ impl PagedL2p {
 
     fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
         let effective_rc = self.buf.effective_rc(pid)?;
-        if self.private_pages.contains(&pid) && effective_rc <= 1 {
+        let checkpoint_protected = self.checkpoint_protected.contains(&pid);
+        if self.private_pages.contains(&pid) && effective_rc <= 1 && !checkpoint_protected {
             return Ok(pid);
         }
         if effective_rc <= 1 {
@@ -182,11 +200,13 @@ impl PagedL2p {
             if already_touched_by_lsn {
                 let new_pid = self.buf.cow_for_write(pid, lsn)?;
                 if new_pid != pid {
+                    self.private_pages.remove(&pid);
                     self.private_pages.insert(new_pid);
                 }
                 return Ok(new_pid);
             }
             let new_pid = self.buf.clone_private(pid, lsn)?;
+            self.private_pages.remove(&pid);
             self.private_pages.insert(new_pid);
             self.retired_pages.insert(pid);
             return Ok(new_pid);
@@ -216,6 +236,47 @@ impl PagedL2p {
         }
         self.private_pages.clear();
         self.finish_op(Ok(()))
+    }
+
+    pub(crate) fn begin_checkpoint(&mut self) -> Checkpoint {
+        let private_pages = self.private_pages.clone();
+        let retired_pages = self.retired_pages.clone();
+        self.checkpoint_protected.extend(private_pages.iter().copied());
+        Checkpoint {
+            root: self.root,
+            dirty: self.buf.dirty_snapshot(),
+            private_pages,
+            retired_pages,
+        }
+    }
+
+    pub(crate) fn install_flushed_checkpoint(&mut self, flushed: FlushedSnapshot) {
+        self.buf.install_flushed_snapshot(flushed);
+    }
+
+    pub(crate) fn checkpoint_snapshot_committed(
+        &mut self,
+        checkpoint: Checkpoint,
+        flushed: FlushedSnapshot,
+        generation: Lsn,
+    ) -> Result<()> {
+        self.install_flushed_checkpoint(flushed);
+        for pid in &checkpoint.retired_pages {
+            if self.retired_pages.remove(pid) {
+                self.buf.free(*pid, generation)?;
+            }
+        }
+        for pid in &checkpoint.private_pages {
+            self.private_pages.remove(pid);
+            self.checkpoint_protected.remove(pid);
+        }
+        self.finish_op(Ok(()))
+    }
+
+    pub(crate) fn abort_checkpoint(&mut self, checkpoint: &Checkpoint) {
+        for pid in &checkpoint.private_pages {
+            self.checkpoint_protected.remove(pid);
+        }
     }
 
     /// Run the structural checker over the whole tree.

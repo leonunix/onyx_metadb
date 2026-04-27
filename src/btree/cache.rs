@@ -34,6 +34,27 @@ enum Slot {
     Dirty(Page),
 }
 
+pub(crate) struct DirtySnapshot {
+    page_store: Arc<PageStore>,
+    page_cache: Arc<PageCache>,
+    pages: Vec<DirtySnapshotPage>,
+}
+
+pub(crate) struct FlushedSnapshot {
+    pages: Vec<FlushedSnapshotPage>,
+}
+
+struct DirtySnapshotPage {
+    pid: PageId,
+    original: Page,
+}
+
+struct FlushedSnapshotPage {
+    pid: PageId,
+    original: Page,
+    sealed: Arc<Page>,
+}
+
 impl Slot {
     fn page(&self) -> &Page {
         match self {
@@ -203,6 +224,39 @@ impl PageBuf {
         Ok(())
     }
 
+    pub(crate) fn dirty_snapshot(&self) -> DirtySnapshot {
+        let mut pages: Vec<_> = self
+            .pages
+            .iter()
+            .filter_map(|(pid, slot)| match slot {
+                Slot::Dirty(page) => Some(DirtySnapshotPage {
+                    pid: *pid,
+                    original: page.clone(),
+                }),
+                Slot::Clean(_) => None,
+            })
+            .collect();
+        pages.sort_unstable_by_key(|page| page.pid);
+        DirtySnapshot {
+            page_store: self.page_store.clone(),
+            page_cache: self.page_cache.clone(),
+            pages,
+        }
+    }
+
+    pub(crate) fn install_flushed_snapshot(&mut self, flushed: FlushedSnapshot) {
+        for page in flushed.pages {
+            let Some(Slot::Dirty(current)) = self.pages.get(&page.pid) else {
+                continue;
+            };
+            if current.bytes() != page.original.bytes() {
+                continue;
+            }
+            self.page_cache.insert(page.pid, page.sealed.clone());
+            self.pages.insert(page.pid, Slot::Clean(page.sealed));
+        }
+    }
+
     fn ensure_loaded(&mut self, pid: PageId) -> Result<()> {
         if self.pages.contains_key(&pid) {
             return Ok(());
@@ -210,6 +264,29 @@ impl PageBuf {
         let page = self.page_cache.get(pid)?;
         self.pages.insert(pid, Slot::Clean(page));
         Ok(())
+    }
+}
+
+impl DirtySnapshot {
+    pub(crate) fn write(&self) -> Result<FlushedSnapshot> {
+        if self.pages.is_empty() {
+            return Ok(FlushedSnapshot { pages: Vec::new() });
+        }
+        let mut flushed = Vec::with_capacity(self.pages.len());
+        for page in &self.pages {
+            let mut sealed = page.original.clone();
+            sealed.seal();
+            self.page_store.write_page(page.pid, &sealed)?;
+            let sealed = Arc::new(sealed);
+            self.page_cache.insert(page.pid, sealed.clone());
+            flushed.push(FlushedSnapshotPage {
+                pid: page.pid,
+                original: page.original.clone(),
+                sealed,
+            });
+        }
+        self.page_store.sync()?;
+        Ok(FlushedSnapshot { pages: flushed })
     }
 }
 
