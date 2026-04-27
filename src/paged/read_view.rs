@@ -103,9 +103,96 @@ impl ReadView {
     /// route through this when they have an already-bucketed slice for
     /// one shard.
     pub fn multi_get(&self, lbas: &[u64]) -> Result<Vec<Option<L2pValue>>> {
-        let mut out = Vec::with_capacity(lbas.len());
-        for &lba in lbas {
-            out.push(self.get(lba)?);
+        #[derive(Clone, Copy)]
+        struct Walk {
+            out_idx: usize,
+            leaf_idx: u64,
+            bit: usize,
+            current: PageId,
+        }
+
+        let mut out = vec![None; lbas.len()];
+        let mut active = Vec::with_capacity(lbas.len());
+        for (out_idx, &lba) in lbas.iter().enumerate() {
+            let leaf_idx = lba >> LEAF_SHIFT;
+            if leaf_idx > max_leaf_idx_at_level(self.root_level) {
+                continue;
+            }
+            active.push(Walk {
+                out_idx,
+                leaf_idx,
+                bit: (lba & LEAF_MASK) as usize,
+                current: self.root,
+            });
+        }
+
+        let mut level = self.root_level;
+        while level > 0 && !active.is_empty() {
+            let disk_pids: Vec<PageId> = active
+                .iter()
+                .filter_map(|walk| {
+                    if self.overlay.contains_key(&walk.current) {
+                        None
+                    } else {
+                        Some(walk.current)
+                    }
+                })
+                .collect();
+            let disk_pages = self.page_cache.get_many(&disk_pids)?;
+            let mut disk_iter = disk_pages.into_iter();
+            let mut next = Vec::with_capacity(active.len());
+            for walk in active {
+                let slot = slot_in_index(walk.leaf_idx, level);
+                let child = if let Some(page) = self.overlay.get(&walk.current) {
+                    index_child_at(page, slot)
+                } else {
+                    let page = disk_iter.next().ok_or_else(|| {
+                        crate::error::MetaDbError::Corruption(
+                            "paged read_view multi_get disk page iterator underflow".into(),
+                        )
+                    })?;
+                    index_child_at(page.as_ref(), slot)
+                };
+                if child != NULL_PAGE {
+                    next.push(Walk {
+                        current: child,
+                        ..walk
+                    });
+                }
+            }
+            active = next;
+            level -= 1;
+        }
+
+        if !active.is_empty() {
+            let disk_pids: Vec<PageId> = active
+                .iter()
+                .filter_map(|walk| {
+                    if self.overlay.contains_key(&walk.current) {
+                        None
+                    } else {
+                        Some(walk.current)
+                    }
+                })
+                .collect();
+            let disk_pages = self.page_cache.get_many(&disk_pids)?;
+            let mut disk_iter = disk_pages.into_iter();
+            for walk in active {
+                if let Some(page) = self.overlay.get(&walk.current) {
+                    if leaf_bit_set(page, walk.bit) {
+                        out[walk.out_idx] = Some(leaf_value_at(page, walk.bit));
+                    }
+                } else {
+                    let page = disk_iter.next().ok_or_else(|| {
+                        crate::error::MetaDbError::Corruption(
+                            "paged read_view multi_get leaf iterator underflow".into(),
+                        )
+                    })?;
+                    if leaf_bit_set(page.as_ref(), walk.bit) {
+                        out[walk.out_idx] = Some(leaf_value_at(page.as_ref(), walk.bit));
+                    }
+                }
+            }
         }
         Ok(out)
     }

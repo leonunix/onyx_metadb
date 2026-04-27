@@ -569,7 +569,31 @@ impl PageBuf {
         }
         self.page_store.sync()?;
         for (pid, page) in flushed {
-            self.page_cache.insert(pid, page.clone());
+            // L2P index pages are tiny (≤1/256 of leaf bytes for a typical
+            // tree) and every L2P walk dereferences them. Try to pin them
+            // outside the LRU so heavy leaf / dedup_index churn cannot
+            // evict the path. `pin` returns false when the budget is full,
+            // which is fine — we fall back to the regular LRU insert and
+            // rely on warmup_index_pages on the next reopen to top off.
+            //
+            // `warmup_index_pages` only runs at `open()`; for a fresh
+            // `create()` the tree is empty and never gets retroactively
+            // pinned, so without this on-demand path `pinned_pages` stays
+            // at 0 forever. Soak (2026-04-27) showed that exact failure
+            // mode: 1 GiB pin budget, 0 pages pinned, l2p_remap tail ramp
+            // from 20 µs avg to 38 SECONDS as cache pressure ate the
+            // hot index.
+            let is_index = matches!(
+                page.header().map(|h| h.page_type),
+                Ok(PageType::PagedIndex)
+            );
+            if is_index && self.page_cache.pin(pid, page.clone()) {
+                // Pinned — skip LRU insert. The pinned table shadows LRU
+                // on lookup, so a subsequent `insert` would only waste
+                // capacity.
+            } else {
+                self.page_cache.insert(pid, page.clone());
+            }
             self.pages_insert(pid, Slot::Clean(page));
         }
         Ok(())

@@ -35,11 +35,15 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(target_os = "linux")]
+use io_uring::{IoUring, opcode, types};
 
 use crate::config::PAGE_SIZE;
 use crate::epoch::EpochManager;
@@ -48,6 +52,8 @@ use crate::page::{Page, PageHeader, PageType};
 use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 
 const RC_LOCK_SHARDS: usize = 64;
+#[cfg(target_os = "linux")]
+const DEFAULT_READ_URING_ENTRIES: u32 = 128;
 
 /// Default pre-extension chunk if the caller uses [`PageStore::create`]
 /// / [`PageStore::open`] without threading a `Config`. Must stay in
@@ -58,6 +64,8 @@ pub const DEFAULT_GROW_CHUNK_PAGES: u64 = 512;
 pub struct PageStore {
     path: PathBuf,
     file: File,
+    #[cfg(target_os = "linux")]
+    read_uring: Mutex<Option<IoUring>>,
     inner: Mutex<Inner>,
     /// Per-pid sharded mutexes serialising [`atomic_rc_delta`]. Needed
     /// because a page can be shared across multiple [`PagedL2p`]
@@ -159,6 +167,8 @@ impl PageStore {
         Ok(Self {
             path,
             file,
+            #[cfg(target_os = "linux")]
+            read_uring: Mutex::new(new_read_uring()),
             inner: Mutex::new(Inner {
                 high_water: FIRST_DATA_PAGE,
                 committed_file_pages: FIRST_DATA_PAGE,
@@ -223,6 +233,8 @@ impl PageStore {
         Ok(Self {
             path,
             file,
+            #[cfg(target_os = "linux")]
+            read_uring: Mutex::new(new_read_uring()),
             inner: Mutex::new(Inner {
                 high_water,
                 committed_file_pages: high_water,
@@ -272,6 +284,23 @@ impl PageStore {
         let page = read_page_raw(&self.file, page_id)?;
         page.verify(page_id)?;
         Ok(page)
+    }
+
+    /// Read and verify several pages. On Linux this uses one io_uring submit
+    /// per chunk, so callers with many cache misses can raise device queue
+    /// depth instead of serialising `pread` calls.
+    pub(crate) fn read_pages(&self, page_ids: &[PageId]) -> Result<Vec<Page>> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        for &page_id in page_ids {
+            self.check_in_range(page_id)?;
+        }
+        let pages = read_pages_raw(&self.file, page_ids, self.read_uring())?;
+        for (page_id, page) in page_ids.iter().copied().zip(&pages) {
+            page.verify(page_id)?;
+        }
+        Ok(pages)
     }
 
     /// Read page `page_id` without running `verify`. Used by recovery and
@@ -649,12 +678,175 @@ impl PageStore {
     fn punch_free_page(&self, page_id: PageId) -> Result<()> {
         punch_hole(&self.file, page_id * PAGE_SIZE as u64, PAGE_SIZE as u64)
     }
+
+    #[cfg(target_os = "linux")]
+    fn read_uring(&self) -> Option<&Mutex<Option<IoUring>>> {
+        Some(&self.read_uring)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_uring(&self) -> Option<&()> {
+        None
+    }
 }
 
 fn read_page_raw(file: &File, page_id: PageId) -> Result<Page> {
     let mut page = Page::zeroed();
     file.read_exact_at(page.bytes_mut(), page_id * PAGE_SIZE as u64)?;
     Ok(page)
+}
+
+#[cfg(target_os = "linux")]
+fn new_read_uring() -> Option<IoUring> {
+    match IoUring::new(DEFAULT_READ_URING_ENTRIES) {
+        Ok(ring) => Some(ring),
+        Err(err) => {
+            tracing::debug!(error = %err, "page_store io_uring unavailable; falling back to pread");
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_pages_raw(
+    file: &File,
+    page_ids: &[PageId],
+    read_uring: Option<&Mutex<Option<IoUring>>>,
+) -> Result<Vec<Page>> {
+    if page_ids.len() == 1 {
+        return Ok(vec![read_page_raw(file, page_ids[0])?]);
+    }
+    let Some(read_uring) = read_uring else {
+        return read_pages_raw_pread(file, page_ids);
+    };
+    let mut guard = read_uring.lock();
+    let Some(ring) = guard.as_mut() else {
+        return read_pages_raw_pread(file, page_ids);
+    };
+    match read_pages_raw_uring(file, page_ids, ring) {
+        Ok(pages) => Ok(pages),
+        Err(err) if is_uring_setup_error(&err) => {
+            tracing::debug!(error = %err, "page_store io_uring read failed; falling back to pread");
+            *guard = None;
+            read_pages_raw_pread(file, page_ids)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_pages_raw(file: &File, page_ids: &[PageId], _read_uring: Option<&()>) -> Result<Vec<Page>> {
+    read_pages_raw_pread(file, page_ids)
+}
+
+fn read_pages_raw_pread(file: &File, page_ids: &[PageId]) -> Result<Vec<Page>> {
+    let mut pages = Vec::with_capacity(page_ids.len());
+    for &page_id in page_ids {
+        pages.push(read_page_raw(file, page_id)?);
+    }
+    Ok(pages)
+}
+
+#[cfg(target_os = "linux")]
+fn read_pages_raw_uring(file: &File, page_ids: &[PageId], ring: &mut IoUring) -> Result<Vec<Page>> {
+    let fd = file.as_raw_fd();
+    let mut out = Vec::with_capacity(page_ids.len());
+    for chunk in page_ids.chunks(DEFAULT_READ_URING_ENTRIES as usize) {
+        let mut pages: Vec<Page> = (0..chunk.len()).map(|_| Page::zeroed()).collect();
+        for (idx, (&page_id, page)) in chunk.iter().zip(pages.iter_mut()).enumerate() {
+            let entry = opcode::Read::new(
+                types::Fd(fd),
+                page.bytes_mut().as_mut_ptr(),
+                PAGE_SIZE as u32,
+            )
+            .offset(page_id * PAGE_SIZE as u64)
+            .build()
+            .user_data(idx as u64);
+            let mut sq = ring.submission();
+            // SAFETY: each SQE points at a distinct Page buffer in `pages`.
+            // The vector is kept alive and not reallocated until every CQE for
+            // this chunk has been harvested below.
+            unsafe {
+                sq.push(&entry).map_err(|_| {
+                    MetaDbError::Io(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "page_store io_uring submission queue full at op {idx}/{}",
+                            chunk.len()
+                        ),
+                    ))
+                })?;
+            }
+        }
+
+        ring.submit_and_wait(chunk.len()).map_err(MetaDbError::Io)?;
+
+        let mut results = vec![None; chunk.len()];
+        let mut harvested = 0usize;
+        let mut cq = ring.completion();
+        cq.sync();
+        for cqe in &mut cq {
+            let idx = cqe.user_data() as usize;
+            if idx >= results.len() {
+                return Err(MetaDbError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "page_store io_uring CQE user_data {idx} out of range (batch size {})",
+                        chunk.len()
+                    ),
+                )));
+            }
+            results[idx] = Some(cqe.result());
+            harvested += 1;
+            if harvested == chunk.len() {
+                break;
+            }
+        }
+        if harvested != chunk.len() {
+            return Err(MetaDbError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "page_store io_uring harvested {harvested} CQEs, expected {}",
+                    chunk.len()
+                ),
+            )));
+        }
+        drop(cq);
+
+        for (idx, result) in results.into_iter().enumerate() {
+            let result = result.ok_or_else(|| {
+                MetaDbError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("page_store io_uring missing CQE for op {idx}"),
+                ))
+            })?;
+            if result < 0 {
+                return Err(MetaDbError::Io(io::Error::from_raw_os_error(-result)));
+            }
+            if result as usize != PAGE_SIZE {
+                return Err(MetaDbError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "page_store io_uring short read at page {}: got {result} of {PAGE_SIZE}",
+                        chunk[idx]
+                    ),
+                )));
+            }
+        }
+        out.extend(pages);
+    }
+    Ok(out)
+}
+
+#[cfg(target_os = "linux")]
+fn is_uring_setup_error(err: &MetaDbError) -> bool {
+    match err {
+        MetaDbError::Io(io) => matches!(
+            io.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM)
+        ),
+        _ => false,
+    }
 }
 
 fn is_zero_page(page: &Page) -> bool {

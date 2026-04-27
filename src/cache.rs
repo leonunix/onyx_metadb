@@ -19,7 +19,7 @@
 //! from both. Intended for L2P index pages (≤ 1/256 of leaf bytes, so
 //! practically always in-cache regardless of cache pressure).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +28,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 
 use crate::config::PAGE_SIZE;
-use crate::error::Result;
+use crate::error::{MetaDbError, Result};
 use crate::page::Page;
 use crate::page_store::PageStore;
 use crate::types::PageId;
@@ -248,12 +248,100 @@ impl PageCache {
         self.misses.fetch_add(1, Ordering::Relaxed);
         let page = Arc::new(self.page_store.read_page(page_id)?);
 
+        // L2P index pages discovered via cold-read (cache miss + reload)
+        // skip the LRU and go straight to the pinned table. They're
+        // tiny (≤1/256 of leaf bytes) and on every L2P walk's path; once
+        // pinned the path stays hot regardless of leaf / dedup_index
+        // pressure. Mirror of the `PageBuf::flush` post-write pin in
+        // [paged/cache.rs]; both paths exist because pages enter the
+        // shared cache via two routes (post-flush insert + read miss).
+        let is_index = matches!(
+            page.header().map(|h| h.page_type),
+            Ok(crate::page::PageType::PagedIndex)
+        );
+        if is_index {
+            if let Some(existing) = self.shards[shard_idx].read().get(page_id) {
+                return Ok(existing);
+            }
+            if self.pin(page_id, page.clone()) {
+                return Ok(page);
+            }
+            // Pin budget exhausted — fall through to the regular LRU
+            // insert below so the page is still cached.
+        }
+
         let mut shard = self.shards[shard_idx].write();
         if let Some(existing) = shard.get(page_id) {
             return Ok(existing);
         }
         self.apply_insert_outcome(shard.insert(page_id, page.clone()));
         Ok(page)
+    }
+
+    /// Read several pages through the shared cache, batching cache misses into
+    /// one page-store request. Returned pages follow `page_ids` order.
+    pub(crate) fn get_many(&self, page_ids: &[PageId]) -> Result<Vec<Arc<Page>>> {
+        let mut out: Vec<Option<Arc<Page>>> = vec![None; page_ids.len()];
+        let mut miss_positions: HashMap<PageId, Vec<usize>> = HashMap::new();
+        let mut unique_misses = Vec::new();
+
+        for (idx, &page_id) in page_ids.iter().enumerate() {
+            let shard_idx = self.shard_idx(page_id);
+            if let Some(page) = self.shards[shard_idx].read().get(page_id) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                out[idx] = Some(page);
+                continue;
+            }
+            match miss_positions.entry(page_id) {
+                Entry::Occupied(mut entry) => entry.get_mut().push(idx),
+                Entry::Vacant(entry) => {
+                    unique_misses.push(page_id);
+                    entry.insert(vec![idx]);
+                }
+            }
+        }
+
+        if !unique_misses.is_empty() {
+            self.misses
+                .fetch_add(unique_misses.len() as u64, Ordering::Relaxed);
+            let loaded = self.page_store.read_pages(&unique_misses)?;
+            for (page_id, page) in unique_misses.into_iter().zip(loaded) {
+                let shard_idx = self.shard_idx(page_id);
+                let arc = if let Some(existing) = self.shards[shard_idx].read().get(page_id) {
+                    existing
+                } else {
+                    let page = Arc::new(page);
+                    let is_index = matches!(
+                        page.header().map(|h| h.page_type),
+                        Ok(crate::page::PageType::PagedIndex)
+                    );
+                    if is_index && self.pin(page_id, page.clone()) {
+                        page
+                    } else {
+                        let mut shard = self.shards[shard_idx].write();
+                        if let Some(existing) = shard.get(page_id) {
+                            existing
+                        } else {
+                            self.apply_insert_outcome(shard.insert(page_id, page.clone()));
+                            page
+                        }
+                    }
+                };
+                if let Some(idxs) = miss_positions.remove(&page_id) {
+                    for idx in idxs {
+                        out[idx] = Some(arc.clone());
+                    }
+                }
+            }
+        }
+
+        out.into_iter()
+            .map(|page| {
+                page.ok_or_else(|| {
+                    MetaDbError::Corruption("page_cache get_many left an empty result".into())
+                })
+            })
+            .collect()
     }
 
     /// Load a page for mutation.

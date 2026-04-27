@@ -47,9 +47,11 @@ impl Db {
                 continue;
             }
             let view = volume.shards[sid].read_view.read().clone();
+            let shard_lbas: Vec<Lba> = idxs.iter().map(|&idx| lbas[idx]).collect();
             let walk_started = std::time::Instant::now();
-            for idx in idxs {
-                out[idx] = view.get(lbas[idx])?;
+            let shard_out = view.multi_get(&shard_lbas)?;
+            for (idx, value) in idxs.into_iter().zip(shard_out) {
+                out[idx] = value;
             }
             let tree_walk = walk_started.elapsed();
             // `pin_wait` is recorded once per shard so the metric's
