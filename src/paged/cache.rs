@@ -20,10 +20,14 @@ use crate::page_store::PageStore;
 use crate::paged::format::{index_collect_children, init_index, init_leaf, page_level};
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
-/// Cache entry.
+/// Cache entry. Both variants carry `Arc<Page>` so dirty pages can be
+/// shared with `ReadView` overlays at apply-publish time without copying
+/// 4 KiB. Mutation of a `Dirty` slot uses `Arc::make_mut` so an Arc
+/// shared with an in-flight ReadView snapshot gets cloned-on-write —
+/// the snapshot keeps its bytes, the live tree continues mutating.
 enum Slot {
     Clean(Arc<Page>),
-    Dirty(Page),
+    Dirty(Arc<Page>),
 }
 
 impl Slot {
@@ -180,17 +184,20 @@ impl PageBuf {
     /// make call-site LSN-awareness visible, but is intentionally
     /// ignored.
     pub fn modify(&mut self, pid: PageId, _generation: Lsn) -> Result<&mut Page> {
-        let page = match self.pages_remove(pid) {
-            Some(Slot::Dirty(page)) => page,
-            Some(Slot::Clean(page)) => {
+        let arc: Arc<Page> = match self.pages_remove(pid) {
+            Some(Slot::Dirty(arc)) => arc,
+            Some(Slot::Clean(arc)) => {
                 self.page_cache.invalidate(pid);
-                (*page).clone()
+                arc
             }
-            None => self.page_cache.get_for_modify(pid)?,
+            None => Arc::new(self.page_cache.get_for_modify(pid)?),
         };
-        self.pages_insert(pid, Slot::Dirty(page));
+        self.pages_insert(pid, Slot::Dirty(arc));
+        // `Arc::make_mut` clones the page if a `ReadView` overlay
+        // still holds this Arc — the published snapshot keeps the
+        // pre-mutation bytes; the live tree mutates a fresh copy.
         match self.pages.get_mut(&pid).unwrap() {
-            Slot::Dirty(page) => Ok(page),
+            Slot::Dirty(arc) => Ok(Arc::make_mut(arc)),
             Slot::Clean(_) => unreachable!("modify always stores a dirty page"),
         }
     }
@@ -203,7 +210,7 @@ impl PageBuf {
         let mut page = self.read(src)?.clone();
         page.set_generation(generation);
         page.set_refcount(1);
-        self.pages_insert(new_pid, Slot::Dirty(page));
+        self.pages_insert(new_pid, Slot::Dirty(Arc::new(page)));
         Ok(new_pid)
     }
 
@@ -214,7 +221,7 @@ impl PageBuf {
         let pid = self.page_store.allocate()?;
         let mut page = Page::zeroed();
         init_leaf(&mut page, 0);
-        self.pages_insert(pid, Slot::Dirty(page));
+        self.pages_insert(pid, Slot::Dirty(Arc::new(page)));
         Ok(pid)
     }
 
@@ -225,7 +232,7 @@ impl PageBuf {
         let pid = self.page_store.allocate()?;
         let mut page = Page::zeroed();
         init_index(&mut page, 0, level);
-        self.pages_insert(pid, Slot::Dirty(page));
+        self.pages_insert(pid, Slot::Dirty(Arc::new(page)));
         Ok(pid)
     }
 
@@ -366,7 +373,8 @@ impl PageBuf {
     /// `page_cache` afterwards so nothing observes the stale pre-RMW
     /// copy.
     fn persist_if_dirty(&mut self, pid: PageId) -> Result<()> {
-        if let Some(Slot::Dirty(page)) = self.pages.get_mut(&pid) {
+        if let Some(Slot::Dirty(arc)) = self.pages.get_mut(&pid) {
+            let page = Arc::make_mut(arc);
             page.seal();
             self.page_store.write_page(pid, page)?;
         }
@@ -436,7 +444,7 @@ impl PageBuf {
             .copy_from_slice(self.read(pid)?.bytes());
         new_page.set_generation(0);
         new_page.set_refcount(1);
-        self.pages_insert(new_pid, Slot::Dirty(new_page));
+        self.pages_insert(new_pid, Slot::Dirty(Arc::new(new_page)));
 
         // Queue rc deltas for end-of-op commit instead of hitting disk
         // per-edge. Within one descent, a child is first incref'd here
@@ -551,10 +559,13 @@ impl PageBuf {
         dirty.sort_unstable();
         let mut flushed: Vec<(PageId, Arc<Page>)> = Vec::with_capacity(dirty.len());
         for pid in &dirty {
-            let mut page = self.pages[pid].page().clone();
+            let Some(Slot::Dirty(arc)) = self.pages.get_mut(pid) else {
+                unreachable!("dirty list mismatched pages content");
+            };
+            let page = Arc::make_mut(arc);
             page.seal();
-            self.page_store.write_page(*pid, &page)?;
-            flushed.push((*pid, Arc::new(page)));
+            self.page_store.write_page(*pid, page)?;
+            flushed.push((*pid, arc.clone()));
         }
         self.page_store.sync()?;
         for (pid, page) in flushed {
@@ -562,6 +573,13 @@ impl PageBuf {
             self.pages_insert(pid, Slot::Clean(page));
         }
         Ok(())
+    }
+
+    pub fn iter_dirty(&self) -> impl Iterator<Item = (PageId, Arc<Page>)> + '_ {
+        self.pages.iter().filter_map(|(pid, slot)| match slot {
+            Slot::Dirty(arc) => Some((*pid, arc.clone())),
+            Slot::Clean(_) => None,
+        })
     }
 
     /// Helper for tests / `PagedL2p::root_level`: read a page's level
@@ -631,7 +649,8 @@ mod tests {
         let before = ps.free_list_len();
         let out = buf.atomic_decref(idx).unwrap();
         assert_eq!(out, DecrefOutcome::Freed);
-        // index + leaf0 + leaf1 all hit the free list.
+        // index + leaf0 + leaf1 all hit the deferred-free queue.
+        ps.try_reclaim().unwrap();
         assert_eq!(ps.free_list_len(), before + 3);
     }
 

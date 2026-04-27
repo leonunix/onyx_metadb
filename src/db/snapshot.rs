@@ -531,6 +531,14 @@ impl Db {
             }
         };
 
+        // Drain whatever the apply just queued for deferred reclaim. We
+        // still hold drop_gate.write + apply_gate.write here; live readers
+        // (which only take epoch pins) can be active, and any of their
+        // pins held back from the snapshot pages will keep tags alive
+        // across this call. That's correct: those pages stay parked
+        // until the long reader departs.
+        self.reclaim_freed_pages()?;
+
         Ok(Some(DropReport {
             snapshot_id: id,
             freed_leaf_values,
@@ -579,14 +587,27 @@ impl<'a> SnapshotView<'a> {
         self.entry.vol_ord
     }
 
-    /// Point lookup as of the snapshot's LSN. Routes through the
-    /// owning volume's shard layout — commit 6 always stamps
-    /// `vol_ord = 0`, commit 9 switches that to the real source.
+    /// Point lookup as of the snapshot's LSN. Lock-free via
+    /// [`crate::paged::ReadView`] rooted at the snapshot's per-shard
+    /// pid; the overlay is empty because `take_snapshot` always
+    /// flushes first. The epoch pin keeps deferred-reclaim from
+    /// physically freeing pages we're walking; `snapshot_views.read()`
+    /// (held by `_guard`) excludes `drop_snapshot` from removing the
+    /// snapshot entry while a view is alive.
     pub fn get(&self, lba: Lba) -> Result<Option<L2pValue>> {
+        let _pin = self.db.page_store.epoch().pin();
         let volume = self.db.volume(self.entry.vol_ord)?;
         let sid = shard_for_key_l2p(&volume.shards, lba);
-        let tree = volume.shards[sid].tree.read();
-        tree.get_at_read_only(self.entry.l2p_shard_roots[sid], lba)
+        let snap_root = self.entry.l2p_shard_roots[sid];
+        let page_cache = volume.shards[sid].read_view.read().page_cache().clone();
+        let snap_level = crate::paged::ReadView::read_root_level(&page_cache, snap_root)?;
+        let snap_view = crate::paged::ReadView::new(
+            snap_root,
+            snap_level,
+            std::sync::Arc::new(std::collections::HashMap::new()),
+            page_cache,
+        );
+        snap_view.get(lba)
     }
 
     /// Range scan as of the snapshot's LSN.

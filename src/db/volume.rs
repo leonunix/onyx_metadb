@@ -292,6 +292,13 @@ impl Db {
             self.commit_cvar.notify_all();
         }
 
+        // Drain everything apply_drop_volume queued for deferred reclaim.
+        // Snapshot views are excluded above (`snapshot_views.write()`),
+        // and live readers can only have non-this-volume views, so any
+        // page tags here are eligible the moment min_active_pin advances
+        // past them.
+        self.reclaim_freed_pages()?;
+
         Ok(Some(DropVolumeReport {
             vol_ord,
             pages_freed,

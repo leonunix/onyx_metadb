@@ -309,6 +309,7 @@ impl Db {
             };
             outcomes.push((idx, outcome));
         }
+        super::apply::publish_l2p_read_view(&volume.shards[sid], &tree);
         Ok(L2pBucketApplyResult {
             outcomes,
             rc_actions,

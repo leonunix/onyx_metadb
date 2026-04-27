@@ -101,6 +101,9 @@ fn delete_empties_leaf_then_parent() {
     // ancestors up to (but not including) the root.
     assert_eq!(t.delete(b).unwrap(), Some(v(2)));
     t.flush().unwrap();
+    // PagedL2p::flush ran tree.checkpoint_committed which deferred the
+    // physical free; drain reclaim before asserting.
+    ps.try_reclaim().unwrap();
     // At least some pages should have been freed (leaf plus any
     // dedicated index pages on b's path).
     assert!(ps.free_list_len() > free_before);

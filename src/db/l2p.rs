@@ -3,28 +3,38 @@ use super::*;
 impl Db {
     // -------- tree operations --------------------------------------------
 
-    /// Point lookup in volume `vol_ord`'s L2P tree.
+    /// Point lookup in volume `vol_ord`'s L2P tree. Lock-free: pin the
+    /// epoch barrier (one atomic load + one atomic store), clone the
+    /// shard's published `ReadView`, walk it without touching the apply
+    /// path. Flush no longer blocks reads — it physically frees pages
+    /// only via the deferred-reclaim queue, which respects every
+    /// active pin (see [`crate::epoch`]).
     pub fn get(&self, vol_ord: VolumeOrdinal, lba: Lba) -> Result<Option<L2pValue>> {
+        let pin_started = std::time::Instant::now();
+        let _pin = self.page_store.epoch().pin();
+        let pin_wait = pin_started.elapsed();
         let volume = self.volume(vol_ord)?;
         let sid = shard_for_key_l2p(&volume.shards, lba);
-        let lock_started = std::time::Instant::now();
-        let tree = volume.shards[sid].tree.read();
-        let lock_wait = lock_started.elapsed();
+        let view = volume.shards[sid].read_view.read().clone();
         let walk_started = std::time::Instant::now();
-        let result = tree.get_read_only(lba);
+        let result = view.get(lba);
         let tree_walk = walk_started.elapsed();
-        self.metrics.record_l2p_get(lock_wait, tree_walk);
+        self.metrics.record_l2p_get(pin_wait, tree_walk);
         result
     }
 
     /// Batched L2P lookup inside volume `vol_ord`. Groups `lbas` by shard,
-    /// locks each shard once, and reads every lba that falls to it before
-    /// moving on. Output order matches input order; duplicates produce
-    /// repeated results.
+    /// loads each shard's published `ReadView` once, and walks every
+    /// lba that falls to it. Output order matches input order;
+    /// duplicates produce repeated results. Same epoch-pin model as
+    /// [`get`](Self::get) — a single pin guards the whole batch.
     pub fn multi_get(&self, vol_ord: VolumeOrdinal, lbas: &[Lba]) -> Result<Vec<Option<L2pValue>>> {
         if lbas.is_empty() {
             return Ok(Vec::new());
         }
+        let pin_started = std::time::Instant::now();
+        let _pin = self.page_store.epoch().pin();
+        let pin_wait = pin_started.elapsed();
         let volume = self.volume(vol_ord)?;
         let shard_count = volume.shards.len();
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
@@ -32,50 +42,21 @@ impl Db {
             buckets[shard_for_key_l2p(&volume.shards, *lba)].push(idx);
         }
         let mut out: Vec<Option<L2pValue>> = vec![None; lbas.len()];
-        let mut pending: Vec<Option<Vec<usize>>> = buckets
-            .into_iter()
-            .map(|idxs| if idxs.is_empty() { None } else { Some(idxs) })
-            .collect();
-        let mut remaining = pending.iter().filter(|idxs| idxs.is_some()).count();
-
-        while remaining > 0 {
-            let mut progressed = false;
-            for (sid, idxs_slot) in pending.iter_mut().enumerate() {
-                let Some(idxs) = idxs_slot.take() else {
-                    continue;
-                };
-                let lock_started = std::time::Instant::now();
-                let Some(tree) = volume.shards[sid].tree.try_read() else {
-                    *idxs_slot = Some(idxs);
-                    continue;
-                };
-                let lock_wait = lock_started.elapsed();
-                let walk_started = std::time::Instant::now();
-                let res = fill_multi_get_bucket(&tree, idxs, lbas, &mut out);
-                let tree_walk = walk_started.elapsed();
-                self.metrics.record_l2p_get(lock_wait, tree_walk);
-                res?;
-                remaining -= 1;
-                progressed = true;
-            }
-            if progressed {
+        for (sid, idxs) in buckets.into_iter().enumerate() {
+            if idxs.is_empty() {
                 continue;
             }
-
-            let sid = pending
-                .iter()
-                .position(|idxs| idxs.is_some())
-                .expect("remaining > 0 implies a pending shard");
-            let idxs = pending[sid].take().unwrap();
-            let lock_started = std::time::Instant::now();
-            let tree = volume.shards[sid].tree.read();
-            let lock_wait = lock_started.elapsed();
+            let view = volume.shards[sid].read_view.read().clone();
             let walk_started = std::time::Instant::now();
-            let res = fill_multi_get_bucket(&tree, idxs, lbas, &mut out);
+            for idx in idxs {
+                out[idx] = view.get(lbas[idx])?;
+            }
             let tree_walk = walk_started.elapsed();
-            self.metrics.record_l2p_get(lock_wait, tree_walk);
-            res?;
-            remaining -= 1;
+            // `pin_wait` is recorded once per shard so the metric's
+            // existing `lock_wait_us / calls` ratio still represents
+            // per-shard barrier-acquire latency; in the epoch design
+            // this is one atomic load + one atomic store (~5 ns).
+            self.metrics.record_l2p_get(pin_wait, tree_walk);
         }
         Ok(out)
     }
@@ -329,18 +310,3 @@ impl Db {
     }
 }
 
-fn fill_multi_get_bucket(
-    tree: &PagedL2p,
-    idxs: Vec<usize>,
-    lbas: &[Lba],
-    out: &mut [Option<L2pValue>],
-) -> Result<()> {
-    let shard_lbas: Vec<Lba> = idxs.iter().map(|&idx| lbas[idx]).collect();
-    for (idx, value) in idxs
-        .into_iter()
-        .zip(tree.multi_get_read_only(&shard_lbas)?.into_iter())
-    {
-        out[idx] = value;
-    }
-    Ok(())
-}

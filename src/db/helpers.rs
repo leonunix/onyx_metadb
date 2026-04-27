@@ -136,6 +136,23 @@ pub(super) fn open_shards(
     Ok(shards)
 }
 
+/// Wrap a freshly-built `PagedL2p` in an `L2pShard`, seeding the
+/// read-view with an empty overlay. The empty overlay is correct for
+/// any newly-opened tree because `create_with_cache` / `open_with_cache`
+/// leave no dirty pages pending publish.
+pub(super) fn make_l2p_shard(tree: PagedL2p, page_cache: &Arc<PageCache>) -> L2pShard {
+    let view = crate::paged::ReadView::new(
+        tree.root(),
+        tree.root_level(),
+        Arc::new(std::collections::HashMap::new()),
+        page_cache.clone(),
+    );
+    L2pShard {
+        tree: RwLock::new(tree),
+        read_view: RwLock::new(Arc::new(view)),
+    }
+}
+
 pub(super) fn create_l2p_shards(
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
@@ -146,9 +163,7 @@ pub(super) fn create_l2p_shards(
     for _ in 0..shard_count {
         let tree = PagedL2p::create_with_cache(page_store.clone(), page_cache.clone())?;
         roots.push(tree.root());
-        shards.push(L2pShard {
-            tree: RwLock::new(tree),
-        });
+        shards.push(make_l2p_shard(tree, &page_cache));
     }
     Ok((shards, roots.into_boxed_slice()))
 }
@@ -161,14 +176,13 @@ pub(super) fn open_l2p_shards(
 ) -> Result<Vec<L2pShard>> {
     let mut shards = Vec::with_capacity(roots.len());
     for &root in roots {
-        shards.push(L2pShard {
-            tree: RwLock::new(PagedL2p::open_with_cache(
-                page_store.clone(),
-                page_cache.clone(),
-                root,
-                next_gen,
-            )?),
-        });
+        let tree = PagedL2p::open_with_cache(
+            page_store.clone(),
+            page_cache.clone(),
+            root,
+            next_gen,
+        )?;
+        shards.push(make_l2p_shard(tree, &page_cache));
     }
     Ok(shards)
 }

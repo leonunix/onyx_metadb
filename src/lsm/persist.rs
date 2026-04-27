@@ -292,6 +292,7 @@ mod tests {
         let head = write_level(&ps, &handles, 1).unwrap();
         let before = ps.free_list_len();
         free_level(&ps, head, 2).unwrap();
+        ps.try_reclaim().unwrap();
         assert_eq!(ps.free_list_len(), before + 3); // 3 chained pages freed
     }
 

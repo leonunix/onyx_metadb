@@ -27,6 +27,7 @@ pub mod btree;
 pub mod cache;
 pub mod config;
 pub mod db;
+pub mod epoch;
 pub mod error;
 pub mod fuzz;
 pub mod lsm;

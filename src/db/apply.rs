@@ -1,5 +1,12 @@
 use super::*;
 
+/// Must be invoked **before** the caller drops the tree write guard:
+/// the guard's lifetime is what makes "tree.root() at publish time" a
+/// well-defined moment that includes every just-mutated dirty page.
+pub(super) fn publish_l2p_read_view(shard: &L2pShard, tree: &PagedL2p) {
+    *shard.read_view.write() = Arc::new(tree.snapshot_read_view());
+}
+
 /// Apply one [`WalOp`] to raw `Db` state. Used by both the live commit
 /// path (through `self.apply_op`) and the WAL-replay path (before
 /// `Self` exists). Takes individual references so it can run against
@@ -55,6 +62,7 @@ pub(super) fn apply_op_bare(
             let sid = shard_for_key_l2p(&volume.shards, *lba);
             let mut tree = volume.shards[sid].tree.write();
             let prev = tree.insert_at_lsn(*lba, *value, lsn)?;
+            publish_l2p_read_view(&volume.shards[sid], &tree);
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::L2pDelete { vol_ord, lba } => {
@@ -64,6 +72,7 @@ pub(super) fn apply_op_bare(
             let sid = shard_for_key_l2p(&volume.shards, *lba);
             let mut tree = volume.shards[sid].tree.write();
             let prev = tree.delete_at_lsn(*lba, lsn)?;
+            publish_l2p_read_view(&volume.shards[sid], &tree);
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::DedupPut { hash, value } => {
@@ -282,6 +291,10 @@ pub(super) fn apply_l2p_remap(
         any_snap_pins(new_value, birth, &mut tree)?
     };
 
+    // Publish here — snap_pins above needed `&mut tree`; below this
+    // line the function only touches refcount shards.
+    publish_l2p_read_view(&volume.shards[l2p_sid], &tree);
+
     // Decision: rc[head_pba] changes only when the tuple is gained /
     // lost from the union of (live ∪ all snaps). `prev != Some(new)`
     // captures "live's mapping at this lba changes value byte-for-byte".
@@ -408,6 +421,7 @@ pub(super) fn apply_l2p_range_delete(
                 }
             }
         }
+        publish_l2p_read_view(&volume.shards[sid], &tree);
     }
 
     // Second pass: precise snap-pin suppress + decref. Bucket by
@@ -580,9 +594,7 @@ pub(super) fn build_clone_volume_shards(
             )?
         };
         actual_roots.push(tree.root());
-        shards.push(L2pShard {
-            tree: RwLock::new(tree),
-        });
+        shards.push(super::helpers::make_l2p_shard(tree, page_cache));
     }
     Ok((shards, actual_roots.into_boxed_slice()))
 }

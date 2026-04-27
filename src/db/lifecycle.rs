@@ -381,6 +381,13 @@ impl Db {
 
             dedup_index.free_old_level_heads(&old_dedup_heads, dedup_generation)?;
             dedup_reverse.free_old_level_heads(&old_dedup_reverse_heads, dedup_generation)?;
+
+            // Open-path counterpart of `Db::reclaim_freed_pages`: no
+            // readers can be pinned yet, so every deferred entry queued
+            // by the checkpoint above is reclaimable in one pass. Done
+            // before `verify::reclaim_orphan_pages` so the orphan walk
+            // sees the post-replay free list as the live state.
+            page_store.try_reclaim()?;
         }
 
         // Reclaim orphan pages AFTER replay + post-replay commit:
@@ -391,6 +398,15 @@ impl Db {
         // traverse already-freed pages.
         let reclaim_generation = last_applied.max(manifest.checkpoint_lsn).max(1) + 1;
         verify::reclaim_orphan_pages(&page_store, &manifest, reclaim_generation)?;
+
+        // Drain everything verify + post-replay commits queued. No
+        // readers exist yet (Db isn't returned until below), so the
+        // epoch barrier is trivially satisfied; this just turns the
+        // deferred entries into actual on-disk Free pages + free-list
+        // entries before we hand the page store to the live Db. Cache
+        // invalidation is unnecessary because the page cache is fresh
+        // for this open.
+        page_store.try_reclaim()?;
 
         // Warm the pinned index-page set across every volume. Walks
         // each shard's tree once; stops at the first pin refusal so a
@@ -557,7 +573,31 @@ impl Db {
         commit_l2p_checkpoint(&mut l2p_guards, tree_generation)?;
         commit_refcount_checkpoint(&mut refcount_guards, tree_generation)?;
         self.finish_dedup_manifest_update(dedup_update, tree_generation)?;
+        // Drop locks before reclaiming so concurrent readers (which
+        // hold no apply guard in the epoch design) can keep walking.
+        drop(l2p_guards);
+        drop(refcount_guards);
+        drop(manifest_state);
+        drop(_apply_guard);
+        self.reclaim_freed_pages()?;
         crate::wal::prune_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
+        Ok(())
+    }
+
+    /// Drain everything currently safe to physically free (i.e. tagged
+    /// at an epoch below every active reader pin) and invalidate the
+    /// shared page cache for each reclaimed pid.
+    ///
+    /// Cache invalidation matters: during the deferred window a stale
+    /// reader that fell through to disk may have re-populated the cache
+    /// with the page's pre-free bytes. Without this step a subsequent
+    /// allocator that hands the pid back out for a different page would
+    /// hit the stale cached entry instead of fetching the new content.
+    pub(crate) fn reclaim_freed_pages(&self) -> Result<()> {
+        let reclaimed = self.page_store.try_reclaim()?;
+        for pid in reclaimed {
+            self.page_cache.invalidate(pid);
+        }
         Ok(())
     }
 }

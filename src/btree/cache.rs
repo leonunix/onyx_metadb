@@ -321,6 +321,9 @@ mod tests {
         let free_before = ps.free_list_len();
         buf.free(pid, 2).unwrap();
         assert!(!buf.contains(pid));
+        // Defer-free: physical Free-stamp + free-list push only happens
+        // when reclaim runs.
+        ps.try_reclaim().unwrap();
         assert_eq!(ps.free_list_len(), free_before + 1);
     }
 

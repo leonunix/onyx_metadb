@@ -138,6 +138,28 @@ impl PagedL2p {
         self.buf.page_store()
     }
 
+    pub fn page_cache(&self) -> &Arc<crate::cache::PageCache> {
+        self.buf.page_cache()
+    }
+
+    /// Capture a `ReadView` snapshot of the current tree state plus
+    /// every still-dirty page Arc. Apply calls this before dropping
+    /// `shard.tree.write()` so lock-free readers see post-apply state
+    /// — the overlay must include pages COW'd by this apply because
+    /// `PagedL2p::flush` (which is what makes them visible via
+    /// `page_cache`) only runs every 50 ms from onyx's
+    /// `durability-watermark`.
+    pub fn snapshot_read_view(&self) -> super::ReadView {
+        let overlay: std::collections::HashMap<PageId, Arc<crate::page::Page>> =
+            self.buf.iter_dirty().collect();
+        super::ReadView::new(
+            self.root,
+            self.root_level,
+            Arc::new(overlay),
+            self.buf.page_cache().clone(),
+        )
+    }
+
     fn alloc_leaf_private(&mut self, generation: Lsn) -> Result<PageId> {
         let pid = self.buf.alloc_leaf(generation)?;
         self.private_pages.insert(pid);

@@ -33,13 +33,16 @@
 //! list, high-water mark, committed file size).
 
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::config::PAGE_SIZE;
+use crate::epoch::EpochManager;
 use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageHeader, PageType};
 use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
@@ -66,6 +69,26 @@ pub struct PageStore {
     /// Batch size for pre-extending the backing file in `allocate` /
     /// `allocate_run`. Frozen at construction; never mutated.
     grow_chunk: u64,
+    /// Epoch coordinator shared with lock-free L2P readers. Reader
+    /// `pin()` records its starting epoch in a slot; [`free`] /
+    /// [`free_idempotent`] tag deferred work with the pre-bump epoch
+    /// and `try_reclaim` only physically frees pids whose tag is below
+    /// every active pin. See [`crate::epoch`] for the safety proof.
+    epoch: Arc<EpochManager>,
+    /// Pending physical frees, keyed by pid (HashMap dedups so the
+    /// idempotent / replay path cannot push the same pid twice).
+    deferred_free: Mutex<HashMap<PageId, DeferredFree>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeferredFree {
+    epoch: u64,
+    generation: Lsn,
+    /// `true` if the entry came from [`free_idempotent`] — i.e. WAL
+    /// replay path. Reclaim re-checks the on-disk page type before
+    /// pushing onto the free list so a crash mid-reclaim cannot leave
+    /// a duplicate free-list entry on the next replay.
+    idempotent: bool,
 }
 
 fn new_rc_locks() -> Box<[Mutex<()>]> {
@@ -143,6 +166,8 @@ impl PageStore {
             }),
             rc_locks: new_rc_locks(),
             grow_chunk,
+            epoch: Arc::new(EpochManager::new()),
+            deferred_free: Mutex::new(HashMap::new()),
         })
     }
 
@@ -205,12 +230,28 @@ impl PageStore {
             }),
             rc_locks: new_rc_locks(),
             grow_chunk,
+            epoch: Arc::new(EpochManager::new()),
+            deferred_free: Mutex::new(HashMap::new()),
         })
     }
 
     /// Path the store was opened from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Shared epoch coordinator. Lock-free L2P readers `pin()` here
+    /// before walking; deferred-free reclaim respects every active pin.
+    pub fn epoch(&self) -> &Arc<EpochManager> {
+        &self.epoch
+    }
+
+    /// Number of pages currently waiting for an epoch-safe reclaim.
+    /// Useful for tests and the metrics layer; do not gate behaviour on
+    /// this — production callers use [`try_reclaim`] which atomically
+    /// drains.
+    pub fn deferred_free_len(&self) -> usize {
+        self.deferred_free.lock().len()
     }
 
     /// Next page id that will be handed out by `allocate` if the free list
@@ -442,10 +483,14 @@ impl PageStore {
         Ok(())
     }
 
-    /// Mark `page_id` as free. Writes a sealed `Free`-typed page stamped
-    /// with `generation` and pushes onto the free list. `generation`
-    /// should be the current LSN so verifier tooling can tell when the
-    /// page was released.
+    /// Mark `page_id` as free. The physical Free-stamp + hole-punch +
+    /// free-list push is **deferred** until [`try_reclaim`] runs and
+    /// observes that no live reader could still walk the page (see
+    /// [`crate::epoch`] for the safety proof). The on-disk bytes stay
+    /// the page's old (still-valid) content during the deferred window,
+    /// so a stale L2P reader that falls through page-cache to disk
+    /// keeps decoding correctly. `generation` is recorded with the
+    /// deferred entry and stamped onto the Free page at reclaim time.
     ///
     /// Refuses to free reserved pages (manifest slots) or pages outside
     /// the current high-water range.
@@ -456,21 +501,29 @@ impl PageStore {
             )));
         }
         self.check_in_range(page_id)?;
-        let mut page = Page::new(PageHeader::new(PageType::Free, generation));
-        page.set_refcount(0);
-        page.seal();
-        self.file
-            .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
-        self.punch_free_page(page_id)?;
-        let mut inner = self.inner.lock();
-        inner.free_list.push(page_id);
+        // Tag with the pre-bump epoch and bump global so any reader
+        // pinning after this call observes G_pin > tag.
+        let tag = self.epoch.advance();
+        let prev = self.deferred_free.lock().insert(
+            page_id,
+            DeferredFree {
+                epoch: tag,
+                generation,
+                idempotent: false,
+            },
+        );
+        if prev.is_some() {
+            return Err(MetaDbError::Corruption(format!(
+                "page_store: double free of page {page_id} (already pending reclaim)",
+            )));
+        }
         Ok(())
     }
 
-    /// Idempotent version of [`free`]. If `page_id` already decodes as a
-    /// `Free` page, no write happens and the free list is untouched —
-    /// returns `Ok(false)`. Otherwise behaves exactly like `free` and
-    /// returns `Ok(true)`.
+    /// Idempotent version of [`free`]. If `page_id` is already pending
+    /// reclaim, or is already on disk as a `Free` / zero page, no work
+    /// is queued and `Ok(false)` is returned. Otherwise the deferred
+    /// entry is recorded and `Ok(true)` is returned.
     ///
     /// Used by WAL-replay paths (e.g. `DropSnapshot`) that may re-run
     /// against pages a crashed predecessor already freed. Cross-process
@@ -485,6 +538,8 @@ impl PageStore {
             )));
         }
         self.check_in_range(page_id)?;
+        // Disk Free / zero check: a crash + replay path may already have
+        // physically freed this pid in an earlier attempt.
         if let Ok(existing) = read_page_raw(&self.file, page_id) {
             if is_zero_page(&existing) {
                 return Ok(false);
@@ -495,7 +550,72 @@ impl PageStore {
                 }
             }
         }
-        let mut page = Page::new(PageHeader::new(PageType::Free, generation));
+        let tag = self.epoch.advance();
+        let mut deferred = self.deferred_free.lock();
+        if deferred.contains_key(&page_id) {
+            return Ok(false);
+        }
+        deferred.insert(
+            page_id,
+            DeferredFree {
+                epoch: tag,
+                generation,
+                idempotent: true,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Drain every deferred-free entry whose tag is below the smallest
+    /// active reader pin, physically free those pids (Free-stamp +
+    /// hole-punch + free-list push), and return the list of reclaimed
+    /// pids so the caller can invalidate any stale page-cache entries.
+    ///
+    /// Idempotent and lock-free relative to readers: callers that hold
+    /// no apply-side guard may invoke this from a background sweeper.
+    pub fn try_reclaim(&self) -> Result<Vec<PageId>> {
+        let safe_below = self.epoch.min_active_pin();
+        let mut deferred = self.deferred_free.lock();
+        if deferred.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut to_reclaim: Vec<(PageId, DeferredFree)> = Vec::new();
+        deferred.retain(|pid, entry| {
+            if entry.epoch < safe_below {
+                to_reclaim.push((*pid, *entry));
+                false
+            } else {
+                true
+            }
+        });
+        drop(deferred);
+
+        let mut reclaimed = Vec::with_capacity(to_reclaim.len());
+        for (pid, entry) in to_reclaim {
+            if self.actually_free(pid, entry)? {
+                reclaimed.push(pid);
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    /// Disk-side of a deferred free. Returns `true` if the pid was
+    /// actually pushed onto the free list (and therefore needs its
+    /// page-cache entry invalidated by the caller). Returns `false` for
+    /// idempotent entries that find the page already Free on disk.
+    fn actually_free(&self, page_id: PageId, entry: DeferredFree) -> Result<bool> {
+        if entry.idempotent {
+            if let Ok(existing) = read_page_raw(&self.file, page_id) {
+                if !is_zero_page(&existing) {
+                    if let Ok(h) = existing.header() {
+                        if h.page_type == PageType::Free {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+        let mut page = Page::new(PageHeader::new(PageType::Free, entry.generation));
         page.set_refcount(0);
         page.seal();
         self.file
@@ -639,6 +759,7 @@ mod tests {
                 ps.write_page(pid, &mk_page(i + 1, i as u8)).unwrap();
             }
             ps.free(FIRST_DATA_PAGE + 1, 100).unwrap();
+            ps.try_reclaim().unwrap();
             ps.sync_all().unwrap();
         }
         let ps = PageStore::open(&path).unwrap();
@@ -650,7 +771,12 @@ mod tests {
     }
 
     #[test]
-    fn free_list_is_lifo() {
+    fn try_reclaim_recycles_freed_pids() {
+        // Deferred-free means three free calls + one try_reclaim batch
+        // hands every pid back to the free list in some order. We assert
+        // the SET of recycled pids and that no allocation bumped past
+        // the original high-water — order within the batch is unspecified
+        // because reclaim drains a HashMap.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pages.onyx_meta");
         let ps = PageStore::create(&path).unwrap();
@@ -663,10 +789,19 @@ mod tests {
         ps.free(a, 10).unwrap();
         ps.free(b, 11).unwrap();
         ps.free(c, 12).unwrap();
-        // LIFO: the last freed (c) comes back first.
-        assert_eq!(ps.allocate().unwrap(), c);
-        assert_eq!(ps.allocate().unwrap(), b);
-        assert_eq!(ps.allocate().unwrap(), a);
+        // Frees are deferred; the free list is empty until reclaim runs.
+        assert_eq!(ps.free_list_len(), 0);
+        assert_eq!(ps.deferred_free_len(), 3);
+        let reclaimed = ps.try_reclaim().unwrap();
+        assert_eq!(reclaimed.len(), 3);
+        let mut got = vec![
+            ps.allocate().unwrap(),
+            ps.allocate().unwrap(),
+            ps.allocate().unwrap(),
+        ];
+        got.sort();
+        assert_eq!(got, vec![a, b, c]);
+        assert_eq!(ps.high_water(), c + 1);
     }
 
     #[test]
@@ -808,6 +943,7 @@ mod tests {
         let pid = ps.allocate().unwrap();
         ps.write_page(pid, &mk_page(1, 0)).unwrap();
         ps.free(pid, 1).unwrap();
+        ps.try_reclaim().unwrap();
         assert_eq!(ps.free_list_len(), 1);
         // Run allocation bypasses the free list entirely.
         let start = ps.allocate_run(4).unwrap();
@@ -825,6 +961,7 @@ mod tests {
             ps.write_page(start + i, &mk_page(1, 0)).unwrap();
         }
         ps.free_run(start, 3, 99).unwrap();
+        ps.try_reclaim().unwrap();
         assert_eq!(ps.free_list_len(), 3);
     }
 
@@ -937,6 +1074,7 @@ mod tests {
                 ps.write_page(pid, &mk_page(1, 0)).unwrap();
             }
             ps.free(FIRST_DATA_PAGE + 2, 42).unwrap();
+            ps.try_reclaim().unwrap();
             last_valid_pid = FIRST_DATA_PAGE + 1;
             ps.sync_all().unwrap();
         }

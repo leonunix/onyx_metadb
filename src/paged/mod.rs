@@ -9,7 +9,9 @@ pub mod cache;
 pub mod format;
 pub mod invariants;
 pub mod leaf_compact;
+pub mod read_view;
 pub mod tree;
 
 pub use format::{INDEX_FANOUT, L2pValue, LEAF_ENTRY_COUNT, LEAF_VALUE_SIZE, MAX_INDEX_LEVEL};
+pub use read_view::ReadView;
 pub use tree::{DeleteOutcome, DiffEntry, InsertOutcome, PagedL2p, PagedRangeIter};

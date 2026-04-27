@@ -170,7 +170,11 @@ struct Shard {
 }
 
 struct L2pShard {
+    /// Apply serialises on `tree` for COW correctness; readers don't
+    /// touch it. See [`crate::paged::ReadView`] for the lock-free
+    /// path.
     tree: RwLock<PagedL2p>,
+    read_view: RwLock<Arc<crate::paged::ReadView>>,
 }
 
 /// L2P home for one user-facing volume. Owns its own shard group; shard
