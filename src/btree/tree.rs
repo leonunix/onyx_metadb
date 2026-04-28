@@ -9,7 +9,6 @@
 //! Concurrency: `BTree` is `!Sync` in practice — its `PageBuf` is
 //! `&mut self` only. `Db` wraps one per shard in a `Mutex`.
 
-use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -25,6 +24,7 @@ use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::{MetaDbError, Result};
 use crate::page::PageType;
 use crate::page_store::PageStore;
+use crate::paged::read_view::PageIdSet;
 use crate::types::{Lsn, PageId};
 
 /// Minimum leaf fill before a delete triggers a borrow-or-merge.
@@ -38,21 +38,33 @@ pub struct BTree {
     buf: PageBuf,
     root: PageId,
     next_gen: Lsn,
-    private_pages: HashSet<PageId>,
-    retired_pages: HashSet<PageId>,
-    checkpoint_protected: HashSet<PageId>,
+    private_pages: PageIdSet,
+    retired_pages: PageIdSet,
+    checkpoint_protected: PageIdSet,
 }
 
 pub(crate) struct Checkpoint {
     pub(crate) root: PageId,
     dirty: DirtySnapshot,
-    private_pages: HashSet<PageId>,
-    retired_pages: HashSet<PageId>,
+    private_pages: PageIdSet,
+    retired_pages: PageIdSet,
 }
 
 impl Checkpoint {
     pub(crate) fn write_dirty_pages(&self) -> Result<FlushedSnapshot> {
         self.dirty.write()
+    }
+
+    pub(crate) fn private_pages(&self) -> Vec<PageId> {
+        let mut pages: Vec<_> = self.private_pages.iter().copied().collect();
+        pages.sort_unstable();
+        pages
+    }
+
+    pub(crate) fn retired_pages(&self) -> Vec<PageId> {
+        let mut pages: Vec<_> = self.retired_pages.iter().copied().collect();
+        pages.sort_unstable();
+        pages
     }
 }
 
@@ -81,9 +93,9 @@ impl BTree {
             buf,
             root,
             next_gen: 2,
-            private_pages: HashSet::new(),
-            retired_pages: HashSet::new(),
-            checkpoint_protected: HashSet::new(),
+            private_pages: PageIdSet::default(),
+            retired_pages: PageIdSet::default(),
+            checkpoint_protected: PageIdSet::default(),
         })
     }
 
@@ -105,9 +117,9 @@ impl BTree {
             buf,
             root,
             next_gen,
-            private_pages: HashSet::new(),
-            retired_pages: HashSet::new(),
-            checkpoint_protected: HashSet::new(),
+            private_pages: PageIdSet::default(),
+            retired_pages: PageIdSet::default(),
+            checkpoint_protected: PageIdSet::default(),
         })
     }
 
@@ -159,7 +171,7 @@ impl BTree {
     }
 
     fn ensure_private(&mut self, pid: PageId, generation: Lsn) -> Result<PageId> {
-        if self.private_pages.contains(&pid) && !self.checkpoint_protected.contains(&pid) {
+        if self.private_pages.contains(&pid) {
             return Ok(pid);
         }
         let new_pid = self.buf.clone_private(pid, generation)?;
@@ -221,7 +233,8 @@ impl BTree {
     pub(crate) fn begin_checkpoint(&mut self) -> Checkpoint {
         let private_pages = self.private_pages.clone();
         let retired_pages = self.retired_pages.clone();
-        self.checkpoint_protected.extend(private_pages.iter().copied());
+        self.checkpoint_protected
+            .extend(private_pages.iter().copied());
         Checkpoint {
             root: self.root,
             dirty: self.buf.dirty_snapshot(),
@@ -230,25 +243,32 @@ impl BTree {
         }
     }
 
-    pub(crate) fn checkpoint_snapshot_committed(
+    pub(crate) fn install_flushed_checkpoint_page(
         &mut self,
-        checkpoint: Checkpoint,
-        flushed: FlushedSnapshot,
-        _generation: Lsn,
-    ) -> Result<Vec<PageId>> {
-        self.buf.install_flushed_snapshot(flushed);
-        let mut retired_to_free = Vec::new();
-        for pid in &checkpoint.retired_pages {
-            if self.retired_pages.remove(pid) {
-                self.buf.detach_for_free(*pid);
-                retired_to_free.push(*pid);
-            }
+        flushed: &FlushedSnapshot,
+        page_idx: usize,
+    ) -> Option<(PageId, bool)> {
+        self.buf.install_flushed_snapshot_page(flushed, page_idx)
+    }
+
+    pub(crate) fn checkpoint_retired_page_committed(&mut self, pid: PageId) -> Option<PageId> {
+        if self.retired_pages.remove(&pid) {
+            self.buf.detach_for_free(pid);
+            Some(pid)
+        } else {
+            None
         }
-        for pid in &checkpoint.private_pages {
-            self.private_pages.remove(pid);
-            self.checkpoint_protected.remove(pid);
+    }
+
+    pub(crate) fn checkpoint_private_page_committed(&mut self, pid: PageId, flushed_clean: bool) {
+        if flushed_clean {
+            self.private_pages.remove(&pid);
         }
-        self.finish_op(Ok(retired_to_free))
+        self.checkpoint_protected.remove(&pid);
+    }
+
+    pub(crate) fn finish_checkpoint_commit(&mut self) -> Result<()> {
+        self.finish_op(Ok(()))
     }
 
     pub(crate) fn abort_checkpoint(&mut self, checkpoint: &Checkpoint) {

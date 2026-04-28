@@ -14,7 +14,6 @@
 //! parent's slot is nulled out. Root is never freed — its level stays
 //! pinned for the lifetime of the tree.
 
-use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -27,6 +26,7 @@ use crate::paged::format::{
     index_child_at, index_child_count, index_set_child, leaf_bit_set, leaf_clear, leaf_entry_count,
     leaf_set, leaf_value_at, max_leaf_idx_at_level, page_level, slot_in_index,
 };
+use crate::paged::read_view::PageIdSet;
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
 mod helpers;
@@ -43,16 +43,16 @@ pub struct PagedL2p {
     root: PageId,
     root_level: u8,
     next_gen: Lsn,
-    private_pages: HashSet<PageId>,
-    retired_pages: HashSet<PageId>,
-    checkpoint_protected: HashSet<PageId>,
+    private_pages: PageIdSet,
+    retired_pages: PageIdSet,
+    checkpoint_protected: PageIdSet,
 }
 
 pub(crate) struct Checkpoint {
     pub(crate) root: PageId,
     dirty: DirtySnapshot,
-    private_pages: HashSet<PageId>,
-    retired_pages: HashSet<PageId>,
+    private_pages: PageIdSet,
+    retired_pages: PageIdSet,
 }
 
 impl Checkpoint {
@@ -60,12 +60,33 @@ impl Checkpoint {
         let flushed = self.dirty.write()?;
         Ok(flushed)
     }
+
+    pub(crate) fn private_pages(&self) -> Vec<PageId> {
+        let mut pages: Vec<_> = self.private_pages.iter().copied().collect();
+        pages.sort_unstable();
+        pages
+    }
+
+    pub(crate) fn retired_pages(&self) -> Vec<PageId> {
+        let mut pages: Vec<_> = self.retired_pages.iter().copied().collect();
+        pages.sort_unstable();
+        pages
+    }
 }
 
 impl PagedL2p {
     fn finish_op<T>(&mut self, result: Result<T>) -> Result<T> {
+        self.buf.flush_read_overlay_updates();
         self.buf.evict_clean_pages();
         result
+    }
+
+    pub(crate) fn finish_batch_apply(&mut self) -> Result<()> {
+        self.finish_op(Ok(()))
+    }
+
+    pub(crate) fn set_exclusive_read_overlay_mutation(&mut self, enabled: bool) {
+        self.buf.set_exclusive_read_overlay_mutation(enabled);
     }
 
     /// Fresh empty tree. Allocates one leaf as the root, level 0.
@@ -86,9 +107,9 @@ impl PagedL2p {
             root,
             root_level: 0,
             next_gen: 2,
-            private_pages: HashSet::new(),
-            retired_pages: HashSet::new(),
-            checkpoint_protected: HashSet::new(),
+            private_pages: PageIdSet::default(),
+            retired_pages: PageIdSet::default(),
+            checkpoint_protected: PageIdSet::default(),
         })
     }
 
@@ -117,9 +138,9 @@ impl PagedL2p {
             root,
             root_level,
             next_gen,
-            private_pages: HashSet::new(),
-            retired_pages: HashSet::new(),
-            checkpoint_protected: HashSet::new(),
+            private_pages: PageIdSet::default(),
+            retired_pages: PageIdSet::default(),
+            checkpoint_protected: PageIdSet::default(),
         })
     }
 
@@ -180,12 +201,10 @@ impl PagedL2p {
     /// `page_cache`) only runs every 50 ms from onyx's
     /// `durability-watermark`.
     pub fn snapshot_read_view(&self) -> super::ReadView {
-        let overlay: std::collections::HashMap<PageId, Arc<crate::page::Page>> =
-            self.buf.iter_dirty().collect();
         super::ReadView::new(
             self.root,
             self.root_level,
-            Arc::new(overlay),
+            self.buf.read_overlay(),
             self.buf.page_cache().clone(),
         )
     }
@@ -204,8 +223,7 @@ impl PagedL2p {
 
     fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
         let effective_rc = self.buf.effective_rc(pid)?;
-        let checkpoint_protected = self.checkpoint_protected.contains(&pid);
-        if self.private_pages.contains(&pid) && effective_rc <= 1 && !checkpoint_protected {
+        if self.private_pages.contains(&pid) && effective_rc <= 1 {
             return Ok(pid);
         }
         if effective_rc <= 1 {
@@ -254,7 +272,8 @@ impl PagedL2p {
     pub(crate) fn begin_checkpoint(&mut self) -> Checkpoint {
         let private_pages = self.private_pages.clone();
         let retired_pages = self.retired_pages.clone();
-        self.checkpoint_protected.extend(private_pages.iter().copied());
+        self.checkpoint_protected
+            .extend(private_pages.iter().copied());
         Checkpoint {
             root: self.root,
             dirty: self.buf.dirty_snapshot(),
@@ -263,29 +282,32 @@ impl PagedL2p {
         }
     }
 
-    pub(crate) fn install_flushed_checkpoint(&mut self, flushed: FlushedSnapshot) {
-        self.buf.install_flushed_snapshot(flushed);
+    pub(crate) fn install_flushed_checkpoint_page(
+        &mut self,
+        flushed: &FlushedSnapshot,
+        page_idx: usize,
+    ) -> Option<(PageId, bool)> {
+        self.buf.install_flushed_snapshot_page(flushed, page_idx)
     }
 
-    pub(crate) fn checkpoint_snapshot_committed(
-        &mut self,
-        checkpoint: Checkpoint,
-        flushed: FlushedSnapshot,
-        _generation: Lsn,
-    ) -> Result<Vec<PageId>> {
-        self.install_flushed_checkpoint(flushed);
-        let mut retired_to_free = Vec::new();
-        for pid in &checkpoint.retired_pages {
-            if self.retired_pages.remove(pid) {
-                self.buf.detach_for_free(*pid);
-                retired_to_free.push(*pid);
-            }
+    pub(crate) fn checkpoint_retired_page_committed(&mut self, pid: PageId) -> Option<PageId> {
+        if self.retired_pages.remove(&pid) {
+            self.buf.detach_for_free(pid);
+            Some(pid)
+        } else {
+            None
         }
-        for pid in &checkpoint.private_pages {
-            self.private_pages.remove(pid);
-            self.checkpoint_protected.remove(pid);
+    }
+
+    pub(crate) fn checkpoint_private_page_committed(&mut self, pid: PageId, flushed_clean: bool) {
+        if flushed_clean {
+            self.private_pages.remove(&pid);
         }
-        self.finish_op(Ok(retired_to_free))
+        self.checkpoint_protected.remove(&pid);
+    }
+
+    pub(crate) fn finish_checkpoint_commit(&mut self) -> Result<()> {
+        self.finish_op(Ok(()))
     }
 
     pub(crate) fn abort_checkpoint(&mut self, checkpoint: &Checkpoint) {
@@ -478,6 +500,19 @@ impl PagedL2p {
         self.insert_with_lsn(lba, value, lsn)
     }
 
+    pub(crate) fn insert_at_lsn_deferred_finish(
+        &mut self,
+        lba: u64,
+        value: L2pValue,
+        lsn: Lsn,
+    ) -> Result<Option<L2pValue>> {
+        self.advance_next_gen(lsn);
+        let result = self
+            .insert_with_lsn_inner(lba, value, lsn, false)
+            .map(|outcome| outcome.prev);
+        self.finalize_rc_deltas_deferred_finish(lsn, result)
+    }
+
     /// Variant of [`insert_at_lsn`](Self::insert_at_lsn) that also
     /// reports whether the leaf holding `lba` was shared with another
     /// tree (snapshot / clone) at the moment this op descended to it.
@@ -502,7 +537,7 @@ impl PagedL2p {
 
     fn insert_with_lsn(&mut self, lba: u64, value: L2pValue, lsn: Lsn) -> Result<Option<L2pValue>> {
         let result = self
-            .insert_with_lsn_inner(lba, value, lsn)
+            .insert_with_lsn_inner(lba, value, lsn, false)
             .map(|outcome| outcome.prev);
         self.finalize_rc_deltas(lsn, result)
     }
@@ -513,7 +548,7 @@ impl PagedL2p {
         value: L2pValue,
         lsn: Lsn,
     ) -> Result<InsertOutcome> {
-        self.insert_with_lsn_inner(lba, value, lsn)
+        self.insert_with_lsn_inner(lba, value, lsn, true)
     }
 
     fn insert_with_lsn_inner(
@@ -521,6 +556,7 @@ impl PagedL2p {
         lba: u64,
         value: L2pValue,
         lsn: Lsn,
+        capture_share_info: bool,
     ) -> Result<InsertOutcome> {
         let leaf_idx = lba >> LEAF_SHIFT;
         let bit = (lba & LEAF_MASK) as usize;
@@ -531,7 +567,8 @@ impl PagedL2p {
         // level==1 in this case, and by the time `grow_root` runs the
         // leaf's refcount has already been bumped by the newly-
         // allocated parent index.
-        let mut leaf_was_shared = self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
+        let mut leaf_was_shared =
+            capture_share_info && self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
 
         // Grow root up to whatever level covers `leaf_idx`.
         while leaf_idx > max_leaf_idx_at_level(self.root_level) {
@@ -558,7 +595,7 @@ impl PagedL2p {
                     self.alloc_index_private(lsn, level - 1)?
                 }
             } else {
-                if level == 1 {
+                if capture_share_info && level == 1 {
                     // Capture the pre-COW effective rc so the caller
                     // can distinguish "snapshot still references old
                     // leaf via this page" from "op can safely mutate
@@ -604,6 +641,21 @@ impl PagedL2p {
         }
         self.advance_next_gen(lsn);
         self.delete_with_lsn(lba, lsn, false)
+    }
+
+    pub(crate) fn delete_at_lsn_deferred_finish(
+        &mut self,
+        lba: u64,
+        lsn: Lsn,
+    ) -> Result<Option<L2pValue>> {
+        if self.get(lba)?.is_none() {
+            return Ok(None);
+        }
+        self.advance_next_gen(lsn);
+        let result = self
+            .delete_with_lsn_inner_with_share(lba, lsn, false)
+            .map(|outcome| outcome.prev);
+        self.finalize_rc_deltas_deferred_finish(lsn, result)
     }
 
     /// Variant of [`delete_at_lsn`](Self::delete_at_lsn) that also
@@ -724,14 +776,19 @@ impl PagedL2p {
     /// `result`; any queued deltas for a failing op are discarded so a
     /// retry won't double-apply.
     fn finalize_rc_deltas<T>(&mut self, lsn: Lsn, result: Result<T>) -> Result<T> {
+        let result = self.finalize_rc_deltas_deferred_finish(lsn, result);
+        self.finish_op(result)
+    }
+
+    fn finalize_rc_deltas_deferred_finish<T>(&mut self, lsn: Lsn, result: Result<T>) -> Result<T> {
         match result {
             Ok(v) => {
                 let commit = self.buf.commit_rc_deltas(lsn);
-                self.finish_op(commit.map(|()| v))
+                commit.map(|()| v)
             }
             Err(e) => {
                 self.buf.clear_rc_deltas();
-                self.finish_op(Err(e))
+                Err(e)
             }
         }
     }

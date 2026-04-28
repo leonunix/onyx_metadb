@@ -146,7 +146,7 @@ pub(super) fn make_l2p_shard(tree: PagedL2p, page_cache: &Arc<PageCache>) -> L2p
     let view = crate::paged::ReadView::new(
         tree.root(),
         tree.root_level(),
-        Arc::new(std::collections::HashMap::new()),
+        crate::paged::ReadOverlay::default(),
         page_cache.clone(),
     );
     L2pShard {

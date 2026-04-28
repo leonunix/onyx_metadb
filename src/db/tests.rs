@@ -29,6 +29,46 @@ pub(super) fn mk_db_with_cache_bytes(page_cache_bytes: u64) -> (TempDir, Db) {
     (dir, db)
 }
 
+#[test]
+fn apply_lane_maintenance_bypasses_queued_wal_work() {
+    let lane = ApplyLane::new(0);
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+    let order_for_lsn1 = order.clone();
+    lane.enqueue_ready(
+        1,
+        Box::new(move || {
+            order_for_lsn1.lock().unwrap().push(1);
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }),
+    );
+    started_rx.recv().unwrap();
+
+    let order_for_lsn2 = order.clone();
+    lane.enqueue_ready(
+        2,
+        Box::new(move || {
+            order_for_lsn2.lock().unwrap().push(2);
+            done_tx.send(()).unwrap();
+        }),
+    );
+    let order_for_maintenance = order.clone();
+    lane.enqueue_maintenance(Box::new(move || {
+        order_for_maintenance.lock().unwrap().push(99);
+    }));
+
+    release_tx.send(()).unwrap();
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(*order.lock().unwrap(), vec![1, 99, 2]);
+    assert_eq!(lane.last_applied_lsn(), 2);
+}
+
 mod batch;
 mod cleanup;
 

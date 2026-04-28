@@ -52,8 +52,11 @@ use crate::page::{Page, PageHeader, PageType};
 use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 
 const RC_LOCK_SHARDS: usize = 64;
+const MAX_RECLAIM_RUN_PAGES: usize = 256;
 #[cfg(target_os = "linux")]
 const DEFAULT_READ_URING_ENTRIES: u32 = 128;
+#[cfg(target_os = "linux")]
+const DEFAULT_WRITE_URING_ENTRIES: u32 = 128;
 
 /// Default pre-extension chunk if the caller uses [`PageStore::create`]
 /// / [`PageStore::open`] without threading a `Config`. Must stay in
@@ -66,6 +69,8 @@ pub struct PageStore {
     file: File,
     #[cfg(target_os = "linux")]
     read_uring: Mutex<Option<IoUring>>,
+    #[cfg(target_os = "linux")]
+    write_uring: Mutex<Option<IoUring>>,
     inner: Mutex<Inner>,
     /// Per-pid sharded mutexes serialising [`atomic_rc_delta`]. Needed
     /// because a page can be shared across multiple [`PagedL2p`]
@@ -169,6 +174,8 @@ impl PageStore {
             file,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
+            #[cfg(target_os = "linux")]
+            write_uring: Mutex::new(new_write_uring()),
             inner: Mutex::new(Inner {
                 high_water: FIRST_DATA_PAGE,
                 committed_file_pages: FIRST_DATA_PAGE,
@@ -235,6 +242,8 @@ impl PageStore {
             file,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
+            #[cfg(target_os = "linux")]
+            write_uring: Mutex::new(new_write_uring()),
             inner: Mutex::new(Inner {
                 high_water,
                 committed_file_pages: high_water,
@@ -318,6 +327,60 @@ impl PageStore {
         self.file
             .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
         Ok(())
+    }
+
+    /// Write a contiguous run of already-sealed page bytes starting at
+    /// `start_page`. `bytes.len()` must be a non-zero multiple of
+    /// [`PAGE_SIZE`].
+    pub fn write_page_run_bytes(&self, start_page: PageId, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() || bytes.len() % PAGE_SIZE != 0 {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "page run write requires a non-empty multiple of {PAGE_SIZE} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let pages = (bytes.len() / PAGE_SIZE) as u64;
+        let last = start_page
+            .checked_add(pages - 1)
+            .ok_or(MetaDbError::OutOfSpace)?;
+        self.check_in_range(last)?;
+        self.file
+            .write_all_at(bytes, start_page * PAGE_SIZE as u64)?;
+        Ok(())
+    }
+
+    /// Write multiple already-sealed page runs, keeping the final
+    /// durability boundary at the caller's later [`sync`](Self::sync).
+    pub fn write_page_runs_parallel(&self, runs: Vec<(PageId, Vec<u8>)>) -> Result<()> {
+        write_page_runs_raw(&self.file, runs, self.write_uring())
+    }
+
+    pub fn write_sealed_page_runs(&self, mut pages: Vec<(PageId, Arc<Page>)>) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        pages.sort_unstable_by_key(|(pid, _)| *pid);
+        let mut runs = Vec::new();
+        let mut run_start: Option<PageId> = None;
+        let mut run_next = 0;
+        let mut run_bytes = Vec::with_capacity(MAX_RECLAIM_RUN_PAGES * PAGE_SIZE);
+        for (pid, page) in pages {
+            let run_pages = run_bytes.len() / PAGE_SIZE;
+            if run_start.is_some() && (pid != run_next || run_pages >= MAX_RECLAIM_RUN_PAGES) {
+                runs.push((run_start.unwrap(), std::mem::take(&mut run_bytes)));
+                run_bytes.reserve(MAX_RECLAIM_RUN_PAGES * PAGE_SIZE);
+                run_start = None;
+            }
+            if run_start.is_none() {
+                run_start = Some(pid);
+            }
+            run_bytes.extend_from_slice(page.bytes());
+            run_next = pid + 1;
+        }
+        if let Some(start) = run_start {
+            runs.push((start, run_bytes));
+        }
+        self.write_page_runs_parallel(runs)
     }
 
     /// Atomically mutate the refcount of `page_id` by `delta` (positive
@@ -639,6 +702,16 @@ impl PageStore {
     /// Idempotent and lock-free relative to readers: callers that hold
     /// no apply-side guard may invoke this from a background sweeper.
     pub fn try_reclaim(&self) -> Result<Vec<PageId>> {
+        self.try_reclaim_limit(usize::MAX)
+    }
+
+    /// Budgeted variant of [`try_reclaim`]. Reclaims at most `max_pages`
+    /// safe entries so latency-sensitive callers can make progress
+    /// without turning one checkpoint into an unbounded free storm.
+    pub fn try_reclaim_limit(&self, max_pages: usize) -> Result<Vec<PageId>> {
+        if max_pages == 0 {
+            return Ok(Vec::new());
+        }
         let safe_below = self.epoch.min_active_pin();
         let mut deferred = self.deferred_free.lock();
         if deferred.is_empty() {
@@ -646,7 +719,7 @@ impl PageStore {
         }
         let mut to_reclaim: Vec<(PageId, DeferredFree)> = Vec::new();
         deferred.retain(|pid, entry| {
-            if entry.epoch < safe_below {
+            if entry.epoch < safe_below && to_reclaim.len() < max_pages {
                 to_reclaim.push((*pid, *entry));
                 false
             } else {
@@ -655,46 +728,65 @@ impl PageStore {
         });
         drop(deferred);
 
-        let mut reclaimed = Vec::with_capacity(to_reclaim.len());
+        to_reclaim.sort_unstable_by_key(|(pid, _)| *pid);
+        let mut reclaimable = Vec::with_capacity(to_reclaim.len());
         for (pid, entry) in to_reclaim {
-            if self.actually_free(pid, entry)? {
-                reclaimed.push(pid);
+            if entry.idempotent && self.is_already_free_on_disk(pid)? {
+                continue;
             }
+            reclaimable.push((pid, entry));
         }
+        let reclaimed = self.reclaim_sorted_runs(&reclaimable)?;
         Ok(reclaimed)
     }
 
-    /// Disk-side of a deferred free. Returns `true` if the pid was
-    /// actually pushed onto the free list (and therefore needs its
-    /// page-cache entry invalidated by the caller). Returns `false` for
-    /// idempotent entries that find the page already Free on disk.
-    fn actually_free(&self, page_id: PageId, entry: DeferredFree) -> Result<bool> {
-        if entry.idempotent {
-            if let Ok(existing) = read_page_raw(&self.file, page_id) {
-                if !is_zero_page(&existing) {
-                    if let Ok(h) = existing.header() {
-                        if h.page_type == PageType::Free {
-                            return Ok(false);
-                        }
-                    }
-                }
+    fn is_already_free_on_disk(&self, page_id: PageId) -> Result<bool> {
+        let existing = read_page_raw(&self.file, page_id)?;
+        if is_zero_page(&existing) {
+            return Ok(true);
+        }
+        if let Ok(h) = existing.header() {
+            if h.page_type == PageType::Free {
+                return Ok(true);
             }
         }
-        let mut page = Page::new(PageHeader::new(PageType::Free, entry.generation));
-        page.set_refcount(0);
-        page.seal();
-        self.file
-            .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
-        self.punch_free_page(page_id)?;
+        Ok(false)
+    }
+
+    fn reclaim_sorted_runs(&self, pages: &[(PageId, DeferredFree)]) -> Result<Vec<PageId>> {
+        let mut reclaimed = Vec::with_capacity(pages.len());
+        let mut idx = 0;
+        while idx < pages.len() {
+            let start = pages[idx].0;
+            let mut end = idx + 1;
+            while end < pages.len()
+                && pages[end].0 == pages[end - 1].0 + 1
+                && end - idx < MAX_RECLAIM_RUN_PAGES
+            {
+                end += 1;
+            }
+
+            let mut bytes = Vec::with_capacity((end - idx) * PAGE_SIZE);
+            for (_, entry) in &pages[idx..end] {
+                let mut page = Page::new(PageHeader::new(PageType::Free, entry.generation));
+                page.set_refcount(0);
+                page.seal();
+                bytes.extend_from_slice(page.bytes());
+            }
+            self.write_page_run_bytes(start, &bytes)?;
+            self.punch_free_run(start, end - idx)?;
+            reclaimed.extend(pages[idx..end].iter().map(|(pid, _)| *pid));
+            idx = end;
+        }
+
         let mut inner = self.inner.lock();
-        inner.free_list.push(page_id);
-        Ok(true)
+        inner.free_list.extend(reclaimed.iter().copied());
+        Ok(reclaimed)
     }
 
     /// `fdatasync` the page file (content only).
     pub fn sync(&self) -> Result<()> {
-        self.file.sync_data()?;
-        Ok(())
+        sync_data_raw(&self.file, self.write_uring())
     }
 
     /// `fsync` the page file (content + metadata).
@@ -711,8 +803,12 @@ impl PageStore {
         Ok(())
     }
 
-    fn punch_free_page(&self, page_id: PageId) -> Result<()> {
-        punch_hole(&self.file, page_id * PAGE_SIZE as u64, PAGE_SIZE as u64)
+    fn punch_free_run(&self, start_page: PageId, page_count: usize) -> Result<()> {
+        punch_hole(
+            &self.file,
+            start_page * PAGE_SIZE as u64,
+            (page_count * PAGE_SIZE) as u64,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -720,8 +816,18 @@ impl PageStore {
         Some(&self.read_uring)
     }
 
+    #[cfg(target_os = "linux")]
+    fn write_uring(&self) -> Option<&Mutex<Option<IoUring>>> {
+        Some(&self.write_uring)
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn read_uring(&self) -> Option<&()> {
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn write_uring(&self) -> Option<&()> {
         None
     }
 }
@@ -738,6 +844,17 @@ fn new_read_uring() -> Option<IoUring> {
         Ok(ring) => Some(ring),
         Err(err) => {
             tracing::debug!(error = %err, "page_store io_uring unavailable; falling back to pread");
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn new_write_uring() -> Option<IoUring> {
+    match IoUring::new(DEFAULT_WRITE_URING_ENTRIES) {
+        Ok(ring) => Some(ring),
+        Err(err) => {
+            tracing::debug!(error = %err, "page_store write io_uring unavailable; falling back to pwrite");
             None
         }
     }
@@ -781,6 +898,218 @@ fn read_pages_raw_pread(file: &File, page_ids: &[PageId]) -> Result<Vec<Page>> {
         pages.push(read_page_raw(file, page_id)?);
     }
     Ok(pages)
+}
+
+#[cfg(target_os = "linux")]
+fn write_page_runs_raw(
+    file: &File,
+    runs: Vec<(PageId, Vec<u8>)>,
+    write_uring: Option<&Mutex<Option<IoUring>>>,
+) -> Result<()> {
+    if runs.is_empty() {
+        return Ok(());
+    }
+    let Some(write_uring) = write_uring else {
+        return write_page_runs_raw_pwrite(file, runs);
+    };
+    let mut guard = write_uring.lock();
+    let Some(ring) = guard.as_mut() else {
+        return write_page_runs_raw_pwrite(file, runs);
+    };
+    match write_page_runs_raw_uring(file, &runs, ring) {
+        Ok(()) => Ok(()),
+        Err(err) if is_uring_setup_error(&err) => {
+            tracing::debug!(error = %err, "page_store io_uring write failed; falling back to pwrite");
+            *guard = None;
+            write_page_runs_raw_pwrite(file, runs)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_page_runs_raw(
+    file: &File,
+    runs: Vec<(PageId, Vec<u8>)>,
+    _write_uring: Option<&()>,
+) -> Result<()> {
+    write_page_runs_raw_pwrite(file, runs)
+}
+
+fn write_page_runs_raw_pwrite(file: &File, runs: Vec<(PageId, Vec<u8>)>) -> Result<()> {
+    for (start_page, bytes) in runs {
+        file.write_all_at(&bytes, start_page * PAGE_SIZE as u64)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sync_data_raw(file: &File, write_uring: Option<&Mutex<Option<IoUring>>>) -> Result<()> {
+    let Some(write_uring) = write_uring else {
+        file.sync_data()?;
+        return Ok(());
+    };
+    let mut guard = write_uring.lock();
+    let Some(ring) = guard.as_mut() else {
+        file.sync_data()?;
+        return Ok(());
+    };
+    match sync_data_raw_uring(file, ring) {
+        Ok(()) => Ok(()),
+        Err(err) if is_uring_setup_error(&err) => {
+            tracing::debug!(error = %err, "page_store io_uring fsync failed; falling back to fdatasync");
+            *guard = None;
+            file.sync_data()?;
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_data_raw(file: &File, _write_uring: Option<&()>) -> Result<()> {
+    file.sync_data()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sync_data_raw_uring(file: &File, ring: &mut IoUring) -> Result<()> {
+    let fd = file.as_raw_fd();
+    let entry = opcode::Fsync::new(types::Fd(fd))
+        .flags(types::FsyncFlags::DATASYNC)
+        .build()
+        .user_data(0);
+    {
+        let mut sq = ring.submission();
+        // SAFETY: the SQE carries only the file descriptor and no borrowed
+        // userspace buffer. The descriptor stays open for the whole call.
+        unsafe {
+            sq.push(&entry).map_err(|_| {
+                MetaDbError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    "page_store fsync io_uring submission queue full",
+                ))
+            })?;
+        }
+    }
+    ring.submit_and_wait(1).map_err(MetaDbError::Io)?;
+    let mut cq = ring.completion();
+    cq.sync();
+    let Some(cqe) = cq.next() else {
+        return Err(MetaDbError::Io(io::Error::new(
+            io::ErrorKind::Other,
+            "page_store fsync io_uring missing CQE",
+        )));
+    };
+    let result = cqe.result();
+    if result < 0 {
+        return Err(MetaDbError::Io(io::Error::from_raw_os_error(-result)));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_page_runs_raw_uring(
+    file: &File,
+    runs: &[(PageId, Vec<u8>)],
+    ring: &mut IoUring,
+) -> Result<()> {
+    let fd = file.as_raw_fd();
+    for (base, chunk) in runs
+        .chunks(DEFAULT_WRITE_URING_ENTRIES as usize)
+        .enumerate()
+    {
+        for (idx, (start_page, bytes)) in chunk.iter().enumerate() {
+            if bytes.is_empty() || bytes.len() % PAGE_SIZE != 0 {
+                return Err(MetaDbError::InvalidArgument(format!(
+                    "page run write requires a non-empty multiple of {PAGE_SIZE} bytes, got {}",
+                    bytes.len()
+                )));
+            }
+            let len = u32::try_from(bytes.len()).map_err(|_| {
+                MetaDbError::InvalidArgument(format!(
+                    "page run write too large for io_uring: {} bytes",
+                    bytes.len()
+                ))
+            })?;
+            let entry = opcode::Write::new(types::Fd(fd), bytes.as_ptr(), len)
+                .offset(start_page * PAGE_SIZE as u64)
+                .build()
+                .user_data(idx as u64);
+            let mut sq = ring.submission();
+            // SAFETY: SQEs borrow byte buffers owned by `runs`; `runs` is
+            // kept alive and not mutated until all CQEs for this chunk have
+            // been harvested below.
+            unsafe {
+                sq.push(&entry).map_err(|_| {
+                    MetaDbError::Io(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "page_store write io_uring submission queue full at chunk {base} op {idx}/{}",
+                            chunk.len()
+                        ),
+                    ))
+                })?;
+            }
+        }
+
+        ring.submit_and_wait(chunk.len()).map_err(MetaDbError::Io)?;
+
+        let mut results = vec![None; chunk.len()];
+        let mut harvested = 0usize;
+        let mut cq = ring.completion();
+        cq.sync();
+        for cqe in &mut cq {
+            let idx = cqe.user_data() as usize;
+            if idx >= results.len() {
+                return Err(MetaDbError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "page_store write io_uring CQE user_data {idx} out of range (batch size {})",
+                        chunk.len()
+                    ),
+                )));
+            }
+            results[idx] = Some(cqe.result());
+            harvested += 1;
+            if harvested == chunk.len() {
+                break;
+            }
+        }
+        if harvested != chunk.len() {
+            return Err(MetaDbError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "page_store write io_uring harvested {harvested} CQEs, expected {}",
+                    chunk.len()
+                ),
+            )));
+        }
+        drop(cq);
+
+        for (idx, result) in results.into_iter().enumerate() {
+            let result = result.ok_or_else(|| {
+                MetaDbError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("page_store write io_uring missing CQE for op {idx}"),
+                ))
+            })?;
+            if result < 0 {
+                return Err(MetaDbError::Io(io::Error::from_raw_os_error(-result)));
+            }
+            if result as usize != chunk[idx].1.len() {
+                return Err(MetaDbError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "page_store write io_uring short write at page {}: got {result} of {}",
+                        chunk[idx].0,
+                        chunk[idx].1.len()
+                    ),
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

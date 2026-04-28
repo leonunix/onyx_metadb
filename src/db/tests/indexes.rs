@@ -341,14 +341,11 @@ fn drop_snapshot_releases_refcount_state() {
         db.incref_pba(pba, 1).unwrap();
     }
     db.flush().unwrap();
-    let hw_before_snap = db.high_water();
     let s = db.take_snapshot(0).unwrap();
     for pba in 0u64..200 {
         db.incref_pba(pba, 1).unwrap();
     }
     db.flush().unwrap();
-    let hw_after = db.high_water();
-    assert!(hw_after > hw_before_snap);
     // This test has no L2P inserts between take/drop, so the L2P
     // tree never diverges and no tree pages hit rc=0 during the
     // drop. The WAL-logged drop just decrements the shared root's

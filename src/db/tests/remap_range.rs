@@ -280,6 +280,23 @@ fn seed_remaps(db: &Db, start: Lba, count: usize, pba: Pba, tag: u8) {
     }
 }
 
+fn seed_distinct_remaps_batched(db: &Db, total: usize) {
+    const OPS_PER_COMMIT: usize = 4096;
+    for chunk_start in (0..total).step_by(OPS_PER_COMMIT) {
+        let chunk_end = (chunk_start + OPS_PER_COMMIT).min(total);
+        let mut tx = db.begin();
+        for i in chunk_start..chunk_end {
+            tx.l2p_remap(
+                BOOTSTRAP_VOLUME_ORD,
+                i as u64,
+                remap_val(100 + i as u64, 0),
+                None,
+            );
+        }
+        tx.commit().unwrap();
+    }
+}
+
 #[test]
 fn range_delete_empty_range_is_noop() {
     let (_d, db) = mk_db();
@@ -430,23 +447,23 @@ fn range_delete_survives_restart_via_wal_replay() {
 #[test]
 fn range_delete_auto_splits_above_cap() {
     // Force captured.len() to exceed MAX_RANGE_DELETE_CAPTURED so
-    // the auto-split path runs. Seed 2 * MAX + 37 entries; expect
-    // three WAL records + three final applies.
+    // the auto-split path runs. Seed MAX + 37 entries; expect two WAL
+    // records + two final applies. Use batched seed commits so this
+    // regression test exercises range_delete instead of spending most
+    // of its time on single-op WAL round trips.
     let cap = crate::wal::op::MAX_RANGE_DELETE_CAPTURED;
-    let total = 2 * cap + 37;
+    let total = cap + 37;
     let (_d, db) = mk_db();
-    for i in 0..total {
-        remap(&db, i as u64, remap_val(100 + i as u64, 0), None);
-    }
+    seed_distinct_remaps_batched(&db, total);
     let pre_lsn = db.last_applied_lsn();
     let lsn = db
         .range_delete(BOOTSTRAP_VOLUME_ORD, 0, total as u64)
         .unwrap();
-    // Three chunks → three WAL records → LSN bumped by 3.
+    // Two chunks → two WAL records → LSN bumped by 2.
     assert_eq!(
         lsn,
-        pre_lsn + 3,
-        "auto-split emitted exactly three WAL records",
+        pre_lsn + 2,
+        "auto-split emitted exactly two WAL records",
     );
     for i in 0..total {
         assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, i as u64).unwrap(), None);

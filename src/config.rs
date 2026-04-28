@@ -40,7 +40,10 @@ pub struct Config {
     /// Number of WAL writer lanes used by `Db`. Each lane has its own
     /// writer thread, segment directory, and fsync stream. Global LSNs
     /// are still assigned from one short critical section so recovery
-    /// can merge lanes into the existing total order.
+    /// can merge lanes into the existing total order. Default to one
+    /// lane so synchronous Onyx flush writers actually coalesce into
+    /// group commits; raise this only on storage where parallel fsync
+    /// streams beat larger batches.
     pub wal_lanes: u32,
 
     /// Upper bound on a single group-commit batch, in bytes.
@@ -109,7 +112,7 @@ impl Config {
             shards_per_partition: 16,
             max_volumes: 1024,
             wal_segment_bytes: 64 * 1024 * 1024,
-            wal_lanes: 4,
+            wal_lanes: 1,
             group_commit_max_batch_bytes: 4 * 1024 * 1024,
             group_commit_timeout_us: 500,
             page_cache_bytes: 512 * 1024 * 1024,

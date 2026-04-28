@@ -670,68 +670,98 @@ impl Db {
     ) -> Result<L2pBucketApplyResult> {
         let mut outcomes = Vec::with_capacity(indices.len());
         let mut rc_actions = Vec::new();
-        let mut tree = volume.shards[sid].tree.write();
-        for idx in indices {
-            let op_started = std::time::Instant::now();
-            let outcome = match &ops[idx] {
-                WalOp::L2pPut { lba, value, .. } => {
-                    let prev = tree.insert_at_lsn(*lba, *value, lsn)?;
-                    metrics.record_apply_l2p_put(op_started.elapsed());
-                    ApplyOutcome::L2pPrev(prev)
-                }
-                WalOp::L2pDelete { lba, .. } => {
-                    let prev = tree.delete_at_lsn(*lba, lsn)?;
-                    metrics.record_apply_l2p_delete(op_started.elapsed());
-                    ApplyOutcome::L2pPrev(prev)
-                }
-                WalOp::L2pRemap {
-                    lba,
-                    new_value,
-                    guard,
-                    ..
-                } => {
-                    // Guarded remaps (dedup hits): verify the target pba's
-                    // refcount still satisfies `min_rc` before mutating
-                    // L2P. Lock order matches the serial path
-                    // (`apply_l2p_remap` in apply.rs): L2P shard write →
-                    // refcount shard lock. Refcount lanes only ever take
-                    // their own shard's lock and never touch L2P, so
-                    // there is no L2P↔RC cycle.
-                    if let Some((gp, min_rc)) = guard {
-                        let gp_sid = (xxh3_64(&gp.to_be_bytes()) as usize)
-                            % refcount_trees.len();
-                        let cur = {
-                            let mut rc_tree = refcount_trees[gp_sid].lock();
-                            rc_tree.get(*gp)?.map(|e| e.rc).unwrap_or(0)
-                        };
-                        if cur < *min_rc {
-                            metrics.record_apply_l2p_remap(op_started.elapsed());
-                            outcomes.push((
-                                idx,
-                                ApplyOutcome::L2pRemap {
-                                    applied: false,
-                                    prev: None,
-                                    freed_pba: None,
-                                },
-                            ));
-                            continue;
-                        }
+        let shard = &volume.shards[sid];
+        let mut tree = shard.tree.write();
+        let mut read_view_guard = {
+            let mut guard = shard.read_view.write();
+            if tree.page_store().epoch().min_active_pin() == u64::MAX {
+                *guard = Arc::new(crate::paged::ReadView::new(
+                    tree.root(),
+                    tree.root_level(),
+                    crate::paged::ReadOverlay::empty_shared(),
+                    tree.page_cache().clone(),
+                ));
+                tree.set_exclusive_read_overlay_mutation(true);
+                Some(guard)
+            } else {
+                None
+            }
+        };
+        let mut l2p_put_count = 0u64;
+        let mut l2p_delete_count = 0u64;
+        let mut l2p_remap_count = 0u64;
+        let bucket_started = std::time::Instant::now();
+        let apply_result = (|| -> Result<()> {
+            for idx in indices {
+                let outcome = match &ops[idx] {
+                    WalOp::L2pPut { lba, value, .. } => {
+                        let prev = tree.insert_at_lsn_deferred_finish(*lba, *value, lsn)?;
+                        l2p_put_count += 1;
+                        ApplyOutcome::L2pPrev(prev)
                     }
-                    let prev = tree.insert_at_lsn(*lba, *new_value, lsn)?;
-                    let value_changed = prev != Some(*new_value);
-                    if value_changed {
-                        let new_pba = new_value.head_pba();
-                        match prev {
-                            Some(old_value) => {
-                                let old_pba = old_value.head_pba();
-                                if old_pba != new_pba {
-                                    rc_actions.push(RcApplyAction {
-                                        op_idx: idx,
-                                        pba: old_pba,
-                                        delta: -1,
-                                        standalone_refcount: false,
-                                        remap_freed_candidate: true,
-                                    });
+                    WalOp::L2pDelete { lba, .. } => {
+                        let prev = tree.delete_at_lsn_deferred_finish(*lba, lsn)?;
+                        l2p_delete_count += 1;
+                        ApplyOutcome::L2pPrev(prev)
+                    }
+                    WalOp::L2pRemap {
+                        lba,
+                        new_value,
+                        guard,
+                        ..
+                    } => {
+                        // Guarded remaps (dedup hits): verify the target pba's
+                        // refcount still satisfies `min_rc` before mutating
+                        // L2P. Lock order matches the serial path
+                        // (`apply_l2p_remap` in apply.rs): L2P shard write →
+                        // refcount shard lock. Refcount lanes only ever take
+                        // their own shard's lock and never touch L2P, so
+                        // there is no L2P↔RC cycle.
+                        if let Some((gp, min_rc)) = guard {
+                            let gp_sid =
+                                (xxh3_64(&gp.to_be_bytes()) as usize) % refcount_trees.len();
+                            let cur = {
+                                let mut rc_tree = refcount_trees[gp_sid].lock();
+                                rc_tree.get(*gp)?.map(|e| e.rc).unwrap_or(0)
+                            };
+                            if cur < *min_rc {
+                                l2p_remap_count += 1;
+                                outcomes.push((
+                                    idx,
+                                    ApplyOutcome::L2pRemap {
+                                        applied: false,
+                                        prev: None,
+                                        freed_pba: None,
+                                    },
+                                ));
+                                continue;
+                            }
+                        }
+                        let prev = tree.insert_at_lsn_deferred_finish(*lba, *new_value, lsn)?;
+                        let value_changed = prev != Some(*new_value);
+                        if value_changed {
+                            let new_pba = new_value.head_pba();
+                            match prev {
+                                Some(old_value) => {
+                                    let old_pba = old_value.head_pba();
+                                    if old_pba != new_pba {
+                                        rc_actions.push(RcApplyAction {
+                                            op_idx: idx,
+                                            pba: old_pba,
+                                            delta: -1,
+                                            standalone_refcount: false,
+                                            remap_freed_candidate: true,
+                                        });
+                                        rc_actions.push(RcApplyAction {
+                                            op_idx: idx,
+                                            pba: new_pba,
+                                            delta: 1,
+                                            standalone_refcount: false,
+                                            remap_freed_candidate: false,
+                                        });
+                                    }
+                                }
+                                None => {
                                     rc_actions.push(RcApplyAction {
                                         op_idx: idx,
                                         pba: new_pba,
@@ -741,29 +771,47 @@ impl Db {
                                     });
                                 }
                             }
-                            None => {
-                                rc_actions.push(RcApplyAction {
-                                    op_idx: idx,
-                                    pba: new_pba,
-                                    delta: 1,
-                                    standalone_refcount: false,
-                                    remap_freed_candidate: false,
-                                });
-                            }
+                        }
+                        l2p_remap_count += 1;
+                        ApplyOutcome::L2pRemap {
+                            applied: true,
+                            prev,
+                            freed_pba: None,
                         }
                     }
-                    metrics.record_apply_l2p_remap(op_started.elapsed());
-                    ApplyOutcome::L2pRemap {
-                        applied: true,
-                        prev,
-                        freed_pba: None,
-                    }
-                }
-                other => unreachable!("L2P bucket holds only L2P ops; saw {other:?}"),
-            };
-            outcomes.push((idx, outcome));
+                    other => unreachable!("L2P bucket holds only L2P ops; saw {other:?}"),
+                };
+                outcomes.push((idx, outcome));
+            }
+            tree.finish_batch_apply()
+        })();
+        tree.set_exclusive_read_overlay_mutation(false);
+        if let Some(mut guard) = read_view_guard.take() {
+            *guard = Arc::new(tree.snapshot_read_view());
+        } else if apply_result.is_ok() {
+            super::apply::publish_l2p_read_view(shard, &tree);
         }
-        super::apply::publish_l2p_read_view(&volume.shards[sid], &tree);
+        apply_result?;
+        let bucket_elapsed = bucket_started.elapsed();
+        let total_l2p_ops = l2p_put_count + l2p_delete_count + l2p_remap_count;
+        if total_l2p_ops > 0 {
+            let total_us = bucket_elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+            let put_us = total_us.saturating_mul(l2p_put_count) / total_l2p_ops;
+            let delete_us = total_us.saturating_mul(l2p_delete_count) / total_l2p_ops;
+            let remap_us = total_us.saturating_sub(put_us).saturating_sub(delete_us);
+            metrics.record_apply_l2p_put_batch(
+                l2p_put_count,
+                std::time::Duration::from_micros(put_us),
+            );
+            metrics.record_apply_l2p_delete_batch(
+                l2p_delete_count,
+                std::time::Duration::from_micros(delete_us),
+            );
+            metrics.record_apply_l2p_remap_batch(
+                l2p_remap_count,
+                std::time::Duration::from_micros(remap_us),
+            );
+        }
         Ok(L2pBucketApplyResult {
             outcomes,
             rc_actions,

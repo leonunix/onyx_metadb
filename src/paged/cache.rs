@@ -10,7 +10,6 @@
 //! Concurrency is out of scope — the buffer is `&mut self` only, and
 //! the owning `PagedL2p` is wrapped in a `Mutex` one level up.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
@@ -18,7 +17,10 @@ use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageType};
 use crate::page_store::PageStore;
 use crate::paged::format::{index_collect_children, init_index, init_leaf, page_level};
+use crate::paged::read_view::{PageIdMap, PageIdSet, ReadOverlay, ReadOverlayShard};
 use crate::types::{Lsn, NULL_PAGE, PageId};
+
+const LOCAL_ALLOC_RUN_PAGES: usize = 256;
 
 /// Cache entry. Both variants carry `Arc<Page>` so dirty pages can be
 /// shared with `ReadView` overlays at apply-publish time without copying
@@ -31,7 +33,6 @@ enum Slot {
 }
 
 pub(crate) struct DirtySnapshot {
-    page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     pages: Vec<DirtySnapshotPage>,
 }
@@ -43,6 +44,14 @@ pub(crate) struct FlushedSnapshot {
 impl FlushedSnapshot {
     pub(crate) fn pages_count(&self) -> usize {
         self.pages.len()
+    }
+
+    pub(crate) fn append_sealed_pages(&self, out: &mut Vec<(PageId, Arc<Page>)>) {
+        out.extend(
+            self.pages
+                .iter()
+                .map(|page| (page.pid, page.sealed.clone())),
+        );
     }
 }
 
@@ -87,14 +96,16 @@ pub enum DecrefOutcome {
 pub struct PageBuf {
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
-    pages: HashMap<PageId, Slot>,
-    /// Live count of `Slot::Clean` entries in `pages`. Updated in
-    /// lockstep with every mutation of `pages` so `evict_clean_pages`
-    /// can short-circuit the `HashMap::retain` scan when nothing is
-    /// clean. Prefill/write-heavy workloads leave every entry dirty
-    /// after each op, so without the short-circuit every insert pays
-    /// an O(N) scan over a thousands-large HashMap.
-    clean_count: usize,
+    alloc_run_next: PageId,
+    alloc_run_end: PageId,
+    pages: PageIdMap<Slot>,
+    read_overlay_shards: Vec<Arc<ReadOverlayShard>>,
+    read_overlay_updates: PageIdSet,
+    exclusive_read_overlay_mutation: bool,
+    /// Live set of `Slot::Clean` entries in `pages`. This makes
+    /// `evict_clean_pages` O(number of clean pages) instead of scanning
+    /// the whole dirty overlay on every tree op.
+    clean_pages: PageIdSet,
     /// In-memory rc-delta accumulator for the current op.
     ///
     /// [`cow_for_write`](Self::cow_for_write) no longer mutates rc on
@@ -114,7 +125,7 @@ pub struct PageBuf {
     ///   sees a consistent post-commit view);
     /// - preserves WAL-replay idempotency (the commit's gen-stamp
     ///   guard skips deltas the crashed prior attempt already landed).
-    pending_rc: HashMap<PageId, i32>,
+    pending_rc: PageIdMap<i32>,
     rc_delta_lsn: Lsn,
     rc_delta_ordinal: u32,
 }
@@ -131,37 +142,97 @@ impl PageBuf {
         Self {
             page_store,
             page_cache,
-            pages: HashMap::new(),
-            clean_count: 0,
-            pending_rc: HashMap::new(),
+            alloc_run_next: 0,
+            alloc_run_end: 0,
+            pages: PageIdMap::default(),
+            read_overlay_shards: ReadOverlay::empty_shards(),
+            read_overlay_updates: PageIdSet::default(),
+            exclusive_read_overlay_mutation: false,
+            clean_pages: PageIdSet::default(),
+            pending_rc: PageIdMap::default(),
             rc_delta_lsn: 0,
             rc_delta_ordinal: 0,
         }
     }
 
-    /// Insert a slot, keeping `clean_count` consistent with the
+    /// Insert a slot, keeping `clean_pages` consistent with the
     /// Clean/Dirty delta relative to any existing entry at `pid`.
     /// All mutation of `self.pages` must go through one of these
     /// helpers; direct `.insert` / `.remove` calls on `self.pages`
-    /// will drift the counter.
+    /// will drift the clean-page index.
     fn pages_insert(&mut self, pid: PageId, slot: Slot) {
         let is_clean = matches!(slot, Slot::Clean(_));
+        let is_dirty = matches!(slot, Slot::Dirty(_));
         let old = self.pages.insert(pid, slot);
         let was_clean = matches!(old, Some(Slot::Clean(_)));
-        match (was_clean, is_clean) {
-            (true, false) => self.clean_count -= 1,
-            (false, true) => self.clean_count += 1,
-            _ => {}
+        let was_dirty = matches!(old, Some(Slot::Dirty(_)));
+        if was_clean {
+            self.clean_pages.remove(&pid);
+        }
+        if is_clean {
+            self.clean_pages.insert(pid);
+        }
+        if is_dirty || was_dirty {
+            self.read_overlay_updates.insert(pid);
         }
     }
 
-    /// Remove a slot, keeping `clean_count` consistent.
+    /// Remove a slot, keeping `clean_pages` consistent.
     fn pages_remove(&mut self, pid: PageId) -> Option<Slot> {
         let old = self.pages.remove(&pid);
         if matches!(old, Some(Slot::Clean(_))) {
-            self.clean_count -= 1;
+            self.clean_pages.remove(&pid);
+        }
+        if matches!(old, Some(Slot::Dirty(_))) {
+            self.read_overlay_updates.insert(pid);
         }
         old
+    }
+
+    fn read_overlay_insert(&mut self, pid: PageId, page: Arc<Page>) {
+        let idx = ReadOverlay::shard_idx(pid);
+        Arc::make_mut(&mut self.read_overlay_shards[idx]).insert(pid, page);
+    }
+
+    fn read_overlay_remove(&mut self, pid: PageId) {
+        let idx = ReadOverlay::shard_idx(pid);
+        Arc::make_mut(&mut self.read_overlay_shards[idx]).remove(&pid);
+    }
+
+    pub(crate) fn set_exclusive_read_overlay_mutation(&mut self, enabled: bool) {
+        self.exclusive_read_overlay_mutation = enabled;
+    }
+
+    fn detach_from_read_overlay_before_mutation(&mut self, pid: PageId) {
+        if self.exclusive_read_overlay_mutation {
+            self.read_overlay_remove(pid);
+        }
+    }
+
+    pub(crate) fn flush_read_overlay_updates(&mut self) {
+        let updates: Vec<_> = self.read_overlay_updates.drain().collect();
+        for pid in updates {
+            match self.pages.get(&pid) {
+                Some(Slot::Dirty(arc)) => self.read_overlay_insert(pid, arc.clone()),
+                Some(Slot::Clean(_)) | None => self.read_overlay_remove(pid),
+            }
+        }
+    }
+
+    pub(crate) fn read_overlay(&self) -> ReadOverlay {
+        ReadOverlay::from_shards(self.read_overlay_shards.clone())
+    }
+
+    fn allocate_local(&mut self) -> Result<PageId> {
+        if self.alloc_run_next < self.alloc_run_end {
+            let pid = self.alloc_run_next;
+            self.alloc_run_next += 1;
+            return Ok(pid);
+        }
+        let start = self.page_store.allocate_run(LOCAL_ALLOC_RUN_PAGES)?;
+        self.alloc_run_next = start + 1;
+        self.alloc_run_end = start + LOCAL_ALLOC_RUN_PAGES as u64;
+        Ok(start)
     }
 
     /// Underlying page store handle.
@@ -219,6 +290,7 @@ impl PageBuf {
             }
             None => Arc::new(self.page_cache.get_for_modify(pid)?),
         };
+        self.detach_from_read_overlay_before_mutation(pid);
         self.pages_insert(pid, Slot::Dirty(arc));
         // `Arc::make_mut` clones the page if a `ReadView` overlay
         // still holds this Arc — the published snapshot keeps the
@@ -233,7 +305,7 @@ impl PageBuf {
     /// dirty page. The source page and its on-disk refcount are left
     /// untouched; the tree layer uses this for checkpoint shadowing.
     pub fn clone_private(&mut self, src: PageId, generation: Lsn) -> Result<PageId> {
-        let new_pid = self.page_store.allocate()?;
+        let new_pid = self.allocate_local()?;
         let mut page = self.read(src)?.clone();
         page.set_generation(generation);
         page.set_refcount(1);
@@ -245,7 +317,7 @@ impl PageBuf {
     /// `page.generation = 0` so the WAL-apply idempotency guard treats
     /// newly-allocated tree pages as untouched by any WAL op.
     pub fn alloc_leaf(&mut self, _generation: Lsn) -> Result<PageId> {
-        let pid = self.page_store.allocate()?;
+        let pid = self.allocate_local()?;
         let mut page = Page::zeroed();
         init_leaf(&mut page, 0);
         self.pages_insert(pid, Slot::Dirty(Arc::new(page)));
@@ -256,7 +328,7 @@ impl PageBuf {
     /// NULL_PAGE), cache as dirty. See [`alloc_leaf`](Self::alloc_leaf)
     /// for why the generation is stamped as 0.
     pub fn alloc_index(&mut self, _generation: Lsn, level: u8) -> Result<PageId> {
-        let pid = self.page_store.allocate()?;
+        let pid = self.allocate_local()?;
         let mut page = Page::zeroed();
         init_index(&mut page, 0, level);
         self.pages_insert(pid, Slot::Dirty(Arc::new(page)));
@@ -278,7 +350,9 @@ impl PageBuf {
     /// responsible for making sure the old root was already flushed.
     pub fn forget_all(&mut self) {
         self.pages.clear();
-        self.clean_count = 0;
+        self.read_overlay_shards = ReadOverlay::empty_shards();
+        self.read_overlay_updates.clear();
+        self.clean_pages.clear();
     }
 
     /// Return `pid` to the page store's free list, stamping with
@@ -406,6 +480,7 @@ impl PageBuf {
     /// `page_cache` afterwards so nothing observes the stale pre-RMW
     /// copy.
     fn persist_if_dirty(&mut self, pid: PageId) -> Result<()> {
+        self.detach_from_read_overlay_before_mutation(pid);
         if let Some(Slot::Dirty(arc)) = self.pages.get_mut(&pid) {
             let page = Arc::make_mut(arc);
             page.seal();
@@ -564,18 +639,20 @@ impl PageBuf {
     /// lived owner from keeping an unbounded duplicate copy of clean
     /// pages alongside the bounded shared cache.
     ///
-    /// Fast-path: when `clean_count == 0` (every entry is Dirty, the
-    /// common case during write-heavy batches) the retain scan is
-    /// skipped outright. Without this guard every `insert` / `delete`
-    /// at the tree layer would walk the whole HashMap on every op
-    /// just to find nothing to drop — which is the dominant cost of
-    /// the apply phase once the tree has thousands of dirty pages.
+    /// Fast-path: when `clean_pages` is empty (every entry is Dirty, the
+    /// common case during write-heavy batches) cleanup returns outright.
+    /// When clean pages exist, remove only those tracked pids instead of
+    /// scanning the whole dirty overlay on every tree op.
     pub fn evict_clean_pages(&mut self) {
-        if self.clean_count == 0 {
+        if self.clean_pages.is_empty() {
             return;
         }
-        self.pages.retain(|_, slot| slot.is_dirty());
-        self.clean_count = 0;
+        let clean_pages = std::mem::take(&mut self.clean_pages);
+        for pid in clean_pages {
+            if matches!(self.pages.get(&pid), Some(Slot::Clean(_))) {
+                self.pages.remove(&pid);
+            }
+        }
     }
 
     /// Seal + write + fsync every dirty page in ascending page-id order,
@@ -616,10 +693,7 @@ impl PageBuf {
             // mode: 1 GiB pin budget, 0 pages pinned, l2p_remap tail ramp
             // from 20 µs avg to 38 SECONDS as cache pressure ate the
             // hot index.
-            let is_index = matches!(
-                page.header().map(|h| h.page_type),
-                Ok(PageType::PagedIndex)
-            );
+            let is_index = matches!(page.header().map(|h| h.page_type), Ok(PageType::PagedIndex));
             if is_index && self.page_cache.pin(pid, page.clone()) {
                 // Pinned — skip LRU insert. The pinned table shadows LRU
                 // on lookup, so a subsequent `insert` would only waste
@@ -646,25 +720,29 @@ impl PageBuf {
             .collect();
         pages.sort_unstable_by_key(|page| page.pid);
         DirtySnapshot {
-            page_store: self.page_store.clone(),
             page_cache: self.page_cache.clone(),
             pages,
         }
     }
 
-    pub(crate) fn install_flushed_snapshot(&mut self, flushed: FlushedSnapshot) {
-        for page in flushed.pages {
-            let Some(Slot::Dirty(current)) = self.pages.get(&page.pid) else {
-                continue;
-            };
-            if !Arc::ptr_eq(current, &page.original) {
-                continue;
-            }
-            // DirtySnapshot::write() has already published the sealed page to
-            // the shared PageCache outside the shard lock. Install only swaps
-            // this tree-local slot to Clean.
-            self.pages_insert(page.pid, Slot::Clean(page.sealed));
+    pub(crate) fn install_flushed_snapshot_page(
+        &mut self,
+        flushed: &FlushedSnapshot,
+        page_idx: usize,
+    ) -> Option<(PageId, bool)> {
+        let page = flushed.pages.get(page_idx)?;
+        let Some(Slot::Dirty(current)) = self.pages.get(&page.pid) else {
+            return Some((page.pid, true));
+        };
+        if !Arc::ptr_eq(current, &page.original) {
+            return Some((page.pid, false));
         }
+        // DirtySnapshot::write() has already published the sealed page to
+        // the shared PageCache outside the shard lock. Drop the tree-local
+        // Dirty copy so install does not defer a large clean-page retain
+        // scan to finish_op.
+        self.pages_remove(page.pid);
+        Some((page.pid, true))
     }
 
     pub fn iter_dirty(&self) -> impl Iterator<Item = (PageId, Arc<Page>)> + '_ {
@@ -700,14 +778,12 @@ impl DirtySnapshot {
         for page in &self.pages {
             let mut sealed = (*page.original).clone();
             sealed.seal();
-            self.page_store.write_page(page.pid, &sealed)?;
             flushed.push(FlushedSnapshotPage {
                 pid: page.pid,
                 original: page.original.clone(),
                 sealed: Arc::new(sealed),
             });
         }
-        self.page_store.sync()?;
         for page in &flushed {
             let is_index = matches!(
                 page.sealed.header().map(|h| h.page_type),
@@ -726,7 +802,9 @@ impl DirtySnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paged::format::{L2pValue, index_child_at, index_set_child, leaf_bit_set, leaf_set};
+    use crate::paged::format::{
+        L2pValue, index_child_at, index_set_child, leaf_bit_set, leaf_set, leaf_value_at,
+    };
     use tempfile::TempDir;
 
     fn mk_store() -> (TempDir, Arc<PageStore>) {
@@ -757,6 +835,51 @@ mod tests {
         let mut buf2 = PageBuf::new(ps);
         let p = buf2.read(pid).unwrap();
         assert!(leaf_bit_set(p, 5));
+    }
+
+    #[test]
+    fn install_flushed_snapshot_page_detaches_dirty_copy() {
+        let (_d, ps) = mk_store();
+        let mut buf = PageBuf::new(ps);
+        let pid = buf.alloc_leaf(1).unwrap();
+        let v = L2pValue([0x42u8; 28]);
+        leaf_set(buf.modify(pid, 1).unwrap(), 5, &v);
+
+        let flushed = buf.dirty_snapshot().write().unwrap();
+        assert_eq!(buf.dirty_count(), 1);
+        assert_eq!(
+            buf.install_flushed_snapshot_page(&flushed, 0),
+            Some((pid, true))
+        );
+
+        assert!(!buf.contains(pid));
+        assert_eq!(buf.dirty_count(), 0);
+        let page = buf.read(pid).unwrap();
+        assert!(leaf_bit_set(page, 5));
+    }
+
+    #[test]
+    fn install_flushed_snapshot_page_keeps_newer_dirty_copy() {
+        let (_d, ps) = mk_store();
+        let mut buf = PageBuf::new(ps);
+        let pid = buf.alloc_leaf(1).unwrap();
+        let first = L2pValue([0x42u8; 28]);
+        let second = L2pValue([0x24u8; 28]);
+        leaf_set(buf.modify(pid, 1).unwrap(), 5, &first);
+
+        let snapshot = buf.dirty_snapshot();
+        leaf_set(buf.modify(pid, 2).unwrap(), 6, &second);
+        let flushed = snapshot.write().unwrap();
+
+        assert_eq!(
+            buf.install_flushed_snapshot_page(&flushed, 0),
+            Some((pid, false))
+        );
+        assert!(buf.contains(pid));
+        assert_eq!(buf.dirty_count(), 1);
+        let page = buf.read(pid).unwrap();
+        assert_eq!(leaf_value_at(page, 5), first);
+        assert_eq!(leaf_value_at(page, 6), second);
     }
 
     #[test]

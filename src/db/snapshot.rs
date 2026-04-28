@@ -596,7 +596,7 @@ impl<'a> SnapshotView<'a> {
         let snap_view = crate::paged::ReadView::new(
             snap_root,
             snap_level,
-            std::sync::Arc::new(std::collections::HashMap::new()),
+            crate::paged::ReadOverlay::default(),
             page_cache,
         );
         snap_view.get(lba)

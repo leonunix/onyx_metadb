@@ -462,6 +462,19 @@ impl MetaMetrics {
         record_duration(&self.apply_l2p_put_us, &self.apply_l2p_put_max_us, elapsed);
     }
 
+    pub(crate) fn record_apply_l2p_put_batch(&self, count: u64, elapsed: Duration) {
+        if count == 0 {
+            return;
+        }
+        self.apply_l2p_put_count.fetch_add(count, Ordering::Relaxed);
+        record_batch_duration(
+            &self.apply_l2p_put_us,
+            &self.apply_l2p_put_max_us,
+            count,
+            elapsed,
+        );
+    }
+
     pub(crate) fn record_apply_l2p_delete(&self, elapsed: Duration) {
         self.apply_l2p_delete_count.fetch_add(1, Ordering::Relaxed);
         record_duration(
@@ -471,11 +484,39 @@ impl MetaMetrics {
         );
     }
 
+    pub(crate) fn record_apply_l2p_delete_batch(&self, count: u64, elapsed: Duration) {
+        if count == 0 {
+            return;
+        }
+        self.apply_l2p_delete_count
+            .fetch_add(count, Ordering::Relaxed);
+        record_batch_duration(
+            &self.apply_l2p_delete_us,
+            &self.apply_l2p_delete_max_us,
+            count,
+            elapsed,
+        );
+    }
+
     pub(crate) fn record_apply_l2p_remap(&self, elapsed: Duration) {
         self.apply_l2p_remap_count.fetch_add(1, Ordering::Relaxed);
         record_duration(
             &self.apply_l2p_remap_us,
             &self.apply_l2p_remap_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_apply_l2p_remap_batch(&self, count: u64, elapsed: Duration) {
+        if count == 0 {
+            return;
+        }
+        self.apply_l2p_remap_count
+            .fetch_add(count, Ordering::Relaxed);
+        record_batch_duration(
+            &self.apply_l2p_remap_us,
+            &self.apply_l2p_remap_max_us,
+            count,
             elapsed,
         );
     }
@@ -913,6 +954,12 @@ fn record_duration(total: &AtomicU64, max: &AtomicU64, elapsed: Duration) {
     let us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
     total.fetch_add(us, Ordering::Relaxed);
     fetch_max(max, us);
+}
+
+fn record_batch_duration(total: &AtomicU64, max: &AtomicU64, count: u64, elapsed: Duration) {
+    let us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+    total.fetch_add(us, Ordering::Relaxed);
+    fetch_max(max, us / count.max(1));
 }
 
 fn fetch_max(slot: &AtomicU64, value: u64) {

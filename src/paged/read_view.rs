@@ -17,8 +17,9 @@
 //!   read gate keeps flush from reclaiming pids while a stale
 //!   ReadView still references them.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::{Arc, OnceLock};
 
 use crate::cache::PageCache;
 use crate::error::Result;
@@ -29,6 +30,89 @@ use crate::paged::format::{
 };
 use crate::types::{NULL_PAGE, PageId};
 
+#[derive(Default)]
+pub struct PageIdHasher(u64);
+
+impl Hasher for PageIdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        self.0 = hash;
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        let mut x = value.wrapping_add(0x9e3779b97f4a7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        self.0 = x ^ (x >> 31);
+    }
+}
+
+pub const READ_OVERLAY_SHARDS: usize = 1024;
+const READ_OVERLAY_SHARD_MASK: u64 = READ_OVERLAY_SHARDS as u64 - 1;
+
+pub type PageIdMap<V> = HashMap<PageId, V, BuildHasherDefault<PageIdHasher>>;
+pub type PageIdSet = HashSet<PageId, BuildHasherDefault<PageIdHasher>>;
+pub type ReadOverlayShard = PageIdMap<Arc<Page>>;
+
+#[derive(Clone)]
+pub struct ReadOverlay {
+    shards: Arc<Vec<Arc<ReadOverlayShard>>>,
+}
+
+impl Default for ReadOverlay {
+    fn default() -> Self {
+        Self::from_shards(Self::empty_shards())
+    }
+}
+
+impl ReadOverlay {
+    pub fn empty_shared() -> Self {
+        static EMPTY: OnceLock<ReadOverlay> = OnceLock::new();
+        EMPTY
+            .get_or_init(|| Self::from_shards(Self::empty_shards()))
+            .clone()
+    }
+
+    pub fn empty_shards() -> Vec<Arc<ReadOverlayShard>> {
+        let mut shards = Vec::with_capacity(READ_OVERLAY_SHARDS);
+        for _ in 0..READ_OVERLAY_SHARDS {
+            shards.push(Arc::new(ReadOverlayShard::default()));
+        }
+        shards
+    }
+
+    pub fn from_shards(shards: Vec<Arc<ReadOverlayShard>>) -> Self {
+        debug_assert_eq!(shards.len(), READ_OVERLAY_SHARDS);
+        Self {
+            shards: Arc::new(shards),
+        }
+    }
+
+    pub fn shard_idx(pid: PageId) -> usize {
+        (pid & READ_OVERLAY_SHARD_MASK) as usize
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.len()).sum()
+    }
+
+    pub fn contains_key(&self, pid: PageId) -> bool {
+        self.shards[Self::shard_idx(pid)].contains_key(&pid)
+    }
+
+    pub fn get(&self, pid: PageId) -> Option<&Arc<Page>> {
+        self.shards[Self::shard_idx(pid)].get(&pid)
+    }
+}
+
 /// Cheap-to-clone (`Arc`-wrapped) lock-free snapshot of a paged L2P
 /// tree, capturing both the root pointer and any dirty pages the apply
 /// hasn't yet flushed.
@@ -36,7 +120,7 @@ use crate::types::{NULL_PAGE, PageId};
 pub struct ReadView {
     root: PageId,
     root_level: u8,
-    overlay: Arc<HashMap<PageId, Arc<Page>>>,
+    overlay: ReadOverlay,
     page_cache: Arc<PageCache>,
 }
 
@@ -44,7 +128,7 @@ impl ReadView {
     pub fn new(
         root: PageId,
         root_level: u8,
-        overlay: Arc<HashMap<PageId, Arc<Page>>>,
+        overlay: ReadOverlay,
         page_cache: Arc<PageCache>,
     ) -> Self {
         Self {
@@ -131,7 +215,7 @@ impl ReadView {
             let disk_pids: Vec<PageId> = active
                 .iter()
                 .filter_map(|walk| {
-                    if self.overlay.contains_key(&walk.current) {
+                    if self.overlay.contains_key(walk.current) {
                         None
                     } else {
                         Some(walk.current)
@@ -143,7 +227,7 @@ impl ReadView {
             let mut next = Vec::with_capacity(active.len());
             for walk in active {
                 let slot = slot_in_index(walk.leaf_idx, level);
-                let child = if let Some(page) = self.overlay.get(&walk.current) {
+                let child = if let Some(page) = self.overlay.get(walk.current) {
                     index_child_at(page, slot)
                 } else {
                     let page = disk_iter.next().ok_or_else(|| {
@@ -168,7 +252,7 @@ impl ReadView {
             let disk_pids: Vec<PageId> = active
                 .iter()
                 .filter_map(|walk| {
-                    if self.overlay.contains_key(&walk.current) {
+                    if self.overlay.contains_key(walk.current) {
                         None
                     } else {
                         Some(walk.current)
@@ -178,7 +262,7 @@ impl ReadView {
             let disk_pages = self.page_cache.get_many(&disk_pids)?;
             let mut disk_iter = disk_pages.into_iter();
             for walk in active {
-                if let Some(page) = self.overlay.get(&walk.current) {
+                if let Some(page) = self.overlay.get(walk.current) {
                     if leaf_bit_set(page, walk.bit) {
                         out[walk.out_idx] = Some(leaf_value_at(page, walk.bit));
                     }
@@ -198,7 +282,7 @@ impl ReadView {
     }
 
     fn with_page<T>(&self, pid: PageId, f: impl FnOnce(&Page) -> Result<T>) -> Result<T> {
-        if let Some(arc) = self.overlay.get(&pid) {
+        if let Some(arc) = self.overlay.get(pid) {
             return f(arc.as_ref());
         }
         let page = self.page_cache.get(pid)?;
@@ -232,7 +316,7 @@ mod tests {
     }
 
     fn empty_view(tree: &PagedL2p, pc: Arc<PageCache>) -> ReadView {
-        ReadView::new(tree.root(), tree.root_level(), Arc::new(HashMap::new()), pc)
+        ReadView::new(tree.root(), tree.root_level(), ReadOverlay::default(), pc)
     }
 
     fn val(byte: u8) -> L2pValue {

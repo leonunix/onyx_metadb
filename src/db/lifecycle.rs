@@ -1,5 +1,7 @@
 use super::*;
 
+const FLUSH_RECLAIM_BUDGET_PAGES: usize = 8192;
+
 impl Db {
     /// Create a fresh database in `root_dir` using the default config.
     pub fn create(root_dir: &Path) -> Result<Self> {
@@ -691,6 +693,7 @@ impl Db {
 
         let io_started = std::time::Instant::now();
         let mut total_pages_written = 0usize;
+        let mut sealed_pages = Vec::new();
         let mut flushed_l2p = Vec::with_capacity(l2p_checkpoints.len());
         for checkpoints in &l2p_checkpoints {
             let mut flushed = Vec::with_capacity(checkpoints.len());
@@ -698,6 +701,7 @@ impl Db {
                 match checkpoint.write_dirty_pages() {
                     Ok(pages) => {
                         total_pages_written += pages.pages_count();
+                        pages.append_sealed_pages(&mut sealed_pages);
                         flushed.push(pages);
                     }
                     Err(err) => {
@@ -716,6 +720,7 @@ impl Db {
             match checkpoint.write_dirty_pages() {
                 Ok(pages) => {
                     total_pages_written += pages.pages_count();
+                    pages.append_sealed_pages(&mut sealed_pages);
                     flushed_refcount.push(pages);
                 }
                 Err(err) => {
@@ -726,6 +731,20 @@ impl Db {
                     return Err(err);
                 }
             }
+        }
+        if let Err(err) = self.page_store.write_sealed_page_runs(sealed_pages) {
+            self.metrics
+                .record_flush_io(io_started.elapsed(), total_pages_written);
+            self.metrics.record_flush_total(flush_started.elapsed());
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+            return Err(err);
+        }
+        if let Err(err) = self.page_store.sync() {
+            self.metrics
+                .record_flush_io(io_started.elapsed(), total_pages_written);
+            self.metrics.record_flush_total(flush_started.elapsed());
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+            return Err(err);
         }
         self.metrics
             .record_flush_io(io_started.elapsed(), total_pages_written);
@@ -782,33 +801,102 @@ impl Db {
             .record_flush_manifest(manifest_started.elapsed());
 
         let install_started = std::time::Instant::now();
-        let mut checkpoint_frees = Vec::new();
+        let mut install_receivers = Vec::new();
         for (volume, (checkpoints, flushed)) in volumes
             .iter()
             .zip(l2p_checkpoints.into_iter().zip(flushed_l2p.into_iter()))
         {
-            for (shard, (checkpoint, flushed)) in volume
-                .shards
-                .iter()
-                .zip(checkpoints.into_iter().zip(flushed.into_iter()))
+            for (sid, (checkpoint, flushed)) in
+                checkpoints.into_iter().zip(flushed.into_iter()).enumerate()
             {
-                let retired = shard
-                    .tree
-                    .write()
-                    .checkpoint_snapshot_committed(checkpoint, flushed, tree_generation)?;
-                checkpoint_frees.extend(retired);
+                let apply_volume = volume.clone();
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                volume.shards[sid]
+                    .apply_lane
+                    .enqueue_maintenance(Box::new(move || {
+                        let result = (|| {
+                            let mut tree = apply_volume.shards[sid].tree.write();
+                            let mut flushed_private = std::collections::HashMap::new();
+                            for page_idx in 0..flushed.pages_count() {
+                                if let Some((pid, clean)) =
+                                    tree.install_flushed_checkpoint_page(&flushed, page_idx)
+                                {
+                                    flushed_private.insert(pid, clean);
+                                }
+                            }
+                            let mut checkpoint_frees = Vec::new();
+                            for pid in checkpoint.retired_pages() {
+                                if let Some(pid) = tree.checkpoint_retired_page_committed(pid) {
+                                    checkpoint_frees.push(pid);
+                                }
+                            }
+                            for pid in checkpoint.private_pages() {
+                                let flushed_clean =
+                                    flushed_private.get(&pid).copied().unwrap_or(true);
+                                tree.checkpoint_private_page_committed(pid, flushed_clean);
+                            }
+                            tree.finish_checkpoint_commit()?;
+                            Ok(checkpoint_frees)
+                        })();
+                        let _ = tx.send(result);
+                    }));
+                install_receivers.push(rx);
             }
         }
-        for (shard, (checkpoint, flushed)) in self
-            .refcount_shards
-            .iter()
-            .zip(refcount_checkpoints.into_iter().zip(flushed_refcount.into_iter()))
-        {
-            let retired = shard
-                .tree
-                .lock()
-                .checkpoint_snapshot_committed(checkpoint, flushed, tree_generation)?;
-            checkpoint_frees.extend(retired);
+        for (shard, (checkpoint, flushed)) in self.refcount_shards.iter().zip(
+            refcount_checkpoints
+                .into_iter()
+                .zip(flushed_refcount.into_iter()),
+        ) {
+            let tree = shard.tree.clone();
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            shard.apply_lane.enqueue_maintenance(Box::new(move || {
+                let result = (|| {
+                    let mut tree = tree.lock();
+                    let mut flushed_private = std::collections::HashMap::new();
+                    for page_idx in 0..flushed.pages_count() {
+                        if let Some((pid, clean)) =
+                            tree.install_flushed_checkpoint_page(&flushed, page_idx)
+                        {
+                            flushed_private.insert(pid, clean);
+                        }
+                    }
+                    let mut checkpoint_frees = Vec::new();
+                    for pid in checkpoint.retired_pages() {
+                        if let Some(pid) = tree.checkpoint_retired_page_committed(pid) {
+                            checkpoint_frees.push(pid);
+                        }
+                    }
+                    for pid in checkpoint.private_pages() {
+                        let flushed_clean = flushed_private.get(&pid).copied().unwrap_or(true);
+                        tree.checkpoint_private_page_committed(pid, flushed_clean);
+                    }
+                    tree.finish_checkpoint_commit()?;
+                    Ok(checkpoint_frees)
+                })();
+                let _ = tx.send(result);
+            }));
+            install_receivers.push(rx);
+        }
+        let mut checkpoint_frees = Vec::new();
+        for rx in install_receivers {
+            match rx.recv() {
+                Ok(Ok(mut frees)) => checkpoint_frees.append(&mut frees),
+                Ok(Err(err)) => {
+                    drop(manifest_state);
+                    self.metrics.record_flush_install(install_started.elapsed());
+                    self.metrics.record_flush_total(flush_started.elapsed());
+                    return Err(err);
+                }
+                Err(_) => {
+                    drop(manifest_state);
+                    self.metrics.record_flush_install(install_started.elapsed());
+                    self.metrics.record_flush_total(flush_started.elapsed());
+                    return Err(MetaDbError::Corruption(
+                        "checkpoint install lane worker exited before reporting".into(),
+                    ));
+                }
+            }
         }
         self.finish_dedup_manifest_update(dedup_update, tree_generation)?;
         drop(manifest_state);
@@ -823,7 +911,7 @@ impl Db {
         }
 
         let reclaim_started = std::time::Instant::now();
-        self.reclaim_freed_pages()?;
+        self.reclaim_freed_pages_budget(FLUSH_RECLAIM_BUDGET_PAGES)?;
         crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
         self.metrics.record_flush_reclaim(reclaim_started.elapsed());
         self.metrics.record_flush_total(flush_started.elapsed());
@@ -857,10 +945,20 @@ impl Db {
     /// hit the stale cached entry instead of fetching the new content.
     pub(crate) fn reclaim_freed_pages(&self) -> Result<()> {
         let reclaimed = self.page_store.try_reclaim()?;
+        self.invalidate_reclaimed_pages(reclaimed);
+        Ok(())
+    }
+
+    pub(crate) fn reclaim_freed_pages_budget(&self, max_pages: usize) -> Result<()> {
+        let reclaimed = self.page_store.try_reclaim_limit(max_pages)?;
+        self.invalidate_reclaimed_pages(reclaimed);
+        Ok(())
+    }
+
+    fn invalidate_reclaimed_pages(&self, reclaimed: Vec<crate::types::PageId>) {
         for pid in reclaimed {
             self.page_cache.invalidate(pid);
         }
-        Ok(())
     }
 }
 

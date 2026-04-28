@@ -238,6 +238,7 @@ struct ApplyLaneInner {
 }
 
 struct ApplyLaneState {
+    maintenance: VecDeque<Arc<ApplyLaneTaskSlot>>,
     queue: VecDeque<ApplyLaneTask>,
     last_enqueued_lsn: Lsn,
     last_applied_lsn: Lsn,
@@ -245,7 +246,7 @@ struct ApplyLaneState {
 }
 
 struct ApplyLaneTask {
-    lsn: Lsn,
+    lsn: Option<Lsn>,
     slot: Arc<ApplyLaneTaskSlot>,
 }
 
@@ -262,6 +263,7 @@ impl ApplyLane {
     fn new(last_applied_lsn: Lsn) -> Self {
         let inner = Arc::new(ApplyLaneInner {
             state: Mutex::new(ApplyLaneState {
+                maintenance: VecDeque::new(),
                 queue: VecDeque::new(),
                 last_enqueued_lsn: last_applied_lsn,
                 last_applied_lsn,
@@ -290,6 +292,12 @@ impl ApplyLane {
         PendingApplyWork { slot: Some(slot) }
     }
 
+    fn enqueue_maintenance(&self, work: ApplyWork) {
+        let mut state = self.inner.state.lock();
+        state.maintenance.push_back(ApplyLaneTaskSlot::ready(work));
+        self.inner.cvar.notify_one();
+    }
+
     fn enqueue_task(&self, lsn: Lsn, slot: Arc<ApplyLaneTaskSlot>) {
         let mut state = self.inner.state.lock();
         debug_assert!(
@@ -298,7 +306,10 @@ impl ApplyLane {
             state.last_enqueued_lsn
         );
         state.last_enqueued_lsn = lsn;
-        state.queue.push_back(ApplyLaneTask { lsn, slot });
+        state.queue.push_back(ApplyLaneTask {
+            lsn: Some(lsn),
+            slot,
+        });
         self.inner.cvar.notify_one();
     }
 
@@ -308,7 +319,8 @@ impl ApplyLane {
     }
 
     pub(crate) fn queue_len(&self) -> usize {
-        self.inner.state.lock().queue.len()
+        let state = self.inner.state.lock();
+        state.queue.len() + state.maintenance.len()
     }
 }
 
@@ -377,6 +389,9 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
         let task = {
             let mut state = inner.state.lock();
             loop {
+                if let Some(slot) = state.maintenance.pop_front() {
+                    break ApplyLaneTask { lsn: None, slot };
+                }
                 if let Some(task) = state.queue.pop_front() {
                     break task;
                 }
@@ -390,14 +405,16 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
         let work = task.slot.take();
         let _ = catch_unwind(AssertUnwindSafe(work));
 
+        let Some(lsn) = task.lsn else { continue };
+
         let mut state = inner.state.lock();
         debug_assert!(
-            state.last_applied_lsn < task.lsn,
+            state.last_applied_lsn < lsn,
             "apply lane finished out of order: last={}, done={}",
             state.last_applied_lsn,
-            task.lsn
+            lsn
         );
-        state.last_applied_lsn = task.lsn;
+        state.last_applied_lsn = lsn;
         inner.cvar.notify_all();
     }
 }
