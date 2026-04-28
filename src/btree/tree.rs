@@ -134,6 +134,18 @@ impl BTree {
         self.buf.page_store()
     }
 
+    /// Diagnostic snapshot of in-memory bookkeeping sizes per refcount
+    /// shard. Returns (private_pages, retired_pages, pagebuf_total,
+    /// pagebuf_dirty).
+    pub fn growth_summary(&self) -> (usize, usize, usize, usize) {
+        (
+            self.private_pages.len(),
+            self.retired_pages.len(),
+            self.buf.len(),
+            self.buf.dirty_count(),
+        )
+    }
+
     fn alloc_leaf_private(&mut self, generation: Lsn) -> Result<PageId> {
         let pid = self.buf.alloc_leaf(generation)?;
         self.private_pages.insert(pid);

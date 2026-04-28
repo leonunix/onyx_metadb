@@ -80,6 +80,26 @@ impl WalSet {
 
     /// Submit to a chosen lane while preserving one global LSN space.
     pub(crate) fn submit_to(&self, lane: usize, body: Vec<u8>) -> Result<Lsn> {
+        self.submit_to_reserved(lane, body, |_| {})
+    }
+
+    /// Submit to a chosen lane and run `reserve(lsn)` while the global
+    /// LSN allocator mutex is still held.
+    ///
+    /// Db's dispatch scheduler uses this to publish each commit's shard
+    /// footprint before any higher LSN can be allocated. Without that
+    /// reservation window, a fast higher-LSN WAL lane could dispatch into
+    /// a shard before a slower lower-LSN commit had even registered that
+    /// it needs the same shard.
+    pub(crate) fn submit_to_reserved<F>(
+        &self,
+        lane: usize,
+        body: Vec<u8>,
+        reserve: F,
+    ) -> Result<Lsn>
+    where
+        F: FnOnce(Lsn),
+    {
         if self.lanes.is_empty() {
             return Err(MetaDbError::Corruption("WalSet has no lanes".into()));
         }
@@ -102,6 +122,7 @@ impl WalSet {
                     return Err(err);
                 }
             };
+            reserve(lsn);
             (lsn, ack)
         };
 

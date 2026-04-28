@@ -47,7 +47,8 @@ pub use btree::{BTree, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter};
 pub use cache::{PageCache, PageCacheStats};
 pub use config::{Config, PAGE_SIZE};
 pub use db::{
-    Db, DbDedupIter, DbRangeIter, DbRefcountIter, DropReport, DropVolumeReport, SnapshotView,
+    Db, DbDedupIter, DbRangeIter, DbRefcountIter, DropReport, DropVolumeReport, PendingState,
+    SnapshotView,
 };
 pub use error::{MetaDbError, Result};
 pub use lsm::{

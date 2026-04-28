@@ -44,6 +44,12 @@ pub(crate) struct FlushedSnapshot {
     pages: Vec<FlushedSnapshotPage>,
 }
 
+impl FlushedSnapshot {
+    pub(crate) fn pages_count(&self) -> usize {
+        self.pages.len()
+    }
+}
+
 struct DirtySnapshotPage {
     pid: PageId,
     original: Page,

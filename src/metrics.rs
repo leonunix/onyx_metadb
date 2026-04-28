@@ -108,6 +108,28 @@ pub struct MetaMetrics {
     l2p_get_lock_wait_max_us: AtomicU64,
     l2p_get_tree_walk_us: AtomicU64,
     l2p_get_tree_walk_max_us: AtomicU64,
+
+    // Per-phase flush timing. Splits `Db::flush()` into the gate /
+    // sample / IO / manifest / install phases so we can tell which one
+    // is the long pole when buffer fills up faster than checkpoint
+    // drains. `flush_calls` counts completed (success or error) flush
+    // invocations.
+    flush_calls: AtomicU64,
+    flush_total_us: AtomicU64,
+    flush_total_max_us: AtomicU64,
+    flush_gate_wait_us: AtomicU64,
+    flush_gate_wait_max_us: AtomicU64,
+    flush_sample_us: AtomicU64,
+    flush_sample_max_us: AtomicU64,
+    flush_io_us: AtomicU64,
+    flush_io_max_us: AtomicU64,
+    flush_manifest_us: AtomicU64,
+    flush_manifest_max_us: AtomicU64,
+    flush_install_us: AtomicU64,
+    flush_install_max_us: AtomicU64,
+    flush_reclaim_us: AtomicU64,
+    flush_reclaim_max_us: AtomicU64,
+    flush_pages_written: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -203,6 +225,22 @@ pub struct MetaMetricsSnapshot {
     pub l2p_get_lock_wait_max_us: u64,
     pub l2p_get_tree_walk_us: u64,
     pub l2p_get_tree_walk_max_us: u64,
+    pub flush_calls: u64,
+    pub flush_total_us: u64,
+    pub flush_total_max_us: u64,
+    pub flush_gate_wait_us: u64,
+    pub flush_gate_wait_max_us: u64,
+    pub flush_sample_us: u64,
+    pub flush_sample_max_us: u64,
+    pub flush_io_us: u64,
+    pub flush_io_max_us: u64,
+    pub flush_manifest_us: u64,
+    pub flush_manifest_max_us: u64,
+    pub flush_install_us: u64,
+    pub flush_install_max_us: u64,
+    pub flush_reclaim_us: u64,
+    pub flush_reclaim_max_us: u64,
+    pub flush_pages_written: u64,
 }
 
 impl MetaMetrics {
@@ -303,7 +341,65 @@ impl MetaMetrics {
             l2p_get_lock_wait_max_us: load(&self.l2p_get_lock_wait_max_us),
             l2p_get_tree_walk_us: load(&self.l2p_get_tree_walk_us),
             l2p_get_tree_walk_max_us: load(&self.l2p_get_tree_walk_max_us),
+            flush_calls: load(&self.flush_calls),
+            flush_total_us: load(&self.flush_total_us),
+            flush_total_max_us: load(&self.flush_total_max_us),
+            flush_gate_wait_us: load(&self.flush_gate_wait_us),
+            flush_gate_wait_max_us: load(&self.flush_gate_wait_max_us),
+            flush_sample_us: load(&self.flush_sample_us),
+            flush_sample_max_us: load(&self.flush_sample_max_us),
+            flush_io_us: load(&self.flush_io_us),
+            flush_io_max_us: load(&self.flush_io_max_us),
+            flush_manifest_us: load(&self.flush_manifest_us),
+            flush_manifest_max_us: load(&self.flush_manifest_max_us),
+            flush_install_us: load(&self.flush_install_us),
+            flush_install_max_us: load(&self.flush_install_max_us),
+            flush_reclaim_us: load(&self.flush_reclaim_us),
+            flush_reclaim_max_us: load(&self.flush_reclaim_max_us),
+            flush_pages_written: load(&self.flush_pages_written),
         }
+    }
+
+    pub(crate) fn record_flush_attempt(&self) {
+        self.flush_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_flush_total(&self, total: Duration) {
+        record_duration(&self.flush_total_us, &self.flush_total_max_us, total);
+    }
+
+    pub(crate) fn record_flush_gate_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_gate_wait_us,
+            &self.flush_gate_wait_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_flush_sample(&self, elapsed: Duration) {
+        record_duration(&self.flush_sample_us, &self.flush_sample_max_us, elapsed);
+    }
+
+    pub(crate) fn record_flush_io(&self, elapsed: Duration, pages: usize) {
+        record_duration(&self.flush_io_us, &self.flush_io_max_us, elapsed);
+        self.flush_pages_written
+            .fetch_add(pages as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_flush_manifest(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_manifest_us,
+            &self.flush_manifest_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_flush_install(&self, elapsed: Duration) {
+        record_duration(&self.flush_install_us, &self.flush_install_max_us, elapsed);
+    }
+
+    pub(crate) fn record_flush_reclaim(&self, elapsed: Duration) {
+        record_duration(&self.flush_reclaim_us, &self.flush_reclaim_max_us, elapsed);
     }
 
     pub(crate) fn record_commit_empty(&self) {
@@ -679,7 +775,23 @@ impl MetaMetricsSnapshot {
                 "\"l2p_get_lock_wait_us\":{},",
                 "\"l2p_get_lock_wait_max_us\":{},",
                 "\"l2p_get_tree_walk_us\":{},",
-                "\"l2p_get_tree_walk_max_us\":{}",
+                "\"l2p_get_tree_walk_max_us\":{},",
+                "\"flush_calls\":{},",
+                "\"flush_total_us\":{},",
+                "\"flush_total_max_us\":{},",
+                "\"flush_gate_wait_us\":{},",
+                "\"flush_gate_wait_max_us\":{},",
+                "\"flush_sample_us\":{},",
+                "\"flush_sample_max_us\":{},",
+                "\"flush_io_us\":{},",
+                "\"flush_io_max_us\":{},",
+                "\"flush_manifest_us\":{},",
+                "\"flush_manifest_max_us\":{},",
+                "\"flush_install_us\":{},",
+                "\"flush_install_max_us\":{},",
+                "\"flush_reclaim_us\":{},",
+                "\"flush_reclaim_max_us\":{},",
+                "\"flush_pages_written\":{}",
                 "}}"
             ),
             self.commit_attempts,
@@ -773,6 +885,22 @@ impl MetaMetricsSnapshot {
             self.l2p_get_lock_wait_max_us,
             self.l2p_get_tree_walk_us,
             self.l2p_get_tree_walk_max_us,
+            self.flush_calls,
+            self.flush_total_us,
+            self.flush_total_max_us,
+            self.flush_gate_wait_us,
+            self.flush_gate_wait_max_us,
+            self.flush_sample_us,
+            self.flush_sample_max_us,
+            self.flush_io_us,
+            self.flush_io_max_us,
+            self.flush_manifest_us,
+            self.flush_manifest_max_us,
+            self.flush_install_us,
+            self.flush_install_max_us,
+            self.flush_reclaim_us,
+            self.flush_reclaim_max_us,
+            self.flush_pages_written,
         )
     }
 }

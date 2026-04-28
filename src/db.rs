@@ -7,7 +7,7 @@
 //! - thread-safe point writes via one mutex per shard
 //! - fan-out range / diff / snapshot operations
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::{Bound, RangeBounds};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -108,11 +108,12 @@ pub struct Db {
     /// commit fails after a higher-LSN commit has already been durably
     /// acked by another WAL lane.
     commit_poison: Mutex<Option<String>>,
-    /// LSN of the most recent WAL record dispatched into per-shard apply
-    /// lanes. Dispatch remains global-LSN FIFO and does only the short
-    /// enqueue work; expensive tree/LSM apply happens after this advances.
-    last_dispatched_lsn: Mutex<Lsn>,
-    /// Notified whenever `last_dispatched_lsn` advances.
+    /// Scheduler for post-WAL dispatch into apply lanes. It lets a higher
+    /// LSN bypass lower LSNs only when their declared lane footprints are
+    /// disjoint; conflicting commits still dispatch in WAL order.
+    dispatch_state: Mutex<DispatchState>,
+    /// Notified whenever a dispatch reservation is registered, becomes
+    /// durable, or completes.
     dispatch_cvar: Condvar,
     /// Snapshot readers hold a shared guard; `drop_snapshot` takes the
     /// exclusive side so it can't free pages still visible to a live view.
@@ -168,6 +169,29 @@ struct ManifestState {
     manifest: Manifest,
 }
 
+#[derive(Clone, Debug)]
+struct DispatchFootprint {
+    global: bool,
+    lanes: BTreeSet<DispatchLaneKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum DispatchLaneKey {
+    L2p(VolumeOrdinal, usize),
+    Refcount(usize),
+    Dedup,
+}
+
+#[derive(Default)]
+struct DispatchState {
+    pending: BTreeMap<Lsn, DispatchEntry>,
+}
+
+struct DispatchEntry {
+    footprint: DispatchFootprint,
+    durable: bool,
+}
+
 /// Snapshot view info cached per volume, used by `apply_l2p_remap` /
 /// `apply_l2p_range_delete` to decide whether decref of a pba would
 /// orphan content a live snapshot still pins. See [`Db::snap_info_cache`].
@@ -182,6 +206,25 @@ struct SnapInfo {
 }
 
 type ApplyWork = Box<dyn FnOnce() + Send + 'static>;
+
+/// Diagnostic snapshot of in-memory bookkeeping that can grow
+/// unbounded if a downstream drain stalls. See [`Db::pending_state`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingState {
+    pub dispatch_pending: usize,
+    pub deferred_free: usize,
+    pub dedup_lane_queue: usize,
+    pub l2p_apply_queue: usize,
+    pub l2p_private_pages: usize,
+    pub l2p_retired_pages: usize,
+    pub l2p_pagebuf_total: usize,
+    pub l2p_pagebuf_dirty: usize,
+    pub rc_apply_queue: usize,
+    pub rc_private_pages: usize,
+    pub rc_retired_pages: usize,
+    pub rc_pagebuf_total: usize,
+    pub rc_pagebuf_dirty: usize,
+}
 
 struct ApplyLane {
     inner: Arc<ApplyLaneInner>,
@@ -261,6 +304,10 @@ impl ApplyLane {
     #[allow(dead_code)]
     fn last_applied_lsn(&self) -> Lsn {
         self.inner.state.lock().last_applied_lsn
+    }
+
+    pub(crate) fn queue_len(&self) -> usize {
+        self.inner.state.lock().queue.len()
     }
 }
 

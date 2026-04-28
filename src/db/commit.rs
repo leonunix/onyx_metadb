@@ -36,6 +36,38 @@ struct QueuedLanePlan {
     dedup_pending: Option<PendingApplyWork>,
 }
 
+impl DispatchFootprint {
+    pub(super) fn global() -> Self {
+        Self {
+            global: true,
+            lanes: BTreeSet::new(),
+        }
+    }
+
+    fn from_lane_plan(plan: &LaneDispatchPlan) -> Self {
+        let mut lanes = BTreeSet::new();
+        for ((vol_ord, sid), _) in &plan.l2p_sorted {
+            lanes.insert(DispatchLaneKey::L2p(*vol_ord, *sid));
+        }
+        for (sid, enqueued) in plan.rc_enqueued.iter().copied().enumerate() {
+            if enqueued {
+                lanes.insert(DispatchLaneKey::Refcount(sid));
+            }
+        }
+        if !plan.dedup_idxs.is_empty() {
+            lanes.insert(DispatchLaneKey::Dedup);
+        }
+        Self {
+            global: false,
+            lanes,
+        }
+    }
+
+    fn conflicts(&self, other: &Self) -> bool {
+        self.global || other.global || self.lanes.iter().any(|lane| other.lanes.contains(lane))
+    }
+}
+
 fn wal_lane_key(op: &WalOp) -> u64 {
     match op {
         WalOp::L2pPut { vol_ord, lba, .. }
@@ -66,6 +98,17 @@ fn wal_lane_key(op: &WalOp) -> u64 {
         }
         WalOp::CloneVolume { new_ord, .. } => xxh3_64(&new_ord.to_be_bytes()),
     }
+}
+
+fn dispatch_ready(state: &DispatchState, lsn: Lsn) -> bool {
+    let Some(entry) = state.pending.get(&lsn) else {
+        return false;
+    };
+    entry.durable
+        && state
+            .pending
+            .range(..lsn)
+            .all(|(_, lower)| !entry.footprint.conflicts(&lower.footprint))
 }
 
 impl Db {
@@ -109,9 +152,32 @@ impl Db {
         let _drop_guard = self.drop_gate.read();
         self.metrics
             .record_commit_drop_gate_wait(drop_gate_started.elapsed());
+        // Plan the lane footprint before LSN allocation. `submit_wal_ops`
+        // registers this footprint while the WAL set still holds its
+        // allocator mutex, so every lower LSN's footprint is known before
+        // a higher LSN can be assigned.
+        let volumes = self.volumes.read().clone();
+        let serial_apply = self.batch_uses_serial_apply(ops);
+        let plan = if serial_apply {
+            None
+        } else {
+            match self.build_lane_dispatch_plan(&volumes, ops) {
+                Ok(plan) => Some(plan),
+                Err(err) => {
+                    self.metrics.record_commit_error(commit_started.elapsed());
+                    self.poison_commit_waiters(&err);
+                    return Err(err);
+                }
+            }
+        };
+        let dispatch_footprint = plan
+            .as_ref()
+            .map(DispatchFootprint::from_lane_plan)
+            .unwrap_or_else(DispatchFootprint::global);
+
         let body = encode_body(ops);
         let wal_started = std::time::Instant::now();
-        let lsn = match self.submit_wal_ops(ops, body) {
+        let lsn = match self.submit_wal_ops(ops, body, Some(dispatch_footprint)) {
             Ok(lsn) => {
                 self.metrics.record_commit_wal_submit(wal_started.elapsed());
                 lsn
@@ -129,12 +195,10 @@ impl Db {
             return Err(err);
         }
 
-        // Wait for our LSN to become the next dispatch slot. We do not
-        // advance the dispatch watermark until the work has either been
-        // queued into lanes (parallel path) or fully applied (serial
-        // fallback path), so higher LSNs cannot overtake us.
+        // Wait until every lower durable-or-in-flight LSN that touches one
+        // of our lanes has dispatched. Disjoint lower LSNs do not block us.
         let wait_started = std::time::Instant::now();
-        if let Err(err) = self.wait_for_dispatch_turn(lsn) {
+        if let Err(err) = self.mark_wal_durable_and_wait_for_dispatch(lsn) {
             self.metrics
                 .record_commit_apply_wait(wait_started.elapsed());
             self.metrics.record_commit_error(commit_started.elapsed());
@@ -147,30 +211,11 @@ impl Db {
         let apply_guard = self.apply_gate.read();
         self.metrics
             .record_commit_apply_gate_wait(apply_gate_started.elapsed());
-        // Clone out the volume map once per commit — HashMap + `Arc`
-        // clones are cheap, and keeping the Arcs live for the whole
-        // apply loop avoids holding `volumes.read()` across apply.
-        // That matters because commit 8+ will acquire `volumes.write()`
-        // on the lifecycle path, and a long-held reader would stall it.
-        let volumes = self.volumes.read().clone();
-        let serial_apply = self.batch_uses_serial_apply(ops);
-        let plan = if serial_apply {
-            None
-        } else {
-            match self.build_lane_dispatch_plan(&volumes, ops) {
-                Ok(plan) => Some(plan),
-                Err(err) => {
-                    self.metrics.record_commit_error(commit_started.elapsed());
-                    self.poison_commit_waiters(&err);
-                    return Err(err);
-                }
-            }
-        };
 
         let apply_started = std::time::Instant::now();
         let outcomes = if let Some(plan) = plan {
             let queued_plan = self.enqueue_lane_plan(&volumes, lsn, plan, Arc::new(ops.to_vec()));
-            self.advance_dispatch_lsn(lsn);
+            self.complete_retained_dispatch(lsn);
             match self.apply_ops_laned(lsn, ops.len(), queued_plan) {
                 Ok(outcomes) => {
                     self.metrics.record_commit_apply(apply_started.elapsed());
@@ -217,7 +262,7 @@ impl Db {
             return Err(err);
         }
         if serial_apply {
-            self.advance_dispatch_lsn(lsn);
+            self.complete_retained_dispatch(lsn);
         }
         drop(apply_guard);
         self.metrics.record_commit_success(commit_started.elapsed());
@@ -266,9 +311,19 @@ impl Db {
         Ok(outcome)
     }
 
-    pub(super) fn submit_wal_ops(&self, ops: &[WalOp], body: Vec<u8>) -> Result<Lsn> {
+    pub(super) fn submit_wal_ops(
+        &self,
+        ops: &[WalOp],
+        body: Vec<u8>,
+        footprint: Option<DispatchFootprint>,
+    ) -> Result<Lsn> {
         let lane = self.wal_lane_for_ops(ops);
-        self.wal.submit_to(lane, body)
+        match footprint {
+            Some(footprint) => self.wal.submit_to_reserved(lane, body, |lsn| {
+                self.register_dispatch_intent(lsn, footprint);
+            }),
+            None => self.wal.submit_to(lane, body),
+        }
     }
 
     fn wal_lane_for_ops(&self, ops: &[WalOp]) -> usize {
@@ -374,28 +429,57 @@ impl Db {
             .map(|msg| MetaDbError::Corruption(format!("commit pipeline failed: {msg}")))
     }
 
-    fn wait_for_dispatch_turn(&self, lsn: Lsn) -> Result<()> {
-        let mut dispatched = self.last_dispatched_lsn.lock();
-        while *dispatched + 1 < lsn {
+    fn register_dispatch_intent(&self, lsn: Lsn, footprint: DispatchFootprint) {
+        let mut state = self.dispatch_state.lock();
+        let old = state.pending.insert(
+            lsn,
+            DispatchEntry {
+                footprint,
+                durable: false,
+            },
+        );
+        debug_assert!(
+            old.is_none(),
+            "duplicate dispatch reservation for LSN {lsn}"
+        );
+        self.dispatch_cvar.notify_all();
+    }
+
+    fn mark_wal_durable_and_wait_for_dispatch(&self, lsn: Lsn) -> Result<()> {
+        let mut state = self.dispatch_state.lock();
+        let entry = state.pending.get_mut(&lsn).ok_or_else(|| {
+            MetaDbError::Corruption(format!("missing dispatch reservation for LSN {lsn}"))
+        })?;
+        entry.durable = true;
+        self.dispatch_cvar.notify_all();
+
+        loop {
             if let Some(err) = self.commit_poison_error() {
                 return Err(err);
             }
-            self.dispatch_cvar.wait(&mut dispatched);
+            if dispatch_ready(&state, lsn) {
+                return Ok(());
+            }
+            self.dispatch_cvar.wait(&mut state);
         }
-        Ok(())
+    }
+
+    fn forget_dispatch_intent(&self, lsn: Lsn) {
+        let mut state = self.dispatch_state.lock();
+        state.pending.remove(&lsn);
+        self.dispatch_cvar.notify_all();
+    }
+
+    fn complete_retained_dispatch(&self, lsn: Lsn) {
+        self.forget_dispatch_intent(lsn);
     }
 
     pub(super) fn advance_dispatch_lsn(&self, lsn: Lsn) {
-        let mut dispatched = self.last_dispatched_lsn.lock();
-        if *dispatched < lsn {
-            debug_assert_eq!(
-                *dispatched + 1,
-                lsn,
-                "dispatch LSN advanced non-contiguously"
-            );
-            *dispatched = lsn;
-            self.dispatch_cvar.notify_all();
-        }
+        // Lifecycle paths still call this at the old "dispatch complete"
+        // point. They hold `drop_gate.write()` and `apply_gate.write()`,
+        // so ordinary commits cannot have in-flight dispatch reservations
+        // that need ordering against them.
+        self.forget_dispatch_intent(lsn);
     }
 
     pub(super) fn wait_for_global_apply_turn(&self, lsn: Lsn) -> Result<()> {
@@ -1058,5 +1142,71 @@ fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Du
         | WalOp::CreateVolume { .. }
         | WalOp::DropVolume { .. }
         | WalOp::CloneVolume { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn footprint(lanes: impl IntoIterator<Item = DispatchLaneKey>) -> DispatchFootprint {
+        DispatchFootprint {
+            global: false,
+            lanes: lanes.into_iter().collect(),
+        }
+    }
+
+    fn entry(footprint: DispatchFootprint, durable: bool) -> DispatchEntry {
+        DispatchEntry { footprint, durable }
+    }
+
+    #[test]
+    fn dispatch_scheduler_allows_disjoint_higher_lsn_to_bypass() {
+        let mut state = DispatchState::default();
+        state
+            .pending
+            .insert(10, entry(footprint([DispatchLaneKey::L2p(0, 0)]), false));
+        state
+            .pending
+            .insert(11, entry(footprint([DispatchLaneKey::L2p(0, 1)]), true));
+
+        assert!(
+            dispatch_ready(&state, 11),
+            "lower undurable work on another shard must not block dispatch"
+        );
+    }
+
+    #[test]
+    fn dispatch_scheduler_blocks_conflicting_higher_lsn() {
+        let mut state = DispatchState::default();
+        state
+            .pending
+            .insert(10, entry(footprint([DispatchLaneKey::Refcount(2)]), false));
+        state
+            .pending
+            .insert(11, entry(footprint([DispatchLaneKey::Refcount(2)]), true));
+
+        assert!(
+            !dispatch_ready(&state, 11),
+            "same lane must preserve WAL LSN dispatch order"
+        );
+        state.pending.remove(&10);
+        assert!(dispatch_ready(&state, 11));
+    }
+
+    #[test]
+    fn dispatch_scheduler_treats_global_as_conflicting_with_every_lane() {
+        let mut state = DispatchState::default();
+        state
+            .pending
+            .insert(10, entry(DispatchFootprint::global(), true));
+        state
+            .pending
+            .insert(11, entry(footprint([DispatchLaneKey::Dedup]), true));
+
+        assert!(
+            !dispatch_ready(&state, 11),
+            "global serial work must retain the old FIFO barrier"
+        );
     }
 }

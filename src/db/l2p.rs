@@ -239,7 +239,7 @@ impl Db {
             };
             let body = encode_body(std::slice::from_ref(&op));
             let wal_started = std::time::Instant::now();
-            let lsn = match self.submit_wal_ops(std::slice::from_ref(&op), body) {
+            let lsn = match self.submit_wal_ops(std::slice::from_ref(&op), body, None) {
                 Ok(lsn) => {
                     self.metrics.record_range_delete_wal(wal_started.elapsed());
                     lsn

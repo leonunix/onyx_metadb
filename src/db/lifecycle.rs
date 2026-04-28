@@ -98,7 +98,7 @@ impl Db {
             last_applied_lsn: Mutex::new(0),
             commit_cvar: Condvar::new(),
             commit_poison: Mutex::new(None),
-            last_dispatched_lsn: Mutex::new(0),
+            dispatch_state: Mutex::new(DispatchState::default()),
             dispatch_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             drop_gate: RwLock::new(()),
@@ -455,7 +455,7 @@ impl Db {
             last_applied_lsn: Mutex::new(last_applied),
             commit_cvar: Condvar::new(),
             commit_poison: Mutex::new(None),
-            last_dispatched_lsn: Mutex::new(last_applied),
+            dispatch_state: Mutex::new(DispatchState::default()),
             dispatch_cvar: Condvar::new(),
             snapshot_views: RwLock::new(()),
             drop_gate: RwLock::new(()),
@@ -514,9 +514,69 @@ impl Db {
         self.metrics.snapshot()
     }
 
+    /// Diagnostic snapshot of in-memory bookkeeping that can grow
+    /// unbounded if its drain path stalls (deferred reclaim, dispatch
+    /// FIFO, per-shard apply lane queues, per-shard COW retired/private
+    /// page sets, page-buf totals). Cheap: each field is a single
+    /// `len()` call. Intended for OOM triage during soak — these are
+    /// the structures most likely to leak when a worker thread falls
+    /// behind. Aggregates across all volumes' L2P shards plus refcount
+    /// shards plus the dedup lane.
+    pub fn pending_state(&self) -> PendingState {
+        let dispatch_pending = self.dispatch_state.lock().pending.len();
+        let deferred_free = self.page_store.deferred_free_len();
+        let dedup_lane_queue = self.dedup_lane.queue_len();
+        let mut l2p_apply_queue = 0usize;
+        let mut l2p_private_pages = 0usize;
+        let mut l2p_retired_pages = 0usize;
+        let mut l2p_pagebuf_total = 0usize;
+        let mut l2p_pagebuf_dirty = 0usize;
+        for volume in self.volumes.read().values() {
+            for shard in &volume.shards {
+                l2p_apply_queue += shard.apply_lane.queue_len();
+                let tree = shard.tree.read();
+                let (priv_p, ret_p, total, dirty) = tree.growth_summary();
+                l2p_private_pages += priv_p;
+                l2p_retired_pages += ret_p;
+                l2p_pagebuf_total += total;
+                l2p_pagebuf_dirty += dirty;
+            }
+        }
+        let mut rc_apply_queue = 0usize;
+        let mut rc_private_pages = 0usize;
+        let mut rc_retired_pages = 0usize;
+        let mut rc_pagebuf_total = 0usize;
+        let mut rc_pagebuf_dirty = 0usize;
+        for shard in &self.refcount_shards {
+            rc_apply_queue += shard.apply_lane.queue_len();
+            let tree = shard.tree.lock();
+            let (priv_p, ret_p, total, dirty) = tree.growth_summary();
+            rc_private_pages += priv_p;
+            rc_retired_pages += ret_p;
+            rc_pagebuf_total += total;
+            rc_pagebuf_dirty += dirty;
+        }
+        PendingState {
+            dispatch_pending,
+            deferred_free,
+            dedup_lane_queue,
+            l2p_apply_queue,
+            l2p_private_pages,
+            l2p_retired_pages,
+            l2p_pagebuf_total,
+            l2p_pagebuf_dirty,
+            rc_apply_queue,
+            rc_private_pages,
+            rc_retired_pages,
+            rc_pagebuf_total,
+            rc_pagebuf_dirty,
+        }
+    }
+
     pub fn metrics_json(&self) -> String {
         let cache = self.cache_stats();
         let metrics = self.metrics_snapshot();
+        let pending = self.pending_state();
         format!(
             concat!(
                 "{{",
@@ -533,6 +593,21 @@ impl Db {
                 "\"pinned_bytes\":{},",
                 "\"pin_budget_bytes\":{}",
                 "}},",
+                "\"pending\":{{",
+                "\"dispatch\":{},",
+                "\"deferred_free\":{},",
+                "\"dedup_lane_queue\":{},",
+                "\"l2p_apply_queue\":{},",
+                "\"l2p_private_pages\":{},",
+                "\"l2p_retired_pages\":{},",
+                "\"l2p_pagebuf_total\":{},",
+                "\"l2p_pagebuf_dirty\":{},",
+                "\"rc_apply_queue\":{},",
+                "\"rc_private_pages\":{},",
+                "\"rc_retired_pages\":{},",
+                "\"rc_pagebuf_total\":{},",
+                "\"rc_pagebuf_dirty\":{}",
+                "}},",
                 "\"meta\":{}",
                 "}}"
             ),
@@ -547,6 +622,19 @@ impl Db {
             cache.pinned_pages,
             cache.pinned_bytes,
             cache.pin_budget_bytes,
+            pending.dispatch_pending,
+            pending.deferred_free,
+            pending.dedup_lane_queue,
+            pending.l2p_apply_queue,
+            pending.l2p_private_pages,
+            pending.l2p_retired_pages,
+            pending.l2p_pagebuf_total,
+            pending.l2p_pagebuf_dirty,
+            pending.rc_apply_queue,
+            pending.rc_private_pages,
+            pending.rc_retired_pages,
+            pending.rc_pagebuf_total,
+            pending.rc_pagebuf_dirty,
             metrics.to_json(),
         )
     }
@@ -563,7 +651,12 @@ impl Db {
         // the sampled roots before we drop its shard lock; later commits
         // COW away from those pages, so dirty page IO can run without
         // holding either the global gate or every shard lock.
+        self.metrics.record_flush_attempt();
+        let flush_started = std::time::Instant::now();
+        let gate_started = std::time::Instant::now();
         let apply_guard = self.apply_gate.write();
+        self.metrics.record_flush_gate_wait(gate_started.elapsed());
+        let sample_started = std::time::Instant::now();
         let volumes = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
         let mut refcount_guards = self.lock_all_refcount_shards();
@@ -584,14 +677,23 @@ impl Db {
         drop(refcount_guards);
         drop(l2p_guards);
         drop(apply_guard);
+        self.metrics.record_flush_sample(sample_started.elapsed());
 
+        let io_started = std::time::Instant::now();
+        let mut total_pages_written = 0usize;
         let mut flushed_l2p = Vec::with_capacity(l2p_checkpoints.len());
         for checkpoints in &l2p_checkpoints {
             let mut flushed = Vec::with_capacity(checkpoints.len());
             for checkpoint in checkpoints {
                 match checkpoint.write_dirty_pages() {
-                    Ok(pages) => flushed.push(pages),
+                    Ok(pages) => {
+                        total_pages_written += pages.pages_count();
+                        flushed.push(pages);
+                    }
                     Err(err) => {
+                        self.metrics
+                            .record_flush_io(io_started.elapsed(), total_pages_written);
+                        self.metrics.record_flush_total(flush_started.elapsed());
                         self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
                         return Err(err);
                     }
@@ -602,20 +704,32 @@ impl Db {
         let mut flushed_refcount = Vec::with_capacity(refcount_checkpoints.len());
         for checkpoint in &refcount_checkpoints {
             match checkpoint.write_dirty_pages() {
-                Ok(pages) => flushed_refcount.push(pages),
+                Ok(pages) => {
+                    total_pages_written += pages.pages_count();
+                    flushed_refcount.push(pages);
+                }
                 Err(err) => {
+                    self.metrics
+                        .record_flush_io(io_started.elapsed(), total_pages_written);
+                    self.metrics.record_flush_total(flush_started.elapsed());
                     self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
                     return Err(err);
                 }
             }
         }
+        self.metrics
+            .record_flush_io(io_started.elapsed(), total_pages_written);
 
+        let manifest_started = std::time::Instant::now();
         let mut manifest_state = self.manifest_state.lock();
         let dedup_update = match self
             .prepare_dedup_manifest_update(&mut manifest_state.manifest, tree_generation)
         {
             Ok(update) => update,
             Err(err) => {
+                self.metrics
+                    .record_flush_manifest(manifest_started.elapsed());
+                self.metrics.record_flush_total(flush_started.elapsed());
                 self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
                 return Err(err);
             }
@@ -624,6 +738,9 @@ impl Db {
             .faults
             .inject(FaultPoint::FlushPostLevelRewriteBeforeManifest)
         {
+            self.metrics
+                .record_flush_manifest(manifest_started.elapsed());
+            self.metrics.record_flush_total(flush_started.elapsed());
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
             return Err(err);
         }
@@ -634,6 +751,9 @@ impl Db {
             &l2p_checkpoints,
             &refcount_checkpoints,
         ) {
+            self.metrics
+                .record_flush_manifest(manifest_started.elapsed());
+            self.metrics.record_flush_total(flush_started.elapsed());
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
             return Err(err);
         }
@@ -642,10 +762,16 @@ impl Db {
         manifest_state.manifest.checkpoint_lsn = wal_checkpoint;
         let manifest = manifest_state.manifest.clone();
         if let Err(err) = manifest_state.store.commit(&manifest) {
+            self.metrics
+                .record_flush_manifest(manifest_started.elapsed());
+            self.metrics.record_flush_total(flush_started.elapsed());
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
             return Err(err);
         }
+        self.metrics
+            .record_flush_manifest(manifest_started.elapsed());
 
+        let install_started = std::time::Instant::now();
         for (volume, (checkpoints, flushed)) in volumes
             .iter()
             .zip(l2p_checkpoints.into_iter().zip(flushed_l2p.into_iter()))
@@ -673,9 +799,13 @@ impl Db {
         }
         self.finish_dedup_manifest_update(dedup_update, tree_generation)?;
         drop(manifest_state);
+        self.metrics.record_flush_install(install_started.elapsed());
 
+        let reclaim_started = std::time::Instant::now();
         self.reclaim_freed_pages()?;
         crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
+        self.metrics.record_flush_reclaim(reclaim_started.elapsed());
+        self.metrics.record_flush_total(flush_started.elapsed());
         Ok(())
     }
 

@@ -159,6 +159,19 @@ impl PagedL2p {
         self.buf.page_cache()
     }
 
+    /// Diagnostic snapshot of in-memory bookkeeping sizes per shard.
+    /// Cheap (`HashSet/HashMap::len`); intended for OOM triage / soak
+    /// dashboards. Returns (private_pages, retired_pages, pagebuf_total,
+    /// pagebuf_dirty).
+    pub fn growth_summary(&self) -> (usize, usize, usize, usize) {
+        (
+            self.private_pages.len(),
+            self.retired_pages.len(),
+            self.buf.len(),
+            self.buf.dirty_count(),
+        )
+    }
+
     /// Capture a `ReadView` snapshot of the current tree state plus
     /// every still-dirty page Arc. Apply calls this before dropping
     /// `shard.tree.write()` so lock-free readers see post-apply state
