@@ -234,19 +234,21 @@ impl BTree {
         &mut self,
         checkpoint: Checkpoint,
         flushed: FlushedSnapshot,
-        generation: Lsn,
-    ) -> Result<()> {
+        _generation: Lsn,
+    ) -> Result<Vec<PageId>> {
         self.buf.install_flushed_snapshot(flushed);
+        let mut retired_to_free = Vec::new();
         for pid in &checkpoint.retired_pages {
             if self.retired_pages.remove(pid) {
-                self.buf.free(*pid, generation)?;
+                self.buf.detach_for_free(*pid);
+                retired_to_free.push(*pid);
             }
         }
         for pid in &checkpoint.private_pages {
             self.private_pages.remove(pid);
             self.checkpoint_protected.remove(pid);
         }
-        self.finish_op(Ok(()))
+        self.finish_op(Ok(retired_to_free))
     }
 
     pub(crate) fn abort_checkpoint(&mut self, checkpoint: &Checkpoint) {

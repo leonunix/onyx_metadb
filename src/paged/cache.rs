@@ -291,6 +291,12 @@ impl PageBuf {
         Ok(())
     }
 
+    /// Remove a page from this tree-local buffer because the caller is
+    /// about to enqueue it for deferred free outside the tree lock.
+    pub(crate) fn detach_for_free(&mut self, pid: PageId) {
+        self.pages_remove(pid);
+    }
+
     /// Effective refcount of `pid` combining the on-disk header with
     /// this op's queued [`pending_rc`](Self::pending_rc) delta. Used by
     /// [`PagedL2p::insert_at_lsn_with_share_info`](crate::paged::PagedL2p::insert_at_lsn_with_share_info)
@@ -654,15 +660,9 @@ impl PageBuf {
             if !Arc::ptr_eq(current, &page.original) {
                 continue;
             }
-            let is_index = matches!(
-                page.sealed.header().map(|h| h.page_type),
-                Ok(PageType::PagedIndex)
-            );
-            if is_index && self.page_cache.pin(page.pid, page.sealed.clone()) {
-                // Pinned pages shadow LRU lookups.
-            } else {
-                self.page_cache.insert(page.pid, page.sealed.clone());
-            }
+            // DirtySnapshot::write() has already published the sealed page to
+            // the shared PageCache outside the shard lock. Install only swaps
+            // this tree-local slot to Clean.
             self.pages_insert(page.pid, Slot::Clean(page.sealed));
         }
     }

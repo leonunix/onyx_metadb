@@ -385,12 +385,16 @@ impl Db {
             return true;
         }
 
+        // Guarded remaps used to fall back to serial apply because the
+        // lane path's `apply_l2p_bucket` did not honour the guard. The
+        // bucket now does the rc check inline (same lock order as the
+        // serial path: L2P shard write → refcount shard lock), so guard
+        // alone no longer forces serial. Snapshot-bearing volumes still
+        // need the serial path for the snap-pin walk inside
+        // `apply_l2p_remap`.
         let mut remap_vols = HashSet::new();
         for op in ops {
-            if let WalOp::L2pRemap { vol_ord, guard, .. } = op {
-                if guard.is_some() {
-                    return true;
-                }
+            if let WalOp::L2pRemap { vol_ord, .. } = op {
                 remap_vols.insert(*vol_ord);
             }
         }
@@ -598,6 +602,15 @@ impl Db {
         ops: Arc<Vec<WalOp>>,
     ) -> QueuedLanePlan {
         let mut l2p_receivers = Vec::with_capacity(plan.l2p_sorted.len());
+        // Snapshot refcount tree handles once per commit so the per-lane
+        // closures can do guarded-remap rc lookups (dedup hits) without
+        // touching the Db struct from the worker thread.
+        let refcount_trees: Arc<Vec<Arc<Mutex<BTree>>>> = Arc::new(
+            self.refcount_shards
+                .iter()
+                .map(|s| s.tree.clone())
+                .collect(),
+        );
         for ((vol_ord, sid), indices) in plan.l2p_sorted {
             let volume = volumes
                 .get(&vol_ord)
@@ -605,6 +618,7 @@ impl Db {
             let apply_volume = volume.clone();
             let apply_ops = ops.clone();
             let metrics = self.metrics.clone();
+            let refcount_trees = refcount_trees.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
             volume.shards[sid].apply_lane.enqueue_ready(
                 lsn,
@@ -615,6 +629,7 @@ impl Db {
                         indices,
                         lsn,
                         apply_ops.as_slice(),
+                        refcount_trees.as_slice(),
                         metrics.as_ref(),
                     );
                     let _ = tx.send(result);
@@ -650,6 +665,7 @@ impl Db {
         indices: Vec<usize>,
         lsn: Lsn,
         ops: &[WalOp],
+        refcount_trees: &[Arc<Mutex<BTree>>],
         metrics: &MetaMetrics,
     ) -> Result<L2pBucketApplyResult> {
         let mut outcomes = Vec::with_capacity(indices.len());
@@ -668,7 +684,39 @@ impl Db {
                     metrics.record_apply_l2p_delete(op_started.elapsed());
                     ApplyOutcome::L2pPrev(prev)
                 }
-                WalOp::L2pRemap { lba, new_value, .. } => {
+                WalOp::L2pRemap {
+                    lba,
+                    new_value,
+                    guard,
+                    ..
+                } => {
+                    // Guarded remaps (dedup hits): verify the target pba's
+                    // refcount still satisfies `min_rc` before mutating
+                    // L2P. Lock order matches the serial path
+                    // (`apply_l2p_remap` in apply.rs): L2P shard write →
+                    // refcount shard lock. Refcount lanes only ever take
+                    // their own shard's lock and never touch L2P, so
+                    // there is no L2P↔RC cycle.
+                    if let Some((gp, min_rc)) = guard {
+                        let gp_sid = (xxh3_64(&gp.to_be_bytes()) as usize)
+                            % refcount_trees.len();
+                        let cur = {
+                            let mut rc_tree = refcount_trees[gp_sid].lock();
+                            rc_tree.get(*gp)?.map(|e| e.rc).unwrap_or(0)
+                        };
+                        if cur < *min_rc {
+                            metrics.record_apply_l2p_remap(op_started.elapsed());
+                            outcomes.push((
+                                idx,
+                                ApplyOutcome::L2pRemap {
+                                    applied: false,
+                                    prev: None,
+                                    freed_pba: None,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
                     let prev = tree.insert_at_lsn(*lba, *new_value, lsn)?;
                     let value_changed = prev != Some(*new_value);
                     if value_changed {
@@ -730,6 +778,11 @@ impl Db {
         l2p_sorted: Vec<((VolumeOrdinal, usize), Vec<usize>)>,
     ) -> Result<Vec<L2pBucketApplyResult>> {
         let metrics = self.metrics.as_ref();
+        let refcount_trees: Vec<Arc<Mutex<BTree>>> = self
+            .refcount_shards
+            .iter()
+            .map(|s| s.tree.clone())
+            .collect();
         let mut results = Vec::with_capacity(l2p_sorted.len());
         for ((vol_ord, sid), indices) in l2p_sorted {
             let volume = volumes
@@ -737,7 +790,13 @@ impl Db {
                 .expect("volume presence checked during bucketing")
                 .clone();
             results.push(Self::apply_l2p_bucket(
-                volume, sid, indices, lsn, ops, metrics,
+                volume,
+                sid,
+                indices,
+                lsn,
+                ops,
+                &refcount_trees,
+                metrics,
             )?);
         }
         Ok(results)

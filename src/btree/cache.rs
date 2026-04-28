@@ -174,6 +174,12 @@ impl PageBuf {
         Ok(())
     }
 
+    /// Remove a page from this tree-local buffer because the caller is
+    /// about to enqueue it for deferred free outside the tree lock.
+    pub(crate) fn detach_for_free(&mut self, pid: PageId) {
+        self.pages.remove(&pid);
+    }
+
     /// Whether `pid` is currently in the cache.
     pub fn contains(&self, pid: PageId) -> bool {
         self.pages.contains_key(&pid)
@@ -258,7 +264,8 @@ impl PageBuf {
             if current.bytes() != page.original.bytes() {
                 continue;
             }
-            self.page_cache.insert(page.pid, page.sealed.clone());
+            // DirtySnapshot::write() has already refreshed the shared cache
+            // outside the shard lock; install only swaps the local slot.
             self.pages.insert(page.pid, Slot::Clean(page.sealed));
         }
     }

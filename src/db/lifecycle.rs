@@ -94,7 +94,7 @@ impl Db {
             dedup_reverse,
             dedup_lane: ApplyLane::new(0),
             wal,
-            apply_gate: RwLock::new(()),
+            apply_gate: ApplyGate::new(),
             last_applied_lsn: Mutex::new(0),
             commit_cvar: Condvar::new(),
             commit_poison: Mutex::new(None),
@@ -451,7 +451,7 @@ impl Db {
             dedup_reverse,
             dedup_lane: ApplyLane::new(last_applied),
             wal,
-            apply_gate: RwLock::new(()),
+            apply_gate: ApplyGate::new(),
             last_applied_lsn: Mutex::new(last_applied),
             commit_cvar: Condvar::new(),
             commit_poison: Mutex::new(None),
@@ -522,6 +522,14 @@ impl Db {
     /// the structures most likely to leak when a worker thread falls
     /// behind. Aggregates across all volumes' L2P shards plus refcount
     /// shards plus the dedup lane.
+    ///
+    /// **Non-blocking**: this is called by the onyx status socket
+    /// handler. Per-shard tree locks can be held by `flush.install`
+    /// for seconds at a time; using a blocking `tree.read()` /
+    /// `tree.lock()` here would freeze the status socket for the same
+    /// duration. Instead, try-acquire each lock and skip the shard's
+    /// contribution if it's contended. The result is best-effort and
+    /// undercounts during install; that's acceptable for diagnostics.
     pub fn pending_state(&self) -> PendingState {
         let dispatch_pending = self.dispatch_state.lock().pending.len();
         let deferred_free = self.page_store.deferred_free_len();
@@ -534,12 +542,13 @@ impl Db {
         for volume in self.volumes.read().values() {
             for shard in &volume.shards {
                 l2p_apply_queue += shard.apply_lane.queue_len();
-                let tree = shard.tree.read();
-                let (priv_p, ret_p, total, dirty) = tree.growth_summary();
-                l2p_private_pages += priv_p;
-                l2p_retired_pages += ret_p;
-                l2p_pagebuf_total += total;
-                l2p_pagebuf_dirty += dirty;
+                if let Some(tree) = shard.tree.try_read() {
+                    let (priv_p, ret_p, total, dirty) = tree.growth_summary();
+                    l2p_private_pages += priv_p;
+                    l2p_retired_pages += ret_p;
+                    l2p_pagebuf_total += total;
+                    l2p_pagebuf_dirty += dirty;
+                }
             }
         }
         let mut rc_apply_queue = 0usize;
@@ -549,12 +558,13 @@ impl Db {
         let mut rc_pagebuf_dirty = 0usize;
         for shard in &self.refcount_shards {
             rc_apply_queue += shard.apply_lane.queue_len();
-            let tree = shard.tree.lock();
-            let (priv_p, ret_p, total, dirty) = tree.growth_summary();
-            rc_private_pages += priv_p;
-            rc_retired_pages += ret_p;
-            rc_pagebuf_total += total;
-            rc_pagebuf_dirty += dirty;
+            if let Some(tree) = shard.tree.try_lock() {
+                let (priv_p, ret_p, total, dirty) = tree.growth_summary();
+                rc_private_pages += priv_p;
+                rc_retired_pages += ret_p;
+                rc_pagebuf_total += total;
+                rc_pagebuf_dirty += dirty;
+            }
         }
         PendingState {
             dispatch_pending,
@@ -772,6 +782,7 @@ impl Db {
             .record_flush_manifest(manifest_started.elapsed());
 
         let install_started = std::time::Instant::now();
+        let mut checkpoint_frees = Vec::new();
         for (volume, (checkpoints, flushed)) in volumes
             .iter()
             .zip(l2p_checkpoints.into_iter().zip(flushed_l2p.into_iter()))
@@ -781,10 +792,11 @@ impl Db {
                 .iter()
                 .zip(checkpoints.into_iter().zip(flushed.into_iter()))
             {
-                shard
+                let retired = shard
                     .tree
                     .write()
                     .checkpoint_snapshot_committed(checkpoint, flushed, tree_generation)?;
+                checkpoint_frees.extend(retired);
             }
         }
         for (shard, (checkpoint, flushed)) in self
@@ -792,14 +804,23 @@ impl Db {
             .iter()
             .zip(refcount_checkpoints.into_iter().zip(flushed_refcount.into_iter()))
         {
-            shard
+            let retired = shard
                 .tree
                 .lock()
                 .checkpoint_snapshot_committed(checkpoint, flushed, tree_generation)?;
+            checkpoint_frees.extend(retired);
         }
         self.finish_dedup_manifest_update(dedup_update, tree_generation)?;
         drop(manifest_state);
         self.metrics.record_flush_install(install_started.elapsed());
+
+        if !checkpoint_frees.is_empty() {
+            self.page_store
+                .free_many(&checkpoint_frees, tree_generation)?;
+            for pid in checkpoint_frees {
+                self.page_cache.invalidate(pid);
+            }
+        }
 
         let reclaim_started = std::time::Instant::now();
         self.reclaim_freed_pages()?;

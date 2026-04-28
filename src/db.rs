@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::apply_gate::ApplyGate;
 use crate::btree::BTree;
 use crate::btree::format::RcEntry;
 use crate::cache::{PageCache, PageCacheStats};
@@ -91,7 +92,7 @@ pub struct Db {
     /// lock, so concurrent submitters land in the same WAL group-commit
     /// batch. Apply order is restored by the LSN-ordered condvar queue
     /// below, not by serialising WAL submits.
-    apply_gate: RwLock<()>,
+    apply_gate: ApplyGate,
     /// LSN of the most recent op applied to in-memory state. Initialised
     /// from `manifest.checkpoint_lsn` on open (the manifest promises that
     /// every LSN at or below this value is already reflected in the

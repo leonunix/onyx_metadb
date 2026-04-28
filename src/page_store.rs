@@ -506,10 +506,8 @@ impl PageStore {
     /// Convenience wrapper over [`free`]; fails as soon as any page id
     /// falls outside the allowed range.
     pub fn free_run(&self, start: PageId, count: u32, generation: Lsn) -> Result<()> {
-        for i in 0..count as u64 {
-            self.free(start + i, generation)?;
-        }
-        Ok(())
+        let page_ids: Vec<PageId> = (start..start + count as u64).collect();
+        self.free_many(&page_ids, generation)
     }
 
     /// Mark `page_id` as free. The physical Free-stamp + hole-punch +
@@ -524,27 +522,65 @@ impl PageStore {
     /// Refuses to free reserved pages (manifest slots) or pages outside
     /// the current high-water range.
     pub fn free(&self, page_id: PageId, generation: Lsn) -> Result<()> {
-        if page_id < FIRST_DATA_PAGE {
-            return Err(MetaDbError::InvalidArgument(format!(
-                "page {page_id} is reserved (manifest slot)",
+        self.free_many(&[page_id], generation)
+    }
+
+    /// Batch form of [`free`]. All pages are tagged with one epoch and
+    /// inserted under one deferred-free lock acquisition; this keeps
+    /// checkpoint install from paying per-page lock/epoch overhead when a
+    /// dirty shard retires tens of thousands of pages at once.
+    pub fn free_many(&self, page_ids: &[PageId], generation: Lsn) -> Result<()> {
+        if page_ids.is_empty() {
+            return Ok(());
+        }
+        {
+            let inner = self.inner.lock();
+            for &page_id in page_ids {
+                if page_id < FIRST_DATA_PAGE {
+                    return Err(MetaDbError::InvalidArgument(format!(
+                        "page {page_id} is reserved (manifest slot)",
+                    )));
+                }
+                if page_id >= inner.high_water {
+                    return Err(MetaDbError::PageOutOfRange(page_id));
+                }
+            }
+        }
+
+        let mut sorted = page_ids.to_vec();
+        sorted.sort_unstable();
+        if let Some(duplicate) = sorted.windows(2).find_map(|pair| {
+            if pair[0] == pair[1] {
+                Some(pair[0])
+            } else {
+                None
+            }
+        }) {
+            return Err(MetaDbError::Corruption(format!(
+                "page_store: duplicate free of page {duplicate} in one batch",
             )));
         }
-        self.check_in_range(page_id)?;
+
         // Tag with the pre-bump epoch and bump global so any reader
         // pinning after this call observes G_pin > tag.
         let tag = self.epoch.advance();
-        let prev = self.deferred_free.lock().insert(
-            page_id,
-            DeferredFree {
-                epoch: tag,
-                generation,
-                idempotent: false,
-            },
-        );
-        if prev.is_some() {
-            return Err(MetaDbError::Corruption(format!(
-                "page_store: double free of page {page_id} (already pending reclaim)",
-            )));
+        let mut deferred = self.deferred_free.lock();
+        for &page_id in &sorted {
+            if deferred.contains_key(&page_id) {
+                return Err(MetaDbError::Corruption(format!(
+                    "page_store: double free of page {page_id} (already pending reclaim)",
+                )));
+            }
+        }
+        for page_id in sorted {
+            deferred.insert(
+                page_id,
+                DeferredFree {
+                    epoch: tag,
+                    generation,
+                    idempotent: false,
+                },
+            );
         }
         Ok(())
     }
