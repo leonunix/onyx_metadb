@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::btree::format::{init_internal, init_leaf};
 use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::Result;
-use crate::page::Page;
+use crate::page::{Page, PageType};
 use crate::page_store::PageStore;
 use crate::paged::read_view::{PageIdMap, PageIdSet};
 use crate::types::{Lsn, PageId};
@@ -250,15 +250,28 @@ impl PageBuf {
     /// remains available through the shared [`PageCache`]; this only
     /// prevents the long-lived owning tree from keeping an unbounded
     /// second copy in `self.pages`.
-    pub fn evict_clean_pages(&mut self) {
+    pub fn evict_clean_pages_budget(&mut self, max_pages: usize) -> usize {
         if self.clean_pages.is_empty() {
-            return;
+            return 0;
         }
-        let clean_pages = std::mem::take(&mut self.clean_pages);
+        let clean_pages: Vec<_> = self.clean_pages.iter().take(max_pages).copied().collect();
+        let processed = clean_pages.len();
         for pid in clean_pages {
+            self.clean_pages.remove(&pid);
             if matches!(self.pages.get(&pid), Some(Slot::Clean(_))) {
                 self.pages.remove(&pid);
             }
+        }
+        processed
+    }
+
+    pub fn has_clean_pages(&self) -> bool {
+        !self.clean_pages.is_empty()
+    }
+
+    pub fn evict_clean_pages(&mut self) {
+        while self.has_clean_pages() {
+            self.evict_clean_pages_budget(usize::MAX);
         }
     }
 
@@ -321,9 +334,10 @@ impl PageBuf {
         if current.bytes() != page.original.bytes() {
             return Some((page.pid, false));
         }
-        // DirtySnapshot::write() has already refreshed the shared cache
-        // outside the shard lock. Drop the tree-local Dirty copy so install
-        // does not defer a large clean-page retain scan to finish_op.
+        // Db::flush has already written and synced the sealed page. Internal
+        // pages may be refreshed in the shared cache; leaves can fault from
+        // PageStore on demand. Drop the tree-local Dirty copy so install does
+        // not defer a large clean-page retain scan to finish_op.
         self.pages_remove(page.pid);
         Some((page.pid, true))
     }
@@ -357,7 +371,13 @@ impl DirtySnapshot {
             });
         }
         for (pid, sealed) in sealed_pages {
-            self.page_cache.insert(pid, sealed);
+            let is_internal = matches!(
+                sealed.header().map(|h| h.page_type),
+                Ok(PageType::L2pInternal)
+            );
+            if is_internal {
+                self.page_cache.insert(pid, sealed);
+            }
         }
         Ok(FlushedSnapshot { pages: flushed })
     }
@@ -422,7 +442,7 @@ mod tests {
     #[test]
     fn install_flushed_snapshot_page_detaches_dirty_copy() {
         let (_d, ps) = mk_store();
-        let mut buf = PageBuf::new(ps);
+        let mut buf = PageBuf::new(ps.clone());
         let pid = buf.alloc_leaf(7).unwrap();
         leaf_insert(
             buf.modify(pid, 7).unwrap(),
@@ -436,6 +456,10 @@ mod tests {
         .unwrap();
 
         let flushed = buf.dirty_snapshot().write().unwrap();
+        let mut sealed_pages = Vec::new();
+        flushed.append_sealed_pages(&mut sealed_pages);
+        ps.write_sealed_page_runs(sealed_pages).unwrap();
+        ps.sync().unwrap();
         assert_eq!(buf.dirty_count(), 1);
         assert_eq!(
             buf.install_flushed_snapshot_page(&flushed, 0),

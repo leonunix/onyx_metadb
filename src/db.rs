@@ -12,7 +12,7 @@ use std::ops::{Bound, RangeBounds};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::thread::JoinHandle;
 
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -207,6 +207,7 @@ struct SnapInfo {
 }
 
 type ApplyWork = Box<dyn FnOnce() + Send + 'static>;
+const APPLY_LANE_READY_BURST_BEFORE_MAINTENANCE: usize = 64;
 
 /// Diagnostic snapshot of in-memory bookkeeping that can grow
 /// unbounded if a downstream drain stalls. See [`Db::pending_state`].
@@ -242,6 +243,7 @@ struct ApplyLaneState {
     queue: VecDeque<ApplyLaneTask>,
     last_enqueued_lsn: Lsn,
     last_applied_lsn: Lsn,
+    ready_since_maintenance: usize,
     shutdown: bool,
 }
 
@@ -267,6 +269,7 @@ impl ApplyLane {
                 queue: VecDeque::new(),
                 last_enqueued_lsn: last_applied_lsn,
                 last_applied_lsn,
+                ready_since_maintenance: 0,
                 shutdown: false,
             }),
             cvar: Condvar::new(),
@@ -292,10 +295,15 @@ impl ApplyLane {
         PendingApplyWork { slot: Some(slot) }
     }
 
+    #[allow(dead_code)]
     fn enqueue_maintenance(&self, work: ApplyWork) {
-        let mut state = self.inner.state.lock();
-        state.maintenance.push_back(ApplyLaneTaskSlot::ready(work));
-        self.inner.cvar.notify_one();
+        self.handle().enqueue_maintenance(work);
+    }
+
+    fn handle(&self) -> ApplyLaneHandle {
+        ApplyLaneHandle {
+            inner: self.inner.clone(),
+        }
     }
 
     fn enqueue_task(&self, lsn: Lsn, slot: Arc<ApplyLaneTaskSlot>) {
@@ -312,7 +320,22 @@ impl ApplyLane {
         });
         self.inner.cvar.notify_one();
     }
+}
 
+#[derive(Clone)]
+struct ApplyLaneHandle {
+    inner: Arc<ApplyLaneInner>,
+}
+
+impl ApplyLaneHandle {
+    fn enqueue_maintenance(&self, work: ApplyWork) {
+        let mut state = self.inner.state.lock();
+        state.maintenance.push_back(ApplyLaneTaskSlot::ready(work));
+        self.inner.cvar.notify_one();
+    }
+}
+
+impl ApplyLane {
     #[allow(dead_code)]
     fn last_applied_lsn(&self) -> Lsn {
         self.inner.state.lock().last_applied_lsn
@@ -366,6 +389,10 @@ impl ApplyLaneTaskSlot {
         }
         guard.take().expect("apply lane task disappeared")
     }
+
+    fn is_ready(&self) -> bool {
+        self.work.lock().is_some()
+    }
 }
 
 impl PendingApplyWork {
@@ -389,14 +416,44 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
         let task = {
             let mut state = inner.state.lock();
             loop {
-                if let Some(slot) = state.maintenance.pop_front() {
-                    break ApplyLaneTask { lsn: None, slot };
-                }
-                if let Some(task) = state.queue.pop_front() {
-                    break task;
-                }
                 if state.shutdown {
                     return;
+                }
+                match (state.maintenance.is_empty(), state.queue.is_empty()) {
+                    (false, false) => {
+                        let queue_front_ready = state
+                            .queue
+                            .front()
+                            .map(|task| task.slot.is_ready())
+                            .unwrap_or(false);
+                        if !queue_front_ready
+                            || state.ready_since_maintenance
+                                >= APPLY_LANE_READY_BURST_BEFORE_MAINTENANCE
+                        {
+                            let slot = state
+                                .maintenance
+                                .pop_front()
+                                .expect("maintenance checked non-empty");
+                            state.ready_since_maintenance = 0;
+                            break ApplyLaneTask { lsn: None, slot };
+                        }
+                        state.ready_since_maintenance += 1;
+                        break state.queue.pop_front().expect("queue checked non-empty");
+                    }
+                    (false, true) => {
+                        let slot = state
+                            .maintenance
+                            .pop_front()
+                            .expect("maintenance checked non-empty");
+                        state.ready_since_maintenance = 0;
+                        break ApplyLaneTask { lsn: None, slot };
+                    }
+                    (true, false) => {
+                        state.ready_since_maintenance =
+                            state.ready_since_maintenance.saturating_add(1);
+                        break state.queue.pop_front().expect("queue checked non-empty");
+                    }
+                    (true, true) => {}
                 }
                 inner.cvar.wait(&mut state);
             }
@@ -430,6 +487,7 @@ struct L2pShard {
     /// path.
     tree: RwLock<PagedL2p>,
     read_view: RwLock<Arc<crate::paged::ReadView>>,
+    active_readers: AtomicUsize,
     apply_lane: ApplyLane,
 }
 

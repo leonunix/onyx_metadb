@@ -209,13 +209,31 @@ impl PageBuf {
         }
     }
 
-    pub(crate) fn flush_read_overlay_updates(&mut self) {
-        let updates: Vec<_> = self.read_overlay_updates.drain().collect();
+    pub(crate) fn flush_read_overlay_updates_budget(&mut self, max_updates: usize) -> usize {
+        let updates: Vec<_> = self
+            .read_overlay_updates
+            .iter()
+            .take(max_updates)
+            .copied()
+            .collect();
+        let processed = updates.len();
         for pid in updates {
+            self.read_overlay_updates.remove(&pid);
             match self.pages.get(&pid) {
                 Some(Slot::Dirty(arc)) => self.read_overlay_insert(pid, arc.clone()),
                 Some(Slot::Clean(_)) | None => self.read_overlay_remove(pid),
             }
+        }
+        processed
+    }
+
+    pub(crate) fn has_read_overlay_updates(&self) -> bool {
+        !self.read_overlay_updates.is_empty()
+    }
+
+    pub(crate) fn flush_read_overlay_updates(&mut self) {
+        while self.has_read_overlay_updates() {
+            self.flush_read_overlay_updates_budget(usize::MAX);
         }
     }
 
@@ -643,15 +661,28 @@ impl PageBuf {
     /// common case during write-heavy batches) cleanup returns outright.
     /// When clean pages exist, remove only those tracked pids instead of
     /// scanning the whole dirty overlay on every tree op.
-    pub fn evict_clean_pages(&mut self) {
+    pub fn evict_clean_pages_budget(&mut self, max_pages: usize) -> usize {
         if self.clean_pages.is_empty() {
-            return;
+            return 0;
         }
-        let clean_pages = std::mem::take(&mut self.clean_pages);
+        let clean_pages: Vec<_> = self.clean_pages.iter().take(max_pages).copied().collect();
+        let processed = clean_pages.len();
         for pid in clean_pages {
+            self.clean_pages.remove(&pid);
             if matches!(self.pages.get(&pid), Some(Slot::Clean(_))) {
                 self.pages.remove(&pid);
             }
+        }
+        processed
+    }
+
+    pub fn has_clean_pages(&self) -> bool {
+        !self.clean_pages.is_empty()
+    }
+
+    pub fn evict_clean_pages(&mut self) {
+        while self.has_clean_pages() {
+            self.evict_clean_pages_budget(usize::MAX);
         }
     }
 
@@ -737,10 +768,10 @@ impl PageBuf {
         if !Arc::ptr_eq(current, &page.original) {
             return Some((page.pid, false));
         }
-        // DirtySnapshot::write() has already published the sealed page to
-        // the shared PageCache outside the shard lock. Drop the tree-local
-        // Dirty copy so install does not defer a large clean-page retain
-        // scan to finish_op.
+        // Db::flush has already written and synced the sealed page. Index
+        // pages may be pinned in the shared PageCache; leaves can fault from
+        // PageStore on demand. Drop the tree-local Dirty copy so install does
+        // not defer a large clean-page retain scan to finish_op.
         self.pages_remove(page.pid);
         Some((page.pid, true))
     }
@@ -791,7 +822,7 @@ impl DirtySnapshot {
             );
             if is_index && self.page_cache.pin(page.pid, page.sealed.clone()) {
                 // Pinned pages shadow LRU lookups.
-            } else {
+            } else if is_index {
                 self.page_cache.insert(page.pid, page.sealed.clone());
             }
         }
@@ -840,12 +871,16 @@ mod tests {
     #[test]
     fn install_flushed_snapshot_page_detaches_dirty_copy() {
         let (_d, ps) = mk_store();
-        let mut buf = PageBuf::new(ps);
+        let mut buf = PageBuf::new(ps.clone());
         let pid = buf.alloc_leaf(1).unwrap();
         let v = L2pValue([0x42u8; 28]);
         leaf_set(buf.modify(pid, 1).unwrap(), 5, &v);
 
         let flushed = buf.dirty_snapshot().write().unwrap();
+        let mut sealed_pages = Vec::new();
+        flushed.append_sealed_pages(&mut sealed_pages);
+        ps.write_sealed_page_runs(sealed_pages).unwrap();
+        ps.sync().unwrap();
         assert_eq!(buf.dirty_count(), 1);
         assert_eq!(
             buf.install_flushed_snapshot_page(&flushed, 0),

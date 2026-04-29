@@ -126,7 +126,7 @@ pub struct PagedRangeIter {
 }
 
 impl PagedRangeIter {
-    pub(super) fn new(mut items: Vec<(u64, L2pValue)>) -> Self {
+    pub(crate) fn new(mut items: Vec<(u64, L2pValue)>) -> Self {
         items.sort_unstable_by_key(|(k, _)| *k);
         Self {
             inner: items.into_iter(),

@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, Debug)]
 struct RcApplyAction {
@@ -34,6 +35,47 @@ struct QueuedLanePlan {
     rc_pending: Vec<Option<PendingApplyWork>>,
     dedup_idxs: Vec<usize>,
     dedup_pending: Option<PendingApplyWork>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LanedApplyTiming {
+    l2p_wait: std::time::Duration,
+    rc_enqueue: std::time::Duration,
+    rc_wait: std::time::Duration,
+    dedup_enqueue: std::time::Duration,
+    dedup_wait: std::time::Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CommitTiming {
+    drop_gate_wait: std::time::Duration,
+    plan: std::time::Duration,
+    encode: std::time::Duration,
+    wal_submit: std::time::Duration,
+    dispatch_wait: std::time::Duration,
+    apply_gate_wait: std::time::Duration,
+    lane_enqueue: std::time::Duration,
+    apply: std::time::Duration,
+    laned: LanedApplyTiming,
+    finish_global_wait: std::time::Duration,
+}
+
+fn wait_for_l2p_readers_to_drain(shard: &L2pShard) -> bool {
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_micros(750);
+    let mut spins = 0usize;
+    while shard.active_readers.load(Ordering::Acquire) != 0 {
+        if started.elapsed() >= budget {
+            return false;
+        }
+        if spins < 128 {
+            std::hint::spin_loop();
+            spins += 1;
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    true
 }
 
 impl DispatchFootprint {
@@ -100,6 +142,29 @@ fn wal_lane_key(op: &WalOp) -> u64 {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn thread_cpu_time() -> Option<std::time::Duration> {
+    let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, ts.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let ts = unsafe { ts.assume_init() };
+    Some(std::time::Duration::new(
+        ts.tv_sec as u64,
+        ts.tv_nsec as u32,
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn thread_cpu_time() -> Option<std::time::Duration> {
+    None
+}
+
+fn duration_us(duration: std::time::Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
 fn dispatch_ready(state: &DispatchState, lsn: Lsn) -> bool {
     let Some(entry) = state.pending.get(&lsn) else {
         return false;
@@ -141,6 +206,8 @@ impl Db {
             return Ok((self.last_applied_lsn(), Vec::new()));
         }
         let commit_started = std::time::Instant::now();
+        let cpu_started = thread_cpu_time();
+        let mut timing = CommitTiming::default();
         self.metrics.record_commit_attempt(ops.len());
         // `drop_gate.read()` pairs with lifecycle paths' write acquire.
         // Hold it across submit + apply so `drop_snapshot` /
@@ -150,12 +217,14 @@ impl Db {
         // writer can coalesce them into group commits.
         let drop_gate_started = std::time::Instant::now();
         let _drop_guard = self.drop_gate.read();
+        timing.drop_gate_wait = drop_gate_started.elapsed();
         self.metrics
-            .record_commit_drop_gate_wait(drop_gate_started.elapsed());
+            .record_commit_drop_gate_wait(timing.drop_gate_wait);
         // Plan the lane footprint before LSN allocation. `submit_wal_ops`
         // registers this footprint while the WAL set still holds its
         // allocator mutex, so every lower LSN's footprint is known before
         // a higher LSN can be assigned.
+        let plan_started = std::time::Instant::now();
         let volumes = self.volumes.read().clone();
         let serial_apply = self.batch_uses_serial_apply(ops);
         let plan = if serial_apply {
@@ -170,20 +239,37 @@ impl Db {
                 }
             }
         };
+        timing.plan = plan_started.elapsed();
+        let plan_l2p_lanes = plan.as_ref().map(|plan| plan.l2p_sorted.len()).unwrap_or(0);
+        let plan_rc_lanes = plan
+            .as_ref()
+            .map(|plan| {
+                plan.rc_enqueued
+                    .iter()
+                    .filter(|enqueued| **enqueued)
+                    .count()
+            })
+            .unwrap_or(0);
+        let plan_dedup_ops = plan.as_ref().map(|plan| plan.dedup_idxs.len()).unwrap_or(0);
         let dispatch_footprint = plan
             .as_ref()
             .map(DispatchFootprint::from_lane_plan)
             .unwrap_or_else(DispatchFootprint::global);
+        let dispatch_lanes = dispatch_footprint.lanes.len();
 
+        let encode_started = std::time::Instant::now();
         let body = encode_body(ops);
+        timing.encode = encode_started.elapsed();
         let wal_started = std::time::Instant::now();
         let lsn = match self.submit_wal_ops(ops, body, Some(dispatch_footprint)) {
             Ok(lsn) => {
-                self.metrics.record_commit_wal_submit(wal_started.elapsed());
+                timing.wal_submit = wal_started.elapsed();
+                self.metrics.record_commit_wal_submit(timing.wal_submit);
                 lsn
             }
             Err(err) => {
-                self.metrics.record_commit_wal_submit(wal_started.elapsed());
+                timing.wal_submit = wal_started.elapsed();
+                self.metrics.record_commit_wal_submit(timing.wal_submit);
                 self.metrics.record_commit_error(commit_started.elapsed());
                 self.poison_commit_waiters(&err);
                 return Err(err);
@@ -199,30 +285,36 @@ impl Db {
         // of our lanes has dispatched. Disjoint lower LSNs do not block us.
         let wait_started = std::time::Instant::now();
         if let Err(err) = self.mark_wal_durable_and_wait_for_dispatch(lsn) {
-            self.metrics
-                .record_commit_apply_wait(wait_started.elapsed());
+            timing.dispatch_wait = wait_started.elapsed();
+            self.metrics.record_commit_apply_wait(timing.dispatch_wait);
             self.metrics.record_commit_error(commit_started.elapsed());
             return Err(err);
         }
-        self.metrics
-            .record_commit_apply_wait(wait_started.elapsed());
+        timing.dispatch_wait = wait_started.elapsed();
+        self.metrics.record_commit_apply_wait(timing.dispatch_wait);
 
         let apply_gate_started = std::time::Instant::now();
         let apply_guard = self.apply_gate.read();
+        timing.apply_gate_wait = apply_gate_started.elapsed();
         self.metrics
-            .record_commit_apply_gate_wait(apply_gate_started.elapsed());
+            .record_commit_apply_gate_wait(timing.apply_gate_wait);
 
         let apply_started = std::time::Instant::now();
         let outcomes = if let Some(plan) = plan {
+            let enqueue_started = std::time::Instant::now();
             let queued_plan = self.enqueue_lane_plan(&volumes, lsn, plan, Arc::new(ops.to_vec()));
+            timing.lane_enqueue = enqueue_started.elapsed();
             self.complete_retained_dispatch(lsn);
             match self.apply_ops_laned(lsn, ops.len(), queued_plan) {
-                Ok(outcomes) => {
-                    self.metrics.record_commit_apply(apply_started.elapsed());
+                Ok((outcomes, laned_timing)) => {
+                    timing.apply = apply_started.elapsed();
+                    timing.laned = laned_timing;
+                    self.metrics.record_commit_apply(timing.apply);
                     outcomes
                 }
                 Err(err) => {
-                    self.metrics.record_commit_apply(apply_started.elapsed());
+                    timing.apply = apply_started.elapsed();
+                    self.metrics.record_commit_apply(timing.apply);
                     self.metrics.record_commit_error(commit_started.elapsed());
                     self.poison_commit_waiters(&err);
                     return Err(err);
@@ -230,17 +322,20 @@ impl Db {
             }
         } else {
             if let Err(err) = self.wait_for_global_apply_turn(lsn) {
-                self.metrics.record_commit_apply(apply_started.elapsed());
+                timing.apply = apply_started.elapsed();
+                self.metrics.record_commit_apply(timing.apply);
                 self.metrics.record_commit_error(commit_started.elapsed());
                 return Err(err);
             }
             match self.apply_commit_batch(&volumes, lsn, ops) {
                 Ok(outcomes) => {
-                    self.metrics.record_commit_apply(apply_started.elapsed());
+                    timing.apply = apply_started.elapsed();
+                    self.metrics.record_commit_apply(timing.apply);
                     outcomes
                 }
                 Err(err) => {
-                    self.metrics.record_commit_apply(apply_started.elapsed());
+                    timing.apply = apply_started.elapsed();
+                    self.metrics.record_commit_apply(timing.apply);
                     self.metrics.record_commit_error(commit_started.elapsed());
                     self.poison_commit_waiters(&err);
                     return Err(err);
@@ -257,15 +352,64 @@ impl Db {
         // a concurrent flush could observe `last_applied_lsn = lsn - 1`
         // while trees already contain op `lsn`, causing recovery to
         // double-apply on restart (refcount incref is not idempotent).
+        let finish_started = std::time::Instant::now();
         if let Err(err) = self.finish_global_apply(lsn) {
             self.metrics.record_commit_error(commit_started.elapsed());
             return Err(err);
         }
+        timing.finish_global_wait = finish_started.elapsed();
         if serial_apply {
             self.complete_retained_dispatch(lsn);
         }
         drop(apply_guard);
-        self.metrics.record_commit_success(commit_started.elapsed());
+        let total_elapsed = commit_started.elapsed();
+        if total_elapsed >= std::time::Duration::from_secs(1) {
+            let cpu_elapsed = cpu_started
+                .and_then(|started| thread_cpu_time().map(|now| now.saturating_sub(started)));
+            let pending = self.pending_state();
+            let metrics = self.metrics.snapshot();
+            tracing::warn!(
+                lsn,
+                ops = ops.len(),
+                serial_apply,
+                plan_l2p_lanes,
+                plan_rc_lanes,
+                plan_dedup_ops,
+                dispatch_lanes,
+                total_ms = total_elapsed.as_millis() as u64,
+                thread_cpu_ms = cpu_elapsed.map(|d| d.as_millis() as u64),
+                drop_gate_wait_us = duration_us(timing.drop_gate_wait),
+                plan_us = duration_us(timing.plan),
+                encode_us = duration_us(timing.encode),
+                wal_submit_us = duration_us(timing.wal_submit),
+                dispatch_wait_us = duration_us(timing.dispatch_wait),
+                apply_gate_wait_us = duration_us(timing.apply_gate_wait),
+                lane_enqueue_us = duration_us(timing.lane_enqueue),
+                apply_us = duration_us(timing.apply),
+                l2p_lane_wait_us = duration_us(timing.laned.l2p_wait),
+                rc_lane_enqueue_us = duration_us(timing.laned.rc_enqueue),
+                rc_lane_wait_us = duration_us(timing.laned.rc_wait),
+                dedup_lane_enqueue_us = duration_us(timing.laned.dedup_enqueue),
+                dedup_lane_wait_us = duration_us(timing.laned.dedup_wait),
+                finish_global_wait_us = duration_us(timing.finish_global_wait),
+                wal_submit_wait_max_us = metrics.wal_submit_wait_max_us,
+                wal_write_max_us = metrics.wal_write_max_us,
+                wal_fsync_max_us = metrics.wal_fsync_max_us,
+                wal_batch_records_max = metrics.wal_batch_records_max,
+                pending_dispatch = pending.dispatch_pending,
+                pending_dedup_lane_q = pending.dedup_lane_queue,
+                pending_l2p_apply_q = pending.l2p_apply_queue,
+                pending_l2p_dirty = pending.l2p_pagebuf_dirty,
+                pending_rc_apply_q = pending.rc_apply_queue,
+                pending_rc_dirty = pending.rc_pagebuf_dirty,
+                flush_total_max_us = metrics.flush_total_max_us,
+                flush_io_max_us = metrics.flush_io_max_us,
+                flush_install_max_us = metrics.flush_install_max_us,
+                flush_reclaim_max_us = metrics.flush_reclaim_max_us,
+                "metadb: slow commit_with_outcomes (>=1s)"
+            );
+        }
+        self.metrics.record_commit_success(total_elapsed);
         Ok((lsn, outcomes))
     }
 
@@ -671,10 +815,13 @@ impl Db {
         let mut outcomes = Vec::with_capacity(indices.len());
         let mut rc_actions = Vec::new();
         let shard = &volume.shards[sid];
+        let tree_lock_started = std::time::Instant::now();
         let mut tree = shard.tree.write();
+        let tree_lock_wait = tree_lock_started.elapsed();
+        let read_view_prepare_started = std::time::Instant::now();
         let mut read_view_guard = {
             let mut guard = shard.read_view.write();
-            if tree.page_store().epoch().min_active_pin() == u64::MAX {
+            if wait_for_l2p_readers_to_drain(shard) {
                 *guard = Arc::new(crate::paged::ReadView::new(
                     tree.root(),
                     tree.root_level(),
@@ -687,11 +834,13 @@ impl Db {
                 None
             }
         };
+        let read_view_prepare = read_view_prepare_started.elapsed();
         let mut l2p_put_count = 0u64;
         let mut l2p_delete_count = 0u64;
         let mut l2p_remap_count = 0u64;
         let bucket_started = std::time::Instant::now();
-        let apply_result = (|| -> Result<()> {
+        let ops_started = std::time::Instant::now();
+        let ops_result = (|| -> Result<()> {
             for idx in indices {
                 let outcome = match &ops[idx] {
                     WalOp::L2pPut { lba, value, .. } => {
@@ -783,17 +932,49 @@ impl Db {
                 };
                 outcomes.push((idx, outcome));
             }
-            tree.finish_batch_apply()
+            Ok(())
         })();
+        let ops_elapsed = ops_started.elapsed();
+        let finish_started = std::time::Instant::now();
+        let apply_result = match ops_result {
+            Ok(()) => tree.finish_batch_apply(),
+            Err(err) => Err(err),
+        };
+        let finish_elapsed = finish_started.elapsed();
         tree.set_exclusive_read_overlay_mutation(false);
+        let publish_started = std::time::Instant::now();
         if let Some(mut guard) = read_view_guard.take() {
             *guard = Arc::new(tree.snapshot_read_view());
         } else if apply_result.is_ok() {
             super::apply::publish_l2p_read_view(shard, &tree);
         }
+        let publish_elapsed = publish_started.elapsed();
         apply_result?;
         let bucket_elapsed = bucket_started.elapsed();
         let total_l2p_ops = l2p_put_count + l2p_delete_count + l2p_remap_count;
+        if bucket_elapsed.as_micros() >= 100_000
+            || tree_lock_wait.as_micros() >= 100_000
+            || read_view_prepare.as_micros() >= 100_000
+            || ops_elapsed.as_micros() >= 100_000
+            || publish_elapsed.as_micros() >= 100_000
+        {
+            tracing::warn!(
+                vol_ord = volume.ord,
+                shard = sid,
+                lsn,
+                indices = total_l2p_ops,
+                put = l2p_put_count,
+                delete = l2p_delete_count,
+                remap = l2p_remap_count,
+                total_us = duration_us(bucket_elapsed),
+                tree_lock_wait_us = duration_us(tree_lock_wait),
+                read_view_prepare_us = duration_us(read_view_prepare),
+                ops_us = duration_us(ops_elapsed),
+                finish_us = duration_us(finish_elapsed),
+                publish_us = duration_us(publish_elapsed),
+                "metadb: slow l2p apply bucket"
+            );
+        }
         if total_l2p_ops > 0 {
             let total_us = bucket_elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
             let put_us = total_us.saturating_mul(l2p_put_count) / total_l2p_ops;
@@ -1007,10 +1188,12 @@ impl Db {
         lsn: Lsn,
         op_count: usize,
         mut plan: QueuedLanePlan,
-    ) -> Result<Vec<ApplyOutcome>> {
+    ) -> Result<(Vec<ApplyOutcome>, LanedApplyTiming)> {
+        let mut timing = LanedApplyTiming::default();
         let mut outcomes: Vec<Option<ApplyOutcome>> = (0..op_count).map(|_| None).collect();
         let mut first_error = None;
 
+        let l2p_wait_started = std::time::Instant::now();
         for rx in plan.l2p_receivers.drain(..) {
             match rx.recv() {
                 Ok(Ok(result)) => {
@@ -1036,11 +1219,13 @@ impl Db {
                 }
             }
         }
+        timing.l2p_wait = l2p_wait_started.elapsed();
         if let Some(err) = first_error {
             return Err(err);
         }
 
         let mut rc_receivers = Vec::new();
+        let rc_enqueue_started = std::time::Instant::now();
         for sid in 0..plan.rc_pending.len() {
             let Some(pending) = plan.rc_pending[sid].take() else {
                 continue;
@@ -1055,8 +1240,10 @@ impl Db {
             }));
             rc_receivers.push(rx);
         }
+        timing.rc_enqueue = rc_enqueue_started.elapsed();
 
         let mut first_error = None;
+        let rc_wait_started = std::time::Instant::now();
         for rx in rc_receivers {
             match rx.recv() {
                 Ok(Ok(result)) => {
@@ -1088,11 +1275,13 @@ impl Db {
                 }
             }
         }
+        timing.rc_wait = rc_wait_started.elapsed();
         if let Some(err) = first_error {
             return Err(err);
         }
 
         if let Some(pending) = plan.dedup_pending.take() {
+            let dedup_enqueue_started = std::time::Instant::now();
             let ops = plan.ops.clone();
             let indices = std::mem::take(&mut plan.dedup_idxs);
             let dedup_index = self.dedup_index.clone();
@@ -1109,20 +1298,26 @@ impl Db {
                 );
                 let _ = tx.send(outcomes);
             }));
+            timing.dedup_enqueue = dedup_enqueue_started.elapsed();
+            let dedup_wait_started = std::time::Instant::now();
             let dedup_outcomes = rx.recv().map_err(|_| {
                 MetaDbError::Corruption(
                     "persistent dedup lane worker failed to return a result".into(),
                 )
             })?;
+            timing.dedup_wait = dedup_wait_started.elapsed();
             for (idx, outcome) in dedup_outcomes {
                 outcomes[idx] = Some(outcome);
             }
         }
 
-        Ok(outcomes
-            .into_iter()
-            .map(|o| o.expect("every op index filled by exactly one lane"))
-            .collect())
+        Ok((
+            outcomes
+                .into_iter()
+                .map(|o| o.expect("every op index filled by exactly one lane"))
+                .collect(),
+            timing,
+        ))
     }
 
     /// Bucketed batch-apply. Only invoked for sufficiently large

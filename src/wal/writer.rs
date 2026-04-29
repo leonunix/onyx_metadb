@@ -8,8 +8,9 @@
 //! Batch formation follows `docs/DESIGN.md §8.2`:
 //!
 //! 1. Block until at least one record arrives.
-//! 2. Drain more records until either `group_commit_max_batch_bytes` is
-//!    reached or `group_commit_timeout_us` elapses.
+//! 2. Opportunistically drain records that are already queued, then wait
+//!    for more until either `group_commit_max_batch_bytes` is reached or
+//!    `group_commit_timeout_us` elapses.
 //! 3. If the pending batch plus the current segment would exceed
 //!    `wal_segment_bytes`, rotate to a new segment first. A batch never
 //!    spans two segments.
@@ -28,7 +29,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use parking_lot::Mutex;
 
 use crate::config::Config;
@@ -301,10 +302,34 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
         }
         let mut batch_bytes = first_len;
 
-        // Drain more submits up to the byte cap or the timeout.
+        // Drain more submits up to the byte cap or the timeout. Always
+        // consume immediately queued records before looking at the clock, so
+        // a tiny timeout still forms batches when submitters already lined up.
         let deadline = Instant::now() + state.timeout;
         let mut pending_shutdown: Option<Sender<Result<()>>> = None;
-        while batch_bytes < state.max_batch_bytes {
+        while batch_bytes < state.max_batch_bytes && pending_shutdown.is_none() {
+            match receiver.try_recv() {
+                Ok(Op::Submit {
+                    assigned_lsn,
+                    body,
+                    ack,
+                }) => {
+                    batch_bytes += body.len() + WAL_HEADER_SIZE;
+                    submits.push(PendingSubmit {
+                        assigned_lsn,
+                        body,
+                        ack,
+                    });
+                    continue;
+                }
+                Ok(Op::Shutdown { ack }) => {
+                    pending_shutdown = Some(ack);
+                    break;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => break,
+            }
+
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;

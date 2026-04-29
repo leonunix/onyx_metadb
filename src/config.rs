@@ -114,7 +114,7 @@ impl Config {
             wal_segment_bytes: 64 * 1024 * 1024,
             wal_lanes: 1,
             group_commit_max_batch_bytes: 4 * 1024 * 1024,
-            group_commit_timeout_us: 500,
+            group_commit_timeout_us: 1,
             page_cache_bytes: 512 * 1024 * 1024,
             lsm_memtable_bytes: 64 * 1024 * 1024,
             lsm_bloom_bits_per_entry: 10,

@@ -152,6 +152,7 @@ pub(super) fn make_l2p_shard(tree: PagedL2p, page_cache: &Arc<PageCache>) -> L2p
     L2pShard {
         tree: RwLock::new(tree),
         read_view: RwLock::new(Arc::new(view)),
+        active_readers: std::sync::atomic::AtomicUsize::new(0),
         apply_lane: ApplyLane::new(0),
     }
 }

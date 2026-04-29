@@ -1,6 +1,332 @@
 use super::*;
 
 const FLUSH_RECLAIM_BUDGET_PAGES: usize = 8192;
+const FLUSH_INSTALL_PAGE_BUDGET: usize = 64;
+const FLUSH_INSTALL_CLEANUP_BUDGET: usize = 64;
+const FLUSH_INSTALL_STEP_WARN_US: u64 = 100_000;
+
+fn micros(duration: std::time::Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+struct CheckpointInstallReceiver {
+    kind: &'static str,
+    vol_ord: Option<VolumeOrdinal>,
+    shard: usize,
+    rx: crossbeam_channel::Receiver<Result<Vec<PageId>>>,
+}
+
+struct CheckpointInstallState<F> {
+    flushed: F,
+    flushed_pages: usize,
+    next_flushed_page: usize,
+    flushed_private: HashMap<PageId, bool>,
+    retired_pages: Vec<PageId>,
+    next_retired_page: usize,
+    private_pages: Vec<PageId>,
+    next_private_page: usize,
+    checkpoint_frees: Vec<PageId>,
+    steps_started: u64,
+}
+
+impl<F> CheckpointInstallState<F> {
+    fn new(
+        flushed: F,
+        flushed_pages: usize,
+        retired_pages: Vec<PageId>,
+        private_pages: Vec<PageId>,
+    ) -> Self {
+        Self {
+            flushed,
+            flushed_pages,
+            next_flushed_page: 0,
+            flushed_private: HashMap::new(),
+            retired_pages,
+            next_retired_page: 0,
+            private_pages,
+            next_private_page: 0,
+            checkpoint_frees: Vec::new(),
+            steps_started: 0,
+        }
+    }
+
+    fn page_phases_finished(&self) -> bool {
+        self.next_flushed_page >= self.flushed_pages
+            && self.next_retired_page >= self.retired_pages.len()
+            && self.next_private_page >= self.private_pages.len()
+    }
+}
+
+fn enqueue_l2p_checkpoint_install_step(
+    lane: ApplyLaneHandle,
+    volume: Arc<Volume>,
+    sid: usize,
+    state: Arc<Mutex<CheckpointInstallState<crate::paged::cache::FlushedSnapshot>>>,
+    tx: crossbeam_channel::Sender<Result<Vec<PageId>>>,
+) {
+    let next_lane = lane.clone();
+    let enqueued_at = std::time::Instant::now();
+    lane.enqueue_maintenance(Box::new(move || {
+        match run_l2p_checkpoint_install_step(
+            volume.clone(),
+            sid,
+            state.clone(),
+            enqueued_at.elapsed(),
+        ) {
+            Ok(Some(frees)) => {
+                let _ = tx.send(Ok(frees));
+            }
+            Ok(None) => {
+                enqueue_l2p_checkpoint_install_step(next_lane, volume, sid, state, tx);
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err));
+            }
+        }
+    }));
+}
+
+fn run_l2p_checkpoint_install_step(
+    volume: Arc<Volume>,
+    sid: usize,
+    state: Arc<Mutex<CheckpointInstallState<crate::paged::cache::FlushedSnapshot>>>,
+    queue_wait: std::time::Duration,
+) -> Result<Option<Vec<PageId>>> {
+    let total_started = std::time::Instant::now();
+    let state_lock_started = std::time::Instant::now();
+    let mut state = state.lock();
+    let state_lock_elapsed = state_lock_started.elapsed();
+    state.steps_started += 1;
+    let step = state.steps_started;
+    let start_flushed = state.next_flushed_page;
+    let start_retired = state.next_retired_page;
+    let start_private = state.next_private_page;
+    let tree_lock_started = std::time::Instant::now();
+    let mut tree = volume.shards[sid].tree.write();
+    let tree_lock_elapsed = tree_lock_started.elapsed();
+    let mut budget = FLUSH_INSTALL_PAGE_BUDGET;
+
+    let pages_started = std::time::Instant::now();
+    while budget > 0 && state.next_flushed_page < state.flushed_pages {
+        let page_idx = state.next_flushed_page;
+        if let Some((pid, clean)) = tree.install_flushed_checkpoint_page(&state.flushed, page_idx) {
+            state.flushed_private.insert(pid, clean);
+        }
+        state.next_flushed_page += 1;
+        budget -= 1;
+    }
+
+    while budget > 0 && state.next_retired_page < state.retired_pages.len() {
+        let pid = state.retired_pages[state.next_retired_page];
+        if let Some(pid) = tree.checkpoint_retired_page_committed(pid) {
+            state.checkpoint_frees.push(pid);
+        }
+        state.next_retired_page += 1;
+        budget -= 1;
+    }
+
+    while budget > 0 && state.next_private_page < state.private_pages.len() {
+        let pid = state.private_pages[state.next_private_page];
+        let flushed_clean = state.flushed_private.get(&pid).copied().unwrap_or(true);
+        tree.checkpoint_private_page_committed(pid, flushed_clean);
+        state.next_private_page += 1;
+        budget -= 1;
+    }
+    let pages_elapsed = pages_started.elapsed();
+
+    let cleanup_started = std::time::Instant::now();
+    let cleanup_done = tree.finish_checkpoint_commit_step(FLUSH_INSTALL_CLEANUP_BUDGET)?;
+    let cleanup_elapsed = cleanup_started.elapsed();
+    let page_phases_finished = state.page_phases_finished();
+    let done = page_phases_finished && cleanup_done;
+    let checkpoint_frees = state.checkpoint_frees.len();
+    let result = if !done {
+        None
+    } else {
+        Some(std::mem::take(&mut state.checkpoint_frees))
+    };
+    let total_elapsed = total_started.elapsed();
+    let queue_wait_us = micros(queue_wait);
+    let total_us = micros(total_elapsed);
+    let state_lock_us = micros(state_lock_elapsed);
+    let tree_lock_us = micros(tree_lock_elapsed);
+    let pages_us = micros(pages_elapsed);
+    let cleanup_us = micros(cleanup_elapsed);
+    if queue_wait_us >= FLUSH_INSTALL_STEP_WARN_US
+        || total_us >= FLUSH_INSTALL_STEP_WARN_US
+        || state_lock_us >= FLUSH_INSTALL_STEP_WARN_US
+        || tree_lock_us >= FLUSH_INSTALL_STEP_WARN_US
+        || pages_us >= FLUSH_INSTALL_STEP_WARN_US
+        || cleanup_us >= FLUSH_INSTALL_STEP_WARN_US
+    {
+        tracing::warn!(
+            kind = "l2p",
+            vol_ord = volume.ord,
+            shard = sid,
+            step,
+            queue_wait_us,
+            total_us,
+            state_lock_us,
+            tree_lock_us,
+            pages_us,
+            cleanup_us,
+            flushed_done = state.next_flushed_page,
+            flushed_total = state.flushed_pages,
+            retired_done = state.next_retired_page,
+            retired_total = state.retired_pages.len(),
+            private_done = state.next_private_page,
+            private_total = state.private_pages.len(),
+            flushed_step = state.next_flushed_page.saturating_sub(start_flushed),
+            retired_step = state.next_retired_page.saturating_sub(start_retired),
+            private_step = state.next_private_page.saturating_sub(start_private),
+            cleanup_done,
+            page_phases_finished,
+            done,
+            checkpoint_frees,
+            "metadb: slow checkpoint install step"
+        );
+    }
+    if let Some(frees) = result {
+        Ok(Some(frees))
+    } else {
+        return Ok(None);
+    }
+}
+
+fn enqueue_refcount_checkpoint_install_step(
+    lane: ApplyLaneHandle,
+    sid: usize,
+    tree: Arc<Mutex<BTree>>,
+    state: Arc<Mutex<CheckpointInstallState<crate::btree::cache::FlushedSnapshot>>>,
+    tx: crossbeam_channel::Sender<Result<Vec<PageId>>>,
+) {
+    let next_lane = lane.clone();
+    let enqueued_at = std::time::Instant::now();
+    lane.enqueue_maintenance(Box::new(
+        move || match run_refcount_checkpoint_install_step(
+            sid,
+            tree.clone(),
+            state.clone(),
+            enqueued_at.elapsed(),
+        ) {
+            Ok(Some(frees)) => {
+                let _ = tx.send(Ok(frees));
+            }
+            Ok(None) => {
+                enqueue_refcount_checkpoint_install_step(next_lane, sid, tree, state, tx);
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err));
+            }
+        },
+    ));
+}
+
+fn run_refcount_checkpoint_install_step(
+    sid: usize,
+    tree: Arc<Mutex<BTree>>,
+    state: Arc<Mutex<CheckpointInstallState<crate::btree::cache::FlushedSnapshot>>>,
+    queue_wait: std::time::Duration,
+) -> Result<Option<Vec<PageId>>> {
+    let total_started = std::time::Instant::now();
+    let state_lock_started = std::time::Instant::now();
+    let mut state = state.lock();
+    let state_lock_elapsed = state_lock_started.elapsed();
+    state.steps_started += 1;
+    let step = state.steps_started;
+    let start_flushed = state.next_flushed_page;
+    let start_retired = state.next_retired_page;
+    let start_private = state.next_private_page;
+    let tree_lock_started = std::time::Instant::now();
+    let mut tree = tree.lock();
+    let tree_lock_elapsed = tree_lock_started.elapsed();
+    let mut budget = FLUSH_INSTALL_PAGE_BUDGET;
+
+    let pages_started = std::time::Instant::now();
+    while budget > 0 && state.next_flushed_page < state.flushed_pages {
+        let page_idx = state.next_flushed_page;
+        if let Some((pid, clean)) = tree.install_flushed_checkpoint_page(&state.flushed, page_idx) {
+            state.flushed_private.insert(pid, clean);
+        }
+        state.next_flushed_page += 1;
+        budget -= 1;
+    }
+
+    while budget > 0 && state.next_retired_page < state.retired_pages.len() {
+        let pid = state.retired_pages[state.next_retired_page];
+        if let Some(pid) = tree.checkpoint_retired_page_committed(pid) {
+            state.checkpoint_frees.push(pid);
+        }
+        state.next_retired_page += 1;
+        budget -= 1;
+    }
+
+    while budget > 0 && state.next_private_page < state.private_pages.len() {
+        let pid = state.private_pages[state.next_private_page];
+        let flushed_clean = state.flushed_private.get(&pid).copied().unwrap_or(true);
+        tree.checkpoint_private_page_committed(pid, flushed_clean);
+        state.next_private_page += 1;
+        budget -= 1;
+    }
+    let pages_elapsed = pages_started.elapsed();
+
+    let cleanup_started = std::time::Instant::now();
+    let cleanup_done = tree.finish_checkpoint_commit_step(FLUSH_INSTALL_CLEANUP_BUDGET)?;
+    let cleanup_elapsed = cleanup_started.elapsed();
+    let page_phases_finished = state.page_phases_finished();
+    let done = page_phases_finished && cleanup_done;
+    let checkpoint_frees = state.checkpoint_frees.len();
+    let result = if !done {
+        None
+    } else {
+        Some(std::mem::take(&mut state.checkpoint_frees))
+    };
+    let total_elapsed = total_started.elapsed();
+    let queue_wait_us = micros(queue_wait);
+    let total_us = micros(total_elapsed);
+    let state_lock_us = micros(state_lock_elapsed);
+    let tree_lock_us = micros(tree_lock_elapsed);
+    let pages_us = micros(pages_elapsed);
+    let cleanup_us = micros(cleanup_elapsed);
+    if queue_wait_us >= FLUSH_INSTALL_STEP_WARN_US
+        || total_us >= FLUSH_INSTALL_STEP_WARN_US
+        || state_lock_us >= FLUSH_INSTALL_STEP_WARN_US
+        || tree_lock_us >= FLUSH_INSTALL_STEP_WARN_US
+        || pages_us >= FLUSH_INSTALL_STEP_WARN_US
+        || cleanup_us >= FLUSH_INSTALL_STEP_WARN_US
+    {
+        tracing::warn!(
+            kind = "refcount",
+            shard = sid,
+            step,
+            queue_wait_us,
+            total_us,
+            state_lock_us,
+            tree_lock_us,
+            pages_us,
+            cleanup_us,
+            flushed_done = state.next_flushed_page,
+            flushed_total = state.flushed_pages,
+            retired_done = state.next_retired_page,
+            retired_total = state.retired_pages.len(),
+            private_done = state.next_private_page,
+            private_total = state.private_pages.len(),
+            flushed_step = state.next_flushed_page.saturating_sub(start_flushed),
+            retired_step = state.next_retired_page.saturating_sub(start_retired),
+            private_step = state.next_private_page.saturating_sub(start_private),
+            cleanup_done,
+            page_phases_finished,
+            done,
+            checkpoint_frees,
+            "metadb: slow checkpoint install step"
+        );
+    }
+    if let Some(frees) = result {
+        Ok(Some(frees))
+    } else {
+        return Ok(None);
+    }
+}
 
 impl Db {
     /// Create a fresh database in `root_dir` using the default config.
@@ -809,78 +1135,66 @@ impl Db {
             for (sid, (checkpoint, flushed)) in
                 checkpoints.into_iter().zip(flushed.into_iter()).enumerate()
             {
-                let apply_volume = volume.clone();
+                let flushed_pages = flushed.pages_count();
+                let state = Arc::new(Mutex::new(CheckpointInstallState::new(
+                    flushed,
+                    flushed_pages,
+                    checkpoint.retired_pages(),
+                    checkpoint.private_pages(),
+                )));
                 let (tx, rx) = crossbeam_channel::bounded(1);
-                volume.shards[sid]
-                    .apply_lane
-                    .enqueue_maintenance(Box::new(move || {
-                        let result = (|| {
-                            let mut tree = apply_volume.shards[sid].tree.write();
-                            let mut flushed_private = std::collections::HashMap::new();
-                            for page_idx in 0..flushed.pages_count() {
-                                if let Some((pid, clean)) =
-                                    tree.install_flushed_checkpoint_page(&flushed, page_idx)
-                                {
-                                    flushed_private.insert(pid, clean);
-                                }
-                            }
-                            let mut checkpoint_frees = Vec::new();
-                            for pid in checkpoint.retired_pages() {
-                                if let Some(pid) = tree.checkpoint_retired_page_committed(pid) {
-                                    checkpoint_frees.push(pid);
-                                }
-                            }
-                            for pid in checkpoint.private_pages() {
-                                let flushed_clean =
-                                    flushed_private.get(&pid).copied().unwrap_or(true);
-                                tree.checkpoint_private_page_committed(pid, flushed_clean);
-                            }
-                            tree.finish_checkpoint_commit()?;
-                            Ok(checkpoint_frees)
-                        })();
-                        let _ = tx.send(result);
-                    }));
-                install_receivers.push(rx);
+                enqueue_l2p_checkpoint_install_step(
+                    volume.shards[sid].apply_lane.handle(),
+                    volume.clone(),
+                    sid,
+                    state,
+                    tx,
+                );
+                install_receivers.push(CheckpointInstallReceiver {
+                    kind: "l2p",
+                    vol_ord: Some(volume.ord),
+                    shard: sid,
+                    rx,
+                });
             }
         }
-        for (shard, (checkpoint, flushed)) in self.refcount_shards.iter().zip(
-            refcount_checkpoints
-                .into_iter()
-                .zip(flushed_refcount.into_iter()),
-        ) {
+        for (sid, (shard, (checkpoint, flushed))) in self
+            .refcount_shards
+            .iter()
+            .zip(
+                refcount_checkpoints
+                    .into_iter()
+                    .zip(flushed_refcount.into_iter()),
+            )
+            .enumerate()
+        {
+            let flushed_pages = flushed.pages_count();
+            let state = Arc::new(Mutex::new(CheckpointInstallState::new(
+                flushed,
+                flushed_pages,
+                checkpoint.retired_pages(),
+                checkpoint.private_pages(),
+            )));
             let tree = shard.tree.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
-            shard.apply_lane.enqueue_maintenance(Box::new(move || {
-                let result = (|| {
-                    let mut tree = tree.lock();
-                    let mut flushed_private = std::collections::HashMap::new();
-                    for page_idx in 0..flushed.pages_count() {
-                        if let Some((pid, clean)) =
-                            tree.install_flushed_checkpoint_page(&flushed, page_idx)
-                        {
-                            flushed_private.insert(pid, clean);
-                        }
-                    }
-                    let mut checkpoint_frees = Vec::new();
-                    for pid in checkpoint.retired_pages() {
-                        if let Some(pid) = tree.checkpoint_retired_page_committed(pid) {
-                            checkpoint_frees.push(pid);
-                        }
-                    }
-                    for pid in checkpoint.private_pages() {
-                        let flushed_clean = flushed_private.get(&pid).copied().unwrap_or(true);
-                        tree.checkpoint_private_page_committed(pid, flushed_clean);
-                    }
-                    tree.finish_checkpoint_commit()?;
-                    Ok(checkpoint_frees)
-                })();
-                let _ = tx.send(result);
-            }));
-            install_receivers.push(rx);
+            enqueue_refcount_checkpoint_install_step(
+                shard.apply_lane.handle(),
+                sid,
+                tree,
+                state,
+                tx,
+            );
+            install_receivers.push(CheckpointInstallReceiver {
+                kind: "refcount",
+                vol_ord: None,
+                shard: sid,
+                rx,
+            });
         }
         let mut checkpoint_frees = Vec::new();
-        for rx in install_receivers {
-            match rx.recv() {
+        for receiver in install_receivers {
+            let recv_started = std::time::Instant::now();
+            match receiver.rx.recv() {
                 Ok(Ok(mut frees)) => checkpoint_frees.append(&mut frees),
                 Ok(Err(err)) => {
                     drop(manifest_state);
@@ -896,6 +1210,18 @@ impl Db {
                         "checkpoint install lane worker exited before reporting".into(),
                     ));
                 }
+            }
+            let recv_elapsed = recv_started.elapsed();
+            let recv_us = micros(recv_elapsed);
+            if recv_us >= FLUSH_INSTALL_STEP_WARN_US {
+                tracing::warn!(
+                    kind = receiver.kind,
+                    vol_ord = receiver.vol_ord.map(u32::from).unwrap_or(u32::MAX),
+                    shard = receiver.shard,
+                    recv_us,
+                    install_elapsed_us = micros(install_started.elapsed()),
+                    "metadb: slow checkpoint install receiver wait"
+                );
             }
         }
         self.finish_dedup_manifest_update(dedup_update, tree_generation)?;

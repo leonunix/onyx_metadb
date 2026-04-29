@@ -395,11 +395,112 @@ impl Lsm {
         }
         let _drain = self.reader_drain.read();
         let snapshot = self.levels.read().clone();
-        let mut out = Vec::with_capacity(prefixes.len());
+
+        use std::collections::BTreeMap;
+        let mut unique_prefixes: Vec<Vec<u8>> = Vec::new();
+        let mut unique_by_prefix: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut input_to_unique = Vec::with_capacity(prefixes.len());
         for prefix in prefixes {
-            out.push(self.scan_prefix_with_snapshot(prefix, &snapshot)?);
+            if let Some(&idx) = unique_by_prefix.get(*prefix) {
+                input_to_unique.push(idx);
+                continue;
+            }
+            let idx = unique_prefixes.len();
+            let owned = prefix.to_vec();
+            unique_prefixes.push(owned.clone());
+            unique_by_prefix.insert(owned, idx);
+            input_to_unique.push(idx);
         }
-        Ok(out)
+
+        let mut seen: Vec<BTreeMap<Hash32, Option<DedupValue>>> =
+            std::iter::repeat_with(BTreeMap::new)
+                .take(unique_prefixes.len())
+                .collect();
+
+        for (idx, prefix) in unique_prefixes.iter().enumerate() {
+            for (k, op) in self.memtable.collect_prefix(prefix) {
+                seen[idx].entry(k).or_insert(match op {
+                    DedupOp::Put(v) => Some(v),
+                    DedupOp::Delete => None,
+                });
+            }
+        }
+
+        let same_prefix_len = unique_prefixes
+            .first()
+            .map(|first| first.len())
+            .filter(|len| unique_prefixes.iter().all(|prefix| prefix.len() == *len));
+
+        // SSTs, newest-to-oldest. Unlike the single-prefix path, this scans
+        // each matching SST once and distributes rows to every requested
+        // prefix. Dedup cleanup commonly asks for hundreds of 8-byte PBA
+        // prefixes; scanning the same SST once per PBA was the long pole.
+        for (level_idx, handles) in snapshot.iter().enumerate() {
+            let ordered: Vec<SstHandle> = if level_idx == 0 {
+                handles.iter().rev().copied().collect()
+            } else {
+                handles.to_vec()
+            };
+            for handle in ordered {
+                if !unique_prefixes.iter().any(|prefix| {
+                    prefix_might_match_range(&handle.min_hash, &handle.max_hash, prefix)
+                }) {
+                    continue;
+                }
+                let reader = SstReader::open(&self.page_store, &self.page_cache, handle)?;
+                if let Some(prefix_len) = same_prefix_len {
+                    for rec_result in reader.scan() {
+                        let rec = rec_result?;
+                        if rec.hash().len() < prefix_len {
+                            continue;
+                        }
+                        if let Some(&idx) = unique_by_prefix.get(&rec.hash()[..prefix_len]) {
+                            seen[idx].entry(*rec.hash()).or_insert(if rec.is_put() {
+                                Some(rec.value())
+                            } else {
+                                None
+                            });
+                        }
+                    }
+                } else {
+                    let matching_prefixes: Vec<usize> = unique_prefixes
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, prefix)| {
+                            prefix_might_match_range(&handle.min_hash, &handle.max_hash, prefix)
+                                .then_some(idx)
+                        })
+                        .collect();
+                    for rec_result in reader.scan() {
+                        let rec = rec_result?;
+                        for &idx in &matching_prefixes {
+                            if !key_has_prefix(rec.hash(), &unique_prefixes[idx]) {
+                                continue;
+                            }
+                            seen[idx].entry(*rec.hash()).or_insert(if rec.is_put() {
+                                Some(rec.value())
+                            } else {
+                                None
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let unique_results: Vec<Vec<(Hash32, DedupValue)>> = seen
+            .into_iter()
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter_map(|(k, v)| v.map(|val| (k, val)))
+                    .collect()
+            })
+            .collect();
+        Ok(input_to_unique
+            .into_iter()
+            .map(|idx| unique_results[idx].clone())
+            .collect())
     }
 
     fn scan_prefix_with_snapshot(

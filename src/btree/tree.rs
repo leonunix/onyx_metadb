@@ -267,8 +267,9 @@ impl BTree {
         self.checkpoint_protected.remove(&pid);
     }
 
-    pub(crate) fn finish_checkpoint_commit(&mut self) -> Result<()> {
-        self.finish_op(Ok(()))
+    pub(crate) fn finish_checkpoint_commit_step(&mut self, budget: usize) -> Result<bool> {
+        self.buf.evict_clean_pages_budget(budget);
+        Ok(!self.buf.has_clean_pages())
     }
 
     pub(crate) fn abort_checkpoint(&mut self, checkpoint: &Checkpoint) {

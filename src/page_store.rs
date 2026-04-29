@@ -53,6 +53,9 @@ use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 
 const RC_LOCK_SHARDS: usize = 64;
 const MAX_RECLAIM_RUN_PAGES: usize = 256;
+// Keep sealed checkpoint writev runs at Linux's common IOV_MAX while
+// reducing SQE count for large dirty-page flushes.
+const MAX_SEALED_WRITE_RUN_PAGES: usize = 1024;
 #[cfg(target_os = "linux")]
 const DEFAULT_READ_URING_ENTRIES: u32 = 128;
 #[cfg(target_os = "linux")]
@@ -360,16 +363,33 @@ impl PageStore {
             return Ok(());
         }
         pages.sort_unstable_by_key(|(pid, _)| *pid);
-        let mut runs = Vec::new();
+        write_sealed_pages_raw(&self.file, pages, self.write_uring())
+    }
+
+    /// Fallback writer for sealed pages. It keeps only one coalesced
+    /// byte run in memory at a time, rather than materialising every
+    /// dirty checkpoint page into a second full-size buffer.
+    fn write_sealed_page_runs_pwrite(file: &File, pages: Vec<(PageId, Arc<Page>)>) -> Result<()> {
         let mut run_start: Option<PageId> = None;
         let mut run_next = 0;
-        let mut run_bytes = Vec::with_capacity(MAX_RECLAIM_RUN_PAGES * PAGE_SIZE);
+        let mut run_bytes = Vec::with_capacity(MAX_SEALED_WRITE_RUN_PAGES * PAGE_SIZE);
+
+        fn flush_run(
+            file: &File,
+            run_start: &mut Option<PageId>,
+            run_bytes: &mut Vec<u8>,
+        ) -> Result<()> {
+            if let Some(start) = run_start.take() {
+                file.write_all_at(run_bytes, start * PAGE_SIZE as u64)?;
+                run_bytes.clear();
+            }
+            Ok(())
+        }
+
         for (pid, page) in pages {
             let run_pages = run_bytes.len() / PAGE_SIZE;
-            if run_start.is_some() && (pid != run_next || run_pages >= MAX_RECLAIM_RUN_PAGES) {
-                runs.push((run_start.unwrap(), std::mem::take(&mut run_bytes)));
-                run_bytes.reserve(MAX_RECLAIM_RUN_PAGES * PAGE_SIZE);
-                run_start = None;
+            if run_start.is_some() && (pid != run_next || run_pages >= MAX_SEALED_WRITE_RUN_PAGES) {
+                flush_run(file, &mut run_start, &mut run_bytes)?;
             }
             if run_start.is_none() {
                 run_start = Some(pid);
@@ -377,10 +397,8 @@ impl PageStore {
             run_bytes.extend_from_slice(page.bytes());
             run_next = pid + 1;
         }
-        if let Some(start) = run_start {
-            runs.push((start, run_bytes));
-        }
-        self.write_page_runs_parallel(runs)
+        flush_run(file, &mut run_start, &mut run_bytes)?;
+        Ok(())
     }
 
     /// Atomically mutate the refcount of `page_id` by `delta` (positive
@@ -944,6 +962,42 @@ fn write_page_runs_raw_pwrite(file: &File, runs: Vec<(PageId, Vec<u8>)>) -> Resu
 }
 
 #[cfg(target_os = "linux")]
+fn write_sealed_pages_raw(
+    file: &File,
+    pages: Vec<(PageId, Arc<Page>)>,
+    write_uring: Option<&Mutex<Option<IoUring>>>,
+) -> Result<()> {
+    if pages.is_empty() {
+        return Ok(());
+    }
+    let Some(write_uring) = write_uring else {
+        return PageStore::write_sealed_page_runs_pwrite(file, pages);
+    };
+    let mut guard = write_uring.lock();
+    let Some(ring) = guard.as_mut() else {
+        return PageStore::write_sealed_page_runs_pwrite(file, pages);
+    };
+    match write_sealed_pages_raw_uring(file, &pages, ring) {
+        Ok(()) => Ok(()),
+        Err(err) if is_uring_setup_error(&err) => {
+            tracing::debug!(error = %err, "page_store sealed write io_uring failed; falling back to pwrite");
+            *guard = None;
+            PageStore::write_sealed_page_runs_pwrite(file, pages)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_sealed_pages_raw(
+    file: &File,
+    pages: Vec<(PageId, Arc<Page>)>,
+    _write_uring: Option<&()>,
+) -> Result<()> {
+    PageStore::write_sealed_page_runs_pwrite(file, pages)
+}
+
+#[cfg(target_os = "linux")]
 fn sync_data_raw(file: &File, write_uring: Option<&Mutex<Option<IoUring>>>) -> Result<()> {
     let Some(write_uring) = write_uring else {
         file.sync_data()?;
@@ -1004,6 +1058,168 @@ fn sync_data_raw_uring(file: &File, ring: &mut IoUring) -> Result<()> {
     let result = cqe.result();
     if result < 0 {
         return Err(MetaDbError::Io(io::Error::from_raw_os_error(-result)));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct SealedWriteRun {
+    start_page: PageId,
+    pages: Vec<Arc<Page>>,
+    iovecs: Vec<libc::iovec>,
+    total_len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl SealedWriteRun {
+    fn new(start_page: PageId) -> Self {
+        Self {
+            start_page,
+            pages: Vec::with_capacity(MAX_SEALED_WRITE_RUN_PAGES),
+            iovecs: Vec::with_capacity(MAX_SEALED_WRITE_RUN_PAGES),
+            total_len: 0,
+        }
+    }
+
+    fn push(&mut self, page: Arc<Page>) {
+        self.iovecs.push(libc::iovec {
+            iov_base: page.bytes().as_ptr() as *mut libc::c_void,
+            iov_len: PAGE_SIZE,
+        });
+        self.pages.push(page);
+        self.total_len += PAGE_SIZE;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_writev_runs(pages: &[(PageId, Arc<Page>)]) -> Vec<SealedWriteRun> {
+    let mut runs = Vec::new();
+    let mut current: Option<SealedWriteRun> = None;
+    let mut run_next = 0;
+
+    for (pid, page) in pages {
+        let run_pages = current.as_ref().map(|run| run.pages.len()).unwrap_or(0);
+        if current.is_some() && (*pid != run_next || run_pages >= MAX_SEALED_WRITE_RUN_PAGES) {
+            runs.push(current.take().expect("current run checked Some"));
+        }
+        if current.is_none() {
+            current = Some(SealedWriteRun::new(*pid));
+        }
+        current
+            .as_mut()
+            .expect("current run created above")
+            .push(page.clone());
+        run_next = *pid + 1;
+    }
+
+    if let Some(run) = current {
+        runs.push(run);
+    }
+    runs
+}
+
+#[cfg(target_os = "linux")]
+fn write_sealed_pages_raw_uring(
+    file: &File,
+    pages: &[(PageId, Arc<Page>)],
+    ring: &mut IoUring,
+) -> Result<()> {
+    let runs = sealed_writev_runs(pages);
+    if runs.is_empty() {
+        return Ok(());
+    }
+    let fd = file.as_raw_fd();
+    for (base, chunk) in runs
+        .chunks(DEFAULT_WRITE_URING_ENTRIES as usize)
+        .enumerate()
+    {
+        for (idx, run) in chunk.iter().enumerate() {
+            if run.iovecs.is_empty() {
+                return Err(MetaDbError::InvalidArgument(
+                    "page sealed writev run cannot be empty".into(),
+                ));
+            }
+            let iovcnt = u32::try_from(run.iovecs.len()).map_err(|_| {
+                MetaDbError::InvalidArgument(format!(
+                    "page sealed writev run too large: {} iovecs",
+                    run.iovecs.len()
+                ))
+            })?;
+            let entry = opcode::Writev::new(types::Fd(fd), run.iovecs.as_ptr(), iovcnt)
+                .offset(run.start_page * PAGE_SIZE as u64)
+                .build()
+                .user_data(idx as u64);
+            let mut sq = ring.submission();
+            // SAFETY: SQEs borrow iovec arrays and page byte buffers owned
+            // by `runs`; both stay alive and immutable until every CQE for
+            // this chunk has been harvested below.
+            unsafe {
+                sq.push(&entry).map_err(|_| {
+                    MetaDbError::Io(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "page_store sealed writev io_uring submission queue full at chunk {base} op {idx}/{}",
+                            chunk.len()
+                        ),
+                    ))
+                })?;
+            }
+        }
+
+        ring.submit_and_wait(chunk.len()).map_err(MetaDbError::Io)?;
+
+        let mut results = vec![None; chunk.len()];
+        let mut harvested = 0usize;
+        let mut cq = ring.completion();
+        cq.sync();
+        for cqe in &mut cq {
+            let idx = cqe.user_data() as usize;
+            if idx >= results.len() {
+                return Err(MetaDbError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "page_store sealed writev CQE user_data {idx} out of range (batch size {})",
+                        chunk.len()
+                    ),
+                )));
+            }
+            results[idx] = Some(cqe.result());
+            harvested += 1;
+            if harvested == chunk.len() {
+                break;
+            }
+        }
+        if harvested != chunk.len() {
+            return Err(MetaDbError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "page_store sealed writev harvested {harvested} CQEs, expected {}",
+                    chunk.len()
+                ),
+            )));
+        }
+        drop(cq);
+
+        for (idx, result) in results.into_iter().enumerate() {
+            let result = result.ok_or_else(|| {
+                MetaDbError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("page_store sealed writev missing CQE for op {idx}"),
+                ))
+            })?;
+            if result < 0 {
+                return Err(MetaDbError::Io(io::Error::from_raw_os_error(-result)));
+            }
+            if result as usize != chunk[idx].total_len {
+                return Err(MetaDbError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "page_store sealed writev short write at page {}: got {result} of {}",
+                        chunk[idx].start_page, chunk[idx].total_len
+                    ),
+                )));
+            }
+        }
     }
     Ok(())
 }

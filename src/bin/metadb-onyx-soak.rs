@@ -9,10 +9,12 @@
 //! - ~500 `l2p_remap` ops per commit (matches onyx flush_writer batch
 //!   size); each remap implicitly produces decref(old_pba) +
 //!   incref(new_pba) on the apply path
-//! - 1 background flusher firing `db.flush()` every 50 ms (mirrors the
-//!   onyx `DurabilityWatermarkHandle` + `AsyncCheckpoint` cadence)
+//! - 1 background flusher firing `db.flush()` every 5 s (mirrors the
+//!   onyx `DurabilityWatermarkHandle` + `AsyncCheckpoint` checkpoint cadence)
 //! - 4 reader threads doing `db.multi_get()` of 8 LBAs at high QPS
 //!   (covers epoch-pin / ReadView path)
+//! - 1 range scanner periodically walking `Db::range()` (mirrors onyx GC
+//!   blockmap scans and catches scan-vs-apply lock contention)
 //!
 //! Prints a metrics line every 5 s and a PASS/FAIL summary at the end.
 //! Pass criteria are tunable via CLI flags; defaults reflect "metadb
@@ -20,10 +22,12 @@
 //!
 //! Usage:
 //!     metadb-onyx-soak [--db PATH] [--writers 4] [--readers 4]
-//!         [--ops-per-commit 500] [--flush-interval-ms 50]
+//!         [--ops-per-commit 500] [--flush-interval-ms 5000]
 //!         [--duration-secs 300] [--warmup-secs 30]
 //!         [--lba-space 16000000] [--reset]
-//!         [--wal-lanes 1]
+//!         [--wal-lanes 1] [--group-commit-timeout-us 1]
+//!         [--range-scanners 1] [--range-scan-interval-ms 5000]
+//!         [--range-scan-lbas 0]
 //!         [--dedup-hit-pct 30] [--cleanup-batch 256]
 //!         [--target-install-max-ms 2000]
 //!         [--target-commit-p99-ms 500]
@@ -60,6 +64,10 @@ struct Args {
     lba_space: u64,
     reset: bool,
     wal_lanes: u32,
+    group_commit_timeout_us: u64,
+    range_scanners: usize,
+    range_scan_interval_ms: u64,
+    range_scan_lbas: u64,
     dedup_enabled: bool,
     dedup_hit_pct: u8,
     cleanup_batch: usize,
@@ -76,12 +84,16 @@ impl Args {
             readers: 4,
             ops_per_commit: 500,
             reader_batch: 8,
-            flush_interval_ms: 50,
+            flush_interval_ms: 5000,
             duration_secs: 300,
             warmup_secs: 30,
             lba_space: 16_000_000,
             reset: false,
             wal_lanes: 1,
+            group_commit_timeout_us: 1,
+            range_scanners: 1,
+            range_scan_interval_ms: 5000,
+            range_scan_lbas: 0,
             dedup_enabled: false,
             dedup_hit_pct: 0,
             cleanup_batch: 256,
@@ -112,6 +124,22 @@ impl Args {
                         return Err("--wal-lanes must be 1..=u32::MAX".into());
                     }
                     a.wal_lanes = v as u32;
+                }
+                "--group-commit-timeout-us" => {
+                    let v = parse_u64(it.next(), "--group-commit-timeout-us")?;
+                    if v == 0 {
+                        return Err("--group-commit-timeout-us must be > 0".into());
+                    }
+                    a.group_commit_timeout_us = v;
+                }
+                "--range-scanners" => {
+                    a.range_scanners = parse_usize(it.next(), "--range-scanners")?
+                }
+                "--range-scan-interval-ms" => {
+                    a.range_scan_interval_ms = parse_u64(it.next(), "--range-scan-interval-ms")?
+                }
+                "--range-scan-lbas" => {
+                    a.range_scan_lbas = parse_u64(it.next(), "--range-scan-lbas")?
                 }
                 "--dedup-hit-pct" => {
                     let v = parse_u64(it.next(), "--dedup-hit-pct")?;
@@ -155,8 +183,10 @@ fn print_help() {
     eprintln!(
         "metadb-onyx-soak: stress metadb with onyx-shape concurrent commits + periodic flush\n\
         \n\
-        Defaults match the 2026-04-28 production trace (4 writers, ~500 ops/commit,\n\
-        50 ms flush cadence, 16M LBA space).\n\
+        Defaults match the 2026-04-28 production trace shape after checkpoint\n\
+        decoupling (4 writers, ~500 ops/commit, 5s checkpoint cadence,\n\
+        16M LBA space, 1us WAL group wait) plus one periodic full-range\n\
+        scan mirroring onyx GC blockmap scans.\n\
         \n\
         Pass criteria (override with --target-*): \n\
           install_max < 2000 ms, commit P99 < 500 ms, throughput steady (last\n\
@@ -192,6 +222,7 @@ fn run() -> Result<bool, String> {
     let mut cfg = Config::new(&args.db_path);
     cfg.shards_per_partition = 4;
     cfg.wal_lanes = args.wal_lanes;
+    cfg.group_commit_timeout_us = args.group_commit_timeout_us;
     cfg.page_cache_bytes = 4 * 1024 * 1024 * 1024; // 4 GiB, matches onyx prod
     let db = Arc::new(if args.db_path.join("manifest").exists() {
         Db::open_with_config(cfg).map_err(|e| format!("open: {e}"))?
@@ -206,6 +237,7 @@ fn run() -> Result<bool, String> {
     let reader_stats: Vec<Arc<ReaderStats>> = (0..args.readers)
         .map(|_| Arc::new(ReaderStats::new()))
         .collect();
+    let range_scan_stats = Arc::new(RangeScanStats::new());
 
     let writer_handles: Vec<_> = (0..args.writers)
         .map(|wid| {
@@ -241,6 +273,23 @@ fn run() -> Result<bool, String> {
         })
         .collect();
 
+    let range_scan_handles: Vec<_> = (0..args.range_scanners)
+        .map(|sid| {
+            let db = db.clone();
+            let stop = stop.clone();
+            let stats = range_scan_stats.clone();
+            let lba_space = args.lba_space;
+            let scan_lbas = args.range_scan_lbas;
+            let interval = Duration::from_millis(args.range_scan_interval_ms);
+            thread::Builder::new()
+                .name(format!("range-scanner-{sid}"))
+                .spawn(move || {
+                    range_scan_loop(sid, db, stop, stats, lba_space, scan_lbas, interval)
+                })
+                .unwrap()
+        })
+        .collect();
+
     let flusher_stats = Arc::new(FlusherStats::new());
     let flusher_handle = {
         let db = db.clone();
@@ -254,7 +303,7 @@ fn run() -> Result<bool, String> {
     };
 
     eprintln!(
-        "metadb-onyx-soak: writers={} readers={} ops/commit={} flush={}ms duration={}s warmup={}s lba_space={} wal_lanes={} dedup={} dedup_hit={}%% cleanup_batch={}",
+        "metadb-onyx-soak: writers={} readers={} ops/commit={} flush={}ms duration={}s warmup={}s lba_space={} wal_lanes={} group_commit_timeout={}us range_scanners={} range_scan_interval={}ms range_scan_lbas={} dedup={} dedup_hit={}%% cleanup_batch={}",
         args.writers,
         args.readers,
         args.ops_per_commit,
@@ -263,6 +312,10 @@ fn run() -> Result<bool, String> {
         args.warmup_secs,
         args.lba_space,
         args.wal_lanes,
+        args.group_commit_timeout_us,
+        args.range_scanners,
+        args.range_scan_interval_ms,
+        args.range_scan_lbas,
         if args.dedup_enabled { "on" } else { "off" },
         args.dedup_hit_pct,
         args.cleanup_batch,
@@ -282,11 +335,23 @@ fn run() -> Result<bool, String> {
     let started = Instant::now();
     let total = Duration::from_secs(args.duration_secs);
     let warmup = Duration::from_secs(args.warmup_secs);
-    let mut last_sample = Sample::take(&db, &writer_stats, &reader_stats, &flusher_stats);
+    let mut last_sample = Sample::take(
+        &db,
+        &writer_stats,
+        &reader_stats,
+        &range_scan_stats,
+        &flusher_stats,
+    );
     let mut series: Vec<WindowStats> = Vec::new();
     while started.elapsed() < total {
         thread::sleep(Duration::from_secs(5));
-        let now = Sample::take(&db, &writer_stats, &reader_stats, &flusher_stats);
+        let now = Sample::take(
+            &db,
+            &writer_stats,
+            &reader_stats,
+            &range_scan_stats,
+            &flusher_stats,
+        );
         let w = WindowStats::between(&last_sample, &now);
         let elapsed = started.elapsed();
         let total_dedup = w.dedup_hits + w.dedup_misses;
@@ -295,8 +360,9 @@ fn run() -> Result<bool, String> {
         } else {
             w.dedup_hits as f64 * 100.0 / total_dedup as f64
         };
+        let read_items_per_sec = (w.reads as f64 * args.reader_batch as f64) / w.secs;
         eprintln!(
-            "[t={:>5.1}s] commits={:>6} ({:>5.0}/s) ops={:>7} ({:>6.0}/s) commit_p50={:>6.1}ms p99={:>7.1}ms max={:>7.1}ms | commit wal={:>5.1}ms wait={:>5.1}ms gate={:>4.1}ms apply={:>5.1}ms | wal batches={} fsyncs={} batch_max={} write_avg={:>5.1}ms fsync_avg={:>5.1}ms submit_avg={:>5.1}ms | op_us l2p={:>4.1} rc={:>4.1} dedup={:>4.1} | flush={:>3} pages={} io_max={:>7}us manifest_max={:>7}us install_max={:>7}us reclaim_max={:>7}us total_max={:>7}us | l2p_buf={}/{} rc_buf={}/{} apply_q={:>3} cache={:>3}% | dedup hit={:>4.1}%% cleanup={}/{} | reads={:>5} ({:>5.0}/s) read_p99={:>5.1}ms",
+            "[t={:>5.1}s] commits={:>6} ({:>5.0}/s) ops={:>7} ({:>6.0}/s) commit_p50={:>6.1}ms p99={:>7.1}ms max={:>7.1}ms | commit wal={:>5.1}ms wait={:>5.1}ms gate={:>4.1}ms apply={:>5.1}ms | wal batches={} fsyncs={} batch_max={} write_avg={:>5.1}ms fsync_avg={:>5.1}ms submit_avg={:>5.1}ms | op_us l2p={:>4.1} rc={:>4.1} dedup={:>4.1} | flush={:>3} pages={} io_max={:>7}us manifest_max={:>7}us install_max={:>7}us reclaim_max={:>7}us total_max={:>7}us | l2p_buf={}/{} rc_buf={}/{} apply_q={:>3} cache={:>3}% | dedup hit={:>4.1}%% cleanup={}/{} | reads={:>5} ({:>5.0}/s items={:>7.0}/s) read_p99={:>5.1}ms | range scans={} entries={} scan_p99={:>6.1}ms scan_max={:>6.1}ms",
             elapsed.as_secs_f64(),
             w.commits,
             w.commits as f64 / w.secs,
@@ -336,7 +402,12 @@ fn run() -> Result<bool, String> {
             w.cleanup_pbas,
             w.reads,
             w.reads as f64 / w.secs,
+            read_items_per_sec,
             w.read_p99_ms,
+            w.range_scans,
+            w.range_entries,
+            w.range_scan_p99_ms,
+            w.range_scan_max_ms,
         );
         if elapsed >= warmup {
             series.push(w);
@@ -348,6 +419,9 @@ fn run() -> Result<bool, String> {
         let _ = h.join();
     }
     for h in reader_handles {
+        let _ = h.join();
+    }
+    for h in range_scan_handles {
         let _ = h.join();
     }
     let _ = flusher_handle.join();
@@ -463,6 +537,21 @@ impl ReaderStats {
         Self {
             reads: AtomicU64::new(0),
             latencies: Mutex::new(Vec::with_capacity(1 << 14)),
+        }
+    }
+}
+
+struct RangeScanStats {
+    scans: AtomicU64,
+    entries: AtomicU64,
+    latencies: Mutex<Vec<u64>>,
+}
+impl RangeScanStats {
+    fn new() -> Self {
+        Self {
+            scans: AtomicU64::new(0),
+            entries: AtomicU64::new(0),
+            latencies: Mutex::new(Vec::with_capacity(1024)),
         }
     }
 }
@@ -647,6 +736,60 @@ fn flusher_loop(db: Arc<Db>, stop: Arc<AtomicBool>, stats: Arc<FlusherStats>, in
     }
 }
 
+fn range_scan_loop(
+    sid: usize,
+    db: Arc<Db>,
+    stop: Arc<AtomicBool>,
+    stats: Arc<RangeScanStats>,
+    lba_space: u64,
+    scan_lbas: u64,
+    interval: Duration,
+) {
+    let mut rng = ChaCha8Rng::seed_from_u64(0x515C_A11E_D00D_F00D ^ (sid as u64));
+    while !stop.load(Ordering::Relaxed) {
+        if interval.as_nanos() > 0 {
+            thread::sleep(interval);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        let (start, end) = range_scan_bounds(&mut rng, lba_space, scan_lbas);
+        let started = Instant::now();
+        let mut entries = 0u64;
+        match db.scan_range_unordered(VOL, start..end, |_, _| {
+            entries += 1;
+            Ok(())
+        }) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("range-scanner-{sid} range error: {e}");
+                return;
+            }
+        }
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        stats.scans.fetch_add(1, Ordering::Relaxed);
+        stats.entries.fetch_add(entries, Ordering::Relaxed);
+        stats.latencies.lock().push(elapsed_us);
+    }
+}
+
+fn range_scan_bounds(rng: &mut ChaCha8Rng, lba_space: u64, scan_lbas: u64) -> (u64, u64) {
+    if lba_space == 0 {
+        return (0, 0);
+    }
+    let width = if scan_lbas == 0 || scan_lbas >= lba_space {
+        lba_space
+    } else {
+        scan_lbas
+    };
+    if width >= lba_space {
+        (0, lba_space)
+    } else {
+        let start = rng.gen_range(0..=(lba_space - width));
+        (start, start + width)
+    }
+}
+
 // ───────────────────── stats sampling ─────────────────────
 
 struct Sample {
@@ -664,6 +807,9 @@ struct Sample {
     flushes: u64,
     reads: u64,
     read_lats_us: Vec<u64>,
+    range_scans: u64,
+    range_entries: u64,
+    range_lats_us: Vec<u64>,
     at: Instant,
 }
 impl Sample {
@@ -671,6 +817,7 @@ impl Sample {
         db: &Arc<Db>,
         wstats: &[Arc<WriterStats>],
         rstats: &[Arc<ReaderStats>],
+        range_stats: &Arc<RangeScanStats>,
         fstats: &Arc<FlusherStats>,
     ) -> Self {
         let metrics = db.metrics_snapshot();
@@ -700,6 +847,13 @@ impl Sample {
             let mut lats = s.latencies.lock();
             read_lats_us.append(&mut lats);
         }
+        let range_scans = range_stats.scans.load(Ordering::Relaxed);
+        let range_entries = range_stats.entries.load(Ordering::Relaxed);
+        let mut range_lats_us = Vec::new();
+        {
+            let mut lats = range_stats.latencies.lock();
+            range_lats_us.append(&mut lats);
+        }
         Self {
             metrics,
             pending,
@@ -715,6 +869,9 @@ impl Sample {
             flushes: fstats.flushes.load(Ordering::Relaxed),
             reads,
             read_lats_us,
+            range_scans,
+            range_entries,
+            range_lats_us,
             at: Instant::now(),
         }
     }
@@ -761,6 +918,10 @@ struct WindowStats {
     cache_pct: u64,
     reads: u64,
     read_p99_ms: f64,
+    range_scans: u64,
+    range_entries: u64,
+    range_scan_p99_ms: f64,
+    range_scan_max_ms: f64,
 }
 impl WindowStats {
     fn between(prev: &Sample, now: &Sample) -> Self {
@@ -776,6 +937,10 @@ impl WindowStats {
         let mut rl = now.read_lats_us.clone();
         rl.sort_unstable();
         let read_p99_ms = pct(&rl, 99) as f64 / 1000.0;
+        let mut scan_lats = now.range_lats_us.clone();
+        scan_lats.sort_unstable();
+        let range_scan_p99_ms = pct(&scan_lats, 99) as f64 / 1000.0;
+        let range_scan_max_ms = scan_lats.last().copied().unwrap_or(0) as f64 / 1000.0;
         let cache_pct = if now.cache_capacity == 0 {
             0
         } else {
@@ -892,6 +1057,10 @@ impl WindowStats {
             cache_pct,
             reads: now.reads.saturating_sub(prev.reads),
             read_p99_ms,
+            range_scans: now.range_scans.saturating_sub(prev.range_scans),
+            range_entries: now.range_entries.saturating_sub(prev.range_entries),
+            range_scan_p99_ms,
+            range_scan_max_ms,
         }
     }
 }
@@ -927,12 +1096,17 @@ fn report(series: &[WindowStats], args: &Args) -> bool {
     }
     let total_commits: u64 = series.iter().map(|w| w.commits).sum();
     let total_ops: u64 = series.iter().map(|w| w.ops).sum();
+    let total_reads: u64 = series.iter().map(|w| w.reads).sum();
     let total_secs: f64 = series.iter().map(|w| w.secs).sum();
     let final_install_max = series.last().unwrap().flush_install_max_us;
     let final_gate_max = series.last().unwrap().flush_gate_max_us;
     let max_commit_p99 = series
         .iter()
         .map(|w| w.commit_p99_ms)
+        .fold(0.0_f64, f64::max);
+    let max_range_scan_p99 = series
+        .iter()
+        .map(|w| w.range_scan_p99_ms)
         .fold(0.0_f64, f64::max);
 
     // Throughput stability: avg ops/sec in last quarter vs middle quarter.
@@ -960,7 +1134,18 @@ fn report(series: &[WindowStats], args: &Args) -> bool {
         total_ops,
         total_ops as f64 / total_secs.max(0.001)
     );
+    if total_reads > 0 {
+        eprintln!(
+            "reader calls/s={:.0} reader items/s={:.0}",
+            total_reads as f64 / total_secs.max(0.001),
+            (total_reads as f64 * args.reader_batch as f64) / total_secs.max(0.001)
+        );
+    }
     eprintln!("commit p99 max across windows = {:.1} ms", max_commit_p99);
+    eprintln!(
+        "range scan p99 max across windows = {:.1} ms",
+        max_range_scan_p99
+    );
     eprintln!(
         "throughput last/mid = {:.0}/{:.0} ops/s ({:.0}%)",
         last,

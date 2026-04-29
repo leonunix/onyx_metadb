@@ -306,8 +306,17 @@ impl PagedL2p {
         self.checkpoint_protected.remove(&pid);
     }
 
-    pub(crate) fn finish_checkpoint_commit(&mut self) -> Result<()> {
-        self.finish_op(Ok(()))
+    pub(crate) fn finish_checkpoint_commit_step(&mut self, mut budget: usize) -> Result<bool> {
+        let processed = self.buf.flush_read_overlay_updates_budget(budget);
+        budget = budget.saturating_sub(processed);
+        if self.buf.has_read_overlay_updates() {
+            return Ok(false);
+        }
+
+        if budget > 0 {
+            self.buf.evict_clean_pages_budget(budget);
+        }
+        Ok(!self.buf.has_clean_pages())
     }
 
     pub(crate) fn abort_checkpoint(&mut self, checkpoint: &Checkpoint) {

@@ -4,29 +4,30 @@
 //!
 //! Two non-obvious invariants:
 //! - **Overlay must include unflushed dirty pages.** Apply COWs new
-//!   pages into `PagedL2p.buf.pages` but `flush()` only runs every
-//!   50 ms (onyx `durability-watermark`). Between publish and flush
+//!   pages into `PagedL2p.buf.pages` but flush/checkpoint runs on the
+//!   async checkpoint cadence. Between publish and flush
 //!   the new pid isn't on disk and isn't in `page_cache`; if the
 //!   reader cache-missed it, `page_store.read_page` would decode
 //!   garbage. Snapshot safety against later live mutations comes
 //!   from `Slot::Dirty(Arc<Page>)` + `Arc::make_mut` in
 //!   `PageBuf::modify`.
-//! - **Reader must hold `apply_gate.read()`.** Flush is the only
-//!   path that physically frees L2P pages
-//!   (`tree.checkpoint_committed` → `page_store.free`). Holding the
-//!   read gate keeps flush from reclaiming pids while a stale
-//!   ReadView still references them.
+//! - **Reader must hold an epoch pin.** Flush is the only path that
+//!   physically frees L2P pages (`tree.checkpoint_committed` →
+//!   `page_store.free`). The pin keeps deferred reclaim from freeing
+//!   pids while a stale ReadView still references them.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, OnceLock};
 
 use crate::cache::PageCache;
 use crate::error::Result;
 use crate::page::Page;
+use crate::paged::PagedRangeIter;
 use crate::paged::format::{
-    L2pValue, LEAF_MASK, LEAF_SHIFT, index_child_at, leaf_bit_set, leaf_value_at,
-    max_leaf_idx_at_level, page_level, slot_in_index,
+    INDEX_FANOUT, INDEX_SHIFT, L2pValue, LEAF_ENTRY_COUNT, LEAF_MASK, LEAF_SHIFT, index_child_at,
+    leaf_bit_set, leaf_value_at, max_leaf_idx_at_level, page_level, slot_in_index,
 };
 use crate::types::{NULL_PAGE, PageId};
 
@@ -187,6 +188,26 @@ impl ReadView {
     /// route through this when they have an already-bucketed slice for
     /// one shard.
     pub fn multi_get(&self, lbas: &[u64]) -> Result<Vec<Option<L2pValue>>> {
+        let mut out = vec![None; lbas.len()];
+        if lbas.is_empty() {
+            return Ok(out);
+        }
+        let indices: Vec<usize> = (0..lbas.len()).collect();
+        self.multi_get_into(lbas, &indices, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn multi_get_into(
+        &self,
+        lbas: &[u64],
+        indices: &[usize],
+        out: &mut [Option<L2pValue>],
+    ) -> Result<()> {
+        if let [idx] = indices {
+            out[*idx] = self.get(lbas[*idx])?;
+            return Ok(());
+        }
+
         #[derive(Clone, Copy)]
         struct Walk {
             out_idx: usize,
@@ -195,9 +216,9 @@ impl ReadView {
             current: PageId,
         }
 
-        let mut out = vec![None; lbas.len()];
-        let mut active = Vec::with_capacity(lbas.len());
-        for (out_idx, &lba) in lbas.iter().enumerate() {
+        let mut active = Vec::with_capacity(indices.len());
+        for &out_idx in indices {
+            let lba = lbas[out_idx];
             let leaf_idx = lba >> LEAF_SHIFT;
             if leaf_idx > max_leaf_idx_at_level(self.root_level) {
                 continue;
@@ -211,21 +232,21 @@ impl ReadView {
         }
 
         let mut level = self.root_level;
+        let mut next = Vec::with_capacity(active.len());
+        let mut disk_pids = Vec::with_capacity(active.len());
         while level > 0 && !active.is_empty() {
-            let disk_pids: Vec<PageId> = active
-                .iter()
-                .filter_map(|walk| {
-                    if self.overlay.contains_key(walk.current) {
-                        None
-                    } else {
-                        Some(walk.current)
-                    }
-                })
-                .collect();
+            disk_pids.clear();
+            disk_pids.extend(active.iter().filter_map(|walk| {
+                if self.overlay.contains_key(walk.current) {
+                    None
+                } else {
+                    Some(walk.current)
+                }
+            }));
             let disk_pages = self.page_cache.get_many(&disk_pids)?;
             let mut disk_iter = disk_pages.into_iter();
-            let mut next = Vec::with_capacity(active.len());
-            for walk in active {
+            next.clear();
+            for walk in active.drain(..) {
                 let slot = slot_in_index(walk.leaf_idx, level);
                 let child = if let Some(page) = self.overlay.get(walk.current) {
                     index_child_at(page, slot)
@@ -244,21 +265,19 @@ impl ReadView {
                     });
                 }
             }
-            active = next;
+            std::mem::swap(&mut active, &mut next);
             level -= 1;
         }
 
         if !active.is_empty() {
-            let disk_pids: Vec<PageId> = active
-                .iter()
-                .filter_map(|walk| {
-                    if self.overlay.contains_key(walk.current) {
-                        None
-                    } else {
-                        Some(walk.current)
-                    }
-                })
-                .collect();
+            disk_pids.clear();
+            disk_pids.extend(active.iter().filter_map(|walk| {
+                if self.overlay.contains_key(walk.current) {
+                    None
+                } else {
+                    Some(walk.current)
+                }
+            }));
             let disk_pages = self.page_cache.get_many(&disk_pids)?;
             let mut disk_iter = disk_pages.into_iter();
             for walk in active {
@@ -278,7 +297,83 @@ impl ReadView {
                 }
             }
         }
-        Ok(out)
+        Ok(())
+    }
+
+    /// Range scan against this published snapshot. The scan is eager
+    /// like `PagedL2p::range`, but it walks `ReadView` pages through the
+    /// dirty overlay / shared cache and never takes the live tree write
+    /// lock. Callers must hold an epoch pin while iterating so deferred
+    /// page reclaim cannot free pages still reachable from this view.
+    pub fn range<R: RangeBounds<u64>>(&self, range: R) -> Result<PagedRangeIter> {
+        let mut items = Vec::new();
+        self.for_each_range(range, |lba, value| {
+            items.push((lba, value));
+            Ok(())
+        })?;
+        Ok(PagedRangeIter::new(items))
+    }
+
+    /// Walk a range without materialising or sorting the results. Shards are
+    /// already independent in the higher-level caller, and background scanners
+    /// such as GC only need to inspect every live mapping once.
+    pub fn for_each_range<R, F>(&self, range: R, mut f: F) -> Result<()>
+    where
+        R: RangeBounds<u64>,
+        F: FnMut(u64, L2pValue) -> Result<()>,
+    {
+        self.for_each_range_inner(self.root, self.root_level, 0, &range, &mut f)
+    }
+
+    fn for_each_range_inner<R, F>(
+        &self,
+        pid: PageId,
+        level: u8,
+        base_lba: u64,
+        range: &R,
+        f: &mut F,
+    ) -> Result<()>
+    where
+        R: RangeBounds<u64> + ?Sized,
+        F: FnMut(u64, L2pValue) -> Result<()>,
+    {
+        if !range_overlaps(range, base_lba, subtree_end(base_lba, level)) {
+            return Ok(());
+        }
+
+        if level == 0 {
+            self.with_page(pid, |leaf| {
+                for i in 0..LEAF_ENTRY_COUNT {
+                    if !leaf_bit_set(leaf, i) {
+                        continue;
+                    }
+                    let lba = base_lba + i as u64;
+                    if range_contains(range, lba) {
+                        f(lba, leaf_value_at(leaf, i))?;
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok(());
+        }
+
+        let children = self.with_page(pid, |page| {
+            Ok((0..INDEX_FANOUT)
+                .filter_map(|slot| {
+                    let child = index_child_at(page, slot);
+                    (child != NULL_PAGE).then_some((slot, child))
+                })
+                .collect::<Vec<_>>())
+        })?;
+        let slot_span = slot_span_for_level(level);
+        for (slot, child) in children {
+            let child_base = base_lba + (slot as u64) * slot_span;
+            let child_end = child_base.saturating_add(slot_span - 1);
+            if range_overlaps(range, child_base, child_end) {
+                self.for_each_range_inner(child, level - 1, child_base, range, f)?;
+            }
+        }
+        Ok(())
     }
 
     fn with_page<T>(&self, pid: PageId, f: impl FnOnce(&Page) -> Result<T>) -> Result<T> {
@@ -293,6 +388,48 @@ impl ReadView {
         let page = page_cache.get(root)?;
         page_level(page.as_ref())
     }
+}
+
+fn slot_span_for_level(level: u8) -> u64 {
+    debug_assert!(level > 0);
+    1u64 << (LEAF_SHIFT + INDEX_SHIFT * (level as u32 - 1))
+}
+
+fn subtree_end(base_lba: u64, level: u8) -> u64 {
+    let span = if level == 0 {
+        LEAF_ENTRY_COUNT as u64
+    } else {
+        slot_span_for_level(level).saturating_mul(INDEX_FANOUT as u64)
+    };
+    base_lba.saturating_add(span.saturating_sub(1))
+}
+
+fn range_contains<R: RangeBounds<u64> + ?Sized>(range: &R, value: u64) -> bool {
+    let start_ok = match range.start_bound() {
+        Bound::Included(&start) => value >= start,
+        Bound::Excluded(&start) => value > start,
+        Bound::Unbounded => true,
+    };
+    let end_ok = match range.end_bound() {
+        Bound::Included(&end) => value <= end,
+        Bound::Excluded(&end) => value < end,
+        Bound::Unbounded => true,
+    };
+    start_ok && end_ok
+}
+
+fn range_overlaps<R: RangeBounds<u64> + ?Sized>(range: &R, lo: u64, hi: u64) -> bool {
+    let lo_ok = match range.end_bound() {
+        Bound::Included(&end) => lo <= end,
+        Bound::Excluded(&end) => lo < end,
+        Bound::Unbounded => true,
+    };
+    let hi_ok = match range.start_bound() {
+        Bound::Included(&start) => hi >= start,
+        Bound::Excluded(&start) => hi > start,
+        Bound::Unbounded => true,
+    };
+    lo_ok && hi_ok
 }
 
 #[cfg(test)]

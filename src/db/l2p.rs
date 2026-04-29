@@ -1,7 +1,59 @@
 use super::*;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+const MULTI_GET_STACK_INDICES: usize = 64;
+
+struct ActiveShardRead<'a> {
+    shard: &'a L2pShard,
+}
+
+impl Drop for ActiveShardRead<'_> {
+    fn drop(&mut self) {
+        self.shard.active_readers.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn acquire_l2p_read_view(shard: &L2pShard) -> (Arc<crate::paged::ReadView>, ActiveShardRead<'_>) {
+    let guard = shard.read_view.read();
+    shard.active_readers.fetch_add(1, Ordering::AcqRel);
+    let view = guard.clone();
+    drop(guard);
+    (view, ActiveShardRead { shard })
+}
 
 impl Db {
     // -------- tree operations --------------------------------------------
+
+    fn multi_get_ordered(
+        &self,
+        volume: &Volume,
+        lbas: &[Lba],
+        order: &[usize],
+        out: &mut [Option<L2pValue>],
+        pin_wait: Duration,
+    ) -> Result<()> {
+        let mut start = 0;
+        while start < order.len() {
+            let sid = shard_for_key_l2p(&volume.shards, lbas[order[start]]);
+            let mut end = start + 1;
+            while end < order.len() && shard_for_key_l2p(&volume.shards, lbas[order[end]]) == sid {
+                end += 1;
+            }
+
+            let (view, _active_read) = acquire_l2p_read_view(&volume.shards[sid]);
+            let walk_started = std::time::Instant::now();
+            view.multi_get_into(lbas, &order[start..end], out)?;
+            let tree_walk = walk_started.elapsed();
+            // `pin_wait` is recorded once per shard so the metric's
+            // existing `lock_wait_us / calls` ratio still represents
+            // per-shard barrier-acquire latency.
+            self.metrics.record_l2p_get(pin_wait, tree_walk);
+            start = end;
+        }
+        Ok(())
+    }
 
     /// Point lookup in volume `vol_ord`'s L2P tree. Lock-free: pin the
     /// epoch barrier (one atomic load + one atomic store), clone the
@@ -15,7 +67,7 @@ impl Db {
         let pin_wait = pin_started.elapsed();
         let volume = self.volume(vol_ord)?;
         let sid = shard_for_key_l2p(&volume.shards, lba);
-        let view = volume.shards[sid].read_view.read().clone();
+        let (view, _active_read) = acquire_l2p_read_view(&volume.shards[sid]);
         let walk_started = std::time::Instant::now();
         let result = view.get(lba);
         let tree_walk = walk_started.elapsed();
@@ -36,29 +88,20 @@ impl Db {
         let _pin = self.page_store.epoch().pin();
         let pin_wait = pin_started.elapsed();
         let volume = self.volume(vol_ord)?;
-        let shard_count = volume.shards.len();
-        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
-        for (idx, lba) in lbas.iter().enumerate() {
-            buckets[shard_for_key_l2p(&volume.shards, *lba)].push(idx);
-        }
         let mut out: Vec<Option<L2pValue>> = vec![None; lbas.len()];
-        for (sid, idxs) in buckets.into_iter().enumerate() {
-            if idxs.is_empty() {
-                continue;
+
+        if lbas.len() <= MULTI_GET_STACK_INDICES {
+            let mut order_buf = [0usize; MULTI_GET_STACK_INDICES];
+            for (idx, slot) in order_buf.iter_mut().take(lbas.len()).enumerate() {
+                *slot = idx;
             }
-            let view = volume.shards[sid].read_view.read().clone();
-            let shard_lbas: Vec<Lba> = idxs.iter().map(|&idx| lbas[idx]).collect();
-            let walk_started = std::time::Instant::now();
-            let shard_out = view.multi_get(&shard_lbas)?;
-            for (idx, value) in idxs.into_iter().zip(shard_out) {
-                out[idx] = value;
-            }
-            let tree_walk = walk_started.elapsed();
-            // `pin_wait` is recorded once per shard so the metric's
-            // existing `lock_wait_us / calls` ratio still represents
-            // per-shard barrier-acquire latency; in the epoch design
-            // this is one atomic load + one atomic store (~5 ns).
-            self.metrics.record_l2p_get(pin_wait, tree_walk);
+            let order = &mut order_buf[..lbas.len()];
+            order.sort_unstable_by_key(|&idx| shard_for_key_l2p(&volume.shards, lbas[idx]));
+            self.multi_get_ordered(&volume, lbas, order, &mut out, pin_wait)?;
+        } else {
+            let mut order: Vec<usize> = (0..lbas.len()).collect();
+            order.sort_unstable_by_key(|&idx| shard_for_key_l2p(&volume.shards, lbas[idx]));
+            self.multi_get_ordered(&volume, lbas, &order, &mut out, pin_wait)?;
         }
         Ok(out)
     }
@@ -101,11 +144,12 @@ impl Db {
         range: R,
     ) -> Result<DbRangeIter> {
         let range = OwnedRange::new(range);
+        let _pin = self.page_store.epoch().pin();
         let volume = self.volume(vol_ord)?;
-        let mut guards: Vec<_> = volume.shards.iter().map(|s| s.tree.write()).collect();
         let mut items = Vec::new();
-        for tree in &mut guards {
-            items.extend(tree.range(range.clone())?.collect::<Result<Vec<_>>>()?);
+        for shard in &volume.shards {
+            let (view, _active_read) = acquire_l2p_read_view(shard);
+            items.extend(view.range(range.clone())?.collect::<Result<Vec<_>>>()?);
         }
         items.sort_unstable_by_key(|(k, _)| *k);
         Ok(DbRangeIter::new(items))
@@ -122,6 +166,33 @@ impl Db {
         range: R,
     ) -> Result<DbRangeIter> {
         self.range(vol_ord, range)
+    }
+
+    /// Unordered, streaming scan over L2P mappings in `range`.
+    ///
+    /// This is intentionally not a replacement for [`range`](Self::range):
+    /// callers that need globally sorted output should keep using `range`.
+    /// Background maintenance paths such as GC only need to visit every live
+    /// mapping once, so this avoids materialising and sorting millions of
+    /// entries just to immediately iterate them.
+    pub fn scan_range_unordered<R, F>(
+        &self,
+        vol_ord: VolumeOrdinal,
+        range: R,
+        mut f: F,
+    ) -> Result<()>
+    where
+        R: RangeBounds<Lba>,
+        F: FnMut(Lba, L2pValue) -> Result<()>,
+    {
+        let range = OwnedRange::new(range);
+        let _pin = self.page_store.epoch().pin();
+        let volume = self.volume(vol_ord)?;
+        for shard in &volume.shards {
+            let (view, _active_read) = acquire_l2p_read_view(shard);
+            view.for_each_range(range.clone(), |lba, value| f(lba, value))?;
+        }
+        Ok(())
     }
 
     // -------- range delete (SPEC §3.2) ----------------------------------

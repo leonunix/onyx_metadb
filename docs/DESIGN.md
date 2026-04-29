@@ -532,7 +532,7 @@ pub struct Config {
     pub shards_per_partition: u32,      // default 16
     pub wal_segment_bytes: u64,         // default 64 MiB
     pub group_commit_max_batch: usize,  // default 256 txns
-    pub group_commit_timeout_us: u64,   // default 500 µs
+    pub group_commit_timeout_us: u64,   // default 1 µs
     pub page_cache_bytes: u64,          // default 512 MiB
     pub lsm_memtable_bytes: u64,        // default 64 MiB
     pub lsm_bloom_bits_per_entry: u32,  // default 10
