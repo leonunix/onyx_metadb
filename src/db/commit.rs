@@ -60,6 +60,17 @@ struct CommitTiming {
     finish_global_wait: std::time::Duration,
 }
 
+struct ActiveApplyGuard<'a> {
+    db: &'a Db,
+    lsn: Lsn,
+}
+
+impl Drop for ActiveApplyGuard<'_> {
+    fn drop(&mut self) {
+        self.db.active_apply_lsns.lock().remove(&self.lsn);
+    }
+}
+
 fn wait_for_l2p_readers_to_drain(shard: &L2pShard) -> bool {
     let started = std::time::Instant::now();
     let budget = std::time::Duration::from_micros(750);
@@ -189,6 +200,53 @@ impl Db {
         *self.last_applied_lsn.lock()
     }
 
+    fn enter_active_apply(&self, lsn: Lsn) -> ActiveApplyGuard<'_> {
+        self.active_apply_lsns.lock().insert(lsn);
+        ActiveApplyGuard { db: self, lsn }
+    }
+
+    fn has_higher_active_apply(&self, lsn: Lsn) -> bool {
+        self.active_apply_lsns
+            .lock()
+            .iter()
+            .next_back()
+            .is_some_and(|active| *active > lsn)
+    }
+
+    fn acquire_commit_apply_gate(&self, lsn: Lsn) -> crate::apply_gate::ReadGuard<'_> {
+        const RECHECK: std::time::Duration = std::time::Duration::from_micros(100);
+
+        let started = std::time::Instant::now();
+        let mut logged_wait = false;
+        loop {
+            if !self.apply_gate.has_writer_pending() {
+                return self.apply_gate.read();
+            }
+
+            if self.has_higher_active_apply(lsn) {
+                let waited = started.elapsed();
+                if waited >= std::time::Duration::from_millis(1) {
+                    tracing::debug!(
+                        lsn,
+                        wait_us = duration_us(waited),
+                        "metadb: lower-LSN commit bypassing pending checkpoint to unblock global apply order"
+                    );
+                }
+                return self.apply_gate.read_bypass_writer_pending();
+            }
+
+            if !logged_wait && started.elapsed() >= std::time::Duration::from_secs(1) {
+                logged_wait = true;
+                tracing::warn!(
+                    lsn,
+                    wait_ms = started.elapsed().as_millis() as u64,
+                    "metadb: commit waiting behind checkpoint apply gate"
+                );
+            }
+            std::thread::sleep(RECHECK);
+        }
+    }
+
     /// Internal: submit a set of ops to the WAL, apply them to indexes,
     /// and return the assigned LSN plus any per-op outcomes.
     ///
@@ -294,7 +352,8 @@ impl Db {
         self.metrics.record_commit_apply_wait(timing.dispatch_wait);
 
         let apply_gate_started = std::time::Instant::now();
-        let apply_guard = self.apply_gate.read();
+        let apply_guard = self.acquire_commit_apply_gate(lsn);
+        let active_apply = self.enter_active_apply(lsn);
         timing.apply_gate_wait = apply_gate_started.elapsed();
         self.metrics
             .record_commit_apply_gate_wait(timing.apply_gate_wait);
@@ -361,6 +420,7 @@ impl Db {
         if serial_apply {
             self.complete_retained_dispatch(lsn);
         }
+        drop(active_apply);
         drop(apply_guard);
         let total_elapsed = commit_started.elapsed();
         if total_elapsed >= std::time::Duration::from_secs(1) {

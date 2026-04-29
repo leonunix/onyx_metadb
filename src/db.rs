@@ -105,6 +105,14 @@ pub struct Db {
     /// LSN is unique, so at most one thread waits for any given
     /// predecessor value.
     commit_cvar: Condvar,
+    /// LSNs of commits that currently hold `apply_gate.read()`.
+    ///
+    /// This lets a lower-LSN predecessor bypass a pending checkpoint
+    /// writer when a higher-LSN commit is already inside apply and
+    /// waiting for global LSN order. Without that rescue path:
+    /// higher commit holds read → checkpoint waits for write → lower
+    /// commit parks behind writer → higher waits forever for lower.
+    active_apply_lsns: Mutex<BTreeSet<Lsn>>,
     /// Sticky failure used to wake LSN-ordered waiters if a lower-LSN
     /// commit fails after a higher-LSN commit has already been durably
     /// acked by another WAL lane.

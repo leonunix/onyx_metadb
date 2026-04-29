@@ -26,18 +26,18 @@
 //! API surface mirrors `RwLock<()>` so call sites keep
 //! `apply_gate.read()` / `apply_gate.write()` unchanged.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Condvar, Mutex};
 
 pub struct ApplyGate {
-    inner: RwLock<()>,
-    /// Number of write requests currently waiting OR holding the gate.
-    /// Bumped atomically by `write()` before acquiring `inner`, decremented
-    /// after releasing. Readers consult this to decide whether to park.
-    writer_pending: AtomicUsize,
-    cv_lock: Mutex<()>,
+    state: Mutex<GateState>,
     cv: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    readers: usize,
+    writers_pending: usize,
+    writer_active: bool,
 }
 
 impl Default for ApplyGate {
@@ -49,9 +49,7 @@ impl Default for ApplyGate {
 impl ApplyGate {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(()),
-            writer_pending: AtomicUsize::new(0),
-            cv_lock: Mutex::new(()),
+            state: Mutex::new(GateState::default()),
             cv: Condvar::new(),
         }
     }
@@ -64,70 +62,72 @@ impl ApplyGate {
     /// writer's hold time (parking_lot's existing semantics), not by
     /// indefinite starvation.
     pub fn read(&self) -> ReadGuard<'_> {
-        if self.writer_pending.load(Ordering::Acquire) > 0 {
-            let mut guard = self.cv_lock.lock();
-            while self.writer_pending.load(Ordering::Acquire) > 0 {
-                self.cv.wait(&mut guard);
-            }
+        let mut state = self.state.lock();
+        while state.writer_active || state.writers_pending > 0 {
+            self.cv.wait(&mut state);
         }
-        ReadGuard {
-            _inner: self.inner.read(),
+        state.readers += 1;
+        ReadGuard { gate: self }
+    }
+
+    /// Acquire shared access even while a writer is pending.
+    ///
+    /// This is intentionally not the default: it exists for the Db commit
+    /// scheduler's lower-LSN rescue path. If a higher-LSN commit already
+    /// holds the read side and is waiting for global LSN order, a lower-LSN
+    /// predecessor must be allowed through or the pending checkpoint writer
+    /// can form a three-way deadlock.
+    pub(crate) fn read_bypass_writer_pending(&self) -> ReadGuard<'_> {
+        let mut state = self.state.lock();
+        while state.writer_active {
+            self.cv.wait(&mut state);
         }
+        state.readers += 1;
+        ReadGuard { gate: self }
+    }
+
+    pub(crate) fn has_writer_pending(&self) -> bool {
+        let state = self.state.lock();
+        state.writer_active || state.writers_pending > 0
     }
 
     /// Acquire exclusive access. Bumps `writer_pending` immediately so
     /// any reader entering `read()` after this point parks.
     pub fn write(&self) -> WriteGuard<'_> {
-        self.writer_pending.fetch_add(1, Ordering::AcqRel);
-        let inner = self.inner.write();
-        WriteGuard {
-            inner,
-            release: WriterRelease { gate: self },
+        let mut state = self.state.lock();
+        state.writers_pending += 1;
+        while state.writer_active || state.readers > 0 {
+            self.cv.wait(&mut state);
         }
+        state.writers_pending -= 1;
+        state.writer_active = true;
+        WriteGuard { gate: self }
     }
 }
 
 pub struct ReadGuard<'a> {
-    _inner: RwLockReadGuard<'a, ()>,
-}
-
-/// Field drop order: `inner` runs first (releases the inner write lock),
-/// then `release` runs (decrements `writer_pending` and wakes parked
-/// readers). Doing it in this order avoids waking readers that would
-/// immediately re-block on `inner.read()`.
-pub struct WriteGuard<'a> {
-    inner: RwLockWriteGuard<'a, ()>,
-    // Drop runs on this field after `inner` to wake parked readers.
-    #[allow(dead_code)]
-    release: WriterRelease<'a>,
-}
-
-struct WriterRelease<'a> {
     gate: &'a ApplyGate,
 }
 
-impl Drop for WriterRelease<'_> {
+pub struct WriteGuard<'a> {
+    gate: &'a ApplyGate,
+}
+
+impl Drop for ReadGuard<'_> {
     fn drop(&mut self) {
-        let prev = self.gate.writer_pending.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            // Take cv_lock briefly so notify_all happens after any
-            // reader that just observed writer_pending > 0 has parked
-            // — otherwise the notify could fire between the reader's
-            // load and its `wait`, leaving the reader stuck until the
-            // next writer wakes it.
-            let _g = self.gate.cv_lock.lock();
+        let mut state = self.gate.state.lock();
+        state.readers = state.readers.saturating_sub(1);
+        if state.readers == 0 {
             self.gate.cv.notify_all();
         }
     }
 }
 
-// `WriteGuard` deliberately has no `Drop` impl: the field declaration
-// order guarantees `inner` drops before `release`.
-impl<'a> WriteGuard<'a> {
-    /// Read-only handle to the inner guard, for tests / debug.
-    #[allow(dead_code)]
-    pub(crate) fn inner(&self) -> &RwLockWriteGuard<'a, ()> {
-        &self.inner
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock();
+        state.writer_active = false;
+        self.gate.cv.notify_all();
     }
 }
 
@@ -159,7 +159,7 @@ mod tests {
         // Give the writer time to enter the gate's write() and bump
         // writer_pending.
         thread::sleep(Duration::from_millis(20));
-        assert!(gate.writer_pending.load(Ordering::Acquire) > 0);
+        assert!(gate.has_writer_pending());
 
         // A new reader from another thread must park (because
         // writer_pending > 0), even though inner is currently held by
@@ -187,7 +187,7 @@ mod tests {
         reader.join().unwrap();
         assert!(reader_in.load(Ordering::SeqCst));
         assert!(writer_in.load(Ordering::SeqCst));
-        assert_eq!(gate.writer_pending.load(Ordering::Acquire), 0);
+        assert!(!gate.has_writer_pending());
     }
 
     #[test]
@@ -259,5 +259,52 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn bypass_reader_can_enter_behind_pending_writer_when_reader_active() {
+        let gate = Arc::new(ApplyGate::new());
+        let held = gate.read();
+
+        let writer_waiting = Arc::new(AtomicBool::new(false));
+        let writer_entered = Arc::new(AtomicBool::new(false));
+        let writer_gate = gate.clone();
+        let writer_waiting_c = writer_waiting.clone();
+        let writer_entered_c = writer_entered.clone();
+        let writer = thread::spawn(move || {
+            writer_waiting_c.store(true, Ordering::SeqCst);
+            let _guard = writer_gate.write();
+            writer_entered_c.store(true, Ordering::SeqCst);
+        });
+
+        while !writer_waiting.load(Ordering::SeqCst) || !gate.has_writer_pending() {
+            thread::yield_now();
+        }
+
+        let bypass_gate = gate.clone();
+        let bypass_entered = Arc::new(AtomicBool::new(false));
+        let bypass_entered_c = bypass_entered.clone();
+        let bypass = thread::spawn(move || {
+            let _guard = bypass_gate.read_bypass_writer_pending();
+            bypass_entered_c.store(true, Ordering::SeqCst);
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while !bypass_entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            bypass_entered.load(Ordering::SeqCst),
+            "bypass reader should enter while an older reader is draining"
+        );
+        assert!(
+            !writer_entered.load(Ordering::SeqCst),
+            "writer must still wait for the original reader"
+        );
+
+        bypass.join().unwrap();
+        drop(held);
+        writer.join().unwrap();
+        assert!(writer_entered.load(Ordering::SeqCst));
     }
 }
