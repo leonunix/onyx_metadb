@@ -93,6 +93,19 @@ pub struct Config {
     /// (e.g. 512 GiB RAM) this can be raised to tens of GiB to cover
     /// trillion-key datasets.
     pub index_pin_bytes: u64,
+
+    /// Rebuild the in-memory page free list by scanning the whole page file
+    /// during open. This is safest for offline tests and small databases, but
+    /// it makes startup time proportional to the historical high-water mark.
+    /// Large embedded deployments can disable it and rely on normal runtime
+    /// reclaim plus offline `metadb-verify` for deep repair.
+    pub rebuild_free_list_on_open: bool,
+
+    /// Run the full orphan-page reclamation walk during open. The walk is an
+    /// online repair pass after crash/replay windows, but it also scans every
+    /// page below high-water. Large services usually want fast open and an
+    /// explicit maintenance/verify job instead.
+    pub reclaim_orphans_on_open: bool,
 }
 
 impl Config {
@@ -124,6 +137,8 @@ impl Config {
             direct_io: cfg!(target_os = "linux"),
             page_grow_chunk_pages: 512,
             index_pin_bytes: 512 * 1024 * 1024,
+            rebuild_free_list_on_open: true,
+            reclaim_orphans_on_open: true,
         }
     }
 }

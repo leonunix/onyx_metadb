@@ -72,11 +72,29 @@ pub fn replay_into<F>(dir: &Path, from_lsn: Lsn, mut apply_op: F) -> Result<Repl
 where
     F: FnMut(Lsn, &WalOp) -> Result<ApplyOutcome>,
 {
-    replay_impl(dir, from_lsn, |lsn, body| {
-        for op in decode_body(body)? {
-            apply_op(lsn, &op)?;
+    replay_records_into(dir, from_lsn, |lsn, ops| {
+        for op in ops {
+            apply_op(lsn, op)?;
         }
         Ok(())
+    })
+}
+
+/// Replay WAL records forward and invoke `apply_record(lsn, ops)` once per
+/// decoded WAL record. This preserves the live commit batch shape during
+/// recovery: an Onyx flush-writer record with hundreds of L2P remaps can be
+/// applied as one bucketed batch instead of hundreds of single-op applies.
+pub fn replay_records_into<F>(
+    dir: &Path,
+    from_lsn: Lsn,
+    mut apply_record: F,
+) -> Result<ReplayOutcome>
+where
+    F: FnMut(Lsn, &[WalOp]) -> Result<()>,
+{
+    replay_impl(dir, from_lsn, |lsn, body| {
+        let ops = decode_body(body)?;
+        apply_record(lsn, &ops)
     })
 }
 
@@ -93,6 +111,14 @@ where
     F: FnMut(Lsn, &WalOp) -> Result<ApplyOutcome>,
 {
     let dirs = crate::wal::set::replay_dirs(dir)?;
+    if dirs.len() == 1 {
+        let outcome = replay_into(&dirs[0], from_lsn, apply_op)?;
+        return Ok(ReplayWalSetOutcome {
+            merged: outcome.clone(),
+            lanes: vec![outcome],
+        });
+    }
+
     let mut records: Vec<(Lsn, Vec<u8>)> = Vec::new();
     let mut lanes = Vec::with_capacity(dirs.len());
 
@@ -125,6 +151,65 @@ where
         for op in decode_body(&body)? {
             apply_op(lsn, &op)?;
         }
+        if merged.first_lsn.is_none() {
+            merged.first_lsn = Some(lsn);
+        }
+        merged.last_lsn = Some(lsn);
+        merged.record_count += 1;
+    }
+
+    Ok(ReplayWalSetOutcome { merged, lanes })
+}
+
+/// Record-batch variant of [`replay_wal_set_into`].
+pub fn replay_wal_set_records_into<F>(
+    dir: &Path,
+    from_lsn: Lsn,
+    mut apply_record: F,
+) -> Result<ReplayWalSetOutcome>
+where
+    F: FnMut(Lsn, &[WalOp]) -> Result<()>,
+{
+    let dirs = crate::wal::set::replay_dirs(dir)?;
+    if dirs.len() == 1 {
+        let outcome = replay_records_into(&dirs[0], from_lsn, apply_record)?;
+        return Ok(ReplayWalSetOutcome {
+            merged: outcome.clone(),
+            lanes: vec![outcome],
+        });
+    }
+
+    let mut records: Vec<(Lsn, Vec<u8>)> = Vec::new();
+    let mut lanes = Vec::with_capacity(dirs.len());
+
+    for lane_dir in dirs {
+        let outcome = replay_impl(&lane_dir, from_lsn, |lsn, body| {
+            records.push((lsn, body.to_vec()));
+            Ok(())
+        })?;
+        lanes.push(outcome);
+    }
+
+    records.sort_by_key(|(lsn, _)| *lsn);
+    let mut merged = ReplayOutcome {
+        first_lsn: None,
+        last_lsn: None,
+        record_count: 0,
+        torn_tail: None,
+        tail_offset_bytes: 0,
+        final_segment: None,
+    };
+
+    for (lsn, body) in records {
+        if let Some(prev) = merged.last_lsn {
+            if lsn <= prev {
+                return Err(MetaDbError::Corruption(format!(
+                    "wal set lsn non-monotonic: saw {lsn} after {prev}",
+                )));
+            }
+        }
+        let ops = decode_body(&body)?;
+        apply_record(lsn, &ops)?;
         if merged.first_lsn.is_none() {
             merged.first_lsn = Some(lsn);
         }

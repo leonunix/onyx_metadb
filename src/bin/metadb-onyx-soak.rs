@@ -50,6 +50,7 @@ use onyx_metadb::{
     ApplyOutcome, Config, Db, Hash32, MetaMetricsSnapshot, Pba, PendingState, VolumeOrdinal,
 };
 
+const PAGE_FILE: &str = "pages.onyx_meta";
 const VOL: VolumeOrdinal = 0;
 
 struct Args {
@@ -224,7 +225,9 @@ fn run() -> Result<bool, String> {
     cfg.wal_lanes = args.wal_lanes;
     cfg.group_commit_timeout_us = args.group_commit_timeout_us;
     cfg.page_cache_bytes = 4 * 1024 * 1024 * 1024; // 4 GiB, matches onyx prod
-    let db = Arc::new(if args.db_path.join("manifest").exists() {
+    cfg.rebuild_free_list_on_open = false;
+    cfg.reclaim_orphans_on_open = false;
+    let db = Arc::new(if args.db_path.join(PAGE_FILE).exists() {
         Db::open_with_config(cfg).map_err(|e| format!("open: {e}"))?
     } else {
         Db::create_with_config(cfg).map_err(|e| format!("create: {e}"))?

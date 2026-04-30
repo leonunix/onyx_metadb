@@ -208,27 +208,31 @@ impl ReadView {
             return Ok(());
         }
 
-        #[derive(Clone, Copy)]
-        struct Walk {
-            out_idx: usize,
+        struct LeafWalk {
             leaf_idx: u64,
-            bit: usize,
             current: PageId,
+            members: Vec<(usize, usize)>, // (out index, bit inside leaf)
         }
 
-        let mut active = Vec::with_capacity(indices.len());
+        let mut active: Vec<LeafWalk> = Vec::with_capacity(indices.len());
+        let mut by_leaf: HashMap<u64, usize> = HashMap::with_capacity(indices.len().min(256));
         for &out_idx in indices {
             let lba = lbas[out_idx];
             let leaf_idx = lba >> LEAF_SHIFT;
             if leaf_idx > max_leaf_idx_at_level(self.root_level) {
                 continue;
             }
-            active.push(Walk {
-                out_idx,
-                leaf_idx,
-                bit: (lba & LEAF_MASK) as usize,
-                current: self.root,
-            });
+            let bit = (lba & LEAF_MASK) as usize;
+            if let Some(&pos) = by_leaf.get(&leaf_idx) {
+                active[pos].members.push((out_idx, bit));
+            } else {
+                by_leaf.insert(leaf_idx, active.len());
+                active.push(LeafWalk {
+                    leaf_idx,
+                    current: self.root,
+                    members: vec![(out_idx, bit)],
+                });
+            }
         }
 
         let mut level = self.root_level;
@@ -246,7 +250,7 @@ impl ReadView {
             let disk_pages = self.page_cache.get_many(&disk_pids)?;
             let mut disk_iter = disk_pages.into_iter();
             next.clear();
-            for walk in active.drain(..) {
+            for mut walk in active.drain(..) {
                 let slot = slot_in_index(walk.leaf_idx, level);
                 let child = if let Some(page) = self.overlay.get(walk.current) {
                     index_child_at(page, slot)
@@ -259,10 +263,8 @@ impl ReadView {
                     index_child_at(page.as_ref(), slot)
                 };
                 if child != NULL_PAGE {
-                    next.push(Walk {
-                        current: child,
-                        ..walk
-                    });
+                    walk.current = child;
+                    next.push(walk);
                 }
             }
             std::mem::swap(&mut active, &mut next);
@@ -282,8 +284,10 @@ impl ReadView {
             let mut disk_iter = disk_pages.into_iter();
             for walk in active {
                 if let Some(page) = self.overlay.get(walk.current) {
-                    if leaf_bit_set(page, walk.bit) {
-                        out[walk.out_idx] = Some(leaf_value_at(page, walk.bit));
+                    for (out_idx, bit) in walk.members {
+                        if leaf_bit_set(page, bit) {
+                            out[out_idx] = Some(leaf_value_at(page, bit));
+                        }
                     }
                 } else {
                     let page = disk_iter.next().ok_or_else(|| {
@@ -291,8 +295,10 @@ impl ReadView {
                             "paged read_view multi_get leaf iterator underflow".into(),
                         )
                     })?;
-                    if leaf_bit_set(page.as_ref(), walk.bit) {
-                        out[walk.out_idx] = Some(leaf_value_at(page.as_ref(), walk.bit));
+                    for (out_idx, bit) in walk.members {
+                        if leaf_bit_set(page.as_ref(), bit) {
+                            out[out_idx] = Some(leaf_value_at(page.as_ref(), bit));
+                        }
                     }
                 }
             }

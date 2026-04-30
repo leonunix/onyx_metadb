@@ -33,7 +33,7 @@
 //! list, high-water mark, committed file size).
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -52,7 +52,7 @@ use crate::page::{Page, PageHeader, PageType};
 use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 
 const RC_LOCK_SHARDS: usize = 64;
-const MAX_RECLAIM_RUN_PAGES: usize = 256;
+const MAX_RECLAIM_RUN_PAGES: usize = 1024;
 // Keep sealed checkpoint writev runs at Linux's common IOV_MAX while
 // reducing SQE count for large dirty-page flushes.
 const MAX_SEALED_WRITE_RUN_PAGES: usize = 1024;
@@ -91,9 +91,11 @@ pub struct PageStore {
     /// and `try_reclaim` only physically frees pids whose tag is below
     /// every active pin. See [`crate::epoch`] for the safety proof.
     epoch: Arc<EpochManager>,
-    /// Pending physical frees, keyed by pid (HashMap dedups so the
+    /// Pending physical frees, keyed by pid. BTreeMap keeps reclaim
+    /// selection ordered by page id so a budgeted pass still coalesces
+    /// into large hole-punch extents instead of random single pages.
     /// idempotent / replay path cannot push the same pid twice).
-    deferred_free: Mutex<HashMap<PageId, DeferredFree>>,
+    deferred_free: Mutex<BTreeMap<PageId, DeferredFree>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -152,6 +154,19 @@ impl PageStore {
         Self::open_with_grow_chunk(path, DEFAULT_GROW_CHUNK_PAGES)
     }
 
+    /// Fast-open an existing page store without rebuilding the free list.
+    ///
+    /// This trusts the file length as the high-water mark and starts with an
+    /// empty in-memory free list. It is correctness-preserving for normal
+    /// reads/replay because every reachable page still lies below EOF, but
+    /// previously-free interior pages will not be reused until a later online
+    /// reclaim/checkpoint or an explicit verifier/repair pass makes them
+    /// visible again. Intended for large embedded databases where scanning
+    /// every historical page at service startup is too expensive.
+    pub fn open_fast(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_fast_with_grow_chunk(path, DEFAULT_GROW_CHUNK_PAGES)
+    }
+
     /// Create a brand-new page store at `path`. `grow_chunk` sets how
     /// many pages are pre-reserved on each file extension; see module
     /// docs. Must be `>= 1`. Fails if the file already exists.
@@ -187,7 +202,55 @@ impl PageStore {
             rc_locks: new_rc_locks(),
             grow_chunk,
             epoch: Arc::new(EpochManager::new()),
-            deferred_free: Mutex::new(HashMap::new()),
+            deferred_free: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// Fast-open an existing page store with the caller's grow chunk. See
+    /// [`open_fast`](Self::open_fast) for the tradeoff.
+    pub fn open_fast_with_grow_chunk(path: impl AsRef<Path>, grow_chunk: u64) -> Result<Self> {
+        if grow_chunk == 0 {
+            return Err(MetaDbError::InvalidArgument(
+                "page store grow_chunk must be >= 1".into(),
+            ));
+        }
+        let open_started = std::time::Instant::now();
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let size = file.metadata()?.len();
+        if size % PAGE_SIZE as u64 != 0 {
+            return Err(MetaDbError::Corruption(format!(
+                "page file size {size} is not a multiple of page size {PAGE_SIZE}",
+            )));
+        }
+        if size < FIRST_DATA_PAGE * PAGE_SIZE as u64 {
+            return Err(MetaDbError::Corruption(format!(
+                "page file size {size} is shorter than the reserved manifest region",
+            )));
+        }
+        let file_end_pages = size / PAGE_SIZE as u64;
+        tracing::info!(
+            path = %path.display(),
+            high_water_pages = file_end_pages,
+            elapsed_ms = open_started.elapsed().as_millis(),
+            "metadb page store fast-open complete"
+        );
+        Ok(Self {
+            path,
+            file,
+            #[cfg(target_os = "linux")]
+            read_uring: Mutex::new(new_read_uring()),
+            #[cfg(target_os = "linux")]
+            write_uring: Mutex::new(new_write_uring()),
+            inner: Mutex::new(Inner {
+                high_water: file_end_pages,
+                committed_file_pages: file_end_pages,
+                free_list: Vec::new(),
+            }),
+            rc_locks: new_rc_locks(),
+            grow_chunk,
+            epoch: Arc::new(EpochManager::new()),
+            deferred_free: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -203,6 +266,7 @@ impl PageStore {
                 "page store grow_chunk must be >= 1".into(),
             ));
         }
+        let open_started = std::time::Instant::now();
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let size = file.metadata()?.len();
@@ -240,6 +304,14 @@ impl PageStore {
             file.set_len(high_water * PAGE_SIZE as u64)?;
         }
         free_list.retain(|pid| *pid < high_water);
+        tracing::info!(
+            path = %path.display(),
+            scanned_pages = file_end_pages.saturating_sub(FIRST_DATA_PAGE),
+            high_water_pages = high_water,
+            free_list_pages = free_list.len(),
+            elapsed_ms = open_started.elapsed().as_millis(),
+            "metadb page store open scan complete"
+        );
         Ok(Self {
             path,
             file,
@@ -255,7 +327,7 @@ impl PageStore {
             rc_locks: new_rc_locks(),
             grow_chunk,
             epoch: Arc::new(EpochManager::new()),
-            deferred_free: Mutex::new(HashMap::new()),
+            deferred_free: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -526,22 +598,27 @@ impl PageStore {
         Ok(page_id)
     }
 
-    /// Allocate a contiguous run of `count` fresh page ids.
+    /// Allocate a contiguous run of `count` page ids.
     ///
-    /// Always extends the high-water mark; the free list is never
-    /// consulted, because a LIFO pool of individual pages does not
-    /// efficiently produce contiguous runs. The returned page id is the
-    /// first page of the run. On-disk content is uninitialized; the
-    /// caller is expected to write a sealed page at each id.
+    /// Fast path reuses a contiguous run from the free list. Reclaim
+    /// appends sorted page ids, so checkpoint-local allocation runs can
+    /// recycle recently freed runs instead of monotonically pushing
+    /// `high_water` forward. The common case is a contiguous LIFO
+    /// suffix; if that suffix is fragmented, scan backward for an older
+    /// contiguous run before extending the file.
     pub fn allocate_run(&self, count: usize) -> Result<PageId> {
         if count == 0 {
             return Err(MetaDbError::InvalidArgument(
                 "allocate_run requires count > 0".into(),
             ));
         }
+        let count_usize = count;
         let count = u64::try_from(count)
             .map_err(|_| MetaDbError::InvalidArgument("page run too large".into()))?;
         let mut inner = self.inner.lock();
+        if let Some(start) = take_contiguous_free_run(&mut inner.free_list, count_usize) {
+            return Ok(start);
+        }
         let start = inner.high_water;
         let new_high = inner
             .high_water
@@ -550,6 +627,54 @@ impl PageStore {
         self.ensure_file_covers(&mut inner, new_high)?;
         inner.high_water = new_high;
         Ok(start)
+    }
+
+    /// Allocate up to `count` page ids as a local scratch batch.
+    ///
+    /// Unlike [`allocate_run`](Self::allocate_run), this does not require
+    /// reused pages to be contiguous. Hot COW writers only need a small pool
+    /// of fresh page ids; forcing that pool to come from a 256-page contiguous
+    /// free-list span strands fragmented reclaimed pages and keeps pushing the
+    /// high-water mark forward under random-write workloads.
+    ///
+    /// The returned vector is ordered as a stack for callers that consume it
+    /// with `pop()`: reclaimed free-list pages are returned before newly
+    /// extended tail pages.
+    pub fn allocate_batch(&self, count: usize) -> Result<Vec<PageId>> {
+        if count == 0 {
+            return Err(MetaDbError::InvalidArgument(
+                "allocate_batch requires count > 0".into(),
+            ));
+        }
+        let mut inner = self.inner.lock();
+        let reuse = count.min(inner.free_list.len());
+        let mut reused = Vec::with_capacity(reuse);
+        for _ in 0..reuse {
+            // LIFO keeps the free-list's existing cache-locality behaviour.
+            if let Some(page_id) = inner.free_list.pop() {
+                reused.push(page_id);
+            }
+        }
+
+        let missing = count - reused.len();
+        let mut pages = Vec::with_capacity(count);
+        if missing > 0 {
+            let missing_u64 = u64::try_from(missing)
+                .map_err(|_| MetaDbError::InvalidArgument("page batch too large".into()))?;
+            let start = inner.high_water;
+            let new_high = inner
+                .high_water
+                .checked_add(missing_u64)
+                .ok_or(MetaDbError::OutOfSpace)?;
+            self.ensure_file_covers(&mut inner, new_high)?;
+            inner.high_water = new_high;
+            // Store new tail pages in reverse so `pop()` yields ascending ids.
+            pages.extend((start..new_high).rev());
+        }
+        // Appended last so `pop()` consumes reclaimed pages before growing
+        // into the newly extended tail.
+        pages.extend(reused);
+        Ok(pages)
     }
 
     /// Ensure the backing file covers at least `target` pages. Rounds
@@ -735,20 +860,24 @@ impl PageStore {
         if deferred.is_empty() {
             return Ok(Vec::new());
         }
-        let mut to_reclaim: Vec<(PageId, DeferredFree)> = Vec::new();
-        deferred.retain(|pid, entry| {
-            if entry.epoch < safe_below && to_reclaim.len() < max_pages {
-                to_reclaim.push((*pid, *entry));
-                false
-            } else {
-                true
-            }
-        });
+        let selected: Vec<(PageId, DeferredFree)> = deferred
+            .iter()
+            .filter_map(|(pid, entry)| {
+                if entry.epoch < safe_below {
+                    Some((*pid, *entry))
+                } else {
+                    None
+                }
+            })
+            .take(max_pages)
+            .collect();
+        for (pid, _) in &selected {
+            deferred.remove(pid);
+        }
         drop(deferred);
 
-        to_reclaim.sort_unstable_by_key(|(pid, _)| *pid);
-        let mut reclaimable = Vec::with_capacity(to_reclaim.len());
-        for (pid, entry) in to_reclaim {
+        let mut reclaimable = Vec::with_capacity(selected.len());
+        for (pid, entry) in selected {
             if entry.idempotent && self.is_already_free_on_disk(pid)? {
                 continue;
             }
@@ -799,7 +928,42 @@ impl PageStore {
 
         let mut inner = self.inner.lock();
         inner.free_list.extend(reclaimed.iter().copied());
+        self.truncate_free_tail_locked(&mut inner)?;
         Ok(reclaimed)
+    }
+
+    fn truncate_free_tail_locked(&self, inner: &mut Inner) -> Result<()> {
+        if inner.high_water <= FIRST_DATA_PAGE || inner.free_list.is_empty() {
+            return Ok(());
+        }
+        let tail_page = inner.high_water - 1;
+        if !inner.free_list.iter().any(|pid| *pid == tail_page) {
+            return Ok(());
+        }
+
+        inner.free_list.sort_unstable();
+        inner.free_list.dedup();
+        let original_high_water = inner.high_water;
+        while inner.high_water > FIRST_DATA_PAGE
+            && inner
+                .free_list
+                .last()
+                .is_some_and(|pid| *pid == inner.high_water - 1)
+        {
+            inner.free_list.pop();
+            inner.high_water -= 1;
+        }
+
+        if inner.high_water < original_high_water {
+            self.file.set_len(
+                inner
+                    .high_water
+                    .checked_mul(PAGE_SIZE as u64)
+                    .ok_or(MetaDbError::OutOfSpace)?,
+            )?;
+            inner.committed_file_pages = inner.high_water;
+        }
+        Ok(())
     }
 
     /// `fdatasync` the page file (content only).
@@ -848,6 +1012,39 @@ impl PageStore {
     fn write_uring(&self) -> Option<&()> {
         None
     }
+}
+
+fn take_contiguous_free_run(free_list: &mut Vec<PageId>, count: usize) -> Option<PageId> {
+    if count == 0 || free_list.len() < count {
+        return None;
+    }
+
+    let mut run_end = free_list.len();
+    while run_end >= count {
+        let mut run_start = run_end - 1;
+        while run_start > 0 && free_list[run_start - 1].checked_add(1) == Some(free_list[run_start])
+        {
+            run_start -= 1;
+        }
+
+        if run_end - run_start >= count {
+            let take_start = run_end - count;
+            let start = free_list[take_start];
+            if take_start == free_list.len() - count {
+                free_list.truncate(take_start);
+            } else {
+                free_list.drain(take_start..run_end);
+            }
+            return Some(start);
+        }
+
+        if run_start == 0 {
+            break;
+        }
+        run_end = run_start;
+    }
+
+    None
 }
 
 fn read_page_raw(file: &File, page_id: PageId) -> Result<Page> {
@@ -1544,12 +1741,37 @@ mod tests {
     }
 
     #[test]
+    fn fast_open_preserves_reads_without_rebuilding_free_list() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        {
+            let ps = PageStore::create(&path).unwrap();
+            for i in 0..4u64 {
+                let pid = ps.allocate().unwrap();
+                ps.write_page(pid, &mk_page(i + 1, i as u8)).unwrap();
+            }
+            ps.free(FIRST_DATA_PAGE + 1, 100).unwrap();
+            ps.try_reclaim().unwrap();
+            ps.sync_all().unwrap();
+        }
+        let ps = PageStore::open_fast(&path).unwrap();
+        let file_pages = std::fs::metadata(&path).unwrap().len() / PAGE_SIZE as u64;
+        assert_eq!(ps.high_water(), file_pages);
+        assert_eq!(ps.free_list_len(), 0);
+        let r = ps.read_page(FIRST_DATA_PAGE + 2).unwrap();
+        assert_eq!(r.payload()[0], 2);
+        // Fast open does not spend startup time discovering interior free
+        // pages; fresh allocations move forward from EOF.
+        let pid = ps.allocate().unwrap();
+        assert_eq!(pid, file_pages);
+    }
+
+    #[test]
     fn try_reclaim_recycles_freed_pids() {
         // Deferred-free means three free calls + one try_reclaim batch
-        // hands every pid back to the free list in some order. We assert
-        // the SET of recycled pids and that no allocation bumped past
-        // the original high-water — order within the batch is unspecified
-        // because reclaim drains a HashMap.
+        // hands every pid back to the free list. We assert the SET of
+        // recycled pids and that no allocation bumped past the original
+        // high-water.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pages.onyx_meta");
         let ps = PageStore::create(&path).unwrap();
@@ -1708,20 +1930,112 @@ mod tests {
     }
 
     #[test]
-    fn allocate_run_skips_free_list() {
+    fn allocate_run_leaves_fragmented_free_list_entries() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pages.onyx_meta");
         let ps = PageStore::create(&path).unwrap();
-        // Seed the free list with one individual page.
+        // Seed the free list with one interior individual page. Tail
+        // free pages are truncated now, so keep a live page after it.
         let pid = ps.allocate().unwrap();
+        let live_tail = ps.allocate().unwrap();
         ps.write_page(pid, &mk_page(1, 0)).unwrap();
+        ps.write_page(live_tail, &mk_page(1, 1)).unwrap();
         ps.free(pid, 1).unwrap();
         ps.try_reclaim().unwrap();
         assert_eq!(ps.free_list_len(), 1);
-        // Run allocation bypasses the free list entirely.
+        // A single free page cannot satisfy a larger contiguous run.
         let start = ps.allocate_run(4).unwrap();
-        assert_eq!(start, FIRST_DATA_PAGE + 1);
+        assert_eq!(start, live_tail + 1);
         assert_eq!(ps.free_list_len(), 1);
+    }
+
+    #[test]
+    fn allocate_batch_reuses_fragmented_free_list_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        let start = ps.allocate_run(8).unwrap();
+        for i in 0..8 {
+            ps.write_page(start + i, &mk_page(1, i as u8)).unwrap();
+        }
+        ps.free_many(&[start, start + 2, start + 5], 99).unwrap();
+        ps.try_reclaim().unwrap();
+        assert_eq!(ps.free_list_len(), 3);
+        let high_water = ps.high_water();
+
+        let mut batch = ps.allocate_batch(3).unwrap();
+        batch.sort_unstable();
+        assert_eq!(batch, vec![start, start + 2, start + 5]);
+        assert_eq!(ps.high_water(), high_water);
+        assert_eq!(ps.free_list_len(), 0);
+    }
+
+    #[test]
+    fn allocate_batch_extends_only_for_missing_pages() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        let start = ps.allocate_run(4).unwrap();
+        let live_tail = ps.allocate().unwrap();
+        for i in 0..4 {
+            ps.write_page(start + i, &mk_page(1, i as u8)).unwrap();
+        }
+        ps.write_page(live_tail, &mk_page(1, 9)).unwrap();
+        ps.free_many(&[start + 1, start + 3], 99).unwrap();
+        ps.try_reclaim().unwrap();
+        let high_water = ps.high_water();
+
+        let batch = ps.allocate_batch(5).unwrap();
+        assert_eq!(batch.len(), 5);
+        assert_eq!(ps.high_water(), high_water + 3);
+        assert_eq!(ps.free_list_len(), 0);
+    }
+
+    #[test]
+    fn allocate_run_reuses_contiguous_free_list_suffix() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        let start = ps.allocate_run(4).unwrap();
+        let live_tail = ps.allocate().unwrap();
+        for i in 0..4 {
+            ps.write_page(start + i, &mk_page(1, i as u8)).unwrap();
+        }
+        ps.write_page(live_tail, &mk_page(1, 9)).unwrap();
+        ps.free_run(start, 4, 99).unwrap();
+        ps.try_reclaim().unwrap();
+        assert_eq!(ps.free_list_len(), 4);
+
+        let reused = ps.allocate_run(4).unwrap();
+        assert_eq!(reused, start);
+        assert_eq!(ps.free_list_len(), 0);
+        assert_eq!(ps.high_water(), live_tail + 1);
+    }
+
+    #[test]
+    fn allocate_run_reuses_contiguous_run_before_fragmented_tail() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        let run_start = ps.allocate_run(3).unwrap();
+        let gap = ps.allocate().unwrap();
+        let tail = ps.allocate().unwrap();
+        for (idx, pid) in [run_start, run_start + 1, run_start + 2, gap, tail]
+            .into_iter()
+            .enumerate()
+        {
+            ps.write_page(pid, &mk_page(1, idx as u8)).unwrap();
+        }
+        ps.free_run(run_start, 3, 99).unwrap();
+        ps.try_reclaim().unwrap();
+        ps.free(tail, 100).unwrap();
+        ps.try_reclaim().unwrap();
+        assert_eq!(ps.free_list_len(), 3);
+
+        let reused = ps.allocate_run(3).unwrap();
+        assert_eq!(reused, run_start);
+        assert_eq!(ps.free_list_len(), 0);
+        assert_eq!(ps.high_water(), tail);
     }
 
     #[test]
@@ -1730,12 +2044,36 @@ mod tests {
         let path = dir.path().join("pages.onyx_meta");
         let ps = PageStore::create(&path).unwrap();
         let start = ps.allocate_run(3).unwrap();
+        let live_tail = ps.allocate().unwrap();
         for i in 0..3 {
             ps.write_page(start + i, &mk_page(1, 0)).unwrap();
         }
+        ps.write_page(live_tail, &mk_page(1, 9)).unwrap();
         ps.free_run(start, 3, 99).unwrap();
         ps.try_reclaim().unwrap();
         assert_eq!(ps.free_list_len(), 3);
+    }
+
+    #[test]
+    fn reclaim_truncates_contiguous_free_tail() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        let start = ps.allocate_run(5).unwrap();
+        for i in 0..5 {
+            ps.write_page(start + i, &mk_page(1, i as u8)).unwrap();
+        }
+        assert_eq!(ps.high_water(), start + 5);
+
+        ps.free_run(start + 2, 3, 99).unwrap();
+        let reclaimed = ps.try_reclaim().unwrap();
+        assert_eq!(reclaimed, vec![start + 2, start + 3, start + 4]);
+        assert_eq!(ps.high_water(), start + 2);
+        assert_eq!(ps.free_list_len(), 0);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (start + 2) * PAGE_SIZE as u64
+        );
     }
 
     #[test]

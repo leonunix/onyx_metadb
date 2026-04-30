@@ -290,6 +290,9 @@ mod tests {
             .map(mk_handle)
             .collect();
         let head = write_level(&ps, &handles, 1).unwrap();
+        // Keep the level-chain pages interior. Tail free pages are now
+        // truncated instead of kept on the reusable free list.
+        let _live_tail = ps.allocate().unwrap();
         let before = ps.free_list_len();
         free_level(&ps, head, 2).unwrap();
         ps.try_reclaim().unwrap();

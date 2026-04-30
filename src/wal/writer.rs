@@ -368,6 +368,12 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
             }
             Err(e) => {
                 let msg = e.to_string();
+                tracing::error!(
+                    error = %msg,
+                    records = submits.len(),
+                    batch_bytes,
+                    "metadb wal writer: commit batch failed; stopping writer"
+                );
                 for pending in submits.drain(..) {
                     let _ = pending.ack.send(Err(MetaDbError::Corruption(format!(
                         "wal commit failed: {msg}"

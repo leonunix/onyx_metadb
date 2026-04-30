@@ -282,23 +282,32 @@ impl PageCache {
     /// one page-store request. Returned pages follow `page_ids` order.
     pub(crate) fn get_many(&self, page_ids: &[PageId]) -> Result<Vec<Arc<Page>>> {
         let mut out: Vec<Option<Arc<Page>>> = vec![None; page_ids.len()];
-        let mut miss_positions: HashMap<PageId, Vec<usize>> = HashMap::new();
-        let mut unique_misses = Vec::new();
-
+        let mut positions: HashMap<PageId, Vec<usize>> = HashMap::new();
+        let mut unique_page_ids = Vec::new();
         for (idx, &page_id) in page_ids.iter().enumerate() {
-            let shard_idx = self.shard_idx(page_id);
-            if let Some(page) = self.shards[shard_idx].read().get(page_id) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                out[idx] = Some(page);
-                continue;
-            }
-            match miss_positions.entry(page_id) {
+            match positions.entry(page_id) {
                 Entry::Occupied(mut entry) => entry.get_mut().push(idx),
                 Entry::Vacant(entry) => {
-                    unique_misses.push(page_id);
+                    unique_page_ids.push(page_id);
                     entry.insert(vec![idx]);
                 }
             }
+        }
+
+        let mut unique_misses = Vec::new();
+
+        for &page_id in &unique_page_ids {
+            let shard_idx = self.shard_idx(page_id);
+            if let Some(page) = self.shards[shard_idx].read().get(page_id) {
+                if let Some(idxs) = positions.get(&page_id) {
+                    self.hits.fetch_add(idxs.len() as u64, Ordering::Relaxed);
+                    for &idx in idxs {
+                        out[idx] = Some(page.clone());
+                    }
+                }
+                continue;
+            }
+            unique_misses.push(page_id);
         }
 
         if !unique_misses.is_empty() {
@@ -327,7 +336,7 @@ impl PageCache {
                         }
                     }
                 };
-                if let Some(idxs) = miss_positions.remove(&page_id) {
+                if let Some(idxs) = positions.remove(&page_id) {
                     for idx in idxs {
                         out[idx] = Some(arc.clone());
                     }

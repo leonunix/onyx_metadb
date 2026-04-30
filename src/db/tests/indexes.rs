@@ -179,6 +179,23 @@ fn scan_range_unordered_visits_range_without_materialising_sorted_iter() {
     assert_eq!(got, expected);
 }
 
+#[test]
+fn scan_range_unordered_chunked_visits_each_chunk() {
+    let (_d, db) = mk_db();
+    for i in 0u64..64 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    let mut got = Vec::new();
+    db.scan_range_unordered_chunked(0, 7, 23, 5, |lba, value| {
+        got.push((lba, value));
+        Ok(())
+    })
+    .unwrap();
+    got.sort_unstable_by_key(|(lba, _)| *lba);
+    let expected: Vec<_> = (7u64..23).map(|lba| (lba, v(lba as u8))).collect();
+    assert_eq!(got, expected);
+}
+
 // -------- phase 5e: refcount + dedup integration --------
 
 #[test]

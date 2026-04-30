@@ -96,8 +96,7 @@ pub enum DecrefOutcome {
 pub struct PageBuf {
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
-    alloc_run_next: PageId,
-    alloc_run_end: PageId,
+    alloc_pool: Vec<PageId>,
     pages: PageIdMap<Slot>,
     read_overlay_shards: Vec<Arc<ReadOverlayShard>>,
     read_overlay_updates: PageIdSet,
@@ -142,8 +141,7 @@ impl PageBuf {
         Self {
             page_store,
             page_cache,
-            alloc_run_next: 0,
-            alloc_run_end: 0,
+            alloc_pool: Vec::new(),
             pages: PageIdMap::default(),
             read_overlay_shards: ReadOverlay::empty_shards(),
             read_overlay_updates: PageIdSet::default(),
@@ -242,15 +240,13 @@ impl PageBuf {
     }
 
     fn allocate_local(&mut self) -> Result<PageId> {
-        if self.alloc_run_next < self.alloc_run_end {
-            let pid = self.alloc_run_next;
-            self.alloc_run_next += 1;
+        if let Some(pid) = self.alloc_pool.pop() {
             return Ok(pid);
         }
-        let start = self.page_store.allocate_run(LOCAL_ALLOC_RUN_PAGES)?;
-        self.alloc_run_next = start + 1;
-        self.alloc_run_end = start + LOCAL_ALLOC_RUN_PAGES as u64;
-        Ok(start)
+        self.alloc_pool = self.page_store.allocate_batch(LOCAL_ALLOC_RUN_PAGES)?;
+        self.alloc_pool.pop().ok_or_else(|| {
+            MetaDbError::Corruption("paged page allocator returned an empty batch".into())
+        })
     }
 
     /// Underlying page store handle.

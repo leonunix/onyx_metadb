@@ -696,8 +696,12 @@ impl MetaMetrics {
         record_duration(&self.cleanup_scan_us, &self.cleanup_scan_max_us, elapsed);
     }
 
-    pub(crate) fn record_cleanup_forward_check(&self, elapsed: Duration) {
-        self.cleanup_forward_checks.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_cleanup_forward_checks(&self, elapsed: Duration, checks: usize) {
+        if checks == 0 {
+            return;
+        }
+        self.cleanup_forward_checks
+            .fetch_add(checks as u64, Ordering::Relaxed);
         record_duration(
             &self.cleanup_forward_check_us,
             &self.cleanup_forward_check_max_us,

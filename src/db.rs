@@ -24,7 +24,7 @@ use crate::btree::format::RcEntry;
 use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
 use crate::error::{MetaDbError, Result};
-use crate::lsm::{DedupValue, Hash32, Lsm, LsmConfig};
+use crate::lsm::{DedupValue, Hash32, Lsm, LsmConfig, LsmStats};
 use crate::manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VolumeEntry,
     write_snapshot_roots_page,

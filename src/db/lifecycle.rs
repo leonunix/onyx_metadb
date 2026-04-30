@@ -1,12 +1,22 @@
 use super::*;
 
-const FLUSH_RECLAIM_BUDGET_PAGES: usize = 8192;
+const FLUSH_RECLAIM_MIN_BUDGET_PAGES: usize = 8192;
+const FLUSH_RECLAIM_MAX_BUDGET_PAGES: usize = 262_144;
 const FLUSH_INSTALL_PAGE_BUDGET: usize = 64;
 const FLUSH_INSTALL_CLEANUP_BUDGET: usize = 64;
 const FLUSH_INSTALL_STEP_WARN_US: u64 = 100_000;
 
 fn micros(duration: std::time::Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn flush_reclaim_budget(pending_reclaim_pages: usize, pages_written: usize) -> usize {
+    let write_scaled = pages_written.saturating_mul(2);
+    let backlog_scaled = pending_reclaim_pages / 4;
+    FLUSH_RECLAIM_MIN_BUDGET_PAGES
+        .max(write_scaled)
+        .max(backlog_scaled)
+        .min(FLUSH_RECLAIM_MAX_BUDGET_PAGES)
 }
 
 struct CheckpointInstallReceiver {
@@ -457,10 +467,11 @@ impl Db {
     /// injectable fault controller.
     pub fn open_with_config_and_faults(cfg: Config, faults: Arc<FaultController>) -> Result<Self> {
         let pages_path = page_file(&cfg.path);
-        let page_store = Arc::new(PageStore::open_with_grow_chunk(
-            &pages_path,
-            cfg.page_grow_chunk_pages,
-        )?);
+        let page_store = Arc::new(if cfg.rebuild_free_list_on_open {
+            PageStore::open_with_grow_chunk(&pages_path, cfg.page_grow_chunk_pages)?
+        } else {
+            PageStore::open_fast_with_grow_chunk(&pages_path, cfg.page_grow_chunk_pages)?
+        });
         let page_cache = Arc::new(PageCache::new_with_pin_budget(
             page_store.clone(),
             cfg.page_cache_bytes,
@@ -544,114 +555,146 @@ impl Db {
         let mut replayed_drop = false;
         let mut mutated_volumes = false;
         let replay_outcome =
-            crate::recovery::replay_wal_set_into(&wal_path, from_lsn, |lsn, op| {
-                match op {
-                    WalOp::CreateVolume { ord, shard_count } => {
-                        if !volumes.contains_key(ord) {
-                            let (shards, roots) =
-                                apply_create_volume(&page_store, &page_cache, *shard_count)?;
-                            volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
-                            manifest.volumes.push(VolumeEntry {
-                                ord: *ord,
-                                shard_count: *shard_count,
-                                l2p_shard_roots: roots,
-                                created_lsn: lsn,
-                                flags: 0,
-                            });
-                            mutated_volumes = true;
+            crate::recovery::replay_wal_set_records_into(&wal_path, from_lsn, |lsn, ops| {
+                if !batch_contains_lifecycle_op(ops) {
+                    let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
+                        manifest
+                            .snapshots
+                            .iter()
+                            .filter(|s| s.vol_ord == vol)
+                            .map(|s| SnapInfo {
+                                created_lsn: s.created_lsn,
+                                l2p_shard_roots: s.l2p_shard_roots.clone(),
+                            })
+                            .collect()
+                    };
+                    Self::apply_replay_batch(
+                        &volumes,
+                        &refcount_shards,
+                        &dedup_index,
+                        &dedup_reverse,
+                        &page_store,
+                        &metrics,
+                        lsn,
+                        ops,
+                        &snap_lookup,
+                    )?;
+                    return Ok(());
+                }
+
+                for op in ops {
+                    match op {
+                        WalOp::CreateVolume { ord, shard_count } => {
+                            if !volumes.contains_key(ord) {
+                                let (shards, roots) =
+                                    apply_create_volume(&page_store, &page_cache, *shard_count)?;
+                                volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
+                                manifest.volumes.push(VolumeEntry {
+                                    ord: *ord,
+                                    shard_count: *shard_count,
+                                    l2p_shard_roots: roots,
+                                    created_lsn: lsn,
+                                    flags: 0,
+                                });
+                                mutated_volumes = true;
+                            }
+                            manifest.next_volume_ord = manifest
+                                .next_volume_ord
+                                .max(ord.checked_add(1).unwrap_or(u16::MAX));
                         }
-                        manifest.next_volume_ord = manifest
-                            .next_volume_ord
-                            .max(ord.checked_add(1).unwrap_or(u16::MAX));
-                        Ok(ApplyOutcome::Dedup)
-                    }
-                    WalOp::DropVolume { ord, pages } => {
-                        if volumes.contains_key(ord) {
-                            apply_drop_volume(&page_store, lsn, pages)?;
-                            volumes.remove(ord);
-                            manifest.volumes.retain(|v| v.ord != *ord);
-                            mutated_volumes = true;
+                        WalOp::DropVolume { ord, pages } => {
+                            if volumes.contains_key(ord) {
+                                apply_drop_volume(&page_store, lsn, pages)?;
+                                volumes.remove(ord);
+                                manifest.volumes.retain(|v| v.ord != *ord);
+                                mutated_volumes = true;
+                            }
                         }
-                        Ok(ApplyOutcome::Dedup)
-                    }
-                    WalOp::CloneVolume {
-                        src_ord: _,
-                        new_ord,
-                        src_snap_id: _,
-                        src_shard_roots,
-                    } => {
-                        if !volumes.contains_key(new_ord) {
-                            apply_clone_volume_incref(&page_store, &faults, lsn, src_shard_roots)?;
-                            // Same stale-buffer hazard as `Db::clone_volume`:
-                            // every volume whose PagedL2p was opened above
-                            // may hold a pre-incref Clean copy of one of
-                            // these roots — not just the source. Sweep all
-                            // volumes so a later `incref_root_for_snapshot`
-                            // or `cow_for_write` during replay can't flush a
-                            // stale rc back over our disk-direct bump.
-                            let all_vols: Vec<Arc<Volume>> = volumes.values().cloned().collect();
-                            for &pid in src_shard_roots {
-                                if pid == crate::types::NULL_PAGE {
-                                    continue;
-                                }
-                                page_cache.invalidate(pid);
-                                for vol in &all_vols {
-                                    for shard in &vol.shards {
-                                        shard.tree.write().forget_page(pid);
+                        WalOp::CloneVolume {
+                            src_ord: _,
+                            new_ord,
+                            src_snap_id: _,
+                            src_shard_roots,
+                        } => {
+                            if !volumes.contains_key(new_ord) {
+                                apply_clone_volume_incref(
+                                    &page_store,
+                                    &faults,
+                                    lsn,
+                                    src_shard_roots,
+                                )?;
+                                // Same stale-buffer hazard as `Db::clone_volume`:
+                                // every volume whose PagedL2p was opened above
+                                // may hold a pre-incref Clean copy of one of
+                                // these roots — not just the source. Sweep all
+                                // volumes so a later `incref_root_for_snapshot`
+                                // or `cow_for_write` during replay can't flush a
+                                // stale rc back over our disk-direct bump.
+                                let all_vols: Vec<Arc<Volume>> =
+                                    volumes.values().cloned().collect();
+                                for &pid in src_shard_roots {
+                                    if pid == crate::types::NULL_PAGE {
+                                        continue;
+                                    }
+                                    page_cache.invalidate(pid);
+                                    for vol in &all_vols {
+                                        for shard in &vol.shards {
+                                            shard.tree.write().forget_page(pid);
+                                        }
                                     }
                                 }
+                                let (shards, actual_roots) = build_clone_volume_shards(
+                                    src_shard_roots,
+                                    &page_store,
+                                    &page_cache,
+                                    lsn,
+                                )?;
+                                let shard_count = shards.len() as u32;
+                                volumes
+                                    .insert(*new_ord, Arc::new(Volume::new(*new_ord, shards, lsn)));
+                                manifest.volumes.push(VolumeEntry {
+                                    ord: *new_ord,
+                                    shard_count,
+                                    l2p_shard_roots: actual_roots,
+                                    created_lsn: lsn,
+                                    flags: 0,
+                                });
+                                mutated_volumes = true;
                             }
-                            let (shards, actual_roots) = build_clone_volume_shards(
-                                src_shard_roots,
+                            manifest.next_volume_ord = manifest
+                                .next_volume_ord
+                                .max(new_ord.checked_add(1).unwrap_or(u16::MAX));
+                        }
+                        _ => {
+                            let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
+                                manifest
+                                    .snapshots
+                                    .iter()
+                                    .filter(|s| s.vol_ord == vol)
+                                    .map(|s| SnapInfo {
+                                        created_lsn: s.created_lsn,
+                                        l2p_shard_roots: s.l2p_shard_roots.clone(),
+                                    })
+                                    .collect()
+                            };
+                            apply_op_bare(
+                                &volumes,
+                                &refcount_shards,
+                                &dedup_index,
+                                &dedup_reverse,
                                 &page_store,
-                                &page_cache,
                                 lsn,
+                                op,
+                                &snap_lookup,
                             )?;
-                            let shard_count = shards.len() as u32;
-                            volumes.insert(*new_ord, Arc::new(Volume::new(*new_ord, shards, lsn)));
-                            manifest.volumes.push(VolumeEntry {
-                                ord: *new_ord,
-                                shard_count,
-                                l2p_shard_roots: actual_roots,
-                                created_lsn: lsn,
-                                flags: 0,
-                            });
-                            mutated_volumes = true;
+                            if let WalOp::DropSnapshot { id, .. } = op {
+                                manifest.snapshots.retain(|s| s.id != *id);
+                                replayed_drop = true;
+                            }
                         }
-                        manifest.next_volume_ord = manifest
-                            .next_volume_ord
-                            .max(new_ord.checked_add(1).unwrap_or(u16::MAX));
-                        Ok(ApplyOutcome::Dedup)
-                    }
-                    _ => {
-                        let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
-                            manifest
-                                .snapshots
-                                .iter()
-                                .filter(|s| s.vol_ord == vol)
-                                .map(|s| SnapInfo {
-                                    created_lsn: s.created_lsn,
-                                    l2p_shard_roots: s.l2p_shard_roots.clone(),
-                                })
-                                .collect()
-                        };
-                        let outcome = apply_op_bare(
-                            &volumes,
-                            &refcount_shards,
-                            &dedup_index,
-                            &dedup_reverse,
-                            &page_store,
-                            lsn,
-                            op,
-                            &snap_lookup,
-                        )?;
-                        if let WalOp::DropSnapshot { id, .. } = op {
-                            manifest.snapshots.retain(|s| s.id != *id);
-                            replayed_drop = true;
-                        }
-                        Ok(outcome)
                     }
                 }
+                Ok(())
             })?;
         let last_applied = replay_outcome
             .merged
@@ -733,23 +776,31 @@ impl Db {
             page_store.try_reclaim()?;
         }
 
-        // Reclaim orphan pages AFTER replay + post-replay commit:
-        // WAL-replayed DropSnapshot ops have already mutated
-        // `manifest.snapshots` and freed snapshot-exclusive tree
-        // pages, so the walk now sees the post-replay manifest
-        // instead of a stale snapshot list that would try to
-        // traverse already-freed pages.
-        let reclaim_generation = last_applied.max(manifest.checkpoint_lsn).max(1) + 1;
-        verify::reclaim_orphan_pages(&page_store, &manifest, reclaim_generation)?;
+        if cfg.reclaim_orphans_on_open {
+            // Reclaim orphan pages AFTER replay + post-replay commit:
+            // WAL-replayed DropSnapshot ops have already mutated
+            // `manifest.snapshots` and freed snapshot-exclusive tree
+            // pages, so the walk now sees the post-replay manifest
+            // instead of a stale snapshot list that would try to
+            // traverse already-freed pages.
+            let reclaim_generation = last_applied.max(manifest.checkpoint_lsn).max(1) + 1;
+            verify::reclaim_orphan_pages(&page_store, &manifest, reclaim_generation)?;
 
-        // Drain everything verify + post-replay commits queued. No
-        // readers exist yet (Db isn't returned until below), so the
-        // epoch barrier is trivially satisfied; this just turns the
-        // deferred entries into actual on-disk Free pages + free-list
-        // entries before we hand the page store to the live Db. Cache
-        // invalidation is unnecessary because the page cache is fresh
-        // for this open.
-        page_store.try_reclaim()?;
+            // Drain everything verify + post-replay commits queued. No
+            // readers exist yet (Db isn't returned until below), so the
+            // epoch barrier is trivially satisfied; this just turns the
+            // deferred entries into actual on-disk Free pages + free-list
+            // entries before we hand the page store to the live Db. Cache
+            // invalidation is unnecessary because the page cache is fresh
+            // for this open.
+            page_store.try_reclaim()?;
+        } else {
+            tracing::info!(
+                last_applied_lsn = last_applied,
+                high_water_pages = page_store.high_water(),
+                "metadb open skipped orphan-page reclaim"
+            );
+        }
 
         // Warm the pinned index-page set across every volume. Walks
         // each shard's tree once; stops at the first pin refusal so a
@@ -835,6 +886,11 @@ impl Db {
         self.page_store.high_water()
     }
 
+    /// Number of reclaimed pages currently available for reuse.
+    pub fn free_list_len(&self) -> usize {
+        self.page_store.free_list_len()
+    }
+
     /// Snapshot shared page-cache counters.
     pub fn cache_stats(&self) -> PageCacheStats {
         self.page_cache.stats()
@@ -842,6 +898,10 @@ impl Db {
 
     pub fn metrics_snapshot(&self) -> MetaMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    pub fn dedup_lsm_stats(&self) -> (LsmStats, LsmStats) {
+        (self.dedup_index.stats(), self.dedup_reverse.stats())
     }
 
     /// Diagnostic snapshot of in-memory bookkeeping that can grow
@@ -917,11 +977,27 @@ impl Db {
         let cache = self.cache_stats();
         let metrics = self.metrics_snapshot();
         let pending = self.pending_state();
+        let (dedup_index, dedup_reverse) = self.dedup_lsm_stats();
         format!(
             concat!(
                 "{{",
                 "\"last_applied_lsn\":{},",
                 "\"high_water\":{},",
+                "\"free_list\":{},",
+                "\"dedup_index\":{{",
+                "\"levels\":{},",
+                "\"ssts\":{},",
+                "\"records\":{},",
+                "\"active_entries\":{},",
+                "\"frozen_entries\":{}",
+                "}},",
+                "\"dedup_reverse\":{{",
+                "\"levels\":{},",
+                "\"ssts\":{},",
+                "\"records\":{},",
+                "\"active_entries\":{},",
+                "\"frozen_entries\":{}",
+                "}},",
                 "\"cache\":{{",
                 "\"hits\":{},",
                 "\"misses\":{},",
@@ -953,6 +1029,17 @@ impl Db {
             ),
             self.last_applied_lsn(),
             self.high_water(),
+            self.free_list_len(),
+            dedup_index.level_count,
+            dedup_index.total_ssts,
+            dedup_index.total_records,
+            dedup_index.memtable.active_entries,
+            dedup_index.memtable.frozen_entries,
+            dedup_reverse.level_count,
+            dedup_reverse.total_ssts,
+            dedup_reverse.total_records,
+            dedup_reverse.memtable.active_entries,
+            dedup_reverse.memtable.frozen_entries,
             cache.hits,
             cache.misses,
             cache.evictions,
@@ -1239,7 +1326,9 @@ impl Db {
         }
 
         let reclaim_started = std::time::Instant::now();
-        self.reclaim_freed_pages_budget(FLUSH_RECLAIM_BUDGET_PAGES)?;
+        let reclaim_budget =
+            flush_reclaim_budget(self.page_store.deferred_free_len(), total_pages_written);
+        self.reclaim_freed_pages_budget(reclaim_budget)?;
         crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
         self.metrics.record_flush_reclaim(reclaim_started.elapsed());
         self.metrics.record_flush_total(flush_started.elapsed());
@@ -1287,6 +1376,24 @@ impl Db {
         for pid in reclaimed {
             self.page_cache.invalidate(pid);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flush_reclaim_budget_scales_with_writes_and_backlog() {
+        assert_eq!(flush_reclaim_budget(0, 0), FLUSH_RECLAIM_MIN_BUDGET_PAGES);
+        assert_eq!(
+            flush_reclaim_budget(0, FLUSH_RECLAIM_MIN_BUDGET_PAGES),
+            FLUSH_RECLAIM_MIN_BUDGET_PAGES * 2
+        );
+        assert_eq!(
+            flush_reclaim_budget(FLUSH_RECLAIM_MAX_BUDGET_PAGES * 8, 1),
+            FLUSH_RECLAIM_MAX_BUDGET_PAGES
+        );
     }
 }
 

@@ -1059,52 +1059,6 @@ impl Db {
         })
     }
 
-    fn apply_l2p_buckets(
-        &self,
-        volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
-        lsn: Lsn,
-        ops: &[WalOp],
-        l2p_sorted: Vec<((VolumeOrdinal, usize), Vec<usize>)>,
-    ) -> Result<Vec<L2pBucketApplyResult>> {
-        let metrics = self.metrics.as_ref();
-        let refcount_trees: Vec<Arc<Mutex<BTree>>> = self
-            .refcount_shards
-            .iter()
-            .map(|s| s.tree.clone())
-            .collect();
-        let mut results = Vec::with_capacity(l2p_sorted.len());
-        for ((vol_ord, sid), indices) in l2p_sorted {
-            let volume = volumes
-                .get(&vol_ord)
-                .expect("volume presence checked during bucketing")
-                .clone();
-            results.push(Self::apply_l2p_bucket(
-                volume,
-                sid,
-                indices,
-                lsn,
-                ops,
-                &refcount_trees,
-                metrics,
-            )?);
-        }
-        Ok(results)
-    }
-
-    fn apply_refcount_bucket(
-        &self,
-        sid: usize,
-        actions: Vec<RcApplyAction>,
-        lsn: Lsn,
-    ) -> Result<RcBucketApplyResult> {
-        Self::apply_refcount_bucket_to_tree(
-            self.refcount_shards[sid].tree.clone(),
-            self.metrics.clone(),
-            actions,
-            lsn,
-        )
-    }
-
     fn apply_refcount_bucket_to_tree(
         tree: Arc<Mutex<BTree>>,
         metrics: Arc<MetaMetrics>,
@@ -1170,40 +1124,6 @@ impl Db {
             }
         }
         Ok(result)
-    }
-
-    fn apply_refcount_buckets(
-        &self,
-        rc_buckets: Vec<Vec<RcApplyAction>>,
-        lsn: Lsn,
-        _op_count: usize,
-    ) -> Result<Vec<RcBucketApplyResult>> {
-        let non_empty = rc_buckets
-            .iter()
-            .filter(|actions| !actions.is_empty())
-            .count();
-        let mut results = Vec::with_capacity(non_empty);
-        for (sid, actions) in rc_buckets.into_iter().enumerate() {
-            if actions.is_empty() {
-                continue;
-            }
-            results.push(self.apply_refcount_bucket(sid, actions, lsn)?);
-        }
-        Ok(results)
-    }
-
-    fn apply_dedup_indices(
-        &self,
-        ops: &[WalOp],
-        indices: Vec<usize>,
-    ) -> Vec<(usize, ApplyOutcome)> {
-        Self::apply_dedup_indices_to(
-            self.dedup_index.as_ref(),
-            self.dedup_reverse.as_ref(),
-            self.metrics.as_ref(),
-            ops,
-            indices,
-        )
     }
 
     fn apply_dedup_indices_to(
@@ -1380,19 +1300,61 @@ impl Db {
         ))
     }
 
-    /// Bucketed batch-apply. Only invoked for sufficiently large
-    /// batches composed entirely of bucketable ops (plain L2P,
-    /// unguarded/no-snapshot remap, refcount, dedup). See
-    /// [`apply_commit_batch`] for the dispatch rule.
-    fn apply_ops_grouped(
-        &self,
+    pub(super) fn apply_replay_batch(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+        refcount_shards: &[Shard],
+        dedup_index: &Arc<Lsm>,
+        dedup_reverse: &Arc<Lsm>,
+        page_store: &Arc<PageStore>,
+        metrics: &Arc<MetaMetrics>,
+        lsn: Lsn,
+        ops: &[WalOp],
+        snap_info_for_vol: &dyn Fn(VolumeOrdinal) -> Vec<SnapInfo>,
+    ) -> Result<Vec<ApplyOutcome>> {
+        const BUCKET_THRESHOLD: usize = 8;
+        if ops.len() < BUCKET_THRESHOLD
+            || replay_batch_requires_serial_apply(ops, snap_info_for_vol)
+        {
+            let mut outcomes = Vec::with_capacity(ops.len());
+            for op in ops {
+                outcomes.push(apply_op_bare(
+                    volumes,
+                    refcount_shards,
+                    dedup_index.as_ref(),
+                    dedup_reverse.as_ref(),
+                    page_store,
+                    lsn,
+                    op,
+                    snap_info_for_vol,
+                )?);
+            }
+            return Ok(outcomes);
+        }
+
+        Self::apply_ops_grouped_to_lanes(
+            volumes,
+            refcount_shards,
+            dedup_index,
+            dedup_reverse,
+            metrics,
+            lsn,
+            ops,
+        )
+    }
+
+    fn apply_ops_grouped_to_lanes(
+        volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+        refcount_shards: &[Shard],
+        dedup_index: &Arc<Lsm>,
+        dedup_reverse: &Arc<Lsm>,
+        metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
         ops: &[WalOp],
     ) -> Result<Vec<ApplyOutcome>> {
+        let ops = Arc::new(ops.to_vec());
         let mut outcomes: Vec<Option<ApplyOutcome>> = (0..ops.len()).map(|_| None).collect();
         let mut l2p_buckets: HashMap<(VolumeOrdinal, usize), Vec<usize>> = HashMap::new();
-        let mut rc_buckets: Vec<Vec<RcApplyAction>> = vec![Vec::new(); self.refcount_shards.len()];
+        let mut rc_buckets: Vec<Vec<RcApplyAction>> = vec![Vec::new(); refcount_shards.len()];
         let mut dedup_idxs: Vec<usize> = Vec::new();
 
         for (idx, op) in ops.iter().enumerate() {
@@ -1407,7 +1369,7 @@ impl Db {
                     l2p_buckets.entry((*vol_ord, sid)).or_default().push(idx);
                 }
                 WalOp::Incref { pba, .. } | WalOp::Decref { pba, .. } => {
-                    let sid = shard_for_key(&self.refcount_shards, *pba);
+                    let sid = shard_for_key(refcount_shards, *pba);
                     let delta = match op {
                         WalOp::Incref { delta, .. } => i64::from(*delta),
                         WalOp::Decref { delta, .. } => -i64::from(*delta),
@@ -1432,31 +1394,244 @@ impl Db {
                 | WalOp::DropVolume { .. }
                 | WalOp::CloneVolume { .. }
                 | WalOp::L2pRangeDelete { .. } => {
-                    // Already filtered out by `batch_contains_lifecycle_op`.
-                    unreachable!("lifecycle ops must not reach apply_ops_grouped");
+                    unreachable!("lifecycle ops must not reach apply_ops_grouped_to_lanes");
                 }
             }
         }
 
-        // Apply L2P buckets in deterministic bucket order for small
-        // commits, and in parallel for large commits. Buckets target
-        // disjoint per-volume shards; any refcount side effects are
-        // collected and applied after all L2P buckets finish.
+        let refcount_trees: Arc<Vec<_>> = Arc::new(
+            refcount_shards
+                .iter()
+                .map(|shard| shard.tree.clone())
+                .collect(),
+        );
         let mut l2p_sorted: Vec<_> = l2p_buckets.into_iter().collect();
         l2p_sorted.sort_by_key(|((vol, sid), _)| (*vol, *sid));
-        for result in self.apply_l2p_buckets(volumes, lsn, ops, l2p_sorted)? {
+
+        let mut l2p_receivers = Vec::with_capacity(l2p_sorted.len());
+        for ((vol_ord, sid), indices) in l2p_sorted {
+            let volume = volumes
+                .get(&vol_ord)
+                .expect("volume presence checked during bucketing")
+                .clone();
+            let apply_volume = volume.clone();
+            let apply_ops = ops.clone();
+            let refcount_trees = refcount_trees.clone();
+            let metrics = metrics.clone();
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            volume.shards[sid].apply_lane.enqueue_ready(
+                lsn,
+                Box::new(move || {
+                    let result = Self::apply_l2p_bucket(
+                        apply_volume,
+                        sid,
+                        indices,
+                        lsn,
+                        apply_ops.as_slice(),
+                        refcount_trees.as_slice(),
+                        metrics.as_ref(),
+                    );
+                    let _ = tx.send(result);
+                }),
+            );
+            l2p_receivers.push(rx);
+        }
+
+        let mut first_error = None;
+        for rx in l2p_receivers {
+            match rx.recv() {
+                Ok(Ok(result)) => {
+                    for (idx, outcome) in result.outcomes {
+                        outcomes[idx] = Some(outcome);
+                    }
+                    for action in result.rc_actions {
+                        let sid = shard_for_key(refcount_shards, action.pba);
+                        rc_buckets[sid].push(action);
+                    }
+                }
+                Ok(Err(err)) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(MetaDbError::Corruption(
+                            "replay L2P lane worker failed to return a result".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        let mut rc_receivers = Vec::new();
+        for (sid, actions) in rc_buckets.into_iter().enumerate() {
+            if actions.is_empty() {
+                continue;
+            }
+            let tree = refcount_shards[sid].tree.clone();
+            let metrics = metrics.clone();
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            refcount_shards[sid].apply_lane.enqueue_ready(
+                lsn,
+                Box::new(move || {
+                    let result = Self::apply_refcount_bucket_to_tree(tree, metrics, actions, lsn);
+                    let _ = tx.send(result);
+                }),
+            );
+            rc_receivers.push(rx);
+        }
+
+        let mut first_error = None;
+        for rx in rc_receivers {
+            match rx.recv() {
+                Ok(Ok(result)) => {
+                    for (idx, new) in result.refcount_outcomes {
+                        outcomes[idx] = Some(ApplyOutcome::RefcountNew(new));
+                    }
+                    for (idx, pba) in result.remap_freed {
+                        match outcomes[idx].as_mut() {
+                            Some(ApplyOutcome::L2pRemap { freed_pba, .. }) => {
+                                *freed_pba = Some(pba);
+                            }
+                            other => {
+                                unreachable!("remap rc action missing L2pRemap outcome: {other:?}")
+                            }
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(MetaDbError::Corruption(
+                            "replay refcount lane worker failed to return a result".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        for (idx, outcome) in Self::apply_dedup_indices_to(
+            dedup_index.as_ref(),
+            dedup_reverse.as_ref(),
+            metrics.as_ref(),
+            ops.as_slice(),
+            dedup_idxs,
+        ) {
+            outcomes[idx] = Some(outcome);
+        }
+
+        Ok(outcomes
+            .into_iter()
+            .map(|o| o.expect("every op index filled by exactly one replay lane"))
+            .collect())
+    }
+
+    fn apply_ops_grouped_to(
+        volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+        refcount_shards: &[Shard],
+        dedup_index: &Arc<Lsm>,
+        dedup_reverse: &Arc<Lsm>,
+        metrics: &Arc<MetaMetrics>,
+        lsn: Lsn,
+        ops: &[WalOp],
+    ) -> Result<Vec<ApplyOutcome>> {
+        let mut outcomes: Vec<Option<ApplyOutcome>> = (0..ops.len()).map(|_| None).collect();
+        let mut l2p_buckets: HashMap<(VolumeOrdinal, usize), Vec<usize>> = HashMap::new();
+        let mut rc_buckets: Vec<Vec<RcApplyAction>> = vec![Vec::new(); refcount_shards.len()];
+        let mut dedup_idxs: Vec<usize> = Vec::new();
+
+        for (idx, op) in ops.iter().enumerate() {
+            match op {
+                WalOp::L2pPut { vol_ord, lba, .. }
+                | WalOp::L2pDelete { vol_ord, lba }
+                | WalOp::L2pRemap { vol_ord, lba, .. } => {
+                    let volume = volumes.get(vol_ord).ok_or_else(|| {
+                        MetaDbError::Corruption(format!("L2P op for unknown volume ord {vol_ord}"))
+                    })?;
+                    let sid = shard_for_key_l2p(&volume.shards, *lba);
+                    l2p_buckets.entry((*vol_ord, sid)).or_default().push(idx);
+                }
+                WalOp::Incref { pba, .. } | WalOp::Decref { pba, .. } => {
+                    let sid = shard_for_key(refcount_shards, *pba);
+                    let delta = match op {
+                        WalOp::Incref { delta, .. } => i64::from(*delta),
+                        WalOp::Decref { delta, .. } => -i64::from(*delta),
+                        _ => unreachable!(),
+                    };
+                    rc_buckets[sid].push(RcApplyAction {
+                        op_idx: idx,
+                        pba: *pba,
+                        delta,
+                        standalone_refcount: true,
+                        remap_freed_candidate: false,
+                    });
+                }
+                WalOp::DedupPut { .. }
+                | WalOp::DedupDelete { .. }
+                | WalOp::DedupReversePut { .. }
+                | WalOp::DedupReverseDelete { .. } => {
+                    dedup_idxs.push(idx);
+                }
+                WalOp::DropSnapshot { .. }
+                | WalOp::CreateVolume { .. }
+                | WalOp::DropVolume { .. }
+                | WalOp::CloneVolume { .. }
+                | WalOp::L2pRangeDelete { .. } => {
+                    unreachable!("lifecycle ops must not reach apply_ops_grouped_to");
+                }
+            }
+        }
+
+        let refcount_trees: Vec<_> = refcount_shards
+            .iter()
+            .map(|shard| shard.tree.clone())
+            .collect();
+        let mut l2p_sorted: Vec<_> = l2p_buckets.into_iter().collect();
+        l2p_sorted.sort_by_key(|((vol, sid), _)| (*vol, *sid));
+        for ((vol_ord, sid), indices) in l2p_sorted {
+            let volume = volumes
+                .get(&vol_ord)
+                .expect("volume presence checked during bucketing")
+                .clone();
+            let result = Self::apply_l2p_bucket(
+                volume,
+                sid,
+                indices,
+                lsn,
+                ops,
+                &refcount_trees,
+                metrics.as_ref(),
+            )?;
             for (idx, outcome) in result.outcomes {
                 outcomes[idx] = Some(outcome);
             }
             for action in result.rc_actions {
-                let sid = shard_for_key(&self.refcount_shards, action.pba);
+                let sid = shard_for_key(refcount_shards, action.pba);
                 rc_buckets[sid].push(action);
             }
         }
 
-        // Apply refcount buckets. Each bucket owns one refcount shard,
-        // so large remap batches can parallelise this phase too.
-        for result in self.apply_refcount_buckets(rc_buckets, lsn, ops.len())? {
+        for (sid, actions) in rc_buckets.into_iter().enumerate() {
+            if actions.is_empty() {
+                continue;
+            }
+            let result = Self::apply_refcount_bucket_to_tree(
+                refcount_shards[sid].tree.clone(),
+                metrics.clone(),
+                actions,
+                lsn,
+            )?;
             for (idx, new) in result.refcount_outcomes {
                 outcomes[idx] = Some(ApplyOutcome::RefcountNew(new));
             }
@@ -1472,10 +1647,13 @@ impl Db {
             }
         }
 
-        // Dedup ops route through the LSM's own synchronisation; no
-        // shard lock needed. Apply in original order — LSM puts on the
-        // same key are last-write-wins, matching the serial path.
-        for (idx, outcome) in self.apply_dedup_indices(ops, dedup_idxs) {
+        for (idx, outcome) in Self::apply_dedup_indices_to(
+            dedup_index.as_ref(),
+            dedup_reverse.as_ref(),
+            metrics.as_ref(),
+            ops,
+            dedup_idxs,
+        ) {
             outcomes[idx] = Some(outcome);
         }
 
@@ -1484,6 +1662,46 @@ impl Db {
             .map(|o| o.expect("every op index filled by exactly one bucket"))
             .collect())
     }
+
+    /// Bucketed batch-apply. Only invoked for sufficiently large
+    /// batches composed entirely of bucketable ops (plain L2P,
+    /// unguarded/no-snapshot remap, refcount, dedup). See
+    /// [`apply_commit_batch`] for the dispatch rule.
+    fn apply_ops_grouped(
+        &self,
+        volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+        lsn: Lsn,
+        ops: &[WalOp],
+    ) -> Result<Vec<ApplyOutcome>> {
+        Self::apply_ops_grouped_to(
+            volumes,
+            &self.refcount_shards,
+            &self.dedup_index,
+            &self.dedup_reverse,
+            &self.metrics,
+            lsn,
+            ops,
+        )
+    }
+}
+
+fn replay_batch_requires_serial_apply(
+    ops: &[WalOp],
+    snap_info_for_vol: &dyn Fn(VolumeOrdinal) -> Vec<SnapInfo>,
+) -> bool {
+    if batch_contains_lifecycle_op(ops) {
+        return true;
+    }
+
+    let mut remap_vols = HashSet::new();
+    for op in ops {
+        if let WalOp::L2pRemap { vol_ord, .. } = op {
+            remap_vols.insert(*vol_ord);
+        }
+    }
+    remap_vols
+        .into_iter()
+        .any(|vol_ord| !snap_info_for_vol(vol_ord).is_empty())
 }
 
 /// Record per-op-type apply latency for the serial fallback path.

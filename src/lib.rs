@@ -54,7 +54,7 @@ pub use db::{
 pub use error::{MetaDbError, Result};
 pub use lsm::{
     DEDUP_VALUE_SIZE, DedupOp, DedupValue, HASH_SIZE, Hash32, LSM_RECORD_SIZE, LookupResult,
-    Memtable, MemtableStats, RECORDS_PER_PAGE, Record,
+    LsmStats, Memtable, MemtableStats, RECORDS_PER_PAGE, Record,
 };
 pub use manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VOLUME_ENTRY_FIXED_SIZE,

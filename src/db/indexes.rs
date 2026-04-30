@@ -196,38 +196,48 @@ impl Db {
                 return Err(err);
             }
         };
+        let pairs: Vec<(Pba, Hash32)> = pbas
+            .iter()
+            .copied()
+            .zip(hashes_per_pba)
+            .flat_map(|(pba, hashes)| hashes.into_iter().map(move |hash| (pba, hash)))
+            .collect();
+        let forward_entries = if pairs.is_empty() {
+            Vec::new()
+        } else {
+            let hashes: Vec<Hash32> = pairs.iter().map(|(_, hash)| *hash).collect();
+            let check_started = std::time::Instant::now();
+            match self.multi_get_dedup(&hashes) {
+                Ok(entries) => {
+                    self.metrics
+                        .record_cleanup_forward_checks(check_started.elapsed(), hashes.len());
+                    entries
+                }
+                Err(err) => {
+                    self.metrics
+                        .record_cleanup_forward_checks(check_started.elapsed(), hashes.len());
+                    self.metrics.record_cleanup_error(total_started.elapsed());
+                    return Err(err);
+                }
+            }
+        };
+
         let mut tx = self.begin();
         let mut forward_tombstones = 0usize;
-        for (pba, hashes) in pbas.iter().copied().zip(hashes_per_pba.into_iter()) {
-            for hash in hashes {
-                // Only drop the forward entry if it still points at
-                // `pba`. Another writer may have re-registered `hash`
-                // against a newer pba in the interval between the
-                // plan-side scan and now — SPEC §4.5 race protection.
-                let check_started = std::time::Instant::now();
-                let entry = match self.get_dedup(&hash) {
-                    Ok(entry) => {
-                        self.metrics
-                            .record_cleanup_forward_check(check_started.elapsed());
-                        entry
-                    }
-                    Err(err) => {
-                        self.metrics
-                            .record_cleanup_forward_check(check_started.elapsed());
-                        self.metrics.record_cleanup_error(total_started.elapsed());
-                        return Err(err);
-                    }
-                };
-                if let Some(entry) = entry {
-                    if entry.head_pba() == pba {
-                        tx.delete_dedup(hash);
-                        forward_tombstones += 1;
-                    }
+        for ((pba, hash), entry) in pairs.into_iter().zip(forward_entries.into_iter()) {
+            // Only drop the forward entry if it still points at
+            // `pba`. Another writer may have re-registered `hash`
+            // against a newer pba in the interval between the
+            // plan-side scan and now — SPEC §4.5 race protection.
+            if let Some(entry) = entry {
+                if entry.head_pba() == pba {
+                    tx.delete_dedup(hash);
+                    forward_tombstones += 1;
                 }
-                // The reverse entry itself is always stale — regardless
-                // of the forward-index race outcome, the pba is freed.
-                tx.unregister_dedup_reverse(pba, hash);
             }
+            // The reverse entry itself is always stale — regardless
+            // of the forward-index race outcome, the pba is freed.
+            tx.unregister_dedup_reverse(pba, hash);
         }
         self.metrics
             .record_cleanup_tombstones(forward_tombstones, tx.len());

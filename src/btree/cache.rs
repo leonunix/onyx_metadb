@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::btree::format::{init_internal, init_leaf};
 use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
-use crate::error::Result;
+use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageType};
 use crate::page_store::PageStore;
 use crate::paged::read_view::{PageIdMap, PageIdSet};
@@ -28,8 +28,7 @@ const LOCAL_ALLOC_RUN_PAGES: usize = 256;
 pub struct PageBuf {
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
-    alloc_run_next: PageId,
-    alloc_run_end: PageId,
+    alloc_pool: Vec<PageId>,
     pages: PageIdMap<Slot>,
     clean_pages: PageIdSet,
 }
@@ -98,23 +97,20 @@ impl PageBuf {
         Self {
             page_store,
             page_cache,
-            alloc_run_next: 0,
-            alloc_run_end: 0,
+            alloc_pool: Vec::new(),
             pages: PageIdMap::default(),
             clean_pages: PageIdSet::default(),
         }
     }
 
     fn allocate_local(&mut self) -> Result<PageId> {
-        if self.alloc_run_next < self.alloc_run_end {
-            let pid = self.alloc_run_next;
-            self.alloc_run_next += 1;
+        if let Some(pid) = self.alloc_pool.pop() {
             return Ok(pid);
         }
-        let start = self.page_store.allocate_run(LOCAL_ALLOC_RUN_PAGES)?;
-        self.alloc_run_next = start + 1;
-        self.alloc_run_end = start + LOCAL_ALLOC_RUN_PAGES as u64;
-        Ok(start)
+        self.alloc_pool = self.page_store.allocate_batch(LOCAL_ALLOC_RUN_PAGES)?;
+        self.alloc_pool.pop().ok_or_else(|| {
+            MetaDbError::Corruption("btree page allocator returned an empty batch".into())
+        })
     }
 
     fn pages_insert(&mut self, pid: PageId, slot: Slot) {

@@ -787,7 +787,14 @@ pub(super) fn refcount_apply_delta(
 }
 
 pub(super) fn shard_for_key_l2p(shards: &[L2pShard], key: u64) -> usize {
-    (xxh3_64(&key.to_be_bytes()) as usize) % shards.len()
+    // Keep one compact L2P leaf (128 consecutive LBAs) in one shard. The old
+    // hash(lba) router scattered a single 128 KiB/256 KiB user read across
+    // almost every shard, so read-side multi_get had to walk 16 independent
+    // trees before issuing the LV3 reads. Hashing leaf_idx preserves random
+    // write distribution while making spatially-local reads and remap batches
+    // shard-local.
+    let leaf_idx = key >> crate::paged::format::LEAF_SHIFT;
+    (xxh3_64(&leaf_idx.to_be_bytes()) as usize) % shards.len()
 }
 
 /// Returns true if the batch contains any op whose apply has manifest

@@ -1,9 +1,11 @@
 use super::*;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 const MULTI_GET_STACK_INDICES: usize = 64;
+const RANGE_SHARD_ENUM_LEAF_CAP: u64 = 4096;
 
 struct ActiveShardRead<'a> {
     shard: &'a L2pShard,
@@ -21,6 +23,56 @@ fn acquire_l2p_read_view(shard: &L2pShard) -> (Arc<crate::paged::ReadView>, Acti
     let view = guard.clone();
     drop(guard);
     (view, ActiveShardRead { shard })
+}
+
+fn range_start_inclusive(range: &OwnedRange) -> u64 {
+    match range.start_bound() {
+        Bound::Included(&v) => v,
+        Bound::Excluded(&v) => v.saturating_add(1),
+        Bound::Unbounded => 0,
+    }
+}
+
+fn range_end_exclusive(range: &OwnedRange) -> Option<u64> {
+    match range.end_bound() {
+        Bound::Included(&v) => Some(v.saturating_add(1)),
+        Bound::Excluded(&v) => Some(v),
+        Bound::Unbounded => None,
+    }
+}
+
+fn l2p_shards_for_range(shards: &[L2pShard], range: &OwnedRange) -> Vec<usize> {
+    if shards.len() <= 1 {
+        return (0..shards.len()).collect();
+    }
+
+    let Some(end_exclusive) = range_end_exclusive(range) else {
+        return (0..shards.len()).collect();
+    };
+    let start = range_start_inclusive(range);
+    if start >= end_exclusive {
+        return Vec::new();
+    }
+
+    let first_leaf = start >> crate::paged::format::LEAF_SHIFT;
+    let last_leaf = (end_exclusive - 1) >> crate::paged::format::LEAF_SHIFT;
+    let leaf_count = last_leaf - first_leaf + 1;
+    if leaf_count > RANGE_SHARD_ENUM_LEAF_CAP {
+        return (0..shards.len()).collect();
+    }
+
+    let mut seen = vec![false; shards.len()];
+    let mut out = Vec::with_capacity(shards.len().min(leaf_count as usize));
+    for leaf_idx in first_leaf..=last_leaf {
+        let lba = leaf_idx << crate::paged::format::LEAF_SHIFT;
+        let sid = shard_for_key_l2p(shards, lba);
+        if !seen[sid] {
+            seen[sid] = true;
+            out.push(sid);
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 impl Db {
@@ -147,7 +199,8 @@ impl Db {
         let _pin = self.page_store.epoch().pin();
         let volume = self.volume(vol_ord)?;
         let mut items = Vec::new();
-        for shard in &volume.shards {
+        for sid in l2p_shards_for_range(&volume.shards, &range) {
+            let shard = &volume.shards[sid];
             let (view, _active_read) = acquire_l2p_read_view(shard);
             items.extend(view.range(range.clone())?.collect::<Result<Vec<_>>>()?);
         }
@@ -186,11 +239,51 @@ impl Db {
         F: FnMut(Lba, L2pValue) -> Result<()>,
     {
         let range = OwnedRange::new(range);
-        let _pin = self.page_store.epoch().pin();
         let volume = self.volume(vol_ord)?;
-        for shard in &volume.shards {
+        for sid in l2p_shards_for_range(&volume.shards, &range) {
+            let shard = &volume.shards[sid];
+            let _pin = self.page_store.epoch().pin();
             let (view, _active_read) = acquire_l2p_read_view(shard);
             view.for_each_range(range.clone(), |lba, value| f(lba, value))?;
+        }
+        Ok(())
+    }
+
+    /// Chunked variant of [`scan_range_unordered`](Self::scan_range_unordered)
+    /// for background maintenance that may scan an entire volume. Each
+    /// `(chunk, shard)` walk gets its own short epoch pin, so deferred page
+    /// reclaim is not held hostage by a multi-second full-tree scan.
+    ///
+    /// This is best-effort maintenance visibility, not a transactionally
+    /// consistent volume snapshot: concurrent writes may be observed in later
+    /// chunks. Callers such as GC tolerate that and revalidate before rewrite.
+    pub fn scan_range_unordered_chunked<F>(
+        &self,
+        vol_ord: VolumeOrdinal,
+        start: Lba,
+        end: Lba,
+        chunk_lbas: u64,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Lba, L2pValue) -> Result<()>,
+    {
+        if start >= end {
+            return Ok(());
+        }
+        let chunk_lbas = chunk_lbas.max(1);
+        let volume = self.volume(vol_ord)?;
+        let mut chunk_start = start;
+        while chunk_start < end {
+            let chunk_end = chunk_start.saturating_add(chunk_lbas).min(end);
+            let chunk_range = OwnedRange::new(chunk_start..chunk_end);
+            for sid in l2p_shards_for_range(&volume.shards, &chunk_range) {
+                let shard = &volume.shards[sid];
+                let _pin = self.page_store.epoch().pin();
+                let (view, _active_read) = acquire_l2p_read_view(shard);
+                view.for_each_range(chunk_start..chunk_end, |lba, value| f(lba, value))?;
+            }
+            chunk_start = chunk_end;
         }
         Ok(())
     }
