@@ -21,7 +21,7 @@ pub mod writer;
 
 pub use op::{
     TAG_DECREF, TAG_DEDUP_DELETE, TAG_DEDUP_PUT, TAG_INCREF, TAG_L2P_DELETE, TAG_L2P_PUT,
-    WAL_BODY_SCHEMA_VERSION, WalOp, decode_body, encode_body,
+    WAL_BODY_SCHEMA_VERSION, WalOp, decode_body, encode_body, encoded_body_len, try_encode_body,
 };
 pub use record::{
     DecodeError, WAL_HEADER_SIZE, WAL_MAX_BODY, WalRecordIter, WalRecordRef, decode, encode,

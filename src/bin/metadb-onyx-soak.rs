@@ -29,6 +29,7 @@
 //!         [--range-scanners 1] [--range-scan-interval-ms 5000]
 //!         [--range-scan-lbas 0]
 //!         [--dedup-hit-pct 30] [--cleanup-batch 256]
+//!         [--dedup-register-writers 0] [--dedup-register-batch 8192]
 //!         [--target-install-max-ms 2000]
 //!         [--target-commit-p99-ms 500]
 
@@ -72,6 +73,8 @@ struct Args {
     dedup_enabled: bool,
     dedup_hit_pct: u8,
     cleanup_batch: usize,
+    dedup_register_writers: usize,
+    dedup_register_batch: usize,
     target_install_max_ms: u64,
     target_commit_p99_ms: u64,
     target_ops_per_sec: u64,
@@ -98,6 +101,8 @@ impl Args {
             dedup_enabled: false,
             dedup_hit_pct: 0,
             cleanup_batch: 256,
+            dedup_register_writers: 0,
+            dedup_register_batch: 8192,
             target_install_max_ms: 2000,
             target_commit_p99_ms: 500,
             target_ops_per_sec: 0,
@@ -151,6 +156,15 @@ impl Args {
                     a.dedup_hit_pct = v as u8;
                 }
                 "--cleanup-batch" => a.cleanup_batch = parse_usize(it.next(), "--cleanup-batch")?,
+                "--dedup-register-writers" => {
+                    a.dedup_register_writers = parse_usize(it.next(), "--dedup-register-writers")?
+                }
+                "--dedup-register-batch" => {
+                    a.dedup_register_batch = parse_usize(it.next(), "--dedup-register-batch")?;
+                    if a.dedup_register_batch == 0 {
+                        return Err("--dedup-register-batch must be > 0".into());
+                    }
+                }
                 "--target-install-max-ms" => {
                     a.target_install_max_ms = parse_u64(it.next(), "--target-install-max-ms")?
                 }
@@ -240,6 +254,9 @@ fn run() -> Result<bool, String> {
     let reader_stats: Vec<Arc<ReaderStats>> = (0..args.readers)
         .map(|_| Arc::new(ReaderStats::new()))
         .collect();
+    let dedup_register_stats: Vec<Arc<DedupRegisterStats>> = (0..args.dedup_register_writers)
+        .map(|_| Arc::new(DedupRegisterStats::new()))
+        .collect();
     let range_scan_stats = Arc::new(RangeScanStats::new());
 
     let writer_handles: Vec<_> = (0..args.writers)
@@ -258,6 +275,19 @@ fn run() -> Result<bool, String> {
             thread::Builder::new()
                 .name(format!("writer-{wid}"))
                 .spawn(move || writer_loop(wid, db, stop, stats, cfg))
+                .unwrap()
+        })
+        .collect();
+
+    let dedup_register_handles: Vec<_> = (0..args.dedup_register_writers)
+        .map(|rid| {
+            let db = db.clone();
+            let stop = stop.clone();
+            let stats = dedup_register_stats[rid].clone();
+            let batch = args.dedup_register_batch;
+            thread::Builder::new()
+                .name(format!("dedup-register-{rid}"))
+                .spawn(move || dedup_register_loop(rid, db, stop, stats, batch))
                 .unwrap()
         })
         .collect();
@@ -306,7 +336,7 @@ fn run() -> Result<bool, String> {
     };
 
     eprintln!(
-        "metadb-onyx-soak: writers={} readers={} ops/commit={} flush={}ms duration={}s warmup={}s lba_space={} wal_lanes={} group_commit_timeout={}us range_scanners={} range_scan_interval={}ms range_scan_lbas={} dedup={} dedup_hit={}%% cleanup_batch={}",
+        "metadb-onyx-soak: writers={} readers={} ops/commit={} flush={}ms duration={}s warmup={}s lba_space={} wal_lanes={} group_commit_timeout={}us range_scanners={} range_scan_interval={}ms range_scan_lbas={} dedup={} dedup_hit={}%% cleanup_batch={} dedup_register_writers={} dedup_register_batch={}",
         args.writers,
         args.readers,
         args.ops_per_commit,
@@ -322,6 +352,8 @@ fn run() -> Result<bool, String> {
         if args.dedup_enabled { "on" } else { "off" },
         args.dedup_hit_pct,
         args.cleanup_batch,
+        args.dedup_register_writers,
+        args.dedup_register_batch,
     );
     eprintln!(
         "targets: install_max < {} ms, commit P99 < {} ms{}",
@@ -342,6 +374,7 @@ fn run() -> Result<bool, String> {
         &db,
         &writer_stats,
         &reader_stats,
+        &dedup_register_stats,
         &range_scan_stats,
         &flusher_stats,
     );
@@ -352,6 +385,7 @@ fn run() -> Result<bool, String> {
             &db,
             &writer_stats,
             &reader_stats,
+            &dedup_register_stats,
             &range_scan_stats,
             &flusher_stats,
         );
@@ -365,12 +399,16 @@ fn run() -> Result<bool, String> {
         };
         let read_items_per_sec = (w.reads as f64 * args.reader_batch as f64) / w.secs;
         eprintln!(
-            "[t={:>5.1}s] commits={:>6} ({:>5.0}/s) ops={:>7} ({:>6.0}/s) commit_p50={:>6.1}ms p99={:>7.1}ms max={:>7.1}ms | commit wal={:>5.1}ms wait={:>5.1}ms gate={:>4.1}ms apply={:>5.1}ms | wal batches={} fsyncs={} batch_max={} write_avg={:>5.1}ms fsync_avg={:>5.1}ms submit_avg={:>5.1}ms | op_us l2p={:>4.1} rc={:>4.1} dedup={:>4.1} | flush={:>3} pages={} io_max={:>7}us manifest_max={:>7}us install_max={:>7}us reclaim_max={:>7}us total_max={:>7}us | l2p_buf={}/{} rc_buf={}/{} apply_q={:>3} cache={:>3}% | dedup hit={:>4.1}%% cleanup={}/{} | reads={:>5} ({:>5.0}/s items={:>7.0}/s) read_p99={:>5.1}ms | range scans={} entries={} scan_p99={:>6.1}ms scan_max={:>6.1}ms",
+            "[t={:>5.1}s] commits={:>6} ({:>5.0}/s) ops={:>7} ({:>6.0}/s) bulk_dedup={:>7} ({:>4}c {:>7.0}/s p99={:>6.1}ms) commit_p50={:>6.1}ms p99={:>7.1}ms max={:>7.1}ms | commit wal={:>5.1}ms wait={:>5.1}ms gate={:>4.1}ms apply={:>5.1}ms | wal batches={} fsyncs={} batch_max={} write_avg={:>5.1}ms fsync_avg={:>5.1}ms submit_avg={:>5.1}ms | op_us l2p={:>4.1} rc={:>4.1} dedup={:>4.1} | flush={:>3} pages={} io_max={:>7}us manifest_max={:>7}us install_max={:>7}us reclaim_max={:>7}us total_max={:>7}us | l2p_buf={}/{} rc_buf={}/{} apply_q={:>3} cache={:>3}% | dedup hit={:>4.1}%% cleanup={}/{} | reads={:>5} ({:>5.0}/s items={:>7.0}/s) read_p99={:>5.1}ms | range scans={} entries={} scan_p99={:>6.1}ms scan_max={:>6.1}ms",
             elapsed.as_secs_f64(),
             w.commits,
             w.commits as f64 / w.secs,
             w.ops,
             w.ops as f64 / w.secs,
+            w.dedup_register_ops,
+            w.dedup_register_commits,
+            w.dedup_register_ops as f64 / w.secs,
+            w.dedup_register_p99_ms,
             w.commit_p50_ms,
             w.commit_p99_ms,
             w.commit_max_ms,
@@ -422,6 +460,9 @@ fn run() -> Result<bool, String> {
         let _ = h.join();
     }
     for h in reader_handles {
+        let _ = h.join();
+    }
+    for h in dedup_register_handles {
         let _ = h.join();
     }
     for h in range_scan_handles {
@@ -539,6 +580,21 @@ impl ReaderStats {
     fn new() -> Self {
         Self {
             reads: AtomicU64::new(0),
+            latencies: Mutex::new(Vec::with_capacity(1 << 14)),
+        }
+    }
+}
+
+struct DedupRegisterStats {
+    commits: AtomicU64,
+    ops: AtomicU64,
+    latencies: Mutex<Vec<u64>>,
+}
+impl DedupRegisterStats {
+    fn new() -> Self {
+        Self {
+            commits: AtomicU64::new(0),
+            ops: AtomicU64::new(0),
             latencies: Mutex::new(Vec::with_capacity(1 << 14)),
         }
     }
@@ -728,6 +784,38 @@ fn reader_loop(
     }
 }
 
+fn dedup_register_loop(
+    rid: usize,
+    db: Arc<Db>,
+    stop: Arc<AtomicBool>,
+    stats: Arc<DedupRegisterStats>,
+    batch: usize,
+) {
+    let mut hash_seq: u64 = (rid as u64) << 48;
+    let mut pba: u64 = ((rid as u64) << 56) | 0x0080_0000_0000;
+    let mut salt: u64 = (rid as u64) << 40;
+    while !stop.load(Ordering::Relaxed) {
+        let mut tx = db.begin();
+        for _ in 0..batch {
+            hash_seq = hash_seq.wrapping_add(1);
+            pba = pba.wrapping_add(1);
+            salt = salt.wrapping_add(1);
+            let hash = onyx_hash(hash_seq);
+            tx.put_dedup(hash, onyx_dedup_value(pba, salt));
+            tx.register_dedup_reverse(pba, hash);
+        }
+        let started = Instant::now();
+        if let Err(e) = tx.commit() {
+            eprintln!("dedup-register-{rid} commit error: {e}");
+            return;
+        }
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        stats.commits.fetch_add(1, Ordering::Relaxed);
+        stats.ops.fetch_add(batch as u64, Ordering::Relaxed);
+        stats.latencies.lock().push(elapsed_us);
+    }
+}
+
 fn flusher_loop(db: Arc<Db>, stop: Arc<AtomicBool>, stats: Arc<FlusherStats>, interval: Duration) {
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(interval);
@@ -804,6 +892,9 @@ struct Sample {
     ops: u64,
     dedup_hits: u64,
     dedup_misses: u64,
+    dedup_register_commits: u64,
+    dedup_register_ops: u64,
+    dedup_register_lats_us: Vec<u64>,
     cleanup_calls: u64,
     cleanup_pbas: u64,
     commit_lats_us: Vec<u64>,
@@ -820,6 +911,7 @@ impl Sample {
         db: &Arc<Db>,
         wstats: &[Arc<WriterStats>],
         rstats: &[Arc<ReaderStats>],
+        dstats: &[Arc<DedupRegisterStats>],
         range_stats: &Arc<RangeScanStats>,
         fstats: &Arc<FlusherStats>,
     ) -> Self {
@@ -842,6 +934,15 @@ impl Sample {
             cleanup_pbas += s.cleanup_pbas.load(Ordering::Relaxed);
             let mut lats = s.latencies.lock();
             commit_lats_us.append(&mut lats);
+        }
+        let mut dedup_register_commits = 0u64;
+        let mut dedup_register_ops = 0u64;
+        let mut dedup_register_lats_us = Vec::new();
+        for s in dstats {
+            dedup_register_commits += s.commits.load(Ordering::Relaxed);
+            dedup_register_ops += s.ops.load(Ordering::Relaxed);
+            let mut lats = s.latencies.lock();
+            dedup_register_lats_us.append(&mut lats);
         }
         let mut reads = 0u64;
         let mut read_lats_us: Vec<u64> = Vec::new();
@@ -866,6 +967,9 @@ impl Sample {
             ops,
             dedup_hits,
             dedup_misses,
+            dedup_register_commits,
+            dedup_register_ops,
+            dedup_register_lats_us,
             cleanup_calls,
             cleanup_pbas,
             commit_lats_us,
@@ -887,6 +991,9 @@ struct WindowStats {
     ops: u64,
     dedup_hits: u64,
     dedup_misses: u64,
+    dedup_register_commits: u64,
+    dedup_register_ops: u64,
+    dedup_register_p99_ms: f64,
     cleanup_calls: u64,
     cleanup_pbas: u64,
     commit_p50_ms: f64,
@@ -937,6 +1044,9 @@ impl WindowStats {
         let commit_p50_ms = pct(&lats, 50) as f64 / 1000.0;
         let commit_p99_ms = pct(&lats, 99) as f64 / 1000.0;
         let commit_max_ms = lats.last().copied().unwrap_or(0) as f64 / 1000.0;
+        let mut dedup_lats = now.dedup_register_lats_us.clone();
+        dedup_lats.sort_unstable();
+        let dedup_register_p99_ms = pct(&dedup_lats, 99) as f64 / 1000.0;
         let mut rl = now.read_lats_us.clone();
         rl.sort_unstable();
         let read_p99_ms = pct(&rl, 99) as f64 / 1000.0;
@@ -1020,6 +1130,13 @@ impl WindowStats {
             ops: now.ops.saturating_sub(prev.ops),
             dedup_hits: now.dedup_hits.saturating_sub(prev.dedup_hits),
             dedup_misses: now.dedup_misses.saturating_sub(prev.dedup_misses),
+            dedup_register_commits: now
+                .dedup_register_commits
+                .saturating_sub(prev.dedup_register_commits),
+            dedup_register_ops: now
+                .dedup_register_ops
+                .saturating_sub(prev.dedup_register_ops),
+            dedup_register_p99_ms,
             cleanup_calls: now.cleanup_calls.saturating_sub(prev.cleanup_calls),
             cleanup_pbas: now.cleanup_pbas.saturating_sub(prev.cleanup_pbas),
             commit_p50_ms,
@@ -1099,6 +1216,7 @@ fn report(series: &[WindowStats], args: &Args) -> bool {
     }
     let total_commits: u64 = series.iter().map(|w| w.commits).sum();
     let total_ops: u64 = series.iter().map(|w| w.ops).sum();
+    let total_bulk_dedup_ops: u64 = series.iter().map(|w| w.dedup_register_ops).sum();
     let total_reads: u64 = series.iter().map(|w| w.reads).sum();
     let total_secs: f64 = series.iter().map(|w| w.secs).sum();
     let final_install_max = series.last().unwrap().flush_install_max_us;
@@ -1130,12 +1248,14 @@ fn report(series: &[WindowStats], args: &Args) -> bool {
     let stability = if mid == 0.0 { 1.0 } else { last / mid };
 
     eprintln!(
-        "samples={} duration={:.1}s commits={} ops={} avg_ops/s={:.0}",
+        "samples={} duration={:.1}s commits={} ops={} avg_ops/s={:.0} bulk_dedup_ops={} bulk_dedup_ops/s={:.0}",
         series.len(),
         total_secs,
         total_commits,
         total_ops,
-        total_ops as f64 / total_secs.max(0.001)
+        total_ops as f64 / total_secs.max(0.001),
+        total_bulk_dedup_ops,
+        total_bulk_dedup_ops as f64 / total_secs.max(0.001)
     );
     if total_reads > 0 {
         eprintln!(

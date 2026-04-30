@@ -270,7 +270,7 @@ pub enum WalOp {
 
 mod codec;
 
-pub use codec::{decode_body, encode_body};
+pub use codec::{decode_body, encode_body, encoded_body_len, try_encode_body};
 
 #[cfg(test)]
 mod tests;

@@ -37,7 +37,7 @@ use crate::error::{MetaDbError, Result};
 use crate::metrics::MetaMetrics;
 use crate::testing::faults::{FaultController, FaultPoint};
 use crate::types::Lsn;
-use crate::wal::record::{WAL_HEADER_SIZE, encode};
+use crate::wal::record::{WAL_HEADER_SIZE, WAL_MAX_BODY, try_encode};
 use crate::wal::segment::SegmentFile;
 
 /// Handle to the WAL writer thread. Clone-free by design — hand it
@@ -119,6 +119,9 @@ impl Wal {
     /// not guaranteed, but LSN ordering always matches the order in
     /// which the writer thread dequeued the messages.
     pub fn submit(&self, body: Vec<u8>) -> Result<Lsn> {
+        if body.len() > WAL_MAX_BODY {
+            return Err(wal_body_too_large(body.len()));
+        }
         let started = Instant::now();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.sender
@@ -138,6 +141,9 @@ impl Wal {
     /// same-lane enqueue order matches global LSN order, then waits for
     /// the fsync ack outside that mutex.
     pub(crate) fn submit_assigned_async(&self, lsn: Lsn, body: Vec<u8>) -> Result<PendingWalAck> {
+        if body.len() > WAL_MAX_BODY {
+            return Err(wal_body_too_large(body.len()));
+        }
         let started = Instant::now();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.sender
@@ -189,6 +195,12 @@ impl Drop for Wal {
 
 fn writer_exited() -> MetaDbError {
     MetaDbError::Corruption("wal writer thread exited".into())
+}
+
+fn wal_body_too_large(length: usize) -> MetaDbError {
+    MetaDbError::InvalidArgument(format!(
+        "WAL body too large: {length} bytes exceeds WAL_MAX_BODY {WAL_MAX_BODY}"
+    ))
 }
 
 struct WriterState {
@@ -411,6 +423,13 @@ fn commit_batch(
     // Estimated byte count for the rotation check. Accurate because the
     // record header is fixed size.
     let batch_bytes: usize = submits.iter().map(|s| s.body.len() + WAL_HEADER_SIZE).sum();
+    if let Some(oversized) = submits
+        .iter()
+        .map(|s| s.body.len())
+        .find(|len| *len > WAL_MAX_BODY)
+    {
+        return Err(wal_body_too_large(oversized));
+    }
     let first_lsn = submits[0].assigned_lsn.unwrap_or(state.next_lsn);
 
     // Rotate BEFORE assigning LSNs so the new segment's start_lsn
@@ -443,7 +462,7 @@ fn commit_batch(
             .max(lsn)
             .checked_add(1)
             .ok_or(MetaDbError::OutOfSpace)?;
-        encode(&mut buf, lsn, &pending.body);
+        try_encode(&mut buf, lsn, &pending.body).map_err(|len| wal_body_too_large(len as usize))?;
         assigned.push((pending.ack, lsn));
     }
 

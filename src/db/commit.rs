@@ -316,7 +316,13 @@ impl Db {
         let dispatch_lanes = dispatch_footprint.lanes.len();
 
         let encode_started = std::time::Instant::now();
-        let body = encode_body(ops);
+        let body = match try_encode_body(ops) {
+            Ok(body) => body,
+            Err(err) => {
+                self.metrics.record_commit_error(commit_started.elapsed());
+                return Err(err);
+            }
+        };
         timing.encode = encode_started.elapsed();
         let wal_started = std::time::Instant::now();
         let lsn = match self.submit_wal_ops(ops, body, Some(dispatch_footprint)) {
@@ -1133,33 +1139,33 @@ impl Db {
         ops: &[WalOp],
         indices: Vec<usize>,
     ) -> Vec<(usize, ApplyOutcome)> {
+        let batch_started = std::time::Instant::now();
+        let mut index_ops = Vec::new();
+        let mut reverse_ops = Vec::new();
         let mut outcomes = Vec::with_capacity(indices.len());
         for idx in indices {
-            let op_started = std::time::Instant::now();
-            let outcome = match &ops[idx] {
+            match &ops[idx] {
                 WalOp::DedupPut { hash, value } => {
-                    dedup_index.put(*hash, *value);
-                    ApplyOutcome::Dedup
+                    index_ops.push((*hash, crate::lsm::DedupOp::Put(*value)));
                 }
                 WalOp::DedupDelete { hash } => {
-                    dedup_index.delete(*hash);
-                    ApplyOutcome::Dedup
+                    index_ops.push((*hash, crate::lsm::DedupOp::Delete));
                 }
                 WalOp::DedupReversePut { pba, hash } => {
                     let (key, value) = encode_reverse_entry(*pba, hash);
-                    dedup_reverse.put(key, value);
-                    ApplyOutcome::Dedup
+                    reverse_ops.push((key, crate::lsm::DedupOp::Put(value)));
                 }
                 WalOp::DedupReverseDelete { pba, hash } => {
                     let (key, _) = encode_reverse_entry(*pba, hash);
-                    dedup_reverse.delete(key);
-                    ApplyOutcome::Dedup
+                    reverse_ops.push((key, crate::lsm::DedupOp::Delete));
                 }
                 other => unreachable!("dedup bucket holds only dedup ops; saw {other:?}"),
             };
-            metrics.record_apply_dedup(op_started.elapsed());
-            outcomes.push((idx, outcome));
+            outcomes.push((idx, ApplyOutcome::Dedup));
         }
+        dedup_index.apply_batch(&index_ops);
+        dedup_reverse.apply_batch(&reverse_ops);
+        metrics.record_apply_dedup_batch(outcomes.len() as u64, batch_started.elapsed());
         outcomes
     }
 

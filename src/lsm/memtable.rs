@@ -22,10 +22,9 @@
 //!
 //! One `RwLock` per `Memtable`. Reads take the shared side, writes
 //! (including `freeze` / `release_frozen`) take the exclusive side. A
-//! point lookup touches two `BTreeMap::get` calls under the read lock —
-//! short enough that lock contention is a non-issue until we push past
-//! multi-hundred-thousand ops/s. If/when it matters, we can swap in a
-//! skip-list; the public API was designed to allow that.
+//! point lookup checks a small in-memory bloom before touching either
+//! `BTreeMap`, so the common all-miss dedup path avoids logarithmic map
+//! walks while retaining exact lookups for hits and bloom false positives.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,6 +33,7 @@ use parking_lot::RwLock;
 
 use crate::error::{MetaDbError, Result};
 
+use super::bloom::{BloomFilter, DEFAULT_BITS_PER_ENTRY};
 use super::format::{DedupValue, Hash32, LSM_RECORD_SIZE};
 
 /// One logical op as stored in the memtable.
@@ -87,7 +87,9 @@ pub struct Memtable {
 #[derive(Debug)]
 struct Inner {
     active: BTreeMap<Hash32, DedupOp>,
+    active_bloom: BloomFilter,
     frozen: Option<Arc<BTreeMap<Hash32, DedupOp>>>,
+    frozen_bloom: Option<BloomFilter>,
 }
 
 impl Memtable {
@@ -101,7 +103,9 @@ impl Memtable {
         Self {
             inner: RwLock::new(Inner {
                 active: BTreeMap::new(),
+                active_bloom: bloom_for_limit(bytes_limit),
                 frozen: None,
+                frozen_bloom: None,
             }),
             bytes_limit,
         }
@@ -110,28 +114,78 @@ impl Memtable {
     /// Record a `hash → value` put.
     pub fn put(&self, hash: Hash32, value: DedupValue) {
         let mut inner = self.inner.write();
+        inner.active_bloom.insert(&hash);
         inner.active.insert(hash, DedupOp::Put(value));
     }
 
     /// Record a tombstone for `hash`.
     pub fn delete(&self, hash: Hash32) {
         let mut inner = self.inner.write();
+        inner.active_bloom.insert(&hash);
         inner.active.insert(hash, DedupOp::Delete);
+    }
+
+    /// Apply a batch of put/delete operations under one memtable write
+    /// lock. Operation order is preserved, so repeated keys keep normal
+    /// last-write-wins semantics.
+    pub fn apply_batch(&self, ops: &[(Hash32, DedupOp)]) {
+        if ops.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write();
+        for (hash, op) in ops {
+            inner.active_bloom.insert(hash);
+            inner.active.insert(*hash, *op);
+        }
     }
 
     /// Point lookup across active then frozen. The frozen slot is older
     /// than active, so active wins whenever both have an entry.
     pub fn get(&self, hash: &Hash32) -> LookupResult {
         let inner = self.inner.read();
-        if let Some(op) = inner.active.get(hash) {
+        if inner.active_bloom.maybe_contains(hash)
+            && let Some(op) = inner.active.get(hash)
+        {
             return op_to_lookup(*op);
         }
-        if let Some(frozen) = &inner.frozen {
+        if inner
+            .frozen_bloom
+            .as_ref()
+            .is_some_and(|bloom| bloom.maybe_contains(hash))
+            && let Some(frozen) = &inner.frozen
+        {
             if let Some(op) = frozen.get(hash) {
                 return op_to_lookup(*op);
             }
         }
         LookupResult::Miss
+    }
+
+    /// Batched lookup across active then frozen with a single lock
+    /// acquisition. Output order matches `hashes`.
+    pub fn multi_get(&self, hashes: &[Hash32]) -> Vec<LookupResult> {
+        let inner = self.inner.read();
+        hashes
+            .iter()
+            .map(|hash| {
+                if inner.active_bloom.maybe_contains(hash)
+                    && let Some(op) = inner.active.get(hash)
+                {
+                    return op_to_lookup(*op);
+                }
+                if inner
+                    .frozen_bloom
+                    .as_ref()
+                    .is_some_and(|bloom| bloom.maybe_contains(hash))
+                    && let Some(frozen) = &inner.frozen
+                {
+                    if let Some(op) = frozen.get(hash) {
+                        return op_to_lookup(*op);
+                    }
+                }
+                LookupResult::Miss
+            })
+            .collect()
     }
 
     /// Collect every (key, op) pair in the memtable whose key starts
@@ -208,8 +262,11 @@ impl Memtable {
             ));
         }
         let active = std::mem::take(&mut inner.active);
+        let active_bloom =
+            std::mem::replace(&mut inner.active_bloom, bloom_for_limit(self.bytes_limit));
         let frozen = Arc::new(active);
         inner.frozen = Some(frozen.clone());
+        inner.frozen_bloom = Some(active_bloom);
         Ok(frozen)
     }
 
@@ -222,6 +279,7 @@ impl Memtable {
                 "no frozen memtable to release".into(),
             ));
         }
+        inner.frozen_bloom = None;
         Ok(())
     }
 
@@ -237,6 +295,11 @@ fn op_to_lookup(op: DedupOp) -> LookupResult {
         DedupOp::Put(v) => LookupResult::Hit(v),
         DedupOp::Delete => LookupResult::Tombstone,
     }
+}
+
+fn bloom_for_limit(bytes_limit: usize) -> BloomFilter {
+    let expected_entries = (bytes_limit / LSM_RECORD_SIZE).max(1);
+    BloomFilter::with_capacity(expected_entries, DEFAULT_BITS_PER_ENTRY)
 }
 
 /// Returns `[prefix || 0x00..00, prefix || 0xFF..FF exclusive]` as a

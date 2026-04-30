@@ -545,6 +545,14 @@ impl MetaMetrics {
         record_duration(&self.apply_dedup_us, &self.apply_dedup_max_us, elapsed);
     }
 
+    pub(crate) fn record_apply_dedup_batch(&self, ops: u64, elapsed: Duration) {
+        if ops == 0 {
+            return;
+        }
+        self.apply_dedup_count.fetch_add(ops, Ordering::Relaxed);
+        record_duration(&self.apply_dedup_us, &self.apply_dedup_max_us, elapsed);
+    }
+
     pub(crate) fn record_l2p_get(&self, lock_wait: Duration, tree_walk: Duration) {
         self.l2p_get_calls.fetch_add(1, Ordering::Relaxed);
         record_duration(

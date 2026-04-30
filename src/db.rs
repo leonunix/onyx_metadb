@@ -38,7 +38,7 @@ use crate::testing::faults::{FaultController, FaultPoint};
 use crate::tx::{ApplyOutcome, Transaction};
 use crate::types::{FIRST_DATA_PAGE, Lba, Lsn, PageId, Pba, SnapshotId, VolumeOrdinal};
 use crate::verify;
-use crate::wal::{WalOp, WalSet, encode_body};
+use crate::wal::{WalOp, WalSet, try_encode_body};
 
 /// Ordinal of the always-present bootstrap volume. Phase B commit 5 keeps the
 /// surface API single-volume, so every L2P routing decision lands here. Later

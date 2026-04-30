@@ -53,6 +53,7 @@ use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 
 const RC_LOCK_SHARDS: usize = 64;
 const MAX_RECLAIM_RUN_PAGES: usize = 1024;
+const MIN_PUNCH_HOLE_RUN_PAGES: usize = 16;
 // Keep sealed checkpoint writev runs at Linux's common IOV_MAX while
 // reducing SQE count for large dirty-page flushes.
 const MAX_SEALED_WRITE_RUN_PAGES: usize = 1024;
@@ -921,7 +922,9 @@ impl PageStore {
                 bytes.extend_from_slice(page.bytes());
             }
             self.write_page_run_bytes(start, &bytes)?;
-            self.punch_free_run(start, end - idx)?;
+            if end - idx >= MIN_PUNCH_HOLE_RUN_PAGES {
+                self.punch_free_run(start, end - idx)?;
+            }
             reclaimed.extend(pages[idx..end].iter().map(|(pid, _)| *pid));
             idx = end;
         }

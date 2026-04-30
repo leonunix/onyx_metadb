@@ -16,6 +16,7 @@ use crate::metrics::MetaMetrics;
 use crate::testing::faults::FaultController;
 use crate::types::Lsn;
 
+use super::record::WAL_MAX_BODY;
 use super::segment::{list_segments, prune_segments};
 use super::writer::Wal;
 
@@ -100,6 +101,12 @@ impl WalSet {
     where
         F: FnOnce(Lsn),
     {
+        if body.len() > WAL_MAX_BODY {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "WAL body too large: {} bytes exceeds WAL_MAX_BODY {WAL_MAX_BODY}",
+                body.len()
+            )));
+        }
         if self.lanes.is_empty() {
             return Err(MetaDbError::Corruption("WalSet has no lanes".into()));
         }

@@ -165,6 +165,12 @@ impl Lsm {
         self.memtable.delete(hash);
     }
 
+    /// Apply multiple memtable mutations with one lock acquisition.
+    /// The caller is responsible for preserving WAL order inside `ops`.
+    pub fn apply_batch(&self, ops: &[(Hash32, DedupOp)]) {
+        self.memtable.apply_batch(ops);
+    }
+
     pub fn get(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
         // Hold the drain lock through the whole lookup so compaction
         // cannot free victim SST pages while we are still reading them.
@@ -184,11 +190,27 @@ impl Lsm {
         }
         let _drain = self.reader_drain.read();
         let snapshot = self.levels.read().clone();
-        let mut out = Vec::with_capacity(hashes.len());
-        for hash in hashes {
-            out.push(self.lookup_with_snapshot(hash, &snapshot)?);
+
+        let mut out: Vec<Option<Option<DedupValue>>> = vec![None; hashes.len()];
+        let mut unresolved = hashes.len();
+        for (idx, result) in self.memtable.multi_get(hashes).into_iter().enumerate() {
+            match result {
+                LookupResult::Hit(v) => {
+                    out[idx] = Some(Some(v));
+                    unresolved -= 1;
+                }
+                LookupResult::Tombstone => {
+                    out[idx] = Some(None);
+                    unresolved -= 1;
+                }
+                LookupResult::Miss => {}
+            }
         }
-        Ok(out)
+        if unresolved > 0 {
+            self.search_levels_multi(hashes, &mut out, &snapshot)?;
+        }
+
+        Ok(out.into_iter().map(|entry| entry.unwrap_or(None)).collect())
     }
 
     fn lookup_locked(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
@@ -202,19 +224,6 @@ impl Lsm {
         // Vec allocations.
         let snapshot = self.levels.read().clone();
         self.search_levels(hash, &snapshot)
-    }
-
-    fn lookup_with_snapshot(
-        &self,
-        hash: &Hash32,
-        snapshot: &[Vec<SstHandle>],
-    ) -> Result<Option<DedupValue>> {
-        match self.memtable.get(hash) {
-            LookupResult::Hit(v) => return Ok(Some(v)),
-            LookupResult::Tombstone => return Ok(None),
-            LookupResult::Miss => {}
-        }
-        self.search_levels(hash, snapshot)
     }
 
     fn search_levels(
@@ -235,6 +244,56 @@ impl Lsm {
             }
         }
         Ok(None)
+    }
+
+    fn search_levels_multi(
+        &self,
+        hashes: &[Hash32],
+        out: &mut [Option<Option<DedupValue>>],
+        snapshot: &[Vec<SstHandle>],
+    ) -> Result<()> {
+        let mut unresolved = out.iter().filter(|entry| entry.is_none()).count();
+        if unresolved == 0 {
+            return Ok(());
+        }
+
+        for (level_idx, handles) in snapshot.iter().enumerate() {
+            let ordered: Vec<SstHandle> = if level_idx == 0 {
+                handles.iter().rev().copied().collect()
+            } else {
+                handles.to_vec()
+            };
+
+            for handle in ordered {
+                if unresolved == 0 {
+                    return Ok(());
+                }
+                if !hashes.iter().enumerate().any(|(idx, hash)| {
+                    out[idx].is_none() && hash >= &handle.min_hash && hash <= &handle.max_hash
+                }) {
+                    continue;
+                }
+
+                let reader = self.get_cached_reader(handle)?;
+                for (idx, hash) in hashes.iter().enumerate() {
+                    if out[idx].is_some() || hash < &handle.min_hash || hash > &handle.max_hash {
+                        continue;
+                    }
+                    match reader.get(hash)? {
+                        LookupResult::Hit(v) => {
+                            out[idx] = Some(Some(v));
+                            unresolved -= 1;
+                        }
+                        LookupResult::Tombstone => {
+                            out[idx] = Some(None);
+                            unresolved -= 1;
+                        }
+                        LookupResult::Miss => {}
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `true` if the memtable has reached the freeze threshold.

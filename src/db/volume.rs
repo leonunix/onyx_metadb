@@ -59,7 +59,7 @@ impl Db {
         };
 
         let op = WalOp::CreateVolume { ord, shard_count };
-        let body = encode_body(std::slice::from_ref(&op));
+        let body = try_encode_body(std::slice::from_ref(&op))?;
         let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body, None)?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
@@ -234,7 +234,7 @@ impl Db {
             ord: vol_ord,
             pages: pages.clone(),
         };
-        let body = encode_body(std::slice::from_ref(&op));
+        let body = try_encode_body(std::slice::from_ref(&op))?;
         let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body, None)?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
         // Fault window specific to drop_volume: WAL record durable, no
@@ -363,7 +363,7 @@ impl Db {
             src_snap_id,
             src_shard_roots: src_shard_roots.clone(),
         };
-        let body = encode_body(std::slice::from_ref(&op));
+        let body = try_encode_body(std::slice::from_ref(&op))?;
         let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body, None)?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 

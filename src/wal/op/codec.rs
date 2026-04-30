@@ -1,4 +1,5 @@
 use super::*;
+use crate::wal::record::WAL_MAX_BODY;
 
 impl WalOp {
     /// Append the encoded bytes of this op to `out`.
@@ -181,13 +182,35 @@ impl WalOp {
 /// (version byte only) so recovery distinguishes "a writer committed
 /// zero ops" from "body was never written".
 pub fn encode_body(ops: &[WalOp]) -> Vec<u8> {
-    let total = 1 + ops.iter().map(|op| op.encoded_len()).sum::<usize>();
+    let total = encoded_body_len(ops);
     let mut out = Vec::with_capacity(total);
     out.push(WAL_BODY_SCHEMA_VERSION);
     for op in ops {
         op.encode(&mut out);
     }
     out
+}
+
+/// Serialized body length including the schema-version byte.
+pub fn encoded_body_len(ops: &[WalOp]) -> usize {
+    1 + ops.iter().map(|op| op.encoded_len()).sum::<usize>()
+}
+
+/// Non-panicking body encoder. Returns [`MetaDbError::InvalidArgument`]
+/// when the resulting body would exceed the single-record WAL bound.
+pub fn try_encode_body(ops: &[WalOp]) -> Result<Vec<u8>> {
+    let total = encoded_body_len(ops);
+    if total > WAL_MAX_BODY {
+        return Err(MetaDbError::InvalidArgument(format!(
+            "WAL body too large: {total} bytes exceeds WAL_MAX_BODY {WAL_MAX_BODY}"
+        )));
+    }
+    let mut out = Vec::with_capacity(total);
+    out.push(WAL_BODY_SCHEMA_VERSION);
+    for op in ops {
+        op.encode(&mut out);
+    }
+    Ok(out)
 }
 
 /// Decode a WAL record body back into a vector of ops. Fails with
