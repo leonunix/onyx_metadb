@@ -106,7 +106,10 @@ impl Wal {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let thread = std::thread::Builder::new()
             .name("onyx-metadb-wal".to_string())
-            .spawn(move || writer_main(receiver, state))?;
+            .spawn(move || {
+                crate::affinity::bind_current(crate::affinity::ThreadRole::Wal, 0);
+                writer_main(receiver, state)
+            })?;
         Ok(Self {
             sender,
             thread: Mutex::new(Some(thread)),

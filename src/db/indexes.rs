@@ -88,6 +88,31 @@ impl Db {
         self.dedup_index.multi_get(hashes)
     }
 
+    /// Batched hot-path liveness check for dedup hits. The caller already
+    /// looked up `(hash -> value)` once; this re-reads the current forward
+    /// index and refcounts under shared snapshots/locks so stale rows and
+    /// refcount-zero targets are rejected without one point query per hit.
+    pub fn multi_dedup_entries_are_live(
+        &self,
+        entries: &[(Hash32, DedupValue)],
+    ) -> Result<Vec<bool>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let hashes: Vec<Hash32> = entries.iter().map(|(hash, _)| *hash).collect();
+        let forward = self.multi_get_dedup(&hashes)?;
+        let pbas: Vec<Pba> = entries.iter().map(|(_, value)| value.head_pba()).collect();
+        let refcounts = self.multi_get_refcount(&pbas)?;
+
+        Ok(entries
+            .iter()
+            .zip(forward)
+            .zip(refcounts)
+            .map(|(((.., expected), current), rc)| rc > 0 && current.as_ref() == Some(expected))
+            .collect())
+    }
+
     // -------- dedup_reverse operations ----------------------------------
 
     /// Register `hash` as mapped to `pba` in the reverse index. This

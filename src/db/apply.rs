@@ -582,7 +582,7 @@ pub(super) fn build_clone_volume_shards(
 ) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
     let mut shards = Vec::with_capacity(src_shard_roots.len());
     let mut actual_roots = Vec::with_capacity(src_shard_roots.len());
-    for &root in src_shard_roots {
+    for (shard_idx, &root) in src_shard_roots.iter().enumerate() {
         let tree = if root == crate::types::NULL_PAGE {
             PagedL2p::create_with_cache(page_store.clone(), page_cache.clone())?
         } else {
@@ -594,7 +594,9 @@ pub(super) fn build_clone_volume_shards(
             )?
         };
         actual_roots.push(tree.root());
-        shards.push(super::helpers::make_l2p_shard(tree, page_cache));
+        shards.push(super::helpers::make_l2p_shard(
+            tree, page_cache, shard_idx,
+        ));
     }
     Ok((shards, actual_roots.into_boxed_slice()))
 }

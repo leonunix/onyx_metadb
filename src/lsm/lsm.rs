@@ -188,12 +188,31 @@ impl Lsm {
         if hashes.is_empty() {
             return Ok(Vec::new());
         }
+        let mut unique_hashes: Vec<Hash32> = Vec::with_capacity(hashes.len());
+        let mut unique_by_hash: HashMap<Hash32, usize> = HashMap::with_capacity(hashes.len());
+        let mut input_to_unique = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            if let Some(&idx) = unique_by_hash.get(hash) {
+                input_to_unique.push(idx);
+                continue;
+            }
+            let idx = unique_hashes.len();
+            unique_hashes.push(*hash);
+            unique_by_hash.insert(*hash, idx);
+            input_to_unique.push(idx);
+        }
+
         let _drain = self.reader_drain.read();
         let snapshot = self.levels.read().clone();
 
-        let mut out: Vec<Option<Option<DedupValue>>> = vec![None; hashes.len()];
-        let mut unresolved = hashes.len();
-        for (idx, result) in self.memtable.multi_get(hashes).into_iter().enumerate() {
+        let mut out: Vec<Option<Option<DedupValue>>> = vec![None; unique_hashes.len()];
+        let mut unresolved = unique_hashes.len();
+        for (idx, result) in self
+            .memtable
+            .multi_get(&unique_hashes)
+            .into_iter()
+            .enumerate()
+        {
             match result {
                 LookupResult::Hit(v) => {
                     out[idx] = Some(Some(v));
@@ -207,10 +226,15 @@ impl Lsm {
             }
         }
         if unresolved > 0 {
-            self.search_levels_multi(hashes, &mut out, &snapshot)?;
+            self.search_levels_multi(&unique_hashes, &mut out, &snapshot)?;
         }
 
-        Ok(out.into_iter().map(|entry| entry.unwrap_or(None)).collect())
+        let unique_results: Vec<Option<DedupValue>> =
+            out.into_iter().map(|entry| entry.unwrap_or(None)).collect();
+        Ok(input_to_unique
+            .into_iter()
+            .map(|idx| unique_results[idx])
+            .collect())
     }
 
     fn lookup_locked(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
@@ -252,46 +276,129 @@ impl Lsm {
         out: &mut [Option<Option<DedupValue>>],
         snapshot: &[Vec<SstHandle>],
     ) -> Result<()> {
-        let mut unresolved = out.iter().filter(|entry| entry.is_none()).count();
-        if unresolved == 0 {
+        let mut unresolved: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| entry.is_none().then_some(idx))
+            .collect();
+        if unresolved.is_empty() {
             return Ok(());
         }
 
         for (level_idx, handles) in snapshot.iter().enumerate() {
-            let ordered: Vec<SstHandle> = if level_idx == 0 {
-                handles.iter().rev().copied().collect()
-            } else {
-                handles.to_vec()
-            };
+            if unresolved.is_empty() {
+                return Ok(());
+            }
+            if handles.is_empty() {
+                continue;
+            }
 
-            for handle in ordered {
-                if unresolved == 0 {
-                    return Ok(());
-                }
-                if !hashes.iter().enumerate().any(|(idx, hash)| {
-                    out[idx].is_none() && hash >= &handle.min_hash && hash <= &handle.max_hash
-                }) {
+            if level_idx == 0 {
+                self.search_overlapping_level_multi(hashes, out, &mut unresolved, handles)?;
+            } else {
+                self.search_disjoint_level_multi(hashes, out, &mut unresolved, handles)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn search_overlapping_level_multi(
+        &self,
+        hashes: &[Hash32],
+        out: &mut [Option<Option<DedupValue>>],
+        unresolved: &mut Vec<usize>,
+        handles: &[SstHandle],
+    ) -> Result<()> {
+        for handle in handles.iter().rev() {
+            if unresolved.is_empty() {
+                return Ok(());
+            }
+            let candidates: Vec<usize> = unresolved
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    let hash = &hashes[idx];
+                    hash >= &handle.min_hash && hash <= &handle.max_hash
+                })
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let reader = self.get_cached_reader(*handle)?;
+            let mut resolved_any = false;
+            let candidate_hashes: Vec<Hash32> = candidates.iter().map(|&idx| hashes[idx]).collect();
+            for (idx, result) in candidates
+                .into_iter()
+                .zip(reader.multi_get(&candidate_hashes)?)
+            {
+                if out[idx].is_some() {
                     continue;
                 }
-
-                let reader = self.get_cached_reader(handle)?;
-                for (idx, hash) in hashes.iter().enumerate() {
-                    if out[idx].is_some() || hash < &handle.min_hash || hash > &handle.max_hash {
-                        continue;
+                match result {
+                    LookupResult::Hit(v) => {
+                        out[idx] = Some(Some(v));
+                        resolved_any = true;
                     }
-                    match reader.get(hash)? {
-                        LookupResult::Hit(v) => {
-                            out[idx] = Some(Some(v));
-                            unresolved -= 1;
-                        }
-                        LookupResult::Tombstone => {
-                            out[idx] = Some(None);
-                            unresolved -= 1;
-                        }
-                        LookupResult::Miss => {}
+                    LookupResult::Tombstone => {
+                        out[idx] = Some(None);
+                        resolved_any = true;
                     }
+                    LookupResult::Miss => {}
                 }
             }
+            if resolved_any {
+                unresolved.retain(|idx| out[*idx].is_none());
+            }
+        }
+        Ok(())
+    }
+
+    fn search_disjoint_level_multi(
+        &self,
+        hashes: &[Hash32],
+        out: &mut [Option<Option<DedupValue>>],
+        unresolved: &mut Vec<usize>,
+        handles: &[SstHandle],
+    ) -> Result<()> {
+        let mut grouped: Vec<Vec<usize>> = std::iter::repeat_with(Vec::new)
+            .take(handles.len())
+            .collect();
+        for &idx in unresolved.iter() {
+            if let Some(handle_idx) = find_disjoint_handle(handles, &hashes[idx]) {
+                grouped[handle_idx].push(idx);
+            }
+        }
+
+        let mut resolved_any = false;
+        for (handle_idx, indices) in grouped.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let reader = self.get_cached_reader(handles[handle_idx])?;
+            let candidate_hashes: Vec<Hash32> = indices.iter().map(|&idx| hashes[idx]).collect();
+            for (idx, result) in indices
+                .into_iter()
+                .zip(reader.multi_get(&candidate_hashes)?)
+            {
+                if out[idx].is_some() {
+                    continue;
+                }
+                match result {
+                    LookupResult::Hit(v) => {
+                        out[idx] = Some(Some(v));
+                        resolved_any = true;
+                    }
+                    LookupResult::Tombstone => {
+                        out[idx] = Some(None);
+                        resolved_any = true;
+                    }
+                    LookupResult::Miss => {}
+                }
+            }
+        }
+        if resolved_any {
+            unresolved.retain(|idx| out[*idx].is_none());
         }
         Ok(())
     }
@@ -726,15 +833,8 @@ impl Lsm {
     }
 
     fn find_in_disjoint(&self, handles: &[SstHandle], hash: &Hash32) -> Result<LookupResult> {
-        // Disjoint levels can be binary-searched by (min, max); for the
-        // expected small per-level sizes a linear scan is fine and
-        // cache-friendly. Revisit once levels grow past a few hundred
-        // SSTs (phase 8).
-        for handle in handles {
-            if hash < &handle.min_hash || hash > &handle.max_hash {
-                continue;
-            }
-            let reader = self.get_cached_reader(*handle)?;
+        if let Some(idx) = find_disjoint_handle(handles, hash) {
+            let reader = self.get_cached_reader(handles[idx])?;
             return reader.get(hash);
         }
         Ok(LookupResult::Miss)
@@ -744,6 +844,12 @@ impl Lsm {
 mod helpers;
 
 use helpers::*;
+
+fn find_disjoint_handle(handles: &[SstHandle], hash: &Hash32) -> Option<usize> {
+    let upper = handles.partition_point(|handle| handle.min_hash <= *hash);
+    let idx = upper.checked_sub(1)?;
+    (hash <= &handles[idx].max_hash).then_some(idx)
+}
 
 #[cfg(test)]
 mod tests;

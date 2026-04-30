@@ -31,7 +31,7 @@ pub(super) fn mk_db_with_cache_bytes(page_cache_bytes: u64) -> (TempDir, Db) {
 
 #[test]
 fn apply_lane_maintenance_bypasses_queued_wal_work() {
-    let lane = ApplyLane::new(0);
+    let lane = ApplyLane::new(0, ApplyLaneKind::L2p, 0);
     let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -70,7 +70,7 @@ fn apply_lane_maintenance_bypasses_queued_wal_work() {
 
 #[test]
 fn apply_lane_prioritizes_ready_wal_work_with_bounded_maintenance() {
-    let lane = ApplyLane::new(0);
+    let lane = ApplyLane::new(0, ApplyLaneKind::L2p, 0);
     let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();

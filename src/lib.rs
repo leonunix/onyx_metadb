@@ -24,6 +24,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod apply_gate;
+pub mod affinity;
 pub mod btree;
 pub mod cache;
 pub mod config;

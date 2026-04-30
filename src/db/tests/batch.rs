@@ -62,6 +62,41 @@ fn multi_get_dedup_hits_memtable_and_sst() {
 }
 
 #[test]
+fn multi_dedup_entries_are_live_matches_forward_and_refcount() {
+    let (_d, db) = mk_db_with_shards(4);
+    let live = h(1);
+    let zero_rc = h(2);
+    let replaced = h(3);
+    let missing = h(4);
+    let live_value = dv(10);
+    let zero_value = dv(20);
+    let old_value = dv(30);
+    let new_value = dv(31);
+    let missing_value = dv(40);
+
+    db.put_dedup(live, live_value).unwrap();
+    db.put_dedup(zero_rc, zero_value).unwrap();
+    db.put_dedup(replaced, old_value).unwrap();
+    db.put_dedup(replaced, new_value).unwrap();
+    db.incref_pba(live_value.head_pba(), 1).unwrap();
+    db.incref_pba(old_value.head_pba(), 1).unwrap();
+    db.incref_pba(new_value.head_pba(), 1).unwrap();
+    db.incref_pba(missing_value.head_pba(), 1).unwrap();
+
+    let got = db
+        .multi_dedup_entries_are_live(&[
+            (live, live_value),
+            (zero_rc, zero_value),
+            (replaced, old_value),
+            (missing, missing_value),
+            (live, live_value),
+        ])
+        .unwrap();
+
+    assert_eq!(got, vec![true, false, false, false, true]);
+}
+
+#[test]
 fn multi_scan_dedup_reverse_preserves_order_and_per_pba_rows() {
     let (_d, db) = mk_db();
     // pba=10 has two hashes, pba=20 has three, pba=30 has zero.

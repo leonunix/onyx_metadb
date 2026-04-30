@@ -321,6 +321,22 @@ impl<'a> SstReader<'a> {
         )
     }
 
+    /// Batched point lookup against one immutable SST.
+    ///
+    /// Results follow input order. Compared with calling [`Self::get`]
+    /// repeatedly, this shares body-page probes across the batch: every
+    /// binary-search round groups keys by the page they would inspect and
+    /// fetches each page at most once.
+    pub fn multi_get(&self, hashes: &[Hash32]) -> Result<Vec<LookupResult>> {
+        multi_get_from_sst(
+            self.page_cache,
+            self.handle,
+            &self.header,
+            &self.bloom,
+            hashes,
+        )
+    }
+
     /// Iterator over every record in hash order. Used by compaction.
     pub fn scan(&self) -> SstScan<'_> {
         SstScan {
@@ -369,6 +385,17 @@ impl CachedSstReader {
             &self.header,
             &self.bloom,
             hash,
+        )
+    }
+
+    /// Batched point lookup using the cached bloom filter/header.
+    pub fn multi_get(&self, hashes: &[Hash32]) -> Result<Vec<LookupResult>> {
+        multi_get_from_sst(
+            &self.page_cache,
+            self.handle,
+            &self.header,
+            &self.bloom,
+            hashes,
         )
     }
 }
@@ -450,7 +477,154 @@ fn get_from_sst(
     Ok(LookupResult::Miss)
 }
 
+#[derive(Clone, Copy)]
+struct BatchProbe {
+    input_idx: usize,
+    hash: Hash32,
+    lo_page: u32,
+    hi_page: u32,
+    next_page: Option<u32>,
+}
+
+fn multi_get_from_sst(
+    page_cache: &PageCache,
+    handle: SstHandle,
+    header: &SstHeader,
+    bloom: &BloomFilter,
+    hashes: &[Hash32],
+) -> Result<Vec<LookupResult>> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if header.record_count > 0 && header.body_page_count == 0 {
+        return Err(MetaDbError::Corruption(format!(
+            "SST head page {} has records but no body pages",
+            handle.head_page
+        )));
+    }
+
+    let mut out = vec![LookupResult::Miss; hashes.len()];
+    let mut pending = Vec::with_capacity(hashes.len());
+    for (input_idx, hash) in hashes.iter().enumerate() {
+        if hash < &handle.min_hash || hash > &handle.max_hash {
+            continue;
+        }
+        if !bloom.maybe_contains(hash) {
+            continue;
+        }
+        pending.push(BatchProbe {
+            input_idx,
+            hash: *hash,
+            lo_page: 0,
+            hi_page: header.body_page_count,
+            next_page: Some(estimate_probe_page(handle, header.body_page_count, hash)),
+        });
+    }
+
+    while !pending.is_empty() {
+        let mut page_probes = Vec::with_capacity(pending.len());
+        for mut probe in pending.drain(..) {
+            if probe.lo_page >= probe.hi_page {
+                continue;
+            }
+            let page_idx = probe
+                .next_page
+                .take()
+                .filter(|page_idx| *page_idx >= probe.lo_page && *page_idx < probe.hi_page)
+                .unwrap_or_else(|| probe.lo_page + (probe.hi_page - probe.lo_page) / 2);
+            page_probes.push((page_idx, probe));
+        }
+        if page_probes.is_empty() {
+            break;
+        }
+        page_probes.sort_unstable_by_key(|(page_idx, _)| *page_idx);
+
+        let mut groups = Vec::new();
+        let mut page_ids = Vec::new();
+        let mut pos = 0;
+        while pos < page_probes.len() {
+            let page_idx = page_probes[pos].0;
+            let start = pos;
+            pos += 1;
+            while pos < page_probes.len() && page_probes[pos].0 == page_idx {
+                pos += 1;
+            }
+            page_ids.push(handle.body_start_page() + page_idx as u64);
+            groups.push((page_idx, start..pos));
+        }
+        let pages = page_cache.get_many(&page_ids)?;
+
+        for ((page_idx, range), page) in groups.into_iter().zip(pages.into_iter()) {
+            let page_records = page.key_count() as usize;
+            for (_, probe) in page_probes[range].iter().copied() {
+                match search_page_exact(&page, page_records, &probe.hash)? {
+                    PageSearchResult::Found(kind, value) => {
+                        out[probe.input_idx] = lookup_from_record_kind(kind, value)?;
+                    }
+                    PageSearchResult::BelowPage => {
+                        if probe.lo_page < page_idx {
+                            pending.push(BatchProbe {
+                                hi_page: page_idx,
+                                next_page: None,
+                                ..probe
+                            });
+                        }
+                    }
+                    PageSearchResult::AbovePage => {
+                        let next_page = page_idx + 1;
+                        if next_page < probe.hi_page {
+                            pending.push(BatchProbe {
+                                lo_page: next_page,
+                                next_page: None,
+                                ..probe
+                            });
+                        }
+                    }
+                    PageSearchResult::InPageMiss => {}
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn estimate_probe_page(handle: SstHandle, body_page_count: u32, hash: &Hash32) -> u32 {
+    if body_page_count <= 1 {
+        return 0;
+    }
+
+    // Dedup keys are SHA-256 bytes sorted lexicographically. The first
+    // 64 bits are enough to pick a near-target page for uniformly
+    // distributed keys, and correctness does not depend on the estimate:
+    // misses fall back to normal page-level binary search.
+    let min = hash_prefix_u64(&handle.min_hash);
+    let max = hash_prefix_u64(&handle.max_hash);
+    let key = hash_prefix_u64(hash);
+    if max <= min {
+        return body_page_count / 2;
+    }
+
+    let span = (max - min) as u128;
+    let offset = key.saturating_sub(min).min(max - min) as u128;
+    let page = (offset * body_page_count as u128 / (span + 1)) as u32;
+    page.min(body_page_count - 1)
+}
+
+fn hash_prefix_u64(hash: &Hash32) -> u64 {
+    u64::from_be_bytes(hash[..8].try_into().unwrap())
+}
+
 fn search_page(page: &Page, page_records: usize, hash: &Hash32) -> Result<IntraPageResult> {
+    Ok(match search_page_exact(page, page_records, hash)? {
+        PageSearchResult::Found(kind, value) => IntraPageResult::Found(kind, value),
+        PageSearchResult::BelowPage => IntraPageResult::TooHigh,
+        PageSearchResult::AbovePage => IntraPageResult::TooLow,
+        PageSearchResult::InPageMiss => IntraPageResult::TooHigh,
+    })
+}
+
+fn search_page_exact(page: &Page, page_records: usize, hash: &Hash32) -> Result<PageSearchResult> {
     let p = page.payload();
     if page_records == 0 {
         return Err(MetaDbError::Corruption(
@@ -463,10 +637,10 @@ fn search_page(page: &Page, page_records: usize, hash: &Hash32) -> Result<IntraP
     let last_off = (page_records - 1) * LSM_RECORD_SIZE;
     let last_hash: &Hash32 = (&p[last_off..last_off + 32]).try_into().unwrap();
     if hash < first_hash {
-        return Ok(IntraPageResult::TooHigh);
+        return Ok(PageSearchResult::BelowPage);
     }
     if hash > last_hash {
-        return Ok(IntraPageResult::TooLow);
+        return Ok(PageSearchResult::AbovePage);
     }
     // In range: binary-search inside the page.
     let mut lo = 0usize;
@@ -481,7 +655,7 @@ fn search_page(page: &Page, page_records: usize, hash: &Hash32) -> Result<IntraP
                 let mut value_bytes = [0u8; super::format::DEDUP_VALUE_SIZE];
                 value_bytes
                     .copy_from_slice(&p[off + 33..off + 33 + super::format::DEDUP_VALUE_SIZE]);
-                return Ok(IntraPageResult::Found(
+                return Ok(PageSearchResult::Found(
                     kind,
                     super::format::DedupValue(value_bytes),
                 ));
@@ -491,9 +665,27 @@ fn search_page(page: &Page, page_records: usize, hash: &Hash32) -> Result<IntraP
         }
     }
     // Key falls between this page's bounds but no record matches →
-    // miss entirely. Signal by narrowing the outer search to an
-    // empty interval at this page.
-    Ok(IntraPageResult::TooHigh)
+    // miss entirely.
+    Ok(PageSearchResult::InPageMiss)
+}
+
+fn lookup_from_record_kind(kind: u8, value: super::format::DedupValue) -> Result<LookupResult> {
+    Ok(match kind {
+        super::format::KIND_PUT => LookupResult::Hit(value),
+        super::format::KIND_DELETE => LookupResult::Tombstone,
+        other => {
+            return Err(MetaDbError::Corruption(format!(
+                "unknown SST record kind byte {other}",
+            )));
+        }
+    })
+}
+
+enum PageSearchResult {
+    Found(u8, super::format::DedupValue),
+    BelowPage,
+    AbovePage,
+    InPageMiss,
 }
 
 enum IntraPageResult {
@@ -707,6 +899,32 @@ mod tests {
         assert_eq!(reader.get(&h(1)).unwrap(), LookupResult::Hit(v(10)));
         assert_eq!(reader.get(&h(2)).unwrap(), LookupResult::Tombstone);
         assert_eq!(reader.get(&h(3)).unwrap(), LookupResult::Hit(v(30)));
+    }
+
+    #[test]
+    fn multi_get_preserves_order_hits_misses_and_tombstones() {
+        let (_d, ps, cache) = mk_ps();
+        let mut records = sorted_puts(400);
+        records[123] = Record::tombstone(&h(123));
+        let handle = SstWriter::new(&ps, 1).write_sorted(&records).unwrap();
+        let reader = SstReader::open(&ps, &cache, handle).unwrap();
+
+        let hashes = vec![h(399), h(7), h(123), h(500), h(7), h(0)];
+        let got = reader.multi_get(&hashes).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                LookupResult::Hit(v(399u64 as u8)),
+                LookupResult::Hit(v(7)),
+                LookupResult::Tombstone,
+                LookupResult::Miss,
+                LookupResult::Hit(v(7)),
+                LookupResult::Hit(v(0)),
+            ]
+        );
+        for (hash, result) in hashes.iter().zip(got) {
+            assert_eq!(result, reader.get(hash).unwrap());
+        }
     }
 
     #[test]

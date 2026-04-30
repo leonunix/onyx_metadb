@@ -236,6 +236,13 @@ pub struct PendingState {
     pub rc_pagebuf_dirty: usize,
 }
 
+#[derive(Clone, Copy)]
+enum ApplyLaneKind {
+    L2p,
+    Refcount,
+    Dedup,
+}
+
 struct ApplyLane {
     inner: Arc<ApplyLaneInner>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -270,7 +277,7 @@ struct PendingApplyWork {
 }
 
 impl ApplyLane {
-    fn new(last_applied_lsn: Lsn) -> Self {
+    fn new(last_applied_lsn: Lsn, kind: ApplyLaneKind, ordinal: usize) -> Self {
         let inner = Arc::new(ApplyLaneInner {
             state: Mutex::new(ApplyLaneState {
                 maintenance: VecDeque::new(),
@@ -285,7 +292,15 @@ impl ApplyLane {
         let worker_inner = inner.clone();
         let worker = std::thread::Builder::new()
             .name("onyx-metadb-apply-lane".to_string())
-            .spawn(move || apply_lane_worker(worker_inner))
+            .spawn(move || {
+                let role = match kind {
+                    ApplyLaneKind::L2p => crate::affinity::ThreadRole::L2pApply,
+                    ApplyLaneKind::Refcount => crate::affinity::ThreadRole::RefcountApply,
+                    ApplyLaneKind::Dedup => crate::affinity::ThreadRole::DedupApply,
+                };
+                crate::affinity::bind_current(role, ordinal);
+                apply_lane_worker(worker_inner)
+            })
             .expect("failed to spawn metadb apply lane worker");
         Self {
             inner,

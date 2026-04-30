@@ -419,6 +419,52 @@ fn multi_get_matches_single_gets_mixed_layers() {
 }
 
 #[test]
+fn multi_get_matches_single_gets_across_many_disjoint_ssts() {
+    let (_d, _ps, lsm) = mk_lsm();
+    let mut handles = Vec::new();
+    for key in [10u64, 30, 50, 90] {
+        lsm.put(h(key), v(key as u8));
+        handles.push(lsm.flush_memtable(key as Lsn).unwrap().unwrap());
+    }
+    lsm.delete(h(70));
+    handles.push(lsm.flush_memtable(70).unwrap().unwrap());
+    handles.sort_by(|a, b| a.min_hash.cmp(&b.min_hash));
+    lsm.debug_replace_levels(vec![Vec::new(), handles]);
+
+    let hashes = vec![h(0), h(10), h(29), h(30), h(50), h(70), h(90), h(91), h(10)];
+    let got = lsm.multi_get(&hashes).unwrap();
+    assert_eq!(got.len(), hashes.len());
+    for (idx, hash) in hashes.iter().enumerate() {
+        assert_eq!(got[idx], lsm.get(hash).unwrap(), "hash {idx} mismatch");
+    }
+}
+
+#[test]
+fn multi_get_preserves_duplicate_hash_results() {
+    let (_d, _ps, lsm) = mk_lsm();
+    lsm.put(h(1), v(11));
+    lsm.put(h(2), v(22));
+    lsm.flush_memtable(1).unwrap();
+    lsm.delete(h(2));
+    lsm.put(h(3), v(33));
+
+    let hashes = vec![h(1), h(1), h(2), h(3), h(3), h(99), h(99)];
+    let got = lsm.multi_get(&hashes).unwrap();
+    assert_eq!(
+        got,
+        vec![
+            Some(v(11)),
+            Some(v(11)),
+            None,
+            Some(v(33)),
+            Some(v(33)),
+            None,
+            None,
+        ]
+    );
+}
+
+#[test]
 fn multi_get_empty_input_returns_empty() {
     let (_d, _ps, lsm) = mk_lsm();
     lsm.put(h(1), v(1));
