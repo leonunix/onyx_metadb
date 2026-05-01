@@ -46,8 +46,10 @@ use crate::page_store::PageStore;
 use crate::types::{Lsn, PageId};
 
 use super::bloom::{BloomFilter, DEFAULT_BITS_PER_ENTRY, hash_count_for};
-use super::format::{Hash32, LSM_RECORD_SIZE, RECORDS_PER_PAGE, Record};
+use super::format::{HASH_SIZE, Hash32, LSM_RECORD_SIZE, RECORDS_PER_PAGE, Record};
 use super::memtable::{DedupOp, LookupResult};
+
+const SST_SCAN_PREFETCH_PAGES: u32 = 64;
 
 /// Layout version written into each SST header. Bump on any breaking
 /// on-disk change.
@@ -173,31 +175,35 @@ impl<'a> SstWriter<'a> {
 
         let head_page = self.page_store.allocate_run(total_pages)?;
 
-        // Write in id order: header, bloom pages, body pages.
-        self.write_header_page(
+        // Build in id order and hand the whole run to PageStore. The SST
+        // already lives in a contiguous allocation, so this becomes one
+        // batched writev path instead of thousands of tiny pwrite calls.
+        let mut sealed_pages = Vec::with_capacity(total_pages);
+        sealed_pages.push((
             head_page,
-            HeaderMetadata {
+            Arc::new(self.build_header_page(HeaderMetadata {
                 record_count: record_count as u64,
                 bloom: &bloom,
                 bloom_page_count: bloom_page_count as u32,
                 body_page_count: body_page_count as u32,
                 min_hash: records[0].hash(),
                 max_hash: records[record_count - 1].hash(),
-            },
-        )?;
+            })),
+        ));
 
         let mut cursor = head_page + 1;
         for chunk in bloom_bytes.chunks(PAGE_PAYLOAD_SIZE) {
-            self.write_bloom_page(cursor, chunk)?;
+            sealed_pages.push((cursor, Arc::new(self.build_bloom_page(chunk))));
             cursor += 1;
         }
 
         for page_idx in 0..body_page_count {
             let start = page_idx * RECORDS_PER_PAGE;
             let end = ((page_idx + 1) * RECORDS_PER_PAGE).min(record_count);
-            self.write_body_page(cursor, &records[start..end])?;
+            sealed_pages.push((cursor, Arc::new(self.build_body_page(&records[start..end]))));
             cursor += 1;
         }
+        self.page_store.write_sealed_page_runs(sealed_pages)?;
 
         Ok(SstHandle {
             head_page,
@@ -209,7 +215,7 @@ impl<'a> SstWriter<'a> {
         })
     }
 
-    fn write_header_page(&self, page_id: PageId, meta: HeaderMetadata<'_>) -> Result<()> {
+    fn build_header_page(&self, meta: HeaderMetadata<'_>) -> Page {
         let mut page = Page::new(PageHeader::new(PageType::LsmData, self.generation));
         let p = page.payload_mut();
         p[OFF_LAYOUT_VERSION..OFF_LAYOUT_VERSION + 4]
@@ -226,17 +232,17 @@ impl<'a> SstWriter<'a> {
         p[OFF_MIN_HASH..OFF_MIN_HASH + 32].copy_from_slice(meta.min_hash);
         p[OFF_MAX_HASH..OFF_MAX_HASH + 32].copy_from_slice(meta.max_hash);
         page.seal();
-        self.page_store.write_page(page_id, &page)
+        page
     }
 
-    fn write_bloom_page(&self, page_id: PageId, chunk: &[u8]) -> Result<()> {
+    fn build_bloom_page(&self, chunk: &[u8]) -> Page {
         let mut page = Page::new(PageHeader::new(PageType::LsmData, self.generation));
         page.payload_mut()[..chunk.len()].copy_from_slice(chunk);
         page.seal();
-        self.page_store.write_page(page_id, &page)
+        page
     }
 
-    fn write_body_page(&self, page_id: PageId, records: &[Record]) -> Result<()> {
+    fn build_body_page(&self, records: &[Record]) -> Page {
         debug_assert!(records.len() <= RECORDS_PER_PAGE);
         let mut page = Page::new(PageHeader::new(PageType::LsmData, self.generation));
         page.set_key_count(records.len() as u16);
@@ -246,7 +252,7 @@ impl<'a> SstWriter<'a> {
             p[off..off + LSM_RECORD_SIZE].copy_from_slice(r.as_bytes());
         }
         page.seal();
-        self.page_store.write_page(page_id, &page)
+        page
     }
 }
 
@@ -346,7 +352,18 @@ impl<'a> SstReader<'a> {
             next_page_idx: 0,
             buffered: Vec::new(),
             buffered_off: 0,
+            page_batch: Vec::new(),
+            page_batch_next: 0,
         }
+    }
+
+    /// Collect records whose hash starts with `prefix`.
+    ///
+    /// Unlike [`Self::scan`], this binary-searches into the sorted body and
+    /// only reads pages that can contain the requested prefix. This is the hot
+    /// path for `dedup_reverse` cleanup, where the prefix is the 8-byte PBA.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>> {
+        scan_prefix_from_sst(self.page_cache, self.handle, &self.header, prefix)
     }
 }
 
@@ -397,6 +414,10 @@ impl CachedSstReader {
             &self.bloom,
             hashes,
         )
+    }
+
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Record>> {
+        scan_prefix_from_sst(&self.page_cache, self.handle, &self.header, prefix)
     }
 }
 
@@ -615,6 +636,126 @@ fn hash_prefix_u64(hash: &Hash32) -> u64 {
     u64::from_be_bytes(hash[..8].try_into().unwrap())
 }
 
+fn scan_prefix_from_sst(
+    page_cache: &PageCache,
+    handle: SstHandle,
+    header: &SstHeader,
+    prefix: &[u8],
+) -> Result<Vec<Record>> {
+    if prefix.len() > HASH_SIZE {
+        return Ok(Vec::new());
+    }
+    if prefix.is_empty() {
+        return SstScan {
+            page_cache,
+            body_start: handle.body_start_page(),
+            body_pages: handle.body_page_count,
+            next_page_idx: 0,
+            buffered: Vec::new(),
+            buffered_off: 0,
+            page_batch: Vec::new(),
+            page_batch_next: 0,
+        }
+        .collect();
+    }
+    if header.record_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let (lo, hi) = prefix_bounds_exclusive(prefix);
+    if lo > handle.max_hash || hi.as_ref().is_some_and(|upper| upper <= &handle.min_hash) {
+        return Ok(Vec::new());
+    }
+
+    let mut idx = lower_bound_record_index(page_cache, handle, header, &lo)?;
+    let mut out = Vec::new();
+    while idx < header.record_count {
+        let page_idx = (idx as usize) / RECORDS_PER_PAGE;
+        let page = page_cache.get(handle.body_start_page() + page_idx as u64)?;
+        let page_records = page.key_count() as usize;
+        if page_records == 0 {
+            return Err(MetaDbError::Corruption(format!(
+                "SST body page {} has zero records",
+                handle.body_start_page() + page_idx as u64
+            )));
+        }
+
+        let mut in_page = (idx as usize) % RECORDS_PER_PAGE;
+        while in_page < page_records {
+            let off = in_page * LSM_RECORD_SIZE;
+            let p = page.payload();
+            let hash: &Hash32 = (&p[off..off + HASH_SIZE]).try_into().unwrap();
+            if hi.as_ref().is_some_and(|upper| hash >= upper) {
+                return Ok(out);
+            }
+            if !hash.starts_with(prefix) {
+                return Ok(out);
+            }
+            let bytes: &[u8; LSM_RECORD_SIZE] =
+                (&p[off..off + LSM_RECORD_SIZE]).try_into().unwrap();
+            let rec = Record::from_bytes(bytes).map_err(|e| {
+                MetaDbError::Corruption(format!(
+                    "SST body page {} has malformed prefix record {}: {e:?}",
+                    handle.body_start_page() + page_idx as u64,
+                    in_page
+                ))
+            })?;
+            out.push(rec);
+            in_page += 1;
+        }
+        idx = ((page_idx + 1) * RECORDS_PER_PAGE) as u64;
+    }
+    Ok(out)
+}
+
+fn lower_bound_record_index(
+    page_cache: &PageCache,
+    handle: SstHandle,
+    header: &SstHeader,
+    target: &Hash32,
+) -> Result<u64> {
+    let mut lo = 0u64;
+    let mut hi = header.record_count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let page_idx = (mid as usize) / RECORDS_PER_PAGE;
+        let in_page = (mid as usize) % RECORDS_PER_PAGE;
+        let page = page_cache.get(handle.body_start_page() + page_idx as u64)?;
+        let page_records = page.key_count() as usize;
+        if page_records == 0 || in_page >= page_records {
+            return Err(MetaDbError::Corruption(format!(
+                "SST body page {} cannot serve record index {}",
+                handle.body_start_page() + page_idx as u64,
+                mid
+            )));
+        }
+        let off = in_page * LSM_RECORD_SIZE;
+        let hash: &Hash32 = (&page.payload()[off..off + HASH_SIZE]).try_into().unwrap();
+        if hash < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+fn prefix_bounds_exclusive(prefix: &[u8]) -> (Hash32, Option<Hash32>) {
+    debug_assert!(prefix.len() <= HASH_SIZE);
+    let mut lo = [0u8; HASH_SIZE];
+    lo[..prefix.len()].copy_from_slice(prefix);
+
+    let mut hi = [0u8; HASH_SIZE];
+    for i in (0..prefix.len()).rev() {
+        if prefix[i] < 0xFF {
+            hi[..i].copy_from_slice(&prefix[..i]);
+            hi[i] = prefix[i] + 1;
+            return (lo, Some(hi));
+        }
+    }
+    (lo, None)
+}
+
 fn search_page(page: &Page, page_records: usize, hash: &Hash32) -> Result<IntraPageResult> {
     Ok(match search_page_exact(page, page_records, hash)? {
         PageSearchResult::Found(kind, value) => IntraPageResult::Found(kind, value),
@@ -694,8 +835,9 @@ enum IntraPageResult {
     TooHigh,
 }
 
-/// Iterator over the full record stream of an SST. Cheap: at most one
-/// in-flight page buffered at a time.
+/// Iterator over the full record stream of an SST. Full scans bypass the LRU
+/// and read small page batches so compaction and diagnostics do not evict the
+/// point-lookup working set one page at a time.
 pub struct SstScan<'a> {
     page_cache: &'a PageCache,
     body_start: PageId,
@@ -703,6 +845,8 @@ pub struct SstScan<'a> {
     next_page_idx: u32,
     buffered: Vec<Record>,
     buffered_off: usize,
+    page_batch: Vec<Page>,
+    page_batch_next: usize,
 }
 
 impl<'a> Iterator for SstScan<'a> {
@@ -715,16 +859,33 @@ impl<'a> Iterator for SstScan<'a> {
                 self.buffered_off += 1;
                 return Some(Ok(r));
             }
-            if self.next_page_idx >= self.body_pages {
-                return None;
+            if self.page_batch_next >= self.page_batch.len() {
+                if self.next_page_idx >= self.body_pages {
+                    return None;
+                }
+                let remaining = self.body_pages - self.next_page_idx;
+                let batch_pages = remaining.min(SST_SCAN_PREFETCH_PAGES);
+                let page_ids: Vec<PageId> = (0..batch_pages)
+                    .map(|idx| self.body_start + (self.next_page_idx + idx) as u64)
+                    .collect();
+                self.next_page_idx += batch_pages;
+                self.page_batch = match self.page_cache.get_many_bypass(&page_ids) {
+                    Ok(pages) => pages,
+                    Err(e) => return Some(Err(e)),
+                };
+                self.page_batch_next = 0;
             }
-            let page_id = self.body_start + self.next_page_idx as u64;
-            self.next_page_idx += 1;
-            let page = match self.page_cache.get_bypass(page_id) {
-                Ok(p) => p,
-                Err(e) => return Some(Err(e)),
-            };
+            let page = &self.page_batch[self.page_batch_next];
+            self.page_batch_next += 1;
+            let batch_start_idx = self.next_page_idx - self.page_batch.len() as u32;
+            let page_id =
+                self.body_start + batch_start_idx as u64 + self.page_batch_next as u64 - 1;
             let page_records = page.key_count() as usize;
+            if page_records == 0 {
+                return Some(Err(MetaDbError::Corruption(format!(
+                    "SST body page {page_id} has zero records"
+                ))));
+            };
             self.buffered.clear();
             self.buffered_off = 0;
             let p = page.payload();
@@ -960,6 +1121,35 @@ mod tests {
         for (i, r) in got.iter().enumerate() {
             assert_eq!(*r.hash(), h(i as u64));
         }
+    }
+
+    #[test]
+    fn scan_prefix_returns_only_matching_range_across_pages() {
+        let (_d, ps, cache) = mk_ps();
+        let mut records = Vec::new();
+        for group in 0..4u64 {
+            for n in 0..80u64 {
+                let mut hash = [0u8; 32];
+                hash[..8].copy_from_slice(&group.to_be_bytes());
+                hash[8..16].copy_from_slice(&n.to_be_bytes());
+                let rec = if group == 2 && n == 17 {
+                    Record::tombstone(&hash)
+                } else {
+                    Record::put(&hash, &v(n as u8))
+                };
+                records.push(rec);
+            }
+        }
+        records.sort_unstable_by(|a, b| a.hash().cmp(b.hash()));
+        let handle = SstWriter::new(&ps, 1).write_sorted(&records).unwrap();
+        let reader = SstReader::open(&ps, &cache, handle).unwrap();
+
+        let prefix = 2u64.to_be_bytes();
+        let got = reader.scan_prefix(&prefix).unwrap();
+        assert_eq!(got.len(), 80);
+        assert!(got.iter().all(|r| r.hash().starts_with(&prefix)));
+        assert!(got.iter().any(|r| r.is_delete()));
+        assert_eq!(reader.scan_prefix(&9u64.to_be_bytes()).unwrap(), Vec::new());
     }
 
     #[test]

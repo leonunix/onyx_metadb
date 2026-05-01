@@ -384,6 +384,13 @@ impl PageCache {
         self.page_store.read_page(page_id)
     }
 
+    /// Read a run without touching the LRU. Used by long scans so a
+    /// compaction pass can preserve the hot working set while still
+    /// issuing page-store batch reads.
+    pub(crate) fn get_many_bypass(&self, page_ids: &[PageId]) -> Result<Vec<Page>> {
+        self.page_store.read_pages(page_ids)
+    }
+
     /// Insert or refresh a clean page in the cache.
     pub fn insert(&self, page_id: PageId, page: Arc<Page>) {
         let shard_idx = self.shard_idx(page_id);

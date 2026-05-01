@@ -538,9 +538,8 @@ impl Lsm {
     /// an older put, and a newer put overrides an older one.
     ///
     /// Used by `dedup_reverse` to find all (pba, hash) rows that a
-    /// given PBA owns. Cost: one read + scan of every memtable plus
-    /// every SST whose min/max hash range overlaps the prefix. Not
-    /// optimal — a real range iterator lands in phase 8.
+    /// given PBA owns. SSTs are sorted by hash, so matching files can
+    /// range-seek to the prefix instead of walking the full body.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Hash32, DedupValue)>> {
         let _drain = self.reader_drain.read();
         let snapshot = self.levels.read().clone();
@@ -597,10 +596,11 @@ impl Lsm {
             .map(|first| first.len())
             .filter(|len| unique_prefixes.iter().all(|prefix| prefix.len() == *len));
 
-        // SSTs, newest-to-oldest. Unlike the single-prefix path, this scans
-        // each matching SST once and distributes rows to every requested
-        // prefix. Dedup cleanup commonly asks for hundreds of 8-byte PBA
-        // prefixes; scanning the same SST once per PBA was the long pole.
+        // SSTs, newest-to-oldest. Each matching prefix is range-scanned
+        // inside the SST instead of scanning the full file. Dedup cleanup
+        // commonly asks for hundreds of 8-byte PBA prefixes; with sorted
+        // fixed records the per-prefix cost is a binary seek plus the few
+        // pages that actually contain that PBA.
         for (level_idx, handles) in snapshot.iter().enumerate() {
             let ordered: Vec<SstHandle> = if level_idx == 0 {
                 handles.iter().rev().copied().collect()
@@ -615,17 +615,19 @@ impl Lsm {
                 }
                 let reader = SstReader::open(&self.page_store, &self.page_cache, handle)?;
                 if let Some(prefix_len) = same_prefix_len {
-                    for rec_result in reader.scan() {
-                        let rec = rec_result?;
-                        if rec.hash().len() < prefix_len {
+                    for prefix in &unique_prefixes {
+                        if !prefix_might_match_range(&handle.min_hash, &handle.max_hash, prefix) {
                             continue;
                         }
-                        if let Some(&idx) = unique_by_prefix.get(&rec.hash()[..prefix_len]) {
-                            seen[idx].entry(*rec.hash()).or_insert(if rec.is_put() {
-                                Some(rec.value())
-                            } else {
-                                None
-                            });
+                        for rec in reader.scan_prefix(prefix)? {
+                            debug_assert!(rec.hash().len() >= prefix_len);
+                            if let Some(&idx) = unique_by_prefix.get(&rec.hash()[..prefix_len]) {
+                                seen[idx].entry(*rec.hash()).or_insert(if rec.is_put() {
+                                    Some(rec.value())
+                                } else {
+                                    None
+                                });
+                            }
                         }
                     }
                 } else {
@@ -637,12 +639,8 @@ impl Lsm {
                                 .then_some(idx)
                         })
                         .collect();
-                    for rec_result in reader.scan() {
-                        let rec = rec_result?;
-                        for &idx in &matching_prefixes {
-                            if !key_has_prefix(rec.hash(), &unique_prefixes[idx]) {
-                                continue;
-                            }
+                    for &idx in &matching_prefixes {
+                        for rec in reader.scan_prefix(&unique_prefixes[idx])? {
                             seen[idx].entry(*rec.hash()).or_insert(if rec.is_put() {
                                 Some(rec.value())
                             } else {
@@ -699,8 +697,7 @@ impl Lsm {
                     continue;
                 }
                 let reader = SstReader::open(&self.page_store, &self.page_cache, handle)?;
-                for rec_result in reader.scan() {
-                    let rec = rec_result?;
+                for rec in reader.scan_prefix(prefix)? {
                     if !key_has_prefix(rec.hash(), prefix) {
                         continue;
                     }
