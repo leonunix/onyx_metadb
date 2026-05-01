@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 impl Db {
     // -------- refcount + dedup ops --------------------------------------
@@ -288,14 +289,16 @@ impl Db {
 
     /// `true` if the dedup memtable has reached its freeze threshold.
     pub fn dedup_should_flush(&self) -> bool {
-        self.dedup_index.should_flush()
+        self.dedup_index.should_flush() || self.dedup_reverse.should_flush()
     }
 
-    /// Flush the dedup memtable to a fresh L0 SST. Returns `None` if
-    /// the memtable is empty.
+    /// Flush dedup memtables to fresh L0 SSTs. Returns true if either
+    /// side wrote an SST. This is intentionally manifest-neutral: the
+    /// next checkpoint persists the new level heads atomically with the
+    /// database roots.
     pub fn flush_dedup_memtable(&self) -> Result<bool> {
         let generation = self.current_generation();
-        Ok(self.dedup_index.flush_memtable(generation)?.is_some())
+        self.flush_dedup_memtables_at_generation(generation)
     }
 
     /// Run one round of dedup compaction. Returns `true` if any work was
@@ -303,6 +306,43 @@ impl Db {
     pub fn compact_dedup_once(&self) -> Result<bool> {
         let generation = self.current_generation();
         Ok(self.dedup_index.compact_once(generation)?.is_some())
+    }
+
+    pub(super) fn flush_dedup_memtables_at_generation(&self, generation: Lsn) -> Result<bool> {
+        let index = self.dedup_index.flush_memtable(generation)?.is_some();
+        let reverse = self.dedup_reverse.flush_memtable(generation)?.is_some();
+        Ok(index || reverse)
+    }
+
+    pub(super) fn maybe_schedule_dedup_maintenance(&self) {
+        if !self.dedup_should_flush() {
+            return;
+        }
+        if self
+            .dedup_maintenance_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let index = self.dedup_index.clone();
+        let reverse = self.dedup_reverse.clone();
+        let queued = self.dedup_maintenance_queued.clone();
+        let generation = self.last_applied_lsn().saturating_add(1).max(1);
+        self.dedup_maintenance_lane
+            .handle()
+            .enqueue_maintenance(Box::new(move || {
+                let result = (|| -> Result<()> {
+                    index.flush_memtable(generation)?;
+                    reverse.flush_memtable(generation)?;
+                    Ok(())
+                })();
+                if let Err(err) = result {
+                    tracing::warn!(error = %err, "metadb: background dedup memtable flush failed");
+                }
+                queued.store(false, Ordering::Release);
+            }));
     }
 
     /// Iterate every `(Pba, refcount)` pair across all refcount shards,

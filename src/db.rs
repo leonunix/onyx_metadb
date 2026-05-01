@@ -12,7 +12,7 @@ use std::ops::{Bound, RangeBounds};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::thread::JoinHandle;
 
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -81,6 +81,15 @@ pub struct Db {
     /// synchronised, but same-key last-write-wins semantics still need
     /// WAL-order apply across commits.
     dedup_lane: ApplyLane,
+    /// Background lane for dedup LSM memtable flushes. Kept separate
+    /// from `dedup_lane` so foreground dedup apply is never queued
+    /// behind SST construction.
+    dedup_maintenance_lane: ApplyLane,
+    /// True while a dedup memtable maintenance task is queued/running.
+    /// This keeps high-QPS writers from filling the dedup lane with
+    /// duplicate background flush jobs once the active LSM crosses its
+    /// threshold.
+    dedup_maintenance_queued: Arc<AtomicBool>,
     /// Write-ahead log. All mutations route through here so they survive
     /// crash between checkpoints.
     wal: WalSet,
@@ -241,6 +250,7 @@ enum ApplyLaneKind {
     L2p,
     Refcount,
     Dedup,
+    DedupMaintenance,
 }
 
 struct ApplyLane {
@@ -296,7 +306,9 @@ impl ApplyLane {
                 let role = match kind {
                     ApplyLaneKind::L2p => crate::affinity::ThreadRole::L2pApply,
                     ApplyLaneKind::Refcount => crate::affinity::ThreadRole::RefcountApply,
-                    ApplyLaneKind::Dedup => crate::affinity::ThreadRole::DedupApply,
+                    ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {
+                        crate::affinity::ThreadRole::DedupApply
+                    }
                 };
                 crate::affinity::bind_current(role, ordinal);
                 apply_lane_worker(worker_inner)

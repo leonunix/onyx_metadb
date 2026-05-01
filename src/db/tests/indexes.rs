@@ -289,6 +289,24 @@ fn dedup_flush_to_l0_then_read() {
 }
 
 #[test]
+fn dedup_flush_to_l0_flushes_reverse_index_too() {
+    let (_d, db) = mk_db();
+    for i in 0u64..25 {
+        let hash = hash_full(17, i);
+        db.put_dedup(hash, dv(i as u8)).unwrap();
+        db.register_dedup_reverse(17, hash).unwrap();
+    }
+
+    assert!(db.flush_dedup_memtable().unwrap());
+    let mut found = db.scan_dedup_reverse_for_pba(17).unwrap();
+    found.sort();
+    let mut expected: Vec<_> = (0u64..25).map(|i| hash_full(17, i)).collect();
+    expected.sort();
+    assert_eq!(found, expected);
+    assert!(!db.dedup_should_flush());
+}
+
+#[test]
 fn cache_stats_show_hits_evictions_and_respect_budget() {
     let cache_budget = 1024 * 1024;
     let (_d, db) = mk_db_with_cache_bytes(cache_budget);

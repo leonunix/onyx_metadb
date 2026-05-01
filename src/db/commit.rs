@@ -428,6 +428,9 @@ impl Db {
         }
         drop(active_apply);
         drop(apply_guard);
+        if plan_dedup_ops > 0 {
+            self.maybe_schedule_dedup_maintenance();
+        }
         let total_elapsed = commit_started.elapsed();
         if total_elapsed >= std::time::Duration::from_secs(1) {
             let cpu_elapsed = cpu_started
