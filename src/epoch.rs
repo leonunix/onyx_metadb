@@ -37,16 +37,18 @@
 //! pins claims one slot via `next_slot.fetch_add(1)` and keeps it for
 //! the rest of its life — slot lookup is a thread-local pointer compare,
 //! so the hot path is one atomic load + one atomic store. The bound is
-//! [`DEFAULT_SLOT_COUNT`]; onyx's worker pools stay well under that.
+//! [`DEFAULT_SLOT_COUNT`]; onyx's worker pools stay under that even on
+//! high-core-count NVMe hosts.
 //! Exhaustion panics rather than silently sharing slots (sharing would
 //! let one thread's pin clobber another's, breaking `min_active_pin`).
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-/// Default slot table size. Each slot is 8 bytes; 256 covers any realistic
-/// thread count for onyx (worker pool + ublk + admin) with margin.
-pub const DEFAULT_SLOT_COUNT: usize = 256;
+/// Default slot table size. Each slot is 8 bytes; 1024 covers high-core-count
+/// hosts with many ublk queues, read-pool workers, flusher lanes, and metadb
+/// apply threads while staying tiny in memory.
+pub const DEFAULT_SLOT_COUNT: usize = 1024;
 
 /// Sentinel for "slot is not currently pinned." The global epoch starts
 /// at 1 so a real pin never collides with this value.
