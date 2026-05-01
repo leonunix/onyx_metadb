@@ -43,6 +43,16 @@ pub(crate) struct DirtySnapshot {
     pages: Vec<DirtySnapshotPage>,
 }
 
+impl DirtySnapshot {
+    pub(crate) fn pages_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+}
+
 pub(crate) struct FlushedSnapshot {
     pages: Vec<FlushedSnapshotPage>,
 }

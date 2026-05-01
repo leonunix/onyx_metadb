@@ -464,3 +464,88 @@ fn warmup_is_idempotent() {
     assert_eq!(a.pages_pinned, b.pages_pinned);
     assert_eq!(t.buf.page_cache().pinned_pages(), a.pages_pinned);
 }
+
+#[test]
+fn writeback_promotes_unchanged_arcs_and_persists_to_disk() {
+    let (_d, ps) = mk_store();
+    let mut t = PagedL2p::create(ps.clone()).unwrap();
+    // Two distant LBAs guarantee at least one index plus two leaves.
+    t.insert(1, v(11)).unwrap();
+    t.insert(500_000, v(22)).unwrap();
+    let dirty_before = t.dirty_page_count();
+    assert!(
+        dirty_before >= 2,
+        "expected at least one leaf + index dirty, got {dirty_before}",
+    );
+
+    let snap = t.writeback_dirty_snapshot();
+    let pages_attempted = snap.pages_count();
+    assert_eq!(pages_attempted, dirty_before);
+    let flushed = snap.write().unwrap();
+    let mut sealed = Vec::new();
+    flushed.append_sealed_pages(&mut sealed);
+    ps.write_sealed_page_runs(sealed).unwrap();
+    ps.sync().unwrap();
+
+    let (promoted, kept) = t.install_writeback(&flushed);
+    assert_eq!(kept, 0, "no concurrent mutation, nothing should stay dirty");
+    assert_eq!(promoted, pages_attempted);
+    assert_eq!(t.dirty_page_count(), 0);
+
+    // Cross-check by reopening the page store with a fresh tree —
+    // proves the bytes we wrote are durable, not just memory state.
+    let root = t.root();
+    let next_gen = 100;
+    drop(t);
+    let mut t2 = PagedL2p::open(ps, root, next_gen).unwrap();
+    assert_eq!(t2.get(1).unwrap(), Some(v(11)));
+    assert_eq!(t2.get(500_000).unwrap(), Some(v(22)));
+}
+
+#[test]
+fn writeback_keeps_pages_dirty_when_arc_changed_mid_io() {
+    let (_d, ps) = mk_store();
+    let mut t = PagedL2p::create(ps.clone()).unwrap();
+    t.insert(1, v(11)).unwrap();
+    t.insert(500_000, v(22)).unwrap();
+
+    // Snapshot first, THEN mutate the same leaves to model the
+    // background writeback IO window racing a writer.
+    let snap = t.writeback_dirty_snapshot();
+    assert!(snap.pages_count() >= 2);
+    t.insert(1, v(99)).unwrap();
+    t.insert(500_000, v(88)).unwrap();
+
+    let flushed = snap.write().unwrap();
+    let mut sealed = Vec::new();
+    flushed.append_sealed_pages(&mut sealed);
+    ps.write_sealed_page_runs(sealed).unwrap();
+    ps.sync().unwrap();
+
+    let (promoted, kept) = t.install_writeback(&flushed);
+    assert!(
+        kept >= 2,
+        "Arc-mutated leaves must stay dirty, got promoted={promoted} kept={kept}",
+    );
+    assert!(t.dirty_page_count() >= 2);
+
+    // In-memory state still reflects the post-snapshot writes.
+    assert_eq!(t.get(1).unwrap(), Some(v(99)));
+    assert_eq!(t.get(500_000).unwrap(), Some(v(88)));
+}
+
+#[test]
+fn writeback_on_clean_tree_is_a_noop() {
+    let (_d, ps) = mk_store();
+    let mut t = PagedL2p::create(ps.clone()).unwrap();
+    t.insert(1, v(11)).unwrap();
+    t.flush().unwrap();
+    assert_eq!(t.dirty_page_count(), 0);
+
+    let snap = t.writeback_dirty_snapshot();
+    assert!(snap.is_empty());
+    let flushed = snap.write().unwrap();
+    assert_eq!(flushed.pages_count(), 0);
+    let (promoted, kept) = t.install_writeback(&flushed);
+    assert_eq!((promoted, kept), (0, 0));
+}

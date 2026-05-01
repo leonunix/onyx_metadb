@@ -290,6 +290,49 @@ impl PagedL2p {
         self.buf.install_flushed_snapshot_page(flushed, page_idx)
     }
 
+    /// Snapshot currently-dirty pages for an out-of-band writeback pass.
+    ///
+    /// Cheap: clones each `Slot::Dirty` Arc into the returned snapshot
+    /// without touching `private_pages` / `retired_pages` /
+    /// `checkpoint_protected`. The caller may drop the per-shard tree
+    /// lock between this and `install_writeback` so the seal + IO step
+    /// runs without serialising commit traffic.
+    ///
+    /// Background writeback is a *content-only* optimisation: pages get
+    /// pushed to disk earlier than the next `flush()` would, so the
+    /// flush itself sees a much smaller dirty set. Lifecycle bookkeeping
+    /// (private/retired sets, checkpoint_lsn, manifest commit) stays in
+    /// `Db::flush` — writeback never advances the durable checkpoint.
+    pub(crate) fn writeback_dirty_snapshot(&self) -> DirtySnapshot {
+        self.buf.dirty_snapshot()
+    }
+
+    /// Install a writeback that has already been written and synced.
+    ///
+    /// For each page whose `Slot::Dirty(Arc)` still pointer-equals the
+    /// snapshot's clone, drop the dirty entry (subsequent reads fault
+    /// from disk / shared `PageCache`). Pages whose Arc was re-mutated
+    /// during the IO window stay dirty for the next pass to retry.
+    /// Returns `(promoted, kept_dirty)`.
+    pub(crate) fn install_writeback(&mut self, flushed: &FlushedSnapshot) -> (usize, usize) {
+        let mut promoted = 0;
+        let mut kept = 0;
+        for idx in 0..flushed.pages_count() {
+            match self.buf.install_flushed_snapshot_page(flushed, idx) {
+                Some((_, true)) => promoted += 1,
+                Some((_, false)) => kept += 1,
+                None => {}
+            }
+        }
+        (promoted, kept)
+    }
+
+    /// Number of pages currently in `Slot::Dirty`. Used by writeback
+    /// schedulers to skip shards with nothing to flush.
+    pub(crate) fn dirty_page_count(&self) -> usize {
+        self.buf.dirty_count()
+    }
+
     pub(crate) fn checkpoint_retired_page_committed(&mut self, pid: PageId) -> Option<PageId> {
         if self.retired_pages.remove(&pid) {
             self.buf.detach_for_free(pid);

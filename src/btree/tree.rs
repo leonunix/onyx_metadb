@@ -251,6 +251,34 @@ impl BTree {
         self.buf.install_flushed_snapshot_page(flushed, page_idx)
     }
 
+    /// Snapshot currently-dirty pages for an out-of-band writeback pass.
+    /// See [`crate::paged::PagedL2p::writeback_dirty_snapshot`] for the
+    /// design rationale; this is the refcount-tree peer.
+    pub(crate) fn writeback_dirty_snapshot(&self) -> DirtySnapshot {
+        self.buf.dirty_snapshot()
+    }
+
+    /// Install a writeback that has already been written and synced.
+    /// Returns `(promoted, kept_dirty)`. Pages whose buffered bytes
+    /// changed mid-IO stay dirty for the next pass.
+    pub(crate) fn install_writeback(&mut self, flushed: &FlushedSnapshot) -> (usize, usize) {
+        let mut promoted = 0;
+        let mut kept = 0;
+        for idx in 0..flushed.pages_count() {
+            match self.buf.install_flushed_snapshot_page(flushed, idx) {
+                Some((_, true)) => promoted += 1,
+                Some((_, false)) => kept += 1,
+                None => {}
+            }
+        }
+        (promoted, kept)
+    }
+
+    /// Number of pages currently in `Slot::Dirty`.
+    pub(crate) fn dirty_page_count(&self) -> usize {
+        self.buf.dirty_count()
+    }
+
     pub(crate) fn checkpoint_retired_page_committed(&mut self, pid: PageId) -> Option<PageId> {
         if self.retired_pages.remove(&pid) {
             self.buf.detach_for_free(pid);
