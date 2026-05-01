@@ -31,9 +31,9 @@ pub const WAL_HEADER_SIZE: usize = 16;
 
 /// Upper bound on body length we're willing to decode. Records beyond
 /// this are treated as obviously-bad headers — recovery stops rather
-/// than attempting to read garbage bytes. Comfortably above the default
-/// `group_commit_max_batch_bytes` of 4 MiB.
-pub const WAL_MAX_BODY: usize = 16 * 1024 * 1024;
+/// than attempting to read garbage bytes. Comfortably above the largest
+/// background dedup registration batches Onyx emits.
+pub const WAL_MAX_BODY: usize = 32 * 1024 * 1024;
 
 const OFF_LSN: usize = 0;
 const OFF_LENGTH: usize = 8;

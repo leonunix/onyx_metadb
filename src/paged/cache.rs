@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageType};
-use crate::page_store::PageStore;
+use crate::page_store::{PageStore, RcDeltaWithGen};
 use crate::paged::format::{index_collect_children, init_index, init_leaf, page_level};
 use crate::paged::read_view::{PageIdMap, PageIdSet, ReadOverlay, ReadOverlayShard};
 use crate::types::{Lsn, NULL_PAGE, PageId};
@@ -503,6 +503,19 @@ impl PageBuf {
         Ok(())
     }
 
+    fn persist_dirty_pages(&mut self, pids: &[PageId]) -> Result<()> {
+        let mut sealed_pages = Vec::new();
+        for &pid in pids {
+            self.detach_from_read_overlay_before_mutation(pid);
+            if let Some(Slot::Dirty(arc)) = self.pages.get_mut(&pid) {
+                let page = Arc::make_mut(arc);
+                page.seal();
+                sealed_pages.push((pid, arc.clone()));
+            }
+        }
+        self.page_store.write_sealed_page_runs(sealed_pages)
+    }
+
     /// Copy-on-write: if `pid` has refcount 1, return `pid` unchanged.
     /// Otherwise allocate a fresh copy, decrement the original's rc,
     /// and bump each of the new copy's children's refcounts so the old
@@ -605,16 +618,27 @@ impl PageBuf {
         // easier. Sort by pid.
         let mut entries: Vec<(PageId, i32)> = self.pending_rc.drain().collect();
         entries.sort_unstable_by_key(|(pid, _)| *pid);
+        let mut batch = Vec::new();
+        let mut touched = Vec::new();
         for (pid, delta) in entries {
             if delta == 0 {
                 continue;
             }
-            self.persist_if_dirty(pid)?;
             self.rc_delta_ordinal = self.rc_delta_ordinal.checked_add(1).ok_or_else(|| {
                 MetaDbError::Corruption("paged: rc delta ordinal overflow".into())
             })?;
-            self.page_store
-                .atomic_rc_delta_with_gen(pid, delta, lsn, self.rc_delta_ordinal)?;
+            batch.push(RcDeltaWithGen {
+                page_id: pid,
+                delta,
+                lsn,
+                ordinal: self.rc_delta_ordinal,
+            });
+            touched.push(pid);
+        }
+
+        self.persist_dirty_pages(&touched)?;
+        self.page_store.atomic_rc_delta_batch_with_gen(&batch)?;
+        for pid in touched {
             self.pages_remove(pid);
             self.page_cache.invalidate(pid);
         }
@@ -701,9 +725,9 @@ impl PageBuf {
             };
             let page = Arc::make_mut(arc);
             page.seal();
-            self.page_store.write_page(*pid, page)?;
             flushed.push((*pid, arc.clone()));
         }
+        self.page_store.write_sealed_page_runs(flushed.clone())?;
         self.page_store.sync()?;
         for (pid, page) in flushed {
             // L2P index pages are tiny (≤1/256 of leaf bytes for a typical

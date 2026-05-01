@@ -32,6 +32,7 @@
 //! is atomic at the kernel level. The mutex only protects metadata (free
 //! list, high-water mark, committed file size).
 
+use crossbeam_channel::{Receiver, Sender, bounded};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -41,6 +42,8 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use io_uring::{IoUring, opcode, types};
@@ -54,9 +57,15 @@ use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 const RC_LOCK_SHARDS: usize = 64;
 const MAX_RECLAIM_RUN_PAGES: usize = 1024;
 const MIN_PUNCH_HOLE_RUN_PAGES: usize = 16;
-// Keep sealed checkpoint writev runs at Linux's common IOV_MAX while
-// reducing SQE count for large dirty-page flushes.
-const MAX_SEALED_WRITE_RUN_PAGES: usize = 1024;
+// Keep checkpoint writev runs large enough to amortise syscall overhead
+// without letting one checkpoint submit hundreds of MiB and starve WAL fsync.
+const MAX_SEALED_WRITE_RUN_PAGES: usize = 256;
+#[cfg(target_os = "linux")]
+const MAX_SEALED_WRITE_URING_RUNS: usize = 16;
+const PAGE_READ_POOL_WORKERS_MAX: usize = 8;
+const PAGE_READ_BATCH_MAX: usize = 64;
+const PAGE_READ_BATCH_WINDOW: Duration = Duration::from_micros(8);
+const PAGE_READ_CHANNEL_CAP: usize = 512;
 #[cfg(target_os = "linux")]
 const DEFAULT_READ_URING_ENTRIES: u32 = 128;
 #[cfg(target_os = "linux")]
@@ -71,6 +80,7 @@ pub const DEFAULT_GROW_CHUNK_PAGES: u64 = 512;
 pub struct PageStore {
     path: PathBuf,
     file: File,
+    read_pool: PageReadPool,
     #[cfg(target_os = "linux")]
     read_uring: Mutex<Option<IoUring>>,
     #[cfg(target_os = "linux")]
@@ -110,6 +120,14 @@ struct DeferredFree {
     idempotent: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RcDeltaWithGen {
+    pub page_id: PageId,
+    pub delta: i32,
+    pub lsn: Lsn,
+    pub ordinal: u32,
+}
+
 fn new_rc_locks() -> Box<[Mutex<()>]> {
     (0..RC_LOCK_SHARDS)
         .map(|_| Mutex::new(()))
@@ -139,6 +157,66 @@ struct Inner {
     committed_file_pages: u64,
     /// Explicitly-freed pages available for reuse. LIFO.
     free_list: Vec<PageId>,
+}
+
+struct PageReadRequest {
+    page_id: PageId,
+    reply: Sender<Result<Page>>,
+}
+
+struct PageReadPool {
+    sender: Option<Sender<PageReadRequest>>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl PageReadPool {
+    fn start(file: &File) -> Result<Self> {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().div_ceil(16))
+            .unwrap_or(1)
+            .clamp(1, PAGE_READ_POOL_WORKERS_MAX);
+        let (tx, rx) = bounded::<PageReadRequest>(PAGE_READ_CHANNEL_CAP);
+        let mut handles = Vec::with_capacity(workers);
+        for worker_idx in 0..workers {
+            let worker_file = file.try_clone()?;
+            let rx = rx.clone();
+            let join = thread::Builder::new()
+                .name(format!("metadb-page-read-{worker_idx}"))
+                .spawn(move || page_read_worker_loop(worker_file, rx))
+                .map_err(MetaDbError::Io)?;
+            handles.push(join);
+        }
+        Ok(Self {
+            sender: Some(tx),
+            workers: handles,
+        })
+    }
+
+    fn read_page(&self, page_id: PageId) -> Result<Page> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| MetaDbError::Io(io::Error::other("page read pool already shut down")))?;
+        let (reply_tx, reply_rx) = bounded(1);
+        sender
+            .send(PageReadRequest {
+                page_id,
+                reply: reply_tx,
+            })
+            .map_err(|_| MetaDbError::Io(io::Error::other("page read pool closed")))?;
+        reply_rx
+            .recv()
+            .map_err(|_| MetaDbError::Io(io::Error::other("page read worker dropped reply")))?
+    }
+}
+
+impl Drop for PageReadPool {
+    fn drop(&mut self) {
+        self.sender.take();
+        for join in self.workers.drain(..) {
+            let _ = join.join();
+        }
+    }
 }
 
 impl PageStore {
@@ -188,9 +266,11 @@ impl PageStore {
         // (the manifest layer will populate them). First data allocation
         // will pre-extend to FIRST_DATA_PAGE + grow_chunk.
         file.set_len(FIRST_DATA_PAGE * PAGE_SIZE as u64)?;
+        let read_pool = PageReadPool::start(&file)?;
         Ok(Self {
             path,
             file,
+            read_pool,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
             #[cfg(target_os = "linux")]
@@ -230,6 +310,7 @@ impl PageStore {
             )));
         }
         let file_end_pages = size / PAGE_SIZE as u64;
+        let read_pool = PageReadPool::start(&file)?;
         tracing::info!(
             path = %path.display(),
             high_water_pages = file_end_pages,
@@ -239,6 +320,7 @@ impl PageStore {
         Ok(Self {
             path,
             file,
+            read_pool,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
             #[cfg(target_os = "linux")]
@@ -282,6 +364,7 @@ impl PageStore {
             )));
         }
         let file_end_pages = size / PAGE_SIZE as u64;
+        let read_pool = PageReadPool::start(&file)?;
         // Walk every page in [FIRST_DATA_PAGE, file_end_pages). Typed pages
         // extend the recovered `high_water`; Free pages and all-zero punched
         // holes are reusable. A zero suffix past the last typed page is
@@ -316,6 +399,7 @@ impl PageStore {
         Ok(Self {
             path,
             file,
+            read_pool,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
             #[cfg(target_os = "linux")]
@@ -366,9 +450,7 @@ impl PageStore {
     /// returning.
     pub fn read_page(&self, page_id: PageId) -> Result<Page> {
         self.check_in_range(page_id)?;
-        let page = read_page_raw(&self.file, page_id)?;
-        page.verify(page_id)?;
-        Ok(page)
+        self.read_pool.read_page(page_id)
     }
 
     /// Read and verify several pages. On Linux this uses one io_uring submit
@@ -576,6 +658,96 @@ impl PageStore {
         self.file
             .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
         Ok(new_rc)
+    }
+
+    /// Batch form of [`atomic_rc_delta_with_gen`]. All target pages are
+    /// locked in shard order, read through the page-store batch path,
+    /// mutated in memory, and written back through the sealed-page batch
+    /// writer. This preserves the same per-page WAL idempotency markers
+    /// while giving NVMe real queue depth for COW refcount commits.
+    pub(crate) fn atomic_rc_delta_batch_with_gen(
+        &self,
+        deltas: &[RcDeltaWithGen],
+    ) -> Result<Vec<u32>> {
+        if deltas.is_empty() {
+            return Ok(Vec::new());
+        }
+        {
+            let inner = self.inner.lock();
+            for delta in deltas {
+                if delta.lsn == 0 {
+                    return Err(MetaDbError::InvalidArgument(
+                        "atomic_rc_delta_batch_with_gen: lsn must be > 0".into(),
+                    ));
+                }
+                if delta.page_id >= inner.high_water {
+                    return Err(MetaDbError::PageOutOfRange(delta.page_id));
+                }
+            }
+        }
+
+        let mut indexed: Vec<(usize, RcDeltaWithGen)> =
+            deltas.iter().copied().enumerate().collect();
+        indexed.sort_unstable_by_key(|(_, delta)| delta.page_id);
+        if let Some(duplicate) = indexed.windows(2).find_map(|pair| {
+            if pair[0].1.page_id == pair[1].1.page_id {
+                Some(pair[0].1.page_id)
+            } else {
+                None
+            }
+        }) {
+            return Err(MetaDbError::Corruption(format!(
+                "atomic_rc_delta_batch_with_gen: duplicate page {duplicate} in one batch"
+            )));
+        }
+
+        let mut shards: Vec<usize> = indexed
+            .iter()
+            .map(|(_, delta)| (delta.page_id as usize) % RC_LOCK_SHARDS)
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        let _guards: Vec<_> = shards
+            .iter()
+            .map(|&shard| self.rc_locks[shard].lock())
+            .collect();
+
+        let page_ids: Vec<PageId> = indexed.iter().map(|(_, delta)| delta.page_id).collect();
+        let pages = self.read_pages(&page_ids)?;
+        let mut results = vec![0u32; deltas.len()];
+        let mut sealed_pages = Vec::new();
+
+        for (((original_idx, delta), mut page), page_id) in
+            indexed.into_iter().zip(pages).zip(page_ids)
+        {
+            let cur_gen = page.generation();
+            let cur_ordinal = page.flags();
+            let cur_rc = page.refcount();
+            if cur_gen > delta.lsn || (cur_gen == delta.lsn && cur_ordinal >= delta.ordinal) {
+                results[original_idx] = cur_rc;
+                continue;
+            }
+            let new_rc = if delta.delta >= 0 {
+                cur_rc.checked_add(delta.delta as u32)
+            } else {
+                cur_rc.checked_sub((-delta.delta) as u32)
+            }
+            .ok_or_else(|| {
+                MetaDbError::Corruption(format!(
+                    "atomic_rc_delta_batch_with_gen: page {} refcount {} + {} out of range",
+                    delta.page_id, cur_rc, delta.delta
+                ))
+            })?;
+            page.set_refcount(new_rc);
+            page.set_generation(delta.lsn);
+            page.set_flags(delta.ordinal);
+            page.seal();
+            results[original_idx] = new_rc;
+            sealed_pages.push((page_id, Arc::new(page)));
+        }
+
+        self.write_sealed_page_runs(sealed_pages)?;
+        Ok(results)
     }
 
     /// Allocate a fresh page id. If the free list has entries, one is
@@ -1118,6 +1290,63 @@ fn read_pages_raw_pread(file: &File, page_ids: &[PageId]) -> Result<Vec<Page>> {
     Ok(pages)
 }
 
+fn page_read_worker_loop(file: File, rx: Receiver<PageReadRequest>) {
+    #[cfg(target_os = "linux")]
+    let read_uring = Mutex::new(new_read_uring());
+    let mut batch = Vec::with_capacity(PAGE_READ_BATCH_MAX);
+    loop {
+        let first = match rx.recv() {
+            Ok(req) => req,
+            Err(_) => return,
+        };
+        batch.clear();
+        batch.push(first);
+        let deadline = Instant::now() + PAGE_READ_BATCH_WINDOW;
+        loop {
+            while batch.len() < PAGE_READ_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(req) => batch.push(req),
+                    Err(_) => break,
+                }
+            }
+            if batch.len() >= PAGE_READ_BATCH_MAX {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                Ok(req) => batch.push(req),
+                Err(_) => break,
+            }
+        }
+
+        let page_ids: Vec<PageId> = batch.iter().map(|req| req.page_id).collect();
+        #[cfg(target_os = "linux")]
+        let pages_result = read_pages_raw(&file, &page_ids, Some(&read_uring));
+        #[cfg(not(target_os = "linux"))]
+        let pages_result = read_pages_raw(&file, &page_ids, None);
+
+        match pages_result {
+            Ok(pages) => {
+                for (req, page) in batch.drain(..).zip(pages.into_iter()) {
+                    let _ = req.reply.send(page.verify(req.page_id).map(|()| page));
+                }
+            }
+            Err(_) => {
+                for req in batch.drain(..) {
+                    let result = read_page_raw(&file, req.page_id).and_then(|page| {
+                        page.verify(req.page_id)?;
+                        Ok(page)
+                    });
+                    let _ = req.reply.send(result);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn write_page_runs_raw(
     file: &File,
@@ -1329,10 +1558,8 @@ fn write_sealed_pages_raw_uring(
         return Ok(());
     }
     let fd = file.as_raw_fd();
-    for (base, chunk) in runs
-        .chunks(DEFAULT_WRITE_URING_ENTRIES as usize)
-        .enumerate()
-    {
+    let chunk_count = runs.len().div_ceil(MAX_SEALED_WRITE_URING_RUNS);
+    for (base, chunk) in runs.chunks(MAX_SEALED_WRITE_URING_RUNS).enumerate() {
         for (idx, run) in chunk.iter().enumerate() {
             if run.iovecs.is_empty() {
                 return Err(MetaDbError::InvalidArgument(
@@ -1420,8 +1647,48 @@ fn write_sealed_pages_raw_uring(
                 )));
             }
         }
+        request_writeback_for_sealed_runs(file, chunk);
+        if base + 1 < chunk_count {
+            std::thread::yield_now();
+        }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn request_writeback_for_sealed_runs(file: &File, runs: &[SealedWriteRun]) {
+    let Some(first) = runs.first() else {
+        return;
+    };
+    let start = first.start_page.saturating_mul(PAGE_SIZE as u64);
+    let end = runs
+        .iter()
+        .map(|run| {
+            run.start_page
+                .saturating_mul(PAGE_SIZE as u64)
+                .saturating_add(run.total_len as u64)
+        })
+        .max()
+        .unwrap_or(start);
+    let len = end.saturating_sub(start);
+    if len == 0 {
+        return;
+    }
+    let rc = unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            start as libc::off64_t,
+            len as libc::off64_t,
+            libc::SYNC_FILE_RANGE_WRITE,
+        )
+    };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => {}
+            _ => tracing::debug!(error = %err, "page_store sync_file_range writeback hint failed"),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

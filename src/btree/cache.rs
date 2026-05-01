@@ -288,9 +288,9 @@ impl PageBuf {
         for pid in &dirty {
             let mut page = self.pages[pid].page().clone();
             page.seal();
-            self.page_store.write_page(*pid, &page)?;
             flushed.push((*pid, Arc::new(page)));
         }
+        self.page_store.write_sealed_page_runs(flushed.clone())?;
         self.page_store.sync()?;
         for (pid, page) in flushed {
             self.page_cache.insert(pid, page.clone());
