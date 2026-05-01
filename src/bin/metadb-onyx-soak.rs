@@ -399,7 +399,7 @@ fn run() -> Result<bool, String> {
         };
         let read_items_per_sec = (w.reads as f64 * args.reader_batch as f64) / w.secs;
         eprintln!(
-            "[t={:>5.1}s] commits={:>6} ({:>5.0}/s) ops={:>7} ({:>6.0}/s) bulk_dedup={:>7} ({:>4}c {:>7.0}/s p99={:>6.1}ms) commit_p50={:>6.1}ms p99={:>7.1}ms max={:>7.1}ms | commit wal={:>5.1}ms wait={:>5.1}ms gate={:>4.1}ms apply={:>5.1}ms | wal batches={} fsyncs={} batch_max={} write_avg={:>5.1}ms fsync_avg={:>5.1}ms submit_avg={:>5.1}ms | op_us l2p={:>4.1} rc={:>4.1} dedup={:>4.1} | flush={:>3} pages={} io_max={:>7}us manifest_max={:>7}us install_max={:>7}us reclaim_max={:>7}us total_max={:>7}us | l2p_buf={}/{} rc_buf={}/{} apply_q={:>3} cache={:>3}% | dedup hit={:>4.1}%% cleanup={}/{} | reads={:>5} ({:>5.0}/s items={:>7.0}/s) read_p99={:>5.1}ms | range scans={} entries={} scan_p99={:>6.1}ms scan_max={:>6.1}ms",
+            "[t={:>5.1}s] commits={:>6} ({:>5.0}/s) ops={:>7} ({:>6.0}/s) bulk_dedup={:>7} ({:>4}c {:>7.0}/s p99={:>6.1}ms) commit_p50={:>6.1}ms p99={:>7.1}ms max={:>7.1}ms | commit wal={:>5.1}ms wait={:>5.1}ms gate={:>4.1}ms apply={:>5.1}ms | wal batches={} fsyncs={} batch_max={} write_avg={:>5.1}ms fsync_avg={:>5.1}ms submit_avg={:>5.1}ms | op_us l2p={:>4.1} rc={:>4.1} dedup={:>4.1} | flush={:>3} pages={} io_max={:>7}us manifest_max={:>7}us install_max={:>7}us reclaim_max={:>7}us total_max={:>7}us | l2p_buf={}/{} rc_buf={}/{} apply_q={:>3} cache={:>3}% | dedup hit={:>4.1}%% cleanup={}/{} scan={:>5.1}ms fwd={:>5.1}ms cmt={:>5.1}ms | reads={:>5} ({:>5.0}/s items={:>7.0}/s) read_p99={:>5.1}ms | range scans={} entries={} scan_p99={:>6.1}ms scan_max={:>6.1}ms",
             elapsed.as_secs_f64(),
             w.commits,
             w.commits as f64 / w.secs,
@@ -441,6 +441,9 @@ fn run() -> Result<bool, String> {
             hit_pct,
             w.cleanup_calls,
             w.cleanup_pbas,
+            w.cleanup_scan_avg_ms,
+            w.cleanup_forward_check_avg_ms,
+            w.cleanup_commit_avg_ms,
             w.reads,
             w.reads as f64 / w.secs,
             read_items_per_sec,
@@ -996,6 +999,9 @@ struct WindowStats {
     dedup_register_p99_ms: f64,
     cleanup_calls: u64,
     cleanup_pbas: u64,
+    cleanup_scan_avg_ms: f64,
+    cleanup_forward_check_avg_ms: f64,
+    cleanup_commit_avg_ms: f64,
     commit_p50_ms: f64,
     commit_p99_ms: f64,
     commit_max_ms: f64,
@@ -1124,6 +1130,19 @@ impl WindowStats {
             .metrics
             .apply_dedup_us
             .saturating_sub(prev.metrics.apply_dedup_us);
+        let cleanup_calls = now.cleanup_calls.saturating_sub(prev.cleanup_calls);
+        let cleanup_scan_us = now
+            .metrics
+            .cleanup_scan_us
+            .saturating_sub(prev.metrics.cleanup_scan_us);
+        let cleanup_forward_check_us = now
+            .metrics
+            .cleanup_forward_check_us
+            .saturating_sub(prev.metrics.cleanup_forward_check_us);
+        let cleanup_commit_us = now
+            .metrics
+            .cleanup_commit_us
+            .saturating_sub(prev.metrics.cleanup_commit_us);
         Self {
             secs,
             commits,
@@ -1137,8 +1156,11 @@ impl WindowStats {
                 .dedup_register_ops
                 .saturating_sub(prev.dedup_register_ops),
             dedup_register_p99_ms,
-            cleanup_calls: now.cleanup_calls.saturating_sub(prev.cleanup_calls),
+            cleanup_calls,
             cleanup_pbas: now.cleanup_pbas.saturating_sub(prev.cleanup_pbas),
+            cleanup_scan_avg_ms: avg_ms(cleanup_scan_us, cleanup_calls),
+            cleanup_forward_check_avg_ms: avg_ms(cleanup_forward_check_us, cleanup_calls),
+            cleanup_commit_avg_ms: avg_ms(cleanup_commit_us, cleanup_calls),
             commit_p50_ms,
             commit_p99_ms,
             commit_max_ms,
