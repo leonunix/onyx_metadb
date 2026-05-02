@@ -359,12 +359,8 @@ fn v6_rejects_volume_count_exceeding_capacity() {
         .sum();
     // m has dedup_shards=1 from Manifest::empty(); pass that through to
     // the capacity calculator so the test matches the encoder's view.
-    let cap = max_snapshots_for_layout(
-        m.shard_count(),
-        m.dedup_shards as usize,
-        0,
-        baseline_budget,
-    );
+    let cap =
+        max_snapshots_for_layout(m.shard_count(), m.dedup_shards as usize, 0, baseline_budget);
     for i in 0..(cap + 1) as u64 {
         m.snapshots.push(snap(&ps, i, 0, &[10], i));
     }
@@ -383,20 +379,10 @@ fn dedup_n4_encode_decode_round_trip() {
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
         dedup_shards: 4,
-        dedup_index_shard_heads: vec![
-            bx(&[NULL_PAGE]),
-            bx(&[10, 20]),
-            bx(&[]),
-            bx(&[30, 40, 50]),
-        ]
-        .into_boxed_slice(),
-        dedup_reverse_shard_heads: vec![
-            bx(&[NULL_PAGE, 60]),
-            bx(&[]),
-            bx(&[70]),
-            bx(&[80, 90]),
-        ]
-        .into_boxed_slice(),
+        dedup_index_shard_heads: vec![bx(&[NULL_PAGE]), bx(&[10, 20]), bx(&[]), bx(&[30, 40, 50])]
+            .into_boxed_slice(),
+        dedup_reverse_shard_heads: vec![bx(&[NULL_PAGE, 60]), bx(&[]), bx(&[70]), bx(&[80, 90])]
+            .into_boxed_slice(),
         next_snapshot_id: 1,
         next_volume_ord: 1,
         snapshots: Vec::new(),
@@ -516,10 +502,7 @@ fn decode_v7_body_opens_as_dedup_shards_one() {
         decoded.dedup_index_shard_heads[0].as_ref(),
         &[100u64, 200u64]
     );
-    assert_eq!(
-        decoded.dedup_reverse_shard_heads[0].as_ref(),
-        &[NULL_PAGE]
-    );
+    assert_eq!(decoded.dedup_reverse_shard_heads[0].as_ref(), &[NULL_PAGE]);
     assert_eq!(decoded.checkpoint_lsn, 42);
     assert_eq!(decoded.refcount_shard_roots.as_ref(), &[7u64]);
 }

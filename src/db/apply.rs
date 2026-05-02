@@ -4,7 +4,8 @@ use super::*;
 /// the guard's lifetime is what makes "tree.root() at publish time" a
 /// well-defined moment that includes every just-mutated dirty page.
 pub(super) fn publish_l2p_read_view(shard: &L2pShard, tree: &PagedL2p) {
-    *shard.read_view.write() = Arc::new(tree.snapshot_read_view());
+    let view = Arc::new(tree.snapshot_read_view());
+    *shard.read_view.write() = view;
 }
 
 /// Apply one [`WalOp`] to raw `Db` state. Used by both the live commit

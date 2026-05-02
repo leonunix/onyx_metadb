@@ -207,6 +207,9 @@ impl ReadView {
             out[*idx] = self.get(lbas[*idx])?;
             return Ok(());
         }
+        if self.try_multi_get_same_leaf(lbas, indices, out)? {
+            return Ok(());
+        }
 
         struct LeafWalk {
             leaf_idx: u64,
@@ -304,6 +307,50 @@ impl ReadView {
             }
         }
         Ok(())
+    }
+
+    fn try_multi_get_same_leaf(
+        &self,
+        lbas: &[u64],
+        indices: &[usize],
+        out: &mut [Option<L2pValue>],
+    ) -> Result<bool> {
+        let Some((&first_idx, rest)) = indices.split_first() else {
+            return Ok(true);
+        };
+        let leaf_idx = lbas[first_idx] >> LEAF_SHIFT;
+        for &idx in rest {
+            if (lbas[idx] >> LEAF_SHIFT) != leaf_idx {
+                return Ok(false);
+            }
+        }
+        if leaf_idx > max_leaf_idx_at_level(self.root_level) {
+            return Ok(true);
+        }
+
+        let mut current = self.root;
+        let mut level = self.root_level;
+        while level > 0 {
+            let child = self.with_page(current, |page| {
+                Ok(index_child_at(page, slot_in_index(leaf_idx, level)))
+            })?;
+            if child == NULL_PAGE {
+                return Ok(true);
+            }
+            current = child;
+            level -= 1;
+        }
+
+        self.with_page(current, |leaf| {
+            for &idx in indices {
+                let bit = (lbas[idx] & LEAF_MASK) as usize;
+                if leaf_bit_set(leaf, bit) {
+                    out[idx] = Some(leaf_value_at(leaf, bit));
+                }
+            }
+            Ok(())
+        })?;
+        Ok(true)
     }
 
     /// Range scan against this published snapshot. The scan is eager
@@ -517,5 +564,21 @@ mod tests {
 
         let live = tree.snapshot_read_view();
         assert_eq!(live.get(5).unwrap(), Some(val(0x22)));
+    }
+
+    #[test]
+    fn multi_get_same_leaf_uses_one_leaf_walk() {
+        let (_d, ps, pc) = fresh();
+        let mut tree = open_tree(&ps, &pc);
+        tree.insert_at_lsn(8u64, val(0x08), 1).unwrap();
+        tree.insert_at_lsn(9u64, val(0x09), 2).unwrap();
+        tree.insert_at_lsn(11u64, val(0x0b), 3).unwrap();
+        tree.flush().unwrap();
+
+        let view = empty_view(&tree, pc);
+        assert_eq!(
+            view.multi_get(&[8, 9, 10, 11]).unwrap(),
+            vec![Some(val(0x08)), Some(val(0x09)), None, Some(val(0x0b))]
+        );
     }
 }

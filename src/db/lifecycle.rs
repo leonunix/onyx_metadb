@@ -814,8 +814,7 @@ impl Db {
             commit_refcount_checkpoint(&mut refcount_guards, last_applied.max(1) + 1)?;
 
             dedup_index.free_old_level_heads_all(&old_dedup_heads, dedup_generation)?;
-            dedup_reverse
-                .free_old_level_heads_all(&old_dedup_reverse_heads, dedup_generation)?;
+            dedup_reverse.free_old_level_heads_all(&old_dedup_reverse_heads, dedup_generation)?;
 
             // Open-path counterpart of `Db::reclaim_freed_pages`: no
             // readers can be pinned yet, so every deferred entry queued
@@ -974,7 +973,10 @@ impl Db {
     /// [`Manifest::dedup_shards`](crate::manifest::Manifest::dedup_shards).
     /// Used by the status report to expose load skew across shards.
     pub fn dedup_lsm_stats_per_shard(&self) -> (Vec<LsmStats>, Vec<LsmStats>) {
-        (self.dedup_index.shard_stats(), self.dedup_reverse.shard_stats())
+        (
+            self.dedup_index.shard_stats(),
+            self.dedup_reverse.shard_stats(),
+        )
     }
 
     /// Diagnostic snapshot of in-memory bookkeeping that can grow
@@ -996,11 +998,7 @@ impl Db {
     pub fn pending_state(&self) -> PendingState {
         let dispatch_pending = self.dispatch_state.lock().pending.len();
         let deferred_free = self.page_store.deferred_free_len();
-        let dedup_lane_queue: usize = self
-            .dedup_lanes
-            .iter()
-            .map(|lane| lane.queue_len())
-            .sum();
+        let dedup_lane_queue: usize = self.dedup_lanes.iter().map(|lane| lane.queue_len()).sum();
         let mut l2p_apply_queue = 0usize;
         let mut l2p_private_pages = 0usize;
         let mut l2p_retired_pages = 0usize;
@@ -1150,6 +1148,18 @@ impl Db {
     /// applied commit, so after `open` replay can correctly begin at
     /// `checkpoint_lsn + 1`.
     pub fn flush(&self) -> Result<()> {
+        self.flush_with_gate(true).map(|_| ())
+    }
+
+    /// Best-effort checkpoint for background maintenance. If commits are
+    /// currently applying, this returns `Ok(false)` without setting the
+    /// apply gate's writer-pending bit, so foreground commit readers keep
+    /// flowing and the caller can retry on the next interval.
+    pub fn try_flush(&self) -> Result<bool> {
+        self.flush_with_gate(false)
+    }
+
+    fn flush_with_gate(&self, blocking_gate: bool) -> Result<bool> {
         // Exclude every in-flight apply phase only while sampling the
         // checkpoint boundary. Each tree protects the private pages in
         // the sampled roots before we drop its shard lock; later commits
@@ -1158,7 +1168,15 @@ impl Db {
         self.metrics.record_flush_attempt();
         let flush_started = std::time::Instant::now();
         let gate_started = std::time::Instant::now();
-        let apply_guard = self.apply_gate.write();
+        let Some(apply_guard) = (if blocking_gate {
+            Some(self.apply_gate.write())
+        } else {
+            self.apply_gate.try_write()
+        }) else {
+            self.metrics.record_flush_gate_wait(gate_started.elapsed());
+            self.metrics.record_flush_total(flush_started.elapsed());
+            return Ok(false);
+        };
         self.metrics.record_flush_gate_wait(gate_started.elapsed());
         let sample_started = std::time::Instant::now();
         let volumes = self.volumes_snapshot();
@@ -1409,7 +1427,7 @@ impl Db {
         crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
         self.metrics.record_flush_reclaim(reclaim_started.elapsed());
         self.metrics.record_flush_total(flush_started.elapsed());
-        Ok(())
+        Ok(true)
     }
 
     fn abort_checkpoints(

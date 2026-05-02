@@ -108,6 +108,18 @@ pub struct MetaMetrics {
     l2p_get_lock_wait_max_us: AtomicU64,
     l2p_get_tree_walk_us: AtomicU64,
     l2p_get_tree_walk_max_us: AtomicU64,
+    l2p_multi_get_calls: AtomicU64,
+    l2p_multi_get_lbas: AtomicU64,
+    l2p_multi_get_pin_us: AtomicU64,
+    l2p_multi_get_pin_max_us: AtomicU64,
+    l2p_multi_get_volume_us: AtomicU64,
+    l2p_multi_get_volume_max_us: AtomicU64,
+    l2p_multi_get_sort_us: AtomicU64,
+    l2p_multi_get_sort_max_us: AtomicU64,
+    l2p_multi_get_view_us: AtomicU64,
+    l2p_multi_get_view_max_us: AtomicU64,
+    l2p_multi_get_tree_us: AtomicU64,
+    l2p_multi_get_tree_max_us: AtomicU64,
 
     // Per-phase flush timing. Splits `Db::flush()` into the gate /
     // sample / IO / manifest / install phases so we can tell which one
@@ -225,6 +237,18 @@ pub struct MetaMetricsSnapshot {
     pub l2p_get_lock_wait_max_us: u64,
     pub l2p_get_tree_walk_us: u64,
     pub l2p_get_tree_walk_max_us: u64,
+    pub l2p_multi_get_calls: u64,
+    pub l2p_multi_get_lbas: u64,
+    pub l2p_multi_get_pin_us: u64,
+    pub l2p_multi_get_pin_max_us: u64,
+    pub l2p_multi_get_volume_us: u64,
+    pub l2p_multi_get_volume_max_us: u64,
+    pub l2p_multi_get_sort_us: u64,
+    pub l2p_multi_get_sort_max_us: u64,
+    pub l2p_multi_get_view_us: u64,
+    pub l2p_multi_get_view_max_us: u64,
+    pub l2p_multi_get_tree_us: u64,
+    pub l2p_multi_get_tree_max_us: u64,
     pub flush_calls: u64,
     pub flush_total_us: u64,
     pub flush_total_max_us: u64,
@@ -341,6 +365,18 @@ impl MetaMetrics {
             l2p_get_lock_wait_max_us: load(&self.l2p_get_lock_wait_max_us),
             l2p_get_tree_walk_us: load(&self.l2p_get_tree_walk_us),
             l2p_get_tree_walk_max_us: load(&self.l2p_get_tree_walk_max_us),
+            l2p_multi_get_calls: load(&self.l2p_multi_get_calls),
+            l2p_multi_get_lbas: load(&self.l2p_multi_get_lbas),
+            l2p_multi_get_pin_us: load(&self.l2p_multi_get_pin_us),
+            l2p_multi_get_pin_max_us: load(&self.l2p_multi_get_pin_max_us),
+            l2p_multi_get_volume_us: load(&self.l2p_multi_get_volume_us),
+            l2p_multi_get_volume_max_us: load(&self.l2p_multi_get_volume_max_us),
+            l2p_multi_get_sort_us: load(&self.l2p_multi_get_sort_us),
+            l2p_multi_get_sort_max_us: load(&self.l2p_multi_get_sort_max_us),
+            l2p_multi_get_view_us: load(&self.l2p_multi_get_view_us),
+            l2p_multi_get_view_max_us: load(&self.l2p_multi_get_view_max_us),
+            l2p_multi_get_tree_us: load(&self.l2p_multi_get_tree_us),
+            l2p_multi_get_tree_max_us: load(&self.l2p_multi_get_tree_max_us),
             flush_calls: load(&self.flush_calls),
             flush_total_us: load(&self.flush_total_us),
             flush_total_max_us: load(&self.flush_total_max_us),
@@ -564,6 +600,52 @@ impl MetaMetrics {
             &self.l2p_get_tree_walk_us,
             &self.l2p_get_tree_walk_max_us,
             tree_walk,
+        );
+    }
+
+    pub(crate) fn record_l2p_multi_get_call(&self, lbas: usize) {
+        self.l2p_multi_get_calls.fetch_add(1, Ordering::Relaxed);
+        self.l2p_multi_get_lbas
+            .fetch_add(lbas as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_l2p_multi_get_pin(&self, elapsed: Duration) {
+        record_duration(
+            &self.l2p_multi_get_pin_us,
+            &self.l2p_multi_get_pin_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_l2p_multi_get_volume(&self, elapsed: Duration) {
+        record_duration(
+            &self.l2p_multi_get_volume_us,
+            &self.l2p_multi_get_volume_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_l2p_multi_get_sort(&self, elapsed: Duration) {
+        record_duration(
+            &self.l2p_multi_get_sort_us,
+            &self.l2p_multi_get_sort_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_l2p_multi_get_view(&self, elapsed: Duration) {
+        record_duration(
+            &self.l2p_multi_get_view_us,
+            &self.l2p_multi_get_view_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_l2p_multi_get_tree(&self, elapsed: Duration) {
+        record_duration(
+            &self.l2p_multi_get_tree_us,
+            &self.l2p_multi_get_tree_max_us,
+            elapsed,
         );
     }
 
@@ -829,6 +911,18 @@ impl MetaMetricsSnapshot {
                 "\"l2p_get_lock_wait_max_us\":{},",
                 "\"l2p_get_tree_walk_us\":{},",
                 "\"l2p_get_tree_walk_max_us\":{},",
+                "\"l2p_multi_get_calls\":{},",
+                "\"l2p_multi_get_lbas\":{},",
+                "\"l2p_multi_get_pin_us\":{},",
+                "\"l2p_multi_get_pin_max_us\":{},",
+                "\"l2p_multi_get_volume_us\":{},",
+                "\"l2p_multi_get_volume_max_us\":{},",
+                "\"l2p_multi_get_sort_us\":{},",
+                "\"l2p_multi_get_sort_max_us\":{},",
+                "\"l2p_multi_get_view_us\":{},",
+                "\"l2p_multi_get_view_max_us\":{},",
+                "\"l2p_multi_get_tree_us\":{},",
+                "\"l2p_multi_get_tree_max_us\":{},",
                 "\"flush_calls\":{},",
                 "\"flush_total_us\":{},",
                 "\"flush_total_max_us\":{},",
@@ -938,6 +1032,18 @@ impl MetaMetricsSnapshot {
             self.l2p_get_lock_wait_max_us,
             self.l2p_get_tree_walk_us,
             self.l2p_get_tree_walk_max_us,
+            self.l2p_multi_get_calls,
+            self.l2p_multi_get_lbas,
+            self.l2p_multi_get_pin_us,
+            self.l2p_multi_get_pin_max_us,
+            self.l2p_multi_get_volume_us,
+            self.l2p_multi_get_volume_max_us,
+            self.l2p_multi_get_sort_us,
+            self.l2p_multi_get_sort_max_us,
+            self.l2p_multi_get_view_us,
+            self.l2p_multi_get_view_max_us,
+            self.l2p_multi_get_tree_us,
+            self.l2p_multi_get_tree_max_us,
             self.flush_calls,
             self.flush_total_us,
             self.flush_total_max_us,

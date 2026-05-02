@@ -146,4 +146,3 @@ fn set_current_cpu(cpu: usize) -> std::io::Result<()> {
 fn set_current_cpu(_cpu: usize) -> std::io::Result<()> {
     Ok(())
 }
-

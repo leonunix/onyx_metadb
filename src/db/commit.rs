@@ -79,24 +79,6 @@ impl Drop for ActiveApplyGuard<'_> {
     }
 }
 
-fn wait_for_l2p_readers_to_drain(shard: &L2pShard) -> bool {
-    let started = std::time::Instant::now();
-    let budget = std::time::Duration::from_micros(750);
-    let mut spins = 0usize;
-    while shard.active_readers.load(Ordering::Acquire) != 0 {
-        if started.elapsed() >= budget {
-            return false;
-        }
-        if spins < 128 {
-            std::hint::spin_loop();
-            spins += 1;
-        } else {
-            std::thread::yield_now();
-        }
-    }
-    true
-}
-
 impl DispatchFootprint {
     pub(super) fn global() -> Self {
         Self {
@@ -636,16 +618,7 @@ impl Db {
     }
 
     fn batch_uses_serial_apply(&self, ops: &[WalOp]) -> bool {
-        const SMALL_REMAP_LANE_THRESHOLD: usize = 8;
-        if self.batch_requires_serial_apply(ops) {
-            return true;
-        }
-        // Unguarded remaps can discover an old_pba on any refcount shard
-        // after the L2P phase, so the lane path reserves every refcount lane
-        // as a correctness placeholder. That is profitable for big flusher
-        // batches, but far too much machinery for one-off diagnostic writes.
-        ops.len() < SMALL_REMAP_LANE_THRESHOLD
-            && ops.iter().any(|op| matches!(op, WalOp::L2pRemap { .. }))
+        self.batch_requires_serial_apply(ops)
     }
 
     pub(super) fn poison_commit_waiters(&self, err: &MetaDbError) {
@@ -796,18 +769,15 @@ impl Db {
                     });
                 }
                 WalOp::DedupPut { hash, .. } | WalOp::DedupDelete { hash, .. } => {
-                    let sid =
-                        crate::lsm::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    let sid = crate::lsm::shard_for_hash(hash, dedup_shard_count_u32) as usize;
                     dedup_buckets[sid].push(idx);
                 }
-                WalOp::DedupReversePut { hash, .. }
-                | WalOp::DedupReverseDelete { hash, .. } => {
+                WalOp::DedupReversePut { hash, .. } | WalOp::DedupReverseDelete { hash, .. } => {
                     // Forward and reverse for the same `(hash, pba)`
                     // pair must land in the same shard so the dedup
                     // invariant survives a single commit. Route by
                     // hash here, not the encoded reverse key.
-                    let sid =
-                        crate::lsm::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    let sid = crate::lsm::shard_for_hash(hash, dedup_shard_count_u32) as usize;
                     dedup_buckets[sid].push(idx);
                 }
                 WalOp::DropSnapshot { .. }
@@ -924,9 +894,10 @@ impl Db {
         let mut tree = shard.tree.write();
         let tree_lock_wait = tree_lock_started.elapsed();
         let read_view_prepare_started = std::time::Instant::now();
-        let mut read_view_guard = {
-            let mut guard = shard.read_view.write();
-            if wait_for_l2p_readers_to_drain(shard) {
+        let mut read_view_guard = if shard.active_readers.load(Ordering::Acquire) == 0
+            && let Some(mut guard) = shard.read_view.try_write()
+        {
+            if shard.active_readers.load(Ordering::Acquire) == 0 {
                 *guard = Arc::new(crate::paged::ReadView::new(
                     tree.root(),
                     tree.root_level(),
@@ -938,6 +909,8 @@ impl Db {
             } else {
                 None
             }
+        } else {
+            None
         };
         let read_view_prepare = read_view_prepare_started.elapsed();
         let mut l2p_put_count = 0u64;
@@ -1308,9 +1281,8 @@ impl Db {
         // Fan dedup work out across shards. Each non-empty bucket
         // gets its own apply closure on its shard's lane; we collect
         // outcomes from all of them before returning.
-        let mut dedup_receivers: Vec<crossbeam_channel::Receiver<
-            Vec<(usize, ApplyOutcome)>,
-        >> = Vec::new();
+        let mut dedup_receivers: Vec<crossbeam_channel::Receiver<Vec<(usize, ApplyOutcome)>>> =
+            Vec::new();
         let dedup_enqueue_started = std::time::Instant::now();
         let dedup_buckets = std::mem::take(&mut plan.dedup_buckets);
         let pendings = std::mem::take(&mut plan.dedup_pendings);
@@ -1843,6 +1815,44 @@ mod tests {
         assert!(
             !dispatch_ready(&state, 11),
             "global serial work must retain the old FIFO barrier"
+        );
+    }
+
+    #[test]
+    fn small_remap_batches_use_lane_dispatch_not_global_serial() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::create(dir.path()).unwrap();
+        let mut raw = [0u8; 28];
+        raw[..8].copy_from_slice(&123_u64.to_be_bytes());
+
+        let ops = [WalOp::L2pRemap {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 7,
+            new_value: L2pValue(raw),
+            guard: None,
+        }];
+
+        assert!(
+            !db.batch_uses_serial_apply(&ops),
+            "tiny remap commits must keep precise L2P/refcount footprints so they do not block dedup dispatch globally"
+        );
+        let plan = db
+            .build_lane_dispatch_plan(&db.volumes.read().clone(), &ops)
+            .unwrap();
+        let footprint = DispatchFootprint::from_lane_plan(&plan);
+        assert!(!footprint.global);
+        assert!(
+            footprint
+                .lanes
+                .iter()
+                .any(|lane| matches!(lane, DispatchLaneKey::L2p(BOOTSTRAP_VOLUME_ORD, _)))
+        );
+        assert!(
+            !footprint
+                .lanes
+                .iter()
+                .any(|lane| matches!(lane, DispatchLaneKey::Dedup(_))),
+            "remap-only commits should not conflict with dedup shards"
         );
     }
 }

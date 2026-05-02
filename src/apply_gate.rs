@@ -103,6 +103,20 @@ impl ApplyGate {
         state.writer_active = true;
         WriteGuard { gate: self }
     }
+
+    /// Acquire exclusive access only if it is immediately available.
+    ///
+    /// Unlike [`write`](Self::write), this does not mark a writer as
+    /// pending. Opportunistic checkpoint attempts can use it to avoid
+    /// parking new commit readers behind a background maintenance task.
+    pub fn try_write(&self) -> Option<WriteGuard<'_>> {
+        let mut state = self.state.lock();
+        if state.writer_active || state.writers_pending > 0 || state.readers > 0 {
+            return None;
+        }
+        state.writer_active = true;
+        Some(WriteGuard { gate: self })
+    }
 }
 
 pub struct ReadGuard<'a> {
@@ -229,6 +243,21 @@ mod tests {
             "writer waited too long: {:?}",
             waited
         );
+    }
+
+    #[test]
+    fn try_write_does_not_park_later_readers_when_busy() {
+        let gate = ApplyGate::new();
+        let first_reader = gate.read();
+        assert!(gate.try_write().is_none());
+        assert!(
+            !gate.has_writer_pending(),
+            "try_write must not advertise a pending writer"
+        );
+        let second_reader = gate.read();
+        drop(second_reader);
+        drop(first_reader);
+        assert!(gate.try_write().is_some());
     }
 
     #[test]

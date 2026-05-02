@@ -298,8 +298,8 @@ impl Manifest {
                 dedup_shards,
             )));
         }
-        let total_dedup_levels = self.total_dedup_index_levels()
-            + self.total_dedup_reverse_levels();
+        let total_dedup_levels =
+            self.total_dedup_index_levels() + self.total_dedup_reverse_levels();
 
         let volumes_budget_bytes: usize = self
             .volumes
@@ -496,8 +496,11 @@ impl Manifest {
                 "manifest refcount shard_count {refcount_shard_count} exceeds page capacity {MAX_SHARD_ROOTS_PER_PAGE}",
             )));
         }
-        let dedup_shards =
-            u32::from_le_bytes(p[OFF_DEDUP_SHARDS..OFF_DEDUP_SHARDS + 4].try_into().unwrap());
+        let dedup_shards = u32::from_le_bytes(
+            p[OFF_DEDUP_SHARDS..OFF_DEDUP_SHARDS + 4]
+                .try_into()
+                .unwrap(),
+        );
         let dedup_shards_usize = dedup_shards as usize;
         if dedup_shards_usize == 0 || !dedup_shards_usize.is_power_of_two() {
             return Err(MetaDbError::Corruption(format!(
@@ -513,8 +516,7 @@ impl Manifest {
         let mut dedup_index_shard_heads = Vec::with_capacity(dedup_shards_usize);
         let mut total_index_levels = 0usize;
         for _ in 0..dedup_shards_usize {
-            let level_count =
-                u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
+            let level_count = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
             off += 4;
             total_index_levels = total_index_levels.saturating_add(level_count);
             dedup_index_shard_heads.push(read_u64_vec(p, &mut off, level_count));
@@ -523,8 +525,7 @@ impl Manifest {
         let mut dedup_reverse_shard_heads = Vec::with_capacity(dedup_shards_usize);
         let mut total_reverse_levels = 0usize;
         for _ in 0..dedup_shards_usize {
-            let level_count =
-                u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
+            let level_count = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
             off += 4;
             total_reverse_levels = total_reverse_levels.saturating_add(level_count);
             dedup_reverse_shard_heads.push(read_u64_vec(p, &mut off, level_count));
@@ -583,7 +584,12 @@ fn decode_tail_counters(p: &[u8]) -> (u64, VolumeOrdinal, usize, usize) {
             .try_into()
             .unwrap(),
     ) as usize;
-    (next_snapshot_id, next_volume_ord, snapshot_count, volume_count)
+    (
+        next_snapshot_id,
+        next_volume_ord,
+        snapshot_count,
+        volume_count,
+    )
 }
 
 fn decode_snapshots(

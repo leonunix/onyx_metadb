@@ -282,8 +282,9 @@ impl ShardedLsm {
         if self.shards.len() == 1 {
             return self.shards[0].multi_scan_prefix(prefixes);
         }
-        let mut out: Vec<Vec<(Hash32, DedupValue)>> =
-            std::iter::repeat_with(Vec::new).take(prefixes.len()).collect();
+        let mut out: Vec<Vec<(Hash32, DedupValue)>> = std::iter::repeat_with(Vec::new)
+            .take(prefixes.len())
+            .collect();
         for shard in self.shards.iter() {
             let per_prefix = shard.multi_scan_prefix(prefixes)?;
             for (i, rows) in per_prefix.into_iter().enumerate() {

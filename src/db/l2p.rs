@@ -94,10 +94,14 @@ impl Db {
                 end += 1;
             }
 
+            let view_started = std::time::Instant::now();
             let (view, _active_read) = acquire_l2p_read_view(&volume.shards[sid]);
+            self.metrics
+                .record_l2p_multi_get_view(view_started.elapsed());
             let walk_started = std::time::Instant::now();
             view.multi_get_into(lbas, &order[start..end], out)?;
             let tree_walk = walk_started.elapsed();
+            self.metrics.record_l2p_multi_get_tree(tree_walk);
             // `pin_wait` is recorded once per shard so the metric's
             // existing `lock_wait_us / calls` ratio still represents
             // per-shard barrier-acquire latency.
@@ -139,7 +143,12 @@ impl Db {
         let pin_started = std::time::Instant::now();
         let _pin = self.page_store.epoch().pin();
         let pin_wait = pin_started.elapsed();
+        self.metrics.record_l2p_multi_get_call(lbas.len());
+        self.metrics.record_l2p_multi_get_pin(pin_wait);
+        let volume_started = std::time::Instant::now();
         let volume = self.volume(vol_ord)?;
+        self.metrics
+            .record_l2p_multi_get_volume(volume_started.elapsed());
         let mut out: Vec<Option<L2pValue>> = vec![None; lbas.len()];
 
         if lbas.len() <= MULTI_GET_STACK_INDICES {
@@ -148,11 +157,17 @@ impl Db {
                 *slot = idx;
             }
             let order = &mut order_buf[..lbas.len()];
+            let sort_started = std::time::Instant::now();
             order.sort_unstable_by_key(|&idx| shard_for_key_l2p(&volume.shards, lbas[idx]));
+            self.metrics
+                .record_l2p_multi_get_sort(sort_started.elapsed());
             self.multi_get_ordered(&volume, lbas, order, &mut out, pin_wait)?;
         } else {
             let mut order: Vec<usize> = (0..lbas.len()).collect();
+            let sort_started = std::time::Instant::now();
             order.sort_unstable_by_key(|&idx| shard_for_key_l2p(&volume.shards, lbas[idx]));
+            self.metrics
+                .record_l2p_multi_get_sort(sort_started.elapsed());
             self.multi_get_ordered(&volume, lbas, &order, &mut out, pin_wait)?;
         }
         Ok(out)
