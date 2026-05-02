@@ -99,6 +99,29 @@ pub(super) fn validate_shard_count(shards_per_partition: u32) -> Result<usize> {
     Ok(shard_count)
 }
 
+/// Build N independent dedup apply lanes, one per shard. The lane
+/// ordinal feeds into the worker thread's affinity binding so each
+/// shard's apply thread can pin to a different CPU on supported
+/// platforms.
+pub(super) fn build_dedup_lanes(
+    last_applied: Lsn,
+    shard_count: usize,
+    kind: ApplyLaneKind,
+) -> Box<[ApplyLane]> {
+    (0..shard_count)
+        .map(|sid| ApplyLane::new(last_applied, kind, sid))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+/// Per-shard double-queue guards for the dedup maintenance lane.
+pub(super) fn build_dedup_queued_flags(shard_count: usize) -> Box<[Arc<AtomicBool>]> {
+    (0..shard_count)
+        .map(|_| Arc::new(AtomicBool::new(false)))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 /// Validate `cfg.dedup_shards` and return it on success. The dedup
 /// shard count must be a power of two in `[1, MAX_DEDUP_SHARDS]`.
 pub(super) fn validate_dedup_shards(dedup_shards: u32) -> Result<u32> {

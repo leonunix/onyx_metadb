@@ -317,34 +317,41 @@ impl Db {
     }
 
     pub(super) fn maybe_schedule_dedup_maintenance(&self) {
-        if !self.dedup_should_flush() {
-            return;
-        }
-        if self
-            .dedup_maintenance_queued
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-
-        let index = self.dedup_index.clone();
-        let reverse = self.dedup_reverse.clone();
-        let queued = self.dedup_maintenance_queued.clone();
+        let shard_count = self.dedup_lanes.len();
         let generation = self.last_applied_lsn().saturating_add(1).max(1);
-        self.dedup_maintenance_lane
-            .handle()
-            .enqueue_maintenance(Box::new(move || {
-                let result = (|| -> Result<()> {
-                    index.flush_memtable_all(generation)?;
-                    reverse.flush_memtable_all(generation)?;
-                    Ok(())
-                })();
-                if let Err(err) = result {
-                    tracing::warn!(error = %err, "metadb: background dedup memtable flush failed");
-                }
-                queued.store(false, Ordering::Release);
-            }));
+        for sid in 0..shard_count {
+            // Per-shard freeze check: only schedule a flush for the
+            // shards that actually crossed the threshold. Each shard
+            // owns its own queue flag so a hot shard queueing a flush
+            // doesn't block its quiet siblings from scheduling later.
+            if !(self.dedup_index.should_flush_shard(sid)
+                || self.dedup_reverse.should_flush_shard(sid))
+            {
+                continue;
+            }
+            if self.dedup_maintenance_queued[sid]
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let index = self.dedup_index.clone();
+            let reverse = self.dedup_reverse.clone();
+            let queued = self.dedup_maintenance_queued[sid].clone();
+            self.dedup_maintenance_lanes[sid]
+                .handle()
+                .enqueue_maintenance(Box::new(move || {
+                    let result = (|| -> Result<()> {
+                        index.flush_memtable_shard(sid, generation)?;
+                        reverse.flush_memtable_shard(sid, generation)?;
+                        Ok(())
+                    })();
+                    if let Err(err) = result {
+                        tracing::warn!(error = %err, shard = sid, "metadb: background dedup memtable flush failed");
+                    }
+                    queued.store(false, Ordering::Release);
+                }));
+        }
     }
 
     /// Iterate every `(Pba, refcount)` pair across all refcount shards,

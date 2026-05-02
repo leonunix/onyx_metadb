@@ -298,6 +298,11 @@ impl ShardedLsm {
         self.shards.iter().any(|s| s.should_flush())
     }
 
+    /// True if shard `sid`'s memtable has reached the freeze threshold.
+    pub fn should_flush_shard(&self, sid: usize) -> bool {
+        self.shards[sid].should_flush()
+    }
+
     /// Flush every shard's memtable. Returns `true` if any shard wrote
     /// an SST.
     pub fn flush_memtable_all(&self, generation: Lsn) -> Result<bool> {
@@ -308,6 +313,13 @@ impl ShardedLsm {
             }
         }
         Ok(wrote)
+    }
+
+    /// Flush only shard `sid`'s memtable. Used by the per-shard
+    /// background maintenance lane so a slow flush in one shard does
+    /// not stall the others.
+    pub fn flush_memtable_shard(&self, sid: usize, generation: Lsn) -> Result<bool> {
+        Ok(self.shards[sid].flush_memtable(generation)?.is_some())
     }
 
     /// Run one compaction round per shard. Returns `true` if any shard

@@ -436,9 +436,13 @@ impl Db {
             refcount_shards,
             dedup_index,
             dedup_reverse,
-            dedup_lane: ApplyLane::new(0, ApplyLaneKind::Dedup, 0),
-            dedup_maintenance_lane: ApplyLane::new(0, ApplyLaneKind::DedupMaintenance, 1),
-            dedup_maintenance_queued: Arc::new(AtomicBool::new(false)),
+            dedup_lanes: build_dedup_lanes(0, dedup_shards as usize, ApplyLaneKind::Dedup),
+            dedup_maintenance_lanes: build_dedup_lanes(
+                0,
+                dedup_shards as usize,
+                ApplyLaneKind::DedupMaintenance,
+            ),
+            dedup_maintenance_queued: build_dedup_queued_flags(dedup_shards as usize),
             wal,
             apply_gate: ApplyGate::new(),
             last_applied_lsn: Mutex::new(0),
@@ -862,6 +866,9 @@ impl Db {
             }
         }
 
+        // Capture before `manifest` is moved into `ManifestState` below.
+        let manifest_dedup_shards = manifest.dedup_shards as usize;
+
         let db = Self {
             page_store,
             page_cache,
@@ -874,13 +881,17 @@ impl Db {
             refcount_shards,
             dedup_index,
             dedup_reverse,
-            dedup_lane: ApplyLane::new(last_applied, ApplyLaneKind::Dedup, 0),
-            dedup_maintenance_lane: ApplyLane::new(
+            dedup_lanes: build_dedup_lanes(
                 last_applied,
-                ApplyLaneKind::DedupMaintenance,
-                1,
+                manifest_dedup_shards,
+                ApplyLaneKind::Dedup,
             ),
-            dedup_maintenance_queued: Arc::new(AtomicBool::new(false)),
+            dedup_maintenance_lanes: build_dedup_lanes(
+                last_applied,
+                manifest_dedup_shards,
+                ApplyLaneKind::DedupMaintenance,
+            ),
+            dedup_maintenance_queued: build_dedup_queued_flags(manifest_dedup_shards),
             wal,
             apply_gate: ApplyGate::new(),
             last_applied_lsn: Mutex::new(last_applied),
@@ -985,7 +996,11 @@ impl Db {
     pub fn pending_state(&self) -> PendingState {
         let dispatch_pending = self.dispatch_state.lock().pending.len();
         let deferred_free = self.page_store.deferred_free_len();
-        let dedup_lane_queue = self.dedup_lane.queue_len();
+        let dedup_lane_queue: usize = self
+            .dedup_lanes
+            .iter()
+            .map(|lane| lane.queue_len())
+            .sum();
         let mut l2p_apply_queue = 0usize;
         let mut l2p_private_pages = 0usize;
         let mut l2p_retired_pages = 0usize;

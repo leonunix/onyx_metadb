@@ -25,7 +25,11 @@ struct LaneDispatchPlan {
     l2p_sorted: Vec<((VolumeOrdinal, usize), Vec<usize>)>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
     rc_enqueued: Vec<bool>,
-    dedup_idxs: Vec<usize>,
+    /// Dedup op indices grouped by shard. Outer length always equals
+    /// `Db::dedup_lanes.len()`; an empty inner vec means that shard
+    /// has no work in this commit and gets no `DispatchLaneKey::Dedup`
+    /// footprint entry.
+    dedup_buckets: Vec<Vec<usize>>,
 }
 
 struct QueuedLanePlan {
@@ -33,8 +37,12 @@ struct QueuedLanePlan {
     l2p_receivers: Vec<crossbeam_channel::Receiver<Result<L2pBucketApplyResult>>>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
     rc_pending: Vec<Option<PendingApplyWork>>,
-    dedup_idxs: Vec<usize>,
-    dedup_pending: Option<PendingApplyWork>,
+    /// Per-shard dedup op indices. Drained into the per-shard apply
+    /// closures during `apply_ops_laned`.
+    dedup_buckets: Vec<Vec<usize>>,
+    /// One pending slot per non-empty bucket (entries for empty
+    /// buckets are `None`).
+    dedup_pendings: Vec<Option<PendingApplyWork>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -107,8 +115,10 @@ impl DispatchFootprint {
                 lanes.insert(DispatchLaneKey::Refcount(sid));
             }
         }
-        if !plan.dedup_idxs.is_empty() {
-            lanes.insert(DispatchLaneKey::Dedup);
+        for (sid, bucket) in plan.dedup_buckets.iter().enumerate() {
+            if !bucket.is_empty() {
+                lanes.insert(DispatchLaneKey::Dedup(sid as u32));
+            }
         }
         Self {
             global: false,
@@ -308,7 +318,15 @@ impl Db {
                     .count()
             })
             .unwrap_or(0);
-        let plan_dedup_ops = plan.as_ref().map(|plan| plan.dedup_idxs.len()).unwrap_or(0);
+        let plan_dedup_ops = plan
+            .as_ref()
+            .map(|plan| {
+                plan.dedup_buckets
+                    .iter()
+                    .map(|bucket| bucket.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
         let dispatch_footprint = plan
             .as_ref()
             .map(DispatchFootprint::from_lane_plan)
@@ -737,7 +755,10 @@ impl Db {
         let mut rc_buckets: Vec<Vec<RcApplyAction>> = (0..self.refcount_shards.len())
             .map(|_| Vec::new())
             .collect();
-        let mut dedup_idxs = Vec::new();
+        let dedup_shard_count = self.dedup_lanes.len();
+        let dedup_shard_count_u32 = dedup_shard_count as u32;
+        let mut dedup_buckets: Vec<Vec<usize>> =
+            (0..dedup_shard_count).map(|_| Vec::new()).collect();
         let mut remap_may_defer_refcount = false;
 
         for (idx, op) in ops.iter().enumerate() {
@@ -774,10 +795,21 @@ impl Db {
                         remap_freed_candidate: false,
                     });
                 }
-                WalOp::DedupPut { .. }
-                | WalOp::DedupDelete { .. }
-                | WalOp::DedupReversePut { .. }
-                | WalOp::DedupReverseDelete { .. } => dedup_idxs.push(idx),
+                WalOp::DedupPut { hash, .. } | WalOp::DedupDelete { hash, .. } => {
+                    let sid =
+                        crate::lsm::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    dedup_buckets[sid].push(idx);
+                }
+                WalOp::DedupReversePut { hash, .. }
+                | WalOp::DedupReverseDelete { hash, .. } => {
+                    // Forward and reverse for the same `(hash, pba)`
+                    // pair must land in the same shard so the dedup
+                    // invariant survives a single commit. Route by
+                    // hash here, not the encoded reverse key.
+                    let sid =
+                        crate::lsm::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    dedup_buckets[sid].push(idx);
+                }
                 WalOp::DropSnapshot { .. }
                 | WalOp::CreateVolume { .. }
                 | WalOp::DropVolume { .. }
@@ -803,7 +835,7 @@ impl Db {
             l2p_sorted,
             rc_buckets,
             rc_enqueued,
-            dedup_idxs,
+            dedup_buckets,
         })
     }
 
@@ -857,18 +889,22 @@ impl Db {
                 rc_pending[sid] = Some(self.refcount_shards[sid].apply_lane.enqueue_pending(lsn));
             }
         }
-        let dedup_pending = if plan.dedup_idxs.is_empty() {
-            None
-        } else {
-            Some(self.dedup_lane.enqueue_pending(lsn))
-        };
+        // One pending slot per non-empty dedup bucket. Empty buckets
+        // get `None`, matching the per-shard layout of `dedup_buckets`.
+        let mut dedup_pendings: Vec<Option<PendingApplyWork>> =
+            (0..plan.dedup_buckets.len()).map(|_| None).collect();
+        for (sid, bucket) in plan.dedup_buckets.iter().enumerate() {
+            if !bucket.is_empty() {
+                dedup_pendings[sid] = Some(self.dedup_lanes[sid].enqueue_pending(lsn));
+            }
+        }
         QueuedLanePlan {
             ops,
             l2p_receivers,
             rc_buckets: plan.rc_buckets,
             rc_pending,
-            dedup_idxs: plan.dedup_idxs,
-            dedup_pending,
+            dedup_buckets: plan.dedup_buckets,
+            dedup_pendings,
         }
     }
 
@@ -1269,10 +1305,18 @@ impl Db {
             return Err(err);
         }
 
-        if let Some(pending) = plan.dedup_pending.take() {
-            let dedup_enqueue_started = std::time::Instant::now();
+        // Fan dedup work out across shards. Each non-empty bucket
+        // gets its own apply closure on its shard's lane; we collect
+        // outcomes from all of them before returning.
+        let mut dedup_receivers: Vec<crossbeam_channel::Receiver<
+            Vec<(usize, ApplyOutcome)>,
+        >> = Vec::new();
+        let dedup_enqueue_started = std::time::Instant::now();
+        let dedup_buckets = std::mem::take(&mut plan.dedup_buckets);
+        let pendings = std::mem::take(&mut plan.dedup_pendings);
+        for (_sid, (pending_opt, bucket)) in pendings.into_iter().zip(dedup_buckets).enumerate() {
+            let Some(pending) = pending_opt else { continue };
             let ops = plan.ops.clone();
-            let indices = std::mem::take(&mut plan.dedup_idxs);
             let dedup_index = self.dedup_index.clone();
             let dedup_reverse = self.dedup_reverse.clone();
             let metrics = self.metrics.clone();
@@ -1283,22 +1327,25 @@ impl Db {
                     dedup_reverse.as_ref(),
                     metrics.as_ref(),
                     ops.as_slice(),
-                    indices,
+                    bucket,
                 );
                 let _ = tx.send(outcomes);
             }));
-            timing.dedup_enqueue = dedup_enqueue_started.elapsed();
-            let dedup_wait_started = std::time::Instant::now();
+            dedup_receivers.push(rx);
+        }
+        timing.dedup_enqueue = dedup_enqueue_started.elapsed();
+        let dedup_wait_started = std::time::Instant::now();
+        for rx in dedup_receivers {
             let dedup_outcomes = rx.recv().map_err(|_| {
                 MetaDbError::Corruption(
                     "persistent dedup lane worker failed to return a result".into(),
                 )
             })?;
-            timing.dedup_wait = dedup_wait_started.elapsed();
             for (idx, outcome) in dedup_outcomes {
                 outcomes[idx] = Some(outcome);
             }
         }
+        timing.dedup_wait = dedup_wait_started.elapsed();
 
         Ok((
             outcomes
@@ -1791,7 +1838,7 @@ mod tests {
             .insert(10, entry(DispatchFootprint::global(), true));
         state
             .pending
-            .insert(11, entry(footprint([DispatchLaneKey::Dedup]), true));
+            .insert(11, entry(footprint([DispatchLaneKey::Dedup(0)]), true));
 
         assert!(
             !dispatch_ready(&state, 11),

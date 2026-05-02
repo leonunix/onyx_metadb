@@ -82,19 +82,22 @@ pub struct Db {
     /// in the same shard for both forward and reverse indexes, so a
     /// single dedup-pair commit hits at most one shard.
     dedup_reverse: Arc<ShardedLsm>,
-    /// FIFO lane for the global dedup LSMs. The LSM internals are
-    /// synchronised, but same-key last-write-wins semantics still need
-    /// WAL-order apply across commits.
-    dedup_lane: ApplyLane,
-    /// Background lane for dedup LSM memtable flushes. Kept separate
-    /// from `dedup_lane` so foreground dedup apply is never queued
-    /// behind SST construction.
-    dedup_maintenance_lane: ApplyLane,
-    /// True while a dedup memtable maintenance task is queued/running.
-    /// This keeps high-QPS writers from filling the dedup lane with
-    /// duplicate background flush jobs once the active LSM crosses its
+    /// One FIFO apply lane per dedup shard. Each shard's lane
+    /// preserves WAL-order apply for ops within that shard; ops in
+    /// disjoint shards run in parallel because they hold disjoint
+    /// `DispatchLaneKey::Dedup(u32)` footprints. Length always equals
+    /// `manifest.dedup_shards`.
+    dedup_lanes: Box<[ApplyLane]>,
+    /// One background lane per dedup shard for memtable flushes.
+    /// Separate from `dedup_lanes` so foreground apply is never queued
+    /// behind SST construction; per-shard so a slow flush in one shard
+    /// can't stall the rest.
+    dedup_maintenance_lanes: Box<[ApplyLane]>,
+    /// Per-shard double-queue guards. Each shard keeps high-QPS
+    /// writers from filling its maintenance lane with duplicate
+    /// background flush jobs once the active LSM crosses its
     /// threshold.
-    dedup_maintenance_queued: Arc<AtomicBool>,
+    dedup_maintenance_queued: Box<[Arc<AtomicBool>]>,
     /// Write-ahead log. All mutations route through here so they survive
     /// crash between checkpoints.
     wal: WalSet,
@@ -202,7 +205,9 @@ struct DispatchFootprint {
 enum DispatchLaneKey {
     L2p(VolumeOrdinal, usize),
     Refcount(usize),
-    Dedup,
+    /// One key per dedup shard. Ops carrying disjoint shard ids run
+    /// in parallel; ops within the same shard serialize by WAL LSN.
+    Dedup(u32),
 }
 
 #[derive(Default)]
