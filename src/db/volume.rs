@@ -548,17 +548,30 @@ impl Db {
         self.dedup_index.flush_memtable_all(generation)?;
         self.dedup_reverse.flush_memtable_all(generation)?;
 
-        // Phase 1: ShardedLsm holds a single shard; collapse the
-        // per-shard `Vec<Vec<PageId>>` to the flat v7 manifest field.
-        // Phase 2 will store the Vec<Vec> directly.
-        let old_dedup_heads = manifest.dedup_level_heads.to_vec();
-        let old_dedup_reverse_heads = manifest.dedup_reverse_level_heads.to_vec();
-        manifest.dedup_level_heads =
-            flatten_single_shard_heads(self.dedup_index.persist_levels_all(generation)?)?
-                .into_boxed_slice();
-        manifest.dedup_reverse_level_heads =
-            flatten_single_shard_heads(self.dedup_reverse.persist_levels_all(generation)?)?
-                .into_boxed_slice();
+        let old_dedup_heads: Vec<Vec<PageId>> = manifest
+            .dedup_index_shard_heads
+            .iter()
+            .map(|s| s.to_vec())
+            .collect();
+        let old_dedup_reverse_heads: Vec<Vec<PageId>> = manifest
+            .dedup_reverse_shard_heads
+            .iter()
+            .map(|s| s.to_vec())
+            .collect();
+        manifest.dedup_index_shard_heads = self
+            .dedup_index
+            .persist_levels_all(generation)?
+            .into_iter()
+            .map(|heads| heads.into_boxed_slice())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        manifest.dedup_reverse_shard_heads = self
+            .dedup_reverse
+            .persist_levels_all(generation)?
+            .into_iter()
+            .map(|heads| heads.into_boxed_slice())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Ok(DedupManifestUpdate {
             old_dedup_heads,
             old_dedup_reverse_heads,
@@ -571,9 +584,9 @@ impl Db {
         generation: Lsn,
     ) -> Result<()> {
         self.dedup_index
-            .free_old_level_heads_all(&[update.old_dedup_heads], generation)?;
+            .free_old_level_heads_all(&update.old_dedup_heads, generation)?;
         self.dedup_reverse
-            .free_old_level_heads_all(&[update.old_dedup_reverse_heads], generation)?;
+            .free_old_level_heads_all(&update.old_dedup_reverse_heads, generation)?;
         Ok(())
     }
 

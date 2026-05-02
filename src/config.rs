@@ -7,6 +7,11 @@
 
 use std::path::PathBuf;
 
+/// Upper bound on [`Config::dedup_shards`]. Sized so the manifest's
+/// per-shard level-head section never starves the snapshot/volume
+/// region.
+pub const MAX_DEDUP_SHARDS: u32 = 64;
+
 /// Page size in bytes. Fixed for v1; not a runtime choice.
 ///
 /// Changing this would require re-encoding every on-disk format constant,
@@ -67,6 +72,18 @@ pub struct Config {
 
     /// Size ratio between adjacent LSM levels (L_{n+1} = ratio × L_n).
     pub lsm_level_ratio: u32,
+
+    /// Number of dedup LSM shards (`dedup_index` and `dedup_reverse` each
+    /// fan out into this many independent LSMs). Must be a power of two
+    /// in `[1, 64]`. Routing is by SHA-256 high bits, so shards see a
+    /// uniform random partition of the workload.
+    ///
+    /// Set at [`Db::create`](crate::db::Db::create) and recorded in the
+    /// manifest. Opening with `cfg.dedup_shards != manifest.dedup_shards`
+    /// is rejected — the shard count is part of the on-disk layout, not
+    /// a runtime tunable. Default is 1 (single-shard, identical to the
+    /// pre-Phase-2 layout).
+    pub dedup_shards: u32,
 
     /// Amount of WAL (bytes) accumulated before a checkpoint is forced.
     pub checkpoint_bytes: u64,
@@ -133,6 +150,7 @@ impl Config {
             lsm_bloom_bits_per_entry: 10,
             lsm_l0_sst_count_trigger: 4,
             lsm_level_ratio: 10,
+            dedup_shards: 1,
             checkpoint_bytes: 1024 * 1024 * 1024,
             direct_io: cfg!(target_os = "linux"),
             page_grow_chunk_pages: 512,

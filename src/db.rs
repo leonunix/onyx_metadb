@@ -559,8 +559,14 @@ impl Volume {
 }
 
 struct DedupManifestUpdate {
-    old_dedup_heads: Vec<PageId>,
-    old_dedup_reverse_heads: Vec<PageId>,
+    /// Per-shard old `dedup_index` level heads, one entry per shard in
+    /// shard order. Captured before [`prepare_dedup_manifest_update`]
+    /// rewrites the manifest field; passed to
+    /// [`finish_dedup_manifest_update`] which frees them only after
+    /// the manifest commit has made the new heads durable.
+    old_dedup_heads: Vec<Vec<PageId>>,
+    /// Same for `dedup_reverse`.
+    old_dedup_reverse_heads: Vec<Vec<PageId>>,
 }
 
 /// Iterator over a globally key-ordered range scan assembled from all

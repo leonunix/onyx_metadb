@@ -134,3 +134,93 @@ fn bootstrap_volume_is_untouchable() {
     assert!(db.drop_volume(0 as VolumeOrdinal).is_err());
     assert_eq!(db.volumes(), vec![0]);
 }
+
+// -------- Phase 2 dedup-shard lifecycle ---------------------------------
+
+#[test]
+fn create_with_dedup_shards_n4_round_trips_through_reopen() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = onyx_metadb::Config::new(dir.path());
+    cfg.dedup_shards = 4;
+
+    {
+        let db = Db::create_with_config(cfg.clone()).unwrap();
+        // Write a few entries that route to different shards (route by
+        // hash[0]) so every shard ends up with at least one row after
+        // a flush.
+        for byte0 in [0u8, 64, 128, 192] {
+            let mut hash = [0u8; 32];
+            hash[0] = byte0;
+            let mut value = [0u8; 28];
+            value[0] = byte0;
+            db.put_dedup(hash, onyx_metadb::DedupValue(value)).unwrap();
+        }
+        db.flush().unwrap();
+
+        let manifest = db.manifest();
+        assert_eq!(manifest.dedup_shards, 4);
+        assert_eq!(manifest.dedup_index_shard_heads.len(), 4);
+        assert_eq!(manifest.dedup_reverse_shard_heads.len(), 4);
+    }
+
+    // Reopen with the same N=4 succeeds and reads back every entry.
+    let db = Db::open_with_config(cfg).unwrap();
+    for byte0 in [0u8, 64, 128, 192] {
+        let mut hash = [0u8; 32];
+        hash[0] = byte0;
+        let got = db.get_dedup(&hash).unwrap();
+        assert!(got.is_some(), "missing entry for byte0={byte0}");
+    }
+}
+
+fn err_msg<T>(r: onyx_metadb::Result<T>) -> String {
+    match r {
+        Ok(_) => panic!("expected error"),
+        Err(e) => format!("{e}"),
+    }
+}
+
+#[test]
+fn open_rejects_dedup_shards_mismatch_against_manifest() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg_n1 = onyx_metadb::Config::new(dir.path());
+    cfg_n1.dedup_shards = 1;
+    {
+        let _db = Db::create_with_config(cfg_n1.clone()).unwrap();
+    }
+
+    let mut cfg_n4 = onyx_metadb::Config::new(dir.path());
+    cfg_n4.dedup_shards = 4;
+    let msg = err_msg(Db::open_with_config(cfg_n4));
+    assert!(
+        msg.contains("dedup_shards") && msg.contains("recreate"),
+        "expected layout-mismatch error, got: {msg}",
+    );
+}
+
+#[test]
+fn create_rejects_non_power_of_two_dedup_shards() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = onyx_metadb::Config::new(dir.path());
+    cfg.dedup_shards = 3;
+    let msg = err_msg(Db::create_with_config(cfg));
+    assert!(msg.contains("power of two"), "got: {msg}");
+}
+
+#[test]
+fn create_rejects_zero_dedup_shards() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = onyx_metadb::Config::new(dir.path());
+    cfg.dedup_shards = 0;
+    let msg = err_msg(Db::create_with_config(cfg));
+    assert!(msg.contains("greater than zero"), "got: {msg}");
+}
+
+#[test]
+fn create_rejects_dedup_shards_above_cap() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = onyx_metadb::Config::new(dir.path());
+    cfg.dedup_shards = onyx_metadb::MAX_DEDUP_SHARDS * 2;
+    let msg = err_msg(Db::create_with_config(cfg));
+    assert!(msg.contains("MAX_DEDUP_SHARDS"), "got: {msg}");
+}

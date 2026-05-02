@@ -61,10 +61,13 @@ fn dedup_compaction_10gib_reaches_l3_and_stays_readable() {
     run_compaction_storm(&db, target_bytes, checkpoint_records);
     db.flush().unwrap();
     let manifest = db.manifest();
+    // With dedup-lane sharding the index is `Box<[Box<[PageId]>]>`
+    // (one inner vec per shard). Default `cfg.dedup_shards = 1`, so
+    // shard 0 still owns the entire workload.
+    let shard0 = &manifest.dedup_index_shard_heads[0];
     assert!(
-        manifest.dedup_level_heads.len() >= 4 && manifest.dedup_level_heads[3] != NULL_PAGE,
-        "expected L3+ after compaction storm, got {:?}",
-        manifest.dedup_level_heads
+        shard0.len() >= 4 && shard0[3] != NULL_PAGE,
+        "expected L3+ after compaction storm, got {shard0:?}",
     );
     drop(db);
 

@@ -1,19 +1,5 @@
 use super::*;
 
-/// Phase 1 of dedup-lane sharding bridge: collapse the per-shard
-/// `Vec<Vec<PageId>>` returned by `ShardedLsm::persist_levels_all` to
-/// the flat per-LSM `Vec<PageId>` that the v7 manifest still records.
-/// Phase 2 replaces this with direct per-shard manifest fields.
-pub(super) fn flatten_single_shard_heads(per_shard: Vec<Vec<PageId>>) -> Result<Vec<PageId>> {
-    if per_shard.len() != 1 {
-        return Err(MetaDbError::Corruption(format!(
-            "phase 1 expects exactly one dedup shard; persist_levels_all returned {}",
-            per_shard.len()
-        )));
-    }
-    Ok(per_shard.into_iter().next().expect("len == 1 above"))
-}
-
 /// Lock every L2P shard for write across the given volume set, in
 /// (`volumes` order, shard index) order. Callers that reach multiple
 /// volumes pass the sorted output of `Db::volumes_snapshot` so every
@@ -111,6 +97,28 @@ pub(super) fn validate_shard_count(shards_per_partition: u32) -> Result<usize> {
         ));
     }
     Ok(shard_count)
+}
+
+/// Validate `cfg.dedup_shards` and return it on success. The dedup
+/// shard count must be a power of two in `[1, MAX_DEDUP_SHARDS]`.
+pub(super) fn validate_dedup_shards(dedup_shards: u32) -> Result<u32> {
+    if dedup_shards == 0 {
+        return Err(MetaDbError::InvalidArgument(
+            "cfg.dedup_shards must be greater than zero".into(),
+        ));
+    }
+    if !(dedup_shards as usize).is_power_of_two() {
+        return Err(MetaDbError::InvalidArgument(format!(
+            "cfg.dedup_shards must be a power of two; got {dedup_shards}",
+        )));
+    }
+    if dedup_shards > crate::config::MAX_DEDUP_SHARDS {
+        return Err(MetaDbError::InvalidArgument(format!(
+            "cfg.dedup_shards={dedup_shards} exceeds MAX_DEDUP_SHARDS={}",
+            crate::config::MAX_DEDUP_SHARDS,
+        )));
+    }
+    Ok(dedup_shards)
 }
 
 pub(super) fn create_shards(

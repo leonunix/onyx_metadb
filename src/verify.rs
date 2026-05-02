@@ -246,22 +246,26 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         // walked once at the top level above.
     }
 
-    walk_lsm_heads(
-        page_store,
-        &page_cache,
-        &manifest.dedup_level_heads,
-        &mut live,
-        &mut seen_level_pages,
-        &mut seen_ssts,
-    )?;
-    walk_lsm_heads(
-        page_store,
-        &page_cache,
-        &manifest.dedup_reverse_level_heads,
-        &mut live,
-        &mut seen_level_pages,
-        &mut seen_ssts,
-    )?;
+    for shard_heads in manifest.dedup_index_shard_heads.iter() {
+        walk_lsm_heads(
+            page_store,
+            &page_cache,
+            shard_heads,
+            &mut live,
+            &mut seen_level_pages,
+            &mut seen_ssts,
+        )?;
+    }
+    for shard_heads in manifest.dedup_reverse_shard_heads.iter() {
+        walk_lsm_heads(
+            page_store,
+            &page_cache,
+            shard_heads,
+            &mut live,
+            &mut seen_level_pages,
+            &mut seen_ssts,
+        )?;
+    }
 
     Ok(live)
 }

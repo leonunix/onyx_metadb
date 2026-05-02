@@ -47,7 +47,7 @@ pub mod wal;
 
 pub use btree::{BTree, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter};
 pub use cache::{PageCache, PageCacheStats};
-pub use config::{Config, PAGE_SIZE};
+pub use config::{Config, MAX_DEDUP_SHARDS, PAGE_SIZE};
 pub use db::{
     Db, DbDedupIter, DbRangeIter, DbRefcountIter, DropReport, DropVolumeReport, PendingState,
     SnapshotView,

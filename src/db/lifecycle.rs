@@ -361,6 +361,7 @@ impl Db {
         faults: Arc<FaultController>,
     ) -> Result<Self> {
         let shard_count = validate_shard_count(cfg.shards_per_partition)?;
+        let dedup_shards = validate_dedup_shards(cfg.dedup_shards)?;
         std::fs::create_dir_all(&cfg.path)?;
         let pages_path = page_file(&cfg.path);
         let page_store = Arc::new(PageStore::create_with_grow_chunk(
@@ -380,25 +381,25 @@ impl Db {
             create_l2p_shards(page_store.clone(), page_cache.clone(), shard_count)?;
         let (refcount_shards, refcount_roots) =
             create_shards(page_store.clone(), page_cache.clone(), shard_count)?;
-        // Phase 1 of dedup-lane sharding: ShardedLsm wrapper holds a
-        // single shard so wire-format and behaviour are unchanged.
-        // Phase 2 introduces the manifest field and per-shard heads.
         let dedup_index = Arc::new(ShardedLsm::create_with_cache(
             page_store.clone(),
             page_cache.clone(),
             lsm_config.clone(),
-            1,
+            dedup_shards as usize,
         ));
         let dedup_reverse = Arc::new(ShardedLsm::create_with_cache(
             page_store.clone(),
             page_cache.clone(),
             lsm_config,
-            1,
+            dedup_shards as usize,
         ));
         manifest.body_version = MANIFEST_BODY_VERSION;
         manifest.refcount_shard_roots = refcount_roots;
-        manifest.dedup_level_heads = Vec::new().into_boxed_slice();
-        manifest.dedup_reverse_level_heads = Vec::new().into_boxed_slice();
+        manifest.dedup_shards = dedup_shards;
+        manifest.dedup_index_shard_heads =
+            vec![Vec::new().into_boxed_slice(); dedup_shards as usize].into_boxed_slice();
+        manifest.dedup_reverse_shard_heads =
+            vec![Vec::new().into_boxed_slice(); dedup_shards as usize].into_boxed_slice();
         // Seed the bootstrap volume so open() / flush() can route
         // through the same volumes table the live `Db` manages.
         manifest.volumes = vec![VolumeEntry {
@@ -503,6 +504,18 @@ impl Db {
             ));
         }
 
+        // dedup_shards is part of the on-disk layout, not a runtime
+        // tunable. Refuse to open with a mismatched config rather than
+        // silently using one or the other.
+        let cfg_dedup_shards = validate_dedup_shards(cfg.dedup_shards)?;
+        if cfg_dedup_shards != manifest.dedup_shards {
+            return Err(MetaDbError::Corruption(format!(
+                "manifest dedup_shards={} but cfg.dedup_shards={}; this value is part \
+                 of the on-disk layout — recreate the database to change shard count",
+                manifest.dedup_shards, cfg_dedup_shards,
+            )));
+        }
+
         let next_gen = manifest.checkpoint_lsn.max(1) + 1;
 
         // Phase 7 commit 8: open every volume recorded in the manifest.
@@ -529,20 +542,27 @@ impl Db {
             &manifest.refcount_shard_roots,
             next_gen,
         )?;
-        // Phase 1 of dedup-lane sharding: legacy v7 manifest stores a
-        // flat `dedup_level_heads` list. Wrap it as a single shard.
-        // Phase 2 will replace this with the per-shard manifest field.
+        let dedup_index_heads_per_shard: Vec<Vec<PageId>> = manifest
+            .dedup_index_shard_heads
+            .iter()
+            .map(|s| s.to_vec())
+            .collect();
+        let dedup_reverse_heads_per_shard: Vec<Vec<PageId>> = manifest
+            .dedup_reverse_shard_heads
+            .iter()
+            .map(|s| s.to_vec())
+            .collect();
         let dedup_index = Arc::new(ShardedLsm::open_with_cache(
             page_store.clone(),
             page_cache.clone(),
             lsm_config.clone(),
-            &[manifest.dedup_level_heads.to_vec()],
+            &dedup_index_heads_per_shard,
         )?);
         let dedup_reverse = Arc::new(ShardedLsm::open_with_cache(
             page_store.clone(),
             page_cache.clone(),
             lsm_config,
-            &[manifest.dedup_reverse_level_heads.to_vec()],
+            &dedup_reverse_heads_per_shard,
         )?);
 
         // Replay WAL segments forward from checkpoint_lsn+1 onto the
@@ -757,22 +777,31 @@ impl Db {
 
             // Dedup memtable / level heads: mirror what
             // `Db::flush` does via `prepare_dedup_manifest_update`.
-            // Phase 1 keeps the v7 manifest schema (flat per-LSM heads),
-            // so we collapse the per-shard `Vec<Vec<PageId>>` returned
-            // by `ShardedLsm::persist_levels_all` to a single shard's
-            // flat list. Phase 2 introduces per-shard manifest fields.
             let dedup_generation = last_applied.max(1) + 1;
             dedup_index.flush_memtable_all(dedup_generation)?;
             dedup_reverse.flush_memtable_all(dedup_generation)?;
-            let old_dedup_heads = manifest.dedup_level_heads.to_vec();
-            let old_dedup_reverse_heads = manifest.dedup_reverse_level_heads.to_vec();
-            manifest.dedup_level_heads =
-                flatten_single_shard_heads(dedup_index.persist_levels_all(dedup_generation)?)?
-                    .into_boxed_slice();
-            manifest.dedup_reverse_level_heads = flatten_single_shard_heads(
-                dedup_reverse.persist_levels_all(dedup_generation)?,
-            )?
-            .into_boxed_slice();
+            let old_dedup_heads: Vec<Vec<PageId>> = manifest
+                .dedup_index_shard_heads
+                .iter()
+                .map(|s| s.to_vec())
+                .collect();
+            let old_dedup_reverse_heads: Vec<Vec<PageId>> = manifest
+                .dedup_reverse_shard_heads
+                .iter()
+                .map(|s| s.to_vec())
+                .collect();
+            manifest.dedup_index_shard_heads = dedup_index
+                .persist_levels_all(dedup_generation)?
+                .into_iter()
+                .map(|heads| heads.into_boxed_slice())
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            manifest.dedup_reverse_shard_heads = dedup_reverse
+                .persist_levels_all(dedup_generation)?
+                .into_iter()
+                .map(|heads| heads.into_boxed_slice())
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
 
             refresh_manifest_entries(&mut manifest, &sorted, &l2p_guards, &refcount_guards)?;
             manifest.checkpoint_lsn = last_applied;
@@ -780,10 +809,9 @@ impl Db {
             commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
             commit_refcount_checkpoint(&mut refcount_guards, last_applied.max(1) + 1)?;
 
-            dedup_index
-                .free_old_level_heads_all(&[old_dedup_heads], dedup_generation)?;
+            dedup_index.free_old_level_heads_all(&old_dedup_heads, dedup_generation)?;
             dedup_reverse
-                .free_old_level_heads_all(&[old_dedup_reverse_heads], dedup_generation)?;
+                .free_old_level_heads_all(&old_dedup_reverse_heads, dedup_generation)?;
 
             // Open-path counterpart of `Db::reclaim_freed_pages`: no
             // readers can be pinned yet, so every deferred entry queued
@@ -928,6 +956,14 @@ impl Db {
             self.dedup_index.aggregate_stats(),
             self.dedup_reverse.aggregate_stats(),
         )
+    }
+
+    /// Per-shard dedup stats; first vec is `dedup_index`, second is
+    /// `dedup_reverse`. Each inner vec has length
+    /// [`Manifest::dedup_shards`](crate::manifest::Manifest::dedup_shards).
+    /// Used by the status report to expose load skew across shards.
+    pub fn dedup_lsm_stats_per_shard(&self) -> (Vec<LsmStats>, Vec<LsmStats>) {
+        (self.dedup_index.shard_stats(), self.dedup_reverse.shard_stats())
     }
 
     /// Diagnostic snapshot of in-memory bookkeeping that can grow

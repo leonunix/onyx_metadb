@@ -109,16 +109,18 @@ fn print_manifest_human(path: &Path, m: &Manifest, high_water: u64, last_applied
     for (i, p) in m.refcount_shard_roots.iter().enumerate() {
         println!("  [{i}] {}", fmt_page(*p));
     }
-    println!("dedup_level_heads ({}):", m.dedup_level_heads.len());
-    for (i, p) in m.dedup_level_heads.iter().enumerate() {
-        println!("  L{i}: {}", fmt_page(*p));
+    println!("dedup_shards: {}", m.dedup_shards);
+    for (s, shard_heads) in m.dedup_index_shard_heads.iter().enumerate() {
+        println!("dedup_index_shard[{s}] heads ({}):", shard_heads.len());
+        for (i, p) in shard_heads.iter().enumerate() {
+            println!("  L{i}: {}", fmt_page(*p));
+        }
     }
-    println!(
-        "dedup_reverse_level_heads ({}):",
-        m.dedup_reverse_level_heads.len()
-    );
-    for (i, p) in m.dedup_reverse_level_heads.iter().enumerate() {
-        println!("  L{i}: {}", fmt_page(*p));
+    for (s, shard_heads) in m.dedup_reverse_shard_heads.iter().enumerate() {
+        println!("dedup_reverse_shard[{s}] heads ({}):", shard_heads.len());
+        for (i, p) in shard_heads.iter().enumerate() {
+            println!("  L{i}: {}", fmt_page(*p));
+        }
     }
     println!("next_snapshot_id: {}", m.next_snapshot_id);
     println!("snapshots: {}", m.snapshots.len());
@@ -156,14 +158,27 @@ fn print_manifest_json(path: &Path, m: &Manifest, high_water: u64, last_applied:
         "  \"refcount_shard_roots\": {},",
         page_array_json(&m.refcount_shard_roots)
     );
-    println!(
-        "  \"dedup_level_heads\": {},",
-        page_array_json(&m.dedup_level_heads)
-    );
-    println!(
-        "  \"dedup_reverse_level_heads\": {},",
-        page_array_json(&m.dedup_reverse_level_heads)
-    );
+    println!("  \"dedup_shards\": {},", m.dedup_shards);
+    println!("  \"dedup_index_shard_heads\": [");
+    for (s, shard_heads) in m.dedup_index_shard_heads.iter().enumerate() {
+        let comma = if s + 1 < m.dedup_index_shard_heads.len() {
+            ","
+        } else {
+            ""
+        };
+        println!("    {}{comma}", page_array_json(shard_heads));
+    }
+    println!("  ],");
+    println!("  \"dedup_reverse_shard_heads\": [");
+    for (s, shard_heads) in m.dedup_reverse_shard_heads.iter().enumerate() {
+        let comma = if s + 1 < m.dedup_reverse_shard_heads.len() {
+            ","
+        } else {
+            ""
+        };
+        println!("    {}{comma}", page_array_json(shard_heads));
+    }
+    println!("  ],");
     println!("  \"next_snapshot_id\": {},", m.next_snapshot_id);
     println!("  \"snapshots\": [");
     for (i, entry) in m.snapshots.iter().enumerate() {
