@@ -142,7 +142,7 @@ impl Db {
     /// for hot-path queries.
     pub fn scan_dedup_reverse_for_pba(&self, pba: Pba) -> Result<Vec<Hash32>> {
         let prefix = pba.to_be_bytes();
-        let rows = self.dedup_reverse.scan_prefix(&prefix)?;
+        let rows = self.dedup_reverse.scan_prefix_all_shards(&prefix)?;
         Ok(rows
             .into_iter()
             .map(|(key, value)| decode_reverse_hash(&key, &value))
@@ -161,7 +161,9 @@ impl Db {
         }
         let prefixes: Vec<[u8; 8]> = pbas.iter().map(|pba| pba.to_be_bytes()).collect();
         let prefix_refs: Vec<&[u8]> = prefixes.iter().map(|p| p.as_slice()).collect();
-        let rows_per_pba = self.dedup_reverse.multi_scan_prefix(&prefix_refs)?;
+        let rows_per_pba = self
+            .dedup_reverse
+            .multi_scan_prefix_all_shards(&prefix_refs)?;
         Ok(rows_per_pba
             .into_iter()
             .map(|rows| {
@@ -287,9 +289,9 @@ impl Db {
         }
     }
 
-    /// `true` if the dedup memtable has reached its freeze threshold.
+    /// `true` if any dedup memtable shard has reached its freeze threshold.
     pub fn dedup_should_flush(&self) -> bool {
-        self.dedup_index.should_flush() || self.dedup_reverse.should_flush()
+        self.dedup_index.should_flush_any() || self.dedup_reverse.should_flush_any()
     }
 
     /// Flush dedup memtables to fresh L0 SSTs. Returns true if either
@@ -301,16 +303,16 @@ impl Db {
         self.flush_dedup_memtables_at_generation(generation)
     }
 
-    /// Run one round of dedup compaction. Returns `true` if any work was
-    /// performed.
+    /// Run one round of dedup compaction across every forward-index
+    /// shard. Returns `true` if any shard performed work.
     pub fn compact_dedup_once(&self) -> Result<bool> {
         let generation = self.current_generation();
-        Ok(self.dedup_index.compact_once(generation)?.is_some())
+        self.dedup_index.compact_once_any(generation)
     }
 
     pub(super) fn flush_dedup_memtables_at_generation(&self, generation: Lsn) -> Result<bool> {
-        let index = self.dedup_index.flush_memtable(generation)?.is_some();
-        let reverse = self.dedup_reverse.flush_memtable(generation)?.is_some();
+        let index = self.dedup_index.flush_memtable_all(generation)?;
+        let reverse = self.dedup_reverse.flush_memtable_all(generation)?;
         Ok(index || reverse)
     }
 
@@ -334,8 +336,8 @@ impl Db {
             .handle()
             .enqueue_maintenance(Box::new(move || {
                 let result = (|| -> Result<()> {
-                    index.flush_memtable(generation)?;
-                    reverse.flush_memtable(generation)?;
+                    index.flush_memtable_all(generation)?;
+                    reverse.flush_memtable_all(generation)?;
                     Ok(())
                 })();
                 if let Err(err) = result {
@@ -374,7 +376,7 @@ impl Db {
     /// shares one `reader_drain` and one `levels` snapshot with any
     /// concurrent readers.
     pub fn iter_dedup(&self) -> Result<DbDedupIter> {
-        let all = self.dedup_index.scan_prefix(&[])?;
+        let all = self.dedup_index.scan_prefix_all_shards(&[])?;
         Ok(DbDedupIter {
             inner: all.into_iter(),
         })

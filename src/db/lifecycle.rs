@@ -380,15 +380,20 @@ impl Db {
             create_l2p_shards(page_store.clone(), page_cache.clone(), shard_count)?;
         let (refcount_shards, refcount_roots) =
             create_shards(page_store.clone(), page_cache.clone(), shard_count)?;
-        let dedup_index = Arc::new(Lsm::create_with_cache(
+        // Phase 1 of dedup-lane sharding: ShardedLsm wrapper holds a
+        // single shard so wire-format and behaviour are unchanged.
+        // Phase 2 introduces the manifest field and per-shard heads.
+        let dedup_index = Arc::new(ShardedLsm::create_with_cache(
             page_store.clone(),
             page_cache.clone(),
             lsm_config.clone(),
+            1,
         ));
-        let dedup_reverse = Arc::new(Lsm::create_with_cache(
+        let dedup_reverse = Arc::new(ShardedLsm::create_with_cache(
             page_store.clone(),
             page_cache.clone(),
             lsm_config,
+            1,
         ));
         manifest.body_version = MANIFEST_BODY_VERSION;
         manifest.refcount_shard_roots = refcount_roots;
@@ -524,17 +529,20 @@ impl Db {
             &manifest.refcount_shard_roots,
             next_gen,
         )?;
-        let dedup_index = Arc::new(Lsm::open_with_cache(
+        // Phase 1 of dedup-lane sharding: legacy v7 manifest stores a
+        // flat `dedup_level_heads` list. Wrap it as a single shard.
+        // Phase 2 will replace this with the per-shard manifest field.
+        let dedup_index = Arc::new(ShardedLsm::open_with_cache(
             page_store.clone(),
             page_cache.clone(),
             lsm_config.clone(),
-            &manifest.dedup_level_heads,
+            &[manifest.dedup_level_heads.to_vec()],
         )?);
-        let dedup_reverse = Arc::new(Lsm::open_with_cache(
+        let dedup_reverse = Arc::new(ShardedLsm::open_with_cache(
             page_store.clone(),
             page_cache.clone(),
             lsm_config,
-            &manifest.dedup_reverse_level_heads,
+            &[manifest.dedup_reverse_level_heads.to_vec()],
         )?);
 
         // Replay WAL segments forward from checkpoint_lsn+1 onto the
@@ -749,17 +757,22 @@ impl Db {
 
             // Dedup memtable / level heads: mirror what
             // `Db::flush` does via `prepare_dedup_manifest_update`.
+            // Phase 1 keeps the v7 manifest schema (flat per-LSM heads),
+            // so we collapse the per-shard `Vec<Vec<PageId>>` returned
+            // by `ShardedLsm::persist_levels_all` to a single shard's
+            // flat list. Phase 2 introduces per-shard manifest fields.
             let dedup_generation = last_applied.max(1) + 1;
-            dedup_index.flush_memtable(dedup_generation)?;
-            dedup_reverse.flush_memtable(dedup_generation)?;
+            dedup_index.flush_memtable_all(dedup_generation)?;
+            dedup_reverse.flush_memtable_all(dedup_generation)?;
             let old_dedup_heads = manifest.dedup_level_heads.to_vec();
             let old_dedup_reverse_heads = manifest.dedup_reverse_level_heads.to_vec();
-            manifest.dedup_level_heads = dedup_index
-                .persist_levels(dedup_generation)?
-                .into_boxed_slice();
-            manifest.dedup_reverse_level_heads = dedup_reverse
-                .persist_levels(dedup_generation)?
-                .into_boxed_slice();
+            manifest.dedup_level_heads =
+                flatten_single_shard_heads(dedup_index.persist_levels_all(dedup_generation)?)?
+                    .into_boxed_slice();
+            manifest.dedup_reverse_level_heads = flatten_single_shard_heads(
+                dedup_reverse.persist_levels_all(dedup_generation)?,
+            )?
+            .into_boxed_slice();
 
             refresh_manifest_entries(&mut manifest, &sorted, &l2p_guards, &refcount_guards)?;
             manifest.checkpoint_lsn = last_applied;
@@ -767,8 +780,10 @@ impl Db {
             commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
             commit_refcount_checkpoint(&mut refcount_guards, last_applied.max(1) + 1)?;
 
-            dedup_index.free_old_level_heads(&old_dedup_heads, dedup_generation)?;
-            dedup_reverse.free_old_level_heads(&old_dedup_reverse_heads, dedup_generation)?;
+            dedup_index
+                .free_old_level_heads_all(&[old_dedup_heads], dedup_generation)?;
+            dedup_reverse
+                .free_old_level_heads_all(&[old_dedup_reverse_heads], dedup_generation)?;
 
             // Open-path counterpart of `Db::reclaim_freed_pages`: no
             // readers can be pinned yet, so every deferred entry queued
@@ -909,7 +924,10 @@ impl Db {
     }
 
     pub fn dedup_lsm_stats(&self) -> (LsmStats, LsmStats) {
-        (self.dedup_index.stats(), self.dedup_reverse.stats())
+        (
+            self.dedup_index.aggregate_stats(),
+            self.dedup_reverse.aggregate_stats(),
+        )
     }
 
     /// Diagnostic snapshot of in-memory bookkeeping that can grow

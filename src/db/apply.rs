@@ -43,8 +43,8 @@ pub(super) fn publish_l2p_read_view(shard: &L2pShard, tree: &PagedL2p) {
 pub(super) fn apply_op_bare(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
-    dedup_index: &Lsm,
-    dedup_reverse: &Lsm,
+    dedup_index: &ShardedLsm,
+    dedup_reverse: &ShardedLsm,
     page_store: &Arc<PageStore>,
     lsn: Lsn,
     op: &WalOp,
@@ -85,12 +85,12 @@ pub(super) fn apply_op_bare(
         }
         WalOp::DedupReversePut { pba, hash } => {
             let (key, value) = encode_reverse_entry(*pba, hash);
-            dedup_reverse.put(key, value);
+            dedup_reverse.put_reverse(key, value);
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupReverseDelete { pba, hash } => {
             let (key, _) = encode_reverse_entry(*pba, hash);
-            dedup_reverse.delete(key);
+            dedup_reverse.delete_reverse(key);
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::Incref { pba, delta } => {
@@ -594,9 +594,7 @@ pub(super) fn build_clone_volume_shards(
             )?
         };
         actual_roots.push(tree.root());
-        shards.push(super::helpers::make_l2p_shard(
-            tree, page_cache, shard_idx,
-        ));
+        shards.push(super::helpers::make_l2p_shard(tree, page_cache, shard_idx));
     }
     Ok((shards, actual_roots.into_boxed_slice()))
 }

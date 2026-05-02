@@ -620,7 +620,7 @@ fn scan_sees_entries_after_flush_to_sst() {
     }
     // Flush the dedup_reverse memtable so the next scan reads SST data.
     let lsn = db.last_applied_lsn();
-    db.dedup_reverse.flush_memtable(lsn).unwrap();
+    db.dedup_reverse.flush_memtable_all(lsn).unwrap();
     let found = db.scan_dedup_reverse_for_pba(17).unwrap();
     assert_eq!(found.len(), 25);
 }
@@ -651,7 +651,7 @@ fn dedup_reverse_survives_reopen() {
         // flush half so we exercise both WAL-replay AND
         // SST-reload paths.
         let lsn = db.last_applied_lsn();
-        db.dedup_reverse.flush_memtable(lsn).unwrap();
+        db.dedup_reverse.flush_memtable_all(lsn).unwrap();
         db.flush().unwrap();
         db.register_dedup_reverse(77, hash_full(77, 3)).unwrap();
     }

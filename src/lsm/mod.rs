@@ -40,6 +40,7 @@ pub mod format;
 pub mod lsm;
 pub mod memtable;
 pub mod persist;
+pub mod sharded;
 pub mod sst;
 
 pub use bloom::{BloomFilter, DEFAULT_BITS_PER_ENTRY};
@@ -51,4 +52,5 @@ pub use format::{
 pub use lsm::{Lsm, LsmConfig, LsmStats};
 pub use memtable::{DedupOp, LookupResult, Memtable, MemtableStats};
 pub use persist::{HANDLES_PER_PAGE, LSM_LEVELS_LAYOUT_VERSION};
+pub use sharded::{ShardedLsm, shard_for_hash, shard_for_reverse_key};
 pub use sst::{SST_LAYOUT_VERSION, SstHandle, SstReader, SstScan, SstWriter};

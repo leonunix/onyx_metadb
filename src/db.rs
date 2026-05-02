@@ -24,7 +24,7 @@ use crate::btree::format::RcEntry;
 use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
 use crate::error::{MetaDbError, Result};
-use crate::lsm::{DedupValue, Hash32, Lsm, LsmConfig, LsmStats};
+use crate::lsm::{DedupValue, Hash32, LsmConfig, LsmStats, ShardedLsm};
 use crate::manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VolumeEntry,
     write_snapshot_roots_page,
@@ -69,14 +69,19 @@ pub struct Db {
     /// tally — not per-volume — and stays at the top level for that reason.
     refcount_shards: Vec<Shard>,
     /// Global dedup index: 32-byte SHA-256 content hash → 28-byte opaque
-    /// `DedupValue`.
-    dedup_index: Arc<Lsm>,
+    /// `DedupValue`. Backed by a [`ShardedLsm`] so the apply path can
+    /// fan writes across multiple LSMs once Phase 3 wires per-shard
+    /// apply lanes; in Phase 1 the wrapper holds a single shard and
+    /// behaves identically to `Arc<Lsm>`.
+    dedup_index: Arc<ShardedLsm>,
     /// Reverse index: key = `[pba: 8B BE][hash_first_24B]`, value =
     /// `[hash_last_8B | zero padding]`. Used by PBA refcount → 0 to
     /// discover and clean up the `dedup_index` entries whose PBA is
     /// going away. Prefix-scan by 8-byte PBA locates every matching
-    /// row.
-    dedup_reverse: Arc<Lsm>,
+    /// row across all shards. Routing for any `(hash, pba)` pair lands
+    /// in the same shard for both forward and reverse indexes, so a
+    /// single dedup-pair commit hits at most one shard.
+    dedup_reverse: Arc<ShardedLsm>,
     /// FIFO lane for the global dedup LSMs. The LSM internals are
     /// synchronised, but same-key last-write-wins semantics still need
     /// WAL-order apply across commits.

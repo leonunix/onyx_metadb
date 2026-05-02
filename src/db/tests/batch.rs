@@ -105,7 +105,7 @@ fn multi_scan_dedup_reverse_preserves_order_and_per_pba_rows() {
     db.register_dedup_reverse(10, hash_full(10, 1)).unwrap();
     db.register_dedup_reverse(10, hash_full(10, 2)).unwrap();
     let flush_lsn = db.last_applied_lsn();
-    db.dedup_reverse.flush_memtable(flush_lsn).unwrap();
+    db.dedup_reverse.flush_memtable_all(flush_lsn).unwrap();
     db.register_dedup_reverse(20, hash_full(20, 1)).unwrap();
     db.register_dedup_reverse(20, hash_full(20, 2)).unwrap();
     db.register_dedup_reverse(20, hash_full(20, 3)).unwrap();
@@ -137,7 +137,7 @@ fn multi_scan_dedup_reverse_hides_tombstoned_rows_explicitly() {
     db.register_dedup_reverse(10, p10_b).unwrap();
     db.register_dedup_reverse(20, p20_a).unwrap();
     let flush_lsn = db.last_applied_lsn();
-    db.dedup_reverse.flush_memtable(flush_lsn).unwrap();
+    db.dedup_reverse.flush_memtable_all(flush_lsn).unwrap();
 
     // Newer memtable updates: remove one old row, add a new one.
     db.unregister_dedup_reverse(10, p10_a).unwrap();

@@ -1,5 +1,19 @@
 use super::*;
 
+/// Phase 1 of dedup-lane sharding bridge: collapse the per-shard
+/// `Vec<Vec<PageId>>` returned by `ShardedLsm::persist_levels_all` to
+/// the flat per-LSM `Vec<PageId>` that the v7 manifest still records.
+/// Phase 2 replaces this with direct per-shard manifest fields.
+pub(super) fn flatten_single_shard_heads(per_shard: Vec<Vec<PageId>>) -> Result<Vec<PageId>> {
+    if per_shard.len() != 1 {
+        return Err(MetaDbError::Corruption(format!(
+            "phase 1 expects exactly one dedup shard; persist_levels_all returned {}",
+            per_shard.len()
+        )));
+    }
+    Ok(per_shard.into_iter().next().expect("len == 1 above"))
+}
+
 /// Lock every L2P shard for write across the given volume set, in
 /// (`volumes` order, shard index) order. Callers that reach multiple
 /// volumes pass the sorted output of `Db::volumes_snapshot` so every

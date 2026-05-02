@@ -545,19 +545,20 @@ impl Db {
         // Any manifest commit that advances checkpoint_lsn must first
         // make the dedup memtables durable, otherwise replay would skip
         // WAL-applied rows that only existed in RAM.
-        self.dedup_index.flush_memtable(generation)?;
-        self.dedup_reverse.flush_memtable(generation)?;
+        self.dedup_index.flush_memtable_all(generation)?;
+        self.dedup_reverse.flush_memtable_all(generation)?;
 
+        // Phase 1: ShardedLsm holds a single shard; collapse the
+        // per-shard `Vec<Vec<PageId>>` to the flat v7 manifest field.
+        // Phase 2 will store the Vec<Vec> directly.
         let old_dedup_heads = manifest.dedup_level_heads.to_vec();
         let old_dedup_reverse_heads = manifest.dedup_reverse_level_heads.to_vec();
-        manifest.dedup_level_heads = self
-            .dedup_index
-            .persist_levels(generation)?
-            .into_boxed_slice();
-        manifest.dedup_reverse_level_heads = self
-            .dedup_reverse
-            .persist_levels(generation)?
-            .into_boxed_slice();
+        manifest.dedup_level_heads =
+            flatten_single_shard_heads(self.dedup_index.persist_levels_all(generation)?)?
+                .into_boxed_slice();
+        manifest.dedup_reverse_level_heads =
+            flatten_single_shard_heads(self.dedup_reverse.persist_levels_all(generation)?)?
+                .into_boxed_slice();
         Ok(DedupManifestUpdate {
             old_dedup_heads,
             old_dedup_reverse_heads,
@@ -570,9 +571,9 @@ impl Db {
         generation: Lsn,
     ) -> Result<()> {
         self.dedup_index
-            .free_old_level_heads(&update.old_dedup_heads, generation)?;
+            .free_old_level_heads_all(&[update.old_dedup_heads], generation)?;
         self.dedup_reverse
-            .free_old_level_heads(&update.old_dedup_reverse_heads, generation)?;
+            .free_old_level_heads_all(&[update.old_dedup_reverse_heads], generation)?;
         Ok(())
     }
 

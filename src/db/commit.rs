@@ -1136,8 +1136,8 @@ impl Db {
     }
 
     fn apply_dedup_indices_to(
-        dedup_index: &Lsm,
-        dedup_reverse: &Lsm,
+        dedup_index: &ShardedLsm,
+        dedup_reverse: &ShardedLsm,
         metrics: &MetaMetrics,
         ops: &[WalOp],
         indices: Vec<usize>,
@@ -1166,8 +1166,8 @@ impl Db {
             };
             outcomes.push((idx, ApplyOutcome::Dedup));
         }
-        dedup_index.apply_batch(&index_ops);
-        dedup_reverse.apply_batch(&reverse_ops);
+        dedup_index.apply_batch_forward(&index_ops);
+        dedup_reverse.apply_batch_reverse(&reverse_ops);
         metrics.record_apply_dedup_batch(outcomes.len() as u64, batch_started.elapsed());
         outcomes
     }
@@ -1312,8 +1312,8 @@ impl Db {
     pub(super) fn apply_replay_batch(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
-        dedup_index: &Arc<Lsm>,
-        dedup_reverse: &Arc<Lsm>,
+        dedup_index: &Arc<ShardedLsm>,
+        dedup_reverse: &Arc<ShardedLsm>,
         page_store: &Arc<PageStore>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
@@ -1354,8 +1354,8 @@ impl Db {
     fn apply_ops_grouped_to_lanes(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
-        dedup_index: &Arc<Lsm>,
-        dedup_reverse: &Arc<Lsm>,
+        dedup_index: &Arc<ShardedLsm>,
+        dedup_reverse: &Arc<ShardedLsm>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
         ops: &[WalOp],
@@ -1549,8 +1549,8 @@ impl Db {
     fn apply_ops_grouped_to(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
-        dedup_index: &Arc<Lsm>,
-        dedup_reverse: &Arc<Lsm>,
+        dedup_index: &Arc<ShardedLsm>,
+        dedup_reverse: &Arc<ShardedLsm>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
         ops: &[WalOp],
