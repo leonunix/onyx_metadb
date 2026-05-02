@@ -28,6 +28,7 @@
 //!         [--wal-lanes 1] [--group-commit-timeout-us 1]
 //!         [--range-scanners 1] [--range-scan-interval-ms 5000]
 //!         [--range-scan-lbas 0]
+//!         [--dedup-shards 8]
 //!         [--dedup-hit-pct 30] [--cleanup-batch 256]
 //!         [--dedup-register-writers 0] [--dedup-register-batch 8192]
 //!         [--target-install-max-ms 2000]
@@ -70,6 +71,7 @@ struct Args {
     range_scanners: usize,
     range_scan_interval_ms: u64,
     range_scan_lbas: u64,
+    dedup_shards: u32,
     dedup_enabled: bool,
     dedup_hit_pct: u8,
     cleanup_batch: usize,
@@ -98,6 +100,7 @@ impl Args {
             range_scanners: 1,
             range_scan_interval_ms: 5000,
             range_scan_lbas: 0,
+            dedup_shards: 8,
             dedup_enabled: false,
             dedup_hit_pct: 0,
             cleanup_batch: 256,
@@ -146,6 +149,13 @@ impl Args {
                 }
                 "--range-scan-lbas" => {
                     a.range_scan_lbas = parse_u64(it.next(), "--range-scan-lbas")?
+                }
+                "--dedup-shards" => {
+                    let v = parse_u64(it.next(), "--dedup-shards")?;
+                    if v == 0 || v > 64 || !v.is_power_of_two() {
+                        return Err("--dedup-shards must be a power of two in 1..=64".into());
+                    }
+                    a.dedup_shards = v as u32;
                 }
                 "--dedup-hit-pct" => {
                     let v = parse_u64(it.next(), "--dedup-hit-pct")?;
@@ -238,6 +248,7 @@ fn run() -> Result<bool, String> {
     cfg.shards_per_partition = 4;
     cfg.wal_lanes = args.wal_lanes;
     cfg.group_commit_timeout_us = args.group_commit_timeout_us;
+    cfg.dedup_shards = args.dedup_shards;
     cfg.page_cache_bytes = 4 * 1024 * 1024 * 1024; // 4 GiB, matches onyx prod
     cfg.rebuild_free_list_on_open = false;
     cfg.reclaim_orphans_on_open = false;
@@ -336,7 +347,7 @@ fn run() -> Result<bool, String> {
     };
 
     eprintln!(
-        "metadb-onyx-soak: writers={} readers={} ops/commit={} flush={}ms duration={}s warmup={}s lba_space={} wal_lanes={} group_commit_timeout={}us range_scanners={} range_scan_interval={}ms range_scan_lbas={} dedup={} dedup_hit={}%% cleanup_batch={} dedup_register_writers={} dedup_register_batch={}",
+        "metadb-onyx-soak: writers={} readers={} ops/commit={} flush={}ms duration={}s warmup={}s lba_space={} wal_lanes={} group_commit_timeout={}us range_scanners={} range_scan_interval={}ms range_scan_lbas={} dedup_shards={} dedup={} dedup_hit={}%% cleanup_batch={} dedup_register_writers={} dedup_register_batch={}",
         args.writers,
         args.readers,
         args.ops_per_commit,
@@ -349,6 +360,7 @@ fn run() -> Result<bool, String> {
         args.range_scanners,
         args.range_scan_interval_ms,
         args.range_scan_lbas,
+        args.dedup_shards,
         if args.dedup_enabled { "on" } else { "off" },
         args.dedup_hit_pct,
         args.cleanup_batch,

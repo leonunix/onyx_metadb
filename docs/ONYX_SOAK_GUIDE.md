@@ -27,6 +27,8 @@ page cache 4 GiB        匹配 onyx 默认
 WAL lanes 1             默认优先 group commit；可用 `--wal-lanes N` 显式压并行 fsync
 WAL group wait 1us      writer 会先 drain 已排队提交；可用
                         `--group-commit-timeout-us N` 扫额外等待窗口
+dedup shards 8          metadb dedup_index / dedup_reverse 分片数；必须是 2 的幂，
+                        推荐默认 8，避免单 dedup lane 天花板和 N=4 不稳定点
 dedup 默认关闭          `--dedup-hit-pct 30` 开启 dedup 并模拟 onyx 的 dedup 命中率
 cleanup batch 256       PBA refcount 归零积满 256 个就调
                         cleanup_dedup_for_dead_pbas（onyx 写回路同款）
@@ -82,7 +84,7 @@ cargo build --release --bin metadb-onyx-soak
 
 ```bash
 ./target/release/metadb-onyx-soak --reset --duration-secs 90 \
-  --dedup-hit-pct 30 --cleanup-batch 256 \
+  --dedup-shards 8 --dedup-hit-pct 30 --cleanup-batch 256 \
   --target-ops-per-sec 120000
 ```
 
@@ -90,6 +92,22 @@ dedup 路径产生的额外 WAL ops（`put_dedup` + `register_dedup_reverse` + �
 `cleanup_dedup_for_dead_pbas`）会一起打到 metadb，是 onyx 完整写入流程的等价
 负载。不传 `--dedup-hit-pct` 才是纯压缩模式；传 `--dedup-hit-pct 0` 表示开启
 dedup 且 0% 命中（也就是 100% miss）。
+
+### dedup shard 默认值
+
+2026-05-02 在 `nvme-box:/root/onyx_storage/.dev/phase4-perf/SUMMARY.md`
+记录的 120s fio 混合负载（randrw 70/30，4k-32k，qd=256 × 32 jobs）显示：
+
+| metadb.dedup_shards | READ IOPS | WRITE IOPS | READ p99 | READ p99.9 | dedup register entries / 90s |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 72,880 | 31,251 | 1199 ms | 5067 ms | 1.29 M |
+| 4 | 57,170 | 24,513 | 843 ms | 2433 ms | 3.82 M |
+| 8 | 71,172 | 30,517 | 476 ms | 1216 ms | 4.20 M |
+
+结论：`N=8` 相比 `N=1` 在 IOPS 基本持平的情况下，把 READ p99 降低约
+60%、p99.9 降低约 76%，dedup register throughput 提升约 3.3×，说明
+单 dedup apply lane 天花板已经被移除。`N=4` 的 apply_wait tail 更差，是
+不稳定平衡点，不推荐作为默认值。
 
 ## 输出格式
 
