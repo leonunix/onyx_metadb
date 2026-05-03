@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use crate::cache::PageCache;
 use crate::error::Result;
-use crate::lsm::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash32};
 use crate::page_store::PageStore;
 use crate::types::{Lsn, PageId};
 

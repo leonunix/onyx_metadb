@@ -203,119 +203,6 @@ fn run_l2p_checkpoint_install_step(
     }
 }
 
-// `enqueue_refcount_checkpoint_install_step` / `run_refcount_checkpoint_install_step`
-// were the deferred-flush install drivers for the old BTree-backed
-// refcount path. The paged-array refcount writes synchronously during
-// sample-phase `RcShard::flush` and has no install step, so the
-// drivers are dead code as of Stage 1 of metadb-restructure-v9.
-
-#[allow(dead_code)]
-fn run_refcount_checkpoint_install_step(
-    sid: usize,
-    tree: Arc<Mutex<crate::btree::BTree>>,
-    state: Arc<Mutex<CheckpointInstallState<crate::btree::cache::FlushedSnapshot>>>,
-    queue_wait: std::time::Duration,
-) -> Result<Option<Vec<PageId>>> {
-    let total_started = std::time::Instant::now();
-    let state_lock_started = std::time::Instant::now();
-    let mut state = state.lock();
-    let state_lock_elapsed = state_lock_started.elapsed();
-    state.steps_started += 1;
-    let step = state.steps_started;
-    let start_flushed = state.next_flushed_page;
-    let start_retired = state.next_retired_page;
-    let start_private = state.next_private_page;
-    let tree_lock_started = std::time::Instant::now();
-    let mut tree = tree.lock();
-    let tree_lock_elapsed = tree_lock_started.elapsed();
-    let mut budget = FLUSH_INSTALL_PAGE_BUDGET;
-
-    let pages_started = std::time::Instant::now();
-    while budget > 0 && state.next_flushed_page < state.flushed_pages {
-        let page_idx = state.next_flushed_page;
-        if let Some((pid, clean)) = tree.install_flushed_checkpoint_page(&state.flushed, page_idx) {
-            state.flushed_private.insert(pid, clean);
-        }
-        state.next_flushed_page += 1;
-        budget -= 1;
-    }
-
-    while budget > 0 && state.next_retired_page < state.retired_pages.len() {
-        let pid = state.retired_pages[state.next_retired_page];
-        if let Some(pid) = tree.checkpoint_retired_page_committed(pid) {
-            state.checkpoint_frees.push(pid);
-        }
-        state.next_retired_page += 1;
-        budget -= 1;
-    }
-
-    while budget > 0 && state.next_private_page < state.private_pages.len() {
-        let pid = state.private_pages[state.next_private_page];
-        let flushed_clean = state.flushed_private.get(&pid).copied().unwrap_or(true);
-        tree.checkpoint_private_page_committed(pid, flushed_clean);
-        state.next_private_page += 1;
-        budget -= 1;
-    }
-    let pages_elapsed = pages_started.elapsed();
-
-    let cleanup_started = std::time::Instant::now();
-    let cleanup_done = tree.finish_checkpoint_commit_step(FLUSH_INSTALL_CLEANUP_BUDGET)?;
-    let cleanup_elapsed = cleanup_started.elapsed();
-    let page_phases_finished = state.page_phases_finished();
-    let done = page_phases_finished && cleanup_done;
-    let checkpoint_frees = state.checkpoint_frees.len();
-    let result = if !done {
-        None
-    } else {
-        Some(std::mem::take(&mut state.checkpoint_frees))
-    };
-    let total_elapsed = total_started.elapsed();
-    let queue_wait_us = micros(queue_wait);
-    let total_us = micros(total_elapsed);
-    let state_lock_us = micros(state_lock_elapsed);
-    let tree_lock_us = micros(tree_lock_elapsed);
-    let pages_us = micros(pages_elapsed);
-    let cleanup_us = micros(cleanup_elapsed);
-    if queue_wait_us >= FLUSH_INSTALL_STEP_WARN_US
-        || total_us >= FLUSH_INSTALL_STEP_WARN_US
-        || state_lock_us >= FLUSH_INSTALL_STEP_WARN_US
-        || tree_lock_us >= FLUSH_INSTALL_STEP_WARN_US
-        || pages_us >= FLUSH_INSTALL_STEP_WARN_US
-        || cleanup_us >= FLUSH_INSTALL_STEP_WARN_US
-    {
-        tracing::warn!(
-            kind = "refcount",
-            shard = sid,
-            step,
-            queue_wait_us,
-            total_us,
-            state_lock_us,
-            tree_lock_us,
-            pages_us,
-            cleanup_us,
-            flushed_done = state.next_flushed_page,
-            flushed_total = state.flushed_pages,
-            retired_done = state.next_retired_page,
-            retired_total = state.retired_pages.len(),
-            private_done = state.next_private_page,
-            private_total = state.private_pages.len(),
-            flushed_step = state.next_flushed_page.saturating_sub(start_flushed),
-            retired_step = state.next_retired_page.saturating_sub(start_retired),
-            private_step = state.next_private_page.saturating_sub(start_private),
-            cleanup_done,
-            page_phases_finished,
-            done,
-            checkpoint_frees,
-            "metadb: slow checkpoint install step"
-        );
-    }
-    if let Some(frees) = result {
-        Ok(Some(frees))
-    } else {
-        return Ok(None);
-    }
-}
-
 impl Db {
     /// Create a fresh database in `root_dir` using the default config.
     pub fn create(root_dir: &Path) -> Result<Self> {
@@ -352,7 +239,6 @@ impl Db {
             cfg.index_pin_bytes,
         ));
         let metrics = Arc::new(MetaMetrics::new());
-        let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
         let (l2p_shards, l2p_roots) =
@@ -476,7 +362,6 @@ impl Db {
             cfg.index_pin_bytes,
         ));
         let metrics = Arc::new(MetaMetrics::new());
-        let lsm_config = lsm_config_from_cfg(&cfg);
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_existing(page_store.clone(), faults.clone())?;
         if manifest.volumes.is_empty() {
@@ -926,19 +811,19 @@ impl Db {
         self.metrics.snapshot()
     }
 
-    pub fn dedup_lsm_stats(&self) -> (LsmStats, LsmStats) {
-        // Both dedup index and dedup reverse moved off LSM in v9;
-        // report zeroed stats so the status formatter keeps its
+    pub fn dedup_lsm_stats(&self) -> (crate::LsmStats, crate::LsmStats) {
+        // Both dedup index and dedup reverse moved off LSM; report
+        // zeroed stats so the onyx status formatter keeps its
         // `(forward, reverse)` shape until the operator-facing
-        // surface is updated. Use `dedup_tier_sizes` for the cuckoo
-        // L0/L1 occupancy.
-        (LsmStats::default(), LsmStats::default())
+        // surface is updated. Use [`Db::dedup_tier_sizes`] for the
+        // cuckoo L0/L1 occupancy.
+        (crate::LsmStats::default(), crate::LsmStats::default())
     }
 
     /// Per-shard dedup stats are unavailable: the cuckoo dedup_index
     /// has no shard concept and paged-array dedup_reverse uses a
     /// single page table. Returns empty vecs.
-    pub fn dedup_lsm_stats_per_shard(&self) -> (Vec<LsmStats>, Vec<LsmStats>) {
+    pub fn dedup_lsm_stats_per_shard(&self) -> (Vec<crate::LsmStats>, Vec<crate::LsmStats>) {
         (Vec::new(), Vec::new())
     }
 

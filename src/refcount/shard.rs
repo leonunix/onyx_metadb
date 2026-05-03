@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::btree::format::RcEntry;
+use super::RcEntry;
 use crate::cache::PageCache;
 use crate::error::Result;
 use crate::page_store::PageStore;

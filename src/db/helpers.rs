@@ -234,18 +234,6 @@ pub(super) fn open_l2p_shards(
     Ok(shards)
 }
 
-pub(super) fn lsm_config_from_cfg(cfg: &Config) -> LsmConfig {
-    let target_sst_records =
-        ((cfg.lsm_memtable_bytes as usize) / crate::lsm::LSM_RECORD_SIZE).max(1);
-    LsmConfig {
-        memtable_bytes: cfg.lsm_memtable_bytes as usize,
-        bits_per_entry: cfg.lsm_bloom_bits_per_entry,
-        l0_sst_count_trigger: cfg.lsm_l0_sst_count_trigger as usize,
-        target_sst_records,
-        level_ratio: cfg.lsm_level_ratio,
-    }
-}
-
 pub(super) fn max_generation_from_locked_l2p(guards: &[RwLockWriteGuard<'_, PagedL2p>]) -> Lsn {
     guards
         .iter()

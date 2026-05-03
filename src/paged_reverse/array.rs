@@ -45,7 +45,7 @@ use parking_lot::Mutex;
 
 use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
-use crate::lsm::Hash32;
+use crate::dedup_types::Hash32;
 use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
 use crate::page_store::PageStore;
 use crate::paged_meta;

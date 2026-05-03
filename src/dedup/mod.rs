@@ -28,7 +28,7 @@ pub use index::{DedupIndex, TierSizes};
 pub use l1_cache::L1HotCache;
 pub use sketch::FpSketch;
 
-use crate::lsm::Hash32;
+use crate::dedup_types::Hash32;
 
 /// Take the first four bytes of a `Hash32` as the fingerprint.
 /// `Hash32` is already uniformly distributed (SHA-256 / blake3

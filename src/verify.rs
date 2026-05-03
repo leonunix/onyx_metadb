@@ -4,18 +4,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::btree::format::{internal_child_at, internal_key_count, leaf_key_count};
-use crate::cache::PageCache;
-use crate::config::PAGE_SIZE;
 use crate::error::{MetaDbError, Result};
-use crate::lsm::persist::decode_level_page;
-use crate::lsm::{SstHandle, SstReader};
 use crate::manifest::{LoadedManifest, Manifest, ManifestStore, load_snapshot_roots};
 use crate::page::PageType;
 use crate::page_store::PageStore;
 use crate::paged::format::{INDEX_FANOUT, index_child_at};
 use crate::types::{FIRST_DATA_PAGE, Lsn, NULL_PAGE, PageId};
-use crate::{BTree, PagedL2p};
+use crate::PagedL2p;
 
 #[derive(Clone, Debug, Default)]
 pub struct VerifyOptions {
@@ -199,9 +194,6 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
     let mut live = LivePages::default();
     let mut seen_paged: HashSet<PageId> = HashSet::new();
     let mut seen_btree: HashSet<PageId> = HashSet::new();
-    let mut seen_level_pages: HashSet<PageId> = HashSet::new();
-    let mut seen_ssts: HashSet<PageId> = HashSet::new();
-    let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * PAGE_SIZE as u64));
 
     for volume in &manifest.volumes {
         for &root in volume.l2p_shard_roots.iter() {
@@ -472,111 +464,3 @@ fn walk_refcount_paged_array(
     Ok(())
 }
 
-// Dead code: the only verifier caller used to be the refcount
-// roots loop, which now walks the paged-array meta page via
-// [`walk_refcount_paged_array`]. Kept behind `#[allow(dead_code)]`
-// until the BTree module is removed.
-#[allow(dead_code)]
-fn walk_btree(
-    page_store: &PageStore,
-    root: PageId,
-    live: &mut LivePages,
-    seen: &mut HashSet<PageId>,
-) -> Result<()> {
-    if !seen.insert(root) {
-        return Ok(());
-    }
-    let page = page_store.read_page(root)?;
-    match page.header()?.page_type {
-        PageType::L2pLeaf => {
-            let count = leaf_key_count(&page);
-            if count > crate::btree::format::MAX_LEAF_ENTRIES {
-                return Err(MetaDbError::Corruption(format!(
-                    "btree leaf {root} overflows with {count} entries"
-                )));
-            }
-            Ok(())
-        }
-        PageType::L2pInternal => {
-            let key_count = internal_key_count(&page);
-            for idx in 0..=key_count {
-                let child = internal_child_at(&page, idx);
-                live.mark(child);
-                walk_btree(page_store, child, live, seen)?;
-            }
-            Ok(())
-        }
-        other => Err(MetaDbError::Corruption(format!(
-            "page {root} has unexpected type {other:?} in btree walk"
-        ))),
-    }
-}
-
-fn walk_lsm_heads(
-    page_store: &Arc<PageStore>,
-    page_cache: &Arc<PageCache>,
-    heads: &[PageId],
-    live: &mut LivePages,
-    seen_level_pages: &mut HashSet<PageId>,
-    seen_ssts: &mut HashSet<PageId>,
-) -> Result<()> {
-    for &head in heads {
-        if head == NULL_PAGE {
-            continue;
-        }
-        live.mark(head);
-        let mut cursor = head;
-        while cursor != NULL_PAGE {
-            if !seen_level_pages.insert(cursor) {
-                return Err(MetaDbError::Corruption(format!(
-                    "LsmLevels chain loops back to page {cursor}"
-                )));
-            }
-            let page = page_store.read_page(cursor)?;
-            let (next, handles) = decode_level_page(cursor, &page)?;
-            if next != NULL_PAGE {
-                live.mark(next);
-            }
-            for handle in handles {
-                mark_sst(handle, live);
-                if seen_ssts.insert(handle.head_page) {
-                    verify_sst(page_store, page_cache, handle)?;
-                }
-            }
-            cursor = next;
-        }
-    }
-    Ok(())
-}
-
-fn mark_sst(handle: SstHandle, live: &mut LivePages) {
-    for offset in 0..handle.page_count() {
-        live.mark(handle.head_page + offset as u64);
-    }
-}
-
-fn verify_sst(page_store: &PageStore, page_cache: &PageCache, handle: SstHandle) -> Result<()> {
-    let reader = SstReader::open(page_store, page_cache, handle)?;
-    let mut prev = None;
-    let mut count = 0u64;
-    for rec in reader.scan() {
-        let rec = rec?;
-        if let Some(prev_hash) = prev {
-            if rec.hash() <= &prev_hash {
-                return Err(MetaDbError::Corruption(format!(
-                    "SST {} records are not strictly ascending",
-                    handle.head_page
-                )));
-            }
-        }
-        prev = Some(*rec.hash());
-        count += 1;
-    }
-    if count != handle.record_count {
-        return Err(MetaDbError::Corruption(format!(
-            "SST {} scanned {} records but handle says {}",
-            handle.head_page, count, handle.record_count
-        )));
-    }
-    Ok(())
-}

@@ -1,9 +1,9 @@
 //! Paged-array + delta refcount store.
 //!
-//! Replaces the COW B+tree (`crate::btree`). Each shard owns a paged
-//! array indexed by `pba >> ENTRIES_PER_PAGE_SHIFT`; reads / writes go
-//! to a `DeltaMap` first and fall back to the on-disk array on miss.
-//! Apply lanes drain delta into pages at commit boundaries.
+//! Each shard owns a paged array indexed by
+//! `pba >> ENTRIES_PER_PAGE_SHIFT`; reads / writes go to a `DeltaMap`
+//! first and fall back to the on-disk array on miss. Apply lanes
+//! drain delta into pages at commit boundaries.
 //!
 //! # Concurrency model
 //!
@@ -22,9 +22,35 @@ pub use array::{PagedRefcountArray, ENTRIES_PER_PAGE};
 pub use delta::DeltaMap;
 pub use shard::RcShard;
 
-use crate::btree::format::RcEntry;
 use crate::error::{MetaDbError, Result};
 use crate::types::Lsn;
+
+/// Per-PBA refcount entry. `rc` is the live reference count;
+/// `birth_lsn` records the LSN at which the entry transitioned from
+/// `rc=0` to `rc=1` — i.e. when the current content of this PBA was
+/// first incref'd. Birth/death LSN suppression in
+/// `crate::db::apply_l2p_remap` uses this to decide whether a
+/// concurrent snapshot might still pin the PBA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RcEntry {
+    pub rc: u32,
+    pub birth_lsn: Lsn,
+}
+
+impl RcEntry {
+    /// Sentinel for "no entry": rc=0, birth_lsn=0. Returned by callers
+    /// that fold a missing-key lookup into the same arithmetic path.
+    pub const ZERO: Self = Self {
+        rc: 0,
+        birth_lsn: 0,
+    };
+}
+
+impl std::fmt::Display for RcEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(rc={}, birth_lsn={})", self.rc, self.birth_lsn)
+    }
+}
 
 /// Compute the new RcEntry from `(prev, delta, lsn)`. Pure
 /// arithmetic — does not touch any state. Mirrors the semantics of

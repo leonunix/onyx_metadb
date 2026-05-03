@@ -40,9 +40,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::btree::format::RcEntry;
 use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
+use super::RcEntry;
 use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
 use crate::page_store::PageStore;
 use crate::paged_meta;

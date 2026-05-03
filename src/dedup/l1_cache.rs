@@ -20,7 +20,7 @@
 
 use parking_lot::Mutex;
 
-use crate::lsm::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash32};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CachedHit {

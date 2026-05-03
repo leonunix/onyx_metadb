@@ -43,7 +43,7 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
-use crate::lsm::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash32};
 use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
 use crate::page_store::PageStore;
 use crate::paged_meta;

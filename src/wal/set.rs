@@ -237,10 +237,10 @@ mod tests {
         h
     }
 
-    fn value(byte: u8) -> crate::lsm::DedupValue {
+    fn value(byte: u8) -> crate::dedup_types::DedupValue {
         let mut v = [0u8; 28];
         v[0] = byte;
-        crate::lsm::DedupValue(v)
+        crate::dedup_types::DedupValue(v)
     }
 
     #[test]

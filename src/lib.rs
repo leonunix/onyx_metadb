@@ -25,15 +25,14 @@
 
 pub mod affinity;
 pub mod apply_gate;
-pub mod btree;
 pub mod cache;
 pub mod config;
 pub mod dedup;
+pub mod dedup_types;
 pub mod db;
 pub mod epoch;
 pub mod error;
 pub mod fuzz;
-pub mod lsm;
 pub mod manifest;
 pub mod metrics;
 pub mod page;
@@ -49,18 +48,14 @@ pub mod types;
 pub mod verify;
 pub mod wal;
 
-pub use btree::{BTree, MAX_INTERNAL_KEYS, MAX_LEAF_ENTRIES, PageBuf, RangeIter};
 pub use cache::{PageCache, PageCacheStats};
 pub use config::{Config, MAX_DEDUP_SHARDS, PAGE_SIZE};
 pub use db::{
     Db, DbDedupIter, DbRangeIter, DbRefcountIter, DropReport, DropVolumeReport, PendingState,
     SnapshotView,
 };
+pub use dedup_types::{DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash32, LsmStats};
 pub use error::{MetaDbError, Result};
-pub use lsm::{
-    DEDUP_VALUE_SIZE, DedupOp, DedupValue, HASH_SIZE, Hash32, LSM_RECORD_SIZE, LookupResult,
-    LsmStats, Memtable, MemtableStats, RECORDS_PER_PAGE, Record,
-};
 pub use manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VOLUME_ENTRY_FIXED_SIZE,
     VOLUME_FLAG_DROP_PENDING, VolumeEntry, decode_volume_entry_inline, encode_volume_entry_inline,

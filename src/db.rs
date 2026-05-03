@@ -22,7 +22,7 @@ use crate::apply_gate::ApplyGate;
 use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
 use crate::error::{MetaDbError, Result};
-use crate::lsm::{DedupValue, Hash32, LsmConfig, LsmStats, ShardedLsm};
+use crate::dedup_types::{DedupValue, Hash32};
 use crate::manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VolumeEntry,
     write_snapshot_roots_page,
@@ -67,7 +67,7 @@ pub struct Db {
     /// tally — not per-volume — and stays at the top level for that reason.
     refcount_shards: Vec<Shard>,
     /// Global dedup index: 32-byte SHA-256 content hash → 28-byte opaque
-    /// `DedupValue`. Backed by a [`ShardedLsm`] so the apply path can
+    /// `DedupValue`. Backed by [`crate::dedup::DedupIndex`] so the apply path can
     /// fan writes across multiple LSMs once Phase 3 wires per-shard
     /// apply lanes; in Phase 1 the wrapper holds a single shard and
     /// behaves identically to `Arc<Lsm>`.

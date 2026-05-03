@@ -773,7 +773,7 @@ impl Db {
                     });
                 }
                 WalOp::DedupPut { hash, .. } | WalOp::DedupDelete { hash, .. } => {
-                    let sid = crate::lsm::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    let sid = crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
                     dedup_buckets[sid].push(idx);
                 }
                 WalOp::DedupReversePut { hash, .. } | WalOp::DedupReverseDelete { hash, .. } => {
@@ -781,7 +781,7 @@ impl Db {
                     // pair must land in the same shard so the dedup
                     // invariant survives a single commit. Route by
                     // hash here, not the encoded reverse key.
-                    let sid = crate::lsm::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    let sid = crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
                     dedup_buckets[sid].push(idx);
                 }
                 WalOp::DropSnapshot { .. }

@@ -71,7 +71,7 @@
 //! consistent with the rest of metadb.
 
 use crate::error::{MetaDbError, Result};
-use crate::lsm::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash32};
 use crate::paged::L2pValue;
 use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
 
