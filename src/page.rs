@@ -117,6 +117,11 @@ pub enum PageType {
     /// all-zero hash sentinel (collision with a real all-zero hash is
     /// rejected at put time as `Corruption`).
     DedupReverseArray = 11,
+    /// On-disk cuckoo hash data page for dedup_index: 16 buckets ×
+    /// 4 entries × 60 B (Hash32 + DedupValue) plus an 8 B presence
+    /// bitmap. Disambiguated from the cuckoo *meta* page by `key_count`
+    /// (data pages set 0; the meta page sets `0xFFFF`).
+    CuckooData = 12,
 }
 
 impl PageType {
@@ -135,6 +140,7 @@ impl PageType {
             9 => Self::PagedIndex,
             10 => Self::RefcountArray,
             11 => Self::DedupReverseArray,
+            12 => Self::CuckooData,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }

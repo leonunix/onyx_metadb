@@ -28,6 +28,7 @@ pub mod apply_gate;
 pub mod btree;
 pub mod cache;
 pub mod config;
+pub mod dedup;
 pub mod db;
 pub mod epoch;
 pub mod error;

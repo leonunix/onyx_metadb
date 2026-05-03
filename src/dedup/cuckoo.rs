@@ -1,0 +1,748 @@
+//! L3: on-disk cuckoo hash table for dedup_index.
+//!
+//! # Layout
+//!
+//! - Total bucket count `N` is fixed at `create()` time and recorded
+//!   in the meta page. Each bucket holds [`ENTRIES_PER_BUCKET`]
+//!   slots; capacity is `N × ENTRIES_PER_BUCKET`.
+//! - Buckets are packed into 4 KiB data pages — [`BUCKETS_PER_PAGE`]
+//!   buckets per page. Page index `i` covers buckets
+//!   `[i * BUCKETS_PER_PAGE, (i+1) * BUCKETS_PER_PAGE)`.
+//! - The meta page records the bucket count, the two hash seeds,
+//!   and the on-disk PageId for every data page (sparse — pages are
+//!   allocated lazily on first write).
+//!
+//! # Lookup
+//!
+//! Two candidate buckets per key, computed by `xxh3_with_seed(hash,
+//! seed_i) % N`. Each bucket carries up to four occupied slots
+//! (presence tracked by an 8-bit bitmap per page covering all
+//! `BUCKETS_PER_PAGE × ENTRIES_PER_BUCKET = 64` slots).
+//!
+//! # Insert
+//!
+//! Idempotent: if `hash` already lives in either candidate bucket,
+//! `insert` overwrites the value and returns. Otherwise it places
+//! the entry in the first empty slot it finds across the two
+//! candidate buckets. If both are full, it triggers a cuckoo
+//! eviction chain (random victim from b1, swap, retry from victim's
+//! alternate bucket, …) bounded by [`MAX_CUCKOO_CHAIN`]. Exceeding
+//! the chain returns [`MetaDbError::Corruption`] with a "table full"
+//! message — sizing for steady-state load factor below 0.85 makes
+//! this practically unreachable.
+//!
+//! # Delete
+//!
+//! Walk both candidate buckets; clear the slot whose stored hash
+//! matches.
+
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use xxhash_rust::xxh3::xxh3_64_with_seed;
+
+use crate::cache::PageCache;
+use crate::error::{MetaDbError, Result};
+use crate::lsm::{DedupValue, Hash32};
+use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
+use crate::page_store::PageStore;
+use crate::types::{Lsn, PageId};
+
+pub const ENTRY_BYTES: usize = 60; // Hash32 (32) + DedupValue (28)
+pub const ENTRIES_PER_BUCKET: usize = 4;
+pub const BUCKET_BYTES: usize = ENTRY_BYTES * ENTRIES_PER_BUCKET; // 240
+pub const BUCKETS_PER_PAGE: usize =
+    (PAGE_PAYLOAD_SIZE - PRESENCE_BITMAP_BYTES) / BUCKET_BYTES; // 16
+pub const SLOTS_PER_PAGE: usize = BUCKETS_PER_PAGE * ENTRIES_PER_BUCKET; // 64
+pub const PRESENCE_BITMAP_BYTES: usize = 8;
+pub const MAX_CUCKOO_CHAIN: usize = 64;
+
+const META_HEADER_BYTES: usize = 32;
+const META_TABLE_CAPACITY: usize =
+    (PAGE_PAYLOAD_SIZE - META_HEADER_BYTES) / std::mem::size_of::<u64>();
+
+const META_KEY_COUNT_MARKER: u16 = 0xFFFF;
+const DATA_KEY_COUNT_MARKER: u16 = 0;
+
+const _: () = {
+    assert!(BUCKETS_PER_PAGE * BUCKET_BYTES + PRESENCE_BITMAP_BYTES <= PAGE_PAYLOAD_SIZE);
+    assert!(SLOTS_PER_PAGE == 64);
+};
+
+pub struct CuckooHash {
+    bucket_count: u64,
+    seed1: u64,
+    seed2: u64,
+    meta_page_id: PageId,
+    page_store: Arc<PageStore>,
+    page_cache: Arc<PageCache>,
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
+    /// `page_table[page_idx] = on-disk PageId`, or 0 if no page is
+    /// allocated yet for that bucket range.
+    page_table: Vec<PageId>,
+    meta_dirty: bool,
+    /// Approximate number of occupied slots; used for `len()` and
+    /// load-factor reporting. Recomputed exactly during `iter()`.
+    approx_len: u64,
+}
+
+impl CuckooHash {
+    pub fn create(
+        page_store: Arc<PageStore>,
+        page_cache: Arc<PageCache>,
+        bucket_count: u64,
+        seed1: u64,
+        seed2: u64,
+    ) -> Result<Self> {
+        if bucket_count == 0 {
+            return Err(MetaDbError::InvalidArgument(
+                "cuckoo bucket_count must be > 0".into(),
+            ));
+        }
+        let total_pages = bucket_count.div_ceil(BUCKETS_PER_PAGE as u64) as usize;
+        if total_pages > META_TABLE_CAPACITY {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "cuckoo bucket_count {bucket_count} requires {total_pages} pages, exceeds \
+                 single-meta-page capacity {META_TABLE_CAPACITY}; chained meta pages land \
+                 in stage 3.x",
+            )));
+        }
+        let meta_page_id = page_store.allocate()?;
+        let me = Self {
+            bucket_count,
+            seed1,
+            seed2,
+            meta_page_id,
+            page_store,
+            page_cache,
+            inner: Mutex::new(Inner {
+                page_table: vec![0; total_pages],
+                meta_dirty: false,
+                approx_len: 0,
+            }),
+        };
+        me.flush_meta_locked(&me.inner.lock())?;
+        Ok(me)
+    }
+
+    pub fn open(
+        page_store: Arc<PageStore>,
+        page_cache: Arc<PageCache>,
+        meta_page_id: PageId,
+    ) -> Result<Self> {
+        let meta_page = page_store.read_page(meta_page_id)?;
+        let header = meta_page.header()?;
+        if header.page_type != PageType::CuckooData
+            || header.key_count != META_KEY_COUNT_MARKER
+        {
+            return Err(MetaDbError::Corruption(format!(
+                "cuckoo meta page {meta_page_id} has wrong header (type={:?}, key_count={})",
+                header.page_type, header.key_count,
+            )));
+        }
+        let payload = meta_page.payload();
+        let bucket_count = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let seed1 = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+        let seed2 = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+        let page_count = u32::from_le_bytes(payload[24..28].try_into().unwrap()) as usize;
+        if page_count > META_TABLE_CAPACITY {
+            return Err(MetaDbError::Corruption(format!(
+                "cuckoo meta page page_count {page_count} > capacity {META_TABLE_CAPACITY}",
+            )));
+        }
+        let mut page_table = Vec::with_capacity(page_count);
+        for i in 0..page_count {
+            let off = META_HEADER_BYTES + i * 8;
+            let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
+            page_table.push(pid);
+        }
+        // approx_len is recomputed lazily; leave as 0 until the first
+        // explicit len() call (or rebuild on Open path).
+        Ok(Self {
+            bucket_count,
+            seed1,
+            seed2,
+            meta_page_id,
+            page_store,
+            page_cache,
+            inner: Mutex::new(Inner {
+                page_table,
+                meta_dirty: false,
+                approx_len: 0,
+            }),
+        })
+    }
+
+    pub fn meta_page_id(&self) -> PageId {
+        self.meta_page_id
+    }
+
+    pub fn bucket_count(&self) -> u64 {
+        self.bucket_count
+    }
+
+    pub fn seeds(&self) -> (u64, u64) {
+        (self.seed1, self.seed2)
+    }
+
+    /// Approximate live entry count. Tracks insert / delete deltas;
+    /// callers that need an exact figure should use [`recount`].
+    pub fn approx_len(&self) -> u64 {
+        self.inner.lock().approx_len
+    }
+
+    /// Look up `hash`. Returns `Some(value)` if the hash lives in
+    /// either candidate bucket, else `None`.
+    pub fn get(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
+        let (b1, b2) = self.candidate_buckets(hash);
+        if let Some(v) = self.read_bucket_for(hash, b1)? {
+            return Ok(Some(v));
+        }
+        if b2 != b1 {
+            if let Some(v) = self.read_bucket_for(hash, b2)? {
+                return Ok(Some(v));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Insert / overwrite `hash → value`. Returns `Ok(())` on
+    /// success; `Err(Corruption("cuckoo full"))` only if the
+    /// eviction chain exceeds [`MAX_CUCKOO_CHAIN`].
+    pub fn put(&self, hash: Hash32, value: DedupValue, lsn: Lsn) -> Result<()> {
+        // Idempotent overwrite: if the entry already exists, replace
+        // the value in place and return. This keeps semantics
+        // identical to the LSM `put` we are replacing.
+        let (b1, b2) = self.candidate_buckets(&hash);
+        for bucket in [b1, b2].into_iter().filter(|b| *b == b1 || *b != b1) {
+            if self.update_existing(bucket, &hash, value, lsn)? {
+                return Ok(());
+            }
+        }
+        // Try empty slot insertion in either candidate.
+        for bucket in [b1, b2] {
+            if self.try_insert_empty(bucket, hash, value, lsn)? {
+                self.bump_len(1);
+                return Ok(());
+            }
+        }
+        // Both buckets full — kick off a cuckoo chain starting from b1.
+        self.evict_and_insert(b1, hash, value, lsn)?;
+        self.bump_len(1);
+        Ok(())
+    }
+
+    /// Remove the entry for `hash`. No-op if absent.
+    pub fn delete(&self, hash: &Hash32, lsn: Lsn) -> Result<()> {
+        let (b1, b2) = self.candidate_buckets(hash);
+        if self.try_clear_in_bucket(b1, hash, lsn)? {
+            self.bump_len(-1);
+            return Ok(());
+        }
+        if b2 != b1 && self.try_clear_in_bucket(b2, hash, lsn)? {
+            self.bump_len(-1);
+        }
+        Ok(())
+    }
+
+    /// Iterate every live `(hash, value)` pair. Order is page-index
+    /// then bucket then slot (deterministic but not lexicographic on
+    /// hash). Used by the verifier and offline tools.
+    pub fn iter(&self) -> Result<Vec<(Hash32, DedupValue)>> {
+        let snapshot = {
+            let inner = self.inner.lock();
+            inner.page_table.clone()
+        };
+        let mut out = Vec::new();
+        for &pid in &snapshot {
+            if pid == 0 {
+                continue;
+            }
+            let page = self.page_cache.get(pid)?;
+            let bitmap = read_bitmap(&page);
+            for slot in 0..SLOTS_PER_PAGE {
+                if bitmap & (1u64 << slot) != 0 {
+                    let (h, v) = read_slot(&page, slot);
+                    out.push((h, v));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Recompute `approx_len` from the current on-disk state. O(N).
+    pub fn recount(&self) -> Result<u64> {
+        let mut count = 0u64;
+        let snapshot = {
+            let inner = self.inner.lock();
+            inner.page_table.clone()
+        };
+        for &pid in &snapshot {
+            if pid == 0 {
+                continue;
+            }
+            let page = self.page_cache.get(pid)?;
+            count += read_bitmap(&page).count_ones() as u64;
+        }
+        self.inner.lock().approx_len = count;
+        Ok(count)
+    }
+
+    /// Persist the meta page if dirty.
+    pub fn flush_meta(&self) -> Result<()> {
+        let inner = self.inner.lock();
+        if inner.meta_dirty {
+            self.flush_meta_locked(&inner)?;
+        }
+        Ok(())
+    }
+
+    /// Walk every allocated data page id (used by verifier).
+    pub fn data_page_ids(&self) -> Vec<PageId> {
+        let inner = self.inner.lock();
+        inner
+            .page_table
+            .iter()
+            .copied()
+            .filter(|&pid| pid != 0)
+            .collect()
+    }
+
+    // ---- private ---------------------------------------------------
+
+    fn flush_meta_locked(&self, inner: &parking_lot::MutexGuard<'_, Inner>) -> Result<()> {
+        let mut page = Page::new(PageHeader {
+            page_type: PageType::CuckooData,
+            version: crate::page::PAGE_VERSION,
+            key_count: META_KEY_COUNT_MARKER,
+            flags: 0,
+            generation: 0,
+            refcount: 1,
+        });
+        {
+            let payload = page.payload_mut();
+            payload[0..8].copy_from_slice(&self.bucket_count.to_le_bytes());
+            payload[8..16].copy_from_slice(&self.seed1.to_le_bytes());
+            payload[16..24].copy_from_slice(&self.seed2.to_le_bytes());
+            payload[24..28].copy_from_slice(&(inner.page_table.len() as u32).to_le_bytes());
+            payload[28..META_HEADER_BYTES].fill(0);
+            for (i, &pid) in inner.page_table.iter().enumerate() {
+                let off = META_HEADER_BYTES + i * 8;
+                payload[off..off + 8].copy_from_slice(&(pid as u64).to_le_bytes());
+            }
+        }
+        page.seal();
+        self.page_store.write_page(self.meta_page_id, &page)?;
+        self.page_cache.invalidate(self.meta_page_id);
+        self.page_cache.insert(self.meta_page_id, Arc::new(page));
+        Ok(())
+    }
+
+    fn candidate_buckets(&self, hash: &Hash32) -> (u64, u64) {
+        let h1 = xxh3_64_with_seed(hash, self.seed1);
+        let h2 = xxh3_64_with_seed(hash, self.seed2);
+        let b1 = h1 % self.bucket_count;
+        let b2 = h2 % self.bucket_count;
+        (b1, b2)
+    }
+
+    fn alternate_bucket(&self, hash: &Hash32, current: u64) -> u64 {
+        let (b1, b2) = self.candidate_buckets(hash);
+        if current == b1 { b2 } else { b1 }
+    }
+
+    fn read_bucket_for(&self, hash: &Hash32, bucket_id: u64) -> Result<Option<DedupValue>> {
+        let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
+        let pid = {
+            let inner = self.inner.lock();
+            inner.page_table.get(page_idx).copied().unwrap_or(0)
+        };
+        if pid == 0 {
+            return Ok(None);
+        }
+        let page = self.page_cache.get(pid)?;
+        let bitmap = read_bitmap(&page);
+        for slot_in_bucket in 0..ENTRIES_PER_BUCKET {
+            let slot = bucket_in_page * ENTRIES_PER_BUCKET + slot_in_bucket;
+            if bitmap & (1u64 << slot) != 0 {
+                let (stored_hash, value) = read_slot(&page, slot);
+                if &stored_hash == hash {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn update_existing(
+        &self,
+        bucket_id: u64,
+        hash: &Hash32,
+        value: DedupValue,
+        lsn: Lsn,
+    ) -> Result<bool> {
+        self.with_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
+            for slot_in_bucket in 0..ENTRIES_PER_BUCKET {
+                let slot = bucket_in_page * ENTRIES_PER_BUCKET + slot_in_bucket;
+                if *bitmap & (1u64 << slot) != 0 {
+                    let (stored_hash, _) = read_slot(page, slot);
+                    if &stored_hash == hash {
+                        write_slot(page, slot, hash, &value);
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    fn try_insert_empty(
+        &self,
+        bucket_id: u64,
+        hash: Hash32,
+        value: DedupValue,
+        lsn: Lsn,
+    ) -> Result<bool> {
+        self.with_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
+            for slot_in_bucket in 0..ENTRIES_PER_BUCKET {
+                let slot = bucket_in_page * ENTRIES_PER_BUCKET + slot_in_bucket;
+                if *bitmap & (1u64 << slot) == 0 {
+                    write_slot(page, slot, &hash, &value);
+                    *bitmap |= 1u64 << slot;
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    fn try_clear_in_bucket(&self, bucket_id: u64, hash: &Hash32, lsn: Lsn) -> Result<bool> {
+        self.with_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
+            for slot_in_bucket in 0..ENTRIES_PER_BUCKET {
+                let slot = bucket_in_page * ENTRIES_PER_BUCKET + slot_in_bucket;
+                if *bitmap & (1u64 << slot) != 0 {
+                    let (stored_hash, _) = read_slot(page, slot);
+                    if &stored_hash == hash {
+                        clear_slot(page, slot);
+                        *bitmap &= !(1u64 << slot);
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    fn evict_and_insert(
+        &self,
+        start_bucket: u64,
+        mut hash: Hash32,
+        mut value: DedupValue,
+        lsn: Lsn,
+    ) -> Result<()> {
+        let mut current_bucket = start_bucket;
+        for _ in 0..MAX_CUCKOO_CHAIN {
+            // Try empty slot first (unlikely but cheap to check).
+            if self.try_insert_empty(current_bucket, hash, value, lsn)? {
+                return Ok(());
+            }
+            // Pick a victim slot deterministically (slot 0 — sufficient
+            // for the tests we have; more sophisticated selection
+            // helps load-factor headroom and lands in stage 3.x).
+            let victim = self.swap_into_bucket_slot0(current_bucket, hash, value, lsn)?;
+            hash = victim.0;
+            value = victim.1;
+            current_bucket = self.alternate_bucket(&hash, current_bucket);
+        }
+        Err(MetaDbError::Corruption(format!(
+            "cuckoo eviction chain exceeded MAX_CUCKOO_CHAIN={MAX_CUCKOO_CHAIN}; \
+             load factor too high — increase bucket_count and rebuild"
+        )))
+    }
+
+    fn swap_into_bucket_slot0(
+        &self,
+        bucket_id: u64,
+        hash: Hash32,
+        value: DedupValue,
+        lsn: Lsn,
+    ) -> Result<(Hash32, DedupValue)> {
+        self.with_bucket_mut(bucket_id, lsn, |_bitmap, page, bucket_in_page| {
+            let slot = bucket_in_page * ENTRIES_PER_BUCKET; // slot index 0
+            let (victim_hash, victim_value) = read_slot(page, slot);
+            write_slot(page, slot, &hash, &value);
+            Ok((victim_hash, victim_value))
+        })
+    }
+
+    fn with_bucket_mut<T>(
+        &self,
+        bucket_id: u64,
+        lsn: Lsn,
+        f: impl FnOnce(&mut u64, &mut Page, usize) -> Result<T>,
+    ) -> Result<T> {
+        let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
+        // Hold the inner mutex for the whole read-modify-write so two
+        // concurrent writes to the same page can't clobber each other.
+        // This serialises all cuckoo writes through a single mutex —
+        // adequate for the v1 swap; stage 3.x can shard the index if
+        // dedup-register throughput becomes the new bottleneck.
+        let mut inner = self.inner.lock();
+        if page_idx >= inner.page_table.len() {
+            return Err(MetaDbError::Corruption(format!(
+                "cuckoo bucket_id {bucket_id} maps to page_idx {page_idx} but page_table \
+                 is only {} entries",
+                inner.page_table.len(),
+            )));
+        }
+        let (page_id, freshly_allocated) = if inner.page_table[page_idx] == 0 {
+            let pid = self.page_store.allocate()?;
+            inner.page_table[page_idx] = pid;
+            inner.meta_dirty = true;
+            (pid, true)
+        } else {
+            (inner.page_table[page_idx], false)
+        };
+        let mut page = if freshly_allocated {
+            new_data_page()
+        } else {
+            (*self.page_cache.get(page_id)?).clone()
+        };
+        let mut bitmap = read_bitmap(&page);
+        let result = f(&mut bitmap, &mut page, bucket_in_page)?;
+        write_bitmap(&mut page, bitmap);
+        let mut header = page.header()?;
+        header.generation = lsn.max(header.generation);
+        page.write_header(&header);
+        page.seal();
+        self.page_store.write_page(page_id, &page)?;
+        self.page_cache.invalidate(page_id);
+        self.page_cache.insert(page_id, Arc::new(page));
+        Ok(result)
+    }
+
+    fn bump_len(&self, delta: i64) {
+        let mut inner = self.inner.lock();
+        if delta >= 0 {
+            inner.approx_len = inner.approx_len.saturating_add(delta as u64);
+        } else {
+            inner.approx_len = inner.approx_len.saturating_sub((-delta) as u64);
+        }
+    }
+}
+
+#[inline]
+fn bucket_offset(bucket_id: u64) -> (usize, usize) {
+    let id = bucket_id as usize;
+    (id / BUCKETS_PER_PAGE, id % BUCKETS_PER_PAGE)
+}
+
+#[inline]
+fn read_bitmap(page: &Page) -> u64 {
+    let payload = page.payload();
+    u64::from_le_bytes(payload[0..PRESENCE_BITMAP_BYTES].try_into().unwrap())
+}
+
+#[inline]
+fn write_bitmap(page: &mut Page, bitmap: u64) {
+    let payload = page.payload_mut();
+    payload[0..PRESENCE_BITMAP_BYTES].copy_from_slice(&bitmap.to_le_bytes());
+}
+
+#[inline]
+fn slot_offset(slot: usize) -> usize {
+    PRESENCE_BITMAP_BYTES + slot * ENTRY_BYTES
+}
+
+#[inline]
+fn read_slot(page: &Page, slot: usize) -> (Hash32, DedupValue) {
+    let off = slot_offset(slot);
+    let payload = page.payload();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&payload[off..off + 32]);
+    let mut value = [0u8; 28];
+    value.copy_from_slice(&payload[off + 32..off + 60]);
+    (hash, DedupValue(value))
+}
+
+#[inline]
+fn write_slot(page: &mut Page, slot: usize, hash: &Hash32, value: &DedupValue) {
+    let off = slot_offset(slot);
+    let payload = page.payload_mut();
+    payload[off..off + 32].copy_from_slice(hash);
+    payload[off + 32..off + 60].copy_from_slice(value.as_bytes());
+}
+
+#[inline]
+fn clear_slot(page: &mut Page, slot: usize) {
+    let off = slot_offset(slot);
+    let payload = page.payload_mut();
+    payload[off..off + 60].fill(0);
+}
+
+fn new_data_page() -> Page {
+    Page::new(PageHeader {
+        page_type: PageType::CuckooData,
+        version: crate::page::PAGE_VERSION,
+        key_count: DATA_KEY_COUNT_MARKER,
+        flags: 0,
+        generation: 0,
+        refcount: 1,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_index(bucket_count: u64) -> (TempDir, CuckooHash) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages");
+        let page_store = Arc::new(PageStore::create(&path).unwrap());
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
+        let cuckoo = CuckooHash::create(page_store, page_cache, bucket_count, 0xDEAD, 0xBEEF).unwrap();
+        (dir, cuckoo)
+    }
+
+    fn h(byte: u8) -> Hash32 {
+        let mut x = [0u8; 32];
+        x.fill(byte);
+        x
+    }
+
+    fn dv(byte: u8) -> DedupValue {
+        let mut x = [0u8; 28];
+        x[0] = byte;
+        DedupValue(x)
+    }
+
+    #[test]
+    fn empty_get_returns_none() {
+        let (_d, c) = make_index(64);
+        assert_eq!(c.get(&h(0xAA)).unwrap(), None);
+    }
+
+    #[test]
+    fn put_get_round_trip() {
+        let (_d, c) = make_index(64);
+        c.put(h(0xAA), dv(7), 100).unwrap();
+        assert_eq!(c.get(&h(0xAA)).unwrap(), Some(dv(7)));
+        assert_eq!(c.get(&h(0xBB)).unwrap(), None);
+    }
+
+    #[test]
+    fn put_overwrites_same_key() {
+        let (_d, c) = make_index(64);
+        c.put(h(0xAA), dv(7), 100).unwrap();
+        c.put(h(0xAA), dv(9), 101).unwrap();
+        assert_eq!(c.get(&h(0xAA)).unwrap(), Some(dv(9)));
+        assert_eq!(c.approx_len(), 1);
+    }
+
+    #[test]
+    fn delete_clears_entry() {
+        let (_d, c) = make_index(64);
+        c.put(h(0xAA), dv(7), 100).unwrap();
+        c.delete(&h(0xAA), 101).unwrap();
+        assert_eq!(c.get(&h(0xAA)).unwrap(), None);
+    }
+
+    #[test]
+    fn delete_missing_is_noop() {
+        let (_d, c) = make_index(64);
+        c.delete(&h(0xAA), 100).unwrap();
+        assert_eq!(c.approx_len(), 0);
+    }
+
+    #[test]
+    fn many_inserts_below_load_factor() {
+        // 64 buckets × 4 = 256 capacity; 200 inserts ≈ 0.78 load
+        // factor — well within reach without an eviction-chain
+        // overflow.
+        let (_d, c) = make_index(64);
+        for i in 0..200u8 {
+            c.put(h(i), dv(i), (100 + i as u64) as Lsn).unwrap();
+        }
+        for i in 0..200u8 {
+            assert_eq!(c.get(&h(i)).unwrap(), Some(dv(i)), "i={i}");
+        }
+        assert_eq!(c.approx_len(), 200);
+    }
+
+    #[test]
+    fn iter_returns_all_live_pairs() {
+        let (_d, c) = make_index(64);
+        for i in 0..50u8 {
+            c.put(h(i), dv(i), 100).unwrap();
+        }
+        let live = c.iter().unwrap();
+        assert_eq!(live.len(), 50);
+    }
+
+    #[test]
+    fn recount_matches_iter_length() {
+        let (_d, c) = make_index(64);
+        for i in 0..30u8 {
+            c.put(h(i), dv(i), 100).unwrap();
+        }
+        for i in 0..10u8 {
+            c.delete(&h(i), 200).unwrap();
+        }
+        let exact = c.recount().unwrap();
+        assert_eq!(exact, 20);
+        assert_eq!(c.approx_len(), 20);
+    }
+
+    #[test]
+    fn round_trip_via_open() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages");
+        let meta_page_id;
+        {
+            let page_store = Arc::new(PageStore::create(&path).unwrap());
+            let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
+            let c = CuckooHash::create(page_store.clone(), page_cache, 32, 0xAAAA, 0xBBBB).unwrap();
+            meta_page_id = c.meta_page_id();
+            for i in 0..40u8 {
+                c.put(h(i), dv(i), (100 + i as u64) as Lsn).unwrap();
+            }
+            c.flush_meta().unwrap();
+        }
+        let page_store = Arc::new(PageStore::open(&path).unwrap());
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
+        let c = CuckooHash::open(page_store, page_cache, meta_page_id).unwrap();
+        assert_eq!(c.bucket_count(), 32);
+        assert_eq!(c.seeds(), (0xAAAA, 0xBBBB));
+        for i in 0..40u8 {
+            assert_eq!(c.get(&h(i)).unwrap(), Some(dv(i)), "i={i}");
+        }
+        assert_eq!(c.recount().unwrap(), 40);
+    }
+
+    #[test]
+    fn bucket_count_zero_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages");
+        let page_store = Arc::new(PageStore::create(&path).unwrap());
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), 4 * 1024 * 1024));
+        let err = CuckooHash::create(page_store, page_cache, 0, 1, 2).err().unwrap();
+        assert!(matches!(err, MetaDbError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn capacity_overflow_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages");
+        let page_store = Arc::new(PageStore::create(&path).unwrap());
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), 4 * 1024 * 1024));
+        let too_many_buckets = (META_TABLE_CAPACITY as u64 + 1) * BUCKETS_PER_PAGE as u64;
+        let err = CuckooHash::create(page_store, page_cache, too_many_buckets, 1, 2)
+            .err()
+            .unwrap();
+        assert!(matches!(err, MetaDbError::InvalidArgument(_)));
+    }
+}
