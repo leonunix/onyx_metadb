@@ -1139,15 +1139,18 @@ impl Db {
 
     fn apply_dedup_indices_to(
         dedup_index: &ShardedLsm,
-        dedup_reverse: &ShardedLsm,
+        dedup_reverse: &crate::paged_reverse::PagedReverse,
         metrics: &MetaMetrics,
         ops: &[WalOp],
         indices: Vec<usize>,
-    ) -> Vec<(usize, ApplyOutcome)> {
+        lsn: Lsn,
+    ) -> Result<Vec<(usize, ApplyOutcome)>> {
         let batch_started = std::time::Instant::now();
         let mut index_ops = Vec::new();
-        let mut reverse_ops = Vec::new();
         let mut outcomes = Vec::with_capacity(indices.len());
+        // dedup_reverse is now a paged-array per-op store rather than
+        // an LSM batch sink; apply each reverse op inline so the
+        // page-table mutex is released between ops.
         for idx in indices {
             match &ops[idx] {
                 WalOp::DedupPut { hash, value } => {
@@ -1157,21 +1160,18 @@ impl Db {
                     index_ops.push((*hash, crate::lsm::DedupOp::Delete));
                 }
                 WalOp::DedupReversePut { pba, hash } => {
-                    let (key, value) = encode_reverse_entry(*pba, hash);
-                    reverse_ops.push((key, crate::lsm::DedupOp::Put(value)));
+                    dedup_reverse.put(*pba, *hash, lsn)?;
                 }
                 WalOp::DedupReverseDelete { pba, hash } => {
-                    let (key, _) = encode_reverse_entry(*pba, hash);
-                    reverse_ops.push((key, crate::lsm::DedupOp::Delete));
+                    dedup_reverse.delete(*pba, *hash, lsn)?;
                 }
                 other => unreachable!("dedup bucket holds only dedup ops; saw {other:?}"),
             };
             outcomes.push((idx, ApplyOutcome::Dedup));
         }
         dedup_index.apply_batch_forward(&index_ops);
-        dedup_reverse.apply_batch_reverse(&reverse_ops);
         metrics.record_apply_dedup_batch(outcomes.len() as u64, batch_started.elapsed());
-        outcomes
+        Ok(outcomes)
     }
 
     fn apply_ops_laned(
@@ -1274,8 +1274,9 @@ impl Db {
         // Fan dedup work out across shards. Each non-empty bucket
         // gets its own apply closure on its shard's lane; we collect
         // outcomes from all of them before returning.
-        let mut dedup_receivers: Vec<crossbeam_channel::Receiver<Vec<(usize, ApplyOutcome)>>> =
-            Vec::new();
+        let mut dedup_receivers: Vec<
+            crossbeam_channel::Receiver<Result<Vec<(usize, ApplyOutcome)>>>,
+        > = Vec::new();
         let dedup_enqueue_started = std::time::Instant::now();
         let dedup_buckets = std::mem::take(&mut plan.dedup_buckets);
         let pendings = std::mem::take(&mut plan.dedup_pendings);
@@ -1293,6 +1294,7 @@ impl Db {
                     metrics.as_ref(),
                     ops.as_slice(),
                     bucket,
+                    lsn,
                 );
                 let _ = tx.send(outcomes);
             }));
@@ -1301,11 +1303,13 @@ impl Db {
         timing.dedup_enqueue = dedup_enqueue_started.elapsed();
         let dedup_wait_started = std::time::Instant::now();
         for rx in dedup_receivers {
-            let dedup_outcomes = rx.recv().map_err(|_| {
-                MetaDbError::Corruption(
-                    "persistent dedup lane worker failed to return a result".into(),
-                )
-            })?;
+            let dedup_outcomes = rx
+                .recv()
+                .map_err(|_| {
+                    MetaDbError::Corruption(
+                        "persistent dedup lane worker failed to return a result".into(),
+                    )
+                })??;
             for (idx, outcome) in dedup_outcomes {
                 outcomes[idx] = Some(outcome);
             }
@@ -1325,7 +1329,7 @@ impl Db {
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
         dedup_index: &Arc<ShardedLsm>,
-        dedup_reverse: &Arc<ShardedLsm>,
+        dedup_reverse: &Arc<crate::paged_reverse::PagedReverse>,
         page_store: &Arc<PageStore>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
@@ -1367,7 +1371,7 @@ impl Db {
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
         dedup_index: &Arc<ShardedLsm>,
-        dedup_reverse: &Arc<ShardedLsm>,
+        dedup_reverse: &Arc<crate::paged_reverse::PagedReverse>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
         ops: &[WalOp],
@@ -1548,7 +1552,8 @@ impl Db {
             metrics.as_ref(),
             ops.as_slice(),
             dedup_idxs,
-        ) {
+            lsn,
+        )? {
             outcomes[idx] = Some(outcome);
         }
 
@@ -1562,7 +1567,7 @@ impl Db {
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
         dedup_index: &Arc<ShardedLsm>,
-        dedup_reverse: &Arc<ShardedLsm>,
+        dedup_reverse: &Arc<crate::paged_reverse::PagedReverse>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
         ops: &[WalOp],
@@ -1674,7 +1679,8 @@ impl Db {
             metrics.as_ref(),
             ops,
             dedup_idxs,
-        ) {
+            lsn,
+        )? {
             outcomes[idx] = Some(outcome);
         }
 

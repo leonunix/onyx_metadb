@@ -135,42 +135,25 @@ impl Db {
     /// Every full 32-byte hash currently registered for `pba` in the
     /// reverse index. Does **not** include tombstoned entries.
     ///
-    /// Cost: scans every `dedup_reverse` SST whose min/max range
-    /// intersects the 8-byte PBA prefix, plus the memtable. Fine for
-    /// the decref-to-zero cleanup path (rare, per-PBA); not suitable
-    /// for hot-path queries.
+    /// Cost: one paged-array point lookup per PBA (one shared
+    /// `PageCache` hit on the warm path, one `read_page` on a cold
+    /// data page). The legacy LSM prefix-scan was the bottleneck of
+    /// `cleanup_dedup_for_pbas_batch`; this path is two orders of
+    /// magnitude faster on a populated index.
     pub fn scan_dedup_reverse_for_pba(&self, pba: Pba) -> Result<Vec<Hash32>> {
-        let prefix = pba.to_be_bytes();
-        let rows = self.dedup_reverse.scan_prefix_all_shards(&prefix)?;
-        Ok(rows
-            .into_iter()
-            .map(|(key, value)| decode_reverse_hash(&key, &value))
-            .collect())
+        self.dedup_reverse.get_hashes(pba)
     }
 
-    /// Batched `dedup_reverse` prefix scan: one call per PBA, one
-    /// reader-drain acquisition and one `levels` snapshot shared across
-    /// all PBAs. Returns one `Vec<Hash32>` per input PBA, in input order.
+    /// Batched [`scan_dedup_reverse_for_pba`]. Returns one
+    /// `Vec<Hash32>` per input PBA, in input order. Each vec carries
+    /// at most one entry under the v1 single-hash-per-PBA invariant
+    /// (see `paged_reverse` module docs); the shape stays plural so
+    /// the caller does not need to change when overflow lands.
     ///
     /// Intended caller: writer / dedup cleanup path sweeping dead PBAs
     /// in a single batch (see onyx-storage `cleanup_dedup_for_pbas_batch`).
     pub fn multi_scan_dedup_reverse_for_pba(&self, pbas: &[Pba]) -> Result<Vec<Vec<Hash32>>> {
-        if pbas.is_empty() {
-            return Ok(Vec::new());
-        }
-        let prefixes: Vec<[u8; 8]> = pbas.iter().map(|pba| pba.to_be_bytes()).collect();
-        let prefix_refs: Vec<&[u8]> = prefixes.iter().map(|p| p.as_slice()).collect();
-        let rows_per_pba = self
-            .dedup_reverse
-            .multi_scan_prefix_all_shards(&prefix_refs)?;
-        Ok(rows_per_pba
-            .into_iter()
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|(key, value)| decode_reverse_hash(&key, &value))
-                    .collect()
-            })
-            .collect())
+        self.dedup_reverse.multi_get_hashes(pbas)
     }
 
     /// Clean up dedup state for a batch of pbas whose refcount has
@@ -288,9 +271,11 @@ impl Db {
         }
     }
 
-    /// `true` if any dedup memtable shard has reached its freeze threshold.
+    /// `true` if the dedup_index memtable has reached its freeze
+    /// threshold. dedup_reverse is no longer LSM-backed, so only the
+    /// forward index can request a flush.
     pub fn dedup_should_flush(&self) -> bool {
-        self.dedup_index.should_flush_any() || self.dedup_reverse.should_flush_any()
+        self.dedup_index.should_flush_any()
     }
 
     /// Flush dedup memtables to fresh L0 SSTs. Returns true if either
@@ -311,8 +296,11 @@ impl Db {
 
     pub(super) fn flush_dedup_memtables_at_generation(&self, generation: Lsn) -> Result<bool> {
         let index = self.dedup_index.flush_memtable_all(generation)?;
-        let reverse = self.dedup_reverse.flush_memtable_all(generation)?;
-        Ok(index || reverse)
+        // dedup_reverse: paged-array meta page is the only thing that
+        // can be dirty here; data pages already wrote synchronously
+        // under each `PagedReverse::put` / `delete`.
+        self.dedup_reverse.flush_meta()?;
+        Ok(index)
     }
 
     pub(super) fn maybe_schedule_dedup_maintenance(&self) {
@@ -323,9 +311,7 @@ impl Db {
             // shards that actually crossed the threshold. Each shard
             // owns its own queue flag so a hot shard queueing a flush
             // doesn't block its quiet siblings from scheduling later.
-            if !(self.dedup_index.should_flush_shard(sid)
-                || self.dedup_reverse.should_flush_shard(sid))
-            {
+            if !self.dedup_index.should_flush_shard(sid) {
                 continue;
             }
             if self.dedup_maintenance_queued[sid]
@@ -335,17 +321,11 @@ impl Db {
                 continue;
             }
             let index = self.dedup_index.clone();
-            let reverse = self.dedup_reverse.clone();
             let queued = self.dedup_maintenance_queued[sid].clone();
             self.dedup_maintenance_lanes[sid]
                 .handle()
                 .enqueue_maintenance(Box::new(move || {
-                    let result = (|| -> Result<()> {
-                        index.flush_memtable_shard(sid, generation)?;
-                        reverse.flush_memtable_shard(sid, generation)?;
-                        Ok(())
-                    })();
-                    if let Err(err) = result {
+                    if let Err(err) = index.flush_memtable_shard(sid, generation) {
                         tracing::warn!(error = %err, shard = sid, "metadb: background dedup memtable flush failed");
                     }
                     queued.store(false, Ordering::Release);

@@ -45,7 +45,7 @@ pub(super) fn apply_op_bare(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     dedup_index: &ShardedLsm,
-    dedup_reverse: &ShardedLsm,
+    dedup_reverse: &crate::paged_reverse::PagedReverse,
     page_store: &Arc<PageStore>,
     lsn: Lsn,
     op: &WalOp,
@@ -85,13 +85,11 @@ pub(super) fn apply_op_bare(
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupReversePut { pba, hash } => {
-            let (key, value) = encode_reverse_entry(*pba, hash);
-            dedup_reverse.put_reverse(key, value);
+            dedup_reverse.put(*pba, *hash, lsn)?;
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupReverseDelete { pba, hash } => {
-            let (key, _) = encode_reverse_entry(*pba, hash);
-            dedup_reverse.delete_reverse(key);
+            dedup_reverse.delete(*pba, *hash, lsn)?;
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::Incref { pba, delta } => {

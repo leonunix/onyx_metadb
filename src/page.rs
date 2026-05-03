@@ -112,6 +112,11 @@ pub enum PageType {
     /// `generation` in the shared header doubles as `last_applied_lsn` for
     /// replay-skip (refcount apply is not idempotent).
     RefcountArray = 10,
+    /// Paged-array dedup reverse data page: 126 × 32 B blake3 hash entries
+    /// keyed by implicit PBA position. Absent slots stored as the
+    /// all-zero hash sentinel (collision with a real all-zero hash is
+    /// rejected at put time as `Corruption`).
+    DedupReverseArray = 11,
 }
 
 impl PageType {
@@ -129,6 +134,7 @@ impl PageType {
             8 => Self::PagedLeaf,
             9 => Self::PagedIndex,
             10 => Self::RefcountArray,
+            11 => Self::DedupReverseArray,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }

@@ -79,7 +79,7 @@ pub struct Db {
     /// row across all shards. Routing for any `(hash, pba)` pair lands
     /// in the same shard for both forward and reverse indexes, so a
     /// single dedup-pair commit hits at most one shard.
-    dedup_reverse: Arc<ShardedLsm>,
+    dedup_reverse: Arc<crate::paged_reverse::PagedReverse>,
     /// One FIFO apply lane per dedup shard. Each shard's lane
     /// preserves WAL-order apply for ops within that shard; ops in
     /// disjoint shards run in parallel because they hold disjoint

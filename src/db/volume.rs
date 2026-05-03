@@ -536,18 +536,16 @@ impl Db {
         generation: Lsn,
     ) -> Result<DedupManifestUpdate> {
         // Any manifest commit that advances checkpoint_lsn must first
-        // make the dedup memtables durable, otherwise replay would skip
-        // WAL-applied rows that only existed in RAM.
+        // make the dedup_index memtable durable, otherwise replay
+        // would skip WAL-applied rows that only existed in RAM.
+        // dedup_reverse (paged-array) writes synchronously per op via
+        // [`PagedReverse::put`] / `delete`; only the meta page may be
+        // dirty here.
         self.dedup_index.flush_memtable_all(generation)?;
-        self.dedup_reverse.flush_memtable_all(generation)?;
+        self.dedup_reverse.flush_meta()?;
 
         let old_dedup_heads: Vec<Vec<PageId>> = manifest
             .dedup_index_shard_heads
-            .iter()
-            .map(|s| s.to_vec())
-            .collect();
-        let old_dedup_reverse_heads: Vec<Vec<PageId>> = manifest
-            .dedup_reverse_shard_heads
             .iter()
             .map(|s| s.to_vec())
             .collect();
@@ -558,16 +556,15 @@ impl Db {
             .map(|heads| heads.into_boxed_slice())
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        manifest.dedup_reverse_shard_heads = self
-            .dedup_reverse
-            .persist_levels_all(generation)?
-            .into_iter()
-            .map(|heads| heads.into_boxed_slice())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        // dedup_reverse meta page id is stable across opens; mirror
+        // it back into the legacy `dedup_reverse_shard_heads` slot
+        // (single-element box) so existing manifest decode paths keep
+        // working without a schema bump.
+        manifest.dedup_reverse_shard_heads =
+            vec![vec![self.dedup_reverse.meta_page_id()].into_boxed_slice()].into_boxed_slice();
         Ok(DedupManifestUpdate {
             old_dedup_heads,
-            old_dedup_reverse_heads,
+            old_dedup_reverse_heads: Vec::new(),
         })
     }
 
@@ -578,8 +575,9 @@ impl Db {
     ) -> Result<()> {
         self.dedup_index
             .free_old_level_heads_all(&update.old_dedup_heads, generation)?;
-        self.dedup_reverse
-            .free_old_level_heads_all(&update.old_dedup_reverse_heads, generation)?;
+        // dedup_reverse: nothing to reclaim — meta page id is stable
+        // and data pages are managed inline by `PagedReverse`.
+        let _ = update.old_dedup_reverse_heads;
         Ok(())
     }
 
