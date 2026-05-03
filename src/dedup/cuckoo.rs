@@ -70,6 +70,13 @@ const _: () = {
     assert!(SLOTS_PER_PAGE == 64);
 };
 
+/// Number of per-page mutexes used to serialise concurrent
+/// read-modify-write on cuckoo data pages. A power of two makes the
+/// `page_idx & (N - 1)` mask cheap. 64 is enough to spread the load
+/// for production sizing (10⁵+ data pages) while staying in a couple
+/// of cache lines.
+const BUCKET_LOCK_SHARDS: usize = 64;
+
 pub struct CuckooHash {
     bucket_count: u64,
     seed1: u64,
@@ -78,6 +85,12 @@ pub struct CuckooHash {
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     inner: Mutex<Inner>,
+    /// Per-page-shard mutexes guarding the data-page read-modify-write
+    /// sequence. Hashing by `page_idx` so that two concurrent writes
+    /// to the same data page serialise (otherwise their bitmap
+    /// updates would clobber each other), but writes to different
+    /// pages run in parallel.
+    bucket_locks: [Mutex<()>; BUCKET_LOCK_SHARDS],
 }
 
 struct Inner {
@@ -122,6 +135,7 @@ impl CuckooHash {
                 meta_dirty: false,
                 approx_len: 0,
             }),
+            bucket_locks: std::array::from_fn(|_| Mutex::new(())),
         };
         let mut guard = me.inner.lock();
         me.flush_meta_locked(&mut guard)?;
@@ -159,6 +173,7 @@ impl CuckooHash {
                 meta_dirty: false,
                 approx_len: 0,
             }),
+            bucket_locks: std::array::from_fn(|_| Mutex::new(())),
         })
     }
 
@@ -481,27 +496,34 @@ impl CuckooHash {
         f: impl FnOnce(&mut u64, &mut Page, usize) -> Result<T>,
     ) -> Result<T> {
         let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
-        // Hold the inner mutex for the whole read-modify-write so two
-        // concurrent writes to the same page can't clobber each other.
-        // This serialises all cuckoo writes through a single mutex —
-        // current single-mutex serialisation. Per-shard or per-page
-        // sharding is a future optimisation if dedup-register
-        // throughput becomes the bottleneck.
-        let mut inner = self.inner.lock();
-        if page_idx >= inner.page_table.len() {
-            return Err(MetaDbError::Corruption(format!(
-                "cuckoo bucket_id {bucket_id} maps to page_idx {page_idx} but page_table \
-                 is only {} entries",
-                inner.page_table.len(),
-            )));
-        }
-        let (page_id, freshly_allocated) = if inner.page_table[page_idx] == 0 {
-            let pid = self.page_store.allocate()?;
-            inner.page_table[page_idx] = pid;
-            inner.meta_dirty = true;
-            (pid, true)
-        } else {
-            (inner.page_table[page_idx], false)
+        // Lock order: per-page shard FIRST, then the meta mutex.
+        // Holding the shard before resolving / allocating the page id
+        // is what makes per-page sharding race-free: a concurrent
+        // writer for the same page_idx blocks here (same shard) until
+        // the first writer has completed its read-modify-write,
+        // including the `replace_or_insert` that publishes the freshly
+        // allocated page bytes to the cache. Otherwise a second writer
+        // could observe the page-table entry under the meta mutex,
+        // race ahead of the first writer's IO, and read all-zero
+        // bytes via `get_for_modify`.
+        let _shard = self.bucket_locks[page_idx & (BUCKET_LOCK_SHARDS - 1)].lock();
+        let (page_id, freshly_allocated) = {
+            let mut inner = self.inner.lock();
+            if page_idx >= inner.page_table.len() {
+                return Err(MetaDbError::Corruption(format!(
+                    "cuckoo bucket_id {bucket_id} maps to page_idx {page_idx} but page_table \
+                     is only {} entries",
+                    inner.page_table.len(),
+                )));
+            }
+            if inner.page_table[page_idx] == 0 {
+                let pid = self.page_store.allocate()?;
+                inner.page_table[page_idx] = pid;
+                inner.meta_dirty = true;
+                (pid, true)
+            } else {
+                (inner.page_table[page_idx], false)
+            }
         };
         let mut page = if freshly_allocated {
             new_data_page()
@@ -744,5 +766,47 @@ mod tests {
         // Force a meta flush so the chain is materialised on disk.
         cuckoo.flush_meta().unwrap();
         assert!(cuckoo.inner.lock().meta_chain.len() >= 2);
+    }
+
+    #[test]
+    fn concurrent_writers_across_pages() {
+        // Drive ~1000 puts from 8 threads. Buckets are sized so that
+        // each thread's hashes spread across many data pages, so the
+        // per-page-shard locking sees genuine concurrency. Verify
+        // every key round-trips after the storm.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages");
+        let page_store = Arc::new(PageStore::create(&path).unwrap());
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
+        // 4096 buckets * 4 entries = 16384 slots, plenty of headroom
+        // for 8 * 1000 = 8000 inserts.
+        let cuckoo = Arc::new(
+            CuckooHash::create(page_store, page_cache, 4096, 0xDEAD, 0xBEEF).unwrap(),
+        );
+        let threads: Vec<_> = (0..8u8)
+            .map(|tid| {
+                let c = cuckoo.clone();
+                std::thread::spawn(move || {
+                    for i in 0..1000u32 {
+                        let mut hash = [0u8; 32];
+                        hash[0] = tid;
+                        hash[1..5].copy_from_slice(&i.to_le_bytes());
+                        c.put(hash, dv(tid), 100 + i as Lsn).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        for tid in 0..8u8 {
+            for i in 0..1000u32 {
+                let mut hash = [0u8; 32];
+                hash[0] = tid;
+                hash[1..5].copy_from_slice(&i.to_le_bytes());
+                assert_eq!(cuckoo.get(&hash).unwrap(), Some(dv(tid)));
+            }
+        }
+        assert_eq!(cuckoo.recount().unwrap(), 8000);
     }
 }
