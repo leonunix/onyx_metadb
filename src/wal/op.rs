@@ -70,8 +70,8 @@
 //! Keys use big-endian so byte order matches numeric order; that's
 //! consistent with the rest of metadb.
 
-use crate::error::{MetaDbError, Result};
 use crate::dedup_types::{DedupValue, Hash32};
+use crate::error::{MetaDbError, Result};
 use crate::paged::L2pValue;
 use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
 

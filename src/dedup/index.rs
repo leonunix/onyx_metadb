@@ -42,15 +42,15 @@
 use std::sync::Arc;
 
 use crate::cache::PageCache;
-use crate::error::Result;
 use crate::dedup_types::{DedupValue, Hash32};
+use crate::error::Result;
 use crate::page_store::PageStore;
 use crate::types::{Lsn, PageId};
 
 use super::cuckoo::CuckooHash;
+use super::fp_of;
 use super::l1_cache::{L1HotCache, LookupResult};
 use super::sketch::FpSketch;
-use super::fp_of;
 
 pub struct DedupIndex {
     sketch: FpSketch,
@@ -319,8 +319,7 @@ mod tests {
         {
             let page_store = Arc::new(PageStore::create(&path).unwrap());
             let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
-            let idx =
-                DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF).unwrap();
+            let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF).unwrap();
             meta_page_id = idx.meta_page_id();
             for i in 0..30u8 {
                 idx.put(h(i), dv(i), (100 + i as u64) as Lsn).unwrap();

@@ -256,8 +256,10 @@ impl Db {
             0xDEAD_BEEF_CAFE_F00D,
             0x1234_5678_ABCD_EF01,
         )?);
-        let dedup_reverse =
-            Arc::new(crate::paged_reverse::PagedReverse::create(page_store.clone(), page_cache.clone())?);
+        let dedup_reverse = Arc::new(crate::paged_reverse::PagedReverse::create(
+            page_store.clone(),
+            page_cache.clone(),
+        )?);
         manifest.body_version = MANIFEST_BODY_VERSION;
         manifest.refcount_shard_roots = refcount_roots;
         manifest.dedup_shards = dedup_shards;

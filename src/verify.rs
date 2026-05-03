@@ -4,13 +4,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::PagedL2p;
 use crate::error::{MetaDbError, Result};
 use crate::manifest::{LoadedManifest, Manifest, ManifestStore, load_snapshot_roots};
 use crate::page::PageType;
 use crate::page_store::PageStore;
 use crate::paged::format::{INDEX_FANOUT, index_child_at};
 use crate::types::{FIRST_DATA_PAGE, Lsn, NULL_PAGE, PageId};
-use crate::PagedL2p;
 
 #[derive(Clone, Debug, Default)]
 pub struct VerifyOptions {
@@ -390,9 +390,11 @@ fn walk_dedup_reverse_paged_array(
         // each 48 B slot is the overflow head pid.
         for slot in 0..crate::paged_reverse::ENTRIES_PER_PAGE {
             let s_off = slot * 48;
-            let overflow_pid =
-                u64::from_le_bytes(data_page.payload()[s_off + 4..s_off + 12].try_into().unwrap())
-                    as PageId;
+            let overflow_pid = u64::from_le_bytes(
+                data_page.payload()[s_off + 4..s_off + 12]
+                    .try_into()
+                    .unwrap(),
+            ) as PageId;
             if overflow_pid == 0 || overflow_pid == NULL_PAGE {
                 continue;
             }
@@ -463,4 +465,3 @@ fn walk_refcount_paged_array(
     }
     Ok(())
 }
-

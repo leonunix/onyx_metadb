@@ -40,13 +40,13 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use super::RcEntry;
 use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
-use super::RcEntry;
-use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
+use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::paged_meta;
-use crate::types::{Lsn, Pba, PageId};
+use crate::types::{Lsn, PageId, Pba};
 
 use super::delta::Pending;
 
@@ -195,11 +195,7 @@ impl PagedRefcountArray {
         Ok(())
     }
 
-    fn apply_one_page(
-        &self,
-        page_idx: usize,
-        slot_pendings: Vec<(usize, Pending)>,
-    ) -> Result<()> {
+    fn apply_one_page(&self, page_idx: usize, slot_pendings: Vec<(usize, Pending)>) -> Result<()> {
         // Resolve / allocate the page id under the inner lock; release
         // the lock before doing IO so concurrent reads on other pages
         // don't block.
@@ -364,7 +360,10 @@ mod tests {
     }
 
     fn pending(delta: i64, lsn: Lsn) -> Pending {
-        Pending { delta, last_lsn: lsn }
+        Pending {
+            delta,
+            last_lsn: lsn,
+        }
     }
 
     #[test]
@@ -380,7 +379,13 @@ mod tests {
         let (_dir, a) = make_array();
         a.apply_deltas(vec![(7, pending(1, 100))]).unwrap();
         let e = a.get(7).unwrap();
-        assert_eq!(e, RcEntry { rc: 1, birth_lsn: 100 });
+        assert_eq!(
+            e,
+            RcEntry {
+                rc: 1,
+                birth_lsn: 100
+            }
+        );
         assert_eq!(a.allocated_data_pages(), 1);
         assert_eq!(a.page_lsn(7).unwrap(), 100);
     }
@@ -393,7 +398,8 @@ mod tests {
             (1, pending(1, 100)),
             (2, pending(2, 101)),
             (3, pending(5, 102)),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(a.get(1).unwrap().rc, 1);
         assert_eq!(a.get(2).unwrap().rc, 2);
         assert_eq!(a.get(3).unwrap().rc, 5);
@@ -410,7 +416,8 @@ mod tests {
             (pba_p0, pending(1, 100)),
             (pba_p1, pending(1, 101)),
             (pba_p3, pending(1, 102)),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(a.get(pba_p0).unwrap().rc, 1);
         assert_eq!(a.get(pba_p1).unwrap().rc, 1);
         assert_eq!(a.get(pba_p3).unwrap().rc, 1);
@@ -430,21 +437,28 @@ mod tests {
             meta_page_id = a.meta_page_id();
             a.apply_deltas(vec![
                 (10, pending(3, 100)),
-                (
-                    (ENTRIES_PER_PAGE * 2 + 5) as Pba,
-                    pending(7, 200),
-                ),
-            ]).unwrap();
+                ((ENTRIES_PER_PAGE * 2 + 5) as Pba, pending(7, 200)),
+            ])
+            .unwrap();
             a.flush_meta().unwrap();
         }
         // Reopen
         let page_store = Arc::new(PageStore::open(&path).unwrap());
         let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
         let a = PagedRefcountArray::open(page_store, page_cache, meta_page_id).unwrap();
-        assert_eq!(a.get(10).unwrap(), RcEntry { rc: 3, birth_lsn: 100 });
+        assert_eq!(
+            a.get(10).unwrap(),
+            RcEntry {
+                rc: 3,
+                birth_lsn: 100
+            }
+        );
         assert_eq!(
             a.get((ENTRIES_PER_PAGE * 2 + 5) as Pba).unwrap(),
-            RcEntry { rc: 7, birth_lsn: 200 }
+            RcEntry {
+                rc: 7,
+                birth_lsn: 200
+            }
         );
         assert_eq!(a.get(0).unwrap(), RcEntry::ZERO);
         assert_eq!(a.allocated_data_pages(), 2);
@@ -455,13 +469,32 @@ mod tests {
         let (_dir, a) = make_array();
         a.apply_deltas(vec![
             (1, pending(5, 1)),
-            (3, pending(0, 0)),  // no-op, stays zero
+            (3, pending(0, 0)), // no-op, stays zero
             (7, pending(9, 2)),
-        ]).unwrap();
+        ])
+        .unwrap();
         let live = a.iter_live().unwrap();
         assert_eq!(live.len(), 2);
-        assert_eq!(live[0], (1, RcEntry { rc: 5, birth_lsn: 1 }));
-        assert_eq!(live[1], (7, RcEntry { rc: 9, birth_lsn: 2 }));
+        assert_eq!(
+            live[0],
+            (
+                1,
+                RcEntry {
+                    rc: 5,
+                    birth_lsn: 1
+                }
+            )
+        );
+        assert_eq!(
+            live[1],
+            (
+                7,
+                RcEntry {
+                    rc: 9,
+                    birth_lsn: 2
+                }
+            )
+        );
     }
 
     #[test]

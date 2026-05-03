@@ -27,4 +27,4 @@
 //! shared `PageCache`.
 
 pub mod array;
-pub use array::{PagedReverse, ENTRIES_PER_PAGE};
+pub use array::{ENTRIES_PER_PAGE, PagedReverse};

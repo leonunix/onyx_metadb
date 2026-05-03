@@ -773,7 +773,8 @@ impl Db {
                     });
                 }
                 WalOp::DedupPut { hash, .. } | WalOp::DedupDelete { hash, .. } => {
-                    let sid = crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    let sid =
+                        crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
                     dedup_buckets[sid].push(idx);
                 }
                 WalOp::DedupReversePut { hash, .. } | WalOp::DedupReverseDelete { hash, .. } => {
@@ -781,7 +782,8 @@ impl Db {
                     // pair must land in the same shard so the dedup
                     // invariant survives a single commit. Route by
                     // hash here, not the encoded reverse key.
-                    let sid = crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    let sid =
+                        crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
                     dedup_buckets[sid].push(idx);
                 }
                 WalOp::DropSnapshot { .. }
@@ -824,12 +826,8 @@ impl Db {
         // Snapshot refcount shard handles once per commit so the per-lane
         // closures can do guarded-remap rc lookups (dedup hits) without
         // touching the Db struct from the worker thread.
-        let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> = Arc::new(
-            self.refcount_shards
-                .iter()
-                .map(|s| s.rc.clone())
-                .collect(),
-        );
+        let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> =
+            Arc::new(self.refcount_shards.iter().map(|s| s.rc.clone()).collect());
         for ((vol_ord, sid), indices) in plan.l2p_sorted {
             let volume = volumes
                 .get(&vol_ord)
@@ -1299,13 +1297,11 @@ impl Db {
         timing.dedup_enqueue = dedup_enqueue_started.elapsed();
         let dedup_wait_started = std::time::Instant::now();
         for rx in dedup_receivers {
-            let dedup_outcomes = rx
-                .recv()
-                .map_err(|_| {
-                    MetaDbError::Corruption(
-                        "persistent dedup lane worker failed to return a result".into(),
-                    )
-                })??;
+            let dedup_outcomes = rx.recv().map_err(|_| {
+                MetaDbError::Corruption(
+                    "persistent dedup lane worker failed to return a result".into(),
+                )
+            })??;
             for (idx, outcome) in dedup_outcomes {
                 outcomes[idx] = Some(outcome);
             }

@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
-use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
+use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::types::{Lsn, PageId};
 
@@ -96,10 +96,13 @@ pub fn read_chain(
         }
         let chunk_len =
             u32::from_le_bytes(payload[header_off..header_off + 4].try_into().unwrap()) as usize;
-        let next = u64::from_le_bytes(
-            payload[header_off + 8..header_off + 16].try_into().unwrap(),
-        ) as PageId;
-        let chunk_cap = if is_head { head_capacity(head_extra) } else { CONTINUATION_CAPACITY };
+        let next = u64::from_le_bytes(payload[header_off + 8..header_off + 16].try_into().unwrap())
+            as PageId;
+        let chunk_cap = if is_head {
+            head_capacity(head_extra)
+        } else {
+            CONTINUATION_CAPACITY
+        };
         if chunk_len > chunk_cap {
             return Err(MetaDbError::Corruption(format!(
                 "meta chain page {next_pid} chunk_len {chunk_len} exceeds capacity {chunk_cap}",
@@ -114,7 +117,11 @@ pub fn read_chain(
         next_pid = next;
         is_head = false;
     }
-    Ok(ReadResult { head_extra: head_extra_bytes, page_table, chain_pids })
+    Ok(ReadResult {
+        head_extra: head_extra_bytes,
+        page_table,
+        chain_pids,
+    })
 }
 
 /// Persist `page_table` across a chain rooted at `existing_chain[0]`.
@@ -168,7 +175,11 @@ pub fn write_chain(
 
     // Trailing pages from the previous chain go on the free list once
     // the new chain has been written.
-    let to_free: Vec<PageId> = existing_chain.iter().skip(new_chain.len()).copied().collect();
+    let to_free: Vec<PageId> = existing_chain
+        .iter()
+        .skip(new_chain.len())
+        .copied()
+        .collect();
 
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         let pid = new_chain[chunk_idx];
@@ -249,9 +260,8 @@ where
         let header_off = if is_head { head_extra } else { 0 };
         let chunk_len =
             u32::from_le_bytes(payload[header_off..header_off + 4].try_into().unwrap()) as usize;
-        let next = u64::from_le_bytes(
-            payload[header_off + 8..header_off + 16].try_into().unwrap(),
-        ) as PageId;
+        let next = u64::from_le_bytes(payload[header_off + 8..header_off + 16].try_into().unwrap())
+            as PageId;
         let entries_off = header_off + CHAIN_HEADER_BYTES;
         for i in 0..chunk_len {
             let off = entries_off + i * 8;
@@ -397,8 +407,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chain.len(), 2);
-        let read =
-            read_chain(&store, head, PageType::CuckooData, 0xFFFF, extra.len()).unwrap();
+        let read = read_chain(&store, head, PageType::CuckooData, 0xFFFF, extra.len()).unwrap();
         assert_eq!(read.head_extra, extra);
         assert_eq!(read.page_table, table);
     }

@@ -58,10 +58,9 @@ fn mk_cfg(path: &Path) -> Config {
     cfg
 }
 
-/// Populate a fresh database with `ENTRIES` dedup records, flush the
-/// memtable (so lookups actually exercise the SST read path), then
-/// close. Returns the directory so the caller can re-open with a
-/// fresh cache.
+/// Populate a fresh database with `ENTRIES` dedup records, flush so
+/// lookups exercise the on-disk cuckoo read path, then close.
+/// Returns the directory so the caller can re-open with a fresh cache.
 fn populate_and_close() -> TempDir {
     let dir = TempDir::new().unwrap();
     let cfg = mk_cfg(dir.path());
@@ -69,15 +68,7 @@ fn populate_and_close() -> TempDir {
     for i in 0..ENTRIES {
         db.put_dedup(h(i), dv(i)).unwrap();
     }
-    // Force the memtable out so subsequent lookups hit the bloom +
-    // SST data pages — that's the path the cache speeds up.
     db.flush().unwrap();
-    // Run flush_dedup_memtable twice so that whether or not the first
-    // call actually had anything to flush, the second call is a no-op
-    // and returns false — we don't care which; we just want to make
-    // sure any buffered memtable contents have landed as an SST.
-    let _ = db.flush_dedup_memtable().unwrap();
-    let _ = db.flush_dedup_memtable().unwrap();
     dir
 }
 

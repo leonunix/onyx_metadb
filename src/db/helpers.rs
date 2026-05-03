@@ -168,11 +168,8 @@ pub(super) fn open_shards(
 ) -> Result<Vec<Shard>> {
     let mut shards = Vec::with_capacity(roots.len());
     for (shard_idx, &meta_page_id) in roots.iter().enumerate() {
-        let rc = crate::refcount::RcShard::open(
-            page_store.clone(),
-            page_cache.clone(),
-            meta_page_id,
-        )?;
+        let rc =
+            crate::refcount::RcShard::open(page_store.clone(), page_cache.clone(), meta_page_id)?;
         shards.push(Shard {
             rc: Arc::new(rc),
             apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx),

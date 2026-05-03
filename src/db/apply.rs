@@ -94,10 +94,9 @@ pub(super) fn apply_op_bare(
         }
         WalOp::Incref { pba, delta } => {
             let sid = shard_for_key(refcount_shards, *pba);
-            let (_, new) =
-                refcount_shards[sid]
-                    .rc
-                    .stage(*pba, i64::from(*delta), lsn)?;
+            let (_, new) = refcount_shards[sid]
+                .rc
+                .stage(*pba, i64::from(*delta), lsn)?;
             Ok(ApplyOutcome::RefcountNew(new))
         }
         WalOp::Decref { pba, delta } => {
@@ -388,8 +387,7 @@ pub(super) fn apply_l2p_range_delete(
                 // Per-snap fast filter via birth_lsn, same shape as
                 // apply_l2p_remap. Look up birth_lsn first under the
                 // rc shard mutex, then walk only candidate snaps.
-                let captured_birth =
-                    lookup_birth_lsn(refcount_shards, captured_value.head_pba())?;
+                let captured_birth = lookup_birth_lsn(refcount_shards, captured_value.head_pba())?;
                 for s in snap_infos {
                     if let Some(b) = captured_birth {
                         if b > s.created_lsn {

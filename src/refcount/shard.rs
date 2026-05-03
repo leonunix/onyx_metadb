@@ -16,7 +16,7 @@ use super::RcEntry;
 use crate::cache::PageCache;
 use crate::error::Result;
 use crate::page_store::PageStore;
-use crate::types::{Lsn, Pba, PageId};
+use crate::types::{Lsn, PageId, Pba};
 
 use super::apply_delta_pure;
 use super::array::PagedRefcountArray;
@@ -181,7 +181,10 @@ mod tests {
         assert_eq!(s.get(10).unwrap(), 5);
         assert_eq!(
             s.get_entry(10).unwrap(),
-            RcEntry { rc: 5, birth_lsn: 100 }
+            RcEntry {
+                rc: 5,
+                birth_lsn: 100
+            }
         );
     }
 
@@ -205,7 +208,10 @@ mod tests {
         s.flush().unwrap();
         assert_eq!(
             s.get_entry(10).unwrap(),
-            RcEntry { rc: 1, birth_lsn: 200 }
+            RcEntry {
+                rc: 1,
+                birth_lsn: 200
+            }
         );
     }
 

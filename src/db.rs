@@ -21,8 +21,8 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::apply_gate::ApplyGate;
 use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
-use crate::error::{MetaDbError, Result};
 use crate::dedup_types::{DedupValue, Hash32};
+use crate::error::{MetaDbError, Result};
 use crate::manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VolumeEntry,
     write_snapshot_roots_page,
