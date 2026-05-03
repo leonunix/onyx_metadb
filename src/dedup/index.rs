@@ -97,10 +97,10 @@ impl DedupIndex {
     }
 
     fn rebuild_l0_from_l3(&self) -> Result<()> {
-        for (hash, _value) in self.cuckoo.iter()? {
+        self.cuckoo.for_each(|hash, _value| {
             self.sketch.insert(fp_of(&hash));
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn meta_page_id(&self) -> PageId {

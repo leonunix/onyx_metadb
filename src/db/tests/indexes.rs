@@ -306,40 +306,6 @@ fn dedup_flush_to_l0_flushes_reverse_index_too() {
     assert!(!db.dedup_should_flush());
 }
 
-#[ignore = "v9: dataset (40K entries) exceeds the default cuckoo capacity (~32K @ load 1.0); rewrite once chained meta pages land in stage 3.x"]
-#[test]
-fn cache_stats_show_hits_evictions_and_respect_budget() {
-    let cache_budget = 1024 * 1024;
-    let (_d, db) = mk_db_with_cache_bytes(cache_budget);
-
-    for i in 0u64..40_000 {
-        db.put_dedup(h(i), dv((i % 251) as u8)).unwrap();
-    }
-    assert!(db.flush_dedup_memtable().unwrap());
-
-    let cold = db.cache_stats();
-    assert_eq!(
-        db.get_dedup(&h(12_345)).unwrap(),
-        Some(dv((12_345 % 251) as u8))
-    );
-    let after_first = db.cache_stats();
-    assert!(after_first.misses > cold.misses);
-
-    assert_eq!(
-        db.get_dedup(&h(12_345)).unwrap(),
-        Some(dv((12_345 % 251) as u8))
-    );
-    let after_second = db.cache_stats();
-    assert!(after_second.hits > after_first.hits);
-
-    for i in (0u64..40_000).step_by(crate::lsm::RECORDS_PER_PAGE) {
-        assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dv((i % 251) as u8)));
-    }
-    let after_sweep = db.cache_stats();
-    assert!(after_sweep.evictions > 0);
-    assert!(after_sweep.current_bytes <= cache_budget);
-}
-
 #[test]
 fn dedup_survives_flush_and_reopen() {
     let dir = TempDir::new().unwrap();
@@ -410,29 +376,6 @@ fn drop_snapshot_releases_refcount_state() {
     let _ = db.drop_snapshot(s).unwrap().unwrap();
     for pba in 0u64..200 {
         assert_eq!(db.get_refcount(pba).unwrap(), 2);
-    }
-}
-
-#[ignore = "v9: cuckoo dedup_index has no LSM levels and no compaction; obsolete with the metadb-restructure-v9 swap"]
-#[test]
-fn dedup_compaction_can_be_triggered_from_db() {
-    let (_d, db) = mk_db();
-    for batch in 0..4u64 {
-        for i in 0u64..10 {
-            db.put_dedup(h(batch * 100 + i), dv(batch as u8)).unwrap();
-        }
-        db.flush_dedup_memtable().unwrap();
-    }
-    // With 4 L0 SSTs we're at the default trigger; compaction
-    // should do something.
-    assert!(db.compact_dedup_once().unwrap());
-    for batch in 0..4u64 {
-        for i in 0u64..10 {
-            assert_eq!(
-                db.get_dedup(&h(batch * 100 + i)).unwrap(),
-                Some(dv(batch as u8)),
-            );
-        }
     }
 }
 

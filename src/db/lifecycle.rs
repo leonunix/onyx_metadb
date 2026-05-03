@@ -935,9 +935,9 @@ impl Db {
         (LsmStats::default(), LsmStats::default())
     }
 
-    /// Per-shard dedup stats are gone in v9 — cuckoo dedup_index has
-    /// no shard concept and paged-array dedup_reverse uses a single
-    /// page table. Returns empty vecs.
+    /// Per-shard dedup stats are unavailable: the cuckoo dedup_index
+    /// has no shard concept and paged-array dedup_reverse uses a
+    /// single page table. Returns empty vecs.
     pub fn dedup_lsm_stats_per_shard(&self) -> (Vec<LsmStats>, Vec<LsmStats>) {
         (Vec::new(), Vec::new())
     }

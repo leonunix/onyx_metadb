@@ -244,10 +244,9 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         // walked once at the top level above.
     }
 
-    // dedup_index moved to cuckoo in v9 — the legacy
-    // `dedup_index_shard_heads` slot now carries `[[meta_page_id]]`
-    // (single-element box). Walk the cuckoo meta page + every data
-    // page it indexes.
+    // The legacy `dedup_index_shard_heads` manifest slot now carries
+    // `[[meta_page_id]]` (single-element box) for the cuckoo. Walk
+    // the cuckoo meta page + every data page it indexes.
     let dedup_index_meta_pid: PageId = manifest
         .dedup_index_shard_heads
         .first()
@@ -256,11 +255,10 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
     if dedup_index_meta_pid != NULL_PAGE {
         walk_cuckoo_dedup_index(page_store, dedup_index_meta_pid, &mut live)?;
     }
-    // dedup_reverse moved to paged-array in v9 — the legacy
-    // `dedup_reverse_shard_heads` slot now carries
-    // `[[meta_page_id]]` (single-element box). Walk that meta page +
-    // every data page it indexes, plus any overflow pages reachable
-    // from those data pages.
+    // The legacy `dedup_reverse_shard_heads` manifest slot now
+    // carries `[[meta_page_id]]` (single-element box) for the paged
+    // array. Walk the meta page + every data page it indexes + any
+    // overflow pages reachable from those data pages.
     let dedup_reverse_meta_pid: PageId = manifest
         .dedup_reverse_shard_heads
         .first()
@@ -489,11 +487,10 @@ fn walk_refcount_paged_array(
     Ok(())
 }
 
-// Dead code as of metadb-restructure-v9 Stage 1: the only verifier
-// caller used to be the refcount roots loop; that now walks the
-// paged-array meta page via [`walk_refcount_paged_array`]. Kept
-// behind `#[allow(dead_code)]` until the BTree module is removed
-// in cleanup.
+// Dead code: the only verifier caller used to be the refcount
+// roots loop, which now walks the paged-array meta page via
+// [`walk_refcount_paged_array`]. Kept behind `#[allow(dead_code)]`
+// until the BTree module is removed.
 #[allow(dead_code)]
 fn walk_btree(
     page_store: &PageStore,

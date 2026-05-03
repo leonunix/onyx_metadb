@@ -12,13 +12,11 @@
 //! │ L2  shared `PageCache` (already exists; cuckoo pages  │
 //! │     read here on first touch, stay hot under LRU)     │
 //! ├───────────────────────────────────────────────────────┤
-//! │ L3  on-disk cuckoo hash table (stage 3.2)             │
+//! │ L3  on-disk cuckoo hash table                         │
 //! └───────────────────────────────────────────────────────┘
 //! ```
 //!
-//! L0/L1 are built on Day 3 of the metadb-restructure-v9 plan;
-//! L2 reuses [`crate::cache::PageCache`] without changes; L3 lands
-//! in stage 3.2 once the on-disk cuckoo layout is in place.
+//! L2 reuses [`crate::cache::PageCache`] without changes.
 
 pub mod cuckoo;
 pub mod index;

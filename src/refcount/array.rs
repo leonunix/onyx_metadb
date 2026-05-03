@@ -32,7 +32,7 @@
 //!       no data page allocated yet (rc all zero).
 //!
 //! Single meta page caps a shard at 503 × 336 = 169_008 PBAs. Stage 1
-//! validation only; chain extension lands in stage 1.3c so the cap
+//! validation only; chained meta pages are a future extension so the cap
 //! grows with shard count.
 //!
 //! # Concurrency
@@ -220,7 +220,7 @@ impl PagedRefcountArray {
         if page_idx >= META_TABLE_CAPACITY {
             return Err(MetaDbError::InvalidArgument(format!(
                 "refcount page_idx {page_idx} exceeds single-meta-page capacity {META_TABLE_CAPACITY}; \
-                 chained meta pages land in stage 1.3c",
+                 chained meta pages are a future extension",
             )));
         }
 
@@ -271,13 +271,15 @@ impl PagedRefcountArray {
     }
 
     /// Persist the meta page if it has been mutated since the last
-    /// flush. Idempotent / no-op when clean.
-    pub fn flush_meta(&self) -> Result<()> {
-        let inner = self.inner.lock();
-        if inner.meta_dirty {
-            self.flush_meta_locked(&inner)?;
+    /// flush. Returns `true` when a write actually happened.
+    pub fn flush_meta(&self) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if !inner.meta_dirty {
+            return Ok(false);
         }
-        Ok(())
+        self.flush_meta_locked(&inner)?;
+        inner.meta_dirty = false;
+        Ok(true)
     }
 
     fn flush_meta_locked(&self, inner: &parking_lot::MutexGuard<'_, Inner>) -> Result<()> {

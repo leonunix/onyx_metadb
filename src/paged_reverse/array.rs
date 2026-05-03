@@ -208,7 +208,7 @@ impl PagedReverse {
         if page_idx >= META_TABLE_CAPACITY {
             return Err(MetaDbError::InvalidArgument(format!(
                 "dedup_reverse page_idx {page_idx} exceeds single-meta-page capacity {META_TABLE_CAPACITY}; \
-                 chained meta pages land in stage 2.x",
+                 chained meta pages are a future extension",
             )));
         }
         let (page_id, freshly_allocated) = {
@@ -332,12 +332,16 @@ impl PagedReverse {
         Ok(next)
     }
 
-    pub fn flush_meta(&self) -> Result<()> {
-        let inner = self.inner.lock();
-        if inner.meta_dirty {
-            self.flush_meta_locked(&inner)?;
+    /// Persist the meta page if it has been mutated since the last
+    /// flush. Returns `true` when a write actually happened.
+    pub fn flush_meta(&self) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if !inner.meta_dirty {
+            return Ok(false);
         }
-        Ok(())
+        self.flush_meta_locked(&inner)?;
+        inner.meta_dirty = false;
+        Ok(true)
     }
 
     fn flush_meta_locked(&self, inner: &parking_lot::MutexGuard<'_, Inner>) -> Result<()> {

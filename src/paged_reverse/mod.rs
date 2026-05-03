@@ -1,6 +1,6 @@
 //! Paged-array dedup-reverse store.
 //!
-//! Replaces the LSM-backed dedup_reverse for the v9 layout. The reverse
+//! Replaces the LSM-backed dedup_reverse. The reverse
 //! index has exactly one access pattern in onyx — `cleanup_dead_pba`
 //! looking up every hash registered for a given PBA — so a sparse
 //! paged array indexed by PBA collapses the per-call cost from "scan

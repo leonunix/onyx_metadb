@@ -107,7 +107,7 @@ impl CuckooHash {
             return Err(MetaDbError::InvalidArgument(format!(
                 "cuckoo bucket_count {bucket_count} requires {total_pages} pages, exceeds \
                  single-meta-page capacity {META_TABLE_CAPACITY}; chained meta pages land \
-                 in stage 3.x",
+                 until chained meta pages support arbitrary sizes",
             )));
         }
         let meta_page_id = page_store.allocate()?;
@@ -252,11 +252,27 @@ impl CuckooHash {
     /// then bucket then slot (deterministic but not lexicographic on
     /// hash). Used by the verifier and offline tools.
     pub fn iter(&self) -> Result<Vec<(Hash32, DedupValue)>> {
+        let mut out = Vec::new();
+        self.for_each(|hash, value| {
+            out.push((hash, value));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Streaming walk over every live `(hash, value)` pair without
+    /// materialising the result vec. The L0 rebuild path uses this
+    /// so a 10 M-entry dedup index doesn't allocate ~600 MiB of
+    /// `(Hash32, DedupValue)` tuples just to extract the
+    /// fingerprints.
+    pub fn for_each<F>(&self, mut visit: F) -> Result<()>
+    where
+        F: FnMut(Hash32, DedupValue) -> Result<()>,
+    {
         let snapshot = {
             let inner = self.inner.lock();
             inner.page_table.clone()
         };
-        let mut out = Vec::new();
         for &pid in &snapshot {
             if pid == 0 {
                 continue;
@@ -266,11 +282,11 @@ impl CuckooHash {
             for slot in 0..SLOTS_PER_PAGE {
                 if bitmap & (1u64 << slot) != 0 {
                     let (h, v) = read_slot(&page, slot);
-                    out.push((h, v));
+                    visit(h, v)?;
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Recompute `approx_len` from the current on-disk state. O(N).
@@ -454,7 +470,7 @@ impl CuckooHash {
             }
             // Pick a victim slot deterministically (slot 0 — sufficient
             // for the tests we have; more sophisticated selection
-            // helps load-factor headroom and lands in stage 3.x).
+            // helps load-factor headroom and is a future optimisation).
             let victim = self.swap_into_bucket_slot0(current_bucket, hash, value, lsn)?;
             hash = victim.0;
             value = victim.1;
@@ -491,8 +507,9 @@ impl CuckooHash {
         // Hold the inner mutex for the whole read-modify-write so two
         // concurrent writes to the same page can't clobber each other.
         // This serialises all cuckoo writes through a single mutex —
-        // adequate for the v1 swap; stage 3.x can shard the index if
-        // dedup-register throughput becomes the new bottleneck.
+        // current single-mutex serialisation. Per-shard or per-page
+        // sharding is a future optimisation if dedup-register
+        // throughput becomes the bottleneck.
         let mut inner = self.inner.lock();
         if page_idx >= inner.page_table.len() {
             return Err(MetaDbError::Corruption(format!(
@@ -512,7 +529,7 @@ impl CuckooHash {
         let mut page = if freshly_allocated {
             new_data_page()
         } else {
-            (*self.page_cache.get(page_id)?).clone()
+            self.page_cache.get_for_modify(page_id)?
         };
         let mut bitmap = read_bitmap(&page);
         let result = f(&mut bitmap, &mut page, bucket_in_page)?;
