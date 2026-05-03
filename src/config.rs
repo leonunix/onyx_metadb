@@ -129,7 +129,9 @@ pub struct Config {
     /// so the upper-bound capacity is `dedup_cuckoo_buckets * 4`. Pick
     /// `target_entries / (4 * load_factor)`; a load factor over ~0.85
     /// makes cuckoo eviction chains long and risks `Corruption("table
-    /// full")`. Recorded in the manifest at `Db::create`.
+    /// full")`. Page-table chaining (`crate::paged_meta`) lifts the old
+    /// single-meta-page cap, so the bucket count can now scale with
+    /// the working set. Recorded in the manifest at `Db::create`.
     pub dedup_cuckoo_buckets: u64,
 
     /// Maximum number of entries kept in the dedup_index L1 hot
@@ -171,16 +173,19 @@ impl Config {
             index_pin_bytes: 512 * 1024 * 1024,
             rebuild_free_list_on_open: true,
             reclaim_orphans_on_open: true,
-            // Single-meta-page cap is 503 pages × 16 buckets =
-            // 8 048 buckets × 4 entries = ~32 K cuckoo capacity at
-            // load factor 1.0 (target ~27 K at 0.85). Sized for
-            // unit tests + small soaks; production overrides via
-            // config until chained meta pages land in stage 3.x.
-            dedup_cuckoo_buckets: 8_000,
-            // 8 K L1 hot cache by default — matches the test-scale
-            // capacity above. Production should bump in lock-step
-            // with `dedup_cuckoo_buckets`.
-            dedup_l1_cache_entries: 8_000,
+            // 1 M buckets × 4 entries = 4 M cuckoo capacity at load
+            // factor 1.0 (target ~3.4 M at 0.85). Sized for soak +
+            // small production deployments; large production should
+            // override based on expected unique-hash count. The
+            // chained meta-page layout grows automatically, so the
+            // ceiling is page-store free space rather than a fixed
+            // single-meta-page cap.
+            dedup_cuckoo_buckets: 1_000_000,
+            // 64 K L1 hot cache — sized to keep recently-touched
+            // entries warm without dominating RAM. Each entry is
+            // ~64 B, so 64 K ≈ 4 MiB. Production should bump in
+            // lock-step with the working-set size.
+            dedup_l1_cache_entries: 64_000,
         }
     }
 }
