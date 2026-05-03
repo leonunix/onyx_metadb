@@ -218,7 +218,8 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         if meta_pid == NULL_PAGE {
             continue;
         }
-        live.mark(meta_pid);
+        // Walker marks every meta page in the chain (head + continuations)
+        // via its on_meta callback, matching walk_cuckoo / walk_dedup_reverse.
         walk_refcount_paged_array(page_store, meta_pid, &mut live, &mut seen_btree)?;
     }
 
@@ -326,7 +327,7 @@ fn walk_paged_tree(
     }
 }
 
-/// Walk the dedup_index cuckoo meta page + every allocated data
+/// Walk the dedup_index cuckoo meta chain + every allocated data
 /// page, marking them as live. Cuckoo data pages have no further
 /// outgoing references (no overflow chain like dedup_reverse).
 fn walk_cuckoo_dedup_index(
@@ -334,22 +335,15 @@ fn walk_cuckoo_dedup_index(
     meta_pid: PageId,
     live: &mut LivePages,
 ) -> Result<()> {
-    live.mark(meta_pid);
-    let meta_page = page_store.read_page(meta_pid)?;
-    let header = meta_page.header()?;
-    if header.page_type != PageType::CuckooData {
-        return Err(MetaDbError::Corruption(format!(
-            "cuckoo meta page {meta_pid} has wrong type {:?}",
-            header.page_type
-        )));
-    }
-    let payload = meta_page.payload();
-    // bytes 24..28 carry the data-page count; the page-table starts
-    // at the 32 B meta header (see `dedup::cuckoo`).
-    let page_count = u32::from_le_bytes(payload[24..28].try_into().unwrap()) as usize;
-    for i in 0..page_count {
-        let off = 32 + i * 8;
-        let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
+    let page_table = crate::paged_meta::walk_chain(
+        page_store,
+        meta_pid,
+        PageType::CuckooData,
+        0xFFFF,
+        24, // bucket_count + seed1 + seed2
+        |pid| live.mark(pid),
+    )?;
+    for pid in page_table {
         // Cuckoo's page-table uses 0 (not NULL_PAGE) as the
         // "unallocated" sentinel — a hole in the bucket → page
         // mapping. Real data pages are always >= FIRST_DATA_PAGE.
@@ -369,7 +363,7 @@ fn walk_cuckoo_dedup_index(
     Ok(())
 }
 
-/// Walk the dedup_reverse paged-array meta page, then each
+/// Walk the dedup_reverse paged-array meta chain, then each
 /// allocated data page, then every overflow page in the chains those
 /// data pages point at, marking them all as live.
 fn walk_dedup_reverse_paged_array(
@@ -377,20 +371,15 @@ fn walk_dedup_reverse_paged_array(
     meta_pid: PageId,
     live: &mut LivePages,
 ) -> Result<()> {
-    live.mark(meta_pid);
-    let meta_page = page_store.read_page(meta_pid)?;
-    let header = meta_page.header()?;
-    if header.page_type != PageType::DedupReverseArray {
-        return Err(MetaDbError::Corruption(format!(
-            "dedup_reverse meta page {meta_pid} has wrong type {:?}",
-            header.page_type
-        )));
-    }
-    let payload = meta_page.payload();
-    let page_count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-    for i in 0..page_count {
-        let off = 8 + i * 8;
-        let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
+    let page_table = crate::paged_meta::walk_chain(
+        page_store,
+        meta_pid,
+        PageType::DedupReverseArray,
+        0xFFFF,
+        0,
+        |pid| live.mark(pid),
+    )?;
+    for pid in page_table {
         // Same sentinel conventions as cuckoo: 0 marks a hole.
         if pid == 0 || pid == NULL_PAGE {
             continue;
@@ -443,7 +432,7 @@ fn walk_dedup_reverse_overflow_chain(
     Ok(())
 }
 
-/// Walk the paged-array refcount shard's meta page and mark every
+/// Walk the paged-array refcount shard's meta chain and mark every
 /// allocated data page as live. Replaces the legacy `walk_btree` for
 /// refcount roots.
 fn walk_refcount_paged_array(
@@ -455,19 +444,15 @@ fn walk_refcount_paged_array(
     if !seen.insert(meta_pid) {
         return Ok(());
     }
-    let meta_page = page_store.read_page(meta_pid)?;
-    let header = meta_page.header()?;
-    if header.page_type != PageType::RefcountArray {
-        return Err(MetaDbError::Corruption(format!(
-            "refcount meta page {meta_pid} has wrong type {:?}",
-            header.page_type
-        )));
-    }
-    let payload = meta_page.payload();
-    let page_count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-    for i in 0..page_count {
-        let off = 8 + i * 8;
-        let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
+    let page_table = crate::paged_meta::walk_chain(
+        page_store,
+        meta_pid,
+        PageType::RefcountArray,
+        0xFFFF,
+        0,
+        |pid| live.mark(pid),
+    )?;
+    for pid in page_table {
         // 0 = unallocated (paged-array hole sentinel).
         if pid == 0 || pid == NULL_PAGE {
             continue;

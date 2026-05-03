@@ -28,9 +28,12 @@
 //! ```
 //! 16 + 125 × 32 = 4016 B used, 16 B padding to 4032 B.
 //!
-//! ## Meta page (PageType::DedupReverseArray, marker `key_count = 0xFFFF`)
-//! Same layout as in the refcount module: a `(page_count, [u64;…])`
-//! page table mapping `page_idx → on-disk PageId`.
+//! ## Meta page chain (PageType::DedupReverseArray, `key_count = 0xFFFF`)
+//! Each meta page carries a fixed 16 B chain header (`chunk_len: u32`,
+//! reserved `u32`, `next_meta_pid: u64`) followed by a slice of the
+//! page table. The head meta pid is recorded in the manifest;
+//! continuation pages are reachable via the chain pointer (see
+//! [`crate::paged_meta`]).
 //!
 //! `generation` on every page is the page's `last_applied_lsn` so
 //! `put` / `delete` can replay-skip when a crash repeats an op.
@@ -45,13 +48,11 @@ use crate::error::{MetaDbError, Result};
 use crate::lsm::Hash32;
 use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
 use crate::page_store::PageStore;
+use crate::paged_meta;
 use crate::types::{Lsn, Pba, PageId};
 
 pub const ENTRIES_PER_PAGE: usize = 84;
 const SLOT_BYTES: usize = 48;
-const META_HEADER_BYTES: usize = 8;
-const META_TABLE_CAPACITY: usize =
-    (PAGE_PAYLOAD_SIZE - META_HEADER_BYTES) / std::mem::size_of::<u64>();
 
 const OVERFLOW_HEADER_BYTES: usize = 16;
 const OVERFLOW_HASHES_PER_PAGE: usize = (PAGE_PAYLOAD_SIZE - OVERFLOW_HEADER_BYTES) / 32;
@@ -76,6 +77,7 @@ pub struct PagedReverse {
 
 struct Inner {
     page_table: Vec<PageId>,
+    meta_chain: Vec<PageId>,
     meta_dirty: bool,
 }
 
@@ -88,10 +90,13 @@ impl PagedReverse {
             meta_page_id,
             inner: Mutex::new(Inner {
                 page_table: Vec::new(),
+                meta_chain: vec![meta_page_id],
                 meta_dirty: false,
             }),
         };
-        me.flush_meta_locked(&me.inner.lock())?;
+        let mut guard = me.inner.lock();
+        me.flush_meta_locked(&mut guard)?;
+        drop(guard);
         Ok(me)
     }
 
@@ -100,35 +105,20 @@ impl PagedReverse {
         page_cache: Arc<PageCache>,
         meta_page_id: PageId,
     ) -> Result<Self> {
-        let meta_page = page_store.read_page(meta_page_id)?;
-        let header = meta_page.header()?;
-        if header.page_type != PageType::DedupReverseArray
-            || header.key_count != META_KEY_COUNT_MARKER
-        {
-            return Err(MetaDbError::Corruption(format!(
-                "dedup_reverse meta page {meta_page_id} has wrong header (type={:?}, key_count={})",
-                header.page_type, header.key_count,
-            )));
-        }
-        let payload = meta_page.payload();
-        let page_count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-        if page_count > META_TABLE_CAPACITY {
-            return Err(MetaDbError::Corruption(format!(
-                "dedup_reverse meta page page_count {page_count} > capacity {META_TABLE_CAPACITY}",
-            )));
-        }
-        let mut page_table = Vec::with_capacity(page_count);
-        for i in 0..page_count {
-            let off = META_HEADER_BYTES + i * 8;
-            let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
-            page_table.push(pid);
-        }
+        let read = paged_meta::read_chain(
+            &page_store,
+            meta_page_id,
+            PageType::DedupReverseArray,
+            META_KEY_COUNT_MARKER,
+            0,
+        )?;
         Ok(Self {
             page_store,
             page_cache,
             meta_page_id,
             inner: Mutex::new(Inner {
-                page_table,
+                page_table: read.page_table,
+                meta_chain: read.chain_pids,
                 meta_dirty: false,
             }),
         })
@@ -205,12 +195,6 @@ impl PagedReverse {
         update: impl FnOnce(&[Hash32]) -> Result<Vec<Hash32>>,
     ) -> Result<()> {
         let (page_idx, slot) = page_offset(pba);
-        if page_idx >= META_TABLE_CAPACITY {
-            return Err(MetaDbError::InvalidArgument(format!(
-                "dedup_reverse page_idx {page_idx} exceeds single-meta-page capacity {META_TABLE_CAPACITY}; \
-                 chained meta pages are a future extension",
-            )));
-        }
         let (page_id, freshly_allocated) = {
             let mut inner = self.inner.lock();
             if page_idx >= inner.page_table.len() {
@@ -332,41 +316,30 @@ impl PagedReverse {
         Ok(next)
     }
 
-    /// Persist the meta page if it has been mutated since the last
+    /// Persist the meta chain if it has been mutated since the last
     /// flush. Returns `true` when a write actually happened.
     pub fn flush_meta(&self) -> Result<bool> {
         let mut inner = self.inner.lock();
         if !inner.meta_dirty {
             return Ok(false);
         }
-        self.flush_meta_locked(&inner)?;
+        self.flush_meta_locked(&mut inner)?;
         inner.meta_dirty = false;
         Ok(true)
     }
 
-    fn flush_meta_locked(&self, inner: &parking_lot::MutexGuard<'_, Inner>) -> Result<()> {
-        let mut page = Page::new(PageHeader {
-            page_type: PageType::DedupReverseArray,
-            version: crate::page::PAGE_VERSION,
-            key_count: META_KEY_COUNT_MARKER,
-            flags: 0,
-            generation: 0,
-            refcount: 1,
-        });
-        {
-            let payload = page.payload_mut();
-            let len = inner.page_table.len() as u32;
-            payload[0..4].copy_from_slice(&len.to_le_bytes());
-            payload[4..8].fill(0);
-            for (i, &pid) in inner.page_table.iter().enumerate() {
-                let off = META_HEADER_BYTES + i * 8;
-                payload[off..off + 8].copy_from_slice(&(pid as u64).to_le_bytes());
-            }
-        }
-        page.seal();
-        self.page_store.write_page(self.meta_page_id, &page)?;
-        self.page_cache.invalidate(self.meta_page_id);
-        self.page_cache.insert(self.meta_page_id, Arc::new(page));
+    fn flush_meta_locked(&self, inner: &mut parking_lot::MutexGuard<'_, Inner>) -> Result<()> {
+        let new_chain = paged_meta::write_chain(
+            &self.page_store,
+            &self.page_cache,
+            PageType::DedupReverseArray,
+            META_KEY_COUNT_MARKER,
+            &[],
+            &inner.page_table,
+            &inner.meta_chain,
+            0,
+        )?;
+        inner.meta_chain = new_chain;
         Ok(())
     }
 
@@ -739,10 +712,13 @@ mod tests {
     }
 
     #[test]
-    fn page_idx_beyond_meta_capacity_errors() {
+    fn page_idx_beyond_one_meta_page_chains_a_continuation() {
         let (_d, r) = make_index();
-        let pba = (META_TABLE_CAPACITY * ENTRIES_PER_PAGE) as Pba;
-        let err = r.put(pba, h(1), 1).err().unwrap();
-        assert!(matches!(err, MetaDbError::InvalidArgument(_)));
+        let head_cap = paged_meta::head_capacity(0);
+        let big_pba = ((head_cap + 1) * ENTRIES_PER_PAGE) as Pba;
+        r.put(big_pba, h(1), 1).unwrap();
+        r.flush_meta().unwrap();
+        assert!(r.inner.lock().meta_chain.len() >= 2);
+        assert_eq!(r.get_hashes(big_pba).unwrap(), vec![h(1)]);
     }
 }

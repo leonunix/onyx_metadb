@@ -21,19 +21,13 @@
 //!     birth_lsn[slot]: u64 LE  (offset slot*12 + 4)
 //!   336 × 12 = 4032 B (no slack)
 //!
-//! ## Meta page (PageType::RefcountArray, marked by `key_count = META_KEY_COUNT_MARKER`)
-//! - shared header (64 B)
-//! - payload (4032 B):
-//!   page_count: u32 LE  (offset 0)
-//!   reserved:   u32 LE  (offset 4)
-//!   page_table: [u64 LE; 503]  (offset 8 .. 4032)
-//!     page_table[i] = on-disk PageId for data page covering
-//!       PBAs [i * ENTRIES_PER_PAGE, (i+1) * ENTRIES_PER_PAGE). 0 if
-//!       no data page allocated yet (rc all zero).
-//!
-//! Single meta page caps a shard at 503 × 336 = 169_008 PBAs. Stage 1
-//! validation only; chained meta pages are a future extension so the cap
-//! grows with shard count.
+//! ## Meta page chain (PageType::RefcountArray, `key_count = META_KEY_COUNT_MARKER`)
+//! Each meta page carries a fixed 16 B chain header (`chunk_len: u32`,
+//! reserved `u32`, `next_meta_pid: u64`) followed by a slice of the
+//! page table (`[u64; chunk_len]`). The head meta page id is recorded
+//! in the manifest; continuation pages are reachable via the chain
+//! pointer. The chain grows / shrinks as the page table does — see
+//! [`crate::paged_meta`].
 //!
 //! # Concurrency
 //!
@@ -51,6 +45,7 @@ use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
 use crate::page_store::PageStore;
+use crate::paged_meta;
 use crate::types::{Lsn, Pba, PageId};
 
 use super::delta::Pending;
@@ -58,9 +53,6 @@ use super::delta::Pending;
 /// Entries per data page. 336 × 12 B = 4032 B = PAGE_PAYLOAD_SIZE.
 pub const ENTRIES_PER_PAGE: usize = 336;
 const ENTRY_BYTES: usize = 12;
-const META_HEADER_BYTES: usize = 8;
-const META_TABLE_CAPACITY: usize =
-    (PAGE_PAYLOAD_SIZE - META_HEADER_BYTES) / std::mem::size_of::<u64>();
 
 /// Marker stored in the shared header's `key_count` slot to distinguish
 /// the meta page from data pages of the same `PageType`. Data pages
@@ -71,7 +63,6 @@ const DATA_KEY_COUNT_MARKER: u16 = 0;
 
 const _: () = {
     assert!(ENTRIES_PER_PAGE * ENTRY_BYTES == PAGE_PAYLOAD_SIZE);
-    assert!(META_HEADER_BYTES + META_TABLE_CAPACITY * 8 <= PAGE_PAYLOAD_SIZE);
 };
 
 pub struct PagedRefcountArray {
@@ -82,9 +73,13 @@ pub struct PagedRefcountArray {
 }
 
 struct Inner {
-    /// Mirrors the on-disk meta page payload. Length is the highest
+    /// Mirrors the on-disk page table. Length is the highest
     /// page_idx ever written + 1; interior holes hold `PageId(0)`.
     page_table: Vec<PageId>,
+    /// Meta page chain in order, head first. The head pid is fixed
+    /// (recorded in the manifest); continuation pages are allocated /
+    /// freed by `flush_meta_locked` as the table grows or shrinks.
+    meta_chain: Vec<PageId>,
     /// Set on every write that grows or mutates `page_table`. Cleared
     /// after the meta page is rewritten in `flush_meta_locked`.
     meta_dirty: bool,
@@ -98,6 +93,7 @@ impl PagedRefcountArray {
         let meta_page_id = page_store.allocate()?;
         let inner = Inner {
             page_table: Vec::new(),
+            meta_chain: vec![meta_page_id],
             meta_dirty: false,
         };
         let me = Self {
@@ -108,46 +104,33 @@ impl PagedRefcountArray {
         };
         // Persist an empty meta page so `open()` after a clean restart
         // sees a valid header rather than uninitialised bytes.
-        me.flush_meta_locked(&me.inner.lock())?;
+        let mut guard = me.inner.lock();
+        me.flush_meta_locked(&mut guard)?;
+        drop(guard);
         Ok(me)
     }
 
-    /// Open an existing shard. Reads the meta page and rebuilds the
-    /// in-memory page table.
+    /// Open an existing shard. Walks the meta chain rooted at
+    /// `meta_page_id` and rebuilds the in-memory page table.
     pub fn open(
         page_store: Arc<PageStore>,
         page_cache: Arc<PageCache>,
         meta_page_id: PageId,
     ) -> Result<Self> {
-        let meta_page = page_store.read_page(meta_page_id)?;
-        let header = meta_page.header()?;
-        if header.page_type != PageType::RefcountArray
-            || header.key_count != META_KEY_COUNT_MARKER
-        {
-            return Err(MetaDbError::Corruption(format!(
-                "refcount meta page at {meta_page_id} has wrong header (type={:?}, key_count={})",
-                header.page_type, header.key_count,
-            )));
-        }
-        let payload = meta_page.payload();
-        let page_count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-        if page_count > META_TABLE_CAPACITY {
-            return Err(MetaDbError::Corruption(format!(
-                "refcount meta page page_count {page_count} exceeds capacity {META_TABLE_CAPACITY}",
-            )));
-        }
-        let mut page_table = Vec::with_capacity(page_count);
-        for i in 0..page_count {
-            let off = META_HEADER_BYTES + i * 8;
-            let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
-            page_table.push(pid);
-        }
+        let read = paged_meta::read_chain(
+            &page_store,
+            meta_page_id,
+            PageType::RefcountArray,
+            META_KEY_COUNT_MARKER,
+            0,
+        )?;
         Ok(Self {
             page_store,
             page_cache,
             meta_page_id,
             inner: Mutex::new(Inner {
-                page_table,
+                page_table: read.page_table,
+                meta_chain: read.chain_pids,
                 meta_dirty: false,
             }),
         })
@@ -217,13 +200,6 @@ impl PagedRefcountArray {
         page_idx: usize,
         slot_pendings: Vec<(usize, Pending)>,
     ) -> Result<()> {
-        if page_idx >= META_TABLE_CAPACITY {
-            return Err(MetaDbError::InvalidArgument(format!(
-                "refcount page_idx {page_idx} exceeds single-meta-page capacity {META_TABLE_CAPACITY}; \
-                 chained meta pages are a future extension",
-            )));
-        }
-
         // Resolve / allocate the page id under the inner lock; release
         // the lock before doing IO so concurrent reads on other pages
         // don't block.
@@ -270,47 +246,35 @@ impl PagedRefcountArray {
         Ok(())
     }
 
-    /// Persist the meta page if it has been mutated since the last
+    /// Persist the meta chain if it has been mutated since the last
     /// flush. Returns `true` when a write actually happened.
     pub fn flush_meta(&self) -> Result<bool> {
         let mut inner = self.inner.lock();
         if !inner.meta_dirty {
             return Ok(false);
         }
-        self.flush_meta_locked(&inner)?;
+        self.flush_meta_locked(&mut inner)?;
         inner.meta_dirty = false;
         Ok(true)
     }
 
-    fn flush_meta_locked(&self, inner: &parking_lot::MutexGuard<'_, Inner>) -> Result<()> {
-        let mut page = Page::new(PageHeader {
-            page_type: PageType::RefcountArray,
-            version: crate::page::PAGE_VERSION,
-            key_count: META_KEY_COUNT_MARKER,
-            flags: 0,
-            generation: 0,
-            // Meta page is reachable from `manifest.refcount_shard_roots`;
-            // header refcount = 1 keeps the shared verifier happy.
-            refcount: 1,
-        });
-        {
-            let payload = page.payload_mut();
-            let len = inner.page_table.len() as u32;
-            payload[0..4].copy_from_slice(&len.to_le_bytes());
-            payload[4..8].fill(0);
-            for (i, &pid) in inner.page_table.iter().enumerate() {
-                let off = META_HEADER_BYTES + i * 8;
-                payload[off..off + 8].copy_from_slice(&(pid as u64).to_le_bytes());
-            }
-        }
-        page.seal();
-        self.page_store.write_page(self.meta_page_id, &page)?;
-        self.page_cache.invalidate(self.meta_page_id);
-        self.page_cache
-            .insert(self.meta_page_id, Arc::new(page));
-        // We can't take &mut inner here (it's behind MutexGuard<&>),
-        // so the caller is responsible for clearing the dirty flag if
-        // they hold the lock. `flush_meta()` re-acquires for that.
+    fn flush_meta_locked(&self, inner: &mut parking_lot::MutexGuard<'_, Inner>) -> Result<()> {
+        // The free LSN passed to `paged_meta::write_chain` is used to
+        // stamp the deferred-free entry on shrink. Use the highest
+        // generation observed across the page table so the deferred
+        // entry sorts after the last committed write.
+        let free_lsn: Lsn = 0;
+        let new_chain = paged_meta::write_chain(
+            &self.page_store,
+            &self.page_cache,
+            PageType::RefcountArray,
+            META_KEY_COUNT_MARKER,
+            &[],
+            &inner.page_table,
+            &inner.meta_chain,
+            free_lsn,
+        )?;
+        inner.meta_chain = new_chain;
         Ok(())
     }
 
@@ -502,11 +466,17 @@ mod tests {
     }
 
     #[test]
-    fn page_idx_beyond_meta_capacity_errors() {
+    fn page_idx_beyond_one_meta_page_chains_a_continuation() {
+        // Forcing a page_idx past the head meta capacity must extend
+        // the chain instead of failing.
         let (_dir, a) = make_array();
-        let pba = (META_TABLE_CAPACITY * ENTRIES_PER_PAGE) as Pba;
-        let err = a.apply_deltas(vec![(pba, pending(1, 1))]).err().unwrap();
-        assert!(matches!(err, MetaDbError::InvalidArgument(_)));
+        let head_cap = paged_meta::head_capacity(0);
+        let big_pba = ((head_cap + 1) * ENTRIES_PER_PAGE) as Pba;
+        a.apply_deltas(vec![(big_pba, pending(1, 1))]).unwrap();
+        a.flush_meta().unwrap();
+        // Chain should now have at least 2 meta pages.
+        assert!(a.inner.lock().meta_chain.len() >= 2);
+        assert_eq!(a.get(big_pba).unwrap().rc, 1);
     }
 
     #[test]

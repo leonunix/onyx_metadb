@@ -46,6 +46,7 @@ use crate::error::{MetaDbError, Result};
 use crate::lsm::{DedupValue, Hash32};
 use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
 use crate::page_store::PageStore;
+use crate::paged_meta;
 use crate::types::{Lsn, PageId};
 
 pub const ENTRY_BYTES: usize = 60; // Hash32 (32) + DedupValue (28)
@@ -57,9 +58,9 @@ pub const SLOTS_PER_PAGE: usize = BUCKETS_PER_PAGE * ENTRIES_PER_BUCKET; // 64
 pub const PRESENCE_BITMAP_BYTES: usize = 8;
 pub const MAX_CUCKOO_CHAIN: usize = 64;
 
-const META_HEADER_BYTES: usize = 32;
-const META_TABLE_CAPACITY: usize =
-    (PAGE_PAYLOAD_SIZE - META_HEADER_BYTES) / std::mem::size_of::<u64>();
+/// Bytes the head meta page reserves for module-specific data:
+/// `bucket_count u64 + seed1 u64 + seed2 u64`.
+const HEAD_EXTRA_BYTES: usize = 24;
 
 const META_KEY_COUNT_MARKER: u16 = 0xFFFF;
 const DATA_KEY_COUNT_MARKER: u16 = 0;
@@ -83,6 +84,10 @@ struct Inner {
     /// `page_table[page_idx] = on-disk PageId`, or 0 if no page is
     /// allocated yet for that bucket range.
     page_table: Vec<PageId>,
+    /// Meta page chain in order, head first. The head pid is fixed
+    /// (recorded in the manifest); continuation pages are added /
+    /// removed as `page_table` grows or shrinks.
+    meta_chain: Vec<PageId>,
     meta_dirty: bool,
     /// Approximate number of occupied slots; used for `len()` and
     /// load-factor reporting. Recomputed exactly during `iter()`.
@@ -103,13 +108,6 @@ impl CuckooHash {
             ));
         }
         let total_pages = bucket_count.div_ceil(BUCKETS_PER_PAGE as u64) as usize;
-        if total_pages > META_TABLE_CAPACITY {
-            return Err(MetaDbError::InvalidArgument(format!(
-                "cuckoo bucket_count {bucket_count} requires {total_pages} pages, exceeds \
-                 single-meta-page capacity {META_TABLE_CAPACITY}; chained meta pages land \
-                 until chained meta pages support arbitrary sizes",
-            )));
-        }
         let meta_page_id = page_store.allocate()?;
         let me = Self {
             bucket_count,
@@ -120,11 +118,14 @@ impl CuckooHash {
             page_cache,
             inner: Mutex::new(Inner {
                 page_table: vec![0; total_pages],
+                meta_chain: vec![meta_page_id],
                 meta_dirty: false,
                 approx_len: 0,
             }),
         };
-        me.flush_meta_locked(&me.inner.lock())?;
+        let mut guard = me.inner.lock();
+        me.flush_meta_locked(&mut guard)?;
+        drop(guard);
         Ok(me)
     }
 
@@ -133,32 +134,16 @@ impl CuckooHash {
         page_cache: Arc<PageCache>,
         meta_page_id: PageId,
     ) -> Result<Self> {
-        let meta_page = page_store.read_page(meta_page_id)?;
-        let header = meta_page.header()?;
-        if header.page_type != PageType::CuckooData
-            || header.key_count != META_KEY_COUNT_MARKER
-        {
-            return Err(MetaDbError::Corruption(format!(
-                "cuckoo meta page {meta_page_id} has wrong header (type={:?}, key_count={})",
-                header.page_type, header.key_count,
-            )));
-        }
-        let payload = meta_page.payload();
-        let bucket_count = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-        let seed1 = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-        let seed2 = u64::from_le_bytes(payload[16..24].try_into().unwrap());
-        let page_count = u32::from_le_bytes(payload[24..28].try_into().unwrap()) as usize;
-        if page_count > META_TABLE_CAPACITY {
-            return Err(MetaDbError::Corruption(format!(
-                "cuckoo meta page page_count {page_count} > capacity {META_TABLE_CAPACITY}",
-            )));
-        }
-        let mut page_table = Vec::with_capacity(page_count);
-        for i in 0..page_count {
-            let off = META_HEADER_BYTES + i * 8;
-            let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
-            page_table.push(pid);
-        }
+        let read = paged_meta::read_chain(
+            &page_store,
+            meta_page_id,
+            PageType::CuckooData,
+            META_KEY_COUNT_MARKER,
+            HEAD_EXTRA_BYTES,
+        )?;
+        let bucket_count = u64::from_le_bytes(read.head_extra[0..8].try_into().unwrap());
+        let seed1 = u64::from_le_bytes(read.head_extra[8..16].try_into().unwrap());
+        let seed2 = u64::from_le_bytes(read.head_extra[16..24].try_into().unwrap());
         // approx_len is recomputed lazily; leave as 0 until the first
         // explicit len() call (or rebuild on Open path).
         Ok(Self {
@@ -169,7 +154,8 @@ impl CuckooHash {
             page_store,
             page_cache,
             inner: Mutex::new(Inner {
-                page_table,
+                page_table: read.page_table,
+                meta_chain: read.chain_pids,
                 meta_dirty: false,
                 approx_len: 0,
             }),
@@ -307,14 +293,14 @@ impl CuckooHash {
         Ok(count)
     }
 
-    /// Persist the meta page if dirty. Returns `true` if a write
-    /// happened, `false` if the meta page was already clean.
+    /// Persist the meta chain if dirty. Returns `true` if a write
+    /// happened, `false` if the chain was already clean.
     pub fn flush_meta(&self) -> Result<bool> {
         let mut inner = self.inner.lock();
         if !inner.meta_dirty {
             return Ok(false);
         }
-        self.flush_meta_locked(&inner)?;
+        self.flush_meta_locked(&mut inner)?;
         inner.meta_dirty = false;
         Ok(true)
     }
@@ -332,31 +318,22 @@ impl CuckooHash {
 
     // ---- private ---------------------------------------------------
 
-    fn flush_meta_locked(&self, inner: &parking_lot::MutexGuard<'_, Inner>) -> Result<()> {
-        let mut page = Page::new(PageHeader {
-            page_type: PageType::CuckooData,
-            version: crate::page::PAGE_VERSION,
-            key_count: META_KEY_COUNT_MARKER,
-            flags: 0,
-            generation: 0,
-            refcount: 1,
-        });
-        {
-            let payload = page.payload_mut();
-            payload[0..8].copy_from_slice(&self.bucket_count.to_le_bytes());
-            payload[8..16].copy_from_slice(&self.seed1.to_le_bytes());
-            payload[16..24].copy_from_slice(&self.seed2.to_le_bytes());
-            payload[24..28].copy_from_slice(&(inner.page_table.len() as u32).to_le_bytes());
-            payload[28..META_HEADER_BYTES].fill(0);
-            for (i, &pid) in inner.page_table.iter().enumerate() {
-                let off = META_HEADER_BYTES + i * 8;
-                payload[off..off + 8].copy_from_slice(&(pid as u64).to_le_bytes());
-            }
-        }
-        page.seal();
-        self.page_store.write_page(self.meta_page_id, &page)?;
-        self.page_cache.invalidate(self.meta_page_id);
-        self.page_cache.insert(self.meta_page_id, Arc::new(page));
+    fn flush_meta_locked(&self, inner: &mut parking_lot::MutexGuard<'_, Inner>) -> Result<()> {
+        let mut head_extra = [0u8; HEAD_EXTRA_BYTES];
+        head_extra[0..8].copy_from_slice(&self.bucket_count.to_le_bytes());
+        head_extra[8..16].copy_from_slice(&self.seed1.to_le_bytes());
+        head_extra[16..24].copy_from_slice(&self.seed2.to_le_bytes());
+        let new_chain = paged_meta::write_chain(
+            &self.page_store,
+            &self.page_cache,
+            PageType::CuckooData,
+            META_KEY_COUNT_MARKER,
+            &head_extra,
+            &inner.page_table,
+            &inner.meta_chain,
+            0,
+        )?;
+        inner.meta_chain = new_chain;
         Ok(())
     }
 
@@ -754,15 +731,19 @@ mod tests {
     }
 
     #[test]
-    fn capacity_overflow_rejected() {
+    fn bucket_count_past_one_meta_page_chains_a_continuation() {
+        // Pick a bucket count whose page_table needs > one head meta
+        // page. The chain must extend instead of erroring out.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pages");
         let page_store = Arc::new(PageStore::create(&path).unwrap());
-        let page_cache = Arc::new(PageCache::new(page_store.clone(), 4 * 1024 * 1024));
-        let too_many_buckets = (META_TABLE_CAPACITY as u64 + 1) * BUCKETS_PER_PAGE as u64;
-        let err = CuckooHash::create(page_store, page_cache, too_many_buckets, 1, 2)
-            .err()
-            .unwrap();
-        assert!(matches!(err, MetaDbError::InvalidArgument(_)));
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), 8 * 1024 * 1024));
+        let head_cap = paged_meta::head_capacity(HEAD_EXTRA_BYTES);
+        let big_buckets = ((head_cap + 5) * BUCKETS_PER_PAGE) as u64;
+        let cuckoo =
+            CuckooHash::create(page_store, page_cache, big_buckets, 1, 2).unwrap();
+        // Force a meta flush so the chain is materialised on disk.
+        cuckoo.flush_meta().unwrap();
+        assert!(cuckoo.inner.lock().meta_chain.len() >= 2);
     }
 }

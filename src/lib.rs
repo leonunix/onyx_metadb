@@ -39,6 +39,7 @@ pub mod metrics;
 pub mod page;
 pub mod page_store;
 pub mod paged;
+pub mod paged_meta;
 pub mod paged_reverse;
 pub mod recovery;
 pub mod refcount;
