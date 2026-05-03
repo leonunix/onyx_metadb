@@ -38,18 +38,17 @@
 //! `generation` on every page is the page's `last_applied_lsn` so
 //! `put` / `delete` can replay-skip when a crash repeats an op.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use crate::cache::PageCache;
-use crate::error::{MetaDbError, Result};
 use crate::dedup_types::Hash32;
-use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
+use crate::error::Result;
+use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::paged_meta;
-use crate::types::{Lsn, Pba, PageId};
+use crate::types::{Lsn, PageId, Pba};
 
 pub const ENTRIES_PER_PAGE: usize = 84;
 const SLOT_BYTES: usize = 48;
@@ -60,6 +59,7 @@ const OVERFLOW_HASHES_PER_PAGE: usize = (PAGE_PAYLOAD_SIZE - OVERFLOW_HEADER_BYT
 const META_KEY_COUNT_MARKER: u16 = 0xFFFF;
 const DATA_KEY_COUNT_MARKER: u16 = 0;
 const OVERFLOW_KEY_COUNT_MARKER: u16 = 0xFFFE;
+const REVERSE_LOCK_SHARDS: usize = 64;
 
 const ZERO_HASH: Hash32 = [0u8; 32];
 
@@ -73,6 +73,11 @@ pub struct PagedReverse {
     page_cache: Arc<PageCache>,
     meta_page_id: PageId,
     inner: Mutex<Inner>,
+    /// Serialises data-page read-modify-write. Dedup apply lanes route
+    /// reverse ops by hash so several lanes may touch different hashes
+    /// for the same PBA concurrently; the slot and overflow chain are
+    /// keyed by PBA, so they must be protected by the data page index.
+    page_locks: [Mutex<()>; REVERSE_LOCK_SHARDS],
 }
 
 struct Inner {
@@ -93,6 +98,7 @@ impl PagedReverse {
                 meta_chain: vec![meta_page_id],
                 meta_dirty: false,
             }),
+            page_locks: std::array::from_fn(|_| Mutex::new(())),
         };
         let mut guard = me.inner.lock();
         me.flush_meta_locked(&mut guard)?;
@@ -121,6 +127,7 @@ impl PagedReverse {
                 meta_chain: read.chain_pids,
                 meta_dirty: false,
             }),
+            page_locks: std::array::from_fn(|_| Mutex::new(())),
         })
     }
 
@@ -234,6 +241,7 @@ impl PagedReverse {
         update: impl FnOnce(&[Hash32]) -> Result<Vec<Hash32>>,
     ) -> Result<()> {
         let (page_idx, slot) = page_offset(pba);
+        let _page_guard = self.page_locks[page_idx & (REVERSE_LOCK_SHARDS - 1)].lock();
         let (page_id, freshly_allocated) = {
             let mut inner = self.inner.lock();
             if page_idx >= inner.page_table.len() {
@@ -282,8 +290,7 @@ impl PagedReverse {
         let mut to_free = collect_overflow_chain_pids(self.page_store.as_ref(), prev_overflow)?;
 
         // Build the new state on disk.
-        let new_overflow_pid =
-            self.write_overflow_chain(&new, lsn)?;
+        let new_overflow_pid = self.write_overflow_chain(&new, lsn)?;
         let new_inline = new.first().copied().unwrap_or(ZERO_HASH);
         write_slot(
             &mut page,
@@ -469,8 +476,7 @@ fn read_slot(page: &Page, slot: usize) -> SlotView {
     let payload = page.payload();
     let off = slot * SLOT_BYTES;
     let count = u16::from_le_bytes(payload[off..off + 2].try_into().unwrap());
-    let overflow_pid =
-        u64::from_le_bytes(payload[off + 4..off + 12].try_into().unwrap()) as PageId;
+    let overflow_pid = u64::from_le_bytes(payload[off + 4..off + 12].try_into().unwrap()) as PageId;
     let mut inline_hash = [0u8; 32];
     inline_hash.copy_from_slice(&payload[off + 12..off + 44]);
     SlotView {
@@ -520,10 +526,7 @@ fn write_overflow(page: &mut Page, hashes: &[Hash32], next: PageId) {
     payload[used_end..].fill(0);
 }
 
-fn collect_overflow_chain_pids(
-    page_store: &PageStore,
-    head: PageId,
-) -> Result<Vec<PageId>> {
+fn collect_overflow_chain_pids(page_store: &PageStore, head: PageId) -> Result<Vec<PageId>> {
     let mut out = Vec::new();
     let mut next = head;
     while next != 0 {
@@ -618,6 +621,34 @@ mod tests {
         }
         let got = r.get_hashes(7).unwrap();
         assert_eq!(got.len(), count);
+    }
+
+    #[test]
+    fn concurrent_puts_same_pba_do_not_double_free_overflow() {
+        let (_d, r) = make_index();
+        let count = OVERFLOW_HASHES_PER_PAGE * 2 + 16;
+        for i in 0..count {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+            hash[31] = 0xA5;
+            r.put(7, hash, (100 + i) as Lsn).unwrap();
+        }
+
+        std::thread::scope(|scope| {
+            for t in 0..8u64 {
+                let reverse = &r;
+                scope.spawn(move || {
+                    let mut hash = [0u8; 32];
+                    hash[..8].copy_from_slice(&(0x1_0000 + t).to_be_bytes());
+                    hash[31] = 0x5A;
+                    reverse.put(7, hash, 10_000 + t).unwrap();
+                });
+            }
+        });
+
+        let got = r.get_hashes(7).unwrap();
+        assert_eq!(got.len(), count + 8);
+        r.page_store.try_reclaim().unwrap();
     }
 
     #[test]
@@ -718,7 +749,8 @@ mod tests {
             meta_page_id = r.meta_page_id();
             r.put(7, h(0xAB), 100).unwrap();
             r.put(7, h(0xCD), 101).unwrap();
-            r.put((ENTRIES_PER_PAGE * 2 + 5) as Pba, h(0xEE), 200).unwrap();
+            r.put((ENTRIES_PER_PAGE * 2 + 5) as Pba, h(0xEE), 200)
+                .unwrap();
             r.flush_meta().unwrap();
         }
         let page_store = Arc::new(PageStore::open(&path).unwrap());

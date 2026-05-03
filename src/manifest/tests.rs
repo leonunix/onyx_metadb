@@ -357,10 +357,9 @@ fn v6_rejects_volume_count_exceeding_capacity() {
         .iter()
         .map(|v| volume_entry_inline_size(v.shard_count as usize))
         .sum();
-    // m has dedup_shards=1 from Manifest::empty(); pass that through to
-    // the capacity calculator so the test matches the encoder's view.
-    let cap =
-        max_snapshots_for_layout(m.shard_count(), m.dedup_shards as usize, 0, baseline_budget);
+    // The current cuckoo/paged-reverse layout stores one dedup meta-head
+    // group per index, independent of dedup_shards/apply-lane count.
+    let cap = max_snapshots_for_layout(m.shard_count(), 1, 0, baseline_budget);
     for i in 0..(cap + 1) as u64 {
         m.snapshots.push(snap(&ps, i, 0, &[10], i));
     }
@@ -370,7 +369,8 @@ fn v6_rejects_volume_count_exceeding_capacity() {
 
 #[test]
 fn dedup_n4_encode_decode_round_trip() {
-    // Phase 2: full per-shard layout for dedup_shards = 4.
+    // Cuckoo dedup_index / paged_reverse store one meta-head group even
+    // when dedup_shards = 4 keeps four apply lanes.
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let m = Manifest {
@@ -379,10 +379,8 @@ fn dedup_n4_encode_decode_round_trip() {
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
         dedup_shards: 4,
-        dedup_index_shard_heads: vec![bx(&[NULL_PAGE]), bx(&[10, 20]), bx(&[]), bx(&[30, 40, 50])]
-            .into_boxed_slice(),
-        dedup_reverse_shard_heads: vec![bx(&[NULL_PAGE, 60]), bx(&[]), bx(&[70]), bx(&[80, 90])]
-            .into_boxed_slice(),
+        dedup_index_shard_heads: one_shard(&[10]),
+        dedup_reverse_shard_heads: one_shard(&[20]),
         next_snapshot_id: 1,
         next_volume_ord: 1,
         snapshots: Vec::new(),
@@ -403,8 +401,6 @@ fn dedup_encode_rejects_non_power_of_two_shards() {
     m.refcount_shard_roots = bx(&[1, 2]);
     m.volumes = vec![boot_vol(2, &[100, 101])];
     m.dedup_shards = 3;
-    m.dedup_index_shard_heads = vec![bx(&[]); 3].into_boxed_slice();
-    m.dedup_reverse_shard_heads = vec![bx(&[]); 3].into_boxed_slice();
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
     let err = m.encode(&mut page).unwrap_err();
     match err {
@@ -416,21 +412,21 @@ fn dedup_encode_rejects_non_power_of_two_shards() {
 }
 
 #[test]
-fn dedup_encode_rejects_shard_head_outer_length_mismatch() {
+fn dedup_encode_rejects_meta_head_outer_length_mismatch() {
     let dir = TempDir::new().unwrap();
     let _ps = mk_store(&dir);
     let mut m = Manifest::empty();
     m.refcount_shard_roots = bx(&[1, 2]);
     m.volumes = vec![boot_vol(2, &[100, 101])];
     m.dedup_shards = 4;
-    // Outer length 2 ≠ dedup_shards = 4.
+    // Cuckoo/reverse use one meta-head group each, regardless of
+    // dedup_shards/apply-lane count.
     m.dedup_index_shard_heads = vec![bx(&[]); 2].into_boxed_slice();
-    m.dedup_reverse_shard_heads = vec![bx(&[]); 4].into_boxed_slice();
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
     let err = m.encode(&mut page).unwrap_err();
     match err {
         MetaDbError::InvalidArgument(msg) => {
-            assert!(msg.contains("does not match dedup_shards"), "{msg}");
+            assert!(msg.contains("dedup meta-head outer length"), "{msg}");
         }
         e => panic!("expected InvalidArgument, got {e}"),
     }

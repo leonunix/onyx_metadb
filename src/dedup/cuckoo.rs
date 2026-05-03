@@ -3,8 +3,9 @@
 //! # Layout
 //!
 //! - Total bucket count `N` is fixed at `create()` time and recorded
-//!   in the meta page. Each bucket holds [`ENTRIES_PER_BUCKET`]
-//!   slots; capacity is `N × ENTRIES_PER_BUCKET`.
+//!   in the meta page. Buckets are grouped into 4 KiB data pages; each
+//!   page holds [`SLOTS_PER_PAGE`] slots and acts as one associative
+//!   candidate set.
 //! - Buckets are packed into 4 KiB data pages — [`BUCKETS_PER_PAGE`]
 //!   buckets per page. Page index `i` covers buckets
 //!   `[i * BUCKETS_PER_PAGE, (i+1) * BUCKETS_PER_PAGE)`.
@@ -15,25 +16,26 @@
 //! # Lookup
 //!
 //! Two candidate buckets per key, computed by `xxh3_with_seed(hash,
-//! seed_i) % N`. Each bucket carries up to four occupied slots
-//! (presence tracked by an 8-bit bitmap per page covering all
-//! `BUCKETS_PER_PAGE × ENTRIES_PER_BUCKET = 64` slots).
+//! seed_i) % N`. Each candidate bucket identifies a 4 KiB data page;
+//! the entry can live in any of that page's 64 slots. This keeps the
+//! on-disk layout unchanged while avoiding short cuckoo loops caused
+//! by treating each 4-slot sub-bucket as independently full.
 //!
 //! # Insert
 //!
-//! Idempotent: if `hash` already lives in either candidate bucket,
+//! Idempotent: if `hash` already lives in either candidate page,
 //! `insert` overwrites the value and returns. Otherwise it places
 //! the entry in the first empty slot it finds across the two
-//! candidate buckets. If both are full, it triggers a cuckoo
+//! candidate pages. If both are full, it triggers a cuckoo
 //! eviction chain (random victim from b1, swap, retry from victim's
-//! alternate bucket, …) bounded by [`MAX_CUCKOO_CHAIN`]. Exceeding
+//! alternate page, …) bounded by [`MAX_CUCKOO_CHAIN`]. Exceeding
 //! the chain returns [`MetaDbError::Corruption`] with a "table full"
 //! message — sizing for steady-state load factor below 0.85 makes
 //! this practically unreachable.
 //!
 //! # Delete
 //!
-//! Walk both candidate buckets; clear the slot whose stored hash
+//! Walk both candidate pages; clear the slot whose stored hash
 //! matches.
 
 use std::sync::Arc;
@@ -42,9 +44,9 @@ use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::cache::PageCache;
-use crate::error::{MetaDbError, Result};
 use crate::dedup_types::{DedupValue, Hash32};
-use crate::page::{Page, PageHeader, PageType, PAGE_PAYLOAD_SIZE};
+use crate::error::{MetaDbError, Result};
+use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::paged_meta;
 use crate::types::{Lsn, PageId};
@@ -52,8 +54,7 @@ use crate::types::{Lsn, PageId};
 pub const ENTRY_BYTES: usize = 60; // Hash32 (32) + DedupValue (28)
 pub const ENTRIES_PER_BUCKET: usize = 4;
 pub const BUCKET_BYTES: usize = ENTRY_BYTES * ENTRIES_PER_BUCKET; // 240
-pub const BUCKETS_PER_PAGE: usize =
-    (PAGE_PAYLOAD_SIZE - PRESENCE_BITMAP_BYTES) / BUCKET_BYTES; // 16
+pub const BUCKETS_PER_PAGE: usize = (PAGE_PAYLOAD_SIZE - PRESENCE_BITMAP_BYTES) / BUCKET_BYTES; // 16
 pub const SLOTS_PER_PAGE: usize = BUCKETS_PER_PAGE * ENTRIES_PER_BUCKET; // 64
 pub const PRESENCE_BITMAP_BYTES: usize = 8;
 pub const MAX_CUCKOO_CHAIN: usize = 64;
@@ -223,9 +224,9 @@ impl CuckooHash {
                 return Ok(());
             }
         }
-        // Try empty slot insertion in either candidate.
+        // Try empty slot insertion in either candidate page.
         for bucket in [b1, b2] {
-            if self.try_insert_empty(bucket, hash, value, lsn)? {
+            if self.try_insert_empty_in_page(bucket, hash, value, lsn)? {
                 self.bump_len(1);
                 return Ok(());
             }
@@ -360,9 +361,20 @@ impl CuckooHash {
         (b1, b2)
     }
 
-    fn alternate_bucket(&self, hash: &Hash32, current: u64) -> u64 {
+    fn alternate_bucket_for_page(&self, hash: &Hash32, current: u64) -> u64 {
         let (b1, b2) = self.candidate_buckets(hash);
-        if current == b1 { b2 } else { b1 }
+        let current_page = bucket_offset(current).0;
+        let b1_page = bucket_offset(b1).0;
+        let b2_page = bucket_offset(b2).0;
+        if current_page == b1_page && current_page != b2_page {
+            b2
+        } else if current_page == b2_page && current_page != b1_page {
+            b1
+        } else if current == b1 {
+            b2
+        } else {
+            b1
+        }
     }
 
     fn read_bucket_for(&self, hash: &Hash32, bucket_id: u64) -> Result<Option<DedupValue>> {
@@ -376,8 +388,9 @@ impl CuckooHash {
         }
         let page = self.page_cache.get(pid)?;
         let bitmap = read_bitmap(&page);
-        for slot_in_bucket in 0..ENTRIES_PER_BUCKET {
-            let slot = bucket_in_page * ENTRIES_PER_BUCKET + slot_in_bucket;
+        let start = bucket_in_page * ENTRIES_PER_BUCKET;
+        for offset in 0..SLOTS_PER_PAGE {
+            let slot = (start + offset) % SLOTS_PER_PAGE;
             if bitmap & (1u64 << slot) != 0 {
                 let (stored_hash, value) = read_slot(&page, slot);
                 if &stored_hash == hash {
@@ -395,22 +408,24 @@ impl CuckooHash {
         value: DedupValue,
         lsn: Lsn,
     ) -> Result<bool> {
-        self.with_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
-            for slot_in_bucket in 0..ENTRIES_PER_BUCKET {
-                let slot = bucket_in_page * ENTRIES_PER_BUCKET + slot_in_bucket;
+        self.with_existing_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
+            let start = bucket_in_page * ENTRIES_PER_BUCKET;
+            for offset in 0..SLOTS_PER_PAGE {
+                let slot = (start + offset) % SLOTS_PER_PAGE;
                 if *bitmap & (1u64 << slot) != 0 {
                     let (stored_hash, _) = read_slot(page, slot);
                     if &stored_hash == hash {
                         write_slot(page, slot, hash, &value);
-                        return Ok(true);
+                        return Ok((true, true));
                     }
                 }
             }
-            Ok(false)
+            Ok((false, false))
         })
+        .map(|result| result.unwrap_or(false))
     }
 
-    fn try_insert_empty(
+    fn try_insert_empty_in_page(
         &self,
         bucket_id: u64,
         hash: Hash32,
@@ -418,8 +433,9 @@ impl CuckooHash {
         lsn: Lsn,
     ) -> Result<bool> {
         self.with_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
-            for slot_in_bucket in 0..ENTRIES_PER_BUCKET {
-                let slot = bucket_in_page * ENTRIES_PER_BUCKET + slot_in_bucket;
+            let start = bucket_in_page * ENTRIES_PER_BUCKET;
+            for offset in 0..SLOTS_PER_PAGE {
+                let slot = (start + offset) % SLOTS_PER_PAGE;
                 if *bitmap & (1u64 << slot) == 0 {
                     write_slot(page, slot, &hash, &value);
                     *bitmap |= 1u64 << slot;
@@ -431,20 +447,22 @@ impl CuckooHash {
     }
 
     fn try_clear_in_bucket(&self, bucket_id: u64, hash: &Hash32, lsn: Lsn) -> Result<bool> {
-        self.with_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
-            for slot_in_bucket in 0..ENTRIES_PER_BUCKET {
-                let slot = bucket_in_page * ENTRIES_PER_BUCKET + slot_in_bucket;
+        self.with_existing_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
+            let start = bucket_in_page * ENTRIES_PER_BUCKET;
+            for offset in 0..SLOTS_PER_PAGE {
+                let slot = (start + offset) % SLOTS_PER_PAGE;
                 if *bitmap & (1u64 << slot) != 0 {
                     let (stored_hash, _) = read_slot(page, slot);
                     if &stored_hash == hash {
                         clear_slot(page, slot);
                         *bitmap &= !(1u64 << slot);
-                        return Ok(true);
+                        return Ok((true, true));
                     }
                 }
             }
-            Ok(false)
+            Ok((false, false))
         })
+        .map(|result| result.unwrap_or(false))
     }
 
     fn evict_and_insert(
@@ -455,18 +473,15 @@ impl CuckooHash {
         lsn: Lsn,
     ) -> Result<()> {
         let mut current_bucket = start_bucket;
-        for _ in 0..MAX_CUCKOO_CHAIN {
+        for step in 0..MAX_CUCKOO_CHAIN {
             // Try empty slot first (unlikely but cheap to check).
-            if self.try_insert_empty(current_bucket, hash, value, lsn)? {
+            if self.try_insert_empty_in_page(current_bucket, hash, value, lsn)? {
                 return Ok(());
             }
-            // Pick a victim slot deterministically (slot 0 — sufficient
-            // for the tests we have; more sophisticated selection
-            // helps load-factor headroom and is a future optimisation).
-            let victim = self.swap_into_bucket_slot0(current_bucket, hash, value, lsn)?;
+            let victim = self.swap_into_victim_slot(current_bucket, hash, value, step, lsn)?;
             hash = victim.0;
             value = victim.1;
-            current_bucket = self.alternate_bucket(&hash, current_bucket);
+            current_bucket = self.alternate_bucket_for_page(&hash, current_bucket);
         }
         Err(MetaDbError::Corruption(format!(
             "cuckoo eviction chain exceeded MAX_CUCKOO_CHAIN={MAX_CUCKOO_CHAIN}; \
@@ -474,15 +489,18 @@ impl CuckooHash {
         )))
     }
 
-    fn swap_into_bucket_slot0(
+    fn swap_into_victim_slot(
         &self,
         bucket_id: u64,
         hash: Hash32,
         value: DedupValue,
+        step: usize,
         lsn: Lsn,
     ) -> Result<(Hash32, DedupValue)> {
         self.with_bucket_mut(bucket_id, lsn, |_bitmap, page, bucket_in_page| {
-            let slot = bucket_in_page * ENTRIES_PER_BUCKET; // slot index 0
+            let start = bucket_in_page * ENTRIES_PER_BUCKET;
+            let seed = hash[step % hash.len()] as usize;
+            let slot = (start + seed + step) % SLOTS_PER_PAGE;
             let (victim_hash, victim_value) = read_slot(page, slot);
             write_slot(page, slot, &hash, &value);
             Ok((victim_hash, victim_value))
@@ -540,6 +558,43 @@ impl CuckooHash {
         self.page_store.write_page(page_id, &page)?;
         self.page_cache.replace_or_insert(page_id, Arc::new(page));
         Ok(result)
+    }
+
+    fn with_existing_bucket_mut<T>(
+        &self,
+        bucket_id: u64,
+        lsn: Lsn,
+        f: impl FnOnce(&mut u64, &mut Page, usize) -> Result<(T, bool)>,
+    ) -> Result<Option<T>> {
+        let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
+        let _shard = self.bucket_locks[page_idx & (BUCKET_LOCK_SHARDS - 1)].lock();
+        let page_id = {
+            let inner = self.inner.lock();
+            if page_idx >= inner.page_table.len() {
+                return Err(MetaDbError::Corruption(format!(
+                    "cuckoo bucket_id {bucket_id} maps to page_idx {page_idx} but page_table \
+                     is only {} entries",
+                    inner.page_table.len(),
+                )));
+            }
+            inner.page_table[page_idx]
+        };
+        if page_id == 0 {
+            return Ok(None);
+        }
+        let mut page = (*self.page_cache.get(page_id)?).clone();
+        let mut bitmap = read_bitmap(&page);
+        let (result, dirty) = f(&mut bitmap, &mut page, bucket_in_page)?;
+        if dirty {
+            write_bitmap(&mut page, bitmap);
+            let mut header = page.header()?;
+            header.generation = lsn.max(header.generation);
+            page.write_header(&header);
+            page.seal();
+            self.page_store.write_page(page_id, &page)?;
+            self.page_cache.replace_or_insert(page_id, Arc::new(page));
+        }
+        Ok(Some(result))
     }
 
     fn bump_len(&self, delta: i64) {
@@ -622,7 +677,8 @@ mod tests {
         let path = dir.path().join("pages");
         let page_store = Arc::new(PageStore::create(&path).unwrap());
         let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
-        let cuckoo = CuckooHash::create(page_store, page_cache, bucket_count, 0xDEAD, 0xBEEF).unwrap();
+        let cuckoo =
+            CuckooHash::create(page_store, page_cache, bucket_count, 0xDEAD, 0xBEEF).unwrap();
         (dir, cuckoo)
     }
 
@@ -747,7 +803,9 @@ mod tests {
         let path = dir.path().join("pages");
         let page_store = Arc::new(PageStore::create(&path).unwrap());
         let page_cache = Arc::new(PageCache::new(page_store.clone(), 4 * 1024 * 1024));
-        let err = CuckooHash::create(page_store, page_cache, 0, 1, 2).err().unwrap();
+        let err = CuckooHash::create(page_store, page_cache, 0, 1, 2)
+            .err()
+            .unwrap();
         assert!(matches!(err, MetaDbError::InvalidArgument(_)));
     }
 
@@ -761,8 +819,7 @@ mod tests {
         let page_cache = Arc::new(PageCache::new(page_store.clone(), 8 * 1024 * 1024));
         let head_cap = paged_meta::head_capacity(HEAD_EXTRA_BYTES);
         let big_buckets = ((head_cap + 5) * BUCKETS_PER_PAGE) as u64;
-        let cuckoo =
-            CuckooHash::create(page_store, page_cache, big_buckets, 1, 2).unwrap();
+        let cuckoo = CuckooHash::create(page_store, page_cache, big_buckets, 1, 2).unwrap();
         // Force a meta flush so the chain is materialised on disk.
         cuckoo.flush_meta().unwrap();
         assert!(cuckoo.inner.lock().meta_chain.len() >= 2);
@@ -780,9 +837,8 @@ mod tests {
         let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
         // 4096 buckets * 4 entries = 16384 slots, plenty of headroom
         // for 8 * 1000 = 8000 inserts.
-        let cuckoo = Arc::new(
-            CuckooHash::create(page_store, page_cache, 4096, 0xDEAD, 0xBEEF).unwrap(),
-        );
+        let cuckoo =
+            Arc::new(CuckooHash::create(page_store, page_cache, 4096, 0xDEAD, 0xBEEF).unwrap());
         let threads: Vec<_> = (0..8u8)
             .map(|tid| {
                 let c = cuckoo.clone();
@@ -808,5 +864,21 @@ mod tests {
             }
         }
         assert_eq!(cuckoo.recount().unwrap(), 8000);
+    }
+
+    #[test]
+    fn page_associative_insert_avoids_sub_bucket_false_full() {
+        let (_d, c) = make_index(32);
+        for i in 0..64u64 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            c.put(hash, dv((i & 0xff) as u8), 100 + i).unwrap();
+        }
+        assert_eq!(c.recount().unwrap(), 64);
+        for i in 0..64u64 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            assert_eq!(c.get(&hash).unwrap(), Some(dv((i & 0xff) as u8)));
+        }
     }
 }
