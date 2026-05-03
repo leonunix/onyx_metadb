@@ -1138,7 +1138,7 @@ impl Db {
     }
 
     fn apply_dedup_indices_to(
-        dedup_index: &ShardedLsm,
+        dedup_index: &crate::dedup::DedupIndex,
         dedup_reverse: &crate::paged_reverse::PagedReverse,
         metrics: &MetaMetrics,
         ops: &[WalOp],
@@ -1146,18 +1146,18 @@ impl Db {
         lsn: Lsn,
     ) -> Result<Vec<(usize, ApplyOutcome)>> {
         let batch_started = std::time::Instant::now();
-        let mut index_ops = Vec::new();
         let mut outcomes = Vec::with_capacity(indices.len());
-        // dedup_reverse is now a paged-array per-op store rather than
-        // an LSM batch sink; apply each reverse op inline so the
-        // page-table mutex is released between ops.
+        // Both dedup_index (cuckoo) and dedup_reverse (paged-array)
+        // apply per op now — neither has a batched fast path that
+        // would benefit from buffering. Inline application keeps the
+        // mutexes released between ops.
         for idx in indices {
             match &ops[idx] {
                 WalOp::DedupPut { hash, value } => {
-                    index_ops.push((*hash, crate::lsm::DedupOp::Put(*value)));
+                    dedup_index.put(*hash, *value, lsn)?;
                 }
                 WalOp::DedupDelete { hash } => {
-                    index_ops.push((*hash, crate::lsm::DedupOp::Delete));
+                    dedup_index.delete(hash, lsn)?;
                 }
                 WalOp::DedupReversePut { pba, hash } => {
                     dedup_reverse.put(*pba, *hash, lsn)?;
@@ -1169,7 +1169,6 @@ impl Db {
             };
             outcomes.push((idx, ApplyOutcome::Dedup));
         }
-        dedup_index.apply_batch_forward(&index_ops);
         metrics.record_apply_dedup_batch(outcomes.len() as u64, batch_started.elapsed());
         Ok(outcomes)
     }
@@ -1328,7 +1327,7 @@ impl Db {
     pub(super) fn apply_replay_batch(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
-        dedup_index: &Arc<ShardedLsm>,
+        dedup_index: &Arc<crate::dedup::DedupIndex>,
         dedup_reverse: &Arc<crate::paged_reverse::PagedReverse>,
         page_store: &Arc<PageStore>,
         metrics: &Arc<MetaMetrics>,
@@ -1370,7 +1369,7 @@ impl Db {
     fn apply_ops_grouped_to_lanes(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
-        dedup_index: &Arc<ShardedLsm>,
+        dedup_index: &Arc<crate::dedup::DedupIndex>,
         dedup_reverse: &Arc<crate::paged_reverse::PagedReverse>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
@@ -1566,7 +1565,7 @@ impl Db {
     fn apply_ops_grouped_to(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
-        dedup_index: &Arc<ShardedLsm>,
+        dedup_index: &Arc<crate::dedup::DedupIndex>,
         dedup_reverse: &Arc<crate::paged_reverse::PagedReverse>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,

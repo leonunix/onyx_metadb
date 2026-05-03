@@ -154,7 +154,7 @@ impl DedupIndex {
         Ok(())
     }
 
-    pub fn flush_meta(&self) -> Result<()> {
+    pub fn flush_meta(&self) -> Result<bool> {
         self.cuckoo.flush_meta()
     }
 

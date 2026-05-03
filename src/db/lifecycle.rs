@@ -359,19 +359,28 @@ impl Db {
             create_l2p_shards(page_store.clone(), page_cache.clone(), shard_count)?;
         let (refcount_shards, refcount_roots) =
             create_shards(page_store.clone(), page_cache.clone(), shard_count)?;
-        let dedup_index = Arc::new(ShardedLsm::create_with_cache(
+        let dedup_index = Arc::new(crate::dedup::DedupIndex::create(
             page_store.clone(),
             page_cache.clone(),
-            lsm_config.clone(),
-            dedup_shards as usize,
-        ));
+            cfg.dedup_cuckoo_buckets,
+            cfg.dedup_l1_cache_entries,
+            // Two stable seeds — recorded in the meta page so reopen
+            // sees the same hash partitioning. Any non-zero distinct
+            // pair works.
+            0xDEAD_BEEF_CAFE_F00D,
+            0x1234_5678_ABCD_EF01,
+        )?);
         let dedup_reverse =
             Arc::new(crate::paged_reverse::PagedReverse::create(page_store.clone(), page_cache.clone())?);
         manifest.body_version = MANIFEST_BODY_VERSION;
         manifest.refcount_shard_roots = refcount_roots;
         manifest.dedup_shards = dedup_shards;
+        // dedup_index: cuckoo meta page id stored under the legacy
+        // `dedup_index_shard_heads` slot, single-element box for
+        // compat with the existing decoder (same pattern as
+        // dedup_reverse below).
         manifest.dedup_index_shard_heads =
-            vec![Vec::new().into_boxed_slice(); dedup_shards as usize].into_boxed_slice();
+            vec![vec![dedup_index.meta_page_id()].into_boxed_slice()].into_boxed_slice();
         // dedup_reverse: paged-array stores its meta page id under the
         // legacy field name, single-element box for compat with
         // existing decode logic.
@@ -523,21 +532,21 @@ impl Db {
             &manifest.refcount_shard_roots,
             next_gen,
         )?;
-        let dedup_index_heads_per_shard: Vec<Vec<PageId>> = manifest
+        let dedup_index_meta_pid: PageId = manifest
             .dedup_index_shard_heads
-            .iter()
-            .map(|s| s.to_vec())
-            .collect();
+            .first()
+            .and_then(|s| s.first().copied())
+            .unwrap_or(0);
         let dedup_reverse_meta_pid: PageId = manifest
             .dedup_reverse_shard_heads
             .first()
             .and_then(|s| s.first().copied())
             .unwrap_or(0);
-        let dedup_index = Arc::new(ShardedLsm::open_with_cache(
+        let dedup_index = Arc::new(crate::dedup::DedupIndex::open(
             page_store.clone(),
             page_cache.clone(),
-            lsm_config.clone(),
-            &dedup_index_heads_per_shard,
+            dedup_index_meta_pid,
+            cfg.dedup_l1_cache_entries,
         )?);
         let dedup_reverse = Arc::new(crate::paged_reverse::PagedReverse::open(
             page_store.clone(),
@@ -753,25 +762,16 @@ impl Db {
                 shard.rc.flush()?;
             }
 
-            // Dedup index memtable / level heads: mirror what
-            // `Db::flush` does via `prepare_dedup_manifest_update`.
-            // Paged-array dedup_reverse just needs its meta page
-            // refreshed; meta_page_id is stable across opens so the
-            // manifest entry never needs a value rotation.
-            let dedup_generation = last_applied.max(1) + 1;
-            dedup_index.flush_memtable_all(dedup_generation)?;
+            // Cuckoo dedup_index + paged-array dedup_reverse both
+            // write data pages synchronously per op; only their meta
+            // pages need a flush here. Both meta page ids are stable
+            // across opens, so the manifest slots only need to be
+            // re-stamped to the same value (kept for layout
+            // consistency).
+            dedup_index.flush_meta()?;
             dedup_reverse.flush_meta()?;
-            let old_dedup_heads: Vec<Vec<PageId>> = manifest
-                .dedup_index_shard_heads
-                .iter()
-                .map(|s| s.to_vec())
-                .collect();
-            manifest.dedup_index_shard_heads = dedup_index
-                .persist_levels_all(dedup_generation)?
-                .into_iter()
-                .map(|heads| heads.into_boxed_slice())
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+            manifest.dedup_index_shard_heads =
+                vec![vec![dedup_index.meta_page_id()].into_boxed_slice()].into_boxed_slice();
             manifest.dedup_reverse_shard_heads =
                 vec![vec![dedup_reverse.meta_page_id()].into_boxed_slice()].into_boxed_slice();
 
@@ -780,8 +780,6 @@ impl Db {
             manifest_store.commit(&manifest)?;
             commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
             commit_refcount_checkpoint(&refcount_shards, last_applied.max(1) + 1)?;
-
-            dedup_index.free_old_level_heads_all(&old_dedup_heads, dedup_generation)?;
 
             // Open-path counterpart of `Db::reclaim_freed_pages`: no
             // readers can be pinned yet, so every deferred entry queued
@@ -929,17 +927,24 @@ impl Db {
     }
 
     pub fn dedup_lsm_stats(&self) -> (LsmStats, LsmStats) {
-        // dedup_reverse moved off LSM in v9; report zeroed stats so
-        // the status formatter keeps its `(forward, reverse)` shape
-        // until the operator-facing surface is updated.
-        (self.dedup_index.aggregate_stats(), LsmStats::default())
+        // Both dedup index and dedup reverse moved off LSM in v9;
+        // report zeroed stats so the status formatter keeps its
+        // `(forward, reverse)` shape until the operator-facing
+        // surface is updated. Use `dedup_tier_sizes` for the cuckoo
+        // L0/L1 occupancy.
+        (LsmStats::default(), LsmStats::default())
     }
 
-    /// Per-shard dedup stats; first vec is `dedup_index`, second
-    /// vec is now an empty placeholder for `dedup_reverse` after the
-    /// v9 paged-array migration.
+    /// Per-shard dedup stats are gone in v9 — cuckoo dedup_index has
+    /// no shard concept and paged-array dedup_reverse uses a single
+    /// page table. Returns empty vecs.
     pub fn dedup_lsm_stats_per_shard(&self) -> (Vec<LsmStats>, Vec<LsmStats>) {
-        (self.dedup_index.shard_stats(), Vec::new())
+        (Vec::new(), Vec::new())
+    }
+
+    /// Cuckoo dedup_index L0/L1 tier occupancy snapshot.
+    pub fn dedup_tier_sizes(&self) -> crate::dedup::TierSizes {
+        self.dedup_index.tier_sizes()
     }
 
     /// Diagnostic snapshot of in-memory bookkeeping that can grow

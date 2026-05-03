@@ -271,66 +271,41 @@ impl Db {
         }
     }
 
-    /// `true` if the dedup_index memtable has reached its freeze
-    /// threshold. dedup_reverse is no longer LSM-backed, so only the
-    /// forward index can request a flush.
+    /// `true` if the dedup index has dirty in-memory state that
+    /// would benefit from a flush. Cuckoo writes are synchronous so
+    /// only the meta page can ever be dirty; the answer is always
+    /// `false` outside of explicit `flush_meta` callers.
     pub fn dedup_should_flush(&self) -> bool {
-        self.dedup_index.should_flush_any()
+        false
     }
 
-    /// Flush dedup memtables to fresh L0 SSTs. Returns true if either
-    /// side wrote an SST. This is intentionally manifest-neutral: the
-    /// next checkpoint persists the new level heads atomically with the
-    /// database roots.
+    /// Persist the dedup index meta page if dirty. The cuckoo data
+    /// pages are already on disk after each `put`/`delete`, so this
+    /// only flushes the page-table meta page; manifest-neutral.
     pub fn flush_dedup_memtable(&self) -> Result<bool> {
-        let generation = self.current_generation();
-        self.flush_dedup_memtables_at_generation(generation)
+        self.flush_dedup_memtables_at_generation(self.current_generation())
     }
 
-    /// Run one round of dedup compaction across every forward-index
-    /// shard. Returns `true` if any shard performed work.
+    /// No-op: cuckoo dedup_index has no LSM levels to compact.
+    /// Retained for API stability while operator tooling is updated.
     pub fn compact_dedup_once(&self) -> Result<bool> {
-        let generation = self.current_generation();
-        self.dedup_index.compact_once_any(generation)
+        Ok(false)
     }
 
-    pub(super) fn flush_dedup_memtables_at_generation(&self, generation: Lsn) -> Result<bool> {
-        let index = self.dedup_index.flush_memtable_all(generation)?;
+    pub(super) fn flush_dedup_memtables_at_generation(&self, _generation: Lsn) -> Result<bool> {
+        let dedup_dirty = self.dedup_index.flush_meta()?;
         // dedup_reverse: paged-array meta page is the only thing that
         // can be dirty here; data pages already wrote synchronously
         // under each `PagedReverse::put` / `delete`.
         self.dedup_reverse.flush_meta()?;
-        Ok(index)
+        Ok(dedup_dirty)
     }
 
     pub(super) fn maybe_schedule_dedup_maintenance(&self) {
-        let shard_count = self.dedup_lanes.len();
-        let generation = self.last_applied_lsn().saturating_add(1).max(1);
-        for sid in 0..shard_count {
-            // Per-shard freeze check: only schedule a flush for the
-            // shards that actually crossed the threshold. Each shard
-            // owns its own queue flag so a hot shard queueing a flush
-            // doesn't block its quiet siblings from scheduling later.
-            if !self.dedup_index.should_flush_shard(sid) {
-                continue;
-            }
-            if self.dedup_maintenance_queued[sid]
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
-            }
-            let index = self.dedup_index.clone();
-            let queued = self.dedup_maintenance_queued[sid].clone();
-            self.dedup_maintenance_lanes[sid]
-                .handle()
-                .enqueue_maintenance(Box::new(move || {
-                    if let Err(err) = index.flush_memtable_shard(sid, generation) {
-                        tracing::warn!(error = %err, shard = sid, "metadb: background dedup memtable flush failed");
-                    }
-                    queued.store(false, Ordering::Release);
-                }));
-        }
+        // Cuckoo dedup_index has no compaction or memtable freeze;
+        // background maintenance is a no-op now. The lane wiring stays
+        // in place so callers don't need to special-case the absence
+        // of dedup work.
     }
 
     /// Iterate every `(Pba, refcount)` pair across all refcount shards,
@@ -355,12 +330,11 @@ impl Db {
     }
 
     /// Iterate every live `(Hash32, DedupValue)` entry in the dedup
-    /// forward index, sorted by hash. Tombstoned hashes are hidden.
-    /// Materialised via the LSM's prefix-scan path with an empty prefix;
-    /// shares one `reader_drain` and one `levels` snapshot with any
-    /// concurrent readers.
+    /// forward index. Order is the cuckoo data-page → bucket → slot
+    /// order (deterministic but not lexicographic on hash); callers
+    /// that need a sorted view should sort the returned vec.
     pub fn iter_dedup(&self) -> Result<DbDedupIter> {
-        let all = self.dedup_index.scan_prefix_all_shards(&[])?;
+        let all = self.dedup_index.iter()?;
         Ok(DbDedupIter {
             inner: all.into_iter(),
         })

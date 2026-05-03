@@ -197,10 +197,10 @@ pub(crate) fn reclaim_orphan_pages(
 fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> Result<LivePages> {
     let manifest = &loaded.manifest;
     let mut live = LivePages::default();
-    let mut seen_paged = HashSet::new();
-    let mut seen_btree = HashSet::new();
-    let mut seen_level_pages = HashSet::new();
-    let mut seen_ssts = HashSet::new();
+    let mut seen_paged: HashSet<PageId> = HashSet::new();
+    let mut seen_btree: HashSet<PageId> = HashSet::new();
+    let mut seen_level_pages: HashSet<PageId> = HashSet::new();
+    let mut seen_ssts: HashSet<PageId> = HashSet::new();
     let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * PAGE_SIZE as u64));
 
     for volume in &manifest.volumes {
@@ -244,15 +244,17 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         // walked once at the top level above.
     }
 
-    for shard_heads in manifest.dedup_index_shard_heads.iter() {
-        walk_lsm_heads(
-            page_store,
-            &page_cache,
-            shard_heads,
-            &mut live,
-            &mut seen_level_pages,
-            &mut seen_ssts,
-        )?;
+    // dedup_index moved to cuckoo in v9 — the legacy
+    // `dedup_index_shard_heads` slot now carries `[[meta_page_id]]`
+    // (single-element box). Walk the cuckoo meta page + every data
+    // page it indexes.
+    let dedup_index_meta_pid: PageId = manifest
+        .dedup_index_shard_heads
+        .first()
+        .and_then(|s| s.first().copied())
+        .unwrap_or(NULL_PAGE);
+    if dedup_index_meta_pid != NULL_PAGE {
+        walk_cuckoo_dedup_index(page_store, dedup_index_meta_pid, &mut live)?;
     }
     // dedup_reverse moved to paged-array in v9 — the legacy
     // `dedup_reverse_shard_heads` slot now carries
@@ -326,6 +328,49 @@ fn walk_paged_tree(
     }
 }
 
+/// Walk the dedup_index cuckoo meta page + every allocated data
+/// page, marking them as live. Cuckoo data pages have no further
+/// outgoing references (no overflow chain like dedup_reverse).
+fn walk_cuckoo_dedup_index(
+    page_store: &PageStore,
+    meta_pid: PageId,
+    live: &mut LivePages,
+) -> Result<()> {
+    live.mark(meta_pid);
+    let meta_page = page_store.read_page(meta_pid)?;
+    let header = meta_page.header()?;
+    if header.page_type != PageType::CuckooData {
+        return Err(MetaDbError::Corruption(format!(
+            "cuckoo meta page {meta_pid} has wrong type {:?}",
+            header.page_type
+        )));
+    }
+    let payload = meta_page.payload();
+    // bytes 24..28 carry the data-page count; the page-table starts
+    // at the 32 B meta header (see `dedup::cuckoo`).
+    let page_count = u32::from_le_bytes(payload[24..28].try_into().unwrap()) as usize;
+    for i in 0..page_count {
+        let off = 32 + i * 8;
+        let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
+        // Cuckoo's page-table uses 0 (not NULL_PAGE) as the
+        // "unallocated" sentinel — a hole in the bucket → page
+        // mapping. Real data pages are always >= FIRST_DATA_PAGE.
+        if pid == 0 || pid == NULL_PAGE {
+            continue;
+        }
+        live.mark(pid);
+        let data_page = page_store.read_page(pid)?;
+        let dh = data_page.header()?;
+        if dh.page_type != PageType::CuckooData {
+            return Err(MetaDbError::Corruption(format!(
+                "cuckoo data page {pid} has wrong type {:?}",
+                dh.page_type
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Walk the dedup_reverse paged-array meta page, then each
 /// allocated data page, then every overflow page in the chains those
 /// data pages point at, marking them all as live.
@@ -348,7 +393,8 @@ fn walk_dedup_reverse_paged_array(
     for i in 0..page_count {
         let off = 8 + i * 8;
         let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
-        if pid == NULL_PAGE {
+        // Same sentinel conventions as cuckoo: 0 marks a hole.
+        if pid == 0 || pid == NULL_PAGE {
             continue;
         }
         live.mark(pid);
@@ -368,6 +414,9 @@ fn walk_dedup_reverse_paged_array(
             let overflow_pid =
                 u64::from_le_bytes(data_page.payload()[s_off + 4..s_off + 12].try_into().unwrap())
                     as PageId;
+            if overflow_pid == 0 || overflow_pid == NULL_PAGE {
+                continue;
+            }
             walk_dedup_reverse_overflow_chain(page_store, overflow_pid, live)?;
         }
     }
@@ -421,7 +470,8 @@ fn walk_refcount_paged_array(
     for i in 0..page_count {
         let off = 8 + i * 8;
         let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
-        if pid == NULL_PAGE {
+        // 0 = unallocated (paged-array hole sentinel).
+        if pid == 0 || pid == NULL_PAGE {
             continue;
         }
         live.mark(pid);

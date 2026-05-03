@@ -291,13 +291,16 @@ impl CuckooHash {
         Ok(count)
     }
 
-    /// Persist the meta page if dirty.
-    pub fn flush_meta(&self) -> Result<()> {
-        let inner = self.inner.lock();
-        if inner.meta_dirty {
-            self.flush_meta_locked(&inner)?;
+    /// Persist the meta page if dirty. Returns `true` if a write
+    /// happened, `false` if the meta page was already clean.
+    pub fn flush_meta(&self) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if !inner.meta_dirty {
+            return Ok(false);
         }
-        Ok(())
+        self.flush_meta_locked(&inner)?;
+        inner.meta_dirty = false;
+        Ok(true)
     }
 
     /// Walk every allocated data page id (used by verifier).

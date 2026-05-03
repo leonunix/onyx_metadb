@@ -44,7 +44,7 @@ pub(super) fn publish_l2p_read_view(shard: &L2pShard, tree: &PagedL2p) {
 pub(super) fn apply_op_bare(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
-    dedup_index: &ShardedLsm,
+    dedup_index: &crate::dedup::DedupIndex,
     dedup_reverse: &crate::paged_reverse::PagedReverse,
     page_store: &Arc<PageStore>,
     lsn: Lsn,
@@ -77,11 +77,11 @@ pub(super) fn apply_op_bare(
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::DedupPut { hash, value } => {
-            dedup_index.put(*hash, *value);
+            dedup_index.put(*hash, *value, lsn)?;
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupDelete { hash } => {
-            dedup_index.delete(*hash);
+            dedup_index.delete(hash, lsn)?;
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupReversePut { pba, hash } => {

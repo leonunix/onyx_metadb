@@ -123,6 +123,20 @@ pub struct Config {
     /// page below high-water. Large services usually want fast open and an
     /// explicit maintenance/verify job instead.
     pub reclaim_orphans_on_open: bool,
+
+    /// Number of buckets in the dedup_index cuckoo hash table. Each
+    /// bucket holds 4 entries (`crate::dedup::cuckoo::ENTRIES_PER_BUCKET`),
+    /// so the upper-bound capacity is `dedup_cuckoo_buckets * 4`. Pick
+    /// `target_entries / (4 * load_factor)`; a load factor over ~0.85
+    /// makes cuckoo eviction chains long and risks `Corruption("table
+    /// full")`. Recorded in the manifest at `Db::create`.
+    pub dedup_cuckoo_buckets: u64,
+
+    /// Maximum number of entries kept in the dedup_index L1 hot
+    /// cache. Each entry costs roughly 64 B (`(fp, hash, value, lru
+    /// link)`), so 1 M entries ≈ 64 MiB. Larger caches reduce L3
+    /// IOPS but cost RAM 1:1.
+    pub dedup_l1_cache_entries: usize,
 }
 
 impl Config {
@@ -157,6 +171,16 @@ impl Config {
             index_pin_bytes: 512 * 1024 * 1024,
             rebuild_free_list_on_open: true,
             reclaim_orphans_on_open: true,
+            // Single-meta-page cap is 503 pages × 16 buckets =
+            // 8 048 buckets × 4 entries = ~32 K cuckoo capacity at
+            // load factor 1.0 (target ~27 K at 0.85). Sized for
+            // unit tests + small soaks; production overrides via
+            // config until chained meta pages land in stage 3.x.
+            dedup_cuckoo_buckets: 8_000,
+            // 8 K L1 hot cache by default — matches the test-scale
+            // capacity above. Production should bump in lock-step
+            // with `dedup_cuckoo_buckets`.
+            dedup_l1_cache_entries: 8_000,
         }
     }
 }

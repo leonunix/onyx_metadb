@@ -71,7 +71,7 @@ pub struct Db {
     /// fan writes across multiple LSMs once Phase 3 wires per-shard
     /// apply lanes; in Phase 1 the wrapper holds a single shard and
     /// behaves identically to `Arc<Lsm>`.
-    dedup_index: Arc<ShardedLsm>,
+    dedup_index: Arc<crate::dedup::DedupIndex>,
     /// Reverse index: key = `[pba: 8B BE][hash_first_24B]`, value =
     /// `[hash_last_8B | zero padding]`. Used by PBA refcount → 0 to
     /// discover and clean up the `dedup_index` entries whose PBA is
