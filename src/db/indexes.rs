@@ -271,43 +271,6 @@ impl Db {
         }
     }
 
-    /// `true` if the dedup index has dirty in-memory state that
-    /// would benefit from a flush. Cuckoo writes are synchronous so
-    /// only the meta page can ever be dirty; the answer is always
-    /// `false` outside of explicit `flush_meta` callers.
-    pub fn dedup_should_flush(&self) -> bool {
-        false
-    }
-
-    /// Persist the dedup index meta page if dirty. The cuckoo data
-    /// pages are already on disk after each `put`/`delete`, so this
-    /// only flushes the page-table meta page; manifest-neutral.
-    pub fn flush_dedup_memtable(&self) -> Result<bool> {
-        self.flush_dedup_memtables_at_generation(self.current_generation())
-    }
-
-    /// No-op: cuckoo dedup_index has no LSM levels to compact.
-    /// Retained for API stability while operator tooling is updated.
-    pub fn compact_dedup_once(&self) -> Result<bool> {
-        Ok(false)
-    }
-
-    pub(super) fn flush_dedup_memtables_at_generation(&self, _generation: Lsn) -> Result<bool> {
-        let dedup_dirty = self.dedup_index.flush_meta()?;
-        // dedup_reverse: paged-array meta page is the only thing that
-        // can be dirty here; data pages already wrote synchronously
-        // under each `PagedReverse::put` / `delete`.
-        self.dedup_reverse.flush_meta()?;
-        Ok(dedup_dirty)
-    }
-
-    pub(super) fn maybe_schedule_dedup_maintenance(&self) {
-        // Cuckoo dedup_index has no compaction or memtable freeze;
-        // background maintenance is a no-op now. The lane wiring stays
-        // in place so callers don't need to special-case the absence
-        // of dedup work.
-    }
-
     /// Iterate every `(Pba, refcount)` pair across all refcount shards,
     /// sorted by Pba. Refcount is a running tally (global), so there is
     /// no per-volume filtering — callers doing volume-scoped audits

@@ -130,9 +130,45 @@ impl DedupIndex {
         }
     }
 
-    /// Batched lookup. Output order matches input order.
+    /// Batched lookup. Output order matches input order. Holds the L0
+    /// read lock once across every fingerprint check, then the L1 mutex
+    /// once across the surviving candidates, before falling through to
+    /// L3 only for the residual misses. Most workloads see 90 %+ of
+    /// hashes short-circuit in the L0 sketch, so this collapses N ×
+    /// (L0 + L1) lock pairs to two.
     pub fn multi_get(&self, hashes: &[Hash32]) -> Result<Vec<Option<DedupValue>>> {
-        hashes.iter().map(|h| self.get(h)).collect()
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fps: Vec<u32> = hashes.iter().map(fp_of).collect();
+        let in_l0 = self.sketch.contains_batch(&fps);
+
+        // Collect indices that survived L0 — these are the only ones
+        // worth touching L1 / L3 for.
+        let mut l1_pairs: Vec<(u32, Hash32)> = Vec::new();
+        let mut l1_indices: Vec<usize> = Vec::new();
+        for (i, &alive) in in_l0.iter().enumerate() {
+            if alive {
+                l1_pairs.push((fps[i], hashes[i]));
+                l1_indices.push(i);
+            }
+        }
+        let l1_results = self.l1.lookup_batch(&l1_pairs);
+
+        let mut out: Vec<Option<DedupValue>> = vec![None; hashes.len()];
+        for ((idx, l1_result), pair) in l1_indices.iter().zip(l1_results).zip(l1_pairs.iter()) {
+            match l1_result {
+                LookupResult::Hit(value) => out[*idx] = Some(value),
+                LookupResult::Miss => match self.cuckoo.get(&pair.1)? {
+                    Some(value) => {
+                        self.l1.put(pair.0, pair.1, value);
+                        out[*idx] = Some(value);
+                    }
+                    None => out[*idx] = None,
+                },
+            }
+        }
+        Ok(out)
     }
 
     pub fn put(&self, hash: Hash32, value: DedupValue, lsn: Lsn) -> Result<()> {

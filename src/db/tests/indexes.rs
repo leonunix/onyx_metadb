@@ -282,7 +282,7 @@ fn dedup_flush_to_l0_then_read() {
     for i in 0u64..50 {
         db.put_dedup(h(i), dv(i as u8)).unwrap();
     }
-    assert!(db.flush_dedup_memtable().unwrap());
+    db.flush().unwrap();
     for i in 0u64..50 {
         assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dv(i as u8)));
     }
@@ -297,13 +297,12 @@ fn dedup_flush_to_l0_flushes_reverse_index_too() {
         db.register_dedup_reverse(17, hash).unwrap();
     }
 
-    assert!(db.flush_dedup_memtable().unwrap());
+    db.flush().unwrap();
     let mut found = db.scan_dedup_reverse_for_pba(17).unwrap();
     found.sort();
     let mut expected: Vec<_> = (0u64..25).map(|i| hash_full(17, i)).collect();
     expected.sort();
     assert_eq!(found, expected);
-    assert!(!db.dedup_should_flush());
 }
 
 #[test]
@@ -314,12 +313,10 @@ fn dedup_survives_flush_and_reopen() {
         for i in 0u64..100 {
             db.put_dedup(h(i), dv(i as u8)).unwrap();
         }
-        // Force a couple of L0 SSTs so persistence is exercised.
-        assert!(db.flush_dedup_memtable().unwrap());
+        db.flush().unwrap();
         for i in 100u64..200 {
             db.put_dedup(h(i), dv((i % 255) as u8)).unwrap();
         }
-        assert!(db.flush_dedup_memtable().unwrap());
         db.flush().unwrap();
     }
     let db = Db::open(dir.path()).unwrap();

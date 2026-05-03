@@ -154,8 +154,47 @@ impl PagedReverse {
         Ok(out)
     }
 
+    /// Batched form of [`get_hashes`]. Resolves every PBA's page id
+    /// under one inner-lock acquisition, then walks the page cache
+    /// without holding the lock. Output order matches `pbas`.
     pub fn multi_get_hashes(&self, pbas: &[Pba]) -> Result<Vec<Vec<Hash32>>> {
-        pbas.iter().map(|&pba| self.get_hashes(pba)).collect()
+        if pbas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let resolved: Vec<(usize, PageId)> = {
+            let inner = self.inner.lock();
+            pbas.iter()
+                .map(|&pba| {
+                    let (page_idx, slot) = page_offset(pba);
+                    let pid = inner.page_table.get(page_idx).copied().unwrap_or(0);
+                    (slot, pid)
+                })
+                .collect()
+        };
+        let mut out = Vec::with_capacity(pbas.len());
+        for (slot, page_id) in resolved {
+            if page_id == 0 {
+                out.push(Vec::new());
+                continue;
+            }
+            let data_page = self.page_cache.get(page_id)?;
+            let header = read_slot(&data_page, slot);
+            if header.count == 0 {
+                out.push(Vec::new());
+                continue;
+            }
+            let mut hashes = Vec::with_capacity(header.count as usize);
+            hashes.push(header.inline_hash);
+            let mut next = header.overflow_pid;
+            while next != 0 {
+                let page = self.page_cache.get(next)?;
+                let (used, chain_next, more) = read_overflow(&page);
+                hashes.extend(more.into_iter().take(used as usize));
+                next = chain_next;
+            }
+            out.push(hashes);
+        }
+        Ok(out)
     }
 
     /// Append `hash` to `pba`'s registered list. Idempotent: a put of
@@ -232,8 +271,7 @@ impl PagedReverse {
             page.write_header(&header);
             page.seal();
             self.page_store.write_page(page_id, &page)?;
-            self.page_cache.invalidate(page_id);
-            self.page_cache.insert(page_id, Arc::new(page));
+            self.page_cache.replace_or_insert(page_id, Arc::new(page));
             return Ok(());
         }
         // Free the previous overflow chain (we always rewrite it from
@@ -261,8 +299,7 @@ impl PagedReverse {
         page.write_header(&header);
         page.seal();
         self.page_store.write_page(page_id, &page)?;
-        self.page_cache.invalidate(page_id);
-        self.page_cache.insert(page_id, Arc::new(page));
+        self.page_cache.replace_or_insert(page_id, Arc::new(page));
         // Free old overflow chain after the data page is durable; on
         // crash mid-way, recovery still finds either the old or the
         // new chain via the page LSN check.
@@ -309,8 +346,7 @@ impl PagedReverse {
             page.write_header(&header);
             page.seal();
             self.page_store.write_page(pid, &page)?;
-            self.page_cache.invalidate(pid);
-            self.page_cache.insert(pid, Arc::new(page));
+            self.page_cache.replace_or_insert(pid, Arc::new(page));
             next = pid;
         }
         Ok(next)

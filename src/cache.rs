@@ -398,6 +398,27 @@ impl PageCache {
         self.apply_insert_outcome(outcome);
     }
 
+    /// Atomic invalidate-then-insert under one shard write lock. Use
+    /// this when a page is being rewritten in place (paged-meta flush,
+    /// cuckoo bucket rewrite, refcount data-page apply) — it eliminates
+    /// the gap between [`invalidate`] and [`insert`] where a concurrent
+    /// reader could miss the cache, hit the page store, and race with
+    /// the new bytes.
+    pub fn replace_or_insert(&self, page_id: PageId, page: Arc<Page>) {
+        let shard_idx = self.shard_idx(page_id);
+        let mut shard = self.shards[shard_idx].write();
+        let (was_pinned, was_in_lru) = shard.invalidate(page_id);
+        if was_pinned {
+            self.pinned_pages.fetch_sub(1, Ordering::Relaxed);
+        }
+        if was_in_lru {
+            self.current_pages.fetch_sub(1, Ordering::Relaxed);
+        }
+        let outcome = shard.insert(page_id, page);
+        drop(shard);
+        self.apply_insert_outcome(outcome);
+    }
+
     /// Remove `page_id` from the cache if present — both the LRU and
     /// the pinned table. Called by the COW path whenever a page is
     /// freed (so a pinned stale entry cannot shadow a reallocated

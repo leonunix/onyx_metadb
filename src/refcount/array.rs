@@ -241,8 +241,7 @@ impl PagedRefcountArray {
         page.seal();
 
         self.page_store.write_page(page_id, &page)?;
-        self.page_cache.invalidate(page_id);
-        self.page_cache.insert(page_id, Arc::new(page));
+        self.page_cache.replace_or_insert(page_id, Arc::new(page));
         Ok(())
     }
 

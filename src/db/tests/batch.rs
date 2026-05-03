@@ -47,7 +47,7 @@ fn multi_get_dedup_hits_memtable_and_sst() {
     for i in 0u64..40 {
         db.put_dedup(h(i), dv(i as u8)).unwrap();
     }
-    assert!(db.flush_dedup_memtable().unwrap());
+    db.flush().unwrap();
     for i in 40u64..80 {
         db.put_dedup(h(i), dv(i as u8)).unwrap();
     }

@@ -205,8 +205,7 @@ pub fn write_chain(
         }
         page.seal();
         page_store.write_page(pid, &page)?;
-        page_cache.invalidate(pid);
-        page_cache.insert(pid, Arc::new(page));
+        page_cache.replace_or_insert(pid, Arc::new(page));
     }
 
     for pid in to_free {

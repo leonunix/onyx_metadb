@@ -62,6 +62,21 @@ impl L1HotCache {
         }
     }
 
+    /// Batched form of [`lookup`]. Holds the LRU mutex across `pairs`
+    /// so callers checking N fingerprints pay one lock acquisition.
+    /// Each hit promotes its entry to the LRU head, matching the
+    /// per-call semantics.
+    pub fn lookup_batch(&self, pairs: &[(u32, Hash32)]) -> Vec<LookupResult> {
+        let mut cache = self.inner.lock();
+        pairs
+            .iter()
+            .map(|(fp, full_hash)| match cache.get(fp) {
+                Some(entry) if &entry.hash == full_hash => LookupResult::Hit(entry.value),
+                _ => LookupResult::Miss,
+            })
+            .collect()
+    }
+
     /// Insert / refresh the cached entry for `fp`. Overwrites any
     /// previous entry (including a colliding-fingerprint one — the
     /// new owner wins because it is the most recently accessed).

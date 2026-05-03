@@ -44,6 +44,13 @@ impl FpSketch {
         self.inner.read().contains_key(&fp)
     }
 
+    /// Batched `contains`. Holds the read lock across all `fps` so a
+    /// caller checking N fingerprints at once pays one lock acquisition.
+    pub fn contains_batch(&self, fps: &[u32]) -> Vec<bool> {
+        let g = self.inner.read();
+        fps.iter().map(|fp| g.contains_key(fp)).collect()
+    }
+
     /// Increment the reference count for `fp`.
     pub fn insert(&self, fp: u32) {
         *self.inner.write().entry(fp).or_insert(0) += 1;
