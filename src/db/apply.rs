@@ -96,14 +96,17 @@ pub(super) fn apply_op_bare(
         }
         WalOp::Incref { pba, delta } => {
             let sid = shard_for_key(refcount_shards, *pba);
-            let mut tree = refcount_shards[sid].tree.lock();
-            let new = refcount_apply_delta(&mut tree, *pba, i64::from(*delta), lsn)?;
+            let (_, new) =
+                refcount_shards[sid]
+                    .rc
+                    .stage(*pba, i64::from(*delta), lsn)?;
             Ok(ApplyOutcome::RefcountNew(new))
         }
         WalOp::Decref { pba, delta } => {
             let sid = shard_for_key(refcount_shards, *pba);
-            let mut tree = refcount_shards[sid].tree.lock();
-            let new = refcount_apply_delta(&mut tree, *pba, -i64::from(*delta), lsn)?;
+            let (_, new) = refcount_shards[sid]
+                .rc
+                .stage(*pba, -i64::from(*delta), lsn)?;
             Ok(ApplyOutcome::RefcountNew(new))
         }
         WalOp::L2pRemap {
@@ -216,10 +219,7 @@ pub(super) fn apply_l2p_remap(
 
     if let Some((gp, min_rc)) = guard {
         let gp_sid = shard_for_key(refcount_shards, gp);
-        let cur = {
-            let mut rc_tree = refcount_shards[gp_sid].tree.lock();
-            rc_tree.get(gp)?.map(|e| e.rc).unwrap_or(0)
-        };
+        let cur = refcount_shards[gp_sid].rc.get(gp)?;
         if cur < min_rc {
             return Ok(ApplyOutcome::L2pRemap {
                 applied: false,
@@ -274,21 +274,13 @@ pub(super) fn apply_l2p_remap(
 
     let snap_pins_old = match prev {
         Some(old_value) => {
-            let birth = {
-                let sid = shard_for_key(refcount_shards, old_value.head_pba());
-                let mut rc_tree = refcount_shards[sid].tree.lock();
-                rc_tree.get(old_value.head_pba())?.map(|e| e.birth_lsn)
-            };
+            let birth = lookup_birth_lsn(refcount_shards, old_value.head_pba())?;
             any_snap_pins(old_value, birth, &mut tree)?
         }
         None => false,
     };
     let snap_pins_new = {
-        let birth = {
-            let sid = shard_for_key(refcount_shards, new_pba);
-            let mut rc_tree = refcount_shards[sid].tree.lock();
-            rc_tree.get(new_pba)?.map(|e| e.birth_lsn)
-        };
+        let birth = lookup_birth_lsn(refcount_shards, new_pba)?;
         any_snap_pins(new_value, birth, &mut tree)?
     };
 
@@ -327,9 +319,7 @@ pub(super) fn apply_l2p_remap(
 
     let mut freed_pba: Option<Pba> = None;
     for (sid, pba, delta) in touched {
-        let mut rc_tree = refcount_shards[sid].tree.lock();
-        let pre = rc_tree.get(pba)?.map(|e| e.rc).unwrap_or(0);
-        let new = refcount_apply_delta(&mut rc_tree, pba, i64::from(delta), lsn)?;
+        let (pre, new) = refcount_shards[sid].rc.stage(pba, i64::from(delta), lsn)?;
         if new == 0 && pre > 0 {
             freed_pba = Some(pba);
         }
@@ -400,12 +390,8 @@ pub(super) fn apply_l2p_range_delete(
                 // Per-snap fast filter via birth_lsn, same shape as
                 // apply_l2p_remap. Look up birth_lsn first under the
                 // rc shard mutex, then walk only candidate snaps.
-                let captured_birth = {
-                    let pba = captured_value.head_pba();
-                    let rc_sid = shard_for_key(refcount_shards, pba);
-                    let mut rc_tree = refcount_shards[rc_sid].tree.lock();
-                    rc_tree.get(pba)?.map(|e| e.birth_lsn)
-                };
+                let captured_birth =
+                    lookup_birth_lsn(refcount_shards, captured_value.head_pba())?;
                 for s in snap_infos {
                     if let Some(b) = captured_birth {
                         if b > s.created_lsn {
@@ -440,12 +426,11 @@ pub(super) fn apply_l2p_range_delete(
         if indices.is_empty() {
             continue;
         }
-        let mut rc_tree = refcount_shards[sid].tree.lock();
+        let shard = &refcount_shards[sid];
         for &idx in indices {
             let (_, value) = captured[idx];
             let pba = value.head_pba();
-            let pre = rc_tree.get(pba)?.map(|e| e.rc).unwrap_or(0);
-            let new = refcount_apply_delta(&mut rc_tree, pba, -1, lsn)?;
+            let (pre, new) = shard.rc.stage(pba, -1, lsn)?;
             if new == 0 && pre > 0 {
                 freed_pbas.push(pba);
             }
@@ -711,11 +696,10 @@ pub(super) fn apply_drop_snapshot_pages_and_decrefs(
         if indices.is_empty() {
             continue;
         }
-        let mut rc_tree = refcount_shards[sid].tree.lock();
+        let shard = &refcount_shards[sid];
         for &idx in indices {
             let pba = pba_decrefs[idx];
-            let pre = rc_tree.get(pba)?.map(|e| e.rc).unwrap_or(0);
-            let new = refcount_apply_delta(&mut rc_tree, pba, -1, lsn)?;
+            let (pre, new) = shard.rc.stage(pba, -1, lsn)?;
             if new == 0 && pre > 0 {
                 freed_pbas.push(pba);
             }
@@ -733,58 +717,22 @@ pub(super) fn shard_for_key(shards: &[Shard], key: u64) -> usize {
     (xxh3_64(&key.to_be_bytes()) as usize) % shards.len()
 }
 
-/// Apply a signed delta to `pba`'s refcount under the caller-held shard
-/// mutex. `lsn` stamps `birth_lsn` on a 0→1 transition; existing entries
-/// preserve their birth_lsn across rc changes. Returns the new rc.
+/// Read `pba`'s `birth_lsn` from the refcount shard. Returns `Some` if
+/// the entry is live (rc > 0); `None` if rc == 0. Used by snap-pin
+/// fast filters in [`apply_l2p_remap`] / [`apply_l2p_range_delete`].
 ///
 /// The 0→1 birth_lsn stamp is what powers the birth/death LSN
-/// suppression in [`apply_l2p_remap`]: a pba's birth_lsn equals the lsn
-/// of the op that revived it from rc=0, so concurrent snapshots whose
-/// `created_lsn >= birth_lsn` can be ruled out as having pinned this
-/// pba's content.
-pub(super) fn refcount_apply_delta(
-    tree: &mut BTree,
-    pba: Pba,
-    delta: i64,
-    lsn: Lsn,
-) -> Result<u32> {
-    let cur = tree.get(pba)?.unwrap_or(RcEntry::ZERO);
-    let new_rc: u32 = if delta >= 0 {
-        let amount = u32::try_from(delta).map_err(|_| {
-            MetaDbError::InvalidArgument(format!("refcount delta {delta} exceeds u32"))
-        })?;
-        cur.rc.checked_add(amount).ok_or_else(|| {
-            MetaDbError::InvalidArgument(format!(
-                "refcount overflow for pba {pba}: {} + {amount}",
-                cur.rc,
-            ))
-        })?
+/// suppression: a pba's birth_lsn equals the lsn of the op that
+/// revived it from rc=0, so snapshots whose `created_lsn >= birth_lsn`
+/// can be ruled out as having pinned this pba's content.
+pub(super) fn lookup_birth_lsn(refcount_shards: &[Shard], pba: Pba) -> Result<Option<Lsn>> {
+    let sid = shard_for_key(refcount_shards, pba);
+    let entry = refcount_shards[sid].rc.get_entry(pba)?;
+    Ok(if entry.rc > 0 {
+        Some(entry.birth_lsn)
     } else {
-        let amount = u32::try_from(-delta).map_err(|_| {
-            MetaDbError::InvalidArgument(format!("refcount delta {delta} exceeds u32"))
-        })?;
-        cur.rc.checked_sub(amount).ok_or_else(|| {
-            MetaDbError::InvalidArgument(format!(
-                "refcount decref underflow for pba {pba}: {} - {amount}",
-                cur.rc,
-            ))
-        })?
-    };
-    if new_rc == 0 {
-        if cur.rc > 0 {
-            tree.delete(pba)?;
-        }
-    } else {
-        let birth_lsn = if cur.rc == 0 { lsn } else { cur.birth_lsn };
-        tree.insert(
-            pba,
-            RcEntry {
-                rc: new_rc,
-                birth_lsn,
-            },
-        )?;
-    }
-    Ok(new_rc)
+        None
+    })
 }
 
 pub(super) fn shard_for_key_l2p(shards: &[L2pShard], key: u64) -> usize {

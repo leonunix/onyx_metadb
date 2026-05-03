@@ -28,7 +28,6 @@ impl Db {
         let mut manifest_state = self.manifest_state.lock();
         let volumes = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
-        let mut refcount_guards = self.lock_all_refcount_shards();
 
         // Locate the contiguous range of `l2p_guards` that belongs to
         // `target`. `lock_all_l2p_shards_for` iterates `volumes` in
@@ -53,10 +52,7 @@ impl Db {
         // see commit-ordering rationale on the pre-check.
         //
         // Phase 6.5b: refcount is a running tally, not point-in-time
-        // state. Snapshots only capture L2P. We still hold refcount
-        // guards for `max_generation_from_two_groups` and
-        // `refresh_manifest_from_locked`, but skip the per-tree
-        // snapshot incref.
+        // state. Snapshots only capture L2P; refcount stays unsampled.
         let l2p_roots: Vec<PageId> = l2p_guards[target_start..target_end]
             .iter()
             .map(|tree| tree.root())
@@ -75,12 +71,7 @@ impl Db {
         // volume layout `encode()` will see at commit time.
         let dedup_update =
             self.prepare_dedup_manifest_update(&mut manifest_state.manifest, created_lsn)?;
-        self.refresh_manifest_from_locked(
-            &mut manifest_state.manifest,
-            &volumes,
-            &l2p_guards,
-            &refcount_guards,
-        )?;
+        self.refresh_manifest_from_locked(&mut manifest_state.manifest, &volumes, &l2p_guards)?;
 
         // Pre-check: does the projected manifest (with the new snapshot
         // entry appended) still fit in one page? Failures after this
@@ -113,7 +104,7 @@ impl Db {
             tree.incref_root_for_snapshot()?;
         }
         flush_locked_l2p_shards(&mut l2p_guards)?;
-        self.flush_locked_refcount_shards(&mut refcount_guards)?;
+        self.flush_all_refcount_shards()?;
 
         manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
         let snap_roots: Box<[PageId]> = l2p_roots.into_boxed_slice();
@@ -128,7 +119,7 @@ impl Db {
         let manifest = manifest_state.manifest.clone();
         manifest_state.store.commit(&manifest)?;
         commit_l2p_checkpoint(&mut l2p_guards, created_lsn)?;
-        commit_refcount_checkpoint(&mut refcount_guards, created_lsn)?;
+        commit_refcount_checkpoint(&self.refcount_shards, created_lsn)?;
         self.finish_dedup_manifest_update(dedup_update, created_lsn)?;
         // Append the new snap to the per-volume cache. Inline update —
         // manifest_state is still held above, and `recompute_snap_info`
@@ -300,29 +291,23 @@ impl Db {
         // present) so reopen always finds current roots.
         let volumes_snap = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes_snap);
-        let mut refcount_guards = self.lock_all_refcount_shards();
         flush_locked_l2p_shards(&mut l2p_guards)?;
-        self.flush_locked_refcount_shards(&mut refcount_guards)?;
+        self.flush_all_refcount_shards()?;
 
         let checkpoint_lsn = *self.last_applied_lsn.lock();
-        let dedup_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        let dedup_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
         let dedup_update = {
             let mut mstate = self.manifest_state.lock();
             let dedup_update =
                 self.prepare_dedup_manifest_update(&mut mstate.manifest, dedup_generation)?;
-            self.refresh_manifest_from_locked(
-                &mut mstate.manifest,
-                &volumes_snap,
-                &l2p_guards,
-                &refcount_guards,
-            )?;
+            self.refresh_manifest_from_locked(&mut mstate.manifest, &volumes_snap, &l2p_guards)?;
             mstate.manifest.checkpoint_lsn = checkpoint_lsn;
             let manifest = mstate.manifest.clone();
             mstate.store.commit(&manifest)?;
             dedup_update
         };
         commit_l2p_checkpoint(&mut l2p_guards, dedup_generation)?;
-        commit_refcount_checkpoint(&mut refcount_guards, dedup_generation)?;
+        commit_refcount_checkpoint(&self.refcount_shards, dedup_generation)?;
         self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
 
         // Locate the source volume's shard range within l2p_guards.
@@ -380,7 +365,7 @@ impl Db {
         for (_lba, value) in raw_pba_decrefs {
             let pba = value.head_pba();
             let sid = shard_for_key(&self.refcount_shards, pba);
-            let rc = refcount_guards[sid].get(pba)?.map(|e| e.rc).unwrap_or(0);
+            let rc = self.refcount_shards[sid].rc.get(pba)?;
             let taken = pending.entry(pba).or_insert(0);
             if *taken < rc {
                 *taken += 1;
@@ -388,7 +373,6 @@ impl Db {
             }
         }
         drop(l2p_guards);
-        drop(refcount_guards);
 
         // Page refcounts are physical-page ownership counts, not
         // per-volume logical counts. `clone_volume` can make any live

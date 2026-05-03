@@ -375,6 +375,13 @@ impl Db {
                     timing.apply = apply_started.elapsed();
                     timing.laned = laned_timing;
                     self.metrics.record_commit_apply(timing.apply);
+                    self.metrics.record_commit_apply_laned(
+                        laned_timing.l2p_wait,
+                        laned_timing.rc_enqueue,
+                        laned_timing.rc_wait,
+                        laned_timing.dedup_enqueue,
+                        laned_timing.dedup_wait,
+                    );
                     outcomes
                 }
                 Err(err) => {
@@ -817,13 +824,13 @@ impl Db {
         ops: Arc<Vec<WalOp>>,
     ) -> QueuedLanePlan {
         let mut l2p_receivers = Vec::with_capacity(plan.l2p_sorted.len());
-        // Snapshot refcount tree handles once per commit so the per-lane
+        // Snapshot refcount shard handles once per commit so the per-lane
         // closures can do guarded-remap rc lookups (dedup hits) without
         // touching the Db struct from the worker thread.
-        let refcount_trees: Arc<Vec<Arc<Mutex<BTree>>>> = Arc::new(
+        let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> = Arc::new(
             self.refcount_shards
                 .iter()
-                .map(|s| s.tree.clone())
+                .map(|s| s.rc.clone())
                 .collect(),
         );
         for ((vol_ord, sid), indices) in plan.l2p_sorted {
@@ -833,7 +840,7 @@ impl Db {
             let apply_volume = volume.clone();
             let apply_ops = ops.clone();
             let metrics = self.metrics.clone();
-            let refcount_trees = refcount_trees.clone();
+            let refcount_shards_arc = refcount_shards_arc.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
             volume.shards[sid].apply_lane.enqueue_ready(
                 lsn,
@@ -844,7 +851,7 @@ impl Db {
                         indices,
                         lsn,
                         apply_ops.as_slice(),
-                        refcount_trees.as_slice(),
+                        refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
                     );
                     let _ = tx.send(result);
@@ -884,7 +891,7 @@ impl Db {
         indices: Vec<usize>,
         lsn: Lsn,
         ops: &[WalOp],
-        refcount_trees: &[Arc<Mutex<BTree>>],
+        refcount_shards: &[Arc<crate::refcount::RcShard>],
         metrics: &MetaMetrics,
     ) -> Result<L2pBucketApplyResult> {
         let mut outcomes = Vec::with_capacity(indices.len());
@@ -946,11 +953,8 @@ impl Db {
                         // there is no L2P↔RC cycle.
                         if let Some((gp, min_rc)) = guard {
                             let gp_sid =
-                                (xxh3_64(&gp.to_be_bytes()) as usize) % refcount_trees.len();
-                            let cur = {
-                                let mut rc_tree = refcount_trees[gp_sid].lock();
-                                rc_tree.get(*gp)?.map(|e| e.rc).unwrap_or(0)
-                            };
+                                (xxh3_64(&gp.to_be_bytes()) as usize) % refcount_shards.len();
+                            let cur = refcount_shards[gp_sid].get(*gp)?;
                             if cur < *min_rc {
                                 l2p_remap_count += 1;
                                 outcomes.push((
@@ -1078,7 +1082,7 @@ impl Db {
     }
 
     fn apply_refcount_bucket_to_tree(
-        tree: Arc<Mutex<BTree>>,
+        rc: Arc<crate::refcount::RcShard>,
         metrics: Arc<MetaMetrics>,
         mut actions: Vec<RcApplyAction>,
         lsn: Lsn,
@@ -1088,7 +1092,6 @@ impl Db {
             return Ok(result);
         }
         actions.sort_by_key(|action| action.op_idx);
-        let mut tree = tree.lock();
         let mut by_pba: HashMap<Pba, Vec<RcApplyAction>> = HashMap::new();
         for action in actions {
             by_pba.entry(action.pba).or_default().push(action);
@@ -1103,13 +1106,8 @@ impl Db {
 
             if can_coalesce_remap {
                 let delta: i64 = group.iter().map(|action| action.delta).sum();
-                let pre = if group.iter().any(|action| action.remap_freed_candidate) {
-                    tree.get(pba)?.map(|e| e.rc).unwrap_or(0)
-                } else {
-                    0
-                };
                 let op_started = std::time::Instant::now();
-                let new = refcount_apply_delta(&mut tree, pba, delta, lsn)?;
+                let (pre, new) = rc.stage(pba, delta, lsn)?;
                 metrics.record_apply_refcount(op_started.elapsed());
                 if new == 0 && pre > 0 {
                     if let Some(action) = group
@@ -1124,13 +1122,8 @@ impl Db {
             }
 
             for action in group {
-                let pre = if action.remap_freed_candidate {
-                    tree.get(action.pba)?.map(|e| e.rc).unwrap_or(0)
-                } else {
-                    0
-                };
                 let op_started = std::time::Instant::now();
-                let new = refcount_apply_delta(&mut tree, action.pba, action.delta, lsn)?;
+                let (pre, new) = rc.stage(action.pba, action.delta, lsn)?;
                 metrics.record_apply_refcount(op_started.elapsed());
                 if action.remap_freed_candidate {
                     if new == 0 && pre > 0 {
@@ -1229,11 +1222,11 @@ impl Db {
                 continue;
             };
             let actions = std::mem::take(&mut plan.rc_buckets[sid]);
-            let tree = self.refcount_shards[sid].tree.clone();
+            let rc = self.refcount_shards[sid].rc.clone();
             let metrics = self.metrics.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
             pending.set(Box::new(move || {
-                let result = Self::apply_refcount_bucket_to_tree(tree, metrics, actions, lsn);
+                let result = Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn);
                 let _ = tx.send(result);
             }));
             rc_receivers.push(rx);
@@ -1427,10 +1420,10 @@ impl Db {
             }
         }
 
-        let refcount_trees: Arc<Vec<_>> = Arc::new(
+        let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> = Arc::new(
             refcount_shards
                 .iter()
-                .map(|shard| shard.tree.clone())
+                .map(|shard| shard.rc.clone())
                 .collect(),
         );
         let mut l2p_sorted: Vec<_> = l2p_buckets.into_iter().collect();
@@ -1444,7 +1437,7 @@ impl Db {
                 .clone();
             let apply_volume = volume.clone();
             let apply_ops = ops.clone();
-            let refcount_trees = refcount_trees.clone();
+            let refcount_shards_arc = refcount_shards_arc.clone();
             let metrics = metrics.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
             volume.shards[sid].apply_lane.enqueue_ready(
@@ -1456,7 +1449,7 @@ impl Db {
                         indices,
                         lsn,
                         apply_ops.as_slice(),
-                        refcount_trees.as_slice(),
+                        refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
                     );
                     let _ = tx.send(result);
@@ -1500,13 +1493,13 @@ impl Db {
             if actions.is_empty() {
                 continue;
             }
-            let tree = refcount_shards[sid].tree.clone();
+            let rc = refcount_shards[sid].rc.clone();
             let metrics = metrics.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
             refcount_shards[sid].apply_lane.enqueue_ready(
                 lsn,
                 Box::new(move || {
-                    let result = Self::apply_refcount_bucket_to_tree(tree, metrics, actions, lsn);
+                    let result = Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn);
                     let _ = tx.send(result);
                 }),
             );
@@ -1621,9 +1614,9 @@ impl Db {
             }
         }
 
-        let refcount_trees: Vec<_> = refcount_shards
+        let refcount_shards_vec: Vec<Arc<crate::refcount::RcShard>> = refcount_shards
             .iter()
-            .map(|shard| shard.tree.clone())
+            .map(|shard| shard.rc.clone())
             .collect();
         let mut l2p_sorted: Vec<_> = l2p_buckets.into_iter().collect();
         l2p_sorted.sort_by_key(|((vol, sid), _)| (*vol, *sid));
@@ -1638,7 +1631,7 @@ impl Db {
                 indices,
                 lsn,
                 ops,
-                &refcount_trees,
+                &refcount_shards_vec,
                 metrics.as_ref(),
             )?;
             for (idx, outcome) in result.outcomes {
@@ -1655,7 +1648,7 @@ impl Db {
                 continue;
             }
             let result = Self::apply_refcount_bucket_to_tree(
-                refcount_shards[sid].tree.clone(),
+                refcount_shards[sid].rc.clone(),
                 metrics.clone(),
                 actions,
                 lsn,

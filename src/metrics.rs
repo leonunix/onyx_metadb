@@ -21,6 +21,22 @@ pub struct MetaMetrics {
     commit_apply_us: AtomicU64,
     commit_apply_max_us: AtomicU64,
 
+    // Per-phase split of `commit_apply_us`. `apply_ops_laned` runs
+    // L2P → refcount → dedup as three sequential lane-barrier
+    // phases; each blocks commit ack. Use these counters to
+    // attribute `commit_apply_max_us` to the specific lane class
+    // that dominates the long tail.
+    commit_apply_l2p_wait_us: AtomicU64,
+    commit_apply_l2p_wait_max_us: AtomicU64,
+    commit_apply_rc_enqueue_us: AtomicU64,
+    commit_apply_rc_enqueue_max_us: AtomicU64,
+    commit_apply_rc_wait_us: AtomicU64,
+    commit_apply_rc_wait_max_us: AtomicU64,
+    commit_apply_dedup_enqueue_us: AtomicU64,
+    commit_apply_dedup_enqueue_max_us: AtomicU64,
+    commit_apply_dedup_wait_us: AtomicU64,
+    commit_apply_dedup_wait_max_us: AtomicU64,
+
     wal_submit_calls: AtomicU64,
     wal_submit_wait_us: AtomicU64,
     wal_submit_wait_max_us: AtomicU64,
@@ -163,6 +179,16 @@ pub struct MetaMetricsSnapshot {
     pub commit_apply_gate_wait_max_us: u64,
     pub commit_apply_us: u64,
     pub commit_apply_max_us: u64,
+    pub commit_apply_l2p_wait_us: u64,
+    pub commit_apply_l2p_wait_max_us: u64,
+    pub commit_apply_rc_enqueue_us: u64,
+    pub commit_apply_rc_enqueue_max_us: u64,
+    pub commit_apply_rc_wait_us: u64,
+    pub commit_apply_rc_wait_max_us: u64,
+    pub commit_apply_dedup_enqueue_us: u64,
+    pub commit_apply_dedup_enqueue_max_us: u64,
+    pub commit_apply_dedup_wait_us: u64,
+    pub commit_apply_dedup_wait_max_us: u64,
     pub wal_submit_calls: u64,
     pub wal_submit_wait_us: u64,
     pub wal_submit_wait_max_us: u64,
@@ -291,6 +317,16 @@ impl MetaMetrics {
             commit_apply_gate_wait_max_us: load(&self.commit_apply_gate_wait_max_us),
             commit_apply_us: load(&self.commit_apply_us),
             commit_apply_max_us: load(&self.commit_apply_max_us),
+            commit_apply_l2p_wait_us: load(&self.commit_apply_l2p_wait_us),
+            commit_apply_l2p_wait_max_us: load(&self.commit_apply_l2p_wait_max_us),
+            commit_apply_rc_enqueue_us: load(&self.commit_apply_rc_enqueue_us),
+            commit_apply_rc_enqueue_max_us: load(&self.commit_apply_rc_enqueue_max_us),
+            commit_apply_rc_wait_us: load(&self.commit_apply_rc_wait_us),
+            commit_apply_rc_wait_max_us: load(&self.commit_apply_rc_wait_max_us),
+            commit_apply_dedup_enqueue_us: load(&self.commit_apply_dedup_enqueue_us),
+            commit_apply_dedup_enqueue_max_us: load(&self.commit_apply_dedup_enqueue_max_us),
+            commit_apply_dedup_wait_us: load(&self.commit_apply_dedup_wait_us),
+            commit_apply_dedup_wait_max_us: load(&self.commit_apply_dedup_wait_max_us),
             wal_submit_calls: load(&self.wal_submit_calls),
             wal_submit_wait_us: load(&self.wal_submit_wait_us),
             wal_submit_wait_max_us: load(&self.wal_submit_wait_max_us),
@@ -491,6 +527,41 @@ impl MetaMetrics {
 
     pub(crate) fn record_commit_apply(&self, elapsed: Duration) {
         record_duration(&self.commit_apply_us, &self.commit_apply_max_us, elapsed);
+    }
+
+    pub(crate) fn record_commit_apply_laned(
+        &self,
+        l2p_wait: Duration,
+        rc_enqueue: Duration,
+        rc_wait: Duration,
+        dedup_enqueue: Duration,
+        dedup_wait: Duration,
+    ) {
+        record_duration(
+            &self.commit_apply_l2p_wait_us,
+            &self.commit_apply_l2p_wait_max_us,
+            l2p_wait,
+        );
+        record_duration(
+            &self.commit_apply_rc_enqueue_us,
+            &self.commit_apply_rc_enqueue_max_us,
+            rc_enqueue,
+        );
+        record_duration(
+            &self.commit_apply_rc_wait_us,
+            &self.commit_apply_rc_wait_max_us,
+            rc_wait,
+        );
+        record_duration(
+            &self.commit_apply_dedup_enqueue_us,
+            &self.commit_apply_dedup_enqueue_max_us,
+            dedup_enqueue,
+        );
+        record_duration(
+            &self.commit_apply_dedup_wait_us,
+            &self.commit_apply_dedup_wait_max_us,
+            dedup_wait,
+        );
     }
 
     pub(crate) fn record_apply_l2p_put(&self, elapsed: Duration) {
@@ -837,6 +908,16 @@ impl MetaMetricsSnapshot {
                 "\"commit_apply_gate_wait_max_us\":{},",
                 "\"commit_apply_us\":{},",
                 "\"commit_apply_max_us\":{},",
+                "\"commit_apply_l2p_wait_us\":{},",
+                "\"commit_apply_l2p_wait_max_us\":{},",
+                "\"commit_apply_rc_enqueue_us\":{},",
+                "\"commit_apply_rc_enqueue_max_us\":{},",
+                "\"commit_apply_rc_wait_us\":{},",
+                "\"commit_apply_rc_wait_max_us\":{},",
+                "\"commit_apply_dedup_enqueue_us\":{},",
+                "\"commit_apply_dedup_enqueue_max_us\":{},",
+                "\"commit_apply_dedup_wait_us\":{},",
+                "\"commit_apply_dedup_wait_max_us\":{},",
                 "\"wal_submit_calls\":{},",
                 "\"wal_submit_wait_us\":{},",
                 "\"wal_submit_wait_max_us\":{},",
@@ -958,6 +1039,16 @@ impl MetaMetricsSnapshot {
             self.commit_apply_gate_wait_max_us,
             self.commit_apply_us,
             self.commit_apply_max_us,
+            self.commit_apply_l2p_wait_us,
+            self.commit_apply_l2p_wait_max_us,
+            self.commit_apply_rc_enqueue_us,
+            self.commit_apply_rc_enqueue_max_us,
+            self.commit_apply_rc_wait_us,
+            self.commit_apply_rc_wait_max_us,
+            self.commit_apply_dedup_enqueue_us,
+            self.commit_apply_dedup_enqueue_max_us,
+            self.commit_apply_dedup_wait_us,
+            self.commit_apply_dedup_wait_max_us,
             self.wal_submit_calls,
             self.wal_submit_wait_us,
             self.wal_submit_wait_max_us,

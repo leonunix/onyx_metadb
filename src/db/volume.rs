@@ -166,9 +166,8 @@ impl Db {
         // them and later commit a refreshed manifest.
         let volumes_snap = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes_snap);
-        let mut refcount_guards = self.lock_all_refcount_shards();
         flush_locked_l2p_shards(&mut l2p_guards)?;
-        self.flush_locked_refcount_shards(&mut refcount_guards)?;
+        self.flush_all_refcount_shards()?;
 
         // Locate the dying volume's shard range within l2p_guards.
         let mut target_start = 0usize;
@@ -207,17 +206,12 @@ impl Db {
         // the on-disk manifest pointing at Free pages, and
         // `open_l2p_shards` would fail at the next open.
         let checkpoint_lsn = *self.last_applied_lsn.lock();
-        let dedup_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        let dedup_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
         let dedup_update = {
             let mut mstate = self.manifest_state.lock();
             let dedup_update =
                 self.prepare_dedup_manifest_update(&mut mstate.manifest, dedup_generation)?;
-            self.refresh_manifest_from_locked(
-                &mut mstate.manifest,
-                &volumes_snap,
-                &l2p_guards,
-                &refcount_guards,
-            )?;
+            self.refresh_manifest_from_locked(&mut mstate.manifest, &volumes_snap, &l2p_guards)?;
             mstate.manifest.volumes.retain(|v| v.ord != vol_ord);
             mstate.manifest.checkpoint_lsn = checkpoint_lsn;
             let manifest = mstate.manifest.clone();
@@ -225,10 +219,9 @@ impl Db {
             dedup_update
         };
         commit_l2p_checkpoint(&mut l2p_guards, dedup_generation)?;
-        commit_refcount_checkpoint(&mut refcount_guards, dedup_generation)?;
+        commit_refcount_checkpoint(&self.refcount_shards, dedup_generation)?;
         self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
         drop(l2p_guards);
-        drop(refcount_guards);
 
         let op = WalOp::DropVolume {
             ord: vol_ord,
@@ -590,19 +583,16 @@ impl Db {
         Ok(())
     }
 
-    pub(super) fn lock_all_refcount_shards(&self) -> Vec<MutexGuard<'_, BTree>> {
-        self.refcount_shards
-            .iter()
-            .map(|shard| shard.tree.lock())
-            .collect()
-    }
-
-    pub(super) fn flush_locked_refcount_shards(
-        &self,
-        guards: &mut [MutexGuard<'_, BTree>],
-    ) -> Result<()> {
-        for tree in guards {
-            tree.flush()?;
+    /// Paged-array refcount no longer needs per-shard guards held
+    /// across snapshot / flush prepare windows: each `RcShard` has
+    /// its own internal mutex covering apply + read, and snapshot
+    /// semantics are unchanged because refcount is not snapshotted.
+    /// Callers that previously asked for guards now operate directly
+    /// on the shards via [`flush_all_refcount_shards`] /
+    /// [`refresh_manifest_from_shards`].
+    pub(super) fn flush_all_refcount_shards(&self) -> Result<()> {
+        for shard in &self.refcount_shards {
+            shard.rc.flush()?;
         }
         Ok(())
     }
@@ -618,16 +608,14 @@ impl Db {
         manifest: &mut Manifest,
         volumes: &[Arc<Volume>],
         l2p_guards: &[RwLockWriteGuard<'_, PagedL2p>],
-        refcount_guards: &[MutexGuard<'_, BTree>],
     ) -> Result<()> {
-        refresh_manifest_entries(manifest, volumes, l2p_guards, refcount_guards)
+        refresh_manifest_entries(manifest, volumes, l2p_guards, &self.refcount_shards)
     }
 
     pub(super) fn current_generation(&self) -> Lsn {
         let volumes = self.volumes_snapshot();
         let l2p = lock_all_l2p_shards_for(&volumes);
-        let refcount = self.lock_all_refcount_shards();
-        max_generation_from_two_groups(&l2p, &refcount)
+        max_generation_from_two_groups(&l2p, &self.refcount_shards)
     }
 
     pub(super) fn collect_range_for_roots(

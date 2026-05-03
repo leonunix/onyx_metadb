@@ -214,14 +214,12 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
             tree.check_invariants()?;
         }
     }
-    for &root in manifest.refcount_shard_roots.iter() {
-        if root == NULL_PAGE {
+    for &meta_pid in manifest.refcount_shard_roots.iter() {
+        if meta_pid == NULL_PAGE {
             continue;
         }
-        live.mark(root);
-        walk_btree(page_store, root, &mut live, &mut seen_btree)?;
-        let mut tree = BTree::open(page_store.clone(), root, 1)?;
-        tree.check_invariants()?;
+        live.mark(meta_pid);
+        walk_refcount_paged_array(page_store, meta_pid, &mut live, &mut seen_btree)?;
     }
 
     for snapshot in &manifest.snapshots {
@@ -325,6 +323,55 @@ fn walk_paged_tree(
     }
 }
 
+/// Walk the paged-array refcount shard's meta page and mark every
+/// allocated data page as live. Replaces the legacy `walk_btree` for
+/// refcount roots.
+fn walk_refcount_paged_array(
+    page_store: &PageStore,
+    meta_pid: PageId,
+    live: &mut LivePages,
+    seen: &mut HashSet<PageId>,
+) -> Result<()> {
+    if !seen.insert(meta_pid) {
+        return Ok(());
+    }
+    let meta_page = page_store.read_page(meta_pid)?;
+    let header = meta_page.header()?;
+    if header.page_type != PageType::RefcountArray {
+        return Err(MetaDbError::Corruption(format!(
+            "refcount meta page {meta_pid} has wrong type {:?}",
+            header.page_type
+        )));
+    }
+    let payload = meta_page.payload();
+    let page_count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    for i in 0..page_count {
+        let off = 8 + i * 8;
+        let pid = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()) as PageId;
+        if pid == NULL_PAGE {
+            continue;
+        }
+        live.mark(pid);
+        // Refcount data pages have no outgoing references; just verify
+        // the type tag.
+        let data_page = page_store.read_page(pid)?;
+        let dh = data_page.header()?;
+        if dh.page_type != PageType::RefcountArray {
+            return Err(MetaDbError::Corruption(format!(
+                "refcount data page {pid} has wrong type {:?}",
+                dh.page_type
+            )));
+        }
+    }
+    Ok(())
+}
+
+// Dead code as of metadb-restructure-v9 Stage 1: the only verifier
+// caller used to be the refcount roots loop; that now walks the
+// paged-array meta page via [`walk_refcount_paged_array`]. Kept
+// behind `#[allow(dead_code)]` until the BTree module is removed
+// in cleanup.
+#[allow(dead_code)]
 fn walk_btree(
     page_store: &PageStore,
     root: PageId,

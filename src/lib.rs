@@ -39,6 +39,7 @@ pub mod page;
 pub mod page_store;
 pub mod paged;
 pub mod recovery;
+pub mod refcount;
 pub mod testing;
 pub mod tx;
 pub mod types;

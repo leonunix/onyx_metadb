@@ -25,7 +25,7 @@ pub(super) fn refresh_manifest_entries(
     manifest: &mut Manifest,
     volumes: &[Arc<Volume>],
     l2p_guards: &[RwLockWriteGuard<'_, PagedL2p>],
-    refcount_guards: &[MutexGuard<'_, BTree>],
+    refcount_shards: &[Shard],
 ) -> Result<()> {
     manifest.body_version = MANIFEST_BODY_VERSION;
     let expected_total: usize = volumes.iter().map(|v| v.shards.len()).sum();
@@ -53,9 +53,9 @@ pub(super) fn refresh_manifest_entries(
         });
     }
     manifest.volumes = new_entries;
-    manifest.refcount_shard_roots = refcount_guards
+    manifest.refcount_shard_roots = refcount_shards
         .iter()
-        .map(|tree| tree.root())
+        .map(|shard| shard.rc.meta_page_id())
         .collect::<Vec<_>>()
         .into_boxed_slice();
     Ok(())
@@ -78,13 +78,11 @@ pub(super) fn commit_l2p_checkpoint(
     Ok(())
 }
 
-pub(super) fn commit_refcount_checkpoint(
-    guards: &mut [MutexGuard<'_, BTree>],
-    generation: Lsn,
-) -> Result<()> {
-    for tree in guards {
-        tree.checkpoint_committed(generation)?;
-    }
+/// No-op shim: paged-array refcount has no checkpoint to commit
+/// (sample-phase `RcShard::flush` already wrote everything synchronously).
+/// Kept for call-site stability while the open / flush paths still mention
+/// "refcount checkpoint".
+pub(super) fn commit_refcount_checkpoint(_shards: &[Shard], _generation: Lsn) -> Result<()> {
     Ok(())
 }
 
@@ -152,10 +150,10 @@ pub(super) fn create_shards(
     let mut shards = Vec::with_capacity(shard_count);
     let mut roots = Vec::with_capacity(shard_count);
     for shard_idx in 0..shard_count {
-        let tree = BTree::create_with_cache(page_store.clone(), page_cache.clone())?;
-        roots.push(tree.root());
+        let rc = crate::refcount::RcShard::create(page_store.clone(), page_cache.clone())?;
+        roots.push(rc.meta_page_id());
         shards.push(Shard {
-            tree: Arc::new(Mutex::new(tree)),
+            rc: Arc::new(rc),
             apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx),
         });
     }
@@ -166,17 +164,17 @@ pub(super) fn open_shards(
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     roots: &[PageId],
-    next_gen: Lsn,
+    _next_gen: Lsn,
 ) -> Result<Vec<Shard>> {
     let mut shards = Vec::with_capacity(roots.len());
-    for (shard_idx, &root) in roots.iter().enumerate() {
+    for (shard_idx, &meta_page_id) in roots.iter().enumerate() {
+        let rc = crate::refcount::RcShard::open(
+            page_store.clone(),
+            page_cache.clone(),
+            meta_page_id,
+        )?;
         shards.push(Shard {
-            tree: Arc::new(Mutex::new(BTree::open_with_cache(
-                page_store.clone(),
-                page_cache.clone(),
-                root,
-                next_gen,
-            )?)),
+            rc: Arc::new(rc),
             apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx),
         });
     }
@@ -248,14 +246,6 @@ pub(super) fn lsm_config_from_cfg(cfg: &Config) -> LsmConfig {
     }
 }
 
-pub(super) fn max_generation_from_locked(guards: &[MutexGuard<'_, BTree>]) -> Lsn {
-    guards
-        .iter()
-        .map(|tree| tree.next_generation())
-        .max()
-        .unwrap_or(0)
-}
-
 pub(super) fn max_generation_from_locked_l2p(guards: &[RwLockWriteGuard<'_, PagedL2p>]) -> Lsn {
     guards
         .iter()
@@ -264,11 +254,13 @@ pub(super) fn max_generation_from_locked_l2p(guards: &[RwLockWriteGuard<'_, Page
         .unwrap_or(0)
 }
 
+/// Paged-array refcount has no per-shard `next_generation` cursor; only
+/// L2P supplies one, so the merged max collapses to the L2P max.
 pub(super) fn max_generation_from_two_groups(
     a: &[RwLockWriteGuard<'_, PagedL2p>],
-    b: &[MutexGuard<'_, BTree>],
+    _refcount_shards: &[Shard],
 ) -> Lsn {
-    max_generation_from_locked_l2p(a).max(max_generation_from_locked(b))
+    max_generation_from_locked_l2p(a)
 }
 
 /// Encode a `(pba, hash)` pair for storage in the `dedup_reverse` LSM.

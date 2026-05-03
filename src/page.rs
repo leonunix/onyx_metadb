@@ -108,6 +108,10 @@ pub enum PageType {
     /// Paged L2P index: 256 × 8 B child page pointers with a level byte in
     /// the type-header. Forms the upper 1..=4 levels of the paged radix tree.
     PagedIndex = 9,
+    /// Refcount paged-array data page: 336 × 12 B (rc + birth_lsn) entries.
+    /// `generation` in the shared header doubles as `last_applied_lsn` for
+    /// replay-skip (refcount apply is not idempotent).
+    RefcountArray = 10,
 }
 
 impl PageType {
@@ -124,6 +128,7 @@ impl PageType {
             7 => Self::LsmLevels,
             8 => Self::PagedLeaf,
             9 => Self::PagedIndex,
+            10 => Self::RefcountArray,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }

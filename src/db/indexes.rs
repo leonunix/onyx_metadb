@@ -7,14 +7,13 @@ impl Db {
     /// Return the current refcount for `pba`, or 0 if no entry exists.
     pub fn get_refcount(&self, pba: Pba) -> Result<u32> {
         let sid = self.refcount_shard_for(pba);
-        let mut tree = self.refcount_shards[sid].tree.lock();
-        Ok(tree.get(pba)?.map(|e| e.rc).unwrap_or(0))
+        self.refcount_shards[sid].rc.get(pba)
     }
 
-    /// Batched refcount lookup. Groups `pbas` by shard, locks each shard
-    /// once, and reads every PBA that falls to it before moving on. Output
-    /// order matches input order; duplicates produce repeated results.
-    /// Unmapped PBAs read back as `0`, same as [`get_refcount`].
+    /// Batched refcount lookup. Groups `pbas` by shard so each shard's
+    /// internal mutex is taken once. Output order matches input;
+    /// duplicates produce repeated results. Unmapped PBAs read back
+    /// as `0`, same as [`get_refcount`].
     pub fn multi_get_refcount(&self, pbas: &[Pba]) -> Result<Vec<u32>> {
         if pbas.is_empty() {
             return Ok(Vec::new());
@@ -29,9 +28,9 @@ impl Db {
             if idxs.is_empty() {
                 continue;
             }
-            let mut tree = self.refcount_shards[sid].tree.lock();
+            let shard = &self.refcount_shards[sid];
             for idx in idxs {
-                out[idx] = tree.get(pbas[idx])?.map(|e| e.rc).unwrap_or(0);
+                out[idx] = shard.rc.get(pbas[idx])?;
             }
         }
         Ok(out)
@@ -365,9 +364,7 @@ impl Db {
     pub fn iter_refcounts(&self) -> Result<DbRefcountIter> {
         let mut all: Vec<(Pba, u32)> = Vec::new();
         for shard in &self.refcount_shards {
-            let mut tree = shard.tree.lock();
-            for rec in tree.iter_stream()? {
-                let (pba, entry) = rec?;
+            for (pba, entry) in shard.rc.iter_live_flushed()? {
                 all.push((pba, entry.rc));
             }
         }

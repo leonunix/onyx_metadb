@@ -19,8 +19,6 @@ use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWri
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::apply_gate::ApplyGate;
-use crate::btree::BTree;
-use crate::btree::format::RcEntry;
 use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
 use crate::error::{MetaDbError, Result};
@@ -522,7 +520,7 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
 }
 
 struct Shard {
-    tree: Arc<Mutex<BTree>>,
+    rc: Arc<crate::refcount::RcShard>,
     apply_lane: ApplyLane,
 }
 

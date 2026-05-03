@@ -203,38 +203,16 @@ fn run_l2p_checkpoint_install_step(
     }
 }
 
-fn enqueue_refcount_checkpoint_install_step(
-    lane: ApplyLaneHandle,
-    sid: usize,
-    tree: Arc<Mutex<BTree>>,
-    state: Arc<Mutex<CheckpointInstallState<crate::btree::cache::FlushedSnapshot>>>,
-    tx: crossbeam_channel::Sender<Result<Vec<PageId>>>,
-) {
-    let next_lane = lane.clone();
-    let enqueued_at = std::time::Instant::now();
-    lane.enqueue_maintenance(Box::new(
-        move || match run_refcount_checkpoint_install_step(
-            sid,
-            tree.clone(),
-            state.clone(),
-            enqueued_at.elapsed(),
-        ) {
-            Ok(Some(frees)) => {
-                let _ = tx.send(Ok(frees));
-            }
-            Ok(None) => {
-                enqueue_refcount_checkpoint_install_step(next_lane, sid, tree, state, tx);
-            }
-            Err(err) => {
-                let _ = tx.send(Err(err));
-            }
-        },
-    ));
-}
+// `enqueue_refcount_checkpoint_install_step` / `run_refcount_checkpoint_install_step`
+// were the deferred-flush install drivers for the old BTree-backed
+// refcount path. The paged-array refcount writes synchronously during
+// sample-phase `RcShard::flush` and has no install step, so the
+// drivers are dead code as of Stage 1 of metadb-restructure-v9.
 
+#[allow(dead_code)]
 fn run_refcount_checkpoint_install_step(
     sid: usize,
-    tree: Arc<Mutex<BTree>>,
+    tree: Arc<Mutex<crate::btree::BTree>>,
     state: Arc<Mutex<CheckpointInstallState<crate::btree::cache::FlushedSnapshot>>>,
     queue_wait: std::time::Duration,
 ) -> Result<Option<Vec<PageId>>> {
@@ -772,11 +750,9 @@ impl Db {
                 v
             };
             let mut l2p_guards = lock_all_l2p_shards_for(&sorted);
-            let mut refcount_guards: Vec<MutexGuard<'_, BTree>> =
-                refcount_shards.iter().map(|s| s.tree.lock()).collect();
             flush_locked_l2p_shards(&mut l2p_guards)?;
-            for tree in refcount_guards.iter_mut() {
-                tree.flush()?;
+            for shard in refcount_shards.iter() {
+                shard.rc.flush()?;
             }
 
             // Dedup memtable / level heads: mirror what
@@ -807,11 +783,11 @@ impl Db {
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
 
-            refresh_manifest_entries(&mut manifest, &sorted, &l2p_guards, &refcount_guards)?;
+            refresh_manifest_entries(&mut manifest, &sorted, &l2p_guards, &refcount_shards)?;
             manifest.checkpoint_lsn = last_applied;
             manifest_store.commit(&manifest)?;
             commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
-            commit_refcount_checkpoint(&mut refcount_guards, last_applied.max(1) + 1)?;
+            commit_refcount_checkpoint(&refcount_shards, last_applied.max(1) + 1)?;
 
             dedup_index.free_old_level_heads_all(&old_dedup_heads, dedup_generation)?;
             dedup_reverse.free_old_level_heads_all(&old_dedup_reverse_heads, dedup_generation)?;
@@ -1023,13 +999,12 @@ impl Db {
         let mut rc_pagebuf_dirty = 0usize;
         for shard in &self.refcount_shards {
             rc_apply_queue += shard.apply_lane.queue_len();
-            if let Some(tree) = shard.tree.try_lock() {
-                let (priv_p, ret_p, total, dirty) = tree.growth_summary();
-                rc_private_pages += priv_p;
-                rc_retired_pages += ret_p;
-                rc_pagebuf_total += total;
-                rc_pagebuf_dirty += dirty;
-            }
+            // Paged-array refcount has no COW / private / retired
+            // page concept (in-place mutation, no snapshots). Report
+            // the data-page count as `private_pages` so the operator
+            // still sees a "how big is this shard" gauge; the other
+            // BTree-specific dials stay zero.
+            rc_private_pages += shard.rc.allocated_data_pages();
         }
         PendingState {
             dispatch_pending,
@@ -1181,8 +1156,7 @@ impl Db {
         let sample_started = std::time::Instant::now();
         let volumes = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
-        let mut refcount_guards = self.lock_all_refcount_shards();
-        let tree_generation = max_generation_from_two_groups(&l2p_guards, &refcount_guards);
+        let tree_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
         let wal_checkpoint = *self.last_applied_lsn.lock();
         let mut l2p_checkpoints = Vec::with_capacity(volumes.len());
         for volume in &volumes {
@@ -1192,11 +1166,13 @@ impl Db {
             }
             l2p_checkpoints.push(checkpoints);
         }
-        let refcount_checkpoints: Vec<_> = refcount_guards
-            .iter_mut()
-            .map(|tree| tree.begin_checkpoint())
-            .collect();
-        drop(refcount_guards);
+        // Paged-array refcount has no deferred-flush / checkpoint
+        // model — `RcShard::flush` directly writes touched pages
+        // and the meta page during commit-boundary apply. Drain any
+        // delta still pending here so the manifest commit below sees
+        // a settled on-disk state.
+        self.flush_all_refcount_shards()?;
+        let refcount_checkpoints: Vec<()> = Vec::new();
         drop(l2p_guards);
         drop(apply_guard);
         self.metrics.record_flush_sample(sample_started.elapsed());
@@ -1225,23 +1201,10 @@ impl Db {
             }
             flushed_l2p.push(flushed);
         }
-        let mut flushed_refcount = Vec::with_capacity(refcount_checkpoints.len());
-        for checkpoint in &refcount_checkpoints {
-            match checkpoint.write_dirty_pages() {
-                Ok(pages) => {
-                    total_pages_written += pages.pages_count();
-                    pages.append_sealed_pages(&mut sealed_pages);
-                    flushed_refcount.push(pages);
-                }
-                Err(err) => {
-                    self.metrics
-                        .record_flush_io(io_started.elapsed(), total_pages_written);
-                    self.metrics.record_flush_total(flush_started.elapsed());
-                    self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
-                    return Err(err);
-                }
-            }
-        }
+        // Refcount checkpoint write_dirty_pages: paged-array has no
+        // deferred dirty pages (flush already happened in sample
+        // phase), so this loop is a no-op stub.
+        let flushed_refcount: Vec<()> = Vec::new();
         if let Err(err) = self.page_store.write_sealed_page_runs(sealed_pages) {
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
@@ -1342,39 +1305,11 @@ impl Db {
                 });
             }
         }
-        for (sid, (shard, (checkpoint, flushed))) in self
-            .refcount_shards
-            .iter()
-            .zip(
-                refcount_checkpoints
-                    .into_iter()
-                    .zip(flushed_refcount.into_iter()),
-            )
-            .enumerate()
-        {
-            let flushed_pages = flushed.pages_count();
-            let state = Arc::new(Mutex::new(CheckpointInstallState::new(
-                flushed,
-                flushed_pages,
-                checkpoint.retired_pages(),
-                checkpoint.private_pages(),
-            )));
-            let tree = shard.tree.clone();
-            let (tx, rx) = crossbeam_channel::bounded(1);
-            enqueue_refcount_checkpoint_install_step(
-                shard.apply_lane.handle(),
-                sid,
-                tree,
-                state,
-                tx,
-            );
-            install_receivers.push(CheckpointInstallReceiver {
-                kind: "refcount",
-                vol_ord: None,
-                shard: sid,
-                rx,
-            });
-        }
+        // Refcount install: paged-array writes are already on disk
+        // after sample-phase flush, and meta_page_id is stable across
+        // flushes so the manifest needs no per-flush update for
+        // refcount roots. Nothing to enqueue here.
+        let _ = flushed_refcount;
         let mut checkpoint_frees = Vec::new();
         for receiver in install_receivers {
             let recv_started = std::time::Instant::now();
@@ -1434,16 +1369,15 @@ impl Db {
         &self,
         volumes: &[Arc<Volume>],
         l2p_checkpoints: &[Vec<crate::paged::tree::Checkpoint>],
-        refcount_checkpoints: &[crate::btree::tree::Checkpoint],
+        _refcount_checkpoints: &[()],
     ) {
         for (volume, checkpoints) in volumes.iter().zip(l2p_checkpoints.iter()) {
             for (shard, checkpoint) in volume.shards.iter().zip(checkpoints.iter()) {
                 shard.tree.write().abort_checkpoint(checkpoint);
             }
         }
-        for (shard, checkpoint) in self.refcount_shards.iter().zip(refcount_checkpoints.iter()) {
-            shard.tree.lock().abort_checkpoint(checkpoint);
-        }
+        // Paged-array refcount has nothing to abort: changes land
+        // synchronously during sample-phase flush.
     }
 
     /// Drain everything currently safe to physically free (i.e. tagged
@@ -1496,7 +1430,7 @@ fn refresh_manifest_from_checkpoints(
     manifest: &mut Manifest,
     volumes: &[Arc<Volume>],
     l2p_checkpoints: &[Vec<crate::paged::tree::Checkpoint>],
-    refcount_checkpoints: &[crate::btree::tree::Checkpoint],
+    _refcount_checkpoints: &[()],
 ) -> Result<()> {
     manifest.body_version = MANIFEST_BODY_VERSION;
     if volumes.len() != l2p_checkpoints.len() {
@@ -1529,10 +1463,8 @@ fn refresh_manifest_from_checkpoints(
         });
     }
     manifest.volumes = new_entries;
-    manifest.refcount_shard_roots = refcount_checkpoints
-        .iter()
-        .map(|checkpoint| checkpoint.root)
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
+    // refcount_shard_roots are stamped at create/open time and never
+    // change across flushes (paged-array meta page id is stable);
+    // leave whatever the manifest already carries untouched.
     Ok(())
 }
