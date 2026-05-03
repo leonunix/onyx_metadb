@@ -296,9 +296,13 @@ fn run() -> Result<bool, String> {
             let stop = stop.clone();
             let stats = dedup_register_stats[rid].clone();
             let batch = args.dedup_register_batch;
+            let register_writers = args.dedup_register_writers;
+            let pba_base = (args.writers as u64 + 1).saturating_mul(args.lba_space.max(1));
             thread::Builder::new()
                 .name(format!("dedup-register-{rid}"))
-                .spawn(move || dedup_register_loop(rid, db, stop, stats, batch))
+                .spawn(move || {
+                    dedup_register_loop(rid, register_writers, pba_base, db, stop, stats, batch)
+                })
                 .unwrap()
         })
         .collect();
@@ -655,9 +659,13 @@ fn writer_loop(
     let stripe = cfg.lba_space / cfg.writers;
     let lba_lo = stripe * (wid as u64);
     let lba_hi = lba_lo + stripe;
-    // Per-writer monotonic PBA stream (top byte = writer id so PBAs
-    // never collide across writers).
-    let mut next_pba: u64 = ((wid as u64) << 56) | 1;
+    // Per-writer monotonic PBA stream. Keep synthetic PBAs dense:
+    // the paged reverse index keys by `pba / ENTRIES_PER_PAGE`, so
+    // high sparse sentinels would benchmark page-table resizing rather
+    // than the production allocator shape.
+    let mut next_pba: u64 = (wid as u64)
+        .saturating_mul(cfg.lba_space.max(1))
+        .saturating_add(1);
     let mut salt: u64 = (wid as u64) << 40;
     let mut hash_seq: u64 = (wid as u64) << 40;
     // Cap dedup pool at 4× cleanup_batch — large enough that we get
@@ -801,19 +809,22 @@ fn reader_loop(
 
 fn dedup_register_loop(
     rid: usize,
+    register_writers: usize,
+    pba_base: u64,
     db: Arc<Db>,
     stop: Arc<AtomicBool>,
     stats: Arc<DedupRegisterStats>,
     batch: usize,
 ) {
     let mut hash_seq: u64 = (rid as u64) << 48;
-    let mut pba: u64 = ((rid as u64) << 56) | 0x0080_0000_0000;
+    let pba_stride = register_writers.max(1) as u64;
+    let mut pba: u64 = pba_base.saturating_add(rid as u64);
     let mut salt: u64 = (rid as u64) << 40;
     while !stop.load(Ordering::Relaxed) {
         let mut tx = db.begin();
         for _ in 0..batch {
             hash_seq = hash_seq.wrapping_add(1);
-            pba = pba.wrapping_add(1);
+            pba = pba.wrapping_add(pba_stride);
             salt = salt.wrapping_add(1);
             let hash = onyx_hash(hash_seq);
             tx.put_dedup(hash, onyx_dedup_value(pba, salt));

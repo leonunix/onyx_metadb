@@ -38,6 +38,7 @@
 //! `generation` on every page is the page's `last_applied_lsn` so
 //! `put` / `delete` can replay-skip when a crash repeats an op.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -210,19 +211,19 @@ impl PagedReverse {
     /// Replay-skip: if the data page's `last_applied_lsn` already
     /// covers `lsn`, the op short-circuits.
     pub fn put(&self, pba: Pba, hash: Hash32, lsn: Lsn) -> Result<()> {
-        // The all-zero hash is a legitimate (if astronomically rare)
-        // value; the on-disk encoding distinguishes occupied vs empty
-        // via the slot's `count` field, not the hash bytes, so no
-        // sentinel guard is needed here.
-        self.mutate(pba, lsn, |existing| {
-            if existing.iter().any(|h| h == &hash) {
-                Ok(existing.to_vec())
-            } else {
-                let mut v = existing.to_vec();
-                v.push(hash);
-                Ok(v)
-            }
-        })
+        self.append_hash(pba, hash, lsn)
+    }
+
+    /// Append several hashes to one PBA with a single data-page
+    /// read-modify-write. This is the hot path for packed Onyx slots:
+    /// one physical PBA can register dozens of 4 KiB content hashes in
+    /// the same commit.
+    pub fn put_many(&self, pba: Pba, hashes: &[Hash32], lsn: Lsn) -> Result<()> {
+        match hashes {
+            [] => Ok(()),
+            [hash] => self.put(pba, *hash, lsn),
+            _ => self.append_hashes(pba, hashes, lsn),
+        }
     }
 
     /// Remove the registered hash for `pba` (no-op if absent).
@@ -314,6 +315,231 @@ impl PagedReverse {
             self.page_cache.invalidate(pid);
             self.page_store.free(pid, lsn)?;
         }
+        Ok(())
+    }
+
+    fn append_hash(&self, pba: Pba, hash: Hash32, lsn: Lsn) -> Result<()> {
+        let (page_idx, slot) = page_offset(pba);
+        let _page_guard = self.page_locks[page_idx & (REVERSE_LOCK_SHARDS - 1)].lock();
+        let (page_id, freshly_allocated) = {
+            let mut inner = self.inner.lock();
+            if page_idx >= inner.page_table.len() {
+                inner.page_table.resize(page_idx + 1, 0);
+                inner.meta_dirty = true;
+            }
+            if inner.page_table[page_idx] == 0 {
+                let pid = self.page_store.allocate()?;
+                inner.page_table[page_idx] = pid;
+                inner.meta_dirty = true;
+                (pid, true)
+            } else {
+                (inner.page_table[page_idx], false)
+            }
+        };
+        let mut data_page = if freshly_allocated {
+            new_data_page()
+        } else {
+            (*self.page_cache.get(page_id)?).clone()
+        };
+        let mut header = read_slot(&data_page, slot);
+        if header.count == 0 {
+            header.count = 1;
+            header.inline_hash = hash;
+            header.overflow_pid = 0;
+            self.write_data_slot_page(page_id, &mut data_page, slot, header, lsn)?;
+            return Ok(());
+        }
+        if header.inline_hash == hash {
+            return Ok(());
+        }
+
+        let mut first_space: Option<(PageId, Arc<Page>, u16, PageId)> = None;
+        let mut next = header.overflow_pid;
+        while next != 0 {
+            let page = self.page_cache.get(next)?;
+            let (used, chain_next, hashes) = read_overflow(&page);
+            if hashes.iter().take(used as usize).any(|h| h == &hash) {
+                return Ok(());
+            }
+            if first_space.is_none() && (used as usize) < OVERFLOW_HASHES_PER_PAGE {
+                first_space = Some((next, page, used, chain_next));
+            }
+            next = chain_next;
+        }
+
+        match first_space {
+            Some((overflow_pid, page, used, chain_next)) => {
+                let mut page = (*page).clone();
+                append_overflow_hash(&mut page, used, chain_next, hash);
+                let mut page_header = page.header()?;
+                page_header.generation = lsn.max(page_header.generation);
+                page.write_header(&page_header);
+                page.seal();
+                self.page_store.write_page(overflow_pid, &page)?;
+                self.page_cache
+                    .replace_or_insert(overflow_pid, Arc::new(page));
+            }
+            None => {
+                let overflow_pid = self.page_store.allocate()?;
+                let mut page = new_overflow_page();
+                write_overflow(&mut page, &[hash], header.overflow_pid);
+                let mut page_header = page.header()?;
+                page_header.generation = lsn;
+                page.write_header(&page_header);
+                page.seal();
+                self.page_store.write_page(overflow_pid, &page)?;
+                self.page_cache
+                    .replace_or_insert(overflow_pid, Arc::new(page));
+                header.overflow_pid = overflow_pid;
+            }
+        }
+
+        header.count = header.count.saturating_add(1);
+        self.write_data_slot_page(page_id, &mut data_page, slot, header, lsn)
+    }
+
+    fn append_hashes(&self, pba: Pba, hashes: &[Hash32], lsn: Lsn) -> Result<()> {
+        let mut ordered = Vec::with_capacity(hashes.len());
+        let mut wanted: HashSet<Hash32> = HashSet::with_capacity(hashes.len());
+        for hash in hashes {
+            if wanted.insert(*hash) {
+                ordered.push(*hash);
+            }
+        }
+        if ordered.is_empty() {
+            return Ok(());
+        }
+
+        let (page_idx, slot) = page_offset(pba);
+        let _page_guard = self.page_locks[page_idx & (REVERSE_LOCK_SHARDS - 1)].lock();
+        let (page_id, freshly_allocated) = {
+            let mut inner = self.inner.lock();
+            if page_idx >= inner.page_table.len() {
+                inner.page_table.resize(page_idx + 1, 0);
+                inner.meta_dirty = true;
+            }
+            if inner.page_table[page_idx] == 0 {
+                let pid = self.page_store.allocate()?;
+                inner.page_table[page_idx] = pid;
+                inner.meta_dirty = true;
+                (pid, true)
+            } else {
+                (inner.page_table[page_idx], false)
+            }
+        };
+        let mut data_page = if freshly_allocated {
+            new_data_page()
+        } else {
+            (*self.page_cache.get(page_id)?).clone()
+        };
+        let mut header = read_slot(&data_page, slot);
+        if header.count == 0 {
+            let count = u16::try_from(ordered.len()).map_err(|_| {
+                crate::error::MetaDbError::Corruption(format!(
+                    "dedup_reverse pba {pba} hash count overflow"
+                ))
+            })?;
+            let inline_hash = ordered[0];
+            let overflow_pid = self.write_overflow_chain(&ordered, lsn)?;
+            header = SlotView {
+                count,
+                overflow_pid,
+                inline_hash,
+            };
+            self.write_data_slot_page(page_id, &mut data_page, slot, header, lsn)?;
+            return Ok(());
+        }
+
+        wanted.remove(&header.inline_hash);
+        let mut space_pages: Vec<(PageId, Arc<Page>, u16, PageId)> = Vec::new();
+        let mut next = header.overflow_pid;
+        while next != 0 {
+            let page = self.page_cache.get(next)?;
+            let (used, chain_next, existing) = read_overflow(&page);
+            for hash in existing.iter().take(used as usize) {
+                wanted.remove(hash);
+            }
+            if (used as usize) < OVERFLOW_HASHES_PER_PAGE {
+                space_pages.push((next, page, used, chain_next));
+            }
+            next = chain_next;
+        }
+
+        let mut pending: Vec<Hash32> = ordered
+            .into_iter()
+            .filter(|hash| wanted.contains(hash))
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let added = pending.len();
+        for (overflow_pid, page, used, chain_next) in space_pages {
+            if pending.is_empty() {
+                break;
+            }
+            let free = OVERFLOW_HASHES_PER_PAGE - used as usize;
+            let take = free.min(pending.len());
+            let chunk: Vec<Hash32> = pending.drain(..take).collect();
+            let mut page = (*page).clone();
+            append_overflow_hashes(&mut page, used, chain_next, &chunk);
+            let mut page_header = page.header()?;
+            page_header.generation = lsn.max(page_header.generation);
+            page.write_header(&page_header);
+            page.seal();
+            self.page_store.write_page(overflow_pid, &page)?;
+            self.page_cache
+                .replace_or_insert(overflow_pid, Arc::new(page));
+        }
+
+        if !pending.is_empty() {
+            let chunks: Vec<&[Hash32]> = pending.chunks(OVERFLOW_HASHES_PER_PAGE).collect();
+            let mut next_pid = header.overflow_pid;
+            for chunk in chunks.into_iter().rev() {
+                let overflow_pid = self.page_store.allocate()?;
+                let mut page = new_overflow_page();
+                write_overflow(&mut page, chunk, next_pid);
+                let mut page_header = page.header()?;
+                page_header.generation = lsn;
+                page.write_header(&page_header);
+                page.seal();
+                self.page_store.write_page(overflow_pid, &page)?;
+                self.page_cache
+                    .replace_or_insert(overflow_pid, Arc::new(page));
+                next_pid = overflow_pid;
+            }
+            header.overflow_pid = next_pid;
+        }
+
+        let added = u16::try_from(added).map_err(|_| {
+            crate::error::MetaDbError::Corruption(format!(
+                "dedup_reverse pba {pba} hash count overflow"
+            ))
+        })?;
+        header.count = header.count.checked_add(added).ok_or_else(|| {
+            crate::error::MetaDbError::Corruption(format!(
+                "dedup_reverse pba {pba} hash count overflow"
+            ))
+        })?;
+        self.write_data_slot_page(page_id, &mut data_page, slot, header, lsn)
+    }
+
+    fn write_data_slot_page(
+        &self,
+        page_id: PageId,
+        page: &mut Page,
+        slot: usize,
+        view: SlotView,
+        lsn: Lsn,
+    ) -> Result<()> {
+        write_slot(page, slot, view);
+        let mut header = page.header()?;
+        header.generation = lsn.max(header.generation);
+        page.write_header(&header);
+        page.seal();
+        self.page_store.write_page(page_id, page)?;
+        self.page_cache
+            .replace_or_insert(page_id, Arc::new(page.clone()));
         Ok(())
     }
 
@@ -526,6 +752,29 @@ fn write_overflow(page: &mut Page, hashes: &[Hash32], next: PageId) {
     payload[used_end..].fill(0);
 }
 
+fn append_overflow_hash(page: &mut Page, used: u16, next: PageId, hash: Hash32) {
+    debug_assert!((used as usize) < OVERFLOW_HASHES_PER_PAGE);
+    let payload = page.payload_mut();
+    payload[0..2].copy_from_slice(&(used + 1).to_le_bytes());
+    payload[2..10].copy_from_slice(&(next as u64).to_le_bytes());
+    payload[10..16].fill(0);
+    let off = OVERFLOW_HEADER_BYTES + used as usize * 32;
+    payload[off..off + 32].copy_from_slice(&hash);
+}
+
+fn append_overflow_hashes(page: &mut Page, used: u16, next: PageId, hashes: &[Hash32]) {
+    debug_assert!((used as usize) + hashes.len() <= OVERFLOW_HASHES_PER_PAGE);
+    let payload = page.payload_mut();
+    let new_used = used as usize + hashes.len();
+    payload[0..2].copy_from_slice(&(new_used as u16).to_le_bytes());
+    payload[2..10].copy_from_slice(&(next as u64).to_le_bytes());
+    payload[10..16].fill(0);
+    for (idx, hash) in hashes.iter().enumerate() {
+        let off = OVERFLOW_HEADER_BYTES + (used as usize + idx) * 32;
+        payload[off..off + 32].copy_from_slice(hash);
+    }
+}
+
 fn collect_overflow_chain_pids(page_store: &PageStore, head: PageId) -> Result<Vec<PageId>> {
     let mut out = Vec::new();
     let mut next = head;
@@ -621,6 +870,49 @@ mod tests {
         }
         let got = r.get_hashes(7).unwrap();
         assert_eq!(got.len(), count);
+    }
+
+    #[test]
+    fn append_many_hashes_reuses_overflow_pages() {
+        let (_d, r) = make_index();
+        let count = OVERFLOW_HASHES_PER_PAGE * 3 + 5;
+        for i in 0..count {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+            hash[31] = 0xBB;
+            r.put(7, hash, (100 + i) as Lsn).unwrap();
+        }
+
+        assert_eq!(r.get_hashes(7).unwrap().len(), count);
+        assert_eq!(
+            r.overflow_page_ids().unwrap().len(),
+            (count - 1).div_ceil(OVERFLOW_HASHES_PER_PAGE)
+        );
+        assert_eq!(r.page_store.deferred_free_len(), 0);
+    }
+
+    #[test]
+    fn put_many_registers_one_pba_batch() {
+        let (_d, r) = make_index();
+        let count = OVERFLOW_HASHES_PER_PAGE * 2 + 7;
+        let hashes: Vec<_> = (0..count)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+                hash[31] = 0xCC;
+                hash
+            })
+            .collect();
+
+        r.put_many(7, &hashes, 100).unwrap();
+        r.put_many(7, &hashes[..8], 101).unwrap();
+
+        assert_eq!(r.get_hashes(7).unwrap().len(), count);
+        assert_eq!(
+            r.overflow_page_ids().unwrap().len(),
+            (count - 1).div_ceil(OVERFLOW_HASHES_PER_PAGE)
+        );
+        assert_eq!(r.page_store.deferred_free_len(), 0);
     }
 
     #[test]

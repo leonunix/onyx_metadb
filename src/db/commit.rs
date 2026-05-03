@@ -1142,28 +1142,45 @@ impl Db {
     ) -> Result<Vec<(usize, ApplyOutcome)>> {
         let batch_started = std::time::Instant::now();
         let mut outcomes = Vec::with_capacity(indices.len());
-        // Both dedup_index (cuckoo) and dedup_reverse (paged-array)
-        // apply per op now — neither has a batched fast path that
-        // would benefit from buffering. Inline application keeps the
-        // mutexes released between ops.
+        let mut reverse_puts: HashMap<Pba, Vec<Hash32>> = HashMap::new();
+        let flush_pba = |pba: Pba, reverse_puts: &mut HashMap<Pba, Vec<Hash32>>| -> Result<()> {
+            let Some(hashes) = reverse_puts.remove(&pba) else {
+                return Ok(());
+            };
+            dedup_reverse.put_many(pba, &hashes, lsn)?;
+            Ok(())
+        };
+        let flush_all = |reverse_puts: &mut HashMap<Pba, Vec<Hash32>>| -> Result<()> {
+            let pbas: Vec<Pba> = reverse_puts.keys().copied().collect();
+            for pba in pbas {
+                flush_pba(pba, reverse_puts)?;
+            }
+            Ok(())
+        };
+
         for idx in indices {
             match &ops[idx] {
                 WalOp::DedupPut { hash, value } => {
                     dedup_index.put(*hash, *value, lsn)?;
+                    outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupDelete { hash } => {
                     dedup_index.delete(hash, lsn)?;
+                    outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupReversePut { pba, hash } => {
-                    dedup_reverse.put(*pba, *hash, lsn)?;
+                    reverse_puts.entry(*pba).or_default().push(*hash);
+                    outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupReverseDelete { pba, hash } => {
+                    flush_pba(*pba, &mut reverse_puts)?;
                     dedup_reverse.delete(*pba, *hash, lsn)?;
+                    outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 other => unreachable!("dedup bucket holds only dedup ops; saw {other:?}"),
             };
-            outcomes.push((idx, ApplyOutcome::Dedup));
         }
+        flush_all(&mut reverse_puts)?;
         metrics.record_apply_dedup_batch(outcomes.len() as u64, batch_started.elapsed());
         Ok(outcomes)
     }

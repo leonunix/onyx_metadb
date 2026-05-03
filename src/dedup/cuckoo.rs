@@ -219,20 +219,44 @@ impl CuckooHash {
         // the value in place and return. This keeps semantics
         // identical to the LSM `put` we are replacing.
         let (b1, b2) = self.candidate_buckets(&hash);
-        for bucket in [b1, b2].into_iter().filter(|b| *b == b1 || *b != b1) {
+        let candidate_count = if bucket_offset(b1).0 == bucket_offset(b2).0 {
+            1
+        } else {
+            2
+        };
+        let candidates = [b1, b2];
+        for bucket in candidates[..candidate_count].iter().copied() {
             if self.update_existing(bucket, &hash, value, lsn)? {
                 return Ok(());
             }
         }
-        // Try empty slot insertion in either candidate page.
-        for bucket in [b1, b2] {
+
+        // Try the emptier candidate page first. With random all-miss
+        // inserts, always preferring b1 creates local full pages well
+        // before the global load factor is high; balancing by page
+        // occupancy keeps the common path insertion-only and avoids
+        // expensive cuckoo chains under Onyx packed-slot registration.
+        let mut insert_order = candidates;
+        let mut free_slots = [0usize; 2];
+        for i in 0..candidate_count {
+            free_slots[i] = self.free_slots_in_page(insert_order[i])?;
+        }
+        if candidate_count == 2 && free_slots[1] > free_slots[0] {
+            insert_order.swap(0, 1);
+            free_slots.swap(0, 1);
+        }
+        for i in 0..candidate_count {
+            if free_slots[i] == 0 {
+                continue;
+            }
+            let bucket = insert_order[i];
             if self.try_insert_empty_in_page(bucket, hash, value, lsn)? {
                 self.bump_len(1);
                 return Ok(());
             }
         }
-        // Both buckets full — kick off a cuckoo chain starting from b1.
-        self.evict_and_insert(b1, hash, value, lsn)?;
+        // Both candidate pages are full — kick off a cuckoo chain.
+        self.evict_and_insert(insert_order[0], hash, value, lsn)?;
         self.bump_len(1);
         Ok(())
     }
@@ -399,6 +423,26 @@ impl CuckooHash {
             }
         }
         Ok(None)
+    }
+
+    fn free_slots_in_page(&self, bucket_id: u64) -> Result<usize> {
+        let (page_idx, _bucket_in_page) = bucket_offset(bucket_id);
+        let pid = {
+            let inner = self.inner.lock();
+            if page_idx >= inner.page_table.len() {
+                return Err(MetaDbError::Corruption(format!(
+                    "cuckoo bucket_id {bucket_id} maps to page_idx {page_idx} but page_table \
+                     is only {} entries",
+                    inner.page_table.len(),
+                )));
+            }
+            inner.page_table[page_idx]
+        };
+        if pid == 0 {
+            return Ok(SLOTS_PER_PAGE);
+        }
+        let page = self.page_cache.get(pid)?;
+        Ok(SLOTS_PER_PAGE - read_bitmap(&page).count_ones() as usize)
     }
 
     fn update_existing(
