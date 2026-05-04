@@ -1,38 +1,53 @@
 # onyx-metadb
 
-独立的元数据引擎（crate），用来替换 onyx-storage 里的 RocksDB。自己一个 git 仓库，
-独立构建、独立测试。
+Onyx 的定制元数据引擎（crate）。独立 git 仓库，但通过 path dep 被 onyx-storage 主
+crate 引用——onyx **唯一**的 meta backend，已经替掉 RocksDB（onyx 主仓 commit
+`b512c44 meta: switch onyx to metadb`）。所有针对 onyx 写路径需求做的 API 形状让步
+（fused WalOp、`atomic_batch_*`、L2pValue 头 8B 即 PBA 的契约、snapshot-aware refcount
+规则等）保留为长期不变量；不再为"抽象通用 KV"留中立接口。
 
 ## 构建与测试
 
 ```bash
 cargo build
-cargo test               # 290 unit + 25 integration tests
+cargo test
 cargo build --release
-cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
+cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前必跑
 ```
 
-测试覆盖率目标 90%+。`--ignored` 的用例不是可选，是发布门控。
+测试覆盖率目标 90%+。`--ignored` 的用例不是可选，是发布门控。仓库当前 `#[test]` 标
+记 ~570 个（src/ + tests/，proptest 共享 harness）。
 
 ## 模块地图
 
 | 模块 | 路径 | 职责 |
 |------|------|------|
-| db | `src/db.rs` | `Db` facade：shard 路由、事务入口、snapshot、commit_ops |
-| tx | `src/tx.rs` | `Transaction`：累积 `WalOp`，一次 `commit()` = 一条 WAL 记录 |
-| wal | `src/wal/` | Append-only segment 文件 + group commit + recovery |
-| page_store | `src/page_store.rs` | 4 KiB page 分配/释放/读/写（Linux O_DIRECT），free list 打开时重建 |
-| manifest | `src/manifest.rs` | 双缓冲 manifest：tree roots / checkpoint_lsn / WAL tail |
-| paged | `src/paged/` | Paged COW radix tree，用于 L2P（LBA → L2pValue） |
-| btree | `src/btree/` | COW B+tree，特化到 refcount（value = u32） |
-| lsm | `src/lsm/` | 固定长度记录 LSM：dedup_index + dedup_reverse |
-| cache | `src/cache.rs` | 统一 16 shard page cache（LRU，scan-resistant） |
-| metrics | `src/metrics.rs` | 运行时计数器/延迟累计，供 soak 和诊断脚本读取 |
-| recovery | `src/recovery.rs` | 打开时 WAL replay |
-| verify | `src/verify.rs` | 结构校验器 + offline audit（`metadb-verify` 的核心） |
-| testing | `src/testing/` | 故障注入点 + 共享 test harness |
-| bin | `src/bin/` | CLI 二进制（verify / soak / bench / dump / replay） |
-| scripts | `scripts/` | 本地诊断脚本（如 `metadb_metrics_summary.py`） |
+| db | `src/db.rs` + `src/db/*.rs` | `Db` facade：shard 路由、apply gate、commit_ops、L2P / refcount / dedup / snapshot / volume lifecycle 入口 |
+| tx | `src/tx.rs` | `Transaction`：累积 `WalOp`，一次 `commit()` = 一条 WAL 记录、一次 group fsync |
+| wal | `src/wal/` | Append-only segment 文件 + group commit writer + recovery |
+| page_store | `src/page_store.rs` | 4 KiB page 分配/释放/读/写（Linux O_DIRECT），free list 打开时重建，writeback worker（in-flight pid 保护） |
+| manifest | `src/manifest.rs` + `src/manifest/` | 双缓冲 manifest：volume entries（含 ordinal + drop pending）、shard roots、dedup level heads / shard heads、checkpoint_lsn、WAL tail |
+| paged | `src/paged/` | Paged COW radix tree（用于 L2P）；leaf compact codec、read view、index pin |
+| paged_meta | `src/paged_meta.rs` | 把 paged radix 复用给非-L2P 用途的薄壳（refcount array / paged_reverse 复用 page IO + COW） |
+| paged_reverse | `src/paged_reverse/` | dedup_reverse 的 paged-array + overflow 链；按 PBA prefix 单点定位（不是扫所有 SST） |
+| refcount | `src/refcount/` | PBA refcount：per-shard paged array + DeltaMap，apply lane 在 commit 边界排干 delta |
+| dedup | `src/dedup/` | dedup_index：4 tier（L0 fp set → L1 hot cache → page cache → on-disk cuckoo）+ apply lanes；`cuckoo.rs` / `index.rs` / `l1_cache.rs` / `sketch.rs` |
+| dedup_types | `src/dedup_types.rs` | `Hash32` / `DedupValue` / 大小常量 |
+| apply_gate | `src/apply_gate.rs` | commit apply 与 flush / snapshot 之间的 RwLock；commit 持 read，flush / snapshot / drop 持 write |
+| epoch | `src/epoch.rs` | per-shard epoch 槽位（NVMe worker 容量已扩） |
+| affinity | `src/affinity.rs` | apply lane / WAL writer 的 CPU pinning |
+| cache | `src/cache.rs` | 16 内部 shard page cache（LRU，scan-resistant，invalidate-on-modify dirty pin，`get_bypass` 给 cuckoo / paged_reverse 扫描用） |
+| metrics | `src/metrics.rs` | 运行时计数器/延迟累计；`metadb_metrics_summary.py` 解析这个 |
+| recovery | `src/recovery.rs` | 打开时 WAL replay；apply 必须幂等（refcount delta + paged COW + cuckoo put + dedup_reverse register） |
+| verify | `src/verify.rs` | 结构校验 + offline audit（`metadb-verify` 入口） |
+| testing | `src/testing/` | `FaultController` / `FaultPoint`，proptest 共享 harness |
+| bin | `src/bin/` | CLI：verify / soak / bench / dump / replay |
+| scripts | `scripts/` | 本地诊断脚本（`metadb_metrics_summary.py` 等） |
+
+> 历史：`src/lsm/` 和 `src/btree/` 已 retire（commit `0e1c69e`），不要再
+> 引用。dedup_index / dedup_reverse / refcount 三表全部走 paged 系列；
+> L2P 之外**没有 LSM、没有 B+tree**。看到任何 PR 想"引一个 LSM 来做 X"先停下
+> 来读 `docs/DESIGN.md` 里的 workload 拆分理由。
 
 ## 关键不变式（非显而易见的，动之前先读）
 
@@ -47,32 +62,43 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
   `apply_gate.write()` 排干所有 apply，保证采样的 `last_applied_lsn` 和 tree 状态
   对齐。**bump 必须在 drop read gate 之前**，否则 flush 可能采到"tree 含 op N + 
   checkpoint_lsn = N-1"的组合，recovery double-apply（refcount incref 非幂等）。
-- `Lsm::reader_drain`：read 侧给 `get` / `scan_prefix` 读 SST 期间用，write 侧是
-  compaction 回收 victim page 前的 drain barrier。**先 read 侧、后 page IO、释放 read
-  侧**；compaction 改完 levels 后必须 `drop(reader_drain.write())` 再 `free_victims`。
-- L2P / refcount shard 的 `Mutex<tree>`：粒度是 shard，不是单 key。跨 shard 操作要
-  取所有锁时（比如 `take_snapshot`、`diff_with_current`）**必须按 shard index 顺序**
-  取锁，避免和写路径死锁。新增聚合接口（比如 `multi_get` 按 shard bucket）也要遵
-  守这条。
+- **dedup_index 的 page-shard 锁**（`dedup/cuckoo.rs`）：cuckoo 数据页改写按 page-shard
+  分锁（commit `de2501f`），foreground put / background reader 的等价物变成 read 侧拿
+  `PageCache` 一致视图、write 侧拿 page-shard 锁后回写并 invalidate。**先 read view、
+  后 page IO、释放 read view**；reader 不持锁穿越多页 hop。
+- **paged_reverse 与 refcount 的 shard 锁**（`paged_reverse/`、`refcount/shard.rs`）：每
+  shard 一组锁（delta lock + array lock）。apply lane worker 持 delta lock 简短地 merge
+  ops、再持 array lock flush；read 路径只读 delta，miss 落 array。**改 lock 顺序 = 死
+  锁风险**，新增跨 shard 聚合接口（multi_get / scan）必须按 shard index 顺序拿。
+- L2P / refcount / dedup shard 的并发都建立在"shard 是 mutation 单位"上。跨 shard 操
+  作（`take_snapshot`、`diff_with_current`、`drop_volume`）必须按 shard index 顺序取
+  锁，避免和写路径死锁。新增聚合接口（比如 `multi_get_*` 按 shard bucket）也要遵守这条。
 
 ### 分片
 
-- `shard_for(key) = xxh3_64(key.to_be_bytes()) as usize % shard_count`。
-- 分片数写死在 `Config::shards_per_partition`，落在 manifest 里。**改 shard 数或哈希
-  函数 = 数据迁移**，不要当普通 refactor 处理。
+- L2P / refcount: `shard_for(key) = xxh3_64(key.to_be_bytes()) as usize % shard_count`。
+  分片数写死在 `Config::shards_per_partition`（默认 16），落在 manifest 里。
+- dedup: `Config::dedup_shards`（默认 8）。**当前最优值**——见
+  [memory: phase4_dedup_shards_results](dev:phase4)。`MAX_DEDUP_SHARDS = 64`。N=4
+  是不稳定平衡点，不要默认。manifest v8 持久化 `dedup_shards` + per-shard heads。
+- **改 shard 数或哈希函数 = 数据迁移**，不要当普通 refactor 处理。
 
 ### Page cache
 
 - 一个 `Db` 只持有一个 `Arc<PageCache>`，clone 给所有 L2P shard / refcount shard /
-  dedup_index / dedup_reverse。预算在 `cfg.page_cache_bytes`，默认 512 MiB。
+  dedup_index / paged_reverse。预算在 `cfg.page_cache_bytes`。
 - 16 内部 shard，对齐 L2P shard fanout。
 - "dirty pin" 是 **invalidate-on-modify + re-insert-on-flush**（不是 refcount pin）。
   脏页不会被驱逐——因为它根本不在 cache 里。维护这条语义的是写路径和 flush 路径，
   别在读路径上加绕过。
-- 保持 **`get_bypass`** 给 LSM scan / compaction 用，避免热页被全表扫刷掉。
+- 保持 **`get_bypass`** 给 cuckoo / paged_reverse / refcount array 的批量 scan 用，避免
+  热页被全表扫刷掉。
 - 当前只 pin L2P **index pages**（`cfg.index_pin_bytes`），leaf 仍走普通 LRU。不要把
   leaf-pin 当作既定优化路线：除非 metrics 显示 leaf miss / leaf read latency 已经成为
   主瓶颈，否则 leaf-pin 的生命周期复杂度通常大于收益。
+- dedup_index 多了一个 `cfg.dedup_l1_cache_entries` 控制 L1 hot LRU；`cfg.dedup_cuckoo_buckets`
+  按 unique-4K 工作集 sizing（每 bucket 4 slot，目标 load factor 0.5–0.7）。**桶数偏小
+  会触发 `MAX_CUCKOO_CHAIN`**，writer 进 packed-slot retry，污染读 p99。
 
 ### WAL / recovery
 
@@ -91,29 +117,43 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
 
 ### Manifest swap
 
-- `dedup_level_heads` 写新页链 → manifest commit → 释放旧页链。三步之间断电恢复出来
-  的状态要么是 pre-commit、要么是 post-commit，不能是中间态。Phase 8a 要加 fault
-  injection 覆盖这个切换。
+- 任何要替换 root 集合的结构都遵循 **写新页链 → manifest commit → 释放旧页链** 三步：
+  L2P shard roots、refcount shard array roots、dedup_index per-shard cuckoo / level heads、
+  dedup_reverse per-shard heads。三步之间断电恢复出来的状态要么是 pre-commit、要么是
+  post-commit，不能是中间态。fault injection 覆盖这些切换。
+- 'chained meta pages'（commit `38a19ca`）：refcount / paged_reverse / cuckoo 的 manifest
+  meta 不再受单页大小限制。改这块布局前读 commit `38a19ca` + `055174a` 的回归说明，
+  老 cuckoo 默认值（commit `d9b16cd` 抬升）不能往回退。
 
 ### Snapshot 范围
 
-- **只有 L2P 支持 snapshot**。Refcount 是累计量，不做 point-in-time；dedup 同理。
-  看到 `entry.refcount_shard_roots.is_empty()` 的 `debug_assert` 就是在挡这条。
+- **只有 L2P 支持 snapshot**。Refcount 是累计量、dedup 是 global，都不做 point-in-time。
+  看到 "shard_roots.is_empty()" 类的 `debug_assert` 就是在挡这条。
 - Snapshot 读走 `SnapshotView`，持 `snapshot_views.read()` 共享 guard；`drop_snapshot`
   拿写侧，保证不会释放还在被读的页。
+- `drop_snapshot` 取 `drop_gate.write()` 排他，确保 plan 期间无并发 `cow_for_write`
+  改动共享页；commit 路径取 `drop_gate.read()` 共享。`take_snapshot` 只靠 manifest
+  commit（没落盘的 snapshot 等同于没存在过），但 `DropSnapshot` 会同时改页 refcount
+  和 snapshot 列表，单次 manifest commit 无法把两者原子化，所以 drop 走 WAL，apply 对
+  每页做 `rc--`、靠 `page.generation >= lsn` 做重放幂等。
 
-## Phase 8a 门控
+## Soak 门控（持续生效，不只是 Phase 8a）
 
-8a 是 standalone soak（`metadb-soak` 二进制，不经过 onyx）。目标：billions of ops +
-进程重启 + fault injection + `metadb-verify` 无报错 + reference-model 无偏差，周级别
-跑干净。8a 不过，Phase 7（接入 onyx）不开工。
+Phase 7（onyx 接入）已 landed，但 standalone soak 仍是任何深层改动的发布门控。`metadb-soak`
+二进制不经过 onyx，目标：billions of ops + 进程重启 + fault injection + `metadb-verify`
+无报错 + reference-model 无偏差。
 
 所以：
 
-- 任何改 commit path / page cache / snapshot / compaction 的 PR，**本地 soak 至少
+- 任何改 commit path / apply gate / page cache / snapshot / cuckoo / paged_reverse /
+  refcount delta apply / chained meta pages / manifest swap 的 PR，**本地 soak 至少
   过几个小时**再 merge。怀疑 flaky 就停下来查根因，不要重跑看是否复现。
 - 新功能优先配一条 proptest 或 fault-injection 用例；没对应的测试，默认不接受。
 - 禁止为了让 soak 过去绕过校验（关 assert、放宽 invariant check）。
+- onyx 主仓里 NVMe 测试机也是这条门控的一部分：metadb 单干跑通的改动，可能在 onyx
+  侧 4-shard concurrent commit 路径上暴露 22-94s stall（见 onyx 上 buffer head stuck
+  的诊断记录）。phase4 的 perf 数据（READ ~96k IOPS、p99 174ms、p99.9 460ms，
+  N=8 / 1024 packed_meta_batch_max_lbas）当前是已验证基线。
 
 ### Soak / metrics 快速入口
 
@@ -143,16 +183,31 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前再跑
 
 ## 和 onyx-storage 的关系
 
-- onyx-storage 在 `/root/onyx_storage`，是 metadb 的**唯一 client**。metadb 就是
-  onyx 的定制元数据引擎，**接受为 onyx 语义下沉做 API 形状让步**（fused WalOp、
-  头 8B 即 pba 的 L2pValue 布局契约、snapshot-aware refcount 规则等），不再为
+- onyx-storage 在 `/root/onyx_storage`，是 metadb 的**唯一 client**，已经把 RocksDB
+  切到 metadb（onyx commit `b512c44 meta: switch onyx to metadb`）。metadb 就是 onyx 的
+  定制元数据引擎，**接受为 onyx 语义下沉做 API 形状让步**（fused WalOp、头 8B 即 pba
+  的 L2pValue 布局契约、`atomic_batch_*`、snapshot-aware refcount 规则等），不再为
   "抽象的通用 db" 保留中立接口。
+- onyx 的 meta 适配层在 [`/root/onyx_storage/src/meta/`](../src/meta/)：`backend::metadb`
+  是唯一 backend，`store` 是给 flusher / writer / cleaner 用的高层封装。onyx 用字符串
+  `VolumeId`、metadb 用 `VolumeOrdinal`，由 `MetadbBackend` 维护双向映射。
 - **施工规格**：[`docs/ONYX_INTEGRATION_SPEC.md`](docs/ONYX_INTEGRATION_SPEC.md)。
-  这是 onyx 一次性切掉 RocksDB 的对接书，涵盖新增 WalOp / Db API、必须守住的
-  不变量、测试矩阵、性能目标、Phase A → Phase B 门控清单。API 演进遵照此文档，
-  不再"先做最干净的接口"。
-- **Phase A 实施进度**：[`docs/ONYX_INTEGRATION_PLAN.md`](docs/ONYX_INTEGRATION_PLAN.md)
-  把 SPEC 拆成 S1~S6 session，每个 session 自带入口 / 交付物 / 退出判据。
-  当前进度表在 plan 文件里自维护。
-- 父项目的 CLAUDE.md 讲 ublk / buffer / packer / GC / dedup pipeline 等存储层面的东
-  西，和 metadb 内部约束不重叠。切 `cd /root/onyx_storage` 工作时读那边的 CLAUDE.md。
+  涵盖 WalOp / Db API、必须守住的不变量、测试矩阵、性能目标。API 演进继续遵照此文档，
+  避免"先做最干净的接口"再返工。
+- **整合实施进度**：[`docs/ONYX_INTEGRATION_PLAN.md`](docs/ONYX_INTEGRATION_PLAN.md)
+  自维护 session 拆解 / 退出判据。
+- 父项目的 CLAUDE.md（`/root/onyx_storage/CLAUDE.md`）讲 ublk / buffer / packer / GC /
+  dedup pipeline 等存储层面的东西，和 metadb 内部约束不重叠。切 `cd /root/onyx_storage`
+  工作时读那边的 CLAUDE.md。
+
+## 当前不要再做的方向（实测撤回，避免重复踩）
+
+- **L2P read view 改 ArcSwap 发布**：失去"apply 前空 overlay + 独占 mutation"后 COW
+  克隆暴涨，`l2p_remap` apply 累计时间膨胀 4×，READ p99 从 ~338ms 飙到 1.15s。源码已
+  撤回，仅留实验数据。
+- **multi_get 解码进读路径输出 buffer**：`read_submit.meta_get` 反而暴涨到 9.44s，
+  READ 跌到 42k。源码已撤回。
+- **N=4 dedup_shards 当默认值**：`apply_wait_max` 曾到 3.55s，是不稳定平衡点。默认走
+  `dedup_shards=8`。
+- **leaf-pin（pin L2P leaf 页）**：metrics 没显示是主瓶颈前不要做，复杂度大于收益。
+  保留为 deferred TODO（参见 user memory `metadb_leaf_pin_todo`）。
