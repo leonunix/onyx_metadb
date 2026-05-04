@@ -1185,7 +1185,7 @@ impl Db {
                         .get((xxh3_64(&pba_guard.to_be_bytes()) as usize) % refcount_shards.len())
                         .ok_or_else(|| MetaDbError::Corruption("missing refcount shard".into()))?
                         .get(*pba_guard)?;
-                    metrics.record_dedup_forward_delete(guard_started.elapsed());
+                    metrics.record_dedup_guard(guard_started.elapsed());
                     if rc >= *min_rc {
                         let started = std::time::Instant::now();
                         dedup_index.put(*hash, *value, lsn)?;

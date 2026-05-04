@@ -172,9 +172,7 @@ impl WalOp {
                 let base = 1 + 2 + 8 + 28 + 1;
                 base + if guard.is_some() { 8 + 4 } else { 0 }
             }
-            WalOp::L2pRangeDelete { captured, .. } => {
-                1 + 2 + 8 + 8 + 4 + captured.len() * (8 + 28)
-            }
+            WalOp::L2pRangeDelete { captured, .. } => 1 + 2 + 8 + 8 + 4 + captured.len() * (8 + 28),
             WalOp::DedupPut { .. } => 1 + 32 + 28,
             WalOp::DedupPutGuarded { .. } => 1 + 32 + 28 + 8 + 4,
             WalOp::DedupDelete { .. } => 1 + 32,

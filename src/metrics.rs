@@ -119,6 +119,9 @@ pub struct MetaMetrics {
     dedup_lane_ready_queue_wait_max_us: AtomicU64,
     dedup_lane_exec_us: AtomicU64,
     dedup_lane_exec_max_us: AtomicU64,
+    dedup_apply_guard_count: AtomicU64,
+    dedup_apply_guard_us: AtomicU64,
+    dedup_apply_guard_max_us: AtomicU64,
     dedup_apply_forward_put_count: AtomicU64,
     dedup_apply_forward_put_us: AtomicU64,
     dedup_apply_forward_put_max_us: AtomicU64,
@@ -282,6 +285,9 @@ pub struct MetaMetricsSnapshot {
     pub dedup_lane_ready_queue_wait_max_us: u64,
     pub dedup_lane_exec_us: u64,
     pub dedup_lane_exec_max_us: u64,
+    pub dedup_apply_guard_count: u64,
+    pub dedup_apply_guard_us: u64,
+    pub dedup_apply_guard_max_us: u64,
     pub dedup_apply_forward_put_count: u64,
     pub dedup_apply_forward_put_us: u64,
     pub dedup_apply_forward_put_max_us: u64,
@@ -438,6 +444,9 @@ impl MetaMetrics {
             dedup_lane_ready_queue_wait_max_us: load(&self.dedup_lane_ready_queue_wait_max_us),
             dedup_lane_exec_us: load(&self.dedup_lane_exec_us),
             dedup_lane_exec_max_us: load(&self.dedup_lane_exec_max_us),
+            dedup_apply_guard_count: load(&self.dedup_apply_guard_count),
+            dedup_apply_guard_us: load(&self.dedup_apply_guard_us),
+            dedup_apply_guard_max_us: load(&self.dedup_apply_guard_max_us),
             dedup_apply_forward_put_count: load(&self.dedup_apply_forward_put_count),
             dedup_apply_forward_put_us: load(&self.dedup_apply_forward_put_us),
             dedup_apply_forward_put_max_us: load(&self.dedup_apply_forward_put_max_us),
@@ -736,6 +745,15 @@ impl MetaMetrics {
         record_duration(
             &self.dedup_apply_forward_put_us,
             &self.dedup_apply_forward_put_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_dedup_guard(&self, elapsed: Duration) {
+        self.dedup_apply_guard_count.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.dedup_apply_guard_us,
+            &self.dedup_apply_guard_max_us,
             elapsed,
         );
     }
@@ -1107,6 +1125,9 @@ impl MetaMetricsSnapshot {
                 "\"dedup_lane_ready_queue_wait_max_us\":{},",
                 "\"dedup_lane_exec_us\":{},",
                 "\"dedup_lane_exec_max_us\":{},",
+                "\"dedup_apply_guard_count\":{},",
+                "\"dedup_apply_guard_us\":{},",
+                "\"dedup_apply_guard_max_us\":{},",
                 "\"dedup_apply_forward_put_count\":{},",
                 "\"dedup_apply_forward_put_us\":{},",
                 "\"dedup_apply_forward_put_max_us\":{},",
@@ -1256,6 +1277,9 @@ impl MetaMetricsSnapshot {
             self.dedup_lane_ready_queue_wait_max_us,
             self.dedup_lane_exec_us,
             self.dedup_lane_exec_max_us,
+            self.dedup_apply_guard_count,
+            self.dedup_apply_guard_us,
+            self.dedup_apply_guard_max_us,
             self.dedup_apply_forward_put_count,
             self.dedup_apply_forward_put_us,
             self.dedup_apply_forward_put_max_us,
