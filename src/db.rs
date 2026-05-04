@@ -21,7 +21,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::apply_gate::ApplyGate;
 use crate::cache::{PageCache, PageCacheStats};
 use crate::config::Config;
-use crate::dedup_types::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash8};
 use crate::error::{MetaDbError, Result};
 use crate::manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VolumeEntry,
@@ -609,15 +609,15 @@ impl Iterator for DbRefcountIter {
     }
 }
 
-/// Iterator over every live `(Hash32, DedupValue)` entry in the
+/// Iterator over every live `(Hash8, DedupValue)` entry in the
 /// dedup forward index. Tombstoned rows are hidden. Output is sorted
 /// by hash.
 pub struct DbDedupIter {
-    inner: std::vec::IntoIter<(Hash32, DedupValue)>,
+    inner: std::vec::IntoIter<(Hash8, DedupValue)>,
 }
 
 impl Iterator for DbDedupIter {
-    type Item = Result<(Hash32, DedupValue)>;
+    type Item = Result<(Hash8, DedupValue)>;
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(Ok)
     }

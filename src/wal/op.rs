@@ -71,7 +71,7 @@
 //! Keys use big-endian so byte order matches numeric order; that's
 //! consistent with the rest of metadb.
 
-use crate::dedup_types::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash8};
 use crate::error::{MetaDbError, Result};
 use crate::paged::L2pValue;
 use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
@@ -184,29 +184,29 @@ pub enum WalOp {
         captured: Vec<(Lba, L2pValue)>,
     },
     DedupPut {
-        hash: Hash32,
+        hash: Hash8,
         value: DedupValue,
     },
     DedupPutGuarded {
-        hash: Hash32,
+        hash: Hash8,
         value: DedupValue,
         pba_guard: Pba,
         min_rc: u32,
     },
     DedupDelete {
-        hash: Hash32,
+        hash: Hash8,
     },
     /// Record that `pba` owns `hash`. Stored in `dedup_reverse` so a
     /// later `decref_pba → 0` can prefix-scan by PBA and tombstone the
     /// corresponding `dedup_index` entries.
     DedupReversePut {
         pba: Pba,
-        hash: Hash32,
+        hash: Hash8,
     },
     /// Tombstone a `(pba, hash)` entry in `dedup_reverse`.
     DedupReverseDelete {
         pba: Pba,
-        hash: Hash32,
+        hash: Hash8,
     },
     Incref {
         pba: Pba,

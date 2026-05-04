@@ -387,9 +387,9 @@ fn walk_dedup_reverse_paged_array(
         }
         // Walk overflow chain reachable from any slot in this data
         // page. Slot layout (paged_reverse::array): bytes 4..12 of
-        // each 48 B slot is the overflow head pid.
+        // each 24 B slot is the overflow head pid.
         for slot in 0..crate::paged_reverse::ENTRIES_PER_PAGE {
-            let s_off = slot * 48;
+            let s_off = slot * 24;
             let overflow_pid = u64::from_le_bytes(
                 data_page.payload()[s_off + 4..s_off + 12]
                     .try_into()

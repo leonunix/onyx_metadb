@@ -25,7 +25,7 @@
 //!
 //! [`WalOp`]: crate::wal::WalOp
 
-use crate::dedup_types::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash8};
 use crate::error::Result;
 use crate::paged::L2pValue;
 use crate::types::{Lba, Lsn, Pba, VolumeOrdinal};
@@ -179,7 +179,7 @@ impl<'db> Transaction<'db> {
     }
 
     /// Buffer a dedup put.
-    pub fn put_dedup(&mut self, hash: Hash32, value: DedupValue) -> &mut Self {
+    pub fn put_dedup(&mut self, hash: Hash8, value: DedupValue) -> &mut Self {
         self.ops.push(WalOp::DedupPut { hash, value });
         self
     }
@@ -187,7 +187,7 @@ impl<'db> Transaction<'db> {
     /// Buffer a dedup put guarded by the target PBA's current refcount.
     pub fn put_dedup_guarded(
         &mut self,
-        hash: Hash32,
+        hash: Hash8,
         value: DedupValue,
         pba_guard: Pba,
         min_rc: u32,
@@ -202,19 +202,19 @@ impl<'db> Transaction<'db> {
     }
 
     /// Buffer a dedup tombstone.
-    pub fn delete_dedup(&mut self, hash: Hash32) -> &mut Self {
+    pub fn delete_dedup(&mut self, hash: Hash8) -> &mut Self {
         self.ops.push(WalOp::DedupDelete { hash });
         self
     }
 
     /// Buffer a `dedup_reverse` registration (`pba` owns `hash`).
-    pub fn register_dedup_reverse(&mut self, pba: Pba, hash: Hash32) -> &mut Self {
+    pub fn register_dedup_reverse(&mut self, pba: Pba, hash: Hash8) -> &mut Self {
         self.ops.push(WalOp::DedupReversePut { pba, hash });
         self
     }
 
     /// Buffer a `dedup_reverse` tombstone for `(pba, hash)`.
-    pub fn unregister_dedup_reverse(&mut self, pba: Pba, hash: Hash32) -> &mut Self {
+    pub fn unregister_dedup_reverse(&mut self, pba: Pba, hash: Hash8) -> &mut Self {
         self.ops.push(WalOp::DedupReverseDelete { pba, hash });
         self
     }

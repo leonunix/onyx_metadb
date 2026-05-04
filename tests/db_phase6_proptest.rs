@@ -18,14 +18,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
-use onyx_metadb::{Config, Db, DedupValue, Hash32, L2pValue, MetaDbError};
+use onyx_metadb::{Config, Db, DedupValue, Hash8, L2pValue, MetaDbError};
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
 use tempfile::TempDir;
 
 type L2pRef = BTreeMap<u64, L2pValue>;
 type RefcountRef = BTreeMap<u64, u32>;
-type DedupRef = BTreeMap<Hash32, DedupValue>;
+type DedupRef = BTreeMap<Hash8, DedupValue>;
 
 fn l2p(n: u8) -> L2pValue {
     let mut x = [0u8; 28];
@@ -39,8 +39,8 @@ fn dval(n: u8) -> DedupValue {
     DedupValue(x)
 }
 
-fn h(n: u64) -> Hash32 {
-    let mut x = [0u8; 32];
+fn h(n: u64) -> Hash8 {
+    let mut x = [0u8; 8];
     x[..8].copy_from_slice(&n.to_be_bytes());
     x
 }

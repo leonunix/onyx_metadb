@@ -5,7 +5,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use onyx_metadb::{Config, Db, DedupValue, Hash32, L2pValue, PageCacheStats, Pba};
+use onyx_metadb::{Config, Db, DedupValue, Hash8, L2pValue, PageCacheStats, Pba};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -259,7 +259,7 @@ struct Mapping {
 #[derive(Clone, Debug)]
 struct DedupEntry {
     pba: Pba,
-    hash: Hash32,
+    hash: Hash8,
     live_refs: u32,
 }
 
@@ -875,8 +875,8 @@ fn dedup_value_from_pba(pba: Pba) -> DedupValue {
     DedupValue(out)
 }
 
-fn hash_from_parts(thread: u64, seq: u64) -> Hash32 {
-    let mut out = [0u8; 32];
+fn hash_from_parts(thread: u64, seq: u64) -> Hash8 {
+    let mut out = [0u8; 8];
     out[..8].copy_from_slice(&thread.to_be_bytes());
     out[8..16].copy_from_slice(&seq.to_be_bytes());
     out[16..24].copy_from_slice(&thread.rotate_left(17).to_be_bytes());

@@ -112,14 +112,18 @@ pub enum PageType {
     /// `generation` in the shared header doubles as `last_applied_lsn` for
     /// replay-skip (refcount apply is not idempotent).
     RefcountArray = 10,
-    /// Paged-array dedup reverse data page: 126 × 32 B blake3 hash entries
-    /// keyed by implicit PBA position. Absent slots stored as the
+    /// Paged-array dedup reverse data page. Layout is driven by
+    /// [`crate::paged_reverse::array`] constants — for the 8-byte hash
+    /// schema, 168 slots × 24 B per slot. Absent slots stored as the
     /// all-zero hash sentinel (collision with a real all-zero hash is
     /// rejected at put time as `Corruption`).
     DedupReverseArray = 11,
-    /// On-disk cuckoo hash data page for dedup_index: 16 buckets ×
-    /// 4 entries × 60 B (Hash32 + DedupValue) plus an 8 B presence
-    /// bitmap. Disambiguated from the cuckoo *meta* page by `key_count`
+    /// On-disk cuckoo hash data page for dedup_index. Layout is driven
+    /// by [`crate::dedup::cuckoo`] constants (`BUCKETS_PER_PAGE`,
+    /// `ENTRY_BYTES`, `PRESENCE_BITMAP_BYTES`); for the 8-byte hash
+    /// schema this is 28 buckets × 4 entries × 36 B (Hash8 +
+    /// DedupValue) plus a 16 B presence bitmap.
+    /// Disambiguated from the cuckoo *meta* page by `key_count`
     /// (data pages set 0; the meta page sets `0xFFFF`).
     CuckooData = 12,
 }

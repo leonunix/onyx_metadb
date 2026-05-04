@@ -42,7 +42,7 @@
 use std::sync::Arc;
 
 use crate::cache::PageCache;
-use crate::dedup_types::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash8};
 use crate::error::Result;
 use crate::page_store::PageStore;
 use crate::types::{Lsn, PageId};
@@ -125,7 +125,7 @@ impl DedupIndex {
 
     /// Single-key lookup. Walks L0 → L1 → L3. Promotes L3 hits into
     /// L1 so the next lookup short-circuits to memory.
-    pub fn get(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
+    pub fn get(&self, hash: &Hash8) -> Result<Option<DedupValue>> {
         let fp = fp_of(hash);
         if !self.sketch.contains(fp) {
             return Ok(None);
@@ -148,7 +148,7 @@ impl DedupIndex {
     /// L3 only for the residual misses. Most workloads see 90 %+ of
     /// hashes short-circuit in the L0 sketch, so this collapses N ×
     /// (L0 + L1) lock pairs to two.
-    pub fn multi_get(&self, hashes: &[Hash32]) -> Result<Vec<Option<DedupValue>>> {
+    pub fn multi_get(&self, hashes: &[Hash8]) -> Result<Vec<Option<DedupValue>>> {
         if hashes.is_empty() {
             return Ok(Vec::new());
         }
@@ -157,7 +157,7 @@ impl DedupIndex {
 
         // Collect indices that survived L0 — these are the only ones
         // worth touching L1 / L3 for.
-        let mut l1_pairs: Vec<(u32, Hash32)> = Vec::new();
+        let mut l1_pairs: Vec<(u32, Hash8)> = Vec::new();
         let mut l1_indices: Vec<usize> = Vec::new();
         for (i, &alive) in in_l0.iter().enumerate() {
             if alive {
@@ -183,7 +183,7 @@ impl DedupIndex {
         Ok(out)
     }
 
-    pub fn put(&self, hash: Hash32, value: DedupValue, lsn: Lsn) -> Result<()> {
+    pub fn put(&self, hash: Hash8, value: DedupValue, lsn: Lsn) -> Result<()> {
         self.cuckoo.put(hash, value, lsn)?;
         let fp = fp_of(&hash);
         self.sketch.insert(fp);
@@ -191,7 +191,7 @@ impl DedupIndex {
         Ok(())
     }
 
-    pub fn delete(&self, hash: &Hash32, lsn: Lsn) -> Result<()> {
+    pub fn delete(&self, hash: &Hash8, lsn: Lsn) -> Result<()> {
         // Order matters: clear L3 first so a concurrent reader that
         // sees fp ∈ L0 falls through to L3 and gets `None`. After
         // L3 returns clear, removing fp from L0 is safe.
@@ -206,7 +206,7 @@ impl DedupIndex {
         self.cuckoo.flush_meta()
     }
 
-    pub fn iter(&self) -> Result<Vec<(Hash32, DedupValue)>> {
+    pub fn iter(&self) -> Result<Vec<(Hash8, DedupValue)>> {
         self.cuckoo.iter()
     }
 
@@ -256,8 +256,8 @@ mod tests {
         (dir, idx)
     }
 
-    fn h(byte: u8) -> Hash32 {
-        let mut x = [0u8; 32];
+    fn h(byte: u8) -> Hash8 {
+        let mut x = [0u8; 8];
         x.fill(byte);
         x
     }

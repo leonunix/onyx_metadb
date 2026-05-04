@@ -248,28 +248,25 @@ pub(super) fn max_generation_from_two_groups(
     max_generation_from_locked_l2p(a)
 }
 
-/// Encode a `(pba, hash)` pair for storage in the `dedup_reverse` LSM.
-///
-/// The LSM key is 32 bytes (`Hash32`). We pack the 8-byte big-endian
-/// PBA into the first 8 bytes so prefix scans by PBA become range
-/// scans, and the first 24 bytes of the content hash into the
-/// remaining 24 bytes of the key. The remaining 8 bytes of the hash
-/// live in the value; decoders recover the full 32-byte hash by
-/// concatenating `key[8..32]` with `value[0..8]`.
-pub(crate) fn encode_reverse_entry(pba: Pba, hash: &Hash32) -> (Hash32, DedupValue) {
-    let mut key = [0u8; 32];
-    key[..8].copy_from_slice(&pba.to_be_bytes());
-    key[8..32].copy_from_slice(&hash[..24]);
+/// Encode a `(pba, hash)` pair for storage in the legacy `dedup_reverse`
+/// LSM layout. With an 8-byte hash the key is just the big-endian PBA
+/// and the full hash lives in the value's first 8 bytes; the helpers
+/// stay as a backwards-compatible test affordance for the LSM-era
+/// fixtures. The paged_reverse store does its own packing and never
+/// touches these helpers.
+pub(crate) fn encode_reverse_entry(pba: Pba, hash: &Hash8) -> (Hash8, DedupValue) {
+    let key = pba.to_be_bytes();
     let mut value = [0u8; 28];
-    value[..8].copy_from_slice(&hash[24..]);
+    value[..8].copy_from_slice(hash);
     (key, DedupValue(value))
 }
 
-/// Reconstruct the full 32-byte hash from a `dedup_reverse` key/value
-/// pair written by [`encode_reverse_entry`].
-pub(crate) fn decode_reverse_hash(key: &Hash32, value: &DedupValue) -> Hash32 {
-    let mut hash = [0u8; 32];
-    hash[..24].copy_from_slice(&key[8..32]);
-    hash[24..].copy_from_slice(&value.0[..8]);
+/// Recover the full hash from an entry written by
+/// [`encode_reverse_entry`]. With the 8-byte hash schema the value
+/// alone holds the entire hash; the key is decorative (PBA) and is
+/// not consulted.
+pub(crate) fn decode_reverse_hash(_key: &Hash8, value: &DedupValue) -> Hash8 {
+    let mut hash = [0u8; 8];
+    hash.copy_from_slice(&value.0[..8]);
     hash
 }

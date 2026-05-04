@@ -20,11 +20,11 @@
 
 use parking_lot::Mutex;
 
-use crate::dedup_types::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash8};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CachedHit {
-    pub hash: Hash32,
+    pub hash: Hash8,
     pub value: DedupValue,
 }
 
@@ -54,7 +54,7 @@ impl L1HotCache {
     /// caller; otherwise reports a miss. The matching variant
     /// promotes the entry to the LRU head; the miss variant does
     /// nothing.
-    pub fn lookup(&self, fp: u32, full_hash: &Hash32) -> LookupResult {
+    pub fn lookup(&self, fp: u32, full_hash: &Hash8) -> LookupResult {
         let mut cache = self.inner.lock();
         match cache.get(&fp) {
             Some(entry) if &entry.hash == full_hash => LookupResult::Hit(entry.value),
@@ -66,7 +66,7 @@ impl L1HotCache {
     /// so callers checking N fingerprints pay one lock acquisition.
     /// Each hit promotes its entry to the LRU head, matching the
     /// per-call semantics.
-    pub fn lookup_batch(&self, pairs: &[(u32, Hash32)]) -> Vec<LookupResult> {
+    pub fn lookup_batch(&self, pairs: &[(u32, Hash8)]) -> Vec<LookupResult> {
         let mut cache = self.inner.lock();
         pairs
             .iter()
@@ -80,7 +80,7 @@ impl L1HotCache {
     /// Insert / refresh the cached entry for `fp`. Overwrites any
     /// previous entry (including a colliding-fingerprint one — the
     /// new owner wins because it is the most recently accessed).
-    pub fn put(&self, fp: u32, hash: Hash32, value: DedupValue) {
+    pub fn put(&self, fp: u32, hash: Hash8, value: DedupValue) {
         self.inner.lock().put(fp, CachedHit { hash, value });
     }
 
@@ -118,8 +118,8 @@ mod tests {
         DedupValue(x)
     }
 
-    fn hash_for(byte: u8) -> Hash32 {
-        let mut h = [0u8; 32];
+    fn hash_for(byte: u8) -> Hash8 {
+        let mut h = [0u8; 8];
         h.fill(byte);
         h
     }

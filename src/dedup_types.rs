@@ -26,8 +26,15 @@ pub struct MemtableStats {
     pub frozen_entries: u64,
 }
 
-/// Length of a content hash key, in bytes (SHA-256 → 32).
-pub const HASH_SIZE: usize = 32;
+/// Length of a content hash key, in bytes.
+///
+/// Onyx hashes 4 KiB blocks with `xxh3_64`; collision tolerance comes
+/// from a verify-on-hit step (read the original block from LV3 and
+/// compare bytewise) rather than from cryptographic hash strength,
+/// so an 8-byte fingerprint is enough. Birthday math at 1 PiB / 4 K
+/// (≈ 2.7 × 10¹¹ unique blocks) puts the expected collision count at
+/// ≈ 1900 across the entire dataset; verify makes those benign.
+pub const HASH_SIZE: usize = 8;
 
 /// Length of a dedup value payload, in bytes.
 ///
@@ -35,10 +42,10 @@ pub const HASH_SIZE: usize = 32;
 /// share buffers where that turns out to be useful.
 pub const DEDUP_VALUE_SIZE: usize = 28;
 
-/// 32-byte SHA-256 content hash. Plain array alias: fixed size,
-/// trivially `Copy`, and byte-wise ordering matches the intended sort
-/// order.
-pub type Hash32 = [u8; HASH_SIZE];
+/// 8-byte content fingerprint (`xxh3_64` of the source 4 K block).
+/// Plain array alias: fixed size, trivially `Copy`, and byte-wise
+/// ordering matches the intended sort order.
+pub type Hash8 = [u8; HASH_SIZE];
 
 /// Opaque 28-byte dedup entry payload. Onyx stores a PBA plus
 /// per-entry metadata here; metadb does not interpret the bytes.
@@ -79,7 +86,7 @@ impl DedupValue {
 /// same hash always lands in the same lane, preserving per-key
 /// ordering across concurrent dedup writes.
 #[inline]
-pub fn shard_for_hash(hash: &Hash32, shards: u32) -> u32 {
+pub fn shard_for_hash(hash: &Hash8, shards: u32) -> u32 {
     debug_assert!(
         shards.is_power_of_two() && shards > 0,
         "dedup_shards must be a power of two; got {shards}"

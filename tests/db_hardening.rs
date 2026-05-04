@@ -2,7 +2,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
-use onyx_metadb::{Db, DedupValue, Hash32, L2pValue, VerifyOptions, verify_path};
+use onyx_metadb::{Db, DedupValue, Hash8, L2pValue, VerifyOptions, verify_path};
 use tempfile::TempDir;
 
 fn l2p(n: u8) -> L2pValue {
@@ -17,8 +17,8 @@ fn dval(n: u8) -> DedupValue {
     DedupValue(x)
 }
 
-fn h(n: u64) -> Hash32 {
-    let mut x = [0u8; 32];
+fn h(n: u64) -> Hash8 {
+    let mut x = [0u8; 8];
     x[..8].copy_from_slice(&n.to_be_bytes());
     x
 }

@@ -121,8 +121,8 @@ fn apply_lane_prioritizes_ready_wal_work_with_bounded_maintenance() {
 mod batch;
 mod cleanup;
 
-pub(super) fn h(n: u64) -> Hash32 {
-    let mut out = [0u8; 32];
+pub(super) fn h(n: u64) -> Hash8 {
+    let mut out = [0u8; 8];
     out[..8].copy_from_slice(&n.to_be_bytes());
     out
 }
@@ -133,20 +133,19 @@ pub(super) fn dv(n: u8) -> DedupValue {
     DedupValue(x)
 }
 
-pub(super) fn hash_full(high: u64, low: u64) -> Hash32 {
-    let mut h = [0u8; 32];
-    h[..8].copy_from_slice(&high.to_be_bytes());
-    h[8..16].copy_from_slice(&(high.wrapping_mul(7)).to_be_bytes());
-    h[16..24].copy_from_slice(&(low.wrapping_mul(11)).to_be_bytes());
-    h[24..].copy_from_slice(&low.to_be_bytes());
-    h
+pub(super) fn hash_full(high: u64, low: u64) -> Hash8 {
+    // Mix `high` and `low` into a single 8-byte fingerprint so the
+    // (high, low) pair survives the schema swap. xorshift-style mix
+    // avoids accidental collisions when `low == 0` (a common case in
+    // tests).
+    let mixed = high.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ low;
+    mixed.to_be_bytes()
 }
 
-pub(super) fn hash_bytes(high: u64, low: u64) -> Hash32 {
-    let mut h = [0u8; 32];
-    h[..8].copy_from_slice(&high.to_be_bytes());
-    h[24..].copy_from_slice(&low.to_be_bytes());
-    h
+pub(super) fn hash_bytes(high: u64, low: u64) -> Hash8 {
+    // Lighter mix: top half is `high`, bottom half folds `low` in.
+    let mixed = (high & 0xFFFF_FFFF_0000_0000) | (low & 0x0000_0000_FFFF_FFFF);
+    mixed.to_be_bytes()
 }
 
 pub(super) fn dedup_val(n: u8) -> DedupValue {

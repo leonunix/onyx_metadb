@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use onyx_metadb::{
-    Db, DedupValue, Hash32, L2pValue, Lba, Manifest, PageId, Pba, SnapshotEntry, SnapshotId,
+    Db, DedupValue, Hash8, L2pValue, Lba, Manifest, PageId, Pba, SnapshotEntry, SnapshotId,
 };
 
 fn main() -> ExitCode {
@@ -391,7 +391,7 @@ fn cmd_dedup_reverse(args: &[String]) -> Result<ExitCode, String> {
     } = parse_flags(args, ParseSpec::one_positional())?;
     let pba = parse_u64(positional.first(), "pba")? as Pba;
     let db = open_db(&path)?;
-    let hashes: Vec<Hash32> = db
+    let hashes: Vec<Hash8> = db
         .scan_dedup_reverse_for_pba(pba)
         .map_err(|e| e.to_string())?;
     if json {
@@ -584,7 +584,7 @@ fn parse_u64(arg: Option<&String>, name: &str) -> Result<u64, String> {
     }
 }
 
-fn parse_hash32(s: &str) -> Result<Hash32, String> {
+fn parse_hash32(s: &str) -> Result<Hash8, String> {
     let stripped = s.strip_prefix("0x").unwrap_or(s);
     if stripped.len() != 64 {
         return Err(format!(
@@ -592,7 +592,7 @@ fn parse_hash32(s: &str) -> Result<Hash32, String> {
             stripped.len(),
         ));
     }
-    let mut out = [0u8; 32];
+    let mut out = [0u8; 8];
     for (i, chunk) in stripped.as_bytes().chunks(2).enumerate() {
         let pair = std::str::from_utf8(chunk).map_err(|_| "invalid utf8 in hash".to_string())?;
         out[i] = u8::from_str_radix(pair, 16).map_err(|e| format!("bad hex `{pair}`: {e}"))?;

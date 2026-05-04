@@ -1147,8 +1147,8 @@ impl Db {
     ) -> Result<Vec<(usize, ApplyOutcome)>> {
         let batch_started = std::time::Instant::now();
         let mut outcomes = Vec::with_capacity(indices.len());
-        let mut reverse_puts: HashMap<Pba, Vec<Hash32>> = HashMap::new();
-        let flush_pba = |pba: Pba, reverse_puts: &mut HashMap<Pba, Vec<Hash32>>| -> Result<()> {
+        let mut reverse_puts: HashMap<Pba, Vec<Hash8>> = HashMap::new();
+        let flush_pba = |pba: Pba, reverse_puts: &mut HashMap<Pba, Vec<Hash8>>| -> Result<()> {
             let Some(hashes) = reverse_puts.remove(&pba) else {
                 return Ok(());
             };
@@ -1158,7 +1158,7 @@ impl Db {
             metrics.record_dedup_reverse_put_batch(count, started.elapsed());
             Ok(())
         };
-        let flush_all = |reverse_puts: &mut HashMap<Pba, Vec<Hash32>>| -> Result<()> {
+        let flush_all = |reverse_puts: &mut HashMap<Pba, Vec<Hash8>>| -> Result<()> {
             let pbas: Vec<Pba> = reverse_puts.keys().copied().collect();
             for pba in pbas {
                 flush_pba(pba, reverse_puts)?;

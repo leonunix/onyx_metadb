@@ -63,28 +63,28 @@ impl Db {
     }
 
     /// Record a `hash → value` entry in the dedup index (WAL-logged).
-    pub fn put_dedup(&self, hash: Hash32, value: DedupValue) -> Result<Lsn> {
+    pub fn put_dedup(&self, hash: Hash8, value: DedupValue) -> Result<Lsn> {
         let mut tx = self.begin();
         tx.put_dedup(hash, value);
         tx.commit()
     }
 
     /// Tombstone `hash` in the dedup index (WAL-logged).
-    pub fn delete_dedup(&self, hash: Hash32) -> Result<Lsn> {
+    pub fn delete_dedup(&self, hash: Hash8) -> Result<Lsn> {
         let mut tx = self.begin();
         tx.delete_dedup(hash);
         tx.commit()
     }
 
     /// Point-lookup `hash` in the dedup index.
-    pub fn get_dedup(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
+    pub fn get_dedup(&self, hash: &Hash8) -> Result<Option<DedupValue>> {
         self.dedup_index.get(hash)
     }
 
     /// Batched dedup index lookup. Shares one LSM reader-drain and one
     /// `levels` snapshot across all hashes. Output order matches input
     /// order; duplicates produce repeated results.
-    pub fn multi_get_dedup(&self, hashes: &[Hash32]) -> Result<Vec<Option<DedupValue>>> {
+    pub fn multi_get_dedup(&self, hashes: &[Hash8]) -> Result<Vec<Option<DedupValue>>> {
         self.dedup_index.multi_get(hashes)
     }
 
@@ -94,13 +94,13 @@ impl Db {
     /// refcount-zero targets are rejected without one point query per hit.
     pub fn multi_dedup_entries_are_live(
         &self,
-        entries: &[(Hash32, DedupValue)],
+        entries: &[(Hash8, DedupValue)],
     ) -> Result<Vec<bool>> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
 
-        let hashes: Vec<Hash32> = entries.iter().map(|(hash, _)| *hash).collect();
+        let hashes: Vec<Hash8> = entries.iter().map(|(hash, _)| *hash).collect();
         let forward = self.multi_get_dedup(&hashes)?;
         let pbas: Vec<Pba> = entries.iter().map(|(_, value)| value.head_pba()).collect();
         let refcounts = self.multi_get_refcount(&pbas)?;
@@ -119,14 +119,14 @@ impl Db {
     /// is an LSM put, not a modification of the forward dedup index.
     /// Callers typically pair it with `put_dedup(hash, value)` inside
     /// one `begin() / commit()` transaction so both land atomically.
-    pub fn register_dedup_reverse(&self, pba: Pba, hash: Hash32) -> Result<Lsn> {
+    pub fn register_dedup_reverse(&self, pba: Pba, hash: Hash8) -> Result<Lsn> {
         let mut tx = self.begin();
         tx.register_dedup_reverse(pba, hash);
         tx.commit()
     }
 
     /// Remove the `(pba, hash)` entry from the reverse index.
-    pub fn unregister_dedup_reverse(&self, pba: Pba, hash: Hash32) -> Result<Lsn> {
+    pub fn unregister_dedup_reverse(&self, pba: Pba, hash: Hash8) -> Result<Lsn> {
         let mut tx = self.begin();
         tx.unregister_dedup_reverse(pba, hash);
         tx.commit()
@@ -140,19 +140,19 @@ impl Db {
     /// data page). The legacy LSM prefix-scan was the bottleneck of
     /// `cleanup_dedup_for_pbas_batch`; this path is two orders of
     /// magnitude faster on a populated index.
-    pub fn scan_dedup_reverse_for_pba(&self, pba: Pba) -> Result<Vec<Hash32>> {
+    pub fn scan_dedup_reverse_for_pba(&self, pba: Pba) -> Result<Vec<Hash8>> {
         self.dedup_reverse.get_hashes(pba)
     }
 
     /// Batched [`scan_dedup_reverse_for_pba`]. Returns one
-    /// `Vec<Hash32>` per input PBA, in input order. Each vec carries
+    /// `Vec<Hash8>` per input PBA, in input order. Each vec carries
     /// at most one entry under the v1 single-hash-per-PBA invariant
     /// (see `paged_reverse` module docs); the shape stays plural so
     /// the caller does not need to change when overflow lands.
     ///
     /// Intended caller: writer / dedup cleanup path sweeping dead PBAs
     /// in a single batch (see onyx-storage `cleanup_dedup_for_pbas_batch`).
-    pub fn multi_scan_dedup_reverse_for_pba(&self, pbas: &[Pba]) -> Result<Vec<Vec<Hash32>>> {
+    pub fn multi_scan_dedup_reverse_for_pba(&self, pbas: &[Pba]) -> Result<Vec<Vec<Hash8>>> {
         self.dedup_reverse.multi_get_hashes(pbas)
     }
 
@@ -206,7 +206,7 @@ impl Db {
                 return Err(err);
             }
         };
-        let pairs: Vec<(Pba, Hash32)> = pbas
+        let pairs: Vec<(Pba, Hash8)> = pbas
             .iter()
             .copied()
             .zip(hashes_per_pba)
@@ -215,7 +215,7 @@ impl Db {
         let forward_entries = if pairs.is_empty() {
             Vec::new()
         } else {
-            let hashes: Vec<Hash32> = pairs.iter().map(|(_, hash)| *hash).collect();
+            let hashes: Vec<Hash8> = pairs.iter().map(|(_, hash)| *hash).collect();
             let check_started = std::time::Instant::now();
             match self.multi_get_dedup(&hashes) {
                 Ok(entries) => {
@@ -292,7 +292,7 @@ impl Db {
         })
     }
 
-    /// Iterate every live `(Hash32, DedupValue)` entry in the dedup
+    /// Iterate every live `(Hash8, DedupValue)` entry in the dedup
     /// forward index. Order is the cuckoo data-page → bucket → slot
     /// order (deterministic but not lexicographic on hash); callers
     /// that need a sorted view should sort the returned vec.

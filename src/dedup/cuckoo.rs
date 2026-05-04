@@ -44,19 +44,23 @@ use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::cache::PageCache;
-use crate::dedup_types::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash8};
 use crate::error::{MetaDbError, Result};
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::paged_meta;
 use crate::types::{Lsn, PageId};
 
-pub const ENTRY_BYTES: usize = 60; // Hash32 (32) + DedupValue (28)
+pub const ENTRY_BYTES: usize = 36; // Hash8 (8) + DedupValue (28)
 pub const ENTRIES_PER_BUCKET: usize = 4;
-pub const BUCKET_BYTES: usize = ENTRY_BYTES * ENTRIES_PER_BUCKET; // 240
-pub const BUCKETS_PER_PAGE: usize = (PAGE_PAYLOAD_SIZE - PRESENCE_BITMAP_BYTES) / BUCKET_BYTES; // 16
-pub const SLOTS_PER_PAGE: usize = BUCKETS_PER_PAGE * ENTRIES_PER_BUCKET; // 64
-pub const PRESENCE_BITMAP_BYTES: usize = 8;
+pub const BUCKET_BYTES: usize = ENTRY_BYTES * ENTRIES_PER_BUCKET; // 144
+/// Bytes reserved at the front of every data page for the presence
+/// bitmap (1 bit per slot). At BUCKETS_PER_PAGE = 28 and 4 slots each
+/// we have 112 slots, fitting in 14 bytes; round up to 16 for
+/// alignment.
+pub const PRESENCE_BITMAP_BYTES: usize = 16;
+pub const BUCKETS_PER_PAGE: usize = (PAGE_PAYLOAD_SIZE - PRESENCE_BITMAP_BYTES) / BUCKET_BYTES;
+pub const SLOTS_PER_PAGE: usize = BUCKETS_PER_PAGE * ENTRIES_PER_BUCKET;
 pub const MAX_CUCKOO_CHAIN: usize = 64;
 
 /// Bytes the head meta page reserves for module-specific data:
@@ -68,7 +72,8 @@ const DATA_KEY_COUNT_MARKER: u16 = 0;
 
 const _: () = {
     assert!(BUCKETS_PER_PAGE * BUCKET_BYTES + PRESENCE_BITMAP_BYTES <= PAGE_PAYLOAD_SIZE);
-    assert!(SLOTS_PER_PAGE == 64);
+    // Sanity: presence bitmap must cover every slot.
+    assert!(SLOTS_PER_PAGE <= PRESENCE_BITMAP_BYTES * 8);
 };
 
 /// Number of per-page mutexes used to serialise concurrent
@@ -198,7 +203,7 @@ impl CuckooHash {
 
     /// Look up `hash`. Returns `Some(value)` if the hash lives in
     /// either candidate bucket, else `None`.
-    pub fn get(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
+    pub fn get(&self, hash: &Hash8) -> Result<Option<DedupValue>> {
         let (b1, b2) = self.candidate_buckets(hash);
         if let Some(v) = self.read_bucket_for(hash, b1)? {
             return Ok(Some(v));
@@ -214,7 +219,7 @@ impl CuckooHash {
     /// Insert / overwrite `hash → value`. Returns `Ok(())` on
     /// success; `Err(Corruption("cuckoo full"))` only if the
     /// eviction chain exceeds [`MAX_CUCKOO_CHAIN`].
-    pub fn put(&self, hash: Hash32, value: DedupValue, lsn: Lsn) -> Result<()> {
+    pub fn put(&self, hash: Hash8, value: DedupValue, lsn: Lsn) -> Result<()> {
         // Idempotent overwrite: if the entry already exists, replace
         // the value in place and return. This keeps semantics
         // identical to the LSM `put` we are replacing.
@@ -262,7 +267,7 @@ impl CuckooHash {
     }
 
     /// Remove the entry for `hash`. No-op if absent.
-    pub fn delete(&self, hash: &Hash32, lsn: Lsn) -> Result<()> {
+    pub fn delete(&self, hash: &Hash8, lsn: Lsn) -> Result<()> {
         let (b1, b2) = self.candidate_buckets(hash);
         if self.try_clear_in_bucket(b1, hash, lsn)? {
             self.bump_len(-1);
@@ -277,7 +282,7 @@ impl CuckooHash {
     /// Iterate every live `(hash, value)` pair. Order is page-index
     /// then bucket then slot (deterministic but not lexicographic on
     /// hash). Used by the verifier and offline tools.
-    pub fn iter(&self) -> Result<Vec<(Hash32, DedupValue)>> {
+    pub fn iter(&self) -> Result<Vec<(Hash8, DedupValue)>> {
         let mut out = Vec::new();
         self.for_each(|hash, value| {
             out.push((hash, value));
@@ -289,11 +294,11 @@ impl CuckooHash {
     /// Streaming walk over every live `(hash, value)` pair without
     /// materialising the result vec. The L0 rebuild path uses this
     /// so a 10 M-entry dedup index doesn't allocate ~600 MiB of
-    /// `(Hash32, DedupValue)` tuples just to extract the
+    /// `(Hash8, DedupValue)` tuples just to extract the
     /// fingerprints.
     pub fn for_each<F>(&self, mut visit: F) -> Result<()>
     where
-        F: FnMut(Hash32, DedupValue) -> Result<()>,
+        F: FnMut(Hash8, DedupValue) -> Result<()>,
     {
         let snapshot = {
             let inner = self.inner.lock();
@@ -306,7 +311,7 @@ impl CuckooHash {
             let page = self.page_cache.get(pid)?;
             let bitmap = read_bitmap(&page);
             for slot in 0..SLOTS_PER_PAGE {
-                if bitmap & (1u64 << slot) != 0 {
+                if bitmap & (1u128 << slot) != 0 {
                     let (h, v) = read_slot(&page, slot);
                     visit(h, v)?;
                 }
@@ -377,7 +382,7 @@ impl CuckooHash {
         Ok(())
     }
 
-    fn candidate_buckets(&self, hash: &Hash32) -> (u64, u64) {
+    fn candidate_buckets(&self, hash: &Hash8) -> (u64, u64) {
         let h1 = xxh3_64_with_seed(hash, self.seed1);
         let h2 = xxh3_64_with_seed(hash, self.seed2);
         let b1 = h1 % self.bucket_count;
@@ -385,7 +390,7 @@ impl CuckooHash {
         (b1, b2)
     }
 
-    fn alternate_bucket_for_page(&self, hash: &Hash32, current: u64) -> u64 {
+    fn alternate_bucket_for_page(&self, hash: &Hash8, current: u64) -> u64 {
         let (b1, b2) = self.candidate_buckets(hash);
         let current_page = bucket_offset(current).0;
         let b1_page = bucket_offset(b1).0;
@@ -401,7 +406,7 @@ impl CuckooHash {
         }
     }
 
-    fn read_bucket_for(&self, hash: &Hash32, bucket_id: u64) -> Result<Option<DedupValue>> {
+    fn read_bucket_for(&self, hash: &Hash8, bucket_id: u64) -> Result<Option<DedupValue>> {
         let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
         let pid = {
             let inner = self.inner.lock();
@@ -415,7 +420,7 @@ impl CuckooHash {
         let start = bucket_in_page * ENTRIES_PER_BUCKET;
         for offset in 0..SLOTS_PER_PAGE {
             let slot = (start + offset) % SLOTS_PER_PAGE;
-            if bitmap & (1u64 << slot) != 0 {
+            if bitmap & (1u128 << slot) != 0 {
                 let (stored_hash, value) = read_slot(&page, slot);
                 if &stored_hash == hash {
                     return Ok(Some(value));
@@ -448,7 +453,7 @@ impl CuckooHash {
     fn update_existing(
         &self,
         bucket_id: u64,
-        hash: &Hash32,
+        hash: &Hash8,
         value: DedupValue,
         lsn: Lsn,
     ) -> Result<bool> {
@@ -456,7 +461,7 @@ impl CuckooHash {
             let start = bucket_in_page * ENTRIES_PER_BUCKET;
             for offset in 0..SLOTS_PER_PAGE {
                 let slot = (start + offset) % SLOTS_PER_PAGE;
-                if *bitmap & (1u64 << slot) != 0 {
+                if *bitmap & (1u128 << slot) != 0 {
                     let (stored_hash, _) = read_slot(page, slot);
                     if &stored_hash == hash {
                         write_slot(page, slot, hash, &value);
@@ -472,7 +477,7 @@ impl CuckooHash {
     fn try_insert_empty_in_page(
         &self,
         bucket_id: u64,
-        hash: Hash32,
+        hash: Hash8,
         value: DedupValue,
         lsn: Lsn,
     ) -> Result<bool> {
@@ -480,9 +485,9 @@ impl CuckooHash {
             let start = bucket_in_page * ENTRIES_PER_BUCKET;
             for offset in 0..SLOTS_PER_PAGE {
                 let slot = (start + offset) % SLOTS_PER_PAGE;
-                if *bitmap & (1u64 << slot) == 0 {
+                if *bitmap & (1u128 << slot) == 0 {
                     write_slot(page, slot, &hash, &value);
-                    *bitmap |= 1u64 << slot;
+                    *bitmap |= 1u128 << slot;
                     return Ok(true);
                 }
             }
@@ -490,16 +495,16 @@ impl CuckooHash {
         })
     }
 
-    fn try_clear_in_bucket(&self, bucket_id: u64, hash: &Hash32, lsn: Lsn) -> Result<bool> {
+    fn try_clear_in_bucket(&self, bucket_id: u64, hash: &Hash8, lsn: Lsn) -> Result<bool> {
         self.with_existing_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
             let start = bucket_in_page * ENTRIES_PER_BUCKET;
             for offset in 0..SLOTS_PER_PAGE {
                 let slot = (start + offset) % SLOTS_PER_PAGE;
-                if *bitmap & (1u64 << slot) != 0 {
+                if *bitmap & (1u128 << slot) != 0 {
                     let (stored_hash, _) = read_slot(page, slot);
                     if &stored_hash == hash {
                         clear_slot(page, slot);
-                        *bitmap &= !(1u64 << slot);
+                        *bitmap &= !(1u128 << slot);
                         return Ok((true, true));
                     }
                 }
@@ -512,7 +517,7 @@ impl CuckooHash {
     fn evict_and_insert(
         &self,
         start_bucket: u64,
-        mut hash: Hash32,
+        mut hash: Hash8,
         mut value: DedupValue,
         lsn: Lsn,
     ) -> Result<()> {
@@ -536,11 +541,11 @@ impl CuckooHash {
     fn swap_into_victim_slot(
         &self,
         bucket_id: u64,
-        hash: Hash32,
+        hash: Hash8,
         value: DedupValue,
         step: usize,
         lsn: Lsn,
-    ) -> Result<(Hash32, DedupValue)> {
+    ) -> Result<(Hash8, DedupValue)> {
         self.with_bucket_mut(bucket_id, lsn, |_bitmap, page, bucket_in_page| {
             let start = bucket_in_page * ENTRIES_PER_BUCKET;
             let seed = hash[step % hash.len()] as usize;
@@ -555,7 +560,7 @@ impl CuckooHash {
         &self,
         bucket_id: u64,
         lsn: Lsn,
-        f: impl FnOnce(&mut u64, &mut Page, usize) -> Result<T>,
+        f: impl FnOnce(&mut u128, &mut Page, usize) -> Result<T>,
     ) -> Result<T> {
         let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
         // Lock order: per-page shard FIRST, then the meta mutex.
@@ -608,7 +613,7 @@ impl CuckooHash {
         &self,
         bucket_id: u64,
         lsn: Lsn,
-        f: impl FnOnce(&mut u64, &mut Page, usize) -> Result<(T, bool)>,
+        f: impl FnOnce(&mut u128, &mut Page, usize) -> Result<(T, bool)>,
     ) -> Result<Option<T>> {
         let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
         let _shard = self.bucket_locks[page_idx & (BUCKET_LOCK_SHARDS - 1)].lock();
@@ -658,13 +663,13 @@ fn bucket_offset(bucket_id: u64) -> (usize, usize) {
 }
 
 #[inline]
-fn read_bitmap(page: &Page) -> u64 {
+fn read_bitmap(page: &Page) -> u128 {
     let payload = page.payload();
-    u64::from_le_bytes(payload[0..PRESENCE_BITMAP_BYTES].try_into().unwrap())
+    u128::from_le_bytes(payload[0..PRESENCE_BITMAP_BYTES].try_into().unwrap())
 }
 
 #[inline]
-fn write_bitmap(page: &mut Page, bitmap: u64) {
+fn write_bitmap(page: &mut Page, bitmap: u128) {
     let payload = page.payload_mut();
     payload[0..PRESENCE_BITMAP_BYTES].copy_from_slice(&bitmap.to_le_bytes());
 }
@@ -675,29 +680,29 @@ fn slot_offset(slot: usize) -> usize {
 }
 
 #[inline]
-fn read_slot(page: &Page, slot: usize) -> (Hash32, DedupValue) {
+fn read_slot(page: &Page, slot: usize) -> (Hash8, DedupValue) {
     let off = slot_offset(slot);
     let payload = page.payload();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&payload[off..off + 32]);
+    let mut hash = [0u8; 8];
+    hash.copy_from_slice(&payload[off..off + 8]);
     let mut value = [0u8; 28];
-    value.copy_from_slice(&payload[off + 32..off + 60]);
+    value.copy_from_slice(&payload[off + 8..off + 8 + 28]);
     (hash, DedupValue(value))
 }
 
 #[inline]
-fn write_slot(page: &mut Page, slot: usize, hash: &Hash32, value: &DedupValue) {
+fn write_slot(page: &mut Page, slot: usize, hash: &Hash8, value: &DedupValue) {
     let off = slot_offset(slot);
     let payload = page.payload_mut();
-    payload[off..off + 32].copy_from_slice(hash);
-    payload[off + 32..off + 60].copy_from_slice(value.as_bytes());
+    payload[off..off + 8].copy_from_slice(hash);
+    payload[off + 8..off + 8 + 28].copy_from_slice(value.as_bytes());
 }
 
 #[inline]
 fn clear_slot(page: &mut Page, slot: usize) {
     let off = slot_offset(slot);
     let payload = page.payload_mut();
-    payload[off..off + 60].fill(0);
+    payload[off..off + ENTRY_BYTES].fill(0);
 }
 
 fn new_data_page() -> Page {
@@ -726,8 +731,8 @@ mod tests {
         (dir, cuckoo)
     }
 
-    fn h(byte: u8) -> Hash32 {
-        let mut x = [0u8; 32];
+    fn h(byte: u8) -> Hash8 {
+        let mut x = [0u8; 8];
         x.fill(byte);
         x
     }
@@ -888,7 +893,7 @@ mod tests {
                 let c = cuckoo.clone();
                 std::thread::spawn(move || {
                     for i in 0..1000u32 {
-                        let mut hash = [0u8; 32];
+                        let mut hash = [0u8; 8];
                         hash[0] = tid;
                         hash[1..5].copy_from_slice(&i.to_le_bytes());
                         c.put(hash, dv(tid), 100 + i as Lsn).unwrap();
@@ -901,7 +906,7 @@ mod tests {
         }
         for tid in 0..8u8 {
             for i in 0..1000u32 {
-                let mut hash = [0u8; 32];
+                let mut hash = [0u8; 8];
                 hash[0] = tid;
                 hash[1..5].copy_from_slice(&i.to_le_bytes());
                 assert_eq!(cuckoo.get(&hash).unwrap(), Some(dv(tid)));
@@ -914,13 +919,13 @@ mod tests {
     fn page_associative_insert_avoids_sub_bucket_false_full() {
         let (_d, c) = make_index(32);
         for i in 0..64u64 {
-            let mut hash = [0u8; 32];
+            let mut hash = [0u8; 8];
             hash[..8].copy_from_slice(&i.to_be_bytes());
             c.put(hash, dv((i & 0xff) as u8), 100 + i).unwrap();
         }
         assert_eq!(c.recount().unwrap(), 64);
         for i in 0..64u64 {
-            let mut hash = [0u8; 32];
+            let mut hash = [0u8; 8];
             hash[..8].copy_from_slice(&i.to_be_bytes());
             assert_eq!(c.get(&hash).unwrap(), Some(dv((i & 0xff) as u8)));
         }
