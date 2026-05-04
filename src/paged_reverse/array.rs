@@ -6,27 +6,29 @@
 //! # On-disk encoding
 //!
 //! ## Data page (PageType::DedupReverseArray, slot-keyed)
-//! Each leaf carries [`ENTRIES_PER_PAGE`] = 84 fixed-size slots, one
-//! per PBA in `[page_idx * 84, (page_idx + 1) * 84)`. Slot layout
-//! (48 B):
+//! Each leaf carries [`ENTRIES_PER_PAGE`] = 168 fixed-size slots, one
+//! per PBA in `[page_idx * 168, (page_idx + 1) * 168)`. Slot layout
+//! (24 B):
 //! ```text
 //!   bytes 0..2   hash_count: u16 LE   (0 = unused slot)
 //!   bytes 2..4   reserved
 //!   bytes 4..12  overflow_pid: u64 LE (0 = no overflow)
-//!   bytes 12..44 inline_hash: [u8; 8]
-//!   bytes 44..48 reserved
+//!   bytes 12..20 inline_hash: [u8; 8]
+//!   bytes 20..24 reserved
 //! ```
-//! 84 × 48 = 4032 B = PAGE_PAYLOAD_SIZE.
+//! 168 × 24 = 4032 B = PAGE_PAYLOAD_SIZE.
 //!
 //! ## Overflow page (PageType::DedupReverseArray, chain-keyed)
 //! Holds the **extra** hashes for one PBA whose inline slot was full.
+//! Layout is driven by [`OVERFLOW_HEADER_BYTES`] (16 B) +
+//! [`OVERFLOW_HASHES_PER_PAGE`] hashes; for an 8 B hash that is 502
+//! hashes per page.
 //! ```text
-//!   bytes 0..2   used: u16 LE          (number of hashes stored, 0..125)
-//!   bytes 2..10  next_pid: u64 LE      (0 if last in chain)
-//!   bytes 10..16 reserved
-//!   bytes 16..   hashes: [Hash8; 125]
+//!   bytes 0..2                used: u16 LE     (hashes stored)
+//!   bytes 2..10               next_pid: u64 LE (0 if last)
+//!   bytes 10..16              reserved
+//!   bytes 16..                hashes: [Hash8; OVERFLOW_HASHES_PER_PAGE]
 //! ```
-//! 16 + 125 × 32 = 4016 B used, 16 B padding to 4032 B.
 //!
 //! ## Meta page chain (PageType::DedupReverseArray, `key_count = 0xFFFF`)
 //! Each meta page carries a fixed 16 B chain header (`chunk_len: u32`,
@@ -70,7 +72,9 @@ const ZERO_HASH: Hash8 = [0u8; 8];
 
 const _: () = {
     assert!(ENTRIES_PER_PAGE * SLOT_BYTES == PAGE_PAYLOAD_SIZE);
-    assert!(OVERFLOW_HASHES_PER_PAGE >= 125);
+    // An overflow page must hold at least one hash to be useful as a
+    // chain link.
+    assert!(OVERFLOW_HASHES_PER_PAGE >= 1);
 };
 
 pub struct PagedReverse {

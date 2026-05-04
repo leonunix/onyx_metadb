@@ -44,14 +44,14 @@ use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::cache::PageCache;
-use crate::dedup_types::{DedupValue, Hash8};
+use crate::dedup_types::{DedupValue, Hash8, DEDUP_VALUE_SIZE, HASH_SIZE};
 use crate::error::{MetaDbError, Result};
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::paged_meta;
 use crate::types::{Lsn, PageId};
 
-pub const ENTRY_BYTES: usize = 36; // Hash8 (8) + DedupValue (28)
+pub const ENTRY_BYTES: usize = HASH_SIZE + DEDUP_VALUE_SIZE;
 pub const ENTRIES_PER_BUCKET: usize = 4;
 pub const BUCKET_BYTES: usize = ENTRY_BYTES * ENTRIES_PER_BUCKET; // 144
 /// Bytes reserved at the front of every data page for the presence
@@ -684,9 +684,9 @@ fn read_slot(page: &Page, slot: usize) -> (Hash8, DedupValue) {
     let off = slot_offset(slot);
     let payload = page.payload();
     let mut hash = [0u8; 8];
-    hash.copy_from_slice(&payload[off..off + 8]);
-    let mut value = [0u8; 28];
-    value.copy_from_slice(&payload[off + 8..off + 8 + 28]);
+    hash.copy_from_slice(&payload[off..off + HASH_SIZE]);
+    let mut value = [0u8; DEDUP_VALUE_SIZE];
+    value.copy_from_slice(&payload[off + HASH_SIZE..off + HASH_SIZE + DEDUP_VALUE_SIZE]);
     (hash, DedupValue(value))
 }
 
@@ -694,8 +694,8 @@ fn read_slot(page: &Page, slot: usize) -> (Hash8, DedupValue) {
 fn write_slot(page: &mut Page, slot: usize, hash: &Hash8, value: &DedupValue) {
     let off = slot_offset(slot);
     let payload = page.payload_mut();
-    payload[off..off + 8].copy_from_slice(hash);
-    payload[off + 8..off + 8 + 28].copy_from_slice(value.as_bytes());
+    payload[off..off + HASH_SIZE].copy_from_slice(hash);
+    payload[off + HASH_SIZE..off + HASH_SIZE + DEDUP_VALUE_SIZE].copy_from_slice(value.as_bytes());
 }
 
 #[inline]
