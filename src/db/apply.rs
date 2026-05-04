@@ -80,6 +80,19 @@ pub(super) fn apply_op_bare(
             dedup_index.put(*hash, *value, lsn)?;
             Ok(ApplyOutcome::Dedup)
         }
+        WalOp::DedupPutGuarded {
+            hash,
+            value,
+            pba_guard,
+            min_rc,
+        } => {
+            let sid = shard_for_key(refcount_shards, *pba_guard);
+            if refcount_shards[sid].rc.get(*pba_guard)? >= *min_rc {
+                dedup_index.put(*hash, *value, lsn)?;
+                dedup_reverse.put(*pba_guard, *hash, lsn)?;
+            }
+            Ok(ApplyOutcome::Dedup)
+        }
         WalOp::DedupDelete { hash } => {
             dedup_index.delete(hash, lsn)?;
             Ok(ApplyOutcome::Dedup)

@@ -269,6 +269,27 @@ fn dedup_put_get_roundtrip_via_memtable() {
 }
 
 #[test]
+fn dedup_put_guarded_respects_refcount_guard() {
+    let (_d, db) = mk_db();
+    let live_hash = h(10);
+    let dead_hash = h(11);
+    db.incref_pba(123, 1).unwrap();
+
+    let mut live_tx = db.begin();
+    live_tx.put_dedup_guarded(live_hash, dv(10), 123, 1);
+    live_tx.commit().unwrap();
+
+    let mut dead_tx = db.begin();
+    dead_tx.put_dedup_guarded(dead_hash, dv(11), 124, 1);
+    dead_tx.commit().unwrap();
+
+    assert_eq!(db.get_dedup(&live_hash).unwrap(), Some(dv(10)));
+    assert_eq!(db.scan_dedup_reverse_for_pba(123).unwrap(), vec![live_hash]);
+    assert_eq!(db.get_dedup(&dead_hash).unwrap(), None);
+    assert!(db.scan_dedup_reverse_for_pba(124).unwrap().is_empty());
+}
+
+#[test]
 fn dedup_delete_tombstones_key() {
     let (_d, db) = mk_db();
     db.put_dedup(h(1), dv(10)).unwrap();

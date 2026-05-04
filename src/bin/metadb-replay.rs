@@ -147,7 +147,7 @@ impl OpCounts {
             WalOp::L2pDelete { .. } => self.l2p_delete += 1,
             WalOp::L2pRemap { .. } => self.l2p_remap += 1,
             WalOp::L2pRangeDelete { .. } => self.l2p_range_delete += 1,
-            WalOp::DedupPut { .. } => self.dedup_put += 1,
+            WalOp::DedupPut { .. } | WalOp::DedupPutGuarded { .. } => self.dedup_put += 1,
             WalOp::DedupDelete { .. } => self.dedup_delete += 1,
             WalOp::DedupReversePut { .. } => self.dedup_reverse_put += 1,
             WalOp::DedupReverseDelete { .. } => self.dedup_reverse_delete += 1,
@@ -322,6 +322,16 @@ fn fmt_op(op: &WalOp) -> String {
         WalOp::DedupPut { hash, value } => {
             format!("DedupPut hash={} value={}", hex(hash), hex(value.0))
         }
+        WalOp::DedupPutGuarded {
+            hash,
+            value,
+            pba_guard,
+            min_rc,
+        } => format!(
+            "DedupPutGuarded hash={} value={} pba_guard={pba_guard} min_rc={min_rc}",
+            hex(hash),
+            hex(value.0)
+        ),
         WalOp::DedupDelete { hash } => format!("DedupDelete hash={}", hex(hash)),
         WalOp::DedupReversePut { pba, hash } => {
             format!("DedupReversePut pba={pba} hash={}", hex(hash))
@@ -406,6 +416,16 @@ fn op_json(op: &WalOp) -> String {
             hex(hash),
             hex(value.0),
         ),
+        WalOp::DedupPutGuarded {
+            hash,
+            value,
+            pba_guard,
+            min_rc,
+        } => format!(
+            "{{\"op\":\"DedupPutGuarded\",\"hash\":\"{}\",\"value\":\"{}\",\"pba_guard\":{pba_guard},\"min_rc\":{min_rc}}}",
+            hex(hash),
+            hex(value.0),
+        ),
         WalOp::DedupDelete { hash } => {
             format!("{{\"op\":\"DedupDelete\",\"hash\":\"{}\"}}", hex(hash))
         }
@@ -463,6 +483,7 @@ fn op_tag_list(ops: &[WalOp]) -> String {
             WalOp::L2pRemap { .. } => "L2pRemap",
             WalOp::L2pRangeDelete { .. } => "L2pRangeDelete",
             WalOp::DedupPut { .. } => "DedupPut",
+            WalOp::DedupPutGuarded { .. } => "DedupPutGuarded",
             WalOp::DedupDelete { .. } => "DedupDelete",
             WalOp::DedupReversePut { .. } => "DedupReversePut",
             WalOp::DedupReverseDelete { .. } => "DedupReverseDelete",

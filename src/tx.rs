@@ -184,6 +184,23 @@ impl<'db> Transaction<'db> {
         self
     }
 
+    /// Buffer a dedup put guarded by the target PBA's current refcount.
+    pub fn put_dedup_guarded(
+        &mut self,
+        hash: Hash32,
+        value: DedupValue,
+        pba_guard: Pba,
+        min_rc: u32,
+    ) -> &mut Self {
+        self.ops.push(WalOp::DedupPutGuarded {
+            hash,
+            value,
+            pba_guard,
+            min_rc,
+        });
+        self
+    }
+
     /// Buffer a dedup tombstone.
     pub fn delete_dedup(&mut self, hash: Hash32) -> &mut Self {
         self.ops.push(WalOp::DedupDelete { hash });

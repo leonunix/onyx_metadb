@@ -129,7 +129,9 @@ fn wal_lane_key(op: &WalOp) -> u64 {
             bytes[2..].copy_from_slice(&start.to_be_bytes());
             xxh3_64(&bytes)
         }
-        WalOp::DedupPut { hash, .. } | WalOp::DedupDelete { hash } => xxh3_64(hash),
+        WalOp::DedupPut { hash, .. }
+        | WalOp::DedupPutGuarded { hash, .. }
+        | WalOp::DedupDelete { hash } => xxh3_64(hash),
         WalOp::DedupReversePut { pba, hash } | WalOp::DedupReverseDelete { pba, hash } => {
             let mut bytes = [0u8; 40];
             bytes[..8].copy_from_slice(&pba.to_be_bytes());
@@ -772,7 +774,9 @@ impl Db {
                         remap_freed_candidate: false,
                     });
                 }
-                WalOp::DedupPut { hash, .. } | WalOp::DedupDelete { hash, .. } => {
+                WalOp::DedupPut { hash, .. }
+                | WalOp::DedupPutGuarded { hash, .. }
+                | WalOp::DedupDelete { hash, .. } => {
                     let sid =
                         crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
                     dedup_buckets[sid].push(idx);
@@ -1135,6 +1139,7 @@ impl Db {
     fn apply_dedup_indices_to(
         dedup_index: &crate::dedup::DedupIndex,
         dedup_reverse: &crate::paged_reverse::PagedReverse,
+        refcount_shards: &[Arc<crate::refcount::RcShard>],
         metrics: &MetaMetrics,
         ops: &[WalOp],
         indices: Vec<usize>,
@@ -1147,7 +1152,10 @@ impl Db {
             let Some(hashes) = reverse_puts.remove(&pba) else {
                 return Ok(());
             };
+            let started = std::time::Instant::now();
+            let count = hashes.len() as u64;
             dedup_reverse.put_many(pba, &hashes, lsn)?;
+            metrics.record_dedup_reverse_put_batch(count, started.elapsed());
             Ok(())
         };
         let flush_all = |reverse_puts: &mut HashMap<Pba, Vec<Hash32>>| -> Result<()> {
@@ -1161,11 +1169,35 @@ impl Db {
         for idx in indices {
             match &ops[idx] {
                 WalOp::DedupPut { hash, value } => {
+                    let started = std::time::Instant::now();
                     dedup_index.put(*hash, *value, lsn)?;
+                    metrics.record_dedup_forward_put(started.elapsed());
+                    outcomes.push((idx, ApplyOutcome::Dedup));
+                }
+                WalOp::DedupPutGuarded {
+                    hash,
+                    value,
+                    pba_guard,
+                    min_rc,
+                } => {
+                    let guard_started = std::time::Instant::now();
+                    let rc = refcount_shards
+                        .get((xxh3_64(&pba_guard.to_be_bytes()) as usize) % refcount_shards.len())
+                        .ok_or_else(|| MetaDbError::Corruption("missing refcount shard".into()))?
+                        .get(*pba_guard)?;
+                    metrics.record_dedup_forward_delete(guard_started.elapsed());
+                    if rc >= *min_rc {
+                        let started = std::time::Instant::now();
+                        dedup_index.put(*hash, *value, lsn)?;
+                        metrics.record_dedup_forward_put(started.elapsed());
+                        reverse_puts.entry(*pba_guard).or_default().push(*hash);
+                    }
                     outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupDelete { hash } => {
+                    let started = std::time::Instant::now();
                     dedup_index.delete(hash, lsn)?;
+                    metrics.record_dedup_forward_delete(started.elapsed());
                     outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupReversePut { pba, hash } => {
@@ -1174,7 +1206,9 @@ impl Db {
                 }
                 WalOp::DedupReverseDelete { pba, hash } => {
                     flush_pba(*pba, &mut reverse_puts)?;
+                    let started = std::time::Instant::now();
                     dedup_reverse.delete(*pba, *hash, lsn)?;
+                    metrics.record_dedup_reverse_delete(started.elapsed());
                     outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 other => unreachable!("dedup bucket holds only dedup ops; saw {other:?}"),
@@ -1291,21 +1325,34 @@ impl Db {
         let dedup_enqueue_started = std::time::Instant::now();
         let dedup_buckets = std::mem::take(&mut plan.dedup_buckets);
         let pendings = std::mem::take(&mut plan.dedup_pendings);
+        let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> =
+            Arc::new(self.refcount_shards.iter().map(|s| s.rc.clone()).collect());
         for (_sid, (pending_opt, bucket)) in pendings.into_iter().zip(dedup_buckets).enumerate() {
             let Some(pending) = pending_opt else { continue };
+            let ready_at = std::time::Instant::now();
+            let bucket_ops = bucket.len() as u64;
             let ops = plan.ops.clone();
             let dedup_index = self.dedup_index.clone();
             let dedup_reverse = self.dedup_reverse.clone();
+            let refcount_shards_arc = refcount_shards_arc.clone();
             let metrics = self.metrics.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
             pending.set(Box::new(move || {
+                let ready_queue_wait = ready_at.elapsed();
+                let exec_started = std::time::Instant::now();
                 let outcomes = Self::apply_dedup_indices_to(
                     dedup_index.as_ref(),
                     dedup_reverse.as_ref(),
+                    refcount_shards_arc.as_slice(),
                     metrics.as_ref(),
                     ops.as_slice(),
                     bucket,
                     lsn,
+                );
+                metrics.record_dedup_lane_task(
+                    bucket_ops,
+                    ready_queue_wait,
+                    exec_started.elapsed(),
                 );
                 let _ = tx.send(outcomes);
             }));
@@ -1418,6 +1465,7 @@ impl Db {
                     });
                 }
                 WalOp::DedupPut { .. }
+                | WalOp::DedupPutGuarded { .. }
                 | WalOp::DedupDelete { .. }
                 | WalOp::DedupReversePut { .. }
                 | WalOp::DedupReverseDelete { .. } => {
@@ -1558,6 +1606,7 @@ impl Db {
         for (idx, outcome) in Self::apply_dedup_indices_to(
             dedup_index.as_ref(),
             dedup_reverse.as_ref(),
+            refcount_shards_arc.as_slice(),
             metrics.as_ref(),
             ops.as_slice(),
             dedup_idxs,
@@ -1613,6 +1662,7 @@ impl Db {
                     });
                 }
                 WalOp::DedupPut { .. }
+                | WalOp::DedupPutGuarded { .. }
                 | WalOp::DedupDelete { .. }
                 | WalOp::DedupReversePut { .. }
                 | WalOp::DedupReverseDelete { .. } => {
@@ -1685,6 +1735,7 @@ impl Db {
         for (idx, outcome) in Self::apply_dedup_indices_to(
             dedup_index.as_ref(),
             dedup_reverse.as_ref(),
+            refcount_shards_vec.as_slice(),
             metrics.as_ref(),
             ops,
             dedup_idxs,
@@ -1751,6 +1802,7 @@ fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Du
         WalOp::L2pRangeDelete { .. } => metrics.record_apply_l2p_range_delete(elapsed),
         WalOp::Incref { .. } | WalOp::Decref { .. } => metrics.record_apply_refcount(elapsed),
         WalOp::DedupPut { .. }
+        | WalOp::DedupPutGuarded { .. }
         | WalOp::DedupDelete { .. }
         | WalOp::DedupReversePut { .. }
         | WalOp::DedupReverseDelete { .. } => metrics.record_apply_dedup(elapsed),

@@ -113,6 +113,24 @@ pub struct MetaMetrics {
     apply_dedup_count: AtomicU64,
     apply_dedup_us: AtomicU64,
     apply_dedup_max_us: AtomicU64,
+    dedup_lane_tasks: AtomicU64,
+    dedup_lane_ops: AtomicU64,
+    dedup_lane_ready_queue_wait_us: AtomicU64,
+    dedup_lane_ready_queue_wait_max_us: AtomicU64,
+    dedup_lane_exec_us: AtomicU64,
+    dedup_lane_exec_max_us: AtomicU64,
+    dedup_apply_forward_put_count: AtomicU64,
+    dedup_apply_forward_put_us: AtomicU64,
+    dedup_apply_forward_put_max_us: AtomicU64,
+    dedup_apply_forward_delete_count: AtomicU64,
+    dedup_apply_forward_delete_us: AtomicU64,
+    dedup_apply_forward_delete_max_us: AtomicU64,
+    dedup_apply_reverse_put_count: AtomicU64,
+    dedup_apply_reverse_put_us: AtomicU64,
+    dedup_apply_reverse_put_max_us: AtomicU64,
+    dedup_apply_reverse_delete_count: AtomicU64,
+    dedup_apply_reverse_delete_us: AtomicU64,
+    dedup_apply_reverse_delete_max_us: AtomicU64,
 
     // L2P read-path split. `l2p_get_lock_wait_us` is time spent blocked
     // acquiring the shard tree read lock (i.e. an apply or another writer
@@ -258,6 +276,24 @@ pub struct MetaMetricsSnapshot {
     pub apply_dedup_count: u64,
     pub apply_dedup_us: u64,
     pub apply_dedup_max_us: u64,
+    pub dedup_lane_tasks: u64,
+    pub dedup_lane_ops: u64,
+    pub dedup_lane_ready_queue_wait_us: u64,
+    pub dedup_lane_ready_queue_wait_max_us: u64,
+    pub dedup_lane_exec_us: u64,
+    pub dedup_lane_exec_max_us: u64,
+    pub dedup_apply_forward_put_count: u64,
+    pub dedup_apply_forward_put_us: u64,
+    pub dedup_apply_forward_put_max_us: u64,
+    pub dedup_apply_forward_delete_count: u64,
+    pub dedup_apply_forward_delete_us: u64,
+    pub dedup_apply_forward_delete_max_us: u64,
+    pub dedup_apply_reverse_put_count: u64,
+    pub dedup_apply_reverse_put_us: u64,
+    pub dedup_apply_reverse_put_max_us: u64,
+    pub dedup_apply_reverse_delete_count: u64,
+    pub dedup_apply_reverse_delete_us: u64,
+    pub dedup_apply_reverse_delete_max_us: u64,
     pub l2p_get_calls: u64,
     pub l2p_get_lock_wait_us: u64,
     pub l2p_get_lock_wait_max_us: u64,
@@ -396,6 +432,24 @@ impl MetaMetrics {
             apply_dedup_count: load(&self.apply_dedup_count),
             apply_dedup_us: load(&self.apply_dedup_us),
             apply_dedup_max_us: load(&self.apply_dedup_max_us),
+            dedup_lane_tasks: load(&self.dedup_lane_tasks),
+            dedup_lane_ops: load(&self.dedup_lane_ops),
+            dedup_lane_ready_queue_wait_us: load(&self.dedup_lane_ready_queue_wait_us),
+            dedup_lane_ready_queue_wait_max_us: load(&self.dedup_lane_ready_queue_wait_max_us),
+            dedup_lane_exec_us: load(&self.dedup_lane_exec_us),
+            dedup_lane_exec_max_us: load(&self.dedup_lane_exec_max_us),
+            dedup_apply_forward_put_count: load(&self.dedup_apply_forward_put_count),
+            dedup_apply_forward_put_us: load(&self.dedup_apply_forward_put_us),
+            dedup_apply_forward_put_max_us: load(&self.dedup_apply_forward_put_max_us),
+            dedup_apply_forward_delete_count: load(&self.dedup_apply_forward_delete_count),
+            dedup_apply_forward_delete_us: load(&self.dedup_apply_forward_delete_us),
+            dedup_apply_forward_delete_max_us: load(&self.dedup_apply_forward_delete_max_us),
+            dedup_apply_reverse_put_count: load(&self.dedup_apply_reverse_put_count),
+            dedup_apply_reverse_put_us: load(&self.dedup_apply_reverse_put_us),
+            dedup_apply_reverse_put_max_us: load(&self.dedup_apply_reverse_put_max_us),
+            dedup_apply_reverse_delete_count: load(&self.dedup_apply_reverse_delete_count),
+            dedup_apply_reverse_delete_us: load(&self.dedup_apply_reverse_delete_us),
+            dedup_apply_reverse_delete_max_us: load(&self.dedup_apply_reverse_delete_max_us),
             l2p_get_calls: load(&self.l2p_get_calls),
             l2p_get_lock_wait_us: load(&self.l2p_get_lock_wait_us),
             l2p_get_lock_wait_max_us: load(&self.l2p_get_lock_wait_max_us),
@@ -658,6 +712,66 @@ impl MetaMetrics {
         }
         self.apply_dedup_count.fetch_add(ops, Ordering::Relaxed);
         record_duration(&self.apply_dedup_us, &self.apply_dedup_max_us, elapsed);
+    }
+
+    pub(crate) fn record_dedup_lane_task(
+        &self,
+        ops: u64,
+        ready_queue_wait: Duration,
+        exec: Duration,
+    ) {
+        self.dedup_lane_tasks.fetch_add(1, Ordering::Relaxed);
+        self.dedup_lane_ops.fetch_add(ops, Ordering::Relaxed);
+        record_duration(
+            &self.dedup_lane_ready_queue_wait_us,
+            &self.dedup_lane_ready_queue_wait_max_us,
+            ready_queue_wait,
+        );
+        record_duration(&self.dedup_lane_exec_us, &self.dedup_lane_exec_max_us, exec);
+    }
+
+    pub(crate) fn record_dedup_forward_put(&self, elapsed: Duration) {
+        self.dedup_apply_forward_put_count
+            .fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.dedup_apply_forward_put_us,
+            &self.dedup_apply_forward_put_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_dedup_forward_delete(&self, elapsed: Duration) {
+        self.dedup_apply_forward_delete_count
+            .fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.dedup_apply_forward_delete_us,
+            &self.dedup_apply_forward_delete_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_dedup_reverse_put_batch(&self, ops: u64, elapsed: Duration) {
+        if ops == 0 {
+            return;
+        }
+        self.dedup_apply_reverse_put_count
+            .fetch_add(ops, Ordering::Relaxed);
+        record_batch_duration(
+            &self.dedup_apply_reverse_put_us,
+            &self.dedup_apply_reverse_put_max_us,
+            ops,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_dedup_reverse_delete(&self, elapsed: Duration) {
+        self.dedup_apply_reverse_delete_count
+            .fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.dedup_apply_reverse_delete_us,
+            &self.dedup_apply_reverse_delete_max_us,
+            elapsed,
+        );
     }
 
     pub(crate) fn record_l2p_get(&self, lock_wait: Duration, tree_walk: Duration) {
@@ -987,6 +1101,24 @@ impl MetaMetricsSnapshot {
                 "\"apply_dedup_count\":{},",
                 "\"apply_dedup_us\":{},",
                 "\"apply_dedup_max_us\":{},",
+                "\"dedup_lane_tasks\":{},",
+                "\"dedup_lane_ops\":{},",
+                "\"dedup_lane_ready_queue_wait_us\":{},",
+                "\"dedup_lane_ready_queue_wait_max_us\":{},",
+                "\"dedup_lane_exec_us\":{},",
+                "\"dedup_lane_exec_max_us\":{},",
+                "\"dedup_apply_forward_put_count\":{},",
+                "\"dedup_apply_forward_put_us\":{},",
+                "\"dedup_apply_forward_put_max_us\":{},",
+                "\"dedup_apply_forward_delete_count\":{},",
+                "\"dedup_apply_forward_delete_us\":{},",
+                "\"dedup_apply_forward_delete_max_us\":{},",
+                "\"dedup_apply_reverse_put_count\":{},",
+                "\"dedup_apply_reverse_put_us\":{},",
+                "\"dedup_apply_reverse_put_max_us\":{},",
+                "\"dedup_apply_reverse_delete_count\":{},",
+                "\"dedup_apply_reverse_delete_us\":{},",
+                "\"dedup_apply_reverse_delete_max_us\":{},",
                 "\"l2p_get_calls\":{},",
                 "\"l2p_get_lock_wait_us\":{},",
                 "\"l2p_get_lock_wait_max_us\":{},",
@@ -1118,6 +1250,24 @@ impl MetaMetricsSnapshot {
             self.apply_dedup_count,
             self.apply_dedup_us,
             self.apply_dedup_max_us,
+            self.dedup_lane_tasks,
+            self.dedup_lane_ops,
+            self.dedup_lane_ready_queue_wait_us,
+            self.dedup_lane_ready_queue_wait_max_us,
+            self.dedup_lane_exec_us,
+            self.dedup_lane_exec_max_us,
+            self.dedup_apply_forward_put_count,
+            self.dedup_apply_forward_put_us,
+            self.dedup_apply_forward_put_max_us,
+            self.dedup_apply_forward_delete_count,
+            self.dedup_apply_forward_delete_us,
+            self.dedup_apply_forward_delete_max_us,
+            self.dedup_apply_reverse_put_count,
+            self.dedup_apply_reverse_put_us,
+            self.dedup_apply_reverse_put_max_us,
+            self.dedup_apply_reverse_delete_count,
+            self.dedup_apply_reverse_delete_us,
+            self.dedup_apply_reverse_delete_max_us,
             self.l2p_get_calls,
             self.l2p_get_lock_wait_us,
             self.l2p_get_lock_wait_max_us,

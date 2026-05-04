@@ -64,6 +64,18 @@ impl WalOp {
                 out.extend_from_slice(hash);
                 out.extend_from_slice(&value.0);
             }
+            WalOp::DedupPutGuarded {
+                hash,
+                value,
+                pba_guard,
+                min_rc,
+            } => {
+                out.push(TAG_DEDUP_PUT_GUARDED);
+                out.extend_from_slice(hash);
+                out.extend_from_slice(&value.0);
+                out.extend_from_slice(&pba_guard.to_be_bytes());
+                out.extend_from_slice(&min_rc.to_be_bytes());
+            }
             WalOp::DedupDelete { hash } => {
                 out.push(TAG_DEDUP_DELETE);
                 out.extend_from_slice(hash);
@@ -160,8 +172,11 @@ impl WalOp {
                 let base = 1 + 2 + 8 + 28 + 1;
                 base + if guard.is_some() { 8 + 4 } else { 0 }
             }
-            WalOp::L2pRangeDelete { captured, .. } => 1 + 2 + 8 + 8 + 4 + captured.len() * (8 + 28),
+            WalOp::L2pRangeDelete { captured, .. } => {
+                1 + 2 + 8 + 8 + 4 + captured.len() * (8 + 28)
+            }
             WalOp::DedupPut { .. } => 1 + 32 + 28,
+            WalOp::DedupPutGuarded { .. } => 1 + 32 + 28 + 8 + 4,
             WalOp::DedupDelete { .. } => 1 + 32,
             WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 32,
             WalOp::Incref { .. } | WalOp::Decref { .. } => 1 + 8 + 4,
@@ -349,6 +364,24 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                     value: DedupValue(v),
                 },
                 &payload[60..],
+            ))
+        }
+        TAG_DEDUP_PUT_GUARDED => {
+            require_len(payload, 72, "DEDUP_PUT_GUARDED")?;
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&payload[..32]);
+            let mut v = [0u8; 28];
+            v.copy_from_slice(&payload[32..60]);
+            let pba_guard = u64::from_be_bytes(payload[60..68].try_into().unwrap());
+            let min_rc = u32::from_be_bytes(payload[68..72].try_into().unwrap());
+            Ok((
+                WalOp::DedupPutGuarded {
+                    hash,
+                    value: DedupValue(v),
+                    pba_guard,
+                    min_rc,
+                },
+                &payload[72..],
             ))
         }
         TAG_DEDUP_DELETE => {

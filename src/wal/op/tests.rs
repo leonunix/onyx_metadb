@@ -56,6 +56,19 @@ fn multi_op_round_trip_preserves_order() {
 }
 
 #[test]
+fn dedup_put_guarded_round_trip() {
+    let ops = vec![WalOp::DedupPutGuarded {
+        hash: h(0xA1),
+        value: dv(0xB2),
+        pba_guard: 0x0123_4567_89AB_CDEF,
+        min_rc: 7,
+    }];
+    let body = encode_body(&ops);
+    assert_eq!(body.len(), 1 + 1 + 32 + 28 + 8 + 4);
+    assert_eq!(decode_body(&body).unwrap(), ops);
+}
+
+#[test]
 fn empty_body_decodes_as_empty_vec() {
     // A v1 body with zero ops is still a 1-byte buffer (just the
     // version prefix). A truly empty buffer hits the "truncated

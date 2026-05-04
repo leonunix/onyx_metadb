@@ -43,6 +43,7 @@
 //! | 11  | `DEDUP_DEL`         | hash (32 B)                                                                         |    32    |
 //! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                                                          |    40    |
 //! | 13  | `DEDUP_REVERSE_DEL` | pba (8 B BE) + hash (32 B)                                                          |    40    |
+//! | 14  | `DEDUP_PUT_GUARDED` | hash (32 B) + value (28 B) + pba_guard (8 B BE) + min_rc (4 B BE)                  |    72    |
 //! | 20  | `INCREF`            | pba (8 B BE) + delta (4 B BE)                                                       |    12    |
 //! | 21  | `DECREF`            | pba (8 B BE) + delta (4 B BE)                                                       |    12    |
 //! | 30  | `DROP_SNAPSHOT`     | id (8 B BE) + page_count (4 B BE) + pid×page_count + decref_count (4 B BE) + pba×decref_count | 16+8(n+m) |
@@ -115,6 +116,7 @@ pub const TAG_DEDUP_PUT: u8 = 0x10;
 pub const TAG_DEDUP_DELETE: u8 = 0x11;
 pub const TAG_DEDUP_REVERSE_PUT: u8 = 0x12;
 pub const TAG_DEDUP_REVERSE_DELETE: u8 = 0x13;
+pub const TAG_DEDUP_PUT_GUARDED: u8 = 0x14;
 pub const TAG_INCREF: u8 = 0x20;
 pub const TAG_DECREF: u8 = 0x21;
 pub const TAG_DROP_SNAPSHOT: u8 = 0x30;
@@ -184,6 +186,12 @@ pub enum WalOp {
     DedupPut {
         hash: Hash32,
         value: DedupValue,
+    },
+    DedupPutGuarded {
+        hash: Hash32,
+        value: DedupValue,
+        pba_guard: Pba,
+        min_rc: u32,
     },
     DedupDelete {
         hash: Hash32,
