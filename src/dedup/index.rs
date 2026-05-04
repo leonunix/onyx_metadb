@@ -47,10 +47,17 @@ use crate::error::Result;
 use crate::page_store::PageStore;
 use crate::types::{Lsn, PageId};
 
-use super::cuckoo::CuckooHash;
+use super::cuckoo::{CuckooHash, ENTRIES_PER_BUCKET};
 use super::fp_of;
 use super::l1_cache::{L1HotCache, LookupResult};
 use super::sketch::FpSketch;
+
+/// L0 capacity to use given the on-disk cuckoo bucket count. Mirrors
+/// L3 max capacity (`bucket_count × ENTRIES_PER_BUCKET`) so the filter
+/// can hold every fingerprint L3 can store without saturating.
+fn l0_capacity_for(cuckoo_bucket_count: u64) -> usize {
+    (cuckoo_bucket_count as usize).saturating_mul(ENTRIES_PER_BUCKET)
+}
 
 pub struct DedupIndex {
     sketch: FpSketch,
@@ -73,8 +80,9 @@ impl DedupIndex {
         seed2: u64,
     ) -> Result<Self> {
         let cuckoo = CuckooHash::create(page_store, page_cache, bucket_count, seed1, seed2)?;
+        let l0_capacity = l0_capacity_for(cuckoo.bucket_count());
         Ok(Self {
-            sketch: FpSketch::new(),
+            sketch: FpSketch::with_capacity(l0_capacity),
             l1: L1HotCache::new(l1_capacity),
             cuckoo,
         })
@@ -89,7 +97,11 @@ impl DedupIndex {
         l1_capacity: usize,
     ) -> Result<Self> {
         let cuckoo = CuckooHash::open(page_store, page_cache, meta_page_id)?;
-        let sketch = FpSketch::with_capacity(cuckoo.approx_len() as usize);
+        // Size L0 to mirror the on-disk cuckoo capacity rather than the
+        // current load. The cuckoo filter cannot grow once allocated;
+        // sizing it at 4 × bucket_count keeps load < 0.95 even after
+        // L3 fills up, avoiding the saturation fallback.
+        let sketch = FpSketch::with_capacity(l0_capacity_for(cuckoo.bucket_count()));
         let l1 = L1HotCache::new(l1_capacity);
         let me = Self { sketch, l1, cuckoo };
         me.rebuild_l0_from_l3()?;
