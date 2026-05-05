@@ -28,24 +28,24 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前必跑
 | page_store | `src/page_store.rs` | 4 KiB page 分配/释放/读/写（Linux O_DIRECT），free list 打开时重建，writeback worker（in-flight pid 保护） |
 | manifest | `src/manifest.rs` + `src/manifest/` | 双缓冲 manifest：volume entries（含 ordinal + drop pending）、shard roots、dedup level heads / shard heads、checkpoint_lsn、WAL tail |
 | paged | `src/paged/` | Paged COW radix tree（用于 L2P）；leaf compact codec、read view、index pin |
-| paged_meta | `src/paged_meta.rs` | 把 paged radix 复用给非-L2P 用途的薄壳（refcount array / paged_reverse 复用 page IO + COW） |
-| paged_reverse | `src/paged_reverse/` | dedup_reverse 的 paged-array + overflow 链；按 PBA prefix 单点定位（不是扫所有 SST） |
+| paged_meta | `src/paged_meta.rs` | 把 paged radix 复用给非-L2P 用途的薄壳（refcount array 复用 page IO + COW；legacy paged_reverse 也走这里） |
+| paged_reverse | `src/paged_reverse/` | legacy dedup_reverse 的 paged-array + overflow 链；当前 onyx 主路径已退役持久 reverse，保留给旧实验/测试直至清理 |
 | refcount | `src/refcount/` | PBA refcount：per-shard paged array + DeltaMap，apply lane 在 commit 边界排干 delta |
 | dedup | `src/dedup/` | dedup_index：4 tier（L0 cuckoo filter → L1 hot cache → page cache → on-disk cuckoo）+ apply lanes；`cuckoo.rs` / `index.rs` / `l1_cache.rs` / `sketch.rs`（L0 早期是 ref-counted fp set，已换成 16-bit cuckoo filter，饱和后 lossless 降级） |
 | dedup_types | `src/dedup_types.rs` | `Hash8`（xxh3_64，8 字节）/ `DedupValue`（27 字节，cuckoo 槽位 32 字节零 padding）/ 大小常量。短哈希 schema：pair 碰撞率 ~1.5e-8，需要 client（onyx）做字节验证；旧的 32-byte SHA-256 布局已退役 |
 | apply_gate | `src/apply_gate.rs` | commit apply 与 flush / snapshot 之间的 RwLock；commit 持 read，flush / snapshot / drop 持 write |
 | epoch | `src/epoch.rs` | per-shard epoch 槽位（NVMe worker 容量已扩） |
 | affinity | `src/affinity.rs` | apply lane / WAL writer 的 CPU pinning |
-| cache | `src/cache.rs` | 16 内部 shard page cache（LRU，scan-resistant，invalidate-on-modify dirty pin，`get_bypass` 给 cuckoo / paged_reverse 扫描用） |
+| cache | `src/cache.rs` | 16 内部 shard page cache（LRU，scan-resistant，invalidate-on-modify dirty pin，`get_bypass` 给 cuckoo / refcount array 的批量 scan 用；legacy paged_reverse 如被触碰也用 bypass） |
 | metrics | `src/metrics.rs` | 运行时计数器/延迟累计；`metadb_metrics_summary.py` 解析这个 |
-| recovery | `src/recovery.rs` | 打开时 WAL replay；apply 必须幂等（refcount delta + paged COW + cuckoo put + dedup_reverse register） |
+| recovery | `src/recovery.rs` | 打开时 WAL replay；apply 必须幂等（refcount delta + paged COW + cuckoo put；legacy dedup_reverse op 若存在也必须幂等） |
 | verify | `src/verify.rs` | 结构校验 + offline audit（`metadb-verify` 入口） |
 | testing | `src/testing/` | `FaultController` / `FaultPoint`，proptest 共享 harness |
 | bin | `src/bin/` | CLI：verify / soak / bench / dump / replay |
 | scripts | `scripts/` | 本地诊断脚本（`metadb_metrics_summary.py` 等） |
 
 > 历史：`src/lsm/` 和 `src/btree/` 已 retire（commit `0e1c69e`），不要再
-> 引用。dedup_index / dedup_reverse / refcount 三表全部走 paged 系列；
+> 引用。dedup_index / refcount 都走专用 paged/cuckoo 系列；dedup_reverse 是已退役的 legacy 路径。
 > L2P 之外**没有 LSM、没有 B+tree**。看到任何 PR 想"引一个 LSM 来做 X"先停下
 > 来读 `docs/DESIGN.md` 里的 workload 拆分理由。
 
@@ -66,7 +66,7 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前必跑
   分锁（commit `de2501f`），foreground put / background reader 的等价物变成 read 侧拿
   `PageCache` 一致视图、write 侧拿 page-shard 锁后回写并 invalidate。**先 read view、
   后 page IO、释放 read view**；reader 不持锁穿越多页 hop。
-- **paged_reverse 与 refcount 的 shard 锁**（`paged_reverse/`、`refcount/shard.rs`）：每
+- **refcount 的 shard 锁**（`refcount/shard.rs`；legacy `paged_reverse/` 遵守同样规则）：每
   shard 一组锁（delta lock + array lock）。apply lane worker 持 delta lock 简短地 merge
   ops、再持 array lock flush；read 路径只读 delta，miss 落 array。**改 lock 顺序 = 死
   锁风险**，新增跨 shard 聚合接口（multi_get / scan）必须按 shard index 顺序拿。
@@ -86,12 +86,12 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前必跑
 ### Page cache
 
 - 一个 `Db` 只持有一个 `Arc<PageCache>`，clone 给所有 L2P shard / refcount shard /
-  dedup_index / paged_reverse。预算在 `cfg.page_cache_bytes`。
+  dedup_index；legacy paged_reverse 若被启用也共享这份 cache。预算在 `cfg.page_cache_bytes`。
 - 16 内部 shard，对齐 L2P shard fanout。
 - "dirty pin" 是 **invalidate-on-modify + re-insert-on-flush**（不是 refcount pin）。
   脏页不会被驱逐——因为它根本不在 cache 里。维护这条语义的是写路径和 flush 路径，
   别在读路径上加绕过。
-- 保持 **`get_bypass`** 给 cuckoo / paged_reverse / refcount array 的批量 scan 用，避免
+- 保持 **`get_bypass`** 给 cuckoo / refcount array（以及 legacy paged_reverse）的批量 scan 用，避免
   热页被全表扫刷掉。
 - 当前只 pin L2P **index pages**（`cfg.index_pin_bytes`），leaf 仍走普通 LRU。不要把
   leaf-pin 当作既定优化路线：除非 metrics 显示 leaf miss / leaf read latency 已经成为
@@ -118,10 +118,10 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前必跑
 ### Manifest swap
 
 - 任何要替换 root 集合的结构都遵循 **写新页链 → manifest commit → 释放旧页链** 三步：
-  L2P shard roots、refcount shard array roots、dedup_index per-shard cuckoo / level heads、
-  dedup_reverse per-shard heads。三步之间断电恢复出来的状态要么是 pre-commit、要么是
+  L2P shard roots、refcount shard array roots、dedup_index per-shard cuckoo / level heads
+  （以及 legacy paged_reverse heads，如果重新启用）。三步之间断电恢复出来的状态要么是 pre-commit、要么是
   post-commit，不能是中间态。fault injection 覆盖这些切换。
-- 'chained meta pages'（commit `38a19ca`）：refcount / paged_reverse / cuckoo 的 manifest
+- 'chained meta pages'（commit `38a19ca`）：refcount / cuckoo（以及 legacy paged_reverse）的 manifest
   meta 不再受单页大小限制。改这块布局前读 commit `38a19ca` + `055174a` 的回归说明，
   老 cuckoo 默认值（commit `d9b16cd` 抬升）不能往回退。
 
@@ -145,7 +145,7 @@ Phase 7（onyx 接入）已 landed，但 standalone soak 仍是任何深层改�
 
 所以：
 
-- 任何改 commit path / apply gate / page cache / snapshot / cuckoo / paged_reverse /
+- 任何改 commit path / apply gate / page cache / snapshot / cuckoo /
   refcount delta apply / chained meta pages / manifest swap 的 PR，**本地 soak 至少
   过几个小时**再 merge。怀疑 flaky 就停下来查根因，不要重跑看是否复现。
 - 新功能优先配一条 proptest 或 fault-injection 用例；没对应的测试，默认不接受。
@@ -162,7 +162,7 @@ Phase 7（onyx 接入）已 landed，但 standalone soak 仍是任何深层改�
 - `METADB_SOAK_OPS_PER_CYCLE=1000000` 控制每个 cycle 的 op 数；`METADB_SOAK_THREADS`
   控制 child worker 数；`METADB_SOAK_PIPELINE_DEPTH` 控制每 worker 预排队深度。
 - `METADB_SOAK_ONYX_MAX_PBA=100000000` 控制 Onyx-mix 的随机 PBA 空间；小值（如
-  256）只用于 pathological dedup_reverse 热点压力。
+  256）只用于 pathological dedup / refcount 热点压力。
 - `./dev.sh metrics` tail 当前 run 的 `metrics.jsonl`。
 - `./dev.sh metrics-summary [run-dir|metrics.jsonl] [samples]` 把累计 counter 转成窗口内
   `tx/s`、`logical ops/s`、WAL batch size、fsync、gate wait、cache hit/miss 和瓶颈提示。
