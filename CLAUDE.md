@@ -31,8 +31,8 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前必跑
 | paged_meta | `src/paged_meta.rs` | 把 paged radix 复用给非-L2P 用途的薄壳（refcount array / paged_reverse 复用 page IO + COW） |
 | paged_reverse | `src/paged_reverse/` | dedup_reverse 的 paged-array + overflow 链；按 PBA prefix 单点定位（不是扫所有 SST） |
 | refcount | `src/refcount/` | PBA refcount：per-shard paged array + DeltaMap，apply lane 在 commit 边界排干 delta |
-| dedup | `src/dedup/` | dedup_index：4 tier（L0 fp set → L1 hot cache → page cache → on-disk cuckoo）+ apply lanes；`cuckoo.rs` / `index.rs` / `l1_cache.rs` / `sketch.rs` |
-| dedup_types | `src/dedup_types.rs` | `Hash32` / `DedupValue` / 大小常量 |
+| dedup | `src/dedup/` | dedup_index：4 tier（L0 cuckoo filter → L1 hot cache → page cache → on-disk cuckoo）+ apply lanes；`cuckoo.rs` / `index.rs` / `l1_cache.rs` / `sketch.rs`（L0 早期是 ref-counted fp set，已换成 16-bit cuckoo filter，饱和后 lossless 降级） |
+| dedup_types | `src/dedup_types.rs` | `Hash8`（xxh3_64，8 字节）/ `DedupValue`（27 字节，cuckoo 槽位 32 字节零 padding）/ 大小常量。短哈希 schema：pair 碰撞率 ~1.5e-8，需要 client（onyx）做字节验证；旧的 32-byte SHA-256 布局已退役 |
 | apply_gate | `src/apply_gate.rs` | commit apply 与 flush / snapshot 之间的 RwLock；commit 持 read，flush / snapshot / drop 持 write |
 | epoch | `src/epoch.rs` | per-shard epoch 槽位（NVMe worker 容量已扩） |
 | affinity | `src/affinity.rs` | apply lane / WAL writer 的 CPU pinning |
