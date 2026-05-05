@@ -173,10 +173,10 @@ impl WalOp {
                 base + if guard.is_some() { 8 + 4 } else { 0 }
             }
             WalOp::L2pRangeDelete { captured, .. } => 1 + 2 + 8 + 8 + 4 + captured.len() * (8 + 28),
-            WalOp::DedupPut { .. } => 1 + 32 + 28,
-            WalOp::DedupPutGuarded { .. } => 1 + 32 + 28 + 8 + 4,
-            WalOp::DedupDelete { .. } => 1 + 32,
-            WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 32,
+            WalOp::DedupPut { .. } => 1 + 8 + 28,
+            WalOp::DedupPutGuarded { .. } => 1 + 8 + 28 + 8 + 4,
+            WalOp::DedupDelete { .. } => 1 + 8,
+            WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 8,
             WalOp::Incref { .. } | WalOp::Decref { .. } => 1 + 8 + 4,
             WalOp::DropSnapshot {
                 pages, pba_decrefs, ..
@@ -351,27 +351,27 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             ))
         }
         TAG_DEDUP_PUT => {
-            require_len(payload, 60, "DEDUP_PUT")?;
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&payload[..32]);
+            require_len(payload, 36, "DEDUP_PUT")?;
+            let mut hash = [0u8; 8];
+            hash.copy_from_slice(&payload[..8]);
             let mut v = [0u8; 28];
-            v.copy_from_slice(&payload[32..60]);
+            v.copy_from_slice(&payload[8..36]);
             Ok((
                 WalOp::DedupPut {
                     hash,
                     value: DedupValue(v),
                 },
-                &payload[60..],
+                &payload[36..],
             ))
         }
         TAG_DEDUP_PUT_GUARDED => {
-            require_len(payload, 72, "DEDUP_PUT_GUARDED")?;
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&payload[..32]);
+            require_len(payload, 48, "DEDUP_PUT_GUARDED")?;
+            let mut hash = [0u8; 8];
+            hash.copy_from_slice(&payload[..8]);
             let mut v = [0u8; 28];
-            v.copy_from_slice(&payload[32..60]);
-            let pba_guard = u64::from_be_bytes(payload[60..68].try_into().unwrap());
-            let min_rc = u32::from_be_bytes(payload[68..72].try_into().unwrap());
+            v.copy_from_slice(&payload[8..36]);
+            let pba_guard = u64::from_be_bytes(payload[36..44].try_into().unwrap());
+            let min_rc = u32::from_be_bytes(payload[44..48].try_into().unwrap());
             Ok((
                 WalOp::DedupPutGuarded {
                     hash,
@@ -379,26 +379,26 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                     pba_guard,
                     min_rc,
                 },
-                &payload[72..],
+                &payload[48..],
             ))
         }
         TAG_DEDUP_DELETE => {
-            require_len(payload, 32, "DEDUP_DELETE")?;
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&payload[..32]);
-            Ok((WalOp::DedupDelete { hash }, &payload[32..]))
+            require_len(payload, 8, "DEDUP_DELETE")?;
+            let mut hash = [0u8; 8];
+            hash.copy_from_slice(&payload[..8]);
+            Ok((WalOp::DedupDelete { hash }, &payload[8..]))
         }
         TAG_DEDUP_REVERSE_PUT | TAG_DEDUP_REVERSE_DELETE => {
-            require_len(payload, 40, "DEDUP_REVERSE")?;
+            require_len(payload, 16, "DEDUP_REVERSE")?;
             let pba = u64::from_be_bytes(payload[..8].try_into().unwrap());
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&payload[8..40]);
+            let mut hash = [0u8; 8];
+            hash.copy_from_slice(&payload[8..16]);
             let op = if tag == TAG_DEDUP_REVERSE_PUT {
                 WalOp::DedupReversePut { pba, hash }
             } else {
                 WalOp::DedupReverseDelete { pba, hash }
             };
-            Ok((op, &payload[40..]))
+            Ok((op, &payload[16..]))
         }
         TAG_INCREF | TAG_DECREF => {
             require_len(payload, 12, "INCREF/DECREF")?;

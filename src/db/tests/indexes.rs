@@ -65,7 +65,7 @@ fn iter_dedup_emits_live_puts_and_hides_tombstones() {
         .unwrap()
         .collect::<Result<Vec<_>>>()
         .unwrap();
-    let keys: Vec<Hash32> = items.iter().map(|(k, _)| *k).collect();
+    let keys: Vec<Hash8> = items.iter().map(|(k, _)| *k).collect();
     assert!(keys.contains(&h1));
     assert!(!keys.contains(&h2));
     assert!(keys.contains(&h3));
@@ -559,7 +559,7 @@ fn register_and_scan_by_pba() {
 
     assert_eq!(
         db.scan_dedup_reverse_for_pba(12345).unwrap(),
-        Vec::<Hash32>::new()
+        Vec::<Hash8>::new()
     );
 }
 

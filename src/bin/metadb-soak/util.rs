@@ -130,8 +130,8 @@ fn l2p_key(tid: usize, slot: u64) -> u64 {
     ((tid as u64) << 32) | slot
 }
 
-fn dedup_hash(tid: usize, slot: u64) -> Hash32 {
-    let mut hash = [0u8; 32];
+fn dedup_hash(tid: usize, slot: u64) -> Hash8 {
+    let mut hash = [0u8; 8];
     hash[..8].copy_from_slice(&(tid as u64).to_be_bytes());
     hash[8..16].copy_from_slice(&slot.to_be_bytes());
     hash

@@ -6,27 +6,29 @@
 //! # On-disk encoding
 //!
 //! ## Data page (PageType::DedupReverseArray, slot-keyed)
-//! Each leaf carries [`ENTRIES_PER_PAGE`] = 84 fixed-size slots, one
-//! per PBA in `[page_idx * 84, (page_idx + 1) * 84)`. Slot layout
-//! (48 B):
+//! Each leaf carries [`ENTRIES_PER_PAGE`] = 168 fixed-size slots, one
+//! per PBA in `[page_idx * 168, (page_idx + 1) * 168)`. Slot layout
+//! (24 B):
 //! ```text
 //!   bytes 0..2   hash_count: u16 LE   (0 = unused slot)
 //!   bytes 2..4   reserved
 //!   bytes 4..12  overflow_pid: u64 LE (0 = no overflow)
-//!   bytes 12..44 inline_hash: [u8; 32]
-//!   bytes 44..48 reserved
+//!   bytes 12..20 inline_hash: [u8; 8]
+//!   bytes 20..24 reserved
 //! ```
-//! 84 × 48 = 4032 B = PAGE_PAYLOAD_SIZE.
+//! 168 × 24 = 4032 B = PAGE_PAYLOAD_SIZE.
 //!
 //! ## Overflow page (PageType::DedupReverseArray, chain-keyed)
 //! Holds the **extra** hashes for one PBA whose inline slot was full.
+//! Layout is driven by [`OVERFLOW_HEADER_BYTES`] (16 B) +
+//! [`OVERFLOW_HASHES_PER_PAGE`] hashes; for an 8 B hash that is 502
+//! hashes per page.
 //! ```text
-//!   bytes 0..2   used: u16 LE          (number of hashes stored, 0..125)
-//!   bytes 2..10  next_pid: u64 LE      (0 if last in chain)
-//!   bytes 10..16 reserved
-//!   bytes 16..   hashes: [Hash32; 125]
+//!   bytes 0..2                used: u16 LE     (hashes stored)
+//!   bytes 2..10               next_pid: u64 LE (0 if last)
+//!   bytes 10..16              reserved
+//!   bytes 16..                hashes: [Hash8; OVERFLOW_HASHES_PER_PAGE]
 //! ```
-//! 16 + 125 × 32 = 4016 B used, 16 B padding to 4032 B.
 //!
 //! ## Meta page chain (PageType::DedupReverseArray, `key_count = 0xFFFF`)
 //! Each meta page carries a fixed 16 B chain header (`chunk_len: u32`,
@@ -44,29 +46,35 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::cache::PageCache;
-use crate::dedup_types::Hash32;
+use crate::dedup_types::{HASH_SIZE, Hash8};
 use crate::error::Result;
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::paged_meta;
 use crate::types::{Lsn, PageId, Pba};
 
-pub const ENTRIES_PER_PAGE: usize = 84;
-const SLOT_BYTES: usize = 48;
+/// Slots per leaf page. With an 8-byte hash, a slot is 24 B
+/// (count u16 + pad u16 + overflow_pid u64 + inline_hash u64), and
+/// `PAGE_PAYLOAD_SIZE / SLOT_BYTES = 168`. Recorded in the manifest;
+/// changing this is a data-format break.
+pub const ENTRIES_PER_PAGE: usize = 168;
+const SLOT_BYTES: usize = 24;
 
 const OVERFLOW_HEADER_BYTES: usize = 16;
-const OVERFLOW_HASHES_PER_PAGE: usize = (PAGE_PAYLOAD_SIZE - OVERFLOW_HEADER_BYTES) / 32;
+const OVERFLOW_HASHES_PER_PAGE: usize = (PAGE_PAYLOAD_SIZE - OVERFLOW_HEADER_BYTES) / HASH_SIZE;
 
 const META_KEY_COUNT_MARKER: u16 = 0xFFFF;
 const DATA_KEY_COUNT_MARKER: u16 = 0;
 const OVERFLOW_KEY_COUNT_MARKER: u16 = 0xFFFE;
 const REVERSE_LOCK_SHARDS: usize = 64;
 
-const ZERO_HASH: Hash32 = [0u8; 32];
+const ZERO_HASH: Hash8 = [0u8; 8];
 
 const _: () = {
     assert!(ENTRIES_PER_PAGE * SLOT_BYTES == PAGE_PAYLOAD_SIZE);
-    assert!(OVERFLOW_HASHES_PER_PAGE >= 125);
+    // An overflow page must hold at least one hash to be useful as a
+    // chain link.
+    assert!(OVERFLOW_HASHES_PER_PAGE >= 1);
 };
 
 pub struct PagedReverse {
@@ -136,7 +144,7 @@ impl PagedReverse {
         self.meta_page_id
     }
 
-    pub fn get_hashes(&self, pba: Pba) -> Result<Vec<Hash32>> {
+    pub fn get_hashes(&self, pba: Pba) -> Result<Vec<Hash8>> {
         let (page_idx, slot) = page_offset(pba);
         let page_id = {
             let inner = self.inner.lock();
@@ -165,7 +173,7 @@ impl PagedReverse {
     /// Batched form of [`get_hashes`]. Resolves every PBA's page id
     /// under one inner-lock acquisition, then walks the page cache
     /// without holding the lock. Output order matches `pbas`.
-    pub fn multi_get_hashes(&self, pbas: &[Pba]) -> Result<Vec<Vec<Hash32>>> {
+    pub fn multi_get_hashes(&self, pbas: &[Pba]) -> Result<Vec<Vec<Hash8>>> {
         if pbas.is_empty() {
             return Ok(Vec::new());
         }
@@ -210,7 +218,7 @@ impl PagedReverse {
     ///
     /// Replay-skip: if the data page's `last_applied_lsn` already
     /// covers `lsn`, the op short-circuits.
-    pub fn put(&self, pba: Pba, hash: Hash32, lsn: Lsn) -> Result<()> {
+    pub fn put(&self, pba: Pba, hash: Hash8, lsn: Lsn) -> Result<()> {
         self.append_hash(pba, hash, lsn)
     }
 
@@ -218,7 +226,7 @@ impl PagedReverse {
     /// read-modify-write. This is the hot path for packed Onyx slots:
     /// one physical PBA can register dozens of 4 KiB content hashes in
     /// the same commit.
-    pub fn put_many(&self, pba: Pba, hashes: &[Hash32], lsn: Lsn) -> Result<()> {
+    pub fn put_many(&self, pba: Pba, hashes: &[Hash8], lsn: Lsn) -> Result<()> {
         match hashes {
             [] => Ok(()),
             [hash] => self.put(pba, *hash, lsn),
@@ -229,7 +237,7 @@ impl PagedReverse {
     /// Remove the registered hash for `pba` (no-op if absent).
     ///
     /// Replay-skip: same as [`put`].
-    pub fn delete(&self, pba: Pba, hash: Hash32, lsn: Lsn) -> Result<()> {
+    pub fn delete(&self, pba: Pba, hash: Hash8, lsn: Lsn) -> Result<()> {
         self.mutate(pba, lsn, |existing| {
             Ok(existing.iter().copied().filter(|h| h != &hash).collect())
         })
@@ -239,7 +247,7 @@ impl PagedReverse {
         &self,
         pba: Pba,
         lsn: Lsn,
-        update: impl FnOnce(&[Hash32]) -> Result<Vec<Hash32>>,
+        update: impl FnOnce(&[Hash8]) -> Result<Vec<Hash8>>,
     ) -> Result<()> {
         let (page_idx, slot) = page_offset(pba);
         let _page_guard = self.page_locks[page_idx & (REVERSE_LOCK_SHARDS - 1)].lock();
@@ -318,7 +326,7 @@ impl PagedReverse {
         Ok(())
     }
 
-    fn append_hash(&self, pba: Pba, hash: Hash32, lsn: Lsn) -> Result<()> {
+    fn append_hash(&self, pba: Pba, hash: Hash8, lsn: Lsn) -> Result<()> {
         let (page_idx, slot) = page_offset(pba);
         let _page_guard = self.page_locks[page_idx & (REVERSE_LOCK_SHARDS - 1)].lock();
         let (page_id, freshly_allocated) = {
@@ -398,9 +406,9 @@ impl PagedReverse {
         self.write_data_slot_page(page_id, &mut data_page, slot, header, lsn)
     }
 
-    fn append_hashes(&self, pba: Pba, hashes: &[Hash32], lsn: Lsn) -> Result<()> {
+    fn append_hashes(&self, pba: Pba, hashes: &[Hash8], lsn: Lsn) -> Result<()> {
         let mut ordered = Vec::with_capacity(hashes.len());
-        let mut wanted: HashSet<Hash32> = HashSet::with_capacity(hashes.len());
+        let mut wanted: HashSet<Hash8> = HashSet::with_capacity(hashes.len());
         for hash in hashes {
             if wanted.insert(*hash) {
                 ordered.push(*hash);
@@ -465,7 +473,7 @@ impl PagedReverse {
             next = chain_next;
         }
 
-        let mut pending: Vec<Hash32> = ordered
+        let mut pending: Vec<Hash8> = ordered
             .into_iter()
             .filter(|hash| wanted.contains(hash))
             .collect();
@@ -480,7 +488,7 @@ impl PagedReverse {
             }
             let free = OVERFLOW_HASHES_PER_PAGE - used as usize;
             let take = free.min(pending.len());
-            let chunk: Vec<Hash32> = pending.drain(..take).collect();
+            let chunk: Vec<Hash8> = pending.drain(..take).collect();
             let mut page = (*page).clone();
             append_overflow_hashes(&mut page, used, chain_next, &chunk);
             let mut page_header = page.header()?;
@@ -493,7 +501,7 @@ impl PagedReverse {
         }
 
         if !pending.is_empty() {
-            let chunks: Vec<&[Hash32]> = pending.chunks(OVERFLOW_HASHES_PER_PAGE).collect();
+            let chunks: Vec<&[Hash8]> = pending.chunks(OVERFLOW_HASHES_PER_PAGE).collect();
             let mut next_pid = header.overflow_pid;
             for chunk in chunks.into_iter().rev() {
                 let overflow_pid = self.page_store.allocate()?;
@@ -543,7 +551,7 @@ impl PagedReverse {
         Ok(())
     }
 
-    fn read_slot_full(&self, page: &Page, slot: usize) -> Result<Vec<Hash32>> {
+    fn read_slot_full(&self, page: &Page, slot: usize) -> Result<Vec<Hash8>> {
         let header = read_slot(page, slot);
         if header.count == 0 {
             return Ok(Vec::new());
@@ -563,12 +571,12 @@ impl PagedReverse {
     /// Allocate and write a fresh overflow chain holding the
     /// non-inline hashes (`hashes[1..]`). Returns the head pid (0 if
     /// no overflow needed).
-    fn write_overflow_chain(&self, hashes: &[Hash32], lsn: Lsn) -> Result<PageId> {
+    fn write_overflow_chain(&self, hashes: &[Hash8], lsn: Lsn) -> Result<PageId> {
         if hashes.len() <= 1 {
             return Ok(0);
         }
         let extras = &hashes[1..];
-        let chunks: Vec<&[Hash32]> = extras.chunks(OVERFLOW_HASHES_PER_PAGE).collect();
+        let chunks: Vec<&[Hash8]> = extras.chunks(OVERFLOW_HASHES_PER_PAGE).collect();
         let mut next: PageId = 0;
         for chunk in chunks.into_iter().rev() {
             let pid = self.page_store.allocate()?;
@@ -614,7 +622,7 @@ impl PagedReverse {
 
     /// Iterate every (pba, hash) pair in PBA order (ascending). Used
     /// by the verifier and offline tools.
-    pub fn iter_live(&self) -> Result<Vec<(Pba, Hash32)>> {
+    pub fn iter_live(&self) -> Result<Vec<(Pba, Hash8)>> {
         let inner = self.inner.lock();
         let page_ids: Vec<(usize, PageId)> = inner
             .page_table
@@ -688,7 +696,7 @@ impl PagedReverse {
 struct SlotView {
     count: u16,
     overflow_pid: PageId,
-    inline_hash: Hash32,
+    inline_hash: Hash8,
 }
 
 #[inline]
@@ -703,8 +711,8 @@ fn read_slot(page: &Page, slot: usize) -> SlotView {
     let off = slot * SLOT_BYTES;
     let count = u16::from_le_bytes(payload[off..off + 2].try_into().unwrap());
     let overflow_pid = u64::from_le_bytes(payload[off + 4..off + 12].try_into().unwrap()) as PageId;
-    let mut inline_hash = [0u8; 32];
-    inline_hash.copy_from_slice(&payload[off + 12..off + 44]);
+    let mut inline_hash = [0u8; HASH_SIZE];
+    inline_hash.copy_from_slice(&payload[off + 12..off + 12 + HASH_SIZE]);
     SlotView {
         count,
         overflow_pid,
@@ -719,50 +727,50 @@ fn write_slot(page: &mut Page, slot: usize, view: SlotView) {
     payload[off..off + 2].copy_from_slice(&view.count.to_le_bytes());
     payload[off + 2..off + 4].fill(0);
     payload[off + 4..off + 12].copy_from_slice(&(view.overflow_pid as u64).to_le_bytes());
-    payload[off + 12..off + 44].copy_from_slice(&view.inline_hash);
-    payload[off + 44..off + 48].fill(0);
+    payload[off + 12..off + 12 + HASH_SIZE].copy_from_slice(&view.inline_hash);
+    payload[off + 12 + HASH_SIZE..off + SLOT_BYTES].fill(0);
 }
 
-fn read_overflow(page: &Page) -> (u16, PageId, Vec<Hash32>) {
+fn read_overflow(page: &Page) -> (u16, PageId, Vec<Hash8>) {
     let payload = page.payload();
     let used = u16::from_le_bytes(payload[0..2].try_into().unwrap());
     let next = u64::from_le_bytes(payload[2..10].try_into().unwrap()) as PageId;
     let mut hashes = Vec::with_capacity(used as usize);
     for i in 0..used as usize {
-        let off = OVERFLOW_HEADER_BYTES + i * 32;
-        let mut h = [0u8; 32];
-        h.copy_from_slice(&payload[off..off + 32]);
+        let off = OVERFLOW_HEADER_BYTES + i * HASH_SIZE;
+        let mut h = [0u8; HASH_SIZE];
+        h.copy_from_slice(&payload[off..off + HASH_SIZE]);
         hashes.push(h);
     }
     (used, next, hashes)
 }
 
-fn write_overflow(page: &mut Page, hashes: &[Hash32], next: PageId) {
+fn write_overflow(page: &mut Page, hashes: &[Hash8], next: PageId) {
     debug_assert!(hashes.len() <= OVERFLOW_HASHES_PER_PAGE);
     let payload = page.payload_mut();
     payload[0..2].copy_from_slice(&(hashes.len() as u16).to_le_bytes());
     payload[2..10].copy_from_slice(&(next as u64).to_le_bytes());
     payload[10..16].fill(0);
     for (i, h) in hashes.iter().enumerate() {
-        let off = OVERFLOW_HEADER_BYTES + i * 32;
-        payload[off..off + 32].copy_from_slice(h);
+        let off = OVERFLOW_HEADER_BYTES + i * HASH_SIZE;
+        payload[off..off + HASH_SIZE].copy_from_slice(h);
     }
     // Zero remaining slots so on-disk image is deterministic.
-    let used_end = OVERFLOW_HEADER_BYTES + hashes.len() * 32;
+    let used_end = OVERFLOW_HEADER_BYTES + hashes.len() * HASH_SIZE;
     payload[used_end..].fill(0);
 }
 
-fn append_overflow_hash(page: &mut Page, used: u16, next: PageId, hash: Hash32) {
+fn append_overflow_hash(page: &mut Page, used: u16, next: PageId, hash: Hash8) {
     debug_assert!((used as usize) < OVERFLOW_HASHES_PER_PAGE);
     let payload = page.payload_mut();
     payload[0..2].copy_from_slice(&(used + 1).to_le_bytes());
     payload[2..10].copy_from_slice(&(next as u64).to_le_bytes());
     payload[10..16].fill(0);
-    let off = OVERFLOW_HEADER_BYTES + used as usize * 32;
-    payload[off..off + 32].copy_from_slice(&hash);
+    let off = OVERFLOW_HEADER_BYTES + used as usize * HASH_SIZE;
+    payload[off..off + HASH_SIZE].copy_from_slice(&hash);
 }
 
-fn append_overflow_hashes(page: &mut Page, used: u16, next: PageId, hashes: &[Hash32]) {
+fn append_overflow_hashes(page: &mut Page, used: u16, next: PageId, hashes: &[Hash8]) {
     debug_assert!((used as usize) + hashes.len() <= OVERFLOW_HASHES_PER_PAGE);
     let payload = page.payload_mut();
     let new_used = used as usize + hashes.len();
@@ -770,8 +778,8 @@ fn append_overflow_hashes(page: &mut Page, used: u16, next: PageId, hashes: &[Ha
     payload[2..10].copy_from_slice(&(next as u64).to_le_bytes());
     payload[10..16].fill(0);
     for (idx, hash) in hashes.iter().enumerate() {
-        let off = OVERFLOW_HEADER_BYTES + (used as usize + idx) * 32;
-        payload[off..off + 32].copy_from_slice(hash);
+        let off = OVERFLOW_HEADER_BYTES + (used as usize + idx) * HASH_SIZE;
+        payload[off..off + HASH_SIZE].copy_from_slice(hash);
     }
 }
 
@@ -823,8 +831,8 @@ mod tests {
         (dir, r)
     }
 
-    fn h(byte: u8) -> Hash32 {
-        let mut x = [0u8; 32];
+    fn h(byte: u8) -> Hash8 {
+        let mut x = [0u8; 8];
         x.fill(byte);
         x
     }
@@ -832,8 +840,8 @@ mod tests {
     #[test]
     fn empty_get_returns_none() {
         let (_d, r) = make_index();
-        assert_eq!(r.get_hashes(0).unwrap(), Vec::<Hash32>::new());
-        assert_eq!(r.get_hashes(1_000_000).unwrap(), Vec::<Hash32>::new());
+        assert_eq!(r.get_hashes(0).unwrap(), Vec::<Hash8>::new());
+        assert_eq!(r.get_hashes(1_000_000).unwrap(), Vec::<Hash8>::new());
     }
 
     #[test]
@@ -862,10 +870,9 @@ mod tests {
             // build a unique non-zero hash by writing the running
             // counter into multiple bytes so we never collide with
             // the all-zero sentinel even for large counts.
-            let mut hash = [0u8; 32];
+            let mut hash = [0u8; 8];
             hash[0] = ((i + 1) & 0xFF) as u8;
             hash[1] = (((i + 1) >> 8) & 0xFF) as u8;
-            hash[31] = 0xAA;
             r.put(7, hash, (100 + i) as Lsn).unwrap();
         }
         let got = r.get_hashes(7).unwrap();
@@ -877,9 +884,8 @@ mod tests {
         let (_d, r) = make_index();
         let count = OVERFLOW_HASHES_PER_PAGE * 3 + 5;
         for i in 0..count {
-            let mut hash = [0u8; 32];
+            let mut hash = [0u8; 8];
             hash[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
-            hash[31] = 0xBB;
             r.put(7, hash, (100 + i) as Lsn).unwrap();
         }
 
@@ -897,9 +903,8 @@ mod tests {
         let count = OVERFLOW_HASHES_PER_PAGE * 2 + 7;
         let hashes: Vec<_> = (0..count)
             .map(|i| {
-                let mut hash = [0u8; 32];
+                let mut hash = [0u8; 8];
                 hash[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
-                hash[31] = 0xCC;
                 hash
             })
             .collect();
@@ -920,9 +925,8 @@ mod tests {
         let (_d, r) = make_index();
         let count = OVERFLOW_HASHES_PER_PAGE * 2 + 16;
         for i in 0..count {
-            let mut hash = [0u8; 32];
+            let mut hash = [0u8; 8];
             hash[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
-            hash[31] = 0xA5;
             r.put(7, hash, (100 + i) as Lsn).unwrap();
         }
 
@@ -930,9 +934,8 @@ mod tests {
             for t in 0..8u64 {
                 let reverse = &r;
                 scope.spawn(move || {
-                    let mut hash = [0u8; 32];
+                    let mut hash = [0u8; 8];
                     hash[..8].copy_from_slice(&(0x1_0000 + t).to_be_bytes());
-                    hash[31] = 0x5A;
                     reverse.put(7, hash, 10_000 + t).unwrap();
                 });
             }
@@ -965,7 +968,7 @@ mod tests {
         let (_d, r) = make_index();
         r.put(7, h(0xAB), 100).unwrap();
         r.delete(7, h(0xAB), 101).unwrap();
-        assert_eq!(r.get_hashes(7).unwrap(), Vec::<Hash32>::new());
+        assert_eq!(r.get_hashes(7).unwrap(), Vec::<Hash8>::new());
     }
 
     #[test]
@@ -1067,7 +1070,7 @@ mod tests {
         let got = r.multi_get_hashes(&[5, 1, 9, 1]).unwrap();
         assert_eq!(got[0], vec![h(5)]);
         assert_eq!(got[1], vec![h(1)]);
-        assert_eq!(got[2], Vec::<Hash32>::new());
+        assert_eq!(got[2], Vec::<Hash8>::new());
         assert_eq!(got[3], vec![h(1)]);
     }
 

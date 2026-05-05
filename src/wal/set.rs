@@ -231,8 +231,8 @@ mod tests {
         cfg
     }
 
-    fn hash(byte: u8) -> [u8; 32] {
-        let mut h = [0u8; 32];
+    fn hash(byte: u8) -> [u8; 8] {
+        let mut h = [0u8; 8];
         h[0] = byte;
         h
     }

@@ -29,21 +29,18 @@
 use std::path::Path;
 use std::time::Instant;
 
-use onyx_metadb::{Config, Db, DedupValue, Hash32};
+use onyx_metadb::{Config, Db, DedupValue, Hash8};
 use tempfile::TempDir;
 
 const ENTRIES: u64 = 20_000;
 const LOOKUP_KEYS: u64 = 2_000;
 const CACHE_BYTES: u64 = 32 * 1024 * 1024;
 
-fn h(n: u64) -> Hash32 {
-    let mut x = [0u8; 32];
-    x[..8].copy_from_slice(&n.to_be_bytes());
-    // Diffuse into the bloom-sensitive region so lookups touch the
-    // bloom filter realistically.
-    x[8..16].copy_from_slice(&n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
-    x[16..24].copy_from_slice(&n.wrapping_mul(0xBF58_476D_1CE4_E5B9).to_le_bytes());
-    x
+fn h(n: u64) -> Hash8 {
+    // 8-byte hash schema: mix `n` into all 8 bytes so distinct keys
+    // diffuse across cuckoo buckets / L0 fingerprint slots.
+    let mixed = n.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ n.rotate_left(17);
+    mixed.to_be_bytes()
 }
 
 fn dv(n: u64) -> DedupValue {
@@ -55,6 +52,11 @@ fn dv(n: u64) -> DedupValue {
 fn mk_cfg(path: &Path) -> Config {
     let mut cfg = Config::new(path);
     cfg.page_cache_bytes = CACHE_BYTES;
+    // Force L3 access on lookups by making the L1 hot cache much
+    // smaller than `LOOKUP_KEYS`. Otherwise the warm pass services
+    // every read out of L1, never touches the on-disk cuckoo, and
+    // page-cache hit deltas collapse to zero — defeating the test.
+    cfg.dedup_l1_cache_entries = 16;
     cfg
 }
 

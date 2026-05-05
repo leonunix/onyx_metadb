@@ -54,7 +54,7 @@ pub use db::{
     Db, DbDedupIter, DbRangeIter, DbRefcountIter, DropReport, DropVolumeReport, PendingState,
     SnapshotView,
 };
-pub use dedup_types::{DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash32, LsmStats};
+pub use dedup_types::{DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash8, LsmStats};
 pub use error::{MetaDbError, Result};
 pub use manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VOLUME_ENTRY_FIXED_SIZE,

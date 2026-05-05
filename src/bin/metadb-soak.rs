@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
 use onyx_metadb::testing::onyx_model::{OnyxRefModel, onyx_dedup_value, onyx_hash, onyx_l2p_value};
 use onyx_metadb::{
-    ApplyOutcome, Db, DedupValue, Hash32, L2pValue, Pba, SnapshotId, VerifyOptions, VolumeOrdinal,
+    ApplyOutcome, Db, DedupValue, Hash8, L2pValue, Pba, SnapshotId, VerifyOptions, VolumeOrdinal,
     verify_path,
 };
 use parking_lot::Mutex;

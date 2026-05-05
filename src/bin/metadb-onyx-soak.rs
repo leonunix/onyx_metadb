@@ -49,7 +49,7 @@ use rand_chacha::ChaCha8Rng;
 
 use onyx_metadb::testing::onyx_model::{onyx_dedup_value, onyx_hash, onyx_l2p_value};
 use onyx_metadb::{
-    ApplyOutcome, Config, Db, Hash32, MetaMetricsSnapshot, Pba, PendingState, VolumeOrdinal,
+    ApplyOutcome, Config, Db, Hash8, MetaMetricsSnapshot, Pba, PendingState, VolumeOrdinal,
 };
 
 const PAGE_FILE: &str = "pages.onyx_meta";
@@ -535,7 +535,7 @@ struct WriterCfg {
 /// commits. Bounded so memory doesn't grow without bound — eviction is
 /// random-replacement once the cap is hit.
 struct DedupPool {
-    by_pba: HashMap<Pba, (Hash32, usize)>, // pba → (hash, index in pbas)
+    by_pba: HashMap<Pba, (Hash8, usize)>, // pba → (hash, index in pbas)
     pbas: Vec<Pba>,
     cap: usize,
 }
@@ -550,7 +550,7 @@ impl DedupPool {
     fn len(&self) -> usize {
         self.pbas.len()
     }
-    fn insert(&mut self, hash: Hash32, pba: Pba, rng: &mut ChaCha8Rng) {
+    fn insert(&mut self, hash: Hash8, pba: Pba, rng: &mut ChaCha8Rng) {
         if self.by_pba.contains_key(&pba) {
             return;
         }
@@ -572,7 +572,7 @@ impl DedupPool {
         self.pbas.push(pba);
         self.by_pba.insert(pba, (hash, idx));
     }
-    fn remove(&mut self, pba: Pba) -> Option<Hash32> {
+    fn remove(&mut self, pba: Pba) -> Option<Hash8> {
         let (hash, idx) = self.by_pba.remove(&pba)?;
         self.pbas.swap_remove(idx);
         if idx < self.pbas.len() {
@@ -582,7 +582,7 @@ impl DedupPool {
         }
         Some(hash)
     }
-    fn sample(&self, rng: &mut ChaCha8Rng) -> Option<(Hash32, Pba)> {
+    fn sample(&self, rng: &mut ChaCha8Rng) -> Option<(Hash8, Pba)> {
         if self.pbas.is_empty() {
             return None;
         }
@@ -677,7 +677,7 @@ fn writer_loop(
         let mut tx = db.begin();
         // Track which (hash, pba) pairs were inserted this commit so we
         // can register them in the pool only after a successful commit.
-        let mut staged_inserts: Vec<(Hash32, Pba)> = Vec::new();
+        let mut staged_inserts: Vec<(Hash8, Pba)> = Vec::new();
         let mut commit_hits = 0u64;
         let mut commit_misses = 0u64;
         for _ in 0..cfg.ops_per_commit {

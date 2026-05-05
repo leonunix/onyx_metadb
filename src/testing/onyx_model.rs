@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    ApplyOutcome, Db, DedupValue, Hash32, L2pValue, Pba, Result, SnapshotId, VolumeOrdinal,
+    ApplyOutcome, Db, DedupValue, Hash8, L2pValue, Pba, Result, SnapshotId, VolumeOrdinal,
 };
 
 pub const BOOTSTRAP_VOL: VolumeOrdinal = 0;
@@ -26,8 +26,8 @@ pub struct OnyxRefModel {
     live_volumes: BTreeSet<VolumeOrdinal>,
     l2p: BTreeMap<(VolumeOrdinal, u64), L2pValue>,
     refcount: BTreeMap<Pba, u32>,
-    dedup: BTreeMap<Hash32, DedupValue>,
-    dedup_reverse: BTreeSet<(Pba, Hash32)>,
+    dedup: BTreeMap<Hash8, DedupValue>,
+    dedup_reverse: BTreeSet<(Pba, Hash8)>,
     snapshots: BTreeMap<SnapshotId, FrozenSnapshot>,
     shared_leaves: BTreeSet<(VolumeOrdinal, u64)>,
     pending_dead_pbas: BTreeSet<Pba>,
@@ -69,7 +69,7 @@ impl OnyxRefModel {
         &self.refcount
     }
 
-    pub fn dedup(&self) -> &BTreeMap<Hash32, DedupValue> {
+    pub fn dedup(&self) -> &BTreeMap<Hash8, DedupValue> {
         &self.dedup
     }
 
@@ -106,7 +106,7 @@ impl OnyxRefModel {
         }
     }
 
-    pub fn put_dedup_raw(&mut self, hash: Hash32, value: DedupValue) {
+    pub fn put_dedup_raw(&mut self, hash: Hash8, value: DedupValue) {
         let pba = value.head_pba();
         if let Some(old) = self.dedup.insert(hash, value) {
             self.dedup_reverse.remove(&(old.head_pba(), hash));
@@ -114,7 +114,7 @@ impl OnyxRefModel {
         self.dedup_reverse.insert((pba, hash));
     }
 
-    pub fn register_dedup_raw(&mut self, pba: Pba, hash: Hash32) {
+    pub fn register_dedup_raw(&mut self, pba: Pba, hash: Hash8) {
         self.dedup_reverse.insert((pba, hash));
     }
 
@@ -260,7 +260,7 @@ impl OnyxRefModel {
     pub fn cleanup_dedup_for_dead_pbas(&mut self, pbas: &[Pba]) -> usize {
         let mut removed_forward = 0usize;
         for &pba in pbas {
-            let hashes: Vec<Hash32> = self
+            let hashes: Vec<Hash8> = self
                 .dedup_reverse
                 .iter()
                 .filter_map(|(entry_pba, hash)| (*entry_pba == pba).then_some(*hash))
@@ -301,7 +301,7 @@ impl OnyxRefModel {
             )));
         }
 
-        let db_dedup: BTreeMap<Hash32, DedupValue> = db
+        let db_dedup: BTreeMap<Hash8, DedupValue> = db
             .iter_dedup()?
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -408,8 +408,8 @@ pub fn onyx_l2p_value(pba: Pba, salt: u64) -> L2pValue {
     L2pValue(bytes)
 }
 
-pub fn onyx_hash(seed: u64) -> Hash32 {
-    let mut hash = [0u8; 32];
+pub fn onyx_hash(seed: u64) -> Hash8 {
+    let mut hash = [0u8; 8];
     hash[..8].copy_from_slice(&seed.to_be_bytes());
     hash[8..16].copy_from_slice(&seed.rotate_left(17).to_be_bytes());
     hash[16..24].copy_from_slice(&seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());

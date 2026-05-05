@@ -12,7 +12,7 @@ use rocksdb::{
     MultiThreaded, Options, WriteBatch, WriteOptions,
 };
 
-type Hash32 = [u8; 32];
+type Hash8 = [u8; 8];
 type Pba = u64;
 
 const CF_L2P: &str = "l2p";
@@ -250,7 +250,7 @@ struct Mapping {
 #[derive(Clone, Debug)]
 struct DedupEntry {
     pba: Pba,
-    hash: Hash32,
+    hash: Hash8,
     live_refs: u32,
 }
 
@@ -720,14 +720,14 @@ fn delta_operand(delta: i32) -> [u8; 4] {
     delta.to_be_bytes()
 }
 
-fn reverse_key(pba: u64, hash: &Hash32) -> [u8; 32] {
-    let mut key = [0u8; 32];
+fn reverse_key(pba: u64, hash: &Hash8) -> [u8; 8] {
+    let mut key = [0u8; 8];
     key[..8].copy_from_slice(&pba.to_be_bytes());
     key[8..32].copy_from_slice(&hash[..24]);
     key
 }
 
-fn reverse_value(hash: &Hash32) -> [u8; 8] {
+fn reverse_value(hash: &Hash8) -> [u8; 8] {
     let mut value = [0u8; 8];
     value.copy_from_slice(&hash[24..32]);
     value
@@ -865,8 +865,8 @@ fn dedup_value_from_pba(pba: Pba) -> [u8; 28] {
     out
 }
 
-fn hash_from_parts(thread: u64, seq: u64) -> Hash32 {
-    let mut out = [0u8; 32];
+fn hash_from_parts(thread: u64, seq: u64) -> Hash8 {
+    let mut out = [0u8; 8];
     out[..8].copy_from_slice(&thread.to_be_bytes());
     out[8..16].copy_from_slice(&seq.to_be_bytes());
     out[16..24].copy_from_slice(&thread.rotate_left(17).to_be_bytes());

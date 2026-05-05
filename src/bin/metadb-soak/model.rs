@@ -1,6 +1,6 @@
 struct Model {
     l2p: BTreeMap<VolumeOrdinal, BTreeMap<u64, L2pValue>>,
-    dedup: BTreeMap<Hash32, DedupValue>,
+    dedup: BTreeMap<Hash8, DedupValue>,
     refcount: BTreeMap<u64, u32>,
 }
 

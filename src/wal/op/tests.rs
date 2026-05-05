@@ -12,8 +12,8 @@ fn dv(n: u8) -> DedupValue {
     DedupValue(x)
 }
 
-fn h(n: u8) -> Hash32 {
-    let mut x = [0u8; 32];
+fn h(n: u8) -> Hash8 {
+    let mut x = [0u8; 8];
     x[0] = n;
     x
 }
@@ -64,7 +64,7 @@ fn dedup_put_guarded_round_trip() {
         min_rc: 7,
     }];
     let body = encode_body(&ops);
-    assert_eq!(body.len(), 1 + 1 + 32 + 28 + 8 + 4);
+    assert_eq!(body.len(), 1 + 1 + 8 + 28 + 8 + 4);
     assert_eq!(decode_body(&body).unwrap(), ops);
 }
 

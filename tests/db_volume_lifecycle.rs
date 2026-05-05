@@ -149,7 +149,7 @@ fn create_with_dedup_shards_n4_round_trips_through_reopen() {
         // hash[0]) so every shard ends up with at least one row after
         // a flush.
         for byte0 in [0u8, 64, 128, 192] {
-            let mut hash = [0u8; 32];
+            let mut hash = [0u8; 8];
             hash[0] = byte0;
             let mut value = [0u8; 28];
             value[0] = byte0;
@@ -166,7 +166,7 @@ fn create_with_dedup_shards_n4_round_trips_through_reopen() {
     // Reopen with the same N=4 succeeds and reads back every entry.
     let db = Db::open_with_config(cfg).unwrap();
     for byte0 in [0u8, 64, 128, 192] {
-        let mut hash = [0u8; 32];
+        let mut hash = [0u8; 8];
         hash[0] = byte0;
         let got = db.get_dedup(&hash).unwrap();
         assert!(got.is_some(), "missing entry for byte0={byte0}");

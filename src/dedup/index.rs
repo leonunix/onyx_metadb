@@ -42,15 +42,22 @@
 use std::sync::Arc;
 
 use crate::cache::PageCache;
-use crate::dedup_types::{DedupValue, Hash32};
+use crate::dedup_types::{DedupValue, Hash8};
 use crate::error::Result;
 use crate::page_store::PageStore;
 use crate::types::{Lsn, PageId};
 
-use super::cuckoo::CuckooHash;
+use super::cuckoo::{CuckooHash, ENTRIES_PER_BUCKET};
 use super::fp_of;
 use super::l1_cache::{L1HotCache, LookupResult};
 use super::sketch::FpSketch;
+
+/// L0 capacity to use given the on-disk cuckoo bucket count. Mirrors
+/// L3 max capacity (`bucket_count × ENTRIES_PER_BUCKET`) so the filter
+/// can hold every fingerprint L3 can store without saturating.
+fn l0_capacity_for(cuckoo_bucket_count: u64) -> usize {
+    (cuckoo_bucket_count as usize).saturating_mul(ENTRIES_PER_BUCKET)
+}
 
 pub struct DedupIndex {
     sketch: FpSketch,
@@ -73,8 +80,9 @@ impl DedupIndex {
         seed2: u64,
     ) -> Result<Self> {
         let cuckoo = CuckooHash::create(page_store, page_cache, bucket_count, seed1, seed2)?;
+        let l0_capacity = l0_capacity_for(cuckoo.bucket_count());
         Ok(Self {
-            sketch: FpSketch::new(),
+            sketch: FpSketch::with_capacity(l0_capacity),
             l1: L1HotCache::new(l1_capacity),
             cuckoo,
         })
@@ -89,7 +97,11 @@ impl DedupIndex {
         l1_capacity: usize,
     ) -> Result<Self> {
         let cuckoo = CuckooHash::open(page_store, page_cache, meta_page_id)?;
-        let sketch = FpSketch::with_capacity(cuckoo.approx_len() as usize);
+        // Size L0 to mirror the on-disk cuckoo capacity rather than the
+        // current load. The cuckoo filter cannot grow once allocated;
+        // sizing it at 4 × bucket_count keeps load < 0.95 even after
+        // L3 fills up, avoiding the saturation fallback.
+        let sketch = FpSketch::with_capacity(l0_capacity_for(cuckoo.bucket_count()));
         let l1 = L1HotCache::new(l1_capacity);
         let me = Self { sketch, l1, cuckoo };
         me.rebuild_l0_from_l3()?;
@@ -113,7 +125,7 @@ impl DedupIndex {
 
     /// Single-key lookup. Walks L0 → L1 → L3. Promotes L3 hits into
     /// L1 so the next lookup short-circuits to memory.
-    pub fn get(&self, hash: &Hash32) -> Result<Option<DedupValue>> {
+    pub fn get(&self, hash: &Hash8) -> Result<Option<DedupValue>> {
         let fp = fp_of(hash);
         if !self.sketch.contains(fp) {
             return Ok(None);
@@ -136,7 +148,7 @@ impl DedupIndex {
     /// L3 only for the residual misses. Most workloads see 90 %+ of
     /// hashes short-circuit in the L0 sketch, so this collapses N ×
     /// (L0 + L1) lock pairs to two.
-    pub fn multi_get(&self, hashes: &[Hash32]) -> Result<Vec<Option<DedupValue>>> {
+    pub fn multi_get(&self, hashes: &[Hash8]) -> Result<Vec<Option<DedupValue>>> {
         if hashes.is_empty() {
             return Ok(Vec::new());
         }
@@ -145,7 +157,7 @@ impl DedupIndex {
 
         // Collect indices that survived L0 — these are the only ones
         // worth touching L1 / L3 for.
-        let mut l1_pairs: Vec<(u32, Hash32)> = Vec::new();
+        let mut l1_pairs: Vec<(u32, Hash8)> = Vec::new();
         let mut l1_indices: Vec<usize> = Vec::new();
         for (i, &alive) in in_l0.iter().enumerate() {
             if alive {
@@ -171,7 +183,7 @@ impl DedupIndex {
         Ok(out)
     }
 
-    pub fn put(&self, hash: Hash32, value: DedupValue, lsn: Lsn) -> Result<()> {
+    pub fn put(&self, hash: Hash8, value: DedupValue, lsn: Lsn) -> Result<()> {
         self.cuckoo.put(hash, value, lsn)?;
         let fp = fp_of(&hash);
         self.sketch.insert(fp);
@@ -179,7 +191,7 @@ impl DedupIndex {
         Ok(())
     }
 
-    pub fn delete(&self, hash: &Hash32, lsn: Lsn) -> Result<()> {
+    pub fn delete(&self, hash: &Hash8, lsn: Lsn) -> Result<()> {
         // Order matters: clear L3 first so a concurrent reader that
         // sees fp ∈ L0 falls through to L3 and gets `None`. After
         // L3 returns clear, removing fp from L0 is safe.
@@ -194,7 +206,7 @@ impl DedupIndex {
         self.cuckoo.flush_meta()
     }
 
-    pub fn iter(&self) -> Result<Vec<(Hash32, DedupValue)>> {
+    pub fn iter(&self) -> Result<Vec<(Hash8, DedupValue)>> {
         self.cuckoo.iter()
     }
 
@@ -244,8 +256,8 @@ mod tests {
         (dir, idx)
     }
 
-    fn h(byte: u8) -> Hash32 {
-        let mut x = [0u8; 32];
+    fn h(byte: u8) -> Hash8 {
+        let mut x = [0u8; 8];
         x.fill(byte);
         x
     }
