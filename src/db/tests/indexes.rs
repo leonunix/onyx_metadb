@@ -73,6 +73,37 @@ fn iter_dedup_emits_live_puts_and_hides_tombstones() {
 }
 
 #[test]
+fn compare_delete_dedup_requires_exact_current_value() {
+    let (_d, db) = mk_db();
+    let hash = h(11);
+    let old = dv(1);
+    let other = dv(2);
+
+    db.put_dedup(hash, old).unwrap();
+    assert!(!db.compare_delete_dedup(hash, other).unwrap());
+    assert_eq!(db.get_dedup(&hash).unwrap(), Some(old));
+
+    assert!(db.compare_delete_dedup(hash, old).unwrap());
+    assert_eq!(db.get_dedup(&hash).unwrap(), None);
+}
+
+#[test]
+fn compare_put_dedup_requires_exact_current_value() {
+    let (_d, db) = mk_db();
+    let hash = h(12);
+    let old = dv(3);
+    let new = dv(4);
+    let other = dv(5);
+
+    db.put_dedup(hash, old).unwrap();
+    assert!(!db.compare_put_dedup(hash, other, new).unwrap());
+    assert_eq!(db.get_dedup(&hash).unwrap(), Some(old));
+
+    assert!(db.compare_put_dedup(hash, old, new).unwrap());
+    assert_eq!(db.get_dedup(&hash).unwrap(), Some(new));
+}
+
+#[test]
 fn iter_dedup_survives_flush_and_reopen() {
     let dir = TempDir::new().unwrap();
     let h1 = h(7);

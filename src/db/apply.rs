@@ -97,6 +97,24 @@ pub(super) fn apply_op_bare(
             dedup_index.delete(hash, lsn)?;
             Ok(ApplyOutcome::Dedup)
         }
+        WalOp::DedupCompareDelete { hash, old_value } => {
+            let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
+            if applied {
+                dedup_index.delete(hash, lsn)?;
+            }
+            Ok(ApplyOutcome::DedupCompare { applied })
+        }
+        WalOp::DedupComparePut {
+            hash,
+            old_value,
+            new_value,
+        } => {
+            let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
+            if applied {
+                dedup_index.put(*hash, *new_value, lsn)?;
+            }
+            Ok(ApplyOutcome::DedupCompare { applied })
+        }
         WalOp::DedupReversePut { pba, hash } => {
             dedup_reverse.put(*pba, *hash, lsn)?;
             Ok(ApplyOutcome::Dedup)

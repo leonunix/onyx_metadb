@@ -53,6 +53,10 @@ pub enum ApplyOutcome {
     /// Dedup put/delete; no pre-image surfaced (LSM reads are not
     /// constant-time, and callers don't need the old value).
     Dedup,
+    /// Conditional dedup-index compare operation. `applied=true`
+    /// means the forward index still matched the expected old value
+    /// at apply time and the mutation landed.
+    DedupCompare { applied: bool },
     /// DropSnapshot result: every leaf value that was freed (i.e. whose
     /// owning `PagedLeaf` page hit rc=0 during apply) and the number of
     /// pages pushed onto the free list.
@@ -204,6 +208,30 @@ impl<'db> Transaction<'db> {
     /// Buffer a dedup tombstone.
     pub fn delete_dedup(&mut self, hash: Hash8) -> &mut Self {
         self.ops.push(WalOp::DedupDelete { hash });
+        self
+    }
+
+    /// Delete a dedup entry only if its current value equals
+    /// `old_value` at WAL apply time.
+    pub fn compare_delete_dedup(&mut self, hash: Hash8, old_value: DedupValue) -> &mut Self {
+        self.ops
+            .push(WalOp::DedupCompareDelete { hash, old_value });
+        self
+    }
+
+    /// Replace a dedup entry only if its current value equals
+    /// `old_value` at WAL apply time.
+    pub fn compare_put_dedup(
+        &mut self,
+        hash: Hash8,
+        old_value: DedupValue,
+        new_value: DedupValue,
+    ) -> &mut Self {
+        self.ops.push(WalOp::DedupComparePut {
+            hash,
+            old_value,
+            new_value,
+        });
         self
     }
 

@@ -80,6 +80,21 @@ impl WalOp {
                 out.push(TAG_DEDUP_DELETE);
                 out.extend_from_slice(hash);
             }
+            WalOp::DedupCompareDelete { hash, old_value } => {
+                out.push(TAG_DEDUP_COMPARE_DELETE);
+                out.extend_from_slice(hash);
+                out.extend_from_slice(&old_value.0);
+            }
+            WalOp::DedupComparePut {
+                hash,
+                old_value,
+                new_value,
+            } => {
+                out.push(TAG_DEDUP_COMPARE_PUT);
+                out.extend_from_slice(hash);
+                out.extend_from_slice(&old_value.0);
+                out.extend_from_slice(&new_value.0);
+            }
             WalOp::DedupReversePut { pba, hash } => {
                 out.push(TAG_DEDUP_REVERSE_PUT);
                 out.extend_from_slice(&pba.to_be_bytes());
@@ -176,6 +191,8 @@ impl WalOp {
             WalOp::DedupPut { .. } => 1 + 8 + 28,
             WalOp::DedupPutGuarded { .. } => 1 + 8 + 28 + 8 + 4,
             WalOp::DedupDelete { .. } => 1 + 8,
+            WalOp::DedupCompareDelete { .. } => 1 + 8 + 28,
+            WalOp::DedupComparePut { .. } => 1 + 8 + 28 + 28,
             WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 8,
             WalOp::Incref { .. } | WalOp::Decref { .. } => 1 + 8 + 4,
             WalOp::DropSnapshot {
@@ -387,6 +404,37 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             let mut hash = [0u8; 8];
             hash.copy_from_slice(&payload[..8]);
             Ok((WalOp::DedupDelete { hash }, &payload[8..]))
+        }
+        TAG_DEDUP_COMPARE_DELETE => {
+            require_len(payload, 36, "DEDUP_COMPARE_DELETE")?;
+            let mut hash = [0u8; 8];
+            hash.copy_from_slice(&payload[..8]);
+            let mut old = [0u8; 28];
+            old.copy_from_slice(&payload[8..36]);
+            Ok((
+                WalOp::DedupCompareDelete {
+                    hash,
+                    old_value: DedupValue(old),
+                },
+                &payload[36..],
+            ))
+        }
+        TAG_DEDUP_COMPARE_PUT => {
+            require_len(payload, 64, "DEDUP_COMPARE_PUT")?;
+            let mut hash = [0u8; 8];
+            hash.copy_from_slice(&payload[..8]);
+            let mut old = [0u8; 28];
+            old.copy_from_slice(&payload[8..36]);
+            let mut new = [0u8; 28];
+            new.copy_from_slice(&payload[36..64]);
+            Ok((
+                WalOp::DedupComparePut {
+                    hash,
+                    old_value: DedupValue(old),
+                    new_value: DedupValue(new),
+                },
+                &payload[64..],
+            ))
         }
         TAG_DEDUP_REVERSE_PUT | TAG_DEDUP_REVERSE_DELETE => {
             require_len(payload, 16, "DEDUP_REVERSE")?;

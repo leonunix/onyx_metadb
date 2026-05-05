@@ -131,7 +131,9 @@ fn wal_lane_key(op: &WalOp) -> u64 {
         }
         WalOp::DedupPut { hash, .. }
         | WalOp::DedupPutGuarded { hash, .. }
-        | WalOp::DedupDelete { hash } => xxh3_64(hash),
+        | WalOp::DedupDelete { hash }
+        | WalOp::DedupCompareDelete { hash, .. }
+        | WalOp::DedupComparePut { hash, .. } => xxh3_64(hash),
         WalOp::DedupReversePut { pba, hash } | WalOp::DedupReverseDelete { pba, hash } => {
             let mut bytes = [0u8; 40];
             bytes[..8].copy_from_slice(&pba.to_be_bytes());
@@ -776,7 +778,9 @@ impl Db {
                 }
                 WalOp::DedupPut { hash, .. }
                 | WalOp::DedupPutGuarded { hash, .. }
-                | WalOp::DedupDelete { hash, .. } => {
+                | WalOp::DedupDelete { hash, .. }
+                | WalOp::DedupCompareDelete { hash, .. }
+                | WalOp::DedupComparePut { hash, .. } => {
                     let sid =
                         crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
                     dedup_buckets[sid].push(idx);
@@ -1175,6 +1179,7 @@ impl Db {
         for idx in indices {
             match &ops[idx] {
                 WalOp::DedupPut { hash, value } => {
+                    flush_all(&mut reverse_puts)?;
                     let started = std::time::Instant::now();
                     dedup_index.put(*hash, *value, lsn)?;
                     metrics.record_dedup_forward_put(started.elapsed());
@@ -1201,10 +1206,35 @@ impl Db {
                     outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupDelete { hash } => {
+                    flush_all(&mut reverse_puts)?;
                     let started = std::time::Instant::now();
                     dedup_index.delete(hash, lsn)?;
                     metrics.record_dedup_forward_delete(started.elapsed());
                     outcomes.push((idx, ApplyOutcome::Dedup));
+                }
+                WalOp::DedupCompareDelete { hash, old_value } => {
+                    flush_all(&mut reverse_puts)?;
+                    let started = std::time::Instant::now();
+                    let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
+                    if applied {
+                        dedup_index.delete(hash, lsn)?;
+                        metrics.record_dedup_forward_delete(started.elapsed());
+                    }
+                    outcomes.push((idx, ApplyOutcome::DedupCompare { applied }));
+                }
+                WalOp::DedupComparePut {
+                    hash,
+                    old_value,
+                    new_value,
+                } => {
+                    flush_all(&mut reverse_puts)?;
+                    let started = std::time::Instant::now();
+                    let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
+                    if applied {
+                        dedup_index.put(*hash, *new_value, lsn)?;
+                        metrics.record_dedup_forward_put(started.elapsed());
+                    }
+                    outcomes.push((idx, ApplyOutcome::DedupCompare { applied }));
                 }
                 WalOp::DedupReversePut { pba, hash } => {
                     reverse_puts.entry(*pba).or_default().push(*hash);
@@ -1473,6 +1503,8 @@ impl Db {
                 WalOp::DedupPut { .. }
                 | WalOp::DedupPutGuarded { .. }
                 | WalOp::DedupDelete { .. }
+                | WalOp::DedupCompareDelete { .. }
+                | WalOp::DedupComparePut { .. }
                 | WalOp::DedupReversePut { .. }
                 | WalOp::DedupReverseDelete { .. } => {
                     dedup_idxs.push(idx);
@@ -1670,6 +1702,8 @@ impl Db {
                 WalOp::DedupPut { .. }
                 | WalOp::DedupPutGuarded { .. }
                 | WalOp::DedupDelete { .. }
+                | WalOp::DedupCompareDelete { .. }
+                | WalOp::DedupComparePut { .. }
                 | WalOp::DedupReversePut { .. }
                 | WalOp::DedupReverseDelete { .. } => {
                     dedup_idxs.push(idx);
@@ -1810,6 +1844,8 @@ fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Du
         WalOp::DedupPut { .. }
         | WalOp::DedupPutGuarded { .. }
         | WalOp::DedupDelete { .. }
+        | WalOp::DedupCompareDelete { .. }
+        | WalOp::DedupComparePut { .. }
         | WalOp::DedupReversePut { .. }
         | WalOp::DedupReverseDelete { .. } => metrics.record_apply_dedup(elapsed),
         WalOp::DropSnapshot { .. }

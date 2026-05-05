@@ -148,7 +148,9 @@ impl OpCounts {
             WalOp::L2pRemap { .. } => self.l2p_remap += 1,
             WalOp::L2pRangeDelete { .. } => self.l2p_range_delete += 1,
             WalOp::DedupPut { .. } | WalOp::DedupPutGuarded { .. } => self.dedup_put += 1,
-            WalOp::DedupDelete { .. } => self.dedup_delete += 1,
+            WalOp::DedupDelete { .. }
+            | WalOp::DedupCompareDelete { .. }
+            | WalOp::DedupComparePut { .. } => self.dedup_delete += 1,
             WalOp::DedupReversePut { .. } => self.dedup_reverse_put += 1,
             WalOp::DedupReverseDelete { .. } => self.dedup_reverse_delete += 1,
             WalOp::Incref { .. } => self.incref += 1,
@@ -333,6 +335,21 @@ fn fmt_op(op: &WalOp) -> String {
             hex(value.0)
         ),
         WalOp::DedupDelete { hash } => format!("DedupDelete hash={}", hex(hash)),
+        WalOp::DedupCompareDelete { hash, old_value } => format!(
+            "DedupCompareDelete hash={} old_value={}",
+            hex(hash),
+            hex(old_value.0)
+        ),
+        WalOp::DedupComparePut {
+            hash,
+            old_value,
+            new_value,
+        } => format!(
+            "DedupComparePut hash={} old_value={} new_value={}",
+            hex(hash),
+            hex(old_value.0),
+            hex(new_value.0)
+        ),
         WalOp::DedupReversePut { pba, hash } => {
             format!("DedupReversePut pba={pba} hash={}", hex(hash))
         }
@@ -429,6 +446,21 @@ fn op_json(op: &WalOp) -> String {
         WalOp::DedupDelete { hash } => {
             format!("{{\"op\":\"DedupDelete\",\"hash\":\"{}\"}}", hex(hash))
         }
+        WalOp::DedupCompareDelete { hash, old_value } => format!(
+            "{{\"op\":\"DedupCompareDelete\",\"hash\":\"{}\",\"old_value\":\"{}\"}}",
+            hex(hash),
+            hex(old_value.0)
+        ),
+        WalOp::DedupComparePut {
+            hash,
+            old_value,
+            new_value,
+        } => format!(
+            "{{\"op\":\"DedupComparePut\",\"hash\":\"{}\",\"old_value\":\"{}\",\"new_value\":\"{}\"}}",
+            hex(hash),
+            hex(old_value.0),
+            hex(new_value.0)
+        ),
         WalOp::DedupReversePut { pba, hash } => format!(
             "{{\"op\":\"DedupReversePut\",\"pba\":{pba},\"hash\":\"{}\"}}",
             hex(hash)
@@ -485,6 +517,8 @@ fn op_tag_list(ops: &[WalOp]) -> String {
             WalOp::DedupPut { .. } => "DedupPut",
             WalOp::DedupPutGuarded { .. } => "DedupPutGuarded",
             WalOp::DedupDelete { .. } => "DedupDelete",
+            WalOp::DedupCompareDelete { .. } => "DedupCompareDelete",
+            WalOp::DedupComparePut { .. } => "DedupComparePut",
             WalOp::DedupReversePut { .. } => "DedupReversePut",
             WalOp::DedupReverseDelete { .. } => "DedupReverseDelete",
             WalOp::Incref { .. } => "Incref",

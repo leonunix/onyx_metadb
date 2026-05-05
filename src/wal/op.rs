@@ -44,6 +44,8 @@
 //! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                                                          |    40    |
 //! | 13  | `DEDUP_REVERSE_DEL` | pba (8 B BE) + hash (32 B)                                                          |    40    |
 //! | 14  | `DEDUP_PUT_GUARDED` | hash (32 B) + value (28 B) + pba_guard (8 B BE) + min_rc (4 B BE)                  |    72    |
+//! | 15  | `DEDUP_COMPARE_DELETE` | hash (32 B) + old_value (28 B)                                                   |    60    |
+//! | 16  | `DEDUP_COMPARE_PUT` | hash (32 B) + old_value (28 B) + new_value (28 B)                                  |    88    |
 //! | 20  | `INCREF`            | pba (8 B BE) + delta (4 B BE)                                                       |    12    |
 //! | 21  | `DECREF`            | pba (8 B BE) + delta (4 B BE)                                                       |    12    |
 //! | 30  | `DROP_SNAPSHOT`     | id (8 B BE) + page_count (4 B BE) + pid×page_count + decref_count (4 B BE) + pba×decref_count | 16+8(n+m) |
@@ -117,6 +119,8 @@ pub const TAG_DEDUP_DELETE: u8 = 0x11;
 pub const TAG_DEDUP_REVERSE_PUT: u8 = 0x12;
 pub const TAG_DEDUP_REVERSE_DELETE: u8 = 0x13;
 pub const TAG_DEDUP_PUT_GUARDED: u8 = 0x14;
+pub const TAG_DEDUP_COMPARE_DELETE: u8 = 0x15;
+pub const TAG_DEDUP_COMPARE_PUT: u8 = 0x16;
 pub const TAG_INCREF: u8 = 0x20;
 pub const TAG_DECREF: u8 = 0x21;
 pub const TAG_DROP_SNAPSHOT: u8 = 0x30;
@@ -195,6 +199,19 @@ pub enum WalOp {
     },
     DedupDelete {
         hash: Hash8,
+    },
+    /// Tombstone `hash` only if the current forward index value is
+    /// exactly `old_value`.
+    DedupCompareDelete {
+        hash: Hash8,
+        old_value: DedupValue,
+    },
+    /// Replace `hash` with `new_value` only if the current forward
+    /// index value is exactly `old_value`.
+    DedupComparePut {
+        hash: Hash8,
+        old_value: DedupValue,
+        new_value: DedupValue,
     },
     /// Record that `pba` owns `hash`. Stored in `dedup_reverse` so a
     /// later `decref_pba → 0` can prefix-scan by PBA and tombstone the

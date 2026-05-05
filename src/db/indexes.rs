@@ -76,6 +76,35 @@ impl Db {
         tx.commit()
     }
 
+    /// Tombstone `hash` only when the current value still equals
+    /// `old_value` at WAL apply time.
+    pub fn compare_delete_dedup(&self, hash: Hash8, old_value: DedupValue) -> Result<bool> {
+        let mut tx = self.begin();
+        tx.compare_delete_dedup(hash, old_value);
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        match outcomes.into_iter().next().unwrap() {
+            ApplyOutcome::DedupCompare { applied } => Ok(applied),
+            _ => unreachable!("compare_delete_dedup produces DedupCompare"),
+        }
+    }
+
+    /// Replace `hash` only when the current value still equals
+    /// `old_value` at WAL apply time.
+    pub fn compare_put_dedup(
+        &self,
+        hash: Hash8,
+        old_value: DedupValue,
+        new_value: DedupValue,
+    ) -> Result<bool> {
+        let mut tx = self.begin();
+        tx.compare_put_dedup(hash, old_value, new_value);
+        let (_, outcomes) = tx.commit_with_outcomes()?;
+        match outcomes.into_iter().next().unwrap() {
+            ApplyOutcome::DedupCompare { applied } => Ok(applied),
+            _ => unreachable!("compare_put_dedup produces DedupCompare"),
+        }
+    }
+
     /// Point-lookup `hash` in the dedup index.
     pub fn get_dedup(&self, hash: &Hash8) -> Result<Option<DedupValue>> {
         self.dedup_index.get(hash)
