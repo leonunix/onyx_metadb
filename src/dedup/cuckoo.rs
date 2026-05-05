@@ -44,7 +44,7 @@ use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::cache::PageCache;
-use crate::dedup_types::{DedupValue, Hash8, DEDUP_VALUE_SIZE, HASH_SIZE};
+use crate::dedup_types::{DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash8};
 use crate::error::{MetaDbError, Result};
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;

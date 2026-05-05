@@ -217,6 +217,7 @@ pub(super) fn apply_l2p_remap(
     })?;
     let l2p_sid = shard_for_key_l2p(&volume.shards, lba);
     let new_pba = new_value.head_pba();
+    let new_is_zero = new_value.0[27] & 0x02 != 0;
 
     // Guard check is done after the L2P shard mutex is taken but
     // before any mutation, so the "guard passed" decision and the
@@ -289,7 +290,9 @@ pub(super) fn apply_l2p_remap(
         }
         None => false,
     };
-    let snap_pins_new = {
+    let snap_pins_new = if new_is_zero {
+        false
+    } else {
         let birth = lookup_birth_lsn(refcount_shards, new_pba)?;
         any_snap_pins(new_value, birth, &mut tree)?
     };
@@ -304,8 +307,9 @@ pub(super) fn apply_l2p_remap(
     let value_changed = prev != Some(new_value);
     let live_loses_old = prev.is_some() && value_changed;
     let live_gains_new = value_changed;
-    let do_decref = live_loses_old && !snap_pins_old;
-    let do_incref = live_gains_new && !snap_pins_new;
+    let old_is_zero = prev.is_some_and(|old_value| old_value.0[27] & 0x02 != 0);
+    let do_decref = live_loses_old && !old_is_zero && !snap_pins_old;
+    let do_incref = live_gains_new && !new_is_zero && !snap_pins_new;
 
     // Collapse per-pba net delta before taking shard locks. Same-head-pba
     // overwrites can legitimately add and remove one logical version in the
@@ -424,7 +428,7 @@ pub(super) fn apply_l2p_range_delete(
     // refcount shard so each shard mutex is taken at most once.
     let mut rc_bucket: Vec<Vec<usize>> = vec![Vec::new(); refcount_shards.len()];
     for (idx, (_, value)) in captured.iter().enumerate() {
-        if !was_mapped[idx] || snap_pinned[idx] {
+        if !was_mapped[idx] || snap_pinned[idx] || value.0[27] & 0x02 != 0 {
             continue;
         }
         rc_bucket[shard_for_key(refcount_shards, value.head_pba())].push(idx);

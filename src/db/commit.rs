@@ -971,10 +971,12 @@ impl Db {
                         let value_changed = prev != Some(*new_value);
                         if value_changed {
                             let new_pba = new_value.head_pba();
+                            let new_is_zero = new_value.0[27] & 0x02 != 0;
                             match prev {
                                 Some(old_value) => {
                                     let old_pba = old_value.head_pba();
-                                    if old_pba != new_pba {
+                                    let old_is_zero = old_value.0[27] & 0x02 != 0;
+                                    if !old_is_zero && (old_pba != new_pba || new_is_zero) {
                                         rc_actions.push(RcApplyAction {
                                             op_idx: idx,
                                             pba: old_pba,
@@ -982,6 +984,8 @@ impl Db {
                                             standalone_refcount: false,
                                             remap_freed_candidate: true,
                                         });
+                                    }
+                                    if !new_is_zero && (old_pba != new_pba || old_is_zero) {
                                         rc_actions.push(RcApplyAction {
                                             op_idx: idx,
                                             pba: new_pba,
@@ -992,13 +996,15 @@ impl Db {
                                     }
                                 }
                                 None => {
-                                    rc_actions.push(RcApplyAction {
-                                        op_idx: idx,
-                                        pba: new_pba,
-                                        delta: 1,
-                                        standalone_refcount: false,
-                                        remap_freed_candidate: false,
-                                    });
+                                    if !new_is_zero {
+                                        rc_actions.push(RcApplyAction {
+                                            op_idx: idx,
+                                            pba: new_pba,
+                                            delta: 1,
+                                            standalone_refcount: false,
+                                            remap_freed_candidate: false,
+                                        });
+                                    }
                                 }
                             }
                         }
