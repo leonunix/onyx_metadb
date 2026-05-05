@@ -275,11 +275,7 @@ fn fingerprint_of(item: u32) -> u16 {
     let h = xxh3_64_with_seed(&item.to_le_bytes(), FP_SEED);
     let fp = (h & SLOT_MASK) as u16;
     // Reserve `0` as the vacant sentinel.
-    if fp == 0 {
-        1
-    } else {
-        fp
-    }
+    if fp == 0 { 1 } else { fp }
 }
 
 #[inline]
