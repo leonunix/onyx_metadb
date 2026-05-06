@@ -63,7 +63,7 @@ pub use manifest::{
 };
 pub use metrics::{MetaMetrics, MetaMetricsSnapshot};
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
-pub use page_store::PageStore;
+pub use page_store::{PageStore, ReclaimOutcome};
 pub use paged::{DiffEntry, L2pValue, PagedL2p};
 pub use recovery::{ReplayOutcome, replay};
 pub use tx::{ApplyOutcome, Transaction};

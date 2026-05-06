@@ -967,6 +967,40 @@ mod tests {
     }
 
     #[test]
+    fn page_store_reclaim_requires_cache_invalidation_before_reuse() {
+        let (_d, ps) = mk_store();
+        let page_cache = Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES));
+        let mut buf = PageBuf::with_cache(ps.clone(), page_cache.clone());
+        let pid = buf.alloc_leaf(1).unwrap();
+        let old = L2pValue([0x11u8; 28]);
+        leaf_set(buf.modify(pid, 1).unwrap(), 7, &old);
+        buf.flush().unwrap();
+        assert_eq!(leaf_value_at(buf.read(pid).unwrap(), 7), old);
+
+        ps.free(pid, 2).unwrap();
+        ps.try_reclaim().unwrap();
+
+        let reused = ps.allocate().unwrap();
+        assert_eq!(reused, pid);
+        let mut page = Page::new(crate::page::PageHeader::new(PageType::PagedLeaf, 3));
+        let new = L2pValue([0x22u8; 28]);
+        leaf_set(&mut page, 7, &new);
+        page.seal();
+        ps.write_page(reused, &page).unwrap();
+
+        let mut stale_buf = PageBuf::with_cache(ps.clone(), page_cache.clone());
+        assert_eq!(
+            leaf_value_at(stale_buf.read(reused).unwrap(), 7),
+            old,
+            "PageStore-only reclaim leaves the shared cache stale"
+        );
+
+        page_cache.invalidate(reused);
+        let mut fresh_buf = PageBuf::with_cache(ps, page_cache);
+        assert_eq!(leaf_value_at(fresh_buf.read(reused).unwrap(), 7), new);
+    }
+
+    #[test]
     fn decref_on_shared_index_stops_at_rc_decrement() {
         let (_d, ps) = mk_store();
         let mut buf = PageBuf::new(ps);

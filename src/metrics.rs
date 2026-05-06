@@ -179,6 +179,10 @@ pub struct MetaMetrics {
     flush_reclaim_us: AtomicU64,
     flush_reclaim_max_us: AtomicU64,
     flush_pages_written: AtomicU64,
+    flush_reclaim_budget_pages: AtomicU64,
+    flush_reclaim_selected_pages: AtomicU64,
+    flush_reclaim_reclaimed_pages: AtomicU64,
+    flush_reclaim_blocked_pages: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -333,6 +337,10 @@ pub struct MetaMetricsSnapshot {
     pub flush_reclaim_us: u64,
     pub flush_reclaim_max_us: u64,
     pub flush_pages_written: u64,
+    pub flush_reclaim_budget_pages: u64,
+    pub flush_reclaim_selected_pages: u64,
+    pub flush_reclaim_reclaimed_pages: u64,
+    pub flush_reclaim_blocked_pages: u64,
 }
 
 impl MetaMetrics {
@@ -492,6 +500,10 @@ impl MetaMetrics {
             flush_reclaim_us: load(&self.flush_reclaim_us),
             flush_reclaim_max_us: load(&self.flush_reclaim_max_us),
             flush_pages_written: load(&self.flush_pages_written),
+            flush_reclaim_budget_pages: load(&self.flush_reclaim_budget_pages),
+            flush_reclaim_selected_pages: load(&self.flush_reclaim_selected_pages),
+            flush_reclaim_reclaimed_pages: load(&self.flush_reclaim_reclaimed_pages),
+            flush_reclaim_blocked_pages: load(&self.flush_reclaim_blocked_pages),
         }
     }
 
@@ -535,6 +547,23 @@ impl MetaMetrics {
 
     pub(crate) fn record_flush_reclaim(&self, elapsed: Duration) {
         record_duration(&self.flush_reclaim_us, &self.flush_reclaim_max_us, elapsed);
+    }
+
+    pub(crate) fn record_flush_reclaim_pages(
+        &self,
+        budget: usize,
+        selected: usize,
+        reclaimed: usize,
+        blocked: usize,
+    ) {
+        self.flush_reclaim_budget_pages
+            .fetch_add(budget as u64, Ordering::Relaxed);
+        self.flush_reclaim_selected_pages
+            .fetch_add(selected as u64, Ordering::Relaxed);
+        self.flush_reclaim_reclaimed_pages
+            .fetch_add(reclaimed as u64, Ordering::Relaxed);
+        self.flush_reclaim_blocked_pages
+            .fetch_add(blocked as u64, Ordering::Relaxed);
     }
 
     pub(crate) fn record_commit_empty(&self) {
@@ -1172,7 +1201,11 @@ impl MetaMetricsSnapshot {
                 "\"flush_install_max_us\":{},",
                 "\"flush_reclaim_us\":{},",
                 "\"flush_reclaim_max_us\":{},",
-                "\"flush_pages_written\":{}",
+                "\"flush_pages_written\":{},",
+                "\"flush_reclaim_budget_pages\":{},",
+                "\"flush_reclaim_selected_pages\":{},",
+                "\"flush_reclaim_reclaimed_pages\":{},",
+                "\"flush_reclaim_blocked_pages\":{}",
                 "}}"
             ),
             self.commit_attempts,
@@ -1325,6 +1358,10 @@ impl MetaMetricsSnapshot {
             self.flush_reclaim_us,
             self.flush_reclaim_max_us,
             self.flush_pages_written,
+            self.flush_reclaim_budget_pages,
+            self.flush_reclaim_selected_pages,
+            self.flush_reclaim_reclaimed_pages,
+            self.flush_reclaim_blocked_pages,
         )
     }
 }

@@ -61,8 +61,9 @@ fn print_usage() {
 
 subcommands:
   manifest       <path>                         decoded manifest + tree roots
-  lba            <path> <lba> [--snapshot ID]   point lookup in L2P
-  l2p            <path> [--from LBA] [--to LBA] [--snapshot ID] [--limit N]
+  lba            <path> <lba> [--vol ORD] [--snapshot ID]
+                                                point lookup in L2P
+  l2p            <path> [--vol ORD] [--from LBA] [--to LBA] [--snapshot ID] [--limit N]
                                                 range scan over L2P
   refcount       <path> <pba>                   point lookup for PBA refcount
   dedup          <path> <hash-hex>              point lookup in dedup_index
@@ -197,10 +198,12 @@ fn cmd_lba(args: &[String]) -> Result<ExitCode, String> {
         json,
         positional,
         snapshot,
+        vol,
         ..
-    } = parse_flags(args, ParseSpec::one_positional().with_snapshot())?;
+    } = parse_flags(args, ParseSpec::one_positional().with_snapshot().with_vol())?;
     let lba = parse_u64(positional.first(), "lba")?;
     let db = open_db(&path)?;
+    let vol = vol.unwrap_or(0);
 
     let result = match snapshot {
         Some(id) => {
@@ -209,9 +212,7 @@ fn cmd_lba(args: &[String]) -> Result<ExitCode, String> {
                 .ok_or_else(|| format!("unknown snapshot id {id}"))?;
             view.get(lba).map_err(|e| e.to_string())?
         }
-        // Commit 7: only the bootstrap volume exists; when commit 8 lets
-        // users create real volumes, this grows a `--vol N` flag.
-        None => db.get(0, lba).map_err(|e| e.to_string())?,
+        None => db.get(vol, lba).map_err(|e| e.to_string())?,
     };
 
     if json {
@@ -220,6 +221,7 @@ fn cmd_lba(args: &[String]) -> Result<ExitCode, String> {
         if let Some(id) = snapshot {
             println!("  \"snapshot\": {id},");
         }
+        println!("  \"vol\": {vol},");
         match result {
             Some(v) => println!("  \"value\": \"{}\"", hex(&v.0)),
             None => println!("  \"value\": null"),
@@ -230,6 +232,7 @@ fn cmd_lba(args: &[String]) -> Result<ExitCode, String> {
         if let Some(id) = snapshot {
             println!("snapshot: {id}");
         }
+        println!("vol: {vol}");
         match result {
             Some(v) => println!("value: {}", hex(&v.0)),
             None => println!("value: <none>"),
@@ -246,16 +249,19 @@ fn cmd_l2p(args: &[String]) -> Result<ExitCode, String> {
         to,
         limit,
         snapshot,
+        vol,
         ..
     } = parse_flags(
         args,
         ParseSpec::path_only()
             .with_from_to()
             .with_limit()
-            .with_snapshot(),
+            .with_snapshot()
+            .with_vol(),
     )?;
     let db = open_db(&path)?;
     let limit = limit.unwrap_or(256) as usize;
+    let vol = vol.unwrap_or(0);
 
     let rows: Vec<(Lba, L2pValue)> = match snapshot {
         Some(id) => {
@@ -269,7 +275,7 @@ fn cmd_l2p(args: &[String]) -> Result<ExitCode, String> {
             )?
         }
         None => collect_range(
-            db.range(0, bounded_range(from, to))
+            db.range(vol, bounded_range(from, to))
                 .map_err(|e| e.to_string())?,
             limit,
         )?,
@@ -280,6 +286,7 @@ fn cmd_l2p(args: &[String]) -> Result<ExitCode, String> {
         if let Some(id) = snapshot {
             println!("  \"snapshot\": {id},");
         }
+        println!("  \"vol\": {vol},");
         if let Some(x) = from {
             println!("  \"from\": {x},");
         }
@@ -298,6 +305,7 @@ fn cmd_l2p(args: &[String]) -> Result<ExitCode, String> {
         println!("  ]");
         println!("}}");
     } else {
+        println!("vol: {vol}");
         println!("count: {}", rows.len());
         for (lba, value) in rows {
             println!("  {lba}  {}", hex(&value.0));
@@ -474,6 +482,7 @@ struct Parsed {
     json: bool,
     positional: Vec<String>,
     snapshot: Option<SnapshotId>,
+    vol: Option<u16>,
     from: Option<u64>,
     to: Option<u64>,
     limit: Option<u64>,
@@ -482,6 +491,7 @@ struct Parsed {
 struct ParseSpec {
     positional_count: usize,
     allow_snapshot: bool,
+    allow_vol: bool,
     allow_from_to: bool,
     allow_limit: bool,
 }
@@ -491,6 +501,7 @@ impl ParseSpec {
         Self {
             positional_count: 0,
             allow_snapshot: false,
+            allow_vol: false,
             allow_from_to: false,
             allow_limit: false,
         }
@@ -505,6 +516,11 @@ impl ParseSpec {
 
     fn with_snapshot(mut self) -> Self {
         self.allow_snapshot = true;
+        self
+    }
+
+    fn with_vol(mut self) -> Self {
+        self.allow_vol = true;
         self
     }
 
@@ -524,6 +540,7 @@ fn parse_flags(args: &[String], spec: ParseSpec) -> Result<Parsed, String> {
     let mut positional = Vec::new();
     let mut json = false;
     let mut snapshot = None;
+    let mut vol = None;
     let mut from = None;
     let mut to = None;
     let mut limit = None;
@@ -533,6 +550,10 @@ fn parse_flags(args: &[String], spec: ParseSpec) -> Result<Parsed, String> {
             "--json" => json = true,
             "--snapshot" if spec.allow_snapshot => {
                 snapshot = Some(parse_u64(it.next(), "--snapshot")?);
+            }
+            "--vol" if spec.allow_vol => {
+                let raw = parse_u64(it.next(), "--vol")?;
+                vol = Some(u16::try_from(raw).map_err(|_| format!("--vol {raw} exceeds u16"))?);
             }
             "--from" if spec.allow_from_to => {
                 from = Some(parse_u64(it.next(), "--from")?);
@@ -567,6 +588,7 @@ fn parse_flags(args: &[String], spec: ParseSpec) -> Result<Parsed, String> {
         json,
         positional,
         snapshot,
+        vol,
         from,
         to,
         limit,

@@ -120,6 +120,13 @@ struct DeferredFree {
     idempotent: bool,
 }
 
+#[derive(Debug, Default)]
+pub struct ReclaimOutcome {
+    pub safe_below: u64,
+    pub selected: usize,
+    pub reclaimed: Vec<PageId>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RcDeltaWithGen {
     pub page_id: PageId,
@@ -1017,21 +1024,24 @@ impl PageStore {
     ///
     /// Idempotent and lock-free relative to readers: callers that hold
     /// no apply-side guard may invoke this from a background sweeper.
-    pub fn try_reclaim(&self) -> Result<Vec<PageId>> {
+    pub fn try_reclaim(&self) -> Result<ReclaimOutcome> {
         self.try_reclaim_limit(usize::MAX)
     }
 
     /// Budgeted variant of [`try_reclaim`]. Reclaims at most `max_pages`
     /// safe entries so latency-sensitive callers can make progress
     /// without turning one checkpoint into an unbounded free storm.
-    pub fn try_reclaim_limit(&self, max_pages: usize) -> Result<Vec<PageId>> {
+    pub fn try_reclaim_limit(&self, max_pages: usize) -> Result<ReclaimOutcome> {
         if max_pages == 0 {
-            return Ok(Vec::new());
+            return Ok(ReclaimOutcome::default());
         }
         let safe_below = self.epoch.min_active_pin();
         let mut deferred = self.deferred_free.lock();
         if deferred.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ReclaimOutcome {
+                safe_below,
+                ..ReclaimOutcome::default()
+            });
         }
         let selected: Vec<(PageId, DeferredFree)> = deferred
             .iter()
@@ -1057,7 +1067,11 @@ impl PageStore {
             reclaimable.push((pid, entry));
         }
         let reclaimed = self.reclaim_sorted_runs(&reclaimable)?;
-        Ok(reclaimed)
+        Ok(ReclaimOutcome {
+            safe_below,
+            selected: reclaimable.len(),
+            reclaimed,
+        })
     }
 
     fn is_already_free_on_disk(&self, page_id: PageId) -> Result<bool> {
@@ -2058,7 +2072,7 @@ mod tests {
         assert_eq!(ps.free_list_len(), 0);
         assert_eq!(ps.deferred_free_len(), 3);
         let reclaimed = ps.try_reclaim().unwrap();
-        assert_eq!(reclaimed.len(), 3);
+        assert_eq!(reclaimed.reclaimed.len(), 3);
         let mut got = vec![
             ps.allocate().unwrap(),
             ps.allocate().unwrap(),
@@ -2067,6 +2081,28 @@ mod tests {
         got.sort();
         assert_eq!(got, vec![a, b, c]);
         assert_eq!(ps.high_water(), c + 1);
+    }
+
+    #[test]
+    fn allocate_does_not_reclaim_deferred_pages_by_itself() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        let a = ps.allocate().unwrap();
+        let b = ps.allocate().unwrap();
+        ps.write_page(a, &mk_page(1, 0)).unwrap();
+        ps.free(a, 10).unwrap();
+
+        assert_eq!(ps.free_list_len(), 0);
+        assert_eq!(ps.deferred_free_len(), 1);
+
+        let next = ps.allocate().unwrap();
+        assert_eq!(
+            next,
+            b + 1,
+            "PageStore allocation must not reclaim pages behind Db's cache invalidation"
+        );
+        assert_eq!(ps.deferred_free_len(), 1);
     }
 
     #[test]
@@ -2337,7 +2373,7 @@ mod tests {
 
         ps.free_run(start + 2, 3, 99).unwrap();
         let reclaimed = ps.try_reclaim().unwrap();
-        assert_eq!(reclaimed, vec![start + 2, start + 3, start + 4]);
+        assert_eq!(reclaimed.reclaimed, vec![start + 2, start + 3, start + 4]);
         assert_eq!(ps.high_water(), start + 2);
         assert_eq!(ps.free_list_len(), 0);
         assert_eq!(

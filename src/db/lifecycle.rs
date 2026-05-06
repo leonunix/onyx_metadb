@@ -1,7 +1,8 @@
 use super::*;
 
-const FLUSH_RECLAIM_MIN_BUDGET_PAGES: usize = 1024;
-const FLUSH_RECLAIM_MAX_BUDGET_PAGES: usize = 16_384;
+const FLUSH_RECLAIM_MIN_BUDGET_PAGES: usize = 4_096;
+const FLUSH_RECLAIM_MAX_BUDGET_PAGES: usize = 1_048_576;
+const FLUSH_RECLAIM_BACKLOG_HARD_CAP_PAGES: usize = 16 * 1_048_576;
 const FLUSH_INSTALL_PAGE_BUDGET: usize = 64;
 const FLUSH_INSTALL_CLEANUP_BUDGET: usize = 64;
 const FLUSH_INSTALL_STEP_WARN_US: u64 = 100_000;
@@ -11,12 +12,19 @@ fn micros(duration: std::time::Duration) -> u64 {
 }
 
 fn flush_reclaim_budget(pending_reclaim_pages: usize, pages_written: usize) -> usize {
-    let write_scaled = pages_written.saturating_mul(2);
-    let backlog_scaled = pending_reclaim_pages / 4;
+    let write_scaled = pages_written.saturating_mul(8);
+    let backlog_scaled = pending_reclaim_pages / 2;
+    let pressure_cap = if pending_reclaim_pages >= FLUSH_RECLAIM_BACKLOG_HARD_CAP_PAGES {
+        FLUSH_RECLAIM_MAX_BUDGET_PAGES
+    } else if pending_reclaim_pages >= 4 * 1_048_576 {
+        FLUSH_RECLAIM_MAX_BUDGET_PAGES / 2
+    } else {
+        FLUSH_RECLAIM_MAX_BUDGET_PAGES / 8
+    };
     FLUSH_RECLAIM_MIN_BUDGET_PAGES
         .max(write_scaled)
         .max(backlog_scaled)
-        .min(FLUSH_RECLAIM_MAX_BUDGET_PAGES)
+        .min(pressure_cap)
 }
 
 struct CheckpointInstallReceiver {
@@ -873,9 +881,9 @@ impl Db {
         }
         let mut rc_apply_queue = 0usize;
         let mut rc_private_pages = 0usize;
-        let mut rc_retired_pages = 0usize;
-        let mut rc_pagebuf_total = 0usize;
-        let mut rc_pagebuf_dirty = 0usize;
+        let rc_retired_pages = 0usize;
+        let rc_pagebuf_total = 0usize;
+        let rc_pagebuf_dirty = 0usize;
         for shard in &self.refcount_shards {
             rc_apply_queue += shard.apply_lane.queue_len();
             // Paged-array refcount has no COW / private / retired
@@ -1235,10 +1243,33 @@ impl Db {
         }
 
         let reclaim_started = std::time::Instant::now();
-        let reclaim_budget =
-            flush_reclaim_budget(self.page_store.deferred_free_len(), total_pages_written);
-        self.reclaim_freed_pages_budget(reclaim_budget)?;
+        let deferred_before = self.page_store.deferred_free_len();
+        let reclaim_budget = flush_reclaim_budget(deferred_before, total_pages_written);
+        let reclaim_outcome = self.reclaim_freed_pages_budget(reclaim_budget)?;
         crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
+        let deferred_after = self.page_store.deferred_free_len();
+        let blocked = reclaim_budget
+            .min(deferred_before)
+            .saturating_sub(reclaim_outcome.selected);
+        self.metrics.record_flush_reclaim_pages(
+            reclaim_budget,
+            reclaim_outcome.selected,
+            reclaim_outcome.reclaimed.len(),
+            blocked,
+        );
+        if deferred_before >= 1_048_576
+            && reclaim_outcome.selected < (reclaim_budget / 4).min(deferred_before)
+        {
+            tracing::debug!(
+                deferred_before,
+                deferred_after,
+                reclaim_budget,
+                selected = reclaim_outcome.selected,
+                reclaimed = reclaim_outcome.reclaimed.len(),
+                safe_below = reclaim_outcome.safe_below,
+                "metadb: reclaim selected few pages under backlog"
+            );
+        }
         self.metrics.record_flush_reclaim(reclaim_started.elapsed());
         self.metrics.record_flush_total(flush_started.elapsed());
         Ok(true)
@@ -1269,20 +1300,23 @@ impl Db {
     /// allocator that hands the pid back out for a different page would
     /// hit the stale cached entry instead of fetching the new content.
     pub(crate) fn reclaim_freed_pages(&self) -> Result<()> {
-        let reclaimed = self.page_store.try_reclaim()?;
-        self.invalidate_reclaimed_pages(reclaimed);
+        let outcome = self.page_store.try_reclaim()?;
+        self.invalidate_reclaimed_pages(&outcome.reclaimed);
         Ok(())
     }
 
-    pub(crate) fn reclaim_freed_pages_budget(&self, max_pages: usize) -> Result<()> {
-        let reclaimed = self.page_store.try_reclaim_limit(max_pages)?;
-        self.invalidate_reclaimed_pages(reclaimed);
-        Ok(())
+    pub(crate) fn reclaim_freed_pages_budget(
+        &self,
+        max_pages: usize,
+    ) -> Result<crate::page_store::ReclaimOutcome> {
+        let outcome = self.page_store.try_reclaim_limit(max_pages)?;
+        self.invalidate_reclaimed_pages(&outcome.reclaimed);
+        Ok(outcome)
     }
 
-    fn invalidate_reclaimed_pages(&self, reclaimed: Vec<crate::types::PageId>) {
+    fn invalidate_reclaimed_pages(&self, reclaimed: &[crate::types::PageId]) {
         for pid in reclaimed {
-            self.page_cache.invalidate(pid);
+            self.page_cache.invalidate(*pid);
         }
     }
 }
@@ -1296,10 +1330,14 @@ mod tests {
         assert_eq!(flush_reclaim_budget(0, 0), FLUSH_RECLAIM_MIN_BUDGET_PAGES);
         assert_eq!(
             flush_reclaim_budget(0, FLUSH_RECLAIM_MIN_BUDGET_PAGES),
-            FLUSH_RECLAIM_MIN_BUDGET_PAGES * 2
+            FLUSH_RECLAIM_MIN_BUDGET_PAGES * 8
         );
         assert_eq!(
-            flush_reclaim_budget(FLUSH_RECLAIM_MAX_BUDGET_PAGES * 8, 1),
+            flush_reclaim_budget(8 * 1_048_576, 1),
+            FLUSH_RECLAIM_MAX_BUDGET_PAGES / 2
+        );
+        assert_eq!(
+            flush_reclaim_budget(FLUSH_RECLAIM_BACKLOG_HARD_CAP_PAGES, 1),
             FLUSH_RECLAIM_MAX_BUDGET_PAGES
         );
     }

@@ -214,8 +214,7 @@ impl<'db> Transaction<'db> {
     /// Delete a dedup entry only if its current value equals
     /// `old_value` at WAL apply time.
     pub fn compare_delete_dedup(&mut self, hash: Hash8, old_value: DedupValue) -> &mut Self {
-        self.ops
-            .push(WalOp::DedupCompareDelete { hash, old_value });
+        self.ops.push(WalOp::DedupCompareDelete { hash, old_value });
         self
     }
 
