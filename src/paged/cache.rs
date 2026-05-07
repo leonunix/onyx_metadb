@@ -45,6 +45,31 @@ impl DirtySnapshot {
     pub(crate) fn is_empty(&self) -> bool {
         self.pages.is_empty()
     }
+
+    pub(crate) fn seal(&self) -> Result<FlushedSnapshot> {
+        let mut flushed = Vec::with_capacity(self.pages.len());
+        for page in &self.pages {
+            let mut sealed = (*page.original).clone();
+            sealed.seal();
+            flushed.push(FlushedSnapshotPage {
+                pid: page.pid,
+                original: page.original.clone(),
+                sealed: Arc::new(sealed),
+            });
+        }
+        for page in &flushed {
+            let is_index = matches!(
+                page.sealed.header().map(|h| h.page_type),
+                Ok(PageType::PagedIndex)
+            );
+            if is_index && self.page_cache.pin(page.pid, page.sealed.clone()) {
+                // Pinned pages shadow LRU lookups.
+            } else if is_index {
+                self.page_cache.insert(page.pid, page.sealed.clone());
+            }
+        }
+        Ok(FlushedSnapshot { pages: flushed })
+    }
 }
 
 pub(crate) struct FlushedSnapshot {
@@ -835,28 +860,8 @@ impl DirtySnapshot {
         if self.pages.is_empty() {
             return Ok(FlushedSnapshot { pages: Vec::new() });
         }
-        let mut flushed = Vec::with_capacity(self.pages.len());
-        for page in &self.pages {
-            let mut sealed = (*page.original).clone();
-            sealed.seal();
-            flushed.push(FlushedSnapshotPage {
-                pid: page.pid,
-                original: page.original.clone(),
-                sealed: Arc::new(sealed),
-            });
-        }
-        for page in &flushed {
-            let is_index = matches!(
-                page.sealed.header().map(|h| h.page_type),
-                Ok(PageType::PagedIndex)
-            );
-            if is_index && self.page_cache.pin(page.pid, page.sealed.clone()) {
-                // Pinned pages shadow LRU lookups.
-            } else if is_index {
-                self.page_cache.insert(page.pid, page.sealed.clone());
-            }
-        }
-        Ok(FlushedSnapshot { pages: flushed })
+        let flushed = self.seal()?;
+        Ok(flushed)
     }
 }
 

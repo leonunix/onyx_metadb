@@ -1,0 +1,5 @@
+# Seeds for onyx_integration_proptest regressions.
+#
+# This file was absent from git but open in the IDE during the metrics
+# instrumentation run. Preserve the path so future failing proptest runs can
+# append concrete seeds here.

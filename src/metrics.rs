@@ -2,6 +2,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, Default)]
+pub(crate) struct DedupPutStageTimings {
+    pub l0_insert: Duration,
+    pub l1_put: Duration,
+    pub cuckoo_update_existing: Duration,
+    pub cuckoo_free_slots: Duration,
+    pub cuckoo_try_insert_empty: Duration,
+    pub cuckoo_evict_and_insert: Duration,
+    pub cuckoo_page_read_cache_wait: Duration,
+    pub cuckoo_page_alloc: Duration,
+    pub cuckoo_page_write_publish: Duration,
+    pub cuckoo_bucket_lock_wait: Duration,
+}
+
+#[derive(Debug, Default)]
 pub struct MetaMetrics {
     commit_attempts: AtomicU64,
     commit_success: AtomicU64,
@@ -134,6 +148,26 @@ pub struct MetaMetrics {
     dedup_apply_reverse_delete_count: AtomicU64,
     dedup_apply_reverse_delete_us: AtomicU64,
     dedup_apply_reverse_delete_max_us: AtomicU64,
+    dedup_put_l0_insert_us: AtomicU64,
+    dedup_put_l0_insert_max_us: AtomicU64,
+    dedup_put_l1_put_us: AtomicU64,
+    dedup_put_l1_put_max_us: AtomicU64,
+    dedup_put_cuckoo_update_existing_us: AtomicU64,
+    dedup_put_cuckoo_update_existing_max_us: AtomicU64,
+    dedup_put_cuckoo_free_slots_us: AtomicU64,
+    dedup_put_cuckoo_free_slots_max_us: AtomicU64,
+    dedup_put_cuckoo_try_insert_empty_us: AtomicU64,
+    dedup_put_cuckoo_try_insert_empty_max_us: AtomicU64,
+    dedup_put_cuckoo_evict_and_insert_us: AtomicU64,
+    dedup_put_cuckoo_evict_and_insert_max_us: AtomicU64,
+    dedup_put_cuckoo_page_read_cache_wait_us: AtomicU64,
+    dedup_put_cuckoo_page_read_cache_wait_max_us: AtomicU64,
+    dedup_put_cuckoo_page_alloc_us: AtomicU64,
+    dedup_put_cuckoo_page_alloc_max_us: AtomicU64,
+    dedup_put_cuckoo_page_write_publish_us: AtomicU64,
+    dedup_put_cuckoo_page_write_publish_max_us: AtomicU64,
+    dedup_put_cuckoo_bucket_lock_wait_us: AtomicU64,
+    dedup_put_cuckoo_bucket_lock_wait_max_us: AtomicU64,
 
     // L2P read-path split. `l2p_get_lock_wait_us` is time spent blocked
     // acquiring the shard tree read lock (i.e. an apply or another writer
@@ -187,6 +221,14 @@ pub struct MetaMetrics {
     flush_sample_max_us_forced: AtomicU64,
     flush_io_us: AtomicU64,
     flush_io_max_us: AtomicU64,
+    flush_io_seal_us: AtomicU64,
+    flush_io_seal_max_us: AtomicU64,
+    flush_io_page_write_us: AtomicU64,
+    flush_io_page_write_max_us: AtomicU64,
+    flush_io_rc_meta_us: AtomicU64,
+    flush_io_rc_meta_max_us: AtomicU64,
+    flush_io_sync_us: AtomicU64,
+    flush_io_sync_max_us: AtomicU64,
     flush_manifest_us: AtomicU64,
     flush_manifest_max_us: AtomicU64,
     flush_install_us: AtomicU64,
@@ -367,6 +409,26 @@ pub struct MetaMetricsSnapshot {
     pub dedup_apply_reverse_delete_count: u64,
     pub dedup_apply_reverse_delete_us: u64,
     pub dedup_apply_reverse_delete_max_us: u64,
+    pub dedup_put_l0_insert_us: u64,
+    pub dedup_put_l0_insert_max_us: u64,
+    pub dedup_put_l1_put_us: u64,
+    pub dedup_put_l1_put_max_us: u64,
+    pub dedup_put_cuckoo_update_existing_us: u64,
+    pub dedup_put_cuckoo_update_existing_max_us: u64,
+    pub dedup_put_cuckoo_free_slots_us: u64,
+    pub dedup_put_cuckoo_free_slots_max_us: u64,
+    pub dedup_put_cuckoo_try_insert_empty_us: u64,
+    pub dedup_put_cuckoo_try_insert_empty_max_us: u64,
+    pub dedup_put_cuckoo_evict_and_insert_us: u64,
+    pub dedup_put_cuckoo_evict_and_insert_max_us: u64,
+    pub dedup_put_cuckoo_page_read_cache_wait_us: u64,
+    pub dedup_put_cuckoo_page_read_cache_wait_max_us: u64,
+    pub dedup_put_cuckoo_page_alloc_us: u64,
+    pub dedup_put_cuckoo_page_alloc_max_us: u64,
+    pub dedup_put_cuckoo_page_write_publish_us: u64,
+    pub dedup_put_cuckoo_page_write_publish_max_us: u64,
+    pub dedup_put_cuckoo_bucket_lock_wait_us: u64,
+    pub dedup_put_cuckoo_bucket_lock_wait_max_us: u64,
     pub l2p_get_calls: u64,
     pub l2p_get_lock_wait_us: u64,
     pub l2p_get_lock_wait_max_us: u64,
@@ -403,6 +465,14 @@ pub struct MetaMetricsSnapshot {
     pub flush_sample_max_us_forced: u64,
     pub flush_io_us: u64,
     pub flush_io_max_us: u64,
+    pub flush_io_seal_us: u64,
+    pub flush_io_seal_max_us: u64,
+    pub flush_io_page_write_us: u64,
+    pub flush_io_page_write_max_us: u64,
+    pub flush_io_rc_meta_us: u64,
+    pub flush_io_rc_meta_max_us: u64,
+    pub flush_io_sync_us: u64,
+    pub flush_io_sync_max_us: u64,
     pub flush_manifest_us: u64,
     pub flush_manifest_max_us: u64,
     pub flush_install_us: u64,
@@ -556,6 +626,48 @@ impl MetaMetrics {
             dedup_apply_reverse_delete_count: load(&self.dedup_apply_reverse_delete_count),
             dedup_apply_reverse_delete_us: load(&self.dedup_apply_reverse_delete_us),
             dedup_apply_reverse_delete_max_us: load(&self.dedup_apply_reverse_delete_max_us),
+            dedup_put_l0_insert_us: load(&self.dedup_put_l0_insert_us),
+            dedup_put_l0_insert_max_us: load(&self.dedup_put_l0_insert_max_us),
+            dedup_put_l1_put_us: load(&self.dedup_put_l1_put_us),
+            dedup_put_l1_put_max_us: load(&self.dedup_put_l1_put_max_us),
+            dedup_put_cuckoo_update_existing_us: load(&self.dedup_put_cuckoo_update_existing_us),
+            dedup_put_cuckoo_update_existing_max_us: load(
+                &self.dedup_put_cuckoo_update_existing_max_us,
+            ),
+            dedup_put_cuckoo_free_slots_us: load(&self.dedup_put_cuckoo_free_slots_us),
+            dedup_put_cuckoo_free_slots_max_us: load(&self.dedup_put_cuckoo_free_slots_max_us),
+            dedup_put_cuckoo_try_insert_empty_us: load(
+                &self.dedup_put_cuckoo_try_insert_empty_us,
+            ),
+            dedup_put_cuckoo_try_insert_empty_max_us: load(
+                &self.dedup_put_cuckoo_try_insert_empty_max_us,
+            ),
+            dedup_put_cuckoo_evict_and_insert_us: load(
+                &self.dedup_put_cuckoo_evict_and_insert_us,
+            ),
+            dedup_put_cuckoo_evict_and_insert_max_us: load(
+                &self.dedup_put_cuckoo_evict_and_insert_max_us,
+            ),
+            dedup_put_cuckoo_page_read_cache_wait_us: load(
+                &self.dedup_put_cuckoo_page_read_cache_wait_us,
+            ),
+            dedup_put_cuckoo_page_read_cache_wait_max_us: load(
+                &self.dedup_put_cuckoo_page_read_cache_wait_max_us,
+            ),
+            dedup_put_cuckoo_page_alloc_us: load(&self.dedup_put_cuckoo_page_alloc_us),
+            dedup_put_cuckoo_page_alloc_max_us: load(&self.dedup_put_cuckoo_page_alloc_max_us),
+            dedup_put_cuckoo_page_write_publish_us: load(
+                &self.dedup_put_cuckoo_page_write_publish_us,
+            ),
+            dedup_put_cuckoo_page_write_publish_max_us: load(
+                &self.dedup_put_cuckoo_page_write_publish_max_us,
+            ),
+            dedup_put_cuckoo_bucket_lock_wait_us: load(
+                &self.dedup_put_cuckoo_bucket_lock_wait_us,
+            ),
+            dedup_put_cuckoo_bucket_lock_wait_max_us: load(
+                &self.dedup_put_cuckoo_bucket_lock_wait_max_us,
+            ),
             l2p_get_calls: load(&self.l2p_get_calls),
             l2p_get_lock_wait_us: load(&self.l2p_get_lock_wait_us),
             l2p_get_lock_wait_max_us: load(&self.l2p_get_lock_wait_max_us),
@@ -592,6 +704,14 @@ impl MetaMetrics {
             flush_sample_max_us_forced: load(&self.flush_sample_max_us_forced),
             flush_io_us: load(&self.flush_io_us),
             flush_io_max_us: load(&self.flush_io_max_us),
+            flush_io_seal_us: load(&self.flush_io_seal_us),
+            flush_io_seal_max_us: load(&self.flush_io_seal_max_us),
+            flush_io_page_write_us: load(&self.flush_io_page_write_us),
+            flush_io_page_write_max_us: load(&self.flush_io_page_write_max_us),
+            flush_io_rc_meta_us: load(&self.flush_io_rc_meta_us),
+            flush_io_rc_meta_max_us: load(&self.flush_io_rc_meta_max_us),
+            flush_io_sync_us: load(&self.flush_io_sync_us),
+            flush_io_sync_max_us: load(&self.flush_io_sync_max_us),
             flush_manifest_us: load(&self.flush_manifest_us),
             flush_manifest_max_us: load(&self.flush_manifest_max_us),
             flush_install_us: load(&self.flush_install_us),
@@ -692,6 +812,38 @@ impl MetaMetrics {
         record_duration(&self.flush_io_us, &self.flush_io_max_us, elapsed);
         self.flush_pages_written
             .fetch_add(pages as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_flush_io_seal(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_io_seal_us,
+            &self.flush_io_seal_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_flush_io_page_write(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_io_page_write_us,
+            &self.flush_io_page_write_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_flush_io_rc_meta(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_io_rc_meta_us,
+            &self.flush_io_rc_meta_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_flush_io_sync(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_io_sync_us,
+            &self.flush_io_sync_max_us,
+            elapsed,
+        );
     }
 
     pub(crate) fn record_flush_manifest(&self, elapsed: Duration) {
@@ -973,6 +1125,72 @@ impl MetaMetrics {
             &self.dedup_apply_forward_put_us,
             &self.dedup_apply_forward_put_max_us,
             elapsed,
+        );
+    }
+
+    pub(crate) fn record_dedup_forward_put_batch(&self, ops: u64, elapsed: Duration) {
+        if ops == 0 {
+            return;
+        }
+        self.dedup_apply_forward_put_count
+            .fetch_add(ops, Ordering::Relaxed);
+        record_duration(
+            &self.dedup_apply_forward_put_us,
+            &self.dedup_apply_forward_put_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_dedup_put_stages(&self, timings: DedupPutStageTimings) {
+        record_duration(
+            &self.dedup_put_l0_insert_us,
+            &self.dedup_put_l0_insert_max_us,
+            timings.l0_insert,
+        );
+        record_duration(
+            &self.dedup_put_l1_put_us,
+            &self.dedup_put_l1_put_max_us,
+            timings.l1_put,
+        );
+        record_duration(
+            &self.dedup_put_cuckoo_update_existing_us,
+            &self.dedup_put_cuckoo_update_existing_max_us,
+            timings.cuckoo_update_existing,
+        );
+        record_duration(
+            &self.dedup_put_cuckoo_free_slots_us,
+            &self.dedup_put_cuckoo_free_slots_max_us,
+            timings.cuckoo_free_slots,
+        );
+        record_duration(
+            &self.dedup_put_cuckoo_try_insert_empty_us,
+            &self.dedup_put_cuckoo_try_insert_empty_max_us,
+            timings.cuckoo_try_insert_empty,
+        );
+        record_duration(
+            &self.dedup_put_cuckoo_evict_and_insert_us,
+            &self.dedup_put_cuckoo_evict_and_insert_max_us,
+            timings.cuckoo_evict_and_insert,
+        );
+        record_duration(
+            &self.dedup_put_cuckoo_page_read_cache_wait_us,
+            &self.dedup_put_cuckoo_page_read_cache_wait_max_us,
+            timings.cuckoo_page_read_cache_wait,
+        );
+        record_duration(
+            &self.dedup_put_cuckoo_page_alloc_us,
+            &self.dedup_put_cuckoo_page_alloc_max_us,
+            timings.cuckoo_page_alloc,
+        );
+        record_duration(
+            &self.dedup_put_cuckoo_page_write_publish_us,
+            &self.dedup_put_cuckoo_page_write_publish_max_us,
+            timings.cuckoo_page_write_publish,
+        );
+        record_duration(
+            &self.dedup_put_cuckoo_bucket_lock_wait_us,
+            &self.dedup_put_cuckoo_bucket_lock_wait_max_us,
+            timings.cuckoo_bucket_lock_wait,
         );
     }
 
@@ -1367,6 +1585,26 @@ impl MetaMetricsSnapshot {
                 "\"dedup_apply_reverse_delete_count\":{},",
                 "\"dedup_apply_reverse_delete_us\":{},",
                 "\"dedup_apply_reverse_delete_max_us\":{},",
+                "\"dedup_put_l0_insert_us\":{},",
+                "\"dedup_put_l0_insert_max_us\":{},",
+                "\"dedup_put_l1_put_us\":{},",
+                "\"dedup_put_l1_put_max_us\":{},",
+                "\"dedup_put_cuckoo_update_existing_us\":{},",
+                "\"dedup_put_cuckoo_update_existing_max_us\":{},",
+                "\"dedup_put_cuckoo_free_slots_us\":{},",
+                "\"dedup_put_cuckoo_free_slots_max_us\":{},",
+                "\"dedup_put_cuckoo_try_insert_empty_us\":{},",
+                "\"dedup_put_cuckoo_try_insert_empty_max_us\":{},",
+                "\"dedup_put_cuckoo_evict_and_insert_us\":{},",
+                "\"dedup_put_cuckoo_evict_and_insert_max_us\":{},",
+                "\"dedup_put_cuckoo_page_read_cache_wait_us\":{},",
+                "\"dedup_put_cuckoo_page_read_cache_wait_max_us\":{},",
+                "\"dedup_put_cuckoo_page_alloc_us\":{},",
+                "\"dedup_put_cuckoo_page_alloc_max_us\":{},",
+                "\"dedup_put_cuckoo_page_write_publish_us\":{},",
+                "\"dedup_put_cuckoo_page_write_publish_max_us\":{},",
+                "\"dedup_put_cuckoo_bucket_lock_wait_us\":{},",
+                "\"dedup_put_cuckoo_bucket_lock_wait_max_us\":{},",
                 "\"l2p_get_calls\":{},",
                 "\"l2p_get_lock_wait_us\":{},",
                 "\"l2p_get_lock_wait_max_us\":{},",
@@ -1403,6 +1641,14 @@ impl MetaMetricsSnapshot {
                 "\"flush_sample_max_us_forced\":{},",
                 "\"flush_io_us\":{},",
                 "\"flush_io_max_us\":{},",
+                "\"flush_io_seal_us\":{},",
+                "\"flush_io_seal_max_us\":{},",
+                "\"flush_io_page_write_us\":{},",
+                "\"flush_io_page_write_max_us\":{},",
+                "\"flush_io_rc_meta_us\":{},",
+                "\"flush_io_rc_meta_max_us\":{},",
+                "\"flush_io_sync_us\":{},",
+                "\"flush_io_sync_max_us\":{},",
                 "\"flush_manifest_us\":{},",
                 "\"flush_manifest_max_us\":{},",
                 "\"flush_install_us\":{},",
@@ -1549,6 +1795,26 @@ impl MetaMetricsSnapshot {
             self.dedup_apply_reverse_delete_count,
             self.dedup_apply_reverse_delete_us,
             self.dedup_apply_reverse_delete_max_us,
+            self.dedup_put_l0_insert_us,
+            self.dedup_put_l0_insert_max_us,
+            self.dedup_put_l1_put_us,
+            self.dedup_put_l1_put_max_us,
+            self.dedup_put_cuckoo_update_existing_us,
+            self.dedup_put_cuckoo_update_existing_max_us,
+            self.dedup_put_cuckoo_free_slots_us,
+            self.dedup_put_cuckoo_free_slots_max_us,
+            self.dedup_put_cuckoo_try_insert_empty_us,
+            self.dedup_put_cuckoo_try_insert_empty_max_us,
+            self.dedup_put_cuckoo_evict_and_insert_us,
+            self.dedup_put_cuckoo_evict_and_insert_max_us,
+            self.dedup_put_cuckoo_page_read_cache_wait_us,
+            self.dedup_put_cuckoo_page_read_cache_wait_max_us,
+            self.dedup_put_cuckoo_page_alloc_us,
+            self.dedup_put_cuckoo_page_alloc_max_us,
+            self.dedup_put_cuckoo_page_write_publish_us,
+            self.dedup_put_cuckoo_page_write_publish_max_us,
+            self.dedup_put_cuckoo_bucket_lock_wait_us,
+            self.dedup_put_cuckoo_bucket_lock_wait_max_us,
             self.l2p_get_calls,
             self.l2p_get_lock_wait_us,
             self.l2p_get_lock_wait_max_us,
@@ -1585,6 +1851,14 @@ impl MetaMetricsSnapshot {
             self.flush_sample_max_us_forced,
             self.flush_io_us,
             self.flush_io_max_us,
+            self.flush_io_seal_us,
+            self.flush_io_seal_max_us,
+            self.flush_io_page_write_us,
+            self.flush_io_page_write_max_us,
+            self.flush_io_rc_meta_us,
+            self.flush_io_rc_meta_max_us,
+            self.flush_io_sync_us,
+            self.flush_io_sync_max_us,
             self.flush_manifest_us,
             self.flush_manifest_max_us,
             self.flush_install_us,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::metrics::DedupPutStageTimings;
 use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, Debug)]
@@ -1243,6 +1244,7 @@ impl Db {
         let batch_started = std::time::Instant::now();
         let mut outcomes = Vec::with_capacity(indices.len());
         let mut reverse_puts: HashMap<Pba, Vec<Hash8>> = HashMap::new();
+        let mut pending_puts: Vec<(Hash8, DedupValue, usize)> = Vec::new();
         let flush_pba = |pba: Pba, reverse_puts: &mut HashMap<Pba, Vec<Hash8>>| -> Result<()> {
             let Some(hashes) = reverse_puts.remove(&pba) else {
                 return Ok(());
@@ -1260,15 +1262,36 @@ impl Db {
             }
             Ok(())
         };
+        let flush_pending_puts =
+            |pending_puts: &mut Vec<(Hash8, DedupValue, usize)>,
+             outcomes: &mut Vec<(usize, ApplyOutcome)>|
+             -> Result<()> {
+                if pending_puts.is_empty() {
+                    return Ok(());
+                }
+                let entries: Vec<(Hash8, DedupValue)> = pending_puts
+                    .iter()
+                    .map(|(hash, value, _)| (*hash, *value))
+                    .collect();
+                let mut put_timings = DedupPutStageTimings::default();
+                let started = std::time::Instant::now();
+                dedup_index.put_many_with_metrics(&entries, lsn, &mut put_timings)?;
+                metrics.record_dedup_forward_put_batch(
+                    pending_puts.len() as u64,
+                    started.elapsed(),
+                );
+                metrics.record_dedup_put_stages(put_timings);
+                for (_, _, idx) in pending_puts.drain(..) {
+                    outcomes.push((idx, ApplyOutcome::Dedup));
+                }
+                Ok(())
+            };
 
         for idx in indices {
             match &ops[idx] {
                 WalOp::DedupPut { hash, value } => {
                     flush_all(&mut reverse_puts)?;
-                    let started = std::time::Instant::now();
-                    dedup_index.put(*hash, *value, lsn)?;
-                    metrics.record_dedup_forward_put(started.elapsed());
-                    outcomes.push((idx, ApplyOutcome::Dedup));
+                    pending_puts.push((*hash, *value, idx));
                 }
                 WalOp::DedupPutGuarded {
                     hash,
@@ -1276,6 +1299,7 @@ impl Db {
                     pba_guard,
                     min_rc,
                 } => {
+                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     let guard_started = std::time::Instant::now();
                     let rc = refcount_shards
                         .get((xxh3_64(&pba_guard.to_be_bytes()) as usize) % refcount_shards.len())
@@ -1283,14 +1307,17 @@ impl Db {
                         .get(*pba_guard)?;
                     metrics.record_dedup_guard(guard_started.elapsed());
                     if rc >= *min_rc {
+                        let mut put_timings = DedupPutStageTimings::default();
                         let started = std::time::Instant::now();
-                        dedup_index.put(*hash, *value, lsn)?;
+                        dedup_index.put_with_metrics(*hash, *value, lsn, &mut put_timings)?;
                         metrics.record_dedup_forward_put(started.elapsed());
+                        metrics.record_dedup_put_stages(put_timings);
                         reverse_puts.entry(*pba_guard).or_default().push(*hash);
                     }
                     outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupDelete { hash } => {
+                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     flush_all(&mut reverse_puts)?;
                     let started = std::time::Instant::now();
                     dedup_index.delete(hash, lsn)?;
@@ -1298,6 +1325,7 @@ impl Db {
                     outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupCompareDelete { hash, old_value } => {
+                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     flush_all(&mut reverse_puts)?;
                     let started = std::time::Instant::now();
                     let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
@@ -1312,20 +1340,25 @@ impl Db {
                     old_value,
                     new_value,
                 } => {
+                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     flush_all(&mut reverse_puts)?;
                     let started = std::time::Instant::now();
                     let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
                     if applied {
-                        dedup_index.put(*hash, *new_value, lsn)?;
+                        let mut put_timings = DedupPutStageTimings::default();
+                        dedup_index.put_with_metrics(*hash, *new_value, lsn, &mut put_timings)?;
                         metrics.record_dedup_forward_put(started.elapsed());
+                        metrics.record_dedup_put_stages(put_timings);
                     }
                     outcomes.push((idx, ApplyOutcome::DedupCompare { applied }));
                 }
                 WalOp::DedupReversePut { pba, hash } => {
+                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     reverse_puts.entry(*pba).or_default().push(*hash);
                     outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupReverseDelete { pba, hash } => {
+                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     flush_pba(*pba, &mut reverse_puts)?;
                     let started = std::time::Instant::now();
                     dedup_reverse.delete(*pba, *hash, lsn)?;
@@ -1335,6 +1368,7 @@ impl Db {
                 other => unreachable!("dedup bucket holds only dedup ops; saw {other:?}"),
             };
         }
+        flush_pending_puts(&mut pending_puts, &mut outcomes)?;
         flush_all(&mut reverse_puts)?;
         metrics.record_apply_dedup_batch(outcomes.len() as u64, batch_started.elapsed());
         Ok(outcomes)

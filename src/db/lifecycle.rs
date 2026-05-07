@@ -1183,13 +1183,16 @@ impl Db {
         for checkpoints in &l2p_checkpoints {
             let mut flushed = Vec::with_capacity(checkpoints.len());
             for checkpoint in checkpoints {
+                let seal_started = std::time::Instant::now();
                 match checkpoint.write_dirty_pages() {
                     Ok(pages) => {
+                        self.metrics.record_flush_io_seal(seal_started.elapsed());
                         total_pages_written += pages.pages_count();
                         pages.append_sealed_pages(&mut sealed_pages);
                         flushed.push(pages);
                     }
                     Err(err) => {
+                        self.metrics.record_flush_io_seal(seal_started.elapsed());
                         self.metrics
                             .record_flush_io(io_started.elapsed(), total_pages_written);
                         self.metrics.record_flush_total(kind, flush_started.elapsed());
@@ -1209,7 +1212,10 @@ impl Db {
             ckpt.append_sealed_pages(&mut sealed_pages);
             total_pages_written += sealed_pages.len() - before;
         }
+        let page_write_started = std::time::Instant::now();
         if let Err(err) = self.page_store.write_sealed_page_runs(sealed_pages) {
+            self.metrics
+                .record_flush_io_page_write(page_write_started.elapsed());
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics.record_flush_total(kind, flush_started.elapsed());
@@ -1217,6 +1223,8 @@ impl Db {
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
             return Err(err);
         }
+        self.metrics
+            .record_flush_io_page_write(page_write_started.elapsed());
         // Refcount meta-chain rewrite. write_meta_chain_external also
         // writes pages via page_store.write_page; the subsequent
         // page_store.sync() makes them durable before manifest commit.
@@ -1225,9 +1233,16 @@ impl Db {
         // manifest needs no per-flush update for refcount roots.
         let mut rc_new_chains: Vec<Vec<PageId>> = Vec::with_capacity(refcount_checkpoints.len());
         for (shard, ckpt) in self.refcount_shards.iter().zip(refcount_checkpoints.iter()) {
+            let rc_meta_started = std::time::Instant::now();
             match shard.rc.write_meta_chain(ckpt, wal_checkpoint) {
-                Ok(chain) => rc_new_chains.push(chain),
+                Ok(chain) => {
+                    self.metrics
+                        .record_flush_io_rc_meta(rc_meta_started.elapsed());
+                    rc_new_chains.push(chain);
+                }
                 Err(err) => {
+                    self.metrics
+                        .record_flush_io_rc_meta(rc_meta_started.elapsed());
                     self.metrics
                         .record_flush_io(io_started.elapsed(), total_pages_written);
                     self.metrics.record_flush_total(kind, flush_started.elapsed());
@@ -1237,7 +1252,9 @@ impl Db {
                 }
             }
         }
+        let sync_started = std::time::Instant::now();
         if let Err(err) = self.page_store.sync() {
+            self.metrics.record_flush_io_sync(sync_started.elapsed());
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics.record_flush_total(kind, flush_started.elapsed());
@@ -1245,6 +1262,7 @@ impl Db {
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
             return Err(err);
         }
+        self.metrics.record_flush_io_sync(sync_started.elapsed());
         self.metrics
             .record_flush_io(io_started.elapsed(), total_pages_written);
 

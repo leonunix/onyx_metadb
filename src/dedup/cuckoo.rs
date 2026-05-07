@@ -38,14 +38,16 @@
 //! Walk both candidate pages; clear the slot whose stored hash
 //! matches.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::cache::PageCache;
 use crate::dedup_types::{DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash8};
 use crate::error::{MetaDbError, Result};
+use crate::metrics::DedupPutStageTimings;
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::paged_meta;
@@ -81,7 +83,13 @@ const _: () = {
 /// `page_idx & (N - 1)` mask cheap. 64 is enough to spread the load
 /// for production sizing (10⁵+ data pages) while staying in a couple
 /// of cache lines.
-const BUCKET_LOCK_SHARDS: usize = 64;
+const BUCKET_LOCK_SHARDS: usize = 8192;
+
+#[derive(Clone, Copy)]
+pub(crate) struct CuckooPutEntry {
+    pub hash: Hash8,
+    pub value: DedupValue,
+}
 
 pub struct CuckooHash {
     bucket_count: u64,
@@ -111,6 +119,13 @@ struct Inner {
     /// Approximate number of occupied slots; used for `len()` and
     /// load-factor reporting. Recomputed exactly during `iter()`.
     approx_len: u64,
+}
+
+struct BatchPageState {
+    page_id: PageId,
+    page: Page,
+    bitmap: u128,
+    dirty: bool,
 }
 
 impl CuckooHash {
@@ -220,6 +235,17 @@ impl CuckooHash {
     /// success; `Err(Corruption("cuckoo full"))` only if the
     /// eviction chain exceeds [`MAX_CUCKOO_CHAIN`].
     pub fn put(&self, hash: Hash8, value: DedupValue, lsn: Lsn) -> Result<()> {
+        let mut timings = DedupPutStageTimings::default();
+        self.put_with_metrics(hash, value, lsn, &mut timings)
+    }
+
+    pub(crate) fn put_with_metrics(
+        &self,
+        hash: Hash8,
+        value: DedupValue,
+        lsn: Lsn,
+        timings: &mut DedupPutStageTimings,
+    ) -> Result<()> {
         // Idempotent overwrite: if the entry already exists, replace
         // the value in place and return. This keeps semantics
         // identical to the LSM `put` we are replacing.
@@ -231,7 +257,10 @@ impl CuckooHash {
         };
         let candidates = [b1, b2];
         for bucket in candidates[..candidate_count].iter().copied() {
-            if self.update_existing(bucket, &hash, value, lsn)? {
+            let started = std::time::Instant::now();
+            let updated = self.update_existing(bucket, &hash, value, lsn, Some(&mut *timings))?;
+            timings.cuckoo_update_existing += started.elapsed();
+            if updated {
                 return Ok(());
             }
         }
@@ -244,7 +273,9 @@ impl CuckooHash {
         let mut insert_order = candidates;
         let mut free_slots = [0usize; 2];
         for i in 0..candidate_count {
+            let started = std::time::Instant::now();
             free_slots[i] = self.free_slots_in_page(insert_order[i])?;
+            timings.cuckoo_free_slots += started.elapsed();
         }
         if candidate_count == 2 && free_slots[1] > free_slots[0] {
             insert_order.swap(0, 1);
@@ -255,15 +286,58 @@ impl CuckooHash {
                 continue;
             }
             let bucket = insert_order[i];
-            if self.try_insert_empty_in_page(bucket, hash, value, lsn)? {
+            let started = std::time::Instant::now();
+            let inserted =
+                self.try_insert_empty_in_page(bucket, hash, value, lsn, Some(&mut *timings))?;
+            timings.cuckoo_try_insert_empty += started.elapsed();
+            if inserted {
                 self.bump_len(1);
                 return Ok(());
             }
         }
         // Both candidate pages are full — kick off a cuckoo chain.
-        self.evict_and_insert(insert_order[0], hash, value, lsn)?;
+        let started = std::time::Instant::now();
+        self.evict_and_insert(insert_order[0], hash, value, lsn, Some(&mut *timings))?;
+        timings.cuckoo_evict_and_insert += started.elapsed();
         self.bump_len(1);
         Ok(())
+    }
+
+    pub(crate) fn put_many_with_metrics(
+        &self,
+        entries: &[CuckooPutEntry],
+        lsn: Lsn,
+        timings: &mut DedupPutStageTimings,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut positions: HashMap<Hash8, usize> = HashMap::new();
+        let mut unique = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(&idx) = positions.get(&entry.hash) {
+                unique[idx] = *entry;
+            } else {
+                positions.insert(entry.hash, unique.len());
+                unique.push(*entry);
+            }
+        }
+
+        let mut affected_pages = HashSet::new();
+        for entry in &unique {
+            let (b1, b2) = self.candidate_buckets(&entry.hash);
+            affected_pages.insert(bucket_offset(b1).0);
+            affected_pages.insert(bucket_offset(b2).0);
+        }
+        let use_batch = affected_pages.len().saturating_mul(2) <= unique.len();
+        if !use_batch {
+            for entry in &unique {
+                self.put_with_metrics(entry.hash, entry.value, lsn, timings)?;
+            }
+            return Ok(());
+        }
+
+        self.put_many_grouped_by_page(&unique, lsn, timings)
     }
 
     /// Remove the entry for `hash`. Returns `true` iff a matching slot
@@ -462,8 +536,9 @@ impl CuckooHash {
         hash: &Hash8,
         value: DedupValue,
         lsn: Lsn,
+        timings: Option<&mut DedupPutStageTimings>,
     ) -> Result<bool> {
-        self.with_existing_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
+        self.with_existing_bucket_mut(bucket_id, lsn, timings, |bitmap, page, bucket_in_page| {
             let start = bucket_in_page * ENTRIES_PER_BUCKET;
             for offset in 0..SLOTS_PER_PAGE {
                 let slot = (start + offset) % SLOTS_PER_PAGE;
@@ -486,8 +561,9 @@ impl CuckooHash {
         hash: Hash8,
         value: DedupValue,
         lsn: Lsn,
+        timings: Option<&mut DedupPutStageTimings>,
     ) -> Result<bool> {
-        self.with_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
+        self.with_bucket_mut(bucket_id, lsn, timings, |bitmap, page, bucket_in_page| {
             let start = bucket_in_page * ENTRIES_PER_BUCKET;
             for offset in 0..SLOTS_PER_PAGE {
                 let slot = (start + offset) % SLOTS_PER_PAGE;
@@ -502,7 +578,7 @@ impl CuckooHash {
     }
 
     fn try_clear_in_bucket(&self, bucket_id: u64, hash: &Hash8, lsn: Lsn) -> Result<bool> {
-        self.with_existing_bucket_mut(bucket_id, lsn, |bitmap, page, bucket_in_page| {
+        self.with_existing_bucket_mut(bucket_id, lsn, None, |bitmap, page, bucket_in_page| {
             let start = bucket_in_page * ENTRIES_PER_BUCKET;
             for offset in 0..SLOTS_PER_PAGE {
                 let slot = (start + offset) % SLOTS_PER_PAGE;
@@ -526,14 +602,22 @@ impl CuckooHash {
         mut hash: Hash8,
         mut value: DedupValue,
         lsn: Lsn,
+        mut timings: Option<&mut DedupPutStageTimings>,
     ) -> Result<()> {
         let mut current_bucket = start_bucket;
         for step in 0..MAX_CUCKOO_CHAIN {
             // Try empty slot first (unlikely but cheap to check).
-            if self.try_insert_empty_in_page(current_bucket, hash, value, lsn)? {
+            let inserted = match timings.as_deref_mut() {
+                Some(t) => self.try_insert_empty_in_page(current_bucket, hash, value, lsn, Some(t))?,
+                None => self.try_insert_empty_in_page(current_bucket, hash, value, lsn, None)?,
+            };
+            if inserted {
                 return Ok(());
             }
-            let victim = self.swap_into_victim_slot(current_bucket, hash, value, step, lsn)?;
+            let victim = match timings.as_deref_mut() {
+                Some(t) => self.swap_into_victim_slot(current_bucket, hash, value, step, lsn, Some(t))?,
+                None => self.swap_into_victim_slot(current_bucket, hash, value, step, lsn, None)?,
+            };
             hash = victim.0;
             value = victim.1;
             current_bucket = self.alternate_bucket_for_page(&hash, current_bucket);
@@ -551,8 +635,9 @@ impl CuckooHash {
         value: DedupValue,
         step: usize,
         lsn: Lsn,
+        timings: Option<&mut DedupPutStageTimings>,
     ) -> Result<(Hash8, DedupValue)> {
-        self.with_bucket_mut(bucket_id, lsn, |_bitmap, page, bucket_in_page| {
+        self.with_bucket_mut(bucket_id, lsn, timings, |_bitmap, page, bucket_in_page| {
             let start = bucket_in_page * ENTRIES_PER_BUCKET;
             let seed = hash[step % hash.len()] as usize;
             let slot = (start + seed + step) % SLOTS_PER_PAGE;
@@ -566,6 +651,7 @@ impl CuckooHash {
         &self,
         bucket_id: u64,
         lsn: Lsn,
+        mut timings: Option<&mut DedupPutStageTimings>,
         f: impl FnOnce(&mut u128, &mut Page, usize) -> Result<T>,
     ) -> Result<T> {
         let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
@@ -579,7 +665,11 @@ impl CuckooHash {
         // could observe the page-table entry under the meta mutex,
         // race ahead of the first writer's IO, and read all-zero
         // bytes via `get_for_modify`.
+        let lock_started = std::time::Instant::now();
         let _shard = self.bucket_locks[page_idx & (BUCKET_LOCK_SHARDS - 1)].lock();
+        if let Some(t) = timings.as_deref_mut() {
+            t.cuckoo_bucket_lock_wait += lock_started.elapsed();
+        }
         let (page_id, freshly_allocated) = {
             let mut inner = self.inner.lock();
             if page_idx >= inner.page_table.len() {
@@ -587,10 +677,14 @@ impl CuckooHash {
                     "cuckoo bucket_id {bucket_id} maps to page_idx {page_idx} but page_table \
                      is only {} entries",
                     inner.page_table.len(),
-                )));
+            )));
             }
             if inner.page_table[page_idx] == 0 {
+                let alloc_started = std::time::Instant::now();
                 let pid = self.page_store.allocate()?;
+                if let Some(t) = timings.as_deref_mut() {
+                    t.cuckoo_page_alloc += alloc_started.elapsed();
+                }
                 inner.page_table[page_idx] = pid;
                 inner.meta_dirty = true;
                 (pid, true)
@@ -601,7 +695,12 @@ impl CuckooHash {
         let mut page = if freshly_allocated {
             new_data_page()
         } else {
-            self.page_cache.get_for_modify(page_id)?
+            let read_started = std::time::Instant::now();
+            let page = self.page_cache.get_for_modify(page_id)?;
+            if let Some(t) = timings.as_deref_mut() {
+                t.cuckoo_page_read_cache_wait += read_started.elapsed();
+            }
+            page
         };
         let mut bitmap = read_bitmap(&page);
         let result = f(&mut bitmap, &mut page, bucket_in_page)?;
@@ -610,8 +709,12 @@ impl CuckooHash {
         header.generation = lsn.max(header.generation);
         page.write_header(&header);
         page.seal();
+        let publish_started = std::time::Instant::now();
         self.page_store.write_page(page_id, &page)?;
         self.page_cache.replace_or_insert(page_id, Arc::new(page));
+        if let Some(t) = timings.as_deref_mut() {
+            t.cuckoo_page_write_publish += publish_started.elapsed();
+        }
         Ok(result)
     }
 
@@ -619,10 +722,15 @@ impl CuckooHash {
         &self,
         bucket_id: u64,
         lsn: Lsn,
+        mut timings: Option<&mut DedupPutStageTimings>,
         f: impl FnOnce(&mut u128, &mut Page, usize) -> Result<(T, bool)>,
     ) -> Result<Option<T>> {
         let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
+        let lock_started = std::time::Instant::now();
         let _shard = self.bucket_locks[page_idx & (BUCKET_LOCK_SHARDS - 1)].lock();
+        if let Some(t) = timings.as_deref_mut() {
+            t.cuckoo_bucket_lock_wait += lock_started.elapsed();
+        }
         let page_id = {
             let inner = self.inner.lock();
             if page_idx >= inner.page_table.len() {
@@ -637,7 +745,11 @@ impl CuckooHash {
         if page_id == 0 {
             return Ok(None);
         }
+        let read_started = std::time::Instant::now();
         let mut page = (*self.page_cache.get(page_id)?).clone();
+        if let Some(t) = timings.as_deref_mut() {
+            t.cuckoo_page_read_cache_wait += read_started.elapsed();
+        }
         let mut bitmap = read_bitmap(&page);
         let (result, dirty) = f(&mut bitmap, &mut page, bucket_in_page)?;
         if dirty {
@@ -646,10 +758,286 @@ impl CuckooHash {
             header.generation = lsn.max(header.generation);
             page.write_header(&header);
             page.seal();
+            let publish_started = std::time::Instant::now();
             self.page_store.write_page(page_id, &page)?;
             self.page_cache.replace_or_insert(page_id, Arc::new(page));
+            if let Some(t) = timings.as_deref_mut() {
+                t.cuckoo_page_write_publish += publish_started.elapsed();
+            }
         }
         Ok(Some(result))
+    }
+
+    fn put_many_grouped_by_page(
+        &self,
+        entries: &[CuckooPutEntry],
+        lsn: Lsn,
+        timings: &mut DedupPutStageTimings,
+    ) -> Result<()> {
+        let mut page_ops: HashMap<usize, Vec<CuckooPutEntry>> = HashMap::new();
+        for entry in entries {
+            let (b1, b2) = self.candidate_buckets(&entry.hash);
+            page_ops.entry(bucket_offset(b1).0).or_default().push(*entry);
+            if bucket_offset(b2).0 != bucket_offset(b1).0 {
+                page_ops.entry(bucket_offset(b2).0).or_default().push(*entry);
+            }
+        }
+
+        let mut page_indices: Vec<usize> = page_ops.keys().copied().collect();
+        page_indices.sort_unstable();
+        let mut lock_shards: Vec<usize> = page_indices
+            .iter()
+            .map(|page_idx| page_idx & (BUCKET_LOCK_SHARDS - 1))
+            .collect();
+        lock_shards.sort_unstable();
+        lock_shards.dedup();
+        let lock_started = std::time::Instant::now();
+        let _guards: Vec<MutexGuard<'_, ()>> = lock_shards
+            .iter()
+            .map(|&shard| self.bucket_locks[shard].lock())
+            .collect();
+        timings.cuckoo_bucket_lock_wait += lock_started.elapsed();
+
+        let mut pages: HashMap<usize, BatchPageState> = HashMap::new();
+        let mut applied: HashSet<Hash8> = HashSet::new();
+        for page_idx in page_indices.iter().copied() {
+            let Some(candidates) = page_ops.get(&page_idx) else {
+                continue;
+            };
+            for hash in self.update_put_candidates_on_page_locked(
+                page_idx,
+                candidates,
+                timings,
+                &mut pages,
+            )? {
+                applied.insert(hash);
+            }
+        }
+
+        let mut inserted = 0u64;
+        for page_idx in page_indices.iter().copied() {
+            let Some(candidates) = page_ops.get(&page_idx) else {
+                continue;
+            };
+            let (inserted_here, hashes) = self.insert_put_candidates_on_page_locked(
+                page_idx,
+                candidates,
+                &applied,
+                timings,
+                &mut pages,
+            )?;
+            inserted = inserted.saturating_add(inserted_here);
+            for hash in hashes {
+                applied.insert(hash);
+            }
+        }
+
+        let publish_started = std::time::Instant::now();
+        let mut dirty_pages = Vec::new();
+        for state in pages.values_mut() {
+            if !state.dirty {
+                continue;
+            }
+            write_bitmap(&mut state.page, state.bitmap);
+            let mut header = state.page.header()?;
+            header.generation = lsn.max(header.generation);
+            state.page.write_header(&header);
+            state.page.seal();
+            dirty_pages.push((state.page_id, Arc::new(state.page.clone())));
+        }
+        self.page_store.write_sealed_page_runs(dirty_pages.clone())?;
+        for (page_id, page) in dirty_pages {
+            self.page_cache.replace_or_insert(page_id, page);
+        }
+        timings.cuckoo_page_write_publish += publish_started.elapsed();
+        let remaining: Vec<CuckooPutEntry> = entries
+            .iter()
+            .copied()
+            .filter(|entry| !applied.contains(&entry.hash))
+            .collect();
+        drop(_guards);
+        if inserted != 0 {
+            self.bump_len(inserted as i64);
+        }
+        for entry in remaining {
+            self.put_with_metrics(entry.hash, entry.value, lsn, timings)?;
+        }
+        Ok(())
+    }
+
+    fn update_put_candidates_on_page_locked(
+        &self,
+        page_idx: usize,
+        candidates: &[CuckooPutEntry],
+        timings: &mut DedupPutStageTimings,
+        pages: &mut HashMap<usize, BatchPageState>,
+    ) -> Result<Vec<Hash8>> {
+        let page_id = {
+            let inner = self.inner.lock();
+            if page_idx >= inner.page_table.len() {
+                return Err(MetaDbError::Corruption(format!(
+                    "cuckoo page_idx {page_idx} is outside page_table len {}",
+                    inner.page_table.len(),
+                )));
+            }
+            inner.page_table[page_idx]
+        };
+        if page_id == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.ensure_batch_page_loaded(page_idx, page_id, timings, pages)?;
+        let mut applied = Vec::new();
+
+        for entry in candidates {
+            let Some(state) = pages.get_mut(&page_idx) else {
+                unreachable!("batch page state must exist after ensure");
+            };
+            let (b1, b2) = self.candidate_buckets(&entry.hash);
+            let mut buckets = [b1, b2];
+            let count = if bucket_offset(b1).0 == bucket_offset(b2).0 {
+                1
+            } else {
+                2
+            };
+            if bucket_offset(buckets[0]).0 != page_idx {
+                buckets.swap(0, 1);
+            }
+            for &bucket in &buckets[..count] {
+                let (candidate_page_idx, bucket_in_page) = bucket_offset(bucket);
+                if candidate_page_idx != page_idx {
+                    continue;
+                }
+                let started = std::time::Instant::now();
+                if update_existing_in_loaded_page(
+                    &mut state.page,
+                    &state.bitmap,
+                    bucket_in_page,
+                    &entry.hash,
+                    &entry.value,
+                ) {
+                    timings.cuckoo_update_existing += started.elapsed();
+                    state.dirty = true;
+                    applied.push(entry.hash);
+                    break;
+                }
+                timings.cuckoo_update_existing += started.elapsed();
+            }
+        }
+        Ok(applied)
+    }
+
+    fn insert_put_candidates_on_page_locked(
+        &self,
+        page_idx: usize,
+        candidates: &[CuckooPutEntry],
+        already_applied: &HashSet<Hash8>,
+        timings: &mut DedupPutStageTimings,
+        pages: &mut HashMap<usize, BatchPageState>,
+    ) -> Result<(u64, Vec<Hash8>)> {
+        if candidates
+            .iter()
+            .all(|entry| already_applied.contains(&entry.hash))
+        {
+            return Ok((0, Vec::new()));
+        }
+
+        let (page_id, freshly_allocated) = {
+            let mut inner = self.inner.lock();
+            if page_idx >= inner.page_table.len() {
+                return Err(MetaDbError::Corruption(format!(
+                    "cuckoo page_idx {page_idx} is outside page_table len {}",
+                    inner.page_table.len(),
+                )));
+            }
+            if inner.page_table[page_idx] == 0 {
+                let alloc_started = std::time::Instant::now();
+                let pid = self.page_store.allocate()?;
+                timings.cuckoo_page_alloc += alloc_started.elapsed();
+                inner.page_table[page_idx] = pid;
+                inner.meta_dirty = true;
+                (pid, true)
+            } else {
+                (inner.page_table[page_idx], false)
+            }
+        };
+
+        if freshly_allocated {
+            pages.entry(page_idx).or_insert_with(|| BatchPageState {
+                page_id,
+                page: new_data_page(),
+                bitmap: 0,
+                dirty: false,
+            });
+        } else {
+            self.ensure_batch_page_loaded(page_idx, page_id, timings, pages)?;
+        }
+        let mut inserted = 0u64;
+        let mut applied = Vec::new();
+
+        for entry in candidates {
+            if already_applied.contains(&entry.hash) {
+                continue;
+            }
+            let Some(state) = pages.get_mut(&page_idx) else {
+                unreachable!("batch page state must exist after ensure");
+            };
+            let (b1, b2) = self.candidate_buckets(&entry.hash);
+            let mut buckets = [b1, b2];
+            let count = if bucket_offset(b1).0 == bucket_offset(b2).0 {
+                1
+            } else {
+                2
+            };
+            if bucket_offset(buckets[0]).0 != page_idx {
+                buckets.swap(0, 1);
+            }
+            for &bucket in &buckets[..count] {
+                let (candidate_page_idx, bucket_in_page) = bucket_offset(bucket);
+                if candidate_page_idx != page_idx {
+                    continue;
+                }
+                let started = std::time::Instant::now();
+                if let Some(slot) = first_empty_slot_in_loaded_page(&state.bitmap, bucket_in_page) {
+                    write_slot(&mut state.page, slot, &entry.hash, &entry.value);
+                    state.bitmap |= 1u128 << slot;
+                    state.dirty = true;
+                    timings.cuckoo_try_insert_empty += started.elapsed();
+                    inserted += 1;
+                    applied.push(entry.hash);
+                    break;
+                }
+                timings.cuckoo_try_insert_empty += started.elapsed();
+            }
+        }
+
+        Ok((inserted, applied))
+    }
+
+    fn ensure_batch_page_loaded(
+        &self,
+        page_idx: usize,
+        page_id: PageId,
+        timings: &mut DedupPutStageTimings,
+        pages: &mut HashMap<usize, BatchPageState>,
+    ) -> Result<()> {
+        if pages.contains_key(&page_idx) {
+            return Ok(());
+        }
+        let read_started = std::time::Instant::now();
+        let page = self.page_cache.get_for_modify(page_id)?;
+        timings.cuckoo_page_read_cache_wait += read_started.elapsed();
+        let bitmap = read_bitmap(&page);
+        pages.insert(
+            page_idx,
+            BatchPageState {
+                page_id,
+                page,
+                bitmap,
+                dirty: false,
+            },
+        );
+        Ok(())
     }
 
     fn bump_len(&self, delta: i64) {
@@ -694,6 +1082,38 @@ fn read_slot(page: &Page, slot: usize) -> (Hash8, DedupValue) {
     let mut value = [0u8; DEDUP_VALUE_SIZE];
     value.copy_from_slice(&payload[off + HASH_SIZE..off + HASH_SIZE + DEDUP_VALUE_SIZE]);
     (hash, DedupValue(value))
+}
+
+fn update_existing_in_loaded_page(
+    page: &mut Page,
+    bitmap: &u128,
+    bucket_in_page: usize,
+    hash: &Hash8,
+    value: &DedupValue,
+) -> bool {
+    let start = bucket_in_page * ENTRIES_PER_BUCKET;
+    for offset in 0..SLOTS_PER_PAGE {
+        let slot = (start + offset) % SLOTS_PER_PAGE;
+        if *bitmap & (1u128 << slot) != 0 {
+            let (stored_hash, _) = read_slot(page, slot);
+            if &stored_hash == hash {
+                write_slot(page, slot, hash, value);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn first_empty_slot_in_loaded_page(bitmap: &u128, bucket_in_page: usize) -> Option<usize> {
+    let start = bucket_in_page * ENTRIES_PER_BUCKET;
+    for offset in 0..SLOTS_PER_PAGE {
+        let slot = (start + offset) % SLOTS_PER_PAGE;
+        if *bitmap & (1u128 << slot) == 0 {
+            return Some(slot);
+        }
+    }
+    None
 }
 
 #[inline]

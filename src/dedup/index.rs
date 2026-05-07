@@ -44,10 +44,11 @@ use std::sync::Arc;
 use crate::cache::PageCache;
 use crate::dedup_types::{DedupValue, Hash8};
 use crate::error::Result;
+use crate::metrics::DedupPutStageTimings;
 use crate::page_store::PageStore;
 use crate::types::{Lsn, PageId};
 
-use super::cuckoo::{CuckooHash, ENTRIES_PER_BUCKET};
+use super::cuckoo::{CuckooHash, CuckooPutEntry, ENTRIES_PER_BUCKET};
 use super::fp_of;
 use super::l1_cache::{L1HotCache, LookupResult};
 use super::sketch::FpSketch;
@@ -191,6 +192,54 @@ impl DedupIndex {
         Ok(())
     }
 
+    pub(crate) fn put_with_metrics(
+        &self,
+        hash: Hash8,
+        value: DedupValue,
+        lsn: Lsn,
+        timings: &mut DedupPutStageTimings,
+    ) -> Result<()> {
+        self.cuckoo.put_with_metrics(hash, value, lsn, timings)?;
+        let fp = fp_of(&hash);
+        let started = std::time::Instant::now();
+        self.sketch.insert(fp);
+        timings.l0_insert += started.elapsed();
+        let started = std::time::Instant::now();
+        self.l1.put(fp, hash, value);
+        timings.l1_put += started.elapsed();
+        Ok(())
+    }
+
+    pub(crate) fn put_many_with_metrics(
+        &self,
+        entries: &[(Hash8, DedupValue)],
+        lsn: Lsn,
+        timings: &mut DedupPutStageTimings,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let cuckoo_entries: Vec<CuckooPutEntry> = entries
+            .iter()
+            .map(|(hash, value)| CuckooPutEntry {
+                hash: *hash,
+                value: *value,
+            })
+            .collect();
+        self.cuckoo
+            .put_many_with_metrics(&cuckoo_entries, lsn, timings)?;
+        for (hash, value) in entries {
+            let fp = fp_of(hash);
+            let started = std::time::Instant::now();
+            self.sketch.insert(fp);
+            timings.l0_insert += started.elapsed();
+            let started = std::time::Instant::now();
+            self.l1.put(fp, *hash, *value);
+            timings.l1_put += started.elapsed();
+        }
+        Ok(())
+    }
+
     pub fn delete(&self, hash: &Hash8, lsn: Lsn) -> Result<()> {
         // Order matters: clear L3 first so a concurrent reader that
         // sees fp ∈ L0 falls through to L3 and gets `None`. After
@@ -291,6 +340,20 @@ mod tests {
         // L0 + L1 populated.
         assert_eq!(idx.tier_sizes().l0_distinct_fps, 1);
         assert_eq!(idx.tier_sizes().l1_entries, 1);
+    }
+
+    #[test]
+    fn put_many_round_trips_and_keeps_last_duplicate() {
+        let (_d, idx) = make_index();
+        let mut timings = DedupPutStageTimings::default();
+        idx.put_many_with_metrics(
+            &[(h(0xAA), dv(1)), (h(0xBB), dv(2)), (h(0xAA), dv(3))],
+            100,
+            &mut timings,
+        )
+        .unwrap();
+        assert_eq!(idx.get(&h(0xAA)).unwrap(), Some(dv(3)));
+        assert_eq!(idx.get(&h(0xBB)).unwrap(), Some(dv(2)));
     }
 
     #[test]
