@@ -158,9 +158,17 @@ fn create_with_dedup_shards_n4_round_trips_through_reopen() {
         db.flush().unwrap();
 
         let manifest = db.manifest();
+        // `dedup_shards` is still a runtime tunable (it drives apply
+        // lanes and dedup routing fan-out), but the dedup_index is now
+        // a single cuckoo table (`a07bd50`) and dedup_reverse is a
+        // single paged-array (`6bc4d92`). Both stamp their stable head
+        // page id under the legacy `*_shard_heads` slot, so the outer
+        // length is always 1 regardless of `dedup_shards`.
         assert_eq!(manifest.dedup_shards, 4);
-        assert_eq!(manifest.dedup_index_shard_heads.len(), 4);
-        assert_eq!(manifest.dedup_reverse_shard_heads.len(), 4);
+        assert_eq!(manifest.dedup_index_shard_heads.len(), 1);
+        assert_eq!(manifest.dedup_index_shard_heads[0].len(), 1);
+        assert_eq!(manifest.dedup_reverse_shard_heads.len(), 1);
+        assert_eq!(manifest.dedup_reverse_shard_heads[0].len(), 1);
     }
 
     // Reopen with the same N=4 succeeds and reads back every entry.

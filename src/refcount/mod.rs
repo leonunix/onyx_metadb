@@ -16,6 +16,7 @@
 
 pub mod array;
 pub mod delta;
+pub mod overlay;
 pub mod shard;
 
 pub use array::{ENTRIES_PER_PAGE, PagedRefcountArray};

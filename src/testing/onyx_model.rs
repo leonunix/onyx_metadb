@@ -405,16 +405,24 @@ pub fn onyx_l2p_value(pba: Pba, salt: u64) -> L2pValue {
     bytes[20..22].copy_from_slice(&((salt as u16) & 0x0fff).to_be_bytes());
     bytes[22..24].copy_from_slice(&(((salt >> 16) as u16) & 0x0fff).to_be_bytes());
     bytes[24..28].copy_from_slice(&(salt as u32 ^ 0xA5A5_5A5A).to_be_bytes());
+    // Bit 1 of byte 27 is the Onyx-side "is_zero" flag — when set, the
+    // L2P entry represents a zero-fill marker and `apply_l2p_remap`
+    // skips incref/decref. The reference model in this file doesn't
+    // model that flag (these proptests exercise non-zero remaps), so
+    // mask it off so refcount semantics match the model.
+    bytes[27] &= !0x02;
     L2pValue(bytes)
 }
 
 pub fn onyx_hash(seed: u64) -> Hash8 {
-    let mut hash = [0u8; 8];
-    hash[..8].copy_from_slice(&seed.to_be_bytes());
-    hash[8..16].copy_from_slice(&seed.rotate_left(17).to_be_bytes());
-    hash[16..24].copy_from_slice(&seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
-    hash[24..32].copy_from_slice(&(!seed).to_be_bytes());
-    hash
+    // `Hash8` is 8 bytes (xxh3_64) since commit e7cfeab. The seed is
+    // already u64-wide, so a single mix is enough to spread the
+    // proptest's small seed values across the fingerprint space.
+    let mixed = seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ seed.rotate_left(17)
+        ^ !seed;
+    mixed.to_be_bytes()
 }
 
 pub fn onyx_dedup_value(pba: Pba, salt: u64) -> DedupValue {

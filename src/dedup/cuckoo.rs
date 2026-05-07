@@ -266,17 +266,23 @@ impl CuckooHash {
         Ok(())
     }
 
-    /// Remove the entry for `hash`. No-op if absent.
-    pub fn delete(&self, hash: &Hash8, lsn: Lsn) -> Result<()> {
+    /// Remove the entry for `hash`. Returns `true` iff a matching slot
+    /// was actually cleared. Returns `false` (no error) if the entry
+    /// was absent — callers use this to gate the L0 sketch / L1 cache
+    /// updates so they don't decrement reference counts for hashes
+    /// that were never inserted (which would otherwise evict L0
+    /// entries belonging to other hashes that share the fingerprint).
+    pub fn delete(&self, hash: &Hash8, lsn: Lsn) -> Result<bool> {
         let (b1, b2) = self.candidate_buckets(hash);
         if self.try_clear_in_bucket(b1, hash, lsn)? {
             self.bump_len(-1);
-            return Ok(());
+            return Ok(true);
         }
         if b2 != b1 && self.try_clear_in_bucket(b2, hash, lsn)? {
             self.bump_len(-1);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Iterate every live `(hash, value)` pair. Order is page-index

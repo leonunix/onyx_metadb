@@ -61,6 +61,14 @@ impl Checkpoint {
         Ok(flushed)
     }
 
+    /// Sample-phase dirty page count for this shard — number of pages
+    /// the in-gate `begin_checkpoint` snapshotted to be written out by
+    /// the post-gate IO phase. Drives the
+    /// `flush_sample_l2p_dirty_pages` metric.
+    pub(crate) fn dirty_pages_count(&self) -> usize {
+        self.dirty.pages_count()
+    }
+
     pub(crate) fn private_pages(&self) -> Vec<PageId> {
         let mut pages: Vec<_> = self.private_pages.iter().copied().collect();
         pages.sort_unstable();

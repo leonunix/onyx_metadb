@@ -117,6 +117,41 @@ def print_window(name: str, rows: list[dict]) -> None:
     print(f"    drop_gate max:       {int(lm.get('commit_drop_gate_wait_max_us', 0)):,} us")
     print(f"    apply wait max:      {int(lm.get('commit_apply_wait_max_us', 0)):,} us")
     print(f"    fsync max:           {int(lm.get('wal_fsync_max_us', 0)):,} us")
+    flush_calls = int(lm.get("flush_calls", 0))
+    flush_calls_steady = int(lm.get("flush_calls_steady", 0))
+    flush_calls_forced = int(lm.get("flush_calls_forced", 0))
+    if flush_calls:
+        print(f"  checkpoint flush")
+        print(
+            f"    calls:               total {flush_calls:,} = steady {flush_calls_steady:,} + forced {flush_calls_forced:,}"
+        )
+        print(
+            f"    sample max steady:   {int(lm.get('flush_sample_max_us_steady', 0)):,} us"
+        )
+        print(
+            f"    sample max forced:   {int(lm.get('flush_sample_max_us_forced', 0)):,} us  (shutdown drain / explicit force)"
+        )
+        print(
+            f"    sample max (combined): {int(lm.get('flush_sample_max_us', 0)):,} us"
+        )
+        if flush_calls_steady:
+            print(
+                f"    sample avg steady:   {int(lm.get('flush_sample_us_steady', 0)) / flush_calls_steady:,.1f} us"
+            )
+        if flush_calls_forced:
+            print(
+                f"    sample avg forced:   {int(lm.get('flush_sample_us_forced', 0)) / flush_calls_forced:,.1f} us"
+            )
+        print(
+            f"    sample workload avg: l2p_dirty {int(lm.get('flush_sample_l2p_dirty_pages', 0)) / max(flush_calls, 1):,.1f}"
+            f" rc_drained {int(lm.get('flush_sample_rc_drained_deltas', 0)) / max(flush_calls, 1):,.1f}"
+            f" rc_fresh {int(lm.get('flush_sample_rc_fresh_pages', 0)) / max(flush_calls, 1):,.1f}"
+        )
+        print(
+            f"    sample workload max: l2p_dirty {int(lm.get('flush_sample_l2p_dirty_pages_max', 0)):,}"
+            f" rc_drained {int(lm.get('flush_sample_rc_drained_deltas_max', 0)):,}"
+            f" rc_fresh {int(lm.get('flush_sample_rc_fresh_pages_max', 0)):,}"
+        )
     if range_delete_calls or cleanup_calls:
         print(f"  op-kind hotspots")
         if range_delete_calls:

@@ -689,5 +689,20 @@ use apply::*;
 use helpers::*;
 pub use volume::DropVolumeReport;
 
+impl Drop for Db {
+    fn drop(&mut self) {
+        // Detach refcount drainers (priority 3) BEFORE the
+        // refcount_shards Box drops. Each drainer worker holds an
+        // `Arc<RcShard>` that would otherwise prevent
+        // `RcShard::drop` from running until its own thread joined,
+        // creating a circular shutdown.
+        for shard in self.refcount_shards.iter() {
+            shard.rc.detach_drainer();
+        }
+        // ApplyLanes have their own Drop that joins their workers;
+        // they fire automatically when the Box goes out of scope.
+    }
+}
+
 #[cfg(test)]
 mod tests;

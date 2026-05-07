@@ -42,7 +42,7 @@ use parking_lot::Mutex;
 
 use super::RcEntry;
 use crate::cache::PageCache;
-use crate::error::{MetaDbError, Result};
+use crate::error::Result;
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::paged_meta;
@@ -52,7 +52,7 @@ use super::delta::Pending;
 
 /// Entries per data page. 336 × 12 B = 4032 B = PAGE_PAYLOAD_SIZE.
 pub const ENTRIES_PER_PAGE: usize = 336;
-const ENTRY_BYTES: usize = 12;
+pub(crate) const ENTRY_BYTES: usize = 12;
 
 /// Marker stored in the shared header's `key_count` slot to distinguish
 /// the meta page from data pages of the same `PageType`. Data pages
@@ -70,6 +70,48 @@ pub struct PagedRefcountArray {
     page_cache: Arc<PageCache>,
     meta_page_id: PageId,
     inner: Mutex<Inner>,
+}
+
+/// One sealed data page produced by a sample-phase stage. Tracks
+/// whether the underlying page id was freshly allocated (page_idx was
+/// a hole pre-stage) so abort can free it cleanly.
+pub struct StagedPage {
+    pub page_id: PageId,
+    pub page_idx: usize,
+    pub sealed: Arc<Page>,
+    pub is_fresh: bool,
+}
+
+/// The full set of sealed pages from one shard's sample-phase work,
+/// plus the highest LSN merged into them. Returned by
+/// [`PagedRefcountArray::stage_deltas_in_memory`].
+pub struct StagedDeltas {
+    pub pages: Vec<StagedPage>,
+    /// Highest LSN observed across the staged pages' headers. Equal
+    /// to `max(pending.last_lsn)` over the drained delta batch when
+    /// the on-disk page generations were lower; otherwise equal to
+    /// the prior page generation. Used by tests / metrics; the page
+    /// header generation is the durable record.
+    pub max_lsn: Lsn,
+}
+
+impl StagedDeltas {
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// Append `(page_id, sealed)` pairs to a shared write-out vec —
+    /// matches L2P's `FlushedSnapshot::append_sealed_pages` pattern so
+    /// refcount sealed pages share a single
+    /// `page_store.write_sealed_page_runs` + `sync` with L2P during
+    /// `flush_with_gate`.
+    pub fn append_sealed_pages(&self, out: &mut Vec<(PageId, Arc<Page>)>) {
+        out.extend(
+            self.pages
+                .iter()
+                .map(|page| (page.page_id, page.sealed.clone())),
+        );
+    }
 }
 
 struct Inner {
@@ -175,11 +217,34 @@ impl PagedRefcountArray {
     /// by data page so each page is read+written exactly once. Marks
     /// the meta page dirty if any new data pages were allocated.
     /// The caller must subsequently call [`flush_meta`] to persist
-    /// the meta page; the apply lane batches multiple `apply_deltas`
-    /// calls behind one `flush_meta`.
+    /// the meta page.
+    ///
+    /// Implemented as `stage_deltas_in_memory` followed by
+    /// `write_staged_pages`. Cold callers (`RcShard::flush` wrapper,
+    /// non-checkpoint paths) use this; the checkpoint hot path drives
+    /// the two halves separately so the disk write happens outside
+    /// `apply_gate.write()`.
     pub fn apply_deltas(&self, deltas: Vec<(Pba, Pending)>) -> Result<()> {
+        let staged = self.stage_deltas_in_memory(deltas)?;
+        self.write_staged_pages(&staged)
+    }
+
+    /// Sample-phase work for the checkpoint snapshot model: drain
+    /// in-memory state only, no disk IO. Builds sealed pages from the
+    /// drained delta batch, allocates fresh page ids for previously-hole
+    /// `page_idx` slots, extends `inner.page_table` to point at them,
+    /// and inserts each sealed page into the shared `page_cache` so
+    /// subsequent `RcShard::stage` reads observe the staged content.
+    /// Returns a [`StagedDeltas`] the caller can later persist via
+    /// [`Self::write_staged_pages`] (or hand to the global flush
+    /// `sealed_pages` runner) and roll back via
+    /// [`Self::abort_staged_deltas`].
+    pub fn stage_deltas_in_memory(&self, deltas: Vec<(Pba, Pending)>) -> Result<StagedDeltas> {
         if deltas.is_empty() {
-            return Ok(());
+            return Ok(StagedDeltas {
+                pages: Vec::new(),
+                max_lsn: 0,
+            });
         }
 
         let mut by_page: HashMap<usize, Vec<(usize, Pending)>> = HashMap::new();
@@ -188,18 +253,29 @@ impl PagedRefcountArray {
             by_page.entry(page_idx).or_default().push((slot, pending));
         }
 
+        let mut pages = Vec::with_capacity(by_page.len());
+        let mut max_lsn: Lsn = 0;
         for (page_idx, slot_pendings) in by_page {
-            self.apply_one_page(page_idx, slot_pendings)?;
+            let staged = self.stage_one_page(page_idx, slot_pendings)?;
+            let page_gen = staged.sealed.header()?.generation;
+            if page_gen > max_lsn {
+                max_lsn = page_gen;
+            }
+            pages.push(staged);
         }
-
-        Ok(())
+        Ok(StagedDeltas { pages, max_lsn })
     }
 
-    fn apply_one_page(&self, page_idx: usize, slot_pendings: Vec<(usize, Pending)>) -> Result<()> {
-        // Resolve / allocate the page id under the inner lock; release
-        // the lock before doing IO so concurrent reads on other pages
-        // don't block.
-        let (page_id, freshly_allocated) = {
+    fn stage_one_page(
+        &self,
+        page_idx: usize,
+        slot_pendings: Vec<(usize, Pending)>,
+    ) -> Result<StagedPage> {
+        // Resolve / allocate the page id under inner; drop inner before
+        // touching the cache so concurrent reads on other pages don't
+        // block. `inner.page_table` mutation under gate is load-bearing:
+        // see refcount/shard.rs::begin_checkpoint.
+        let (page_id, is_fresh) = {
             let mut inner = self.inner.lock();
             if page_idx >= inner.page_table.len() {
                 inner.page_table.resize(page_idx + 1, 0);
@@ -215,14 +291,26 @@ impl PagedRefcountArray {
             }
         };
 
-        let mut page = if freshly_allocated {
+        let mut page = if is_fresh {
             new_empty_data_page()
         } else {
             (*self.page_cache.get(page_id)?).clone()
         };
 
-        let mut max_lsn = page.header()?.generation;
+        let page_generation = page.header()?.generation;
+        let mut max_lsn = page_generation;
         for (slot, pending) in slot_pendings {
+            // Replay-skip: a previous checkpoint attempt may have
+            // written this page's deltas to disk before failing
+            // (write_meta_chain_external / manifest commit / etc.).
+            // The abort path invalidates the cache and restores the
+            // drained deltas; on retry, the page is re-read from disk
+            // with `generation >= pending.last_lsn` for already-applied
+            // slots. Skip them — re-applying would double-count.
+            // Mirrors the per-op replay-skip in `RcShard::stage`.
+            if page_generation >= pending.last_lsn {
+                continue;
+            }
             let prev = read_entry(&page, slot);
             let new = super::apply_delta_pure(prev, pending.delta, pending.last_lsn)?;
             write_entry(&mut page, slot, new);
@@ -236,9 +324,312 @@ impl PagedRefcountArray {
         page.write_header(&header);
         page.seal();
 
-        self.page_store.write_page(page_id, &page)?;
-        self.page_cache.replace_or_insert(page_id, Arc::new(page));
+        let sealed = Arc::new(page);
+        // Cache must hold the staged page before the apply gate is
+        // released — concurrent `RcShard::stage` after gate-release
+        // reads via `array.get` / `array.page_lsn` and must observe
+        // the post-stage entries (replay-skip correctness).
+        self.page_cache.replace_or_insert(page_id, sealed.clone());
+        Ok(StagedPage {
+            page_id,
+            page_idx,
+            sealed,
+            is_fresh,
+        })
+    }
+
+    /// Drainer-side variant of [`Self::stage_deltas_in_memory`]
+    /// (priority 3). Differences from the priority-1 path:
+    ///
+    /// - Allocates fresh page ids from the caller-provided
+    ///   [`PagePool`](super::overlay::PagePool) (batched via
+    ///   `PageStore::allocate_batch`) instead of
+    ///   `page_store.allocate()` per page.
+    /// - Does NOT mutate `inner.page_table`. The
+    ///   [`StagingOverlay`](super::overlay::StagingOverlay) holds the
+    ///   pending `(page_idx, page_id)` mapping until
+    ///   `RcShard::begin_checkpoint` harvests the overlay under
+    ///   `apply_gate.write()` — at which point the table is updated
+    ///   in one shot.
+    /// - Does NOT call `page_cache.replace_or_insert`. The overlay
+    ///   itself is the cache for staged pages; the read path consults
+    ///   the overlay before falling back to `page_cache`.
+    /// - Folds `prior_overlay` (entries from earlier drainer cycles)
+    ///   on top, so multiple cycles for the same `page_idx` accumulate
+    ///   their deltas into a single sealed page.
+    ///
+    /// Returns `Vec<OverlayEntry>` ready to be inserted into the
+    /// shard's `StagingOverlay` by the drainer.
+    pub fn build_overlay_pages(
+        &self,
+        deltas: Vec<(Pba, super::delta::Pending)>,
+        pool: &mut super::overlay::PagePool,
+        prior_overlay: &HashMap<usize, super::overlay::OverlayEntry>,
+    ) -> Result<Vec<super::overlay::OverlayEntry>> {
+        if deltas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut by_page: HashMap<usize, Vec<(usize, super::delta::Pending)>> = HashMap::new();
+        for (pba, pending) in deltas {
+            let (page_idx, slot) = page_offset(pba);
+            by_page.entry(page_idx).or_default().push((slot, pending));
+        }
+
+        let mut out = Vec::with_capacity(by_page.len());
+        for (page_idx, slot_pendings) in by_page {
+            // Resolve the base page in priority order:
+            //   1. prior_overlay (drainer's own previous cycle)
+            //   2. on-disk via inner.page_table + page_cache
+            //   3. hole → fresh page id from pool
+            let prior = prior_overlay.get(&page_idx);
+            let (page_id, is_fresh, mut page, base_source) = if let Some(entry) = prior {
+                (entry.page_id, entry.is_fresh, (*entry.sealed).clone(), "prior_overlay")
+            } else {
+                let existing_pid = {
+                    let inner = self.inner.lock();
+                    inner.page_table.get(page_idx).copied().unwrap_or(0)
+                };
+                if existing_pid != 0 {
+                    let cached = self.page_cache.get(existing_pid)?;
+                    (existing_pid, false, (*cached).clone(), "page_cache")
+                } else {
+                    let pid = pool.alloc()?;
+                    (pid, true, new_empty_data_page(), "fresh_alloc")
+                }
+            };
+
+            let page_generation = page.header()?.generation;
+            // P0 diagnostic: log every overlay page build so we can
+            // correlate "what base was used" vs the underflow target.
+            // Filter via `RUST_LOG=onyx_metadb::refcount::overlay_build=trace`.
+            let pending_slots: Vec<(usize, i64, Lsn)> = slot_pendings
+                .iter()
+                .map(|(s, p)| (*s, p.delta, p.last_lsn))
+                .collect();
+            tracing::trace!(
+                target: "onyx_metadb::refcount::overlay_build",
+                page_idx,
+                page_id,
+                is_fresh,
+                base_source,
+                page_generation,
+                ?pending_slots,
+                "build_overlay_pages: page entry"
+            );
+            let mut max_lsn = page_generation;
+            for (slot, pending) in slot_pendings {
+                // Replay-skip: drop pendings whose lsn is STRICTLY less
+                // than `page_generation` (i.e. an earlier op that the
+                // prior cycle/disk already incorporated). Use `>` not
+                // `>=` because page_generation is the page-wide max
+                // LSN, but a single tx at lsn=N can stage ops on
+                // multiple slots in the same page; if the rc bucket
+                // calls `rc.stage` for those slots back-to-back and
+                // the drainer fires its transition-1 swap *between*
+                // the stages, the tx ends up split across two cycles.
+                // Cycle K applies slot X at lsn=N (sets page_gen=N);
+                // cycle K+1 has slot Y at lsn=N still pending. With
+                // `>=`, the cycle K+1 pending would be silently
+                // dropped — a real soak repro at lsn=11239 lost slot
+                // 279's +8 incref that way (see
+                // `nvme-box:.dev/fio-dedupe-compress-soak/20260507T-bug-repro2/`).
+                // The drainer never sees ops it has already applied
+                // to the prior overlay (transitions are one-way and
+                // delta_active drains atomically per pba group), so
+                // strict `>` is sound. Recovery doesn't go through
+                // this path: the drainer is started AFTER WAL replay
+                // completes (priority-3 contract), so build_overlay
+                // _pages always works on fresh pendings.
+                if page_generation > pending.last_lsn {
+                    continue;
+                }
+                let prev = read_entry(&page, slot);
+                let new = super::apply_delta_pure(prev, pending.delta, pending.last_lsn)?;
+                write_entry(&mut page, slot, new);
+                if pending.last_lsn > max_lsn {
+                    max_lsn = pending.last_lsn;
+                }
+            }
+
+            let mut header = page.header()?;
+            header.generation = max_lsn;
+            page.write_header(&header);
+            page.seal();
+
+            out.push(super::overlay::OverlayEntry {
+                page_id,
+                page_idx,
+                sealed: Arc::new(page),
+                is_fresh,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Look up the array-side `RcEntry` for a `pba` at a specific
+    /// `page_idx -> page_id` mapping. Used by `RcShard::stage` /
+    /// `get` to read the on-disk base when the overlay misses for
+    /// `pba`'s `page_idx`. Identical fast path to [`Self::get`] but
+    /// short-circuits the page_table lookup (caller already resolved
+    /// it) so the overlay+array merge stays a single-acquire pattern.
+    pub fn get_at_page(&self, page_id: PageId, pba: Pba) -> Result<RcEntry> {
+        let (_page_idx, slot) = page_offset(pba);
+        if page_id == 0 {
+            return Ok(RcEntry::ZERO);
+        }
+        let page = self.page_cache.get(page_id)?;
+        Ok(read_entry(&page, slot))
+    }
+
+    /// `(page_id, generation)` for the data page covering `pba` —
+    /// without consulting the overlay. Used by the
+    /// `effective_page_lsn` helper after the overlay missed.
+    pub fn page_id_and_lsn(&self, pba: Pba) -> Result<(PageId, Lsn)> {
+        let (page_idx, _) = page_offset(pba);
+        let page_id = {
+            let inner = self.inner.lock();
+            inner.page_table.get(page_idx).copied().unwrap_or(0)
+        };
+        if page_id == 0 {
+            return Ok((0, 0));
+        }
+        let page = self.page_cache.get(page_id)?;
+        Ok((page_id, page.header()?.generation))
+    }
+
+    /// Apply an iterator of harvested overlay entries into
+    /// `inner.page_table`. Called by `RcShard::begin_checkpoint`
+    /// under `apply_gate.write()` after taking ownership of the
+    /// overlay; this is the moment the page-table mutation that
+    /// priority 1 did during sample is finally performed for the
+    /// drainer's accumulated work.
+    ///
+    /// Returns the highest LSN observed across the harvested pages
+    /// (used to seed `RcCheckpoint.max_lsn`).
+    pub fn install_overlay_into_page_table<'a, I>(&self, entries: I) -> Result<Lsn>
+    where
+        I: IntoIterator<Item = &'a super::overlay::OverlayEntry>,
+    {
+        let mut max_lsn: Lsn = 0;
+        let mut inner = self.inner.lock();
+        for entry in entries {
+            if entry.page_idx >= inner.page_table.len() {
+                inner.page_table.resize(entry.page_idx + 1, 0);
+                inner.meta_dirty = true;
+            }
+            if inner.page_table[entry.page_idx] != entry.page_id {
+                inner.page_table[entry.page_idx] = entry.page_id;
+                inner.meta_dirty = true;
+            }
+            // Keep `page_cache` in sync so post-checkpoint reads (in
+            // case the overlay has already been cleared) hit the
+            // staged sealed page directly rather than re-reading the
+            // pre-stage on-disk content. Symmetric to the
+            // `replace_or_insert` priority-1 sample does.
+            self.page_cache
+                .replace_or_insert(entry.page_id, entry.sealed.clone());
+            let entry_gen = entry.sealed.header()?.generation;
+            if entry_gen > max_lsn {
+                max_lsn = entry_gen;
+            }
+        }
+        Ok(max_lsn)
+    }
+
+    /// Persist sealed pages from a [`StagedDeltas`] to disk. Inline,
+    /// non-batched form used by `RcShard::flush()` for cold callers
+    /// (snapshot / drop_volume / iter_live_flushed). The checkpoint hot
+    /// path appends sealed pages to a shared global vec and writes them
+    /// via `page_store.write_sealed_page_runs` instead.
+    pub fn write_staged_pages(&self, staged: &StagedDeltas) -> Result<()> {
+        for staged_page in &staged.pages {
+            self.page_store
+                .write_page(staged_page.page_id, &staged_page.sealed)?;
+        }
         Ok(())
+    }
+
+    /// Snapshot of the current page table; fresh clone, takes the inner
+    /// lock briefly. Caller drives `paged_meta::write_chain` outside
+    /// the apply gate using this snapshot.
+    pub fn page_table_snapshot(&self) -> Vec<PageId> {
+        self.inner.lock().page_table.clone()
+    }
+
+    /// Snapshot of the current meta chain; fresh clone, takes the inner
+    /// lock briefly. Caller passes this as `existing_chain` to
+    /// `paged_meta::write_chain` outside the apply gate.
+    pub fn meta_chain_snapshot(&self) -> Vec<PageId> {
+        self.inner.lock().meta_chain.clone()
+    }
+
+    /// Outside-gate IO: write a fresh meta chain whose entries are
+    /// `snapshot_page_table` and whose existing chain is
+    /// `snapshot_meta_chain`. Returns the new chain (head first).
+    /// Does NOT install the new chain into `inner` — that is
+    /// [`Self::install_meta_chain`]'s job. The head pid is stable
+    /// (`existing_chain[0]`), so the manifest needs no per-flush
+    /// update — it always references the head pid recorded at create.
+    pub fn write_meta_chain_external(
+        &self,
+        snapshot_page_table: &[PageId],
+        snapshot_meta_chain: &[PageId],
+        free_lsn: Lsn,
+    ) -> Result<Vec<PageId>> {
+        paged_meta::write_chain(
+            &self.page_store,
+            &self.page_cache,
+            PageType::RefcountArray,
+            META_KEY_COUNT_MARKER,
+            &[],
+            snapshot_page_table,
+            snapshot_meta_chain,
+            free_lsn,
+        )
+    }
+
+    /// Install a freshly-written meta chain. Briefly takes
+    /// `inner.lock()`. Clears `meta_dirty` because the on-disk chain
+    /// now matches `inner.page_table` (sample-phase mutated the table
+    /// under the gate; no concurrent path mutates page_table outside
+    /// of sample).
+    pub fn install_meta_chain(&self, new_chain: Vec<PageId>) {
+        let mut inner = self.inner.lock();
+        inner.meta_chain = new_chain;
+        inner.meta_dirty = false;
+    }
+
+    /// Roll back state mutated by [`Self::stage_deltas_in_memory`].
+    /// Best-effort; failures are logged via tracing and otherwise
+    /// ignored — abort runs on an error path and a subsequent
+    /// `RcShard::stage` retry must converge regardless.
+    pub fn abort_staged_deltas(&self, staged: &StagedDeltas, free_lsn: Lsn) {
+        for staged_page in &staged.pages {
+            if staged_page.is_fresh {
+                {
+                    let mut inner = self.inner.lock();
+                    if staged_page.page_idx < inner.page_table.len()
+                        && inner.page_table[staged_page.page_idx] == staged_page.page_id
+                    {
+                        inner.page_table[staged_page.page_idx] = 0;
+                        inner.meta_dirty = true;
+                    }
+                }
+                self.page_cache.invalidate(staged_page.page_id);
+                if let Err(err) = self.page_store.free(staged_page.page_id, free_lsn) {
+                    tracing::warn!(
+                        page_id = staged_page.page_id,
+                        error = %err,
+                        "abort_staged_deltas: failed to free fresh page id"
+                    );
+                }
+            } else {
+                // Pre-existing page: invalidate so subsequent reads
+                // fall through to disk truth (which still reflects the
+                // pre-stage content, since we never wrote this page).
+                self.page_cache.invalidate(staged_page.page_id);
+            }
+        }
     }
 
     /// Persist the meta chain if it has been mutated since the last
@@ -523,5 +914,71 @@ mod tests {
         a.apply_deltas(vec![(0, pending(1, 200))]).unwrap();
         assert_eq!(a.page_lsn(0).unwrap(), 200);
         assert_eq!(a.get(0).unwrap().rc, 2);
+    }
+
+    /// Regression for the 2026-05-07 drainer-mode lost-incref P0
+    /// (`nvme-box:.dev/fio-dedupe-compress-soak/20260507T-bug-repro2/`).
+    ///
+    /// `build_overlay_pages` is called by the drainer per cycle. Within
+    /// one tx at lsn=N, `apply_refcount_bucket_to_tree` calls
+    /// `rc.stage` per pba group, releasing `delta_active.lock` between
+    /// calls. The drainer's transition-1 swap can fire between two
+    /// stages of the same tx, splitting that tx's contributions across
+    /// two drainer cycles:
+    ///
+    ///   cycle K   : applies slot X at lsn=N → page_gen=N
+    ///   cycle K+1 : has slot Y still pending at lsn=N (same page)
+    ///
+    /// With the previous `page_generation >= pending.last_lsn` check,
+    /// cycle K+1 silently dropped slot Y's pending because its
+    /// `page_generation` (the prior cycle K's output, gen=N) was equal
+    /// to the pending lsn — a same-tx split caused a permanent
+    /// undercounting of refcounts. The fix is `>` not `>=`. This test
+    /// emulates the split by invoking `build_overlay_pages` twice in
+    /// succession with two pendings at the same lsn for two different
+    /// slots in the same page_idx, feeding the first cycle's output
+    /// as the second cycle's `prior_overlay`.
+    #[test]
+    fn build_overlay_pages_does_not_drop_same_lsn_pending_split_across_cycles() {
+        use crate::refcount::overlay::{OverlayEntry, PagePool};
+        use std::collections::HashMap;
+        let (_dir, a) = make_array();
+        let metrics = Arc::new(crate::metrics::MetaMetrics::default());
+        let mut pool = PagePool::new(a.page_store.clone(), 4, metrics);
+        // Cycle 1: stage slot 0 (pba=0) at lsn=N. Empty prior.
+        let prior: HashMap<usize, OverlayEntry> = HashMap::new();
+        let lsn_n: Lsn = 11_239;
+        let entries1 = a
+            .build_overlay_pages(vec![(0u64, pending(7, lsn_n))], &mut pool, &prior)
+            .unwrap();
+        assert_eq!(entries1.len(), 1);
+        let cycle1_entry = entries1.into_iter().next().unwrap();
+        assert_eq!(cycle1_entry.page_idx, 0);
+        let cycle1_gen = cycle1_entry.sealed.header().unwrap().generation;
+        assert_eq!(cycle1_gen, lsn_n);
+        // Slot 0 has rc=7 from the +7 incref.
+        assert_eq!(read_entry(&cycle1_entry.sealed, 0).rc, 7);
+        // Slot 1 stayed at zero (cycle 1 didn't touch it).
+        assert_eq!(read_entry(&cycle1_entry.sealed, 1).rc, 0);
+        // Cycle 2: stage slot 1 (pba=1) at the SAME lsn=N. Prior is
+        // cycle 1's entry — its generation already equals lsn=N.
+        // With the `>=` bug this pending would be silently dropped.
+        let mut prior2: HashMap<usize, OverlayEntry> = HashMap::new();
+        prior2.insert(0, cycle1_entry);
+        let entries2 = a
+            .build_overlay_pages(vec![(1u64, pending(8, lsn_n))], &mut pool, &prior2)
+            .unwrap();
+        assert_eq!(entries2.len(), 1);
+        let cycle2_entry = entries2.into_iter().next().unwrap();
+        // Slot 1 must reflect the +8 incref.
+        assert_eq!(
+            read_entry(&cycle2_entry.sealed, 1).rc,
+            8,
+            "same-lsn pending split across cycles must apply, not skip"
+        );
+        // Slot 0 must preserve cycle 1's contribution.
+        assert_eq!(read_entry(&cycle2_entry.sealed, 0).rc, 7);
+        // Page generation stays at lsn_n (max of cycle 1 and cycle 2).
+        assert_eq!(cycle2_entry.sealed.header().unwrap().generation, lsn_n);
     }
 }

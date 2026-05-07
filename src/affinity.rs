@@ -6,6 +6,10 @@ pub struct AffinityConfig {
     pub l2p_apply_cpus: String,
     pub refcount_apply_cpus: String,
     pub dedup_apply_cpus: String,
+    /// CPU set for the per-shard refcount drainer threads (priority 3).
+    /// Same syntax as the other knobs ("0-3,8,12-15"). Leave empty to
+    /// inherit the OS default.
+    pub refcount_drainer_cpus: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -14,6 +18,7 @@ pub enum ThreadRole {
     L2pApply,
     RefcountApply,
     DedupApply,
+    RefcountDrainer,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -22,6 +27,7 @@ struct AffinityLayout {
     l2p_apply: CpuSet,
     refcount_apply: CpuSet,
     dedup_apply: CpuSet,
+    refcount_drainer: CpuSet,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -59,12 +65,14 @@ impl AffinityLayout {
             l2p_apply: CpuSet::parse(&config.l2p_apply_cpus),
             refcount_apply: CpuSet::parse(&config.refcount_apply_cpus),
             dedup_apply: CpuSet::parse(&config.dedup_apply_cpus),
+            refcount_drainer: CpuSet::parse(&config.refcount_drainer_cpus),
         })
         .filter(|layout| {
             !layout.wal.cpus.is_empty()
                 || !layout.l2p_apply.cpus.is_empty()
                 || !layout.refcount_apply.cpus.is_empty()
                 || !layout.dedup_apply.cpus.is_empty()
+                || !layout.refcount_drainer.cpus.is_empty()
         })
     }
 
@@ -74,6 +82,7 @@ impl AffinityLayout {
             ThreadRole::L2pApply => &self.l2p_apply,
             ThreadRole::RefcountApply => &self.refcount_apply,
             ThreadRole::DedupApply => &self.dedup_apply,
+            ThreadRole::RefcountDrainer => &self.refcount_drainer,
         }
     }
 }

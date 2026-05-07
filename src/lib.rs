@@ -61,7 +61,7 @@ pub use manifest::{
     VOLUME_FLAG_DROP_PENDING, VolumeEntry, decode_volume_entry_inline, encode_volume_entry_inline,
     max_snapshots_for_shards, volume_entry_inline_size,
 };
-pub use metrics::{MetaMetrics, MetaMetricsSnapshot};
+pub use metrics::{FlushKind, MetaMetrics, MetaMetricsSnapshot};
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 pub use page_store::{PageStore, ReclaimOutcome};
 pub use paged::{DiffEntry, L2pValue, PagedL2p};

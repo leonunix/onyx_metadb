@@ -34,6 +34,26 @@ struct CheckpointInstallReceiver {
     rx: crossbeam_channel::Receiver<Result<Vec<PageId>>>,
 }
 
+/// Drop guard installed at the top of `Db::flush_with_gate`. Every
+/// per-shard `RcShard::begin_checkpoint` preempts that shard's
+/// priority-3 drainer thread; the drainer is left parked and must be
+/// resumed before the flush returns. We park-everywhere / resume-once
+/// using a guard so every error-return path in flush_with_gate
+/// resumes correctly without each `return Err(...)` having to call
+/// `resume_drainer` explicitly. `resume_drainer` is idempotent — no-op
+/// on shards where the drainer wasn't preempted (or isn't attached).
+struct RcDrainerResumeGuard<'a> {
+    shards: &'a [super::Shard],
+}
+
+impl Drop for RcDrainerResumeGuard<'_> {
+    fn drop(&mut self) {
+        for shard in self.shards {
+            shard.rc.resume_drainer();
+        }
+    }
+}
+
 struct CheckpointInstallState<F> {
     flushed: F,
     flushed_pages: usize,
@@ -306,7 +326,10 @@ impl Db {
         let mut volumes = HashMap::with_capacity(1);
         volumes.insert(BOOTSTRAP_VOLUME_ORD, volume_zero);
 
-        Ok(Self {
+        let drainer_cfg = cfg.clone();
+        let page_store_for_drainers = page_store.clone();
+        let metrics_for_drainers = metrics.clone();
+        let db = Self {
             page_store,
             page_cache,
             metrics,
@@ -339,7 +362,20 @@ impl Db {
             max_volumes: cfg.max_volumes,
             faults,
             db_path: cfg.path,
-        })
+        };
+        // Spawn refcount drainers (priority 3) — fresh DB has no
+        // replay to worry about, so we can spawn unconditionally
+        // after construction. No-op when
+        // `cfg.refcount_drainer_enabled = false`.
+        for (idx, shard) in db.refcount_shards.iter().enumerate() {
+            shard.rc.attach_drainer(
+                page_store_for_drainers.clone(),
+                &drainer_cfg,
+                metrics_for_drainers.clone(),
+                idx,
+            );
+        }
+        Ok(db)
     }
 
     /// Open an existing database from `root_dir` using the default config.
@@ -727,6 +763,9 @@ impl Db {
 
         // Capture before `manifest` is moved into `ManifestState` below.
         let manifest_dedup_shards = manifest.dedup_shards as usize;
+        let drainer_cfg = cfg.clone();
+        let page_store_for_drainers = page_store.clone();
+        let metrics_for_drainers = metrics.clone();
 
         let db = Self {
             page_store,
@@ -767,6 +806,16 @@ impl Db {
             db_path: cfg.path,
         };
         db.recompute_all_snap_infos();
+        // Spawn refcount drainers AFTER WAL replay finished above so
+        // the drainer never observes mid-replay state.
+        for (idx, shard) in db.refcount_shards.iter().enumerate() {
+            shard.rc.attach_drainer(
+                page_store_for_drainers.clone(),
+                &drainer_cfg,
+                metrics_for_drainers.clone(),
+                idx,
+            );
+        }
         Ok(db)
     }
 
@@ -1010,7 +1059,8 @@ impl Db {
     /// applied commit, so after `open` replay can correctly begin at
     /// `checkpoint_lsn + 1`.
     pub fn flush(&self) -> Result<()> {
-        self.flush_with_gate(true).map(|_| ())
+        self.flush_with_gate(crate::metrics::FlushKind::Forced)
+            .map(|_| ())
     }
 
     /// Best-effort checkpoint for background maintenance. If commits are
@@ -1018,16 +1068,22 @@ impl Db {
     /// apply gate's writer-pending bit, so foreground commit readers keep
     /// flowing and the caller can retry on the next interval.
     pub fn try_flush(&self) -> Result<bool> {
-        self.flush_with_gate(false)
+        self.flush_with_gate(crate::metrics::FlushKind::Steady)
     }
 
-    fn flush_with_gate(&self, blocking_gate: bool) -> Result<bool> {
+    fn flush_with_gate(&self, kind: crate::metrics::FlushKind) -> Result<bool> {
         // Exclude every in-flight apply phase only while sampling the
         // checkpoint boundary. Each tree protects the private pages in
         // the sampled roots before we drop its shard lock; later commits
         // COW away from those pages, so dirty page IO can run without
         // holding either the global gate or every shard lock.
-        self.metrics.record_flush_attempt();
+        //
+        // `kind` separates the steady-state `try_flush()` cadence from
+        // forced `flush()` (shutdown drain, explicit force_checkpoint)
+        // in the metrics — `flush_sample_max_us_steady` excludes the
+        // shutdown blast that otherwise dominates the aggregate max.
+        let blocking_gate = matches!(kind, crate::metrics::FlushKind::Forced);
+        self.metrics.record_flush_attempt(kind);
         let flush_started = std::time::Instant::now();
         let gate_started = std::time::Instant::now();
         let Some(apply_guard) = (if blocking_gate {
@@ -1036,10 +1092,25 @@ impl Db {
             self.apply_gate.try_write()
         }) else {
             self.metrics.record_flush_gate_wait(gate_started.elapsed());
-            self.metrics.record_flush_total(flush_started.elapsed());
+            self.metrics.record_flush_total(kind, flush_started.elapsed());
             return Ok(false);
         };
         self.metrics.record_flush_gate_wait(gate_started.elapsed());
+        // RAII guard: every refcount shard's `begin_checkpoint` below
+        // preempts that shard's drainer (priority-3 drainer-mode). The
+        // drainer is left parked and must be resumed before flush
+        // returns — otherwise `delta_active` accumulates indefinitely
+        // across flushes, eventually amplifying into stalls and (after
+        // the prior backpressure-fallback bug was fixed) just slow
+        // commits. The guard runs on every exit path (success and
+        // every `return Err(...)` below) because Rust's `Drop` fires
+        // at scope end. `resume_drainer` is idempotent — safe to call
+        // even on shards whose `begin_checkpoint` failed before
+        // preempting (sample_err mid-loop) or wasn't running a
+        // drainer at all.
+        let _drainer_resume_guard = RcDrainerResumeGuard {
+            shards: &self.refcount_shards,
+        };
         let sample_started = std::time::Instant::now();
         let volumes = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
@@ -1053,16 +1124,57 @@ impl Db {
             }
             l2p_checkpoints.push(checkpoints);
         }
-        // Paged-array refcount has no deferred-flush / checkpoint
-        // model — `RcShard::flush` directly writes touched pages
-        // and the meta page during commit-boundary apply. Drain any
-        // delta still pending here so the manifest commit below sees
-        // a settled on-disk state.
-        self.flush_all_refcount_shards()?;
-        let refcount_checkpoints: Vec<()> = Vec::new();
+        // Refcount sample: drain delta + stage sealed pages in memory.
+        // No disk IO under the gate. Meta-chain rewrite + page writes
+        // happen in the IO phase below; install runs post-manifest.
+        let mut refcount_checkpoints: Vec<crate::refcount::shard::RcCheckpoint> =
+            Vec::with_capacity(self.refcount_shards.len());
+        let mut sample_err: Option<MetaDbError> = None;
+        for shard in &self.refcount_shards {
+            match shard.rc.begin_checkpoint() {
+                Ok(ckpt) => refcount_checkpoints.push(ckpt),
+                Err(err) => {
+                    sample_err = Some(err);
+                    break;
+                }
+            }
+        }
         drop(l2p_guards);
         drop(apply_guard);
-        self.metrics.record_flush_sample(sample_started.elapsed());
+        self.metrics.record_flush_sample(kind, sample_started.elapsed());
+        // Sample workload size: L2P dirty pages snapshotted, refcount
+        // delta entries drained, fresh refcount data pages allocated.
+        // Recorded after gate release so the cost of these accessors
+        // doesn't extend the gate hold time. Lets dashboards correlate
+        // sample wall-time growth with workload-size growth.
+        let l2p_dirty_pages: usize = l2p_checkpoints
+            .iter()
+            .flat_map(|cps| cps.iter())
+            .map(|cp| cp.dirty_pages_count())
+            .sum();
+        let rc_drained_deltas: usize = refcount_checkpoints
+            .iter()
+            .map(|c| c.drained_deltas_count())
+            .sum();
+        let rc_fresh_pages: usize = refcount_checkpoints
+            .iter()
+            .map(|c| c.fresh_pages_count())
+            .sum();
+        self.metrics.record_flush_sample_workload(
+            l2p_dirty_pages,
+            rc_drained_deltas,
+            rc_fresh_pages,
+        );
+        if let Some(err) = sample_err {
+            // Roll back the partial set of refcount checkpoints that
+            // succeeded before the failing shard. `abort_rc_checkpoints`
+            // zips with `self.refcount_shards`, so partial-length input
+            // covers indices 0..n correctly.
+            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            return Err(err);
+        }
 
         let io_started = std::time::Instant::now();
         let mut total_pages_written = 0usize;
@@ -1080,30 +1192,57 @@ impl Db {
                     Err(err) => {
                         self.metrics
                             .record_flush_io(io_started.elapsed(), total_pages_written);
-                        self.metrics.record_flush_total(flush_started.elapsed());
-                        self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+                        self.metrics.record_flush_total(kind, flush_started.elapsed());
+                        self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
+                        self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
                         return Err(err);
                     }
                 }
             }
             flushed_l2p.push(flushed);
         }
-        // Refcount checkpoint write_dirty_pages: paged-array has no
-        // deferred dirty pages (flush already happened in sample
-        // phase), so this loop is a no-op stub.
-        let flushed_refcount: Vec<()> = Vec::new();
+        // Refcount sealed pages flow through the same write_sealed_page_runs
+        // batch as L2P. paged_meta::write_chain (below) handles its own
+        // continuation-page writes; one page_store.sync() covers both.
+        for ckpt in &refcount_checkpoints {
+            let before = sealed_pages.len();
+            ckpt.append_sealed_pages(&mut sealed_pages);
+            total_pages_written += sealed_pages.len() - before;
+        }
         if let Err(err) = self.page_store.write_sealed_page_runs(sealed_pages) {
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
-            self.metrics.record_flush_total(flush_started.elapsed());
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
             return Err(err);
+        }
+        // Refcount meta-chain rewrite. write_meta_chain_external also
+        // writes pages via page_store.write_page; the subsequent
+        // page_store.sync() makes them durable before manifest commit.
+        // The shard's head meta page id is stable across rewrites
+        // (paged_meta::write_chain reuses existing_chain[0]), so the
+        // manifest needs no per-flush update for refcount roots.
+        let mut rc_new_chains: Vec<Vec<PageId>> = Vec::with_capacity(refcount_checkpoints.len());
+        for (shard, ckpt) in self.refcount_shards.iter().zip(refcount_checkpoints.iter()) {
+            match shard.rc.write_meta_chain(ckpt, wal_checkpoint) {
+                Ok(chain) => rc_new_chains.push(chain),
+                Err(err) => {
+                    self.metrics
+                        .record_flush_io(io_started.elapsed(), total_pages_written);
+                    self.metrics.record_flush_total(kind, flush_started.elapsed());
+                    self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
+                    self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+                    return Err(err);
+                }
+            }
         }
         if let Err(err) = self.page_store.sync() {
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
-            self.metrics.record_flush_total(flush_started.elapsed());
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
             return Err(err);
         }
         self.metrics
@@ -1118,8 +1257,10 @@ impl Db {
             Err(err) => {
                 self.metrics
                     .record_flush_manifest(manifest_started.elapsed());
-                self.metrics.record_flush_total(flush_started.elapsed());
-                self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+                self.metrics.record_flush_total(kind, flush_started.elapsed());
+                drop(manifest_state);
+                self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
+                self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
                 return Err(err);
             }
         };
@@ -1129,8 +1270,10 @@ impl Db {
         {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
-            self.metrics.record_flush_total(flush_started.elapsed());
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            drop(manifest_state);
+            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
             return Err(err);
         }
 
@@ -1138,12 +1281,13 @@ impl Db {
             &mut manifest_state.manifest,
             &volumes,
             &l2p_checkpoints,
-            &refcount_checkpoints,
         ) {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
-            self.metrics.record_flush_total(flush_started.elapsed());
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            drop(manifest_state);
+            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
             return Err(err);
         }
         // The tree generation is a local monotonic counter; checkpoint
@@ -1153,12 +1297,27 @@ impl Db {
         if let Err(err) = manifest_state.store.commit(&manifest) {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
-            self.metrics.record_flush_total(flush_started.elapsed());
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &refcount_checkpoints);
+            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            drop(manifest_state);
+            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
             return Err(err);
         }
         self.metrics
             .record_flush_manifest(manifest_started.elapsed());
+
+        // Manifest is durable. Install refcount meta chains in memory
+        // so subsequent `begin_checkpoint` sees the new chain when
+        // computing `existing_chain` for paged_meta::write_chain.
+        // Direct inner.lock() — no race with `RcShard::stage` which
+        // never reads `inner.meta_chain`. Cannot fail.
+        for (shard, new_chain) in self.refcount_shards.iter().zip(rc_new_chains.into_iter()) {
+            shard.rc.install_meta_chain(new_chain);
+        }
+        // Drained deltas have been durably applied + meta chain rotated.
+        // Drop checkpoints to release the snapshot bookkeeping; abort
+        // is no longer reachable for these.
+        drop(refcount_checkpoints);
 
         let install_started = std::time::Instant::now();
         let mut install_receivers = Vec::new();
@@ -1192,11 +1351,8 @@ impl Db {
                 });
             }
         }
-        // Refcount install: paged-array writes are already on disk
-        // after sample-phase flush, and meta_page_id is stable across
-        // flushes so the manifest needs no per-flush update for
-        // refcount roots. Nothing to enqueue here.
-        let _ = flushed_refcount;
+        // Refcount install already happened above (direct inner.lock
+        // after manifest commit); nothing to enqueue here.
         let mut checkpoint_frees = Vec::new();
         for receiver in install_receivers {
             let recv_started = std::time::Instant::now();
@@ -1205,13 +1361,13 @@ impl Db {
                 Ok(Err(err)) => {
                     drop(manifest_state);
                     self.metrics.record_flush_install(install_started.elapsed());
-                    self.metrics.record_flush_total(flush_started.elapsed());
+                    self.metrics.record_flush_total(kind, flush_started.elapsed());
                     return Err(err);
                 }
                 Err(_) => {
                     drop(manifest_state);
                     self.metrics.record_flush_install(install_started.elapsed());
-                    self.metrics.record_flush_total(flush_started.elapsed());
+                    self.metrics.record_flush_total(kind, flush_started.elapsed());
                     return Err(MetaDbError::Corruption(
                         "checkpoint install lane worker exited before reporting".into(),
                     ));
@@ -1271,7 +1427,7 @@ impl Db {
             );
         }
         self.metrics.record_flush_reclaim(reclaim_started.elapsed());
-        self.metrics.record_flush_total(flush_started.elapsed());
+        self.metrics.record_flush_total(kind, flush_started.elapsed());
         Ok(true)
     }
 
@@ -1286,8 +1442,25 @@ impl Db {
                 shard.tree.write().abort_checkpoint(checkpoint);
             }
         }
-        // Paged-array refcount has nothing to abort: changes land
-        // synchronously during sample-phase flush.
+        // Refcount abort runs through `abort_rc_checkpoints` (separate
+        // call) because refcount checkpoints carry a `StagedDeltas`
+        // payload, not a `()` placeholder.
+    }
+
+    /// Roll back a partially-completed refcount checkpoint cycle.
+    /// For each `RcCheckpoint`: restore drained deltas, free fresh
+    /// page ids, invalidate touched cache entries. Best-effort —
+    /// failures are logged and do not propagate. The retry path uses
+    /// per-slot replay-skip in `stage_deltas_in_memory` to converge
+    /// even when sealed pages were already written to disk.
+    fn abort_rc_checkpoints(
+        &self,
+        checkpoints: Vec<crate::refcount::shard::RcCheckpoint>,
+        free_lsn: Lsn,
+    ) {
+        for (shard, ckpt) in self.refcount_shards.iter().zip(checkpoints.into_iter()) {
+            shard.rc.abort_checkpoint(ckpt, free_lsn);
+        }
     }
 
     /// Drain everything currently safe to physically free (i.e. tagged
@@ -1347,7 +1520,6 @@ fn refresh_manifest_from_checkpoints(
     manifest: &mut Manifest,
     volumes: &[Arc<Volume>],
     l2p_checkpoints: &[Vec<crate::paged::tree::Checkpoint>],
-    _refcount_checkpoints: &[()],
 ) -> Result<()> {
     manifest.body_version = MANIFEST_BODY_VERSION;
     if volumes.len() != l2p_checkpoints.len() {

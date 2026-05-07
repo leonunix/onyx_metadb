@@ -980,7 +980,28 @@ impl Db {
                                 Some(old_value) => {
                                     let old_pba = old_value.head_pba();
                                     let old_is_zero = old_value.0[27] & 0x02 != 0;
-                                    if !old_is_zero && (old_pba != new_pba || new_is_zero) {
+                                    let push_decref = !old_is_zero
+                                        && (old_pba != new_pba || new_is_zero);
+                                    let push_incref = !new_is_zero
+                                        && (old_pba != new_pba || old_is_zero);
+                                    // P0 diagnostic: trace every rc_action push
+                                    // so the underflow report can be tied back
+                                    // to the originating op's (lba, prev, new).
+                                    // Filter via `RUST_LOG=onyx_metadb::db::commit::rc_action=trace`.
+                                    tracing::trace!(
+                                        target: "onyx_metadb::db::commit::rc_action",
+                                        op_idx = idx,
+                                        lba = *lba,
+                                        old_pba,
+                                        new_pba,
+                                        old_is_zero,
+                                        new_is_zero,
+                                        push_decref,
+                                        push_incref,
+                                        lsn,
+                                        "apply_l2p_bucket: l2p_remap rc_actions (Some prev)"
+                                    );
+                                    if push_decref {
                                         rc_actions.push(RcApplyAction {
                                             op_idx: idx,
                                             pba: old_pba,
@@ -989,7 +1010,7 @@ impl Db {
                                             remap_freed_candidate: true,
                                         });
                                     }
-                                    if !new_is_zero && (old_pba != new_pba || old_is_zero) {
+                                    if push_incref {
                                         rc_actions.push(RcApplyAction {
                                             op_idx: idx,
                                             pba: new_pba,
@@ -1001,6 +1022,17 @@ impl Db {
                                 }
                                 None => {
                                     if !new_is_zero {
+                                        tracing::trace!(
+                                            target: "onyx_metadb::db::commit::rc_action",
+                                            op_idx = idx,
+                                            lba = *lba,
+                                            new_pba,
+                                            new_is_zero,
+                                            push_decref = false,
+                                            push_incref = true,
+                                            lsn,
+                                            "apply_l2p_bucket: l2p_remap rc_actions (None prev)"
+                                        );
                                         rc_actions.push(RcApplyAction {
                                             op_idx: idx,
                                             pba: new_pba,
@@ -1116,7 +1148,44 @@ impl Db {
             if can_coalesce_remap {
                 let delta: i64 = group.iter().map(|action| action.delta).sum();
                 let op_started = std::time::Instant::now();
-                let (pre, new) = rc.stage(pba, delta, lsn)?;
+                let op_idxs: Vec<usize> = group.iter().map(|a| a.op_idx).collect();
+                // P0 diagnostic: trace every coalesced stage call so we can
+                // confirm whether the +N at lsn=X actually reached the rc
+                // shard. Filter via
+                // `RUST_LOG=onyx_metadb::db::commit::rc_stage=trace`.
+                tracing::trace!(
+                    target: "onyx_metadb::db::commit::rc_stage",
+                    pba,
+                    coalesced_delta = delta,
+                    ?op_idxs,
+                    lsn,
+                    "apply_refcount_bucket_to_tree: coalesced stage entry"
+                );
+                let (pre, new) = match rc.stage(pba, delta, lsn) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        tracing::error!(
+                            target: "onyx_metadb::db::commit::rc_apply_underflow",
+                            pba,
+                            coalesced_delta = delta,
+                            group_size = group.len(),
+                            ?op_idxs,
+                            lsn,
+                            error = %err,
+                            "apply_refcount_bucket_to_tree: coalesced group failed"
+                        );
+                        return Err(err);
+                    }
+                };
+                tracing::trace!(
+                    target: "onyx_metadb::db::commit::rc_stage",
+                    pba,
+                    coalesced_delta = delta,
+                    pre,
+                    new,
+                    lsn,
+                    "apply_refcount_bucket_to_tree: coalesced stage ok"
+                );
                 metrics.record_apply_refcount(op_started.elapsed());
                 if new == 0 && pre > 0 {
                     if let Some(action) = group
@@ -1132,7 +1201,23 @@ impl Db {
 
             for action in group {
                 let op_started = std::time::Instant::now();
-                let (pre, new) = rc.stage(action.pba, action.delta, lsn)?;
+                let (pre, new) = match rc.stage(action.pba, action.delta, lsn) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        tracing::error!(
+                            target: "onyx_metadb::db::commit::rc_apply_underflow",
+                            pba = action.pba,
+                            delta = action.delta,
+                            op_idx = action.op_idx,
+                            standalone = action.standalone_refcount,
+                            remap_freed_candidate = action.remap_freed_candidate,
+                            lsn,
+                            error = %err,
+                            "apply_refcount_bucket_to_tree: serial action failed"
+                        );
+                        return Err(err);
+                    }
+                };
                 metrics.record_apply_refcount(op_started.elapsed());
                 if action.remap_freed_candidate {
                     if new == 0 && pre > 0 {

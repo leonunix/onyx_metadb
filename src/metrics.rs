@@ -163,13 +163,28 @@ pub struct MetaMetrics {
     // is the long pole when buffer fills up faster than checkpoint
     // drains. `flush_calls` counts completed (success or error) flush
     // invocations.
+    //
+    // Aggregate counters (kind-agnostic) preserve backwards compat.
+    // The `_steady` / `_forced` siblings split the same numbers by
+    // [`FlushKind`] so dashboards can separate the running-period
+    // checkpoint cadence from forced / shutdown-drain flushes.
     flush_calls: AtomicU64,
+    flush_calls_steady: AtomicU64,
+    flush_calls_forced: AtomicU64,
     flush_total_us: AtomicU64,
     flush_total_max_us: AtomicU64,
+    flush_total_us_steady: AtomicU64,
+    flush_total_max_us_steady: AtomicU64,
+    flush_total_us_forced: AtomicU64,
+    flush_total_max_us_forced: AtomicU64,
     flush_gate_wait_us: AtomicU64,
     flush_gate_wait_max_us: AtomicU64,
     flush_sample_us: AtomicU64,
     flush_sample_max_us: AtomicU64,
+    flush_sample_us_steady: AtomicU64,
+    flush_sample_max_us_steady: AtomicU64,
+    flush_sample_us_forced: AtomicU64,
+    flush_sample_max_us_forced: AtomicU64,
     flush_io_us: AtomicU64,
     flush_io_max_us: AtomicU64,
     flush_manifest_us: AtomicU64,
@@ -183,6 +198,54 @@ pub struct MetaMetrics {
     flush_reclaim_selected_pages: AtomicU64,
     flush_reclaim_reclaimed_pages: AtomicU64,
     flush_reclaim_blocked_pages: AtomicU64,
+    // Sample-phase workload size. Together with `flush_calls`, these
+    // let dashboards compute per-flush averages and watch trajectories
+    // of the dirty / drained / freshly-allocated counts that drive the
+    // sample-phase hold time. Independent of [`FlushKind`].
+    flush_sample_l2p_dirty_pages: AtomicU64,
+    flush_sample_l2p_dirty_pages_max: AtomicU64,
+    flush_sample_rc_drained_deltas: AtomicU64,
+    flush_sample_rc_drained_deltas_max: AtomicU64,
+    flush_sample_rc_fresh_pages: AtomicU64,
+    flush_sample_rc_fresh_pages_max: AtomicU64,
+    // Refcount drainer (priority 3). Background per-shard threads that
+    // absorb `RcShard.delta` into a sealed-page staging overlay outside
+    // `apply_gate.write()`. All zero when
+    // `Config::refcount_drainer_enabled = false`.
+    rc_drainer_cycles: AtomicU64,
+    rc_drainer_drained_entries: AtomicU64,
+    rc_drainer_pages_built: AtomicU64,
+    rc_drainer_cycle_us: AtomicU64,
+    rc_drainer_cycle_max_us: AtomicU64,
+    /// Peak overlay size observed at end of any drainer cycle.
+    rc_drainer_overlay_size_max_pages: AtomicU64,
+    /// Time `begin_checkpoint` spent waiting for the in-flight drainer
+    /// cycle to complete after preempt was set.
+    rc_drainer_checkpoint_wait_us: AtomicU64,
+    rc_drainer_checkpoint_wait_max_us: AtomicU64,
+    /// Count of `begin_checkpoint` invocations that fell back to the
+    /// priority-1 in-gate drain path because overlay/delta exceeded
+    /// `Config::refcount_drainer_backpressure_pages`.
+    rc_drainer_backpressure_fallbacks: AtomicU64,
+    /// Count of `PageStore::allocate_run` calls made by drainers to
+    /// refill their per-shard `PagePool`.
+    rc_drainer_pool_refills: AtomicU64,
+}
+
+/// Why this `Db::flush()` invocation is happening. Tags the metrics so
+/// dashboards can separate the steady-state checkpoint cadence (driven
+/// by the periodic `try_flush()` background ticker) from forced flushes
+/// (`Db::flush()` — explicit `force_checkpoint`, snapshot operations,
+/// shutdown drain, etc.). Cheap copy, used purely for metric routing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FlushKind {
+    /// Best-effort background checkpoint via `try_flush()`. Skips when
+    /// commits are actively applying.
+    Steady,
+    /// Blocking `flush()` — caller wants the checkpoint to land before
+    /// returning. Includes shutdown drain, explicit force_checkpoint,
+    /// and snapshot/drop_volume internal flushes.
+    Forced,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -322,12 +385,22 @@ pub struct MetaMetricsSnapshot {
     pub l2p_multi_get_tree_us: u64,
     pub l2p_multi_get_tree_max_us: u64,
     pub flush_calls: u64,
+    pub flush_calls_steady: u64,
+    pub flush_calls_forced: u64,
     pub flush_total_us: u64,
     pub flush_total_max_us: u64,
+    pub flush_total_us_steady: u64,
+    pub flush_total_max_us_steady: u64,
+    pub flush_total_us_forced: u64,
+    pub flush_total_max_us_forced: u64,
     pub flush_gate_wait_us: u64,
     pub flush_gate_wait_max_us: u64,
     pub flush_sample_us: u64,
     pub flush_sample_max_us: u64,
+    pub flush_sample_us_steady: u64,
+    pub flush_sample_max_us_steady: u64,
+    pub flush_sample_us_forced: u64,
+    pub flush_sample_max_us_forced: u64,
     pub flush_io_us: u64,
     pub flush_io_max_us: u64,
     pub flush_manifest_us: u64,
@@ -341,6 +414,22 @@ pub struct MetaMetricsSnapshot {
     pub flush_reclaim_selected_pages: u64,
     pub flush_reclaim_reclaimed_pages: u64,
     pub flush_reclaim_blocked_pages: u64,
+    pub flush_sample_l2p_dirty_pages: u64,
+    pub flush_sample_l2p_dirty_pages_max: u64,
+    pub flush_sample_rc_drained_deltas: u64,
+    pub flush_sample_rc_drained_deltas_max: u64,
+    pub flush_sample_rc_fresh_pages: u64,
+    pub flush_sample_rc_fresh_pages_max: u64,
+    pub rc_drainer_cycles: u64,
+    pub rc_drainer_drained_entries: u64,
+    pub rc_drainer_pages_built: u64,
+    pub rc_drainer_cycle_us: u64,
+    pub rc_drainer_cycle_max_us: u64,
+    pub rc_drainer_overlay_size_max_pages: u64,
+    pub rc_drainer_checkpoint_wait_us: u64,
+    pub rc_drainer_checkpoint_wait_max_us: u64,
+    pub rc_drainer_backpressure_fallbacks: u64,
+    pub rc_drainer_pool_refills: u64,
 }
 
 impl MetaMetrics {
@@ -485,12 +574,22 @@ impl MetaMetrics {
             l2p_multi_get_tree_us: load(&self.l2p_multi_get_tree_us),
             l2p_multi_get_tree_max_us: load(&self.l2p_multi_get_tree_max_us),
             flush_calls: load(&self.flush_calls),
+            flush_calls_steady: load(&self.flush_calls_steady),
+            flush_calls_forced: load(&self.flush_calls_forced),
             flush_total_us: load(&self.flush_total_us),
             flush_total_max_us: load(&self.flush_total_max_us),
+            flush_total_us_steady: load(&self.flush_total_us_steady),
+            flush_total_max_us_steady: load(&self.flush_total_max_us_steady),
+            flush_total_us_forced: load(&self.flush_total_us_forced),
+            flush_total_max_us_forced: load(&self.flush_total_max_us_forced),
             flush_gate_wait_us: load(&self.flush_gate_wait_us),
             flush_gate_wait_max_us: load(&self.flush_gate_wait_max_us),
             flush_sample_us: load(&self.flush_sample_us),
             flush_sample_max_us: load(&self.flush_sample_max_us),
+            flush_sample_us_steady: load(&self.flush_sample_us_steady),
+            flush_sample_max_us_steady: load(&self.flush_sample_max_us_steady),
+            flush_sample_us_forced: load(&self.flush_sample_us_forced),
+            flush_sample_max_us_forced: load(&self.flush_sample_max_us_forced),
             flush_io_us: load(&self.flush_io_us),
             flush_io_max_us: load(&self.flush_io_max_us),
             flush_manifest_us: load(&self.flush_manifest_us),
@@ -504,15 +603,40 @@ impl MetaMetrics {
             flush_reclaim_selected_pages: load(&self.flush_reclaim_selected_pages),
             flush_reclaim_reclaimed_pages: load(&self.flush_reclaim_reclaimed_pages),
             flush_reclaim_blocked_pages: load(&self.flush_reclaim_blocked_pages),
+            flush_sample_l2p_dirty_pages: load(&self.flush_sample_l2p_dirty_pages),
+            flush_sample_l2p_dirty_pages_max: load(&self.flush_sample_l2p_dirty_pages_max),
+            flush_sample_rc_drained_deltas: load(&self.flush_sample_rc_drained_deltas),
+            flush_sample_rc_drained_deltas_max: load(&self.flush_sample_rc_drained_deltas_max),
+            flush_sample_rc_fresh_pages: load(&self.flush_sample_rc_fresh_pages),
+            flush_sample_rc_fresh_pages_max: load(&self.flush_sample_rc_fresh_pages_max),
+            rc_drainer_cycles: load(&self.rc_drainer_cycles),
+            rc_drainer_drained_entries: load(&self.rc_drainer_drained_entries),
+            rc_drainer_pages_built: load(&self.rc_drainer_pages_built),
+            rc_drainer_cycle_us: load(&self.rc_drainer_cycle_us),
+            rc_drainer_cycle_max_us: load(&self.rc_drainer_cycle_max_us),
+            rc_drainer_overlay_size_max_pages: load(&self.rc_drainer_overlay_size_max_pages),
+            rc_drainer_checkpoint_wait_us: load(&self.rc_drainer_checkpoint_wait_us),
+            rc_drainer_checkpoint_wait_max_us: load(&self.rc_drainer_checkpoint_wait_max_us),
+            rc_drainer_backpressure_fallbacks: load(&self.rc_drainer_backpressure_fallbacks),
+            rc_drainer_pool_refills: load(&self.rc_drainer_pool_refills),
         }
     }
 
-    pub(crate) fn record_flush_attempt(&self) {
+    pub(crate) fn record_flush_attempt(&self, kind: FlushKind) {
         self.flush_calls.fetch_add(1, Ordering::Relaxed);
+        match kind {
+            FlushKind::Steady => self.flush_calls_steady.fetch_add(1, Ordering::Relaxed),
+            FlushKind::Forced => self.flush_calls_forced.fetch_add(1, Ordering::Relaxed),
+        };
     }
 
-    pub(crate) fn record_flush_total(&self, total: Duration) {
+    pub(crate) fn record_flush_total(&self, kind: FlushKind, total: Duration) {
         record_duration(&self.flush_total_us, &self.flush_total_max_us, total);
+        let (us_slot, max_slot) = match kind {
+            FlushKind::Steady => (&self.flush_total_us_steady, &self.flush_total_max_us_steady),
+            FlushKind::Forced => (&self.flush_total_us_forced, &self.flush_total_max_us_forced),
+        };
+        record_duration(us_slot, max_slot, total);
     }
 
     pub(crate) fn record_flush_gate_wait(&self, elapsed: Duration) {
@@ -523,8 +647,45 @@ impl MetaMetrics {
         );
     }
 
-    pub(crate) fn record_flush_sample(&self, elapsed: Duration) {
+    pub(crate) fn record_flush_sample(&self, kind: FlushKind, elapsed: Duration) {
         record_duration(&self.flush_sample_us, &self.flush_sample_max_us, elapsed);
+        let (us_slot, max_slot) = match kind {
+            FlushKind::Steady => (
+                &self.flush_sample_us_steady,
+                &self.flush_sample_max_us_steady,
+            ),
+            FlushKind::Forced => (
+                &self.flush_sample_us_forced,
+                &self.flush_sample_max_us_forced,
+            ),
+        };
+        record_duration(us_slot, max_slot, elapsed);
+    }
+
+    /// Record sample-phase workload size for one flush. Called from the
+    /// in-gate sample loop with the totals of L2P dirty pages observed,
+    /// refcount delta entries drained, and freshly-allocated refcount
+    /// data pages produced. Kind-agnostic — pair with `flush_calls_*`
+    /// to compute per-flush averages, or watch the `_max` siblings to
+    /// see whether sample-phase workload is itself growing over time.
+    pub(crate) fn record_flush_sample_workload(
+        &self,
+        l2p_dirty_pages: usize,
+        rc_drained_deltas: usize,
+        rc_fresh_pages: usize,
+    ) {
+        let l2p = l2p_dirty_pages as u64;
+        let drained = rc_drained_deltas as u64;
+        let fresh = rc_fresh_pages as u64;
+        self.flush_sample_l2p_dirty_pages
+            .fetch_add(l2p, Ordering::Relaxed);
+        fetch_max(&self.flush_sample_l2p_dirty_pages_max, l2p);
+        self.flush_sample_rc_drained_deltas
+            .fetch_add(drained, Ordering::Relaxed);
+        fetch_max(&self.flush_sample_rc_drained_deltas_max, drained);
+        self.flush_sample_rc_fresh_pages
+            .fetch_add(fresh, Ordering::Relaxed);
+        fetch_max(&self.flush_sample_rc_fresh_pages_max, fresh);
     }
 
     pub(crate) fn record_flush_io(&self, elapsed: Duration, pages: usize) {
@@ -564,6 +725,43 @@ impl MetaMetrics {
             .fetch_add(reclaimed as u64, Ordering::Relaxed);
         self.flush_reclaim_blocked_pages
             .fetch_add(blocked as u64, Ordering::Relaxed);
+    }
+
+    /// One refcount drainer cycle completed. `entries`/`pages` are the
+    /// drained delta entries and the sealed pages produced; `elapsed`
+    /// is the cycle wall-time; `overlay_size` is the post-publish
+    /// overlay size for the high-water mark.
+    pub(crate) fn record_rc_drainer_cycle(
+        &self,
+        entries: usize,
+        pages: usize,
+        elapsed: Duration,
+        overlay_size: usize,
+    ) {
+        self.rc_drainer_cycles.fetch_add(1, Ordering::Relaxed);
+        self.rc_drainer_drained_entries
+            .fetch_add(entries as u64, Ordering::Relaxed);
+        self.rc_drainer_pages_built
+            .fetch_add(pages as u64, Ordering::Relaxed);
+        record_duration(
+            &self.rc_drainer_cycle_us,
+            &self.rc_drainer_cycle_max_us,
+            elapsed,
+        );
+        fetch_max(&self.rc_drainer_overlay_size_max_pages, overlay_size as u64);
+    }
+
+    pub(crate) fn record_rc_drainer_checkpoint_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.rc_drainer_checkpoint_wait_us,
+            &self.rc_drainer_checkpoint_wait_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_rc_drainer_pool_refill(&self) {
+        self.rc_drainer_pool_refills
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_commit_empty(&self) {
@@ -1187,12 +1385,22 @@ impl MetaMetricsSnapshot {
                 "\"l2p_multi_get_tree_us\":{},",
                 "\"l2p_multi_get_tree_max_us\":{},",
                 "\"flush_calls\":{},",
+                "\"flush_calls_steady\":{},",
+                "\"flush_calls_forced\":{},",
                 "\"flush_total_us\":{},",
                 "\"flush_total_max_us\":{},",
+                "\"flush_total_us_steady\":{},",
+                "\"flush_total_max_us_steady\":{},",
+                "\"flush_total_us_forced\":{},",
+                "\"flush_total_max_us_forced\":{},",
                 "\"flush_gate_wait_us\":{},",
                 "\"flush_gate_wait_max_us\":{},",
                 "\"flush_sample_us\":{},",
                 "\"flush_sample_max_us\":{},",
+                "\"flush_sample_us_steady\":{},",
+                "\"flush_sample_max_us_steady\":{},",
+                "\"flush_sample_us_forced\":{},",
+                "\"flush_sample_max_us_forced\":{},",
                 "\"flush_io_us\":{},",
                 "\"flush_io_max_us\":{},",
                 "\"flush_manifest_us\":{},",
@@ -1205,7 +1413,23 @@ impl MetaMetricsSnapshot {
                 "\"flush_reclaim_budget_pages\":{},",
                 "\"flush_reclaim_selected_pages\":{},",
                 "\"flush_reclaim_reclaimed_pages\":{},",
-                "\"flush_reclaim_blocked_pages\":{}",
+                "\"flush_reclaim_blocked_pages\":{},",
+                "\"flush_sample_l2p_dirty_pages\":{},",
+                "\"flush_sample_l2p_dirty_pages_max\":{},",
+                "\"flush_sample_rc_drained_deltas\":{},",
+                "\"flush_sample_rc_drained_deltas_max\":{},",
+                "\"flush_sample_rc_fresh_pages\":{},",
+                "\"flush_sample_rc_fresh_pages_max\":{},",
+                "\"rc_drainer_cycles\":{},",
+                "\"rc_drainer_drained_entries\":{},",
+                "\"rc_drainer_pages_built\":{},",
+                "\"rc_drainer_cycle_us\":{},",
+                "\"rc_drainer_cycle_max_us\":{},",
+                "\"rc_drainer_overlay_size_max_pages\":{},",
+                "\"rc_drainer_checkpoint_wait_us\":{},",
+                "\"rc_drainer_checkpoint_wait_max_us\":{},",
+                "\"rc_drainer_backpressure_fallbacks\":{},",
+                "\"rc_drainer_pool_refills\":{}",
                 "}}"
             ),
             self.commit_attempts,
@@ -1343,12 +1567,22 @@ impl MetaMetricsSnapshot {
             self.l2p_multi_get_tree_us,
             self.l2p_multi_get_tree_max_us,
             self.flush_calls,
+            self.flush_calls_steady,
+            self.flush_calls_forced,
             self.flush_total_us,
             self.flush_total_max_us,
+            self.flush_total_us_steady,
+            self.flush_total_max_us_steady,
+            self.flush_total_us_forced,
+            self.flush_total_max_us_forced,
             self.flush_gate_wait_us,
             self.flush_gate_wait_max_us,
             self.flush_sample_us,
             self.flush_sample_max_us,
+            self.flush_sample_us_steady,
+            self.flush_sample_max_us_steady,
+            self.flush_sample_us_forced,
+            self.flush_sample_max_us_forced,
             self.flush_io_us,
             self.flush_io_max_us,
             self.flush_manifest_us,
@@ -1362,6 +1596,22 @@ impl MetaMetricsSnapshot {
             self.flush_reclaim_selected_pages,
             self.flush_reclaim_reclaimed_pages,
             self.flush_reclaim_blocked_pages,
+            self.flush_sample_l2p_dirty_pages,
+            self.flush_sample_l2p_dirty_pages_max,
+            self.flush_sample_rc_drained_deltas,
+            self.flush_sample_rc_drained_deltas_max,
+            self.flush_sample_rc_fresh_pages,
+            self.flush_sample_rc_fresh_pages_max,
+            self.rc_drainer_cycles,
+            self.rc_drainer_drained_entries,
+            self.rc_drainer_pages_built,
+            self.rc_drainer_cycle_us,
+            self.rc_drainer_cycle_max_us,
+            self.rc_drainer_overlay_size_max_pages,
+            self.rc_drainer_checkpoint_wait_us,
+            self.rc_drainer_checkpoint_wait_max_us,
+            self.rc_drainer_backpressure_fallbacks,
+            self.rc_drainer_pool_refills,
         )
     }
 }

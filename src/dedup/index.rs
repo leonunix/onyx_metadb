@@ -195,10 +195,18 @@ impl DedupIndex {
         // Order matters: clear L3 first so a concurrent reader that
         // sees fp ∈ L0 falls through to L3 and gets `None`. After
         // L3 returns clear, removing fp from L0 is safe.
-        self.cuckoo.delete(hash, lsn)?;
-        let fp = fp_of(hash);
-        self.sketch.remove(fp);
-        self.l1.evict(fp);
+        //
+        // Only update L0 / L1 when L3 actually had this entry. The L0
+        // sketch is reference-counted by fingerprint; multiple distinct
+        // hashes sharing the low 32 bits land on the same fp slot, so
+        // an unconditional `sketch.remove` for an absent hash would
+        // evict L0 reservations belonging to live siblings.
+        let removed = self.cuckoo.delete(hash, lsn)?;
+        if removed {
+            let fp = fp_of(hash);
+            self.sketch.remove(fp);
+            self.l1.evict(fp);
+        }
         Ok(())
     }
 
@@ -283,6 +291,53 @@ mod tests {
         // L0 + L1 populated.
         assert_eq!(idx.tier_sizes().l0_distinct_fps, 1);
         assert_eq!(idx.tier_sizes().l1_entries, 1);
+    }
+
+    #[test]
+    fn delete_of_absent_hash_does_not_evict_fp_collision_sibling() {
+        // Regression for db_phase6_proptest::db_vs_reference_with_reopens.
+        // The L0 sketch is reference-counted by 32-bit fingerprint
+        // (`fp_of(hash) = u32::from_le_bytes(hash[..4])`). Two distinct
+        // hashes that share the same low 4 bytes also share an L0
+        // counter slot. Deleting an *absent* hash must not decrement
+        // that counter — otherwise the live sibling becomes invisible
+        // because L0 short-circuits to `None` first.
+        //
+        // Pick `a` and `b` that differ only past byte 3 so they share
+        // a fingerprint.
+        let a = [0u8, 0, 0, 0, 0, 0, 0, 0];
+        let b = [0u8, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(fp_of(&a), fp_of(&b), "test setup must collide");
+
+        let (_d, idx) = make_index();
+        idx.put(a, dv(0xAA), 100).unwrap();
+        // `b` was never inserted; deleting it is a no-op at L3 and
+        // must leave L0 / L1 entries for `a` intact.
+        idx.delete(&b, 101).unwrap();
+        assert_eq!(
+            idx.get(&a).unwrap(),
+            Some(dv(0xAA)),
+            "fp-collision sibling must still be observable after no-op delete"
+        );
+    }
+
+    #[test]
+    fn put_then_get_all_zero_hash_round_trips() {
+        // Regression: the all-zero hash (`Hash8([0; 8])`) maps to fp_of() = 0,
+        // and an all-zero DedupValue is a valid payload. Both must round-trip
+        // through L0 (sketch) + L1 (cache) + L3 (cuckoo) get.
+        let (_d, idx) = make_index();
+        let zero_hash = [0u8; 8];
+        let zero_value = DedupValue([0u8; 28]);
+        idx.put(zero_hash, zero_value, 100).unwrap();
+        assert_eq!(
+            idx.get(&zero_hash).unwrap(),
+            Some(zero_value),
+            "all-zero hash + all-zero value must be observable post-put"
+        );
+        // Also validate via multi_get (fast path used by lookup_dedup_hits).
+        let multi = idx.multi_get(&[zero_hash]).unwrap();
+        assert_eq!(multi, vec![Some(zero_value)]);
     }
 
     #[test]

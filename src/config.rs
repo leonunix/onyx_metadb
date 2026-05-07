@@ -139,6 +139,44 @@ pub struct Config {
     /// link)`), so 1 M entries ≈ 64 MiB. Larger caches reduce L3
     /// IOPS but cost RAM 1:1.
     pub dedup_l1_cache_entries: usize,
+
+    /// Run a per-shard background drainer that absorbs `RcShard.delta`
+    /// into a sealed-page staging overlay outside `apply_gate.write()`.
+    /// When enabled, `Db::flush()` sample-phase work shrinks to
+    /// "preempt drainer + small final-drain catch-up + atomic overlay
+    /// snapshot" instead of doing the heavy clone-and-apply loop in-
+    /// gate. When disabled (the safe default), `RcShard` reverts to
+    /// the priority-1 path verbatim.
+    pub refcount_drainer_enabled: bool,
+
+    /// Drainer cycle interval. Each shard's drainer parks for at most
+    /// this long before checking whether `delta_active` has any work.
+    /// Threshold-driven wakeups (see `refcount_drainer_threshold_entries`)
+    /// can fire sooner.
+    pub refcount_drainer_interval_ms: u64,
+
+    /// `delta_active` size that wakes the drainer ahead of the next
+    /// timer tick. Sized so the in-gate final-drain catch-up at
+    /// `begin_checkpoint` stays bounded.
+    pub refcount_drainer_threshold_entries: usize,
+
+    /// Hard cap on entries processed by a single drainer cycle.
+    /// Prevents a single cycle from holding overlay state for too long
+    /// when the drainer is far behind. Excess entries roll into the
+    /// next cycle.
+    pub refcount_drainer_max_entries_per_cycle: usize,
+
+    /// Batch size for refilling the per-shard `PagePool`. Each refill
+    /// calls [`PageStore::allocate_run`](crate::page_store::PageStore)
+    /// once, collapsing N per-page lock acquisitions into ⌈N / size⌉.
+    pub refcount_drainer_alloc_run_size: usize,
+
+    /// Backpressure trigger. When
+    /// `delta_active.len() + delta_draining.len() + overlay.pages.len()`
+    /// crosses this at `begin_checkpoint`, the in-gate path falls back
+    /// to the priority-1 synchronous drain instead of trying to absorb
+    /// a huge final batch into the overlay.
+    pub refcount_drainer_backpressure_pages: usize,
 }
 
 impl Config {
@@ -186,6 +224,14 @@ impl Config {
             // ~64 B, so 64 K ≈ 4 MiB. Production should bump in
             // lock-step with the working-set size.
             dedup_l1_cache_entries: 64_000,
+            // Drainer ships default-off. Soak validation flips to
+            // true after multi-hour A/B comparison vs priority-1.
+            refcount_drainer_enabled: false,
+            refcount_drainer_interval_ms: 50,
+            refcount_drainer_threshold_entries: 4_096,
+            refcount_drainer_max_entries_per_cycle: 65_536,
+            refcount_drainer_alloc_run_size: 64,
+            refcount_drainer_backpressure_pages: 8_192,
         }
     }
 }

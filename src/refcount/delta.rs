@@ -59,6 +59,34 @@ impl DeltaMap {
     pub fn drain(&mut self) -> impl Iterator<Item = (Pba, Pending)> + '_ {
         self.inner.drain()
     }
+
+    /// Take ownership of all entries by swapping in an empty map.
+    /// Used by the priority-3 background drainer in its cycle's
+    /// "swap out delta_active" step — bounded `O(1)` move under the
+    /// caller's `delta_active` lock, so concurrent `stage()` callers
+    /// re-acquire the (now-empty) map immediately after.
+    pub fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+
+    /// Re-merge a previously taken/drained entry back into the map.
+    /// Used by `RcShard::abort_checkpoint` to restore drained-but-
+    /// unflushed deltas, and by the backpressure fallback path that
+    /// rolls a draining batch back into `delta_active`.
+    pub fn merge_pending(&mut self, pba: Pba, pending: Pending) {
+        let slot = self.inner.entry(pba).or_default();
+        slot.delta = slot.delta.saturating_add(pending.delta);
+        if pending.last_lsn > slot.last_lsn {
+            slot.last_lsn = pending.last_lsn;
+        }
+    }
+
+    /// Iterate without consuming. Used by the drainer to clone the
+    /// drained batch when it needs to keep the data accessible
+    /// through `delta_draining` while the heavy build runs.
+    pub fn iter(&self) -> impl Iterator<Item = (&Pba, &Pending)> + '_ {
+        self.inner.iter()
+    }
 }
 
 #[cfg(test)]
