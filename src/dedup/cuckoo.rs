@@ -512,6 +512,17 @@ impl CuckooHash {
 
     fn free_slots_in_page(&self, bucket_id: u64) -> Result<usize> {
         let (page_idx, _bucket_in_page) = bucket_offset(bucket_id);
+        // Same lock order as `with_bucket_mut` / `with_existing_bucket_mut`:
+        // per-page shard FIRST, then the meta mutex. Without holding the
+        // shard lock here a writer that has just published a freshly
+        // allocated `page_table[page_idx] = pid` but not yet completed its
+        // `write_page` + `replace_or_insert` could leave us reading raw
+        // zeros from disk via `page_cache.get → page_store.read_page`,
+        // surfacing as `PageMagicMismatch`. The race was effectively
+        // invisible while `write_page` was a single ~30µs pwrite, but
+        // routing it through the centralised io_submitter widens the
+        // window enough to hit it under realistic load.
+        let _shard = self.bucket_locks[page_idx & (BUCKET_LOCK_SHARDS - 1)].lock();
         let pid = {
             let inner = self.inner.lock();
             if page_idx >= inner.page_table.len() {

@@ -33,6 +33,7 @@ pub mod dedup_types;
 pub mod epoch;
 pub mod error;
 pub mod fuzz;
+pub(crate) mod io_submitter;
 pub mod manifest;
 pub mod metrics;
 pub mod page;

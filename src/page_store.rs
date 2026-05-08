@@ -51,6 +51,7 @@ use io_uring::{IoUring, opcode, types};
 use crate::config::PAGE_SIZE;
 use crate::epoch::EpochManager;
 use crate::error::{MetaDbError, Result};
+use crate::io_submitter::IoSubmitter;
 use crate::metrics::MetaMetrics;
 use crate::page::{Page, PageHeader, PageType};
 use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
@@ -82,6 +83,13 @@ pub struct PageStore {
     path: PathBuf,
     file: File,
     read_pool: PageReadPool,
+    /// Centralised submitter for single-page `write_page`. `None` when
+    /// io_uring is unavailable; callers fall back to direct pwrite.
+    /// The previous design's hot path was 99.995% pwrite (cuckoo
+    /// bucket updates, `paged_meta::write_chain`, refcount staged
+    /// pages); routing these through one ring with deep SQ is the
+    /// central perf win targeted by this submitter.
+    io_submitter: Option<IoSubmitter>,
     #[cfg(target_os = "linux")]
     read_uring: Mutex<Option<IoUring>>,
     #[cfg(target_os = "linux")]
@@ -146,6 +154,18 @@ fn new_rc_locks() -> Box<[Mutex<()>]> {
         .map(|_| Mutex::new(()))
         .collect::<Vec<_>>()
         .into_boxed_slice()
+}
+
+fn make_io_submitter(file: &File) -> Option<IoSubmitter> {
+    #[cfg(target_os = "linux")]
+    {
+        IoSubmitter::start(file.as_raw_fd())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        None
+    }
 }
 
 impl std::fmt::Debug for PageStore {
@@ -280,10 +300,12 @@ impl PageStore {
         // will pre-extend to FIRST_DATA_PAGE + grow_chunk.
         file.set_len(FIRST_DATA_PAGE * PAGE_SIZE as u64)?;
         let read_pool = PageReadPool::start(&file)?;
+        let io_submitter = make_io_submitter(&file);
         Ok(Self {
             path,
             file,
             read_pool,
+            io_submitter,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
             #[cfg(target_os = "linux")]
@@ -325,6 +347,7 @@ impl PageStore {
         }
         let file_end_pages = size / PAGE_SIZE as u64;
         let read_pool = PageReadPool::start(&file)?;
+        let io_submitter = make_io_submitter(&file);
         tracing::info!(
             path = %path.display(),
             high_water_pages = file_end_pages,
@@ -335,6 +358,7 @@ impl PageStore {
             path,
             file,
             read_pool,
+            io_submitter,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
             #[cfg(target_os = "linux")]
@@ -380,6 +404,7 @@ impl PageStore {
         }
         let file_end_pages = size / PAGE_SIZE as u64;
         let read_pool = PageReadPool::start(&file)?;
+        let io_submitter = make_io_submitter(&file);
         // Walk every page in [FIRST_DATA_PAGE, file_end_pages). Typed pages
         // extend the recovered `high_water`; Free pages and all-zero punched
         // holes are reusable. A zero suffix past the last typed page is
@@ -415,6 +440,7 @@ impl PageStore {
             path,
             file,
             read_pool,
+            io_submitter,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
             #[cfg(target_os = "linux")]
@@ -442,6 +468,9 @@ impl PageStore {
     /// the same handle is fine; calling with different handles is a
     /// no-op after the first.
     pub fn attach_metrics(&self, metrics: Arc<MetaMetrics>) {
+        if let Some(submitter) = self.io_submitter.as_ref() {
+            submitter.attach_metrics(Arc::clone(&metrics));
+        }
         let _ = self.metrics.set(metrics);
     }
 
@@ -524,8 +553,18 @@ impl PageStore {
     pub fn write_page(&self, page_id: PageId, page: &Page) -> Result<()> {
         self.check_in_range(page_id)?;
         let started = Instant::now();
-        self.file
-            .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
+        // Prefer the centralised io_submitter so cuckoo / paged_meta /
+        // refcount staged single-page writes coalesce with every other
+        // page-file write through one ring. The submitter is sync from
+        // the caller's perspective: returns once the kernel CQE has
+        // been harvested, so subsequent `sync` is durable. Fall back
+        // to direct pwrite when io_uring is unavailable.
+        if let Some(submitter) = self.io_submitter.as_ref() {
+            submitter.submit_write(page_id, Arc::new(page.clone()))?;
+        } else {
+            self.file
+                .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
+        }
         if let Some(metrics) = self.metrics() {
             metrics.record_meta_io_write_batch(1, PAGE_SIZE, started.elapsed());
         }
@@ -578,7 +617,46 @@ impl PageStore {
         let bytes = ops * PAGE_SIZE;
         pages.sort_unstable_by_key(|(pid, _)| *pid);
         let started = Instant::now();
-        write_sealed_pages_raw(&self.file, pages, self.write_uring())?;
+        // Prefer the centralised submitter so flush / cuckoo / paged
+        // sealed writes coalesce with single-page write_page traffic
+        // through one ring. The old shared-uring path capped at
+        // `MAX_SEALED_WRITE_URING_RUNS = 16` SQEs per
+        // `submit_and_wait`; the submitter has SQ=1024 and batches
+        // arbitrarily many concurrent runs per ring transition.
+        if let Some(submitter) = self.io_submitter.as_ref() {
+            // Coalesce contiguous pids into runs (each becomes one
+            // `IORING_OP_WRITEV` SQE). Cap each run at
+            // `MAX_SEALED_WRITE_RUN_PAGES` so the iovec count per
+            // writev stays well under IOV_MAX.
+            let runs = coalesce_sealed_runs(pages, MAX_SEALED_WRITE_RUN_PAGES);
+            let receivers: Vec<_> = runs
+                .into_iter()
+                .map(|(start, run_pages)| submitter.submit_write_run_async(start, run_pages))
+                .collect::<Result<Vec<_>>>()?;
+            let mut first_err: Option<MetaDbError> = None;
+            for rx in receivers {
+                match rx.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                    Err(_) => {
+                        if first_err.is_none() {
+                            first_err = Some(MetaDbError::Io(io::Error::other(
+                                "io submitter dropped reply for write run",
+                            )));
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+        } else {
+            write_sealed_pages_raw(&self.file, pages, self.write_uring())?;
+        }
         if let Some(metrics) = self.metrics() {
             metrics.record_meta_io_write_batch(ops, bytes, started.elapsed());
         }
@@ -1213,9 +1291,22 @@ impl PageStore {
     }
 
     /// `fdatasync` the page file (content only).
+    ///
+    /// Routed through the central [`IoSubmitter`] so the fsync
+    /// SQE serialises naturally behind every previously Ok'd
+    /// `write_page` / `write_sealed_page_runs` op (each of those
+    /// blocked on its own CQE before returning, so by the time the
+    /// fsync op is dequeued the kernel has already received the
+    /// bytes). When the submitter is unavailable, fall back to the
+    /// `fdatasync(2)` syscall — which is per-fd, so it sees the same
+    /// kernel state regardless of the path the writes took.
     pub fn sync(&self) -> Result<()> {
         let started = Instant::now();
-        sync_data_raw(&self.file, self.write_uring())?;
+        if let Some(submitter) = self.io_submitter.as_ref() {
+            submitter.submit_fsync()?;
+        } else {
+            self.file.sync_data()?;
+        }
         if let Some(metrics) = self.metrics() {
             metrics.record_meta_io_fsync(started.elapsed());
         }
@@ -1235,7 +1326,7 @@ impl PageStore {
     fn check_in_range(&self, page_id: PageId) -> Result<()> {
         let inner = self.inner.lock();
         if page_id >= inner.high_water {
-            return Err(MetaDbError::PageOutOfRange(page_id));
+             return Err(MetaDbError::PageOutOfRange(page_id));
         }
         Ok(())
     }
@@ -1267,6 +1358,32 @@ impl PageStore {
     fn write_uring(&self) -> Option<&()> {
         None
     }
+}
+
+/// Group pid-sorted sealed pages into contiguous runs, capped at
+/// `max_pages_per_run` so a single `IORING_OP_WRITEV` SQE doesn't
+/// exceed IOV_MAX. Each run becomes one writev submission through the
+/// centralised submitter.
+fn coalesce_sealed_runs(
+    pages: Vec<(PageId, Arc<Page>)>,
+    max_pages_per_run: usize,
+) -> Vec<(PageId, Vec<Arc<Page>>)> {
+    let mut runs: Vec<(PageId, Vec<Arc<Page>>)> = Vec::new();
+    for (pid, page) in pages {
+        let extend = runs
+            .last()
+            .map(|(start, run_pages)| {
+                let next_pid = start + run_pages.len() as PageId;
+                pid == next_pid && run_pages.len() < max_pages_per_run
+            })
+            .unwrap_or(false);
+        if extend {
+            runs.last_mut().expect("checked extend").1.push(page);
+        } else {
+            runs.push((pid, vec![page]));
+        }
+    }
+    runs
 }
 
 fn take_contiguous_free_run(free_list: &mut Vec<PageId>, count: usize) -> Option<PageId> {
@@ -1504,71 +1621,6 @@ fn write_sealed_pages_raw(
     _write_uring: Option<&()>,
 ) -> Result<()> {
     PageStore::write_sealed_page_runs_pwrite(file, pages)
-}
-
-#[cfg(target_os = "linux")]
-fn sync_data_raw(file: &File, write_uring: Option<&Mutex<Option<IoUring>>>) -> Result<()> {
-    let Some(write_uring) = write_uring else {
-        file.sync_data()?;
-        return Ok(());
-    };
-    let mut guard = write_uring.lock();
-    let Some(ring) = guard.as_mut() else {
-        file.sync_data()?;
-        return Ok(());
-    };
-    match sync_data_raw_uring(file, ring) {
-        Ok(()) => Ok(()),
-        Err(err) if is_uring_setup_error(&err) => {
-            tracing::debug!(error = %err, "page_store io_uring fsync failed; falling back to fdatasync");
-            *guard = None;
-            file.sync_data()?;
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn sync_data_raw(file: &File, _write_uring: Option<&()>) -> Result<()> {
-    file.sync_data()?;
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn sync_data_raw_uring(file: &File, ring: &mut IoUring) -> Result<()> {
-    let fd = file.as_raw_fd();
-    let entry = opcode::Fsync::new(types::Fd(fd))
-        .flags(types::FsyncFlags::DATASYNC)
-        .build()
-        .user_data(0);
-    {
-        let mut sq = ring.submission();
-        // SAFETY: the SQE carries only the file descriptor and no borrowed
-        // userspace buffer. The descriptor stays open for the whole call.
-        unsafe {
-            sq.push(&entry).map_err(|_| {
-                MetaDbError::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    "page_store fsync io_uring submission queue full",
-                ))
-            })?;
-        }
-    }
-    ring.submit_and_wait(1).map_err(MetaDbError::Io)?;
-    let mut cq = ring.completion();
-    cq.sync();
-    let Some(cqe) = cq.next() else {
-        return Err(MetaDbError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            "page_store fsync io_uring missing CQE",
-        )));
-    };
-    let result = cqe.result();
-    if result < 0 {
-        return Err(MetaDbError::Io(io::Error::from_raw_os_error(-result)));
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]

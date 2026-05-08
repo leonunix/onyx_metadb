@@ -45,6 +45,7 @@ pub struct MetaMetrics {
     commit_errors: AtomicU64,
     commit_empty: AtomicU64,
     commit_ops: AtomicU64,
+    commit_ops_per_tx_max: AtomicU64,
     commit_wal_body_bytes: AtomicU64,
     commit_wal_body_bytes_max: AtomicU64,
     commit_total_us: AtomicU64,
@@ -393,6 +394,30 @@ pub struct MetaMetrics {
     meta_io_write_uring_lock_acquires: AtomicU64,
     meta_io_write_uring_lock_wait_us: AtomicU64,
     meta_io_write_uring_lock_wait_max_us: AtomicU64,
+
+    // Centralised IoSubmitter telemetry (Phase 1 observability).
+    //
+    // `io_submitter_iterations` is incremented once per submitter loop
+    // iteration that actually called `submit_and_wait(1)` (i.e. once
+    // per ring transition). `io_submitter_sqes_submitted` totals every
+    // SQE pushed by that iteration (all the new ops drained from the
+    // channel before the wait). Their ratio gives the average batch.
+    //
+    // `_max` counters track per-iteration peaks:
+    //  - `channel_pending_max` = `rx.len()` observed at the start of
+    //    the loop, *before* draining into the SQ. High values say
+    //    producers are queueing faster than the submitter drains.
+    //  - `submit_batch_size_max` = SQEs pushed *this iteration*. If
+    //    this stays small (≪ SQ_ENTRIES) under pressure, batching is
+    //    not happening — either producers are too rate-limited, or
+    //    the submitter is harvesting CQEs too quickly.
+    //  - `inflight_max` = ops with an outstanding CQE at peak. Tracks
+    //    real device-level write/fsync queue depth.
+    io_submitter_iterations: AtomicU64,
+    io_submitter_sqes_submitted: AtomicU64,
+    io_submitter_channel_pending_max: AtomicU64,
+    io_submitter_submit_batch_size_max: AtomicU64,
+    io_submitter_inflight_max: AtomicU64,
 }
 
 /// Why this `Db::flush()` invocation is happening. Tags the metrics so
@@ -418,6 +443,7 @@ pub struct MetaMetricsSnapshot {
     pub commit_errors: u64,
     pub commit_empty: u64,
     pub commit_ops: u64,
+    pub commit_ops_per_tx_max: u64,
     pub commit_wal_body_bytes: u64,
     pub commit_wal_body_bytes_max: u64,
     pub commit_total_us: u64,
@@ -682,6 +708,12 @@ pub struct MetaMetricsSnapshot {
     pub meta_io_write_uring_lock_acquires: u64,
     pub meta_io_write_uring_lock_wait_us: u64,
     pub meta_io_write_uring_lock_wait_max_us: u64,
+
+    pub io_submitter_iterations: u64,
+    pub io_submitter_sqes_submitted: u64,
+    pub io_submitter_channel_pending_max: u64,
+    pub io_submitter_submit_batch_size_max: u64,
+    pub io_submitter_inflight_max: u64,
 }
 
 impl MetaMetrics {
@@ -696,6 +728,7 @@ impl MetaMetrics {
             commit_errors: load(&self.commit_errors),
             commit_empty: load(&self.commit_empty),
             commit_ops: load(&self.commit_ops),
+            commit_ops_per_tx_max: load(&self.commit_ops_per_tx_max),
             commit_wal_body_bytes: load(&self.commit_wal_body_bytes),
             commit_wal_body_bytes_max: load(&self.commit_wal_body_bytes_max),
             commit_total_us: load(&self.commit_total_us),
@@ -992,6 +1025,12 @@ impl MetaMetrics {
             meta_io_write_uring_lock_acquires: load(&self.meta_io_write_uring_lock_acquires),
             meta_io_write_uring_lock_wait_us: load(&self.meta_io_write_uring_lock_wait_us),
             meta_io_write_uring_lock_wait_max_us: load(&self.meta_io_write_uring_lock_wait_max_us),
+
+            io_submitter_iterations: load(&self.io_submitter_iterations),
+            io_submitter_sqes_submitted: load(&self.io_submitter_sqes_submitted),
+            io_submitter_channel_pending_max: load(&self.io_submitter_channel_pending_max),
+            io_submitter_submit_batch_size_max: load(&self.io_submitter_submit_batch_size_max),
+            io_submitter_inflight_max: load(&self.io_submitter_inflight_max),
         }
     }
 
@@ -1112,6 +1151,30 @@ impl MetaMetrics {
         );
     }
 
+    /// Called by the centralised `IoSubmitter` once per submit-and-wait
+    /// iteration. `pulled` = SQEs pushed *this iteration*, `inflight` =
+    /// in-flight ops at submit time, `channel_pending` = `rx.len()`
+    /// before the drain. Iterations with no new SQEs (pure CQE harvest
+    /// rounds) still bump `iterations` so the average batch is accurate.
+    pub(crate) fn record_io_submitter_iteration(
+        &self,
+        pulled: usize,
+        inflight: usize,
+        channel_pending: usize,
+    ) {
+        self.io_submitter_iterations.fetch_add(1, Ordering::Relaxed);
+        if pulled > 0 {
+            self.io_submitter_sqes_submitted
+                .fetch_add(pulled as u64, Ordering::Relaxed);
+        }
+        fetch_max(&self.io_submitter_submit_batch_size_max, pulled as u64);
+        fetch_max(&self.io_submitter_inflight_max, inflight as u64);
+        fetch_max(
+            &self.io_submitter_channel_pending_max,
+            channel_pending as u64,
+        );
+    }
+
     pub(crate) fn record_flush_io_seal(&self, elapsed: Duration) {
         record_duration(&self.flush_io_seal_us, &self.flush_io_seal_max_us, elapsed);
     }
@@ -1212,6 +1275,7 @@ impl MetaMetrics {
     pub(crate) fn record_commit_attempt(&self, ops: usize) {
         self.commit_attempts.fetch_add(1, Ordering::Relaxed);
         self.commit_ops.fetch_add(ops as u64, Ordering::Relaxed);
+        fetch_max(&self.commit_ops_per_tx_max, ops as u64);
     }
 
     pub(crate) fn record_commit_wal_body_bytes(&self, bytes: usize) {
@@ -1890,6 +1954,7 @@ impl MetaMetricsSnapshot {
                 "\"commit_errors\":{},",
                 "\"commit_empty\":{},",
                 "\"commit_ops\":{},",
+                "\"commit_ops_per_tx_max\":{},",
                 "\"commit_wal_body_bytes\":{},",
                 "\"commit_wal_body_bytes_max\":{},",
                 "\"commit_total_us\":{},",
@@ -2132,7 +2197,12 @@ impl MetaMetricsSnapshot {
                 "\"meta_io_fsync_max_us\":{},",
                 "\"meta_io_write_uring_lock_acquires\":{},",
                 "\"meta_io_write_uring_lock_wait_us\":{},",
-                "\"meta_io_write_uring_lock_wait_max_us\":{}",
+                "\"meta_io_write_uring_lock_wait_max_us\":{},",
+                "\"io_submitter_iterations\":{},",
+                "\"io_submitter_sqes_submitted\":{},",
+                "\"io_submitter_channel_pending_max\":{},",
+                "\"io_submitter_submit_batch_size_max\":{},",
+                "\"io_submitter_inflight_max\":{}",
                 "}}"
             ),
             self.commit_attempts,
@@ -2140,6 +2210,7 @@ impl MetaMetricsSnapshot {
             self.commit_errors,
             self.commit_empty,
             self.commit_ops,
+            self.commit_ops_per_tx_max,
             self.commit_wal_body_bytes,
             self.commit_wal_body_bytes_max,
             self.commit_total_us,
@@ -2383,6 +2454,11 @@ impl MetaMetricsSnapshot {
             self.meta_io_write_uring_lock_acquires,
             self.meta_io_write_uring_lock_wait_us,
             self.meta_io_write_uring_lock_wait_max_us,
+            self.io_submitter_iterations,
+            self.io_submitter_sqes_submitted,
+            self.io_submitter_channel_pending_max,
+            self.io_submitter_submit_batch_size_max,
+            self.io_submitter_inflight_max,
         )
     }
 }
