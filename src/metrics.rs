@@ -383,6 +383,16 @@ pub struct MetaMetrics {
     meta_io_fsync_calls: AtomicU64,
     meta_io_fsync_us: AtomicU64,
     meta_io_fsync_max_us: AtomicU64,
+
+    // H5 lock contention probe. The page_store currently funnels every
+    // io_uring write through a single global `write_uring: Mutex<...>`;
+    // when this is the serialization point, lock_wait_max_us approaches
+    // meta_io_write_max_us and lock_wait_us / meta_io_write_us is high.
+    // Once the mutex is split per-role these counters drop, which is the
+    // before/after signal we want.
+    meta_io_write_uring_lock_acquires: AtomicU64,
+    meta_io_write_uring_lock_wait_us: AtomicU64,
+    meta_io_write_uring_lock_wait_max_us: AtomicU64,
 }
 
 /// Why this `Db::flush()` invocation is happening. Tags the metrics so
@@ -668,6 +678,10 @@ pub struct MetaMetricsSnapshot {
     pub meta_io_fsync_calls: u64,
     pub meta_io_fsync_us: u64,
     pub meta_io_fsync_max_us: u64,
+
+    pub meta_io_write_uring_lock_acquires: u64,
+    pub meta_io_write_uring_lock_wait_us: u64,
+    pub meta_io_write_uring_lock_wait_max_us: u64,
 }
 
 impl MetaMetrics {
@@ -972,6 +986,10 @@ impl MetaMetrics {
             meta_io_fsync_calls: load(&self.meta_io_fsync_calls),
             meta_io_fsync_us: load(&self.meta_io_fsync_us),
             meta_io_fsync_max_us: load(&self.meta_io_fsync_max_us),
+
+            meta_io_write_uring_lock_acquires: load(&self.meta_io_write_uring_lock_acquires),
+            meta_io_write_uring_lock_wait_us: load(&self.meta_io_write_uring_lock_wait_us),
+            meta_io_write_uring_lock_wait_max_us: load(&self.meta_io_write_uring_lock_wait_max_us),
         }
     }
 
@@ -1080,6 +1098,16 @@ impl MetaMetrics {
     pub(crate) fn record_meta_io_fsync(&self, elapsed: Duration) {
         self.meta_io_fsync_calls.fetch_add(1, Ordering::Relaxed);
         record_duration(&self.meta_io_fsync_us, &self.meta_io_fsync_max_us, elapsed);
+    }
+
+    pub(crate) fn record_meta_io_write_uring_lock_wait(&self, elapsed: Duration) {
+        self.meta_io_write_uring_lock_acquires
+            .fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.meta_io_write_uring_lock_wait_us,
+            &self.meta_io_write_uring_lock_wait_max_us,
+            elapsed,
+        );
     }
 
     pub(crate) fn record_flush_io_seal(&self, elapsed: Duration) {
@@ -2099,7 +2127,10 @@ impl MetaMetricsSnapshot {
                 "\"meta_io_read_batch_ops_max\":{},",
                 "\"meta_io_fsync_calls\":{},",
                 "\"meta_io_fsync_us\":{},",
-                "\"meta_io_fsync_max_us\":{}",
+                "\"meta_io_fsync_max_us\":{},",
+                "\"meta_io_write_uring_lock_acquires\":{},",
+                "\"meta_io_write_uring_lock_wait_us\":{},",
+                "\"meta_io_write_uring_lock_wait_max_us\":{}",
                 "}}"
             ),
             self.commit_attempts,
@@ -2347,6 +2378,9 @@ impl MetaMetricsSnapshot {
             self.meta_io_fsync_calls,
             self.meta_io_fsync_us,
             self.meta_io_fsync_max_us,
+            self.meta_io_write_uring_lock_acquires,
+            self.meta_io_write_uring_lock_wait_us,
+            self.meta_io_write_uring_lock_wait_max_us,
         )
     }
 }
