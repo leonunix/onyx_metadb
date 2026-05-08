@@ -22,6 +22,8 @@ pub struct MetaMetrics {
     commit_errors: AtomicU64,
     commit_empty: AtomicU64,
     commit_ops: AtomicU64,
+    commit_wal_body_bytes: AtomicU64,
+    commit_wal_body_bytes_max: AtomicU64,
     commit_total_us: AtomicU64,
     commit_total_max_us: AtomicU64,
     commit_wal_submit_us: AtomicU64,
@@ -133,6 +135,39 @@ pub struct MetaMetrics {
     dedup_lane_ready_queue_wait_max_us: AtomicU64,
     dedup_lane_exec_us: AtomicU64,
     dedup_lane_exec_max_us: AtomicU64,
+    // Per-task instrumentation for the L2P / refcount apply lanes.
+    // Aggregated across every shard's lane of the kind. See
+    // [`apply_lane_worker`] in `db.rs` for capture sites.
+    //   - `tasks` counts each apply task that finishes work().
+    //   - `queue_depth_max` is `state.queue.len() + state.maintenance.len()`
+    //     observed at enqueue time — peak backlog at any one lane.
+    //   - `queue_wait_us` is the gap between `enqueue_task()` push and
+    //     the worker popping the task (lane scheduling latency).
+    //   - `exec_us` is the wall time spent inside the work() closure.
+    //   - `idle_us` is time the worker spent blocked in `cvar.wait`
+    //     waiting for a task to arrive.
+    //   - `pending_set_wait_us` is RC-specific: time between worker
+    //     popping a pending task and the commit thread calling `set()`
+    //     to fill in the deferred refcount delta. ~0 for L2P
+    //     (enqueue_ready fills the slot up front).
+    l2p_apply_lane_tasks: AtomicU64,
+    l2p_apply_lane_queue_depth_max: AtomicU64,
+    l2p_apply_lane_queue_wait_us: AtomicU64,
+    l2p_apply_lane_queue_wait_max_us: AtomicU64,
+    l2p_apply_lane_exec_us: AtomicU64,
+    l2p_apply_lane_exec_max_us: AtomicU64,
+    l2p_apply_lane_idle_us: AtomicU64,
+    l2p_apply_lane_idle_max_us: AtomicU64,
+    rc_apply_lane_tasks: AtomicU64,
+    rc_apply_lane_queue_depth_max: AtomicU64,
+    rc_apply_lane_queue_wait_us: AtomicU64,
+    rc_apply_lane_queue_wait_max_us: AtomicU64,
+    rc_apply_lane_exec_us: AtomicU64,
+    rc_apply_lane_exec_max_us: AtomicU64,
+    rc_apply_lane_idle_us: AtomicU64,
+    rc_apply_lane_idle_max_us: AtomicU64,
+    rc_apply_lane_pending_set_wait_us: AtomicU64,
+    rc_apply_lane_pending_set_wait_max_us: AtomicU64,
     dedup_apply_guard_count: AtomicU64,
     dedup_apply_guard_us: AtomicU64,
     dedup_apply_guard_max_us: AtomicU64,
@@ -297,6 +332,8 @@ pub struct MetaMetricsSnapshot {
     pub commit_errors: u64,
     pub commit_empty: u64,
     pub commit_ops: u64,
+    pub commit_wal_body_bytes: u64,
+    pub commit_wal_body_bytes_max: u64,
     pub commit_total_us: u64,
     pub commit_total_max_us: u64,
     pub commit_wal_submit_us: u64,
@@ -394,6 +431,24 @@ pub struct MetaMetricsSnapshot {
     pub dedup_lane_ready_queue_wait_max_us: u64,
     pub dedup_lane_exec_us: u64,
     pub dedup_lane_exec_max_us: u64,
+    pub l2p_apply_lane_tasks: u64,
+    pub l2p_apply_lane_queue_depth_max: u64,
+    pub l2p_apply_lane_queue_wait_us: u64,
+    pub l2p_apply_lane_queue_wait_max_us: u64,
+    pub l2p_apply_lane_exec_us: u64,
+    pub l2p_apply_lane_exec_max_us: u64,
+    pub l2p_apply_lane_idle_us: u64,
+    pub l2p_apply_lane_idle_max_us: u64,
+    pub rc_apply_lane_tasks: u64,
+    pub rc_apply_lane_queue_depth_max: u64,
+    pub rc_apply_lane_queue_wait_us: u64,
+    pub rc_apply_lane_queue_wait_max_us: u64,
+    pub rc_apply_lane_exec_us: u64,
+    pub rc_apply_lane_exec_max_us: u64,
+    pub rc_apply_lane_idle_us: u64,
+    pub rc_apply_lane_idle_max_us: u64,
+    pub rc_apply_lane_pending_set_wait_us: u64,
+    pub rc_apply_lane_pending_set_wait_max_us: u64,
     pub dedup_apply_guard_count: u64,
     pub dedup_apply_guard_us: u64,
     pub dedup_apply_guard_max_us: u64,
@@ -514,6 +569,8 @@ impl MetaMetrics {
             commit_errors: load(&self.commit_errors),
             commit_empty: load(&self.commit_empty),
             commit_ops: load(&self.commit_ops),
+            commit_wal_body_bytes: load(&self.commit_wal_body_bytes),
+            commit_wal_body_bytes_max: load(&self.commit_wal_body_bytes_max),
             commit_total_us: load(&self.commit_total_us),
             commit_total_max_us: load(&self.commit_total_max_us),
             commit_wal_submit_us: load(&self.commit_wal_submit_us),
@@ -611,6 +668,24 @@ impl MetaMetrics {
             dedup_lane_ready_queue_wait_max_us: load(&self.dedup_lane_ready_queue_wait_max_us),
             dedup_lane_exec_us: load(&self.dedup_lane_exec_us),
             dedup_lane_exec_max_us: load(&self.dedup_lane_exec_max_us),
+            l2p_apply_lane_tasks: load(&self.l2p_apply_lane_tasks),
+            l2p_apply_lane_queue_depth_max: load(&self.l2p_apply_lane_queue_depth_max),
+            l2p_apply_lane_queue_wait_us: load(&self.l2p_apply_lane_queue_wait_us),
+            l2p_apply_lane_queue_wait_max_us: load(&self.l2p_apply_lane_queue_wait_max_us),
+            l2p_apply_lane_exec_us: load(&self.l2p_apply_lane_exec_us),
+            l2p_apply_lane_exec_max_us: load(&self.l2p_apply_lane_exec_max_us),
+            l2p_apply_lane_idle_us: load(&self.l2p_apply_lane_idle_us),
+            l2p_apply_lane_idle_max_us: load(&self.l2p_apply_lane_idle_max_us),
+            rc_apply_lane_tasks: load(&self.rc_apply_lane_tasks),
+            rc_apply_lane_queue_depth_max: load(&self.rc_apply_lane_queue_depth_max),
+            rc_apply_lane_queue_wait_us: load(&self.rc_apply_lane_queue_wait_us),
+            rc_apply_lane_queue_wait_max_us: load(&self.rc_apply_lane_queue_wait_max_us),
+            rc_apply_lane_exec_us: load(&self.rc_apply_lane_exec_us),
+            rc_apply_lane_exec_max_us: load(&self.rc_apply_lane_exec_max_us),
+            rc_apply_lane_idle_us: load(&self.rc_apply_lane_idle_us),
+            rc_apply_lane_idle_max_us: load(&self.rc_apply_lane_idle_max_us),
+            rc_apply_lane_pending_set_wait_us: load(&self.rc_apply_lane_pending_set_wait_us),
+            rc_apply_lane_pending_set_wait_max_us: load(&self.rc_apply_lane_pending_set_wait_max_us),
             dedup_apply_guard_count: load(&self.dedup_apply_guard_count),
             dedup_apply_guard_us: load(&self.dedup_apply_guard_us),
             dedup_apply_guard_max_us: load(&self.dedup_apply_guard_max_us),
@@ -636,15 +711,11 @@ impl MetaMetrics {
             ),
             dedup_put_cuckoo_free_slots_us: load(&self.dedup_put_cuckoo_free_slots_us),
             dedup_put_cuckoo_free_slots_max_us: load(&self.dedup_put_cuckoo_free_slots_max_us),
-            dedup_put_cuckoo_try_insert_empty_us: load(
-                &self.dedup_put_cuckoo_try_insert_empty_us,
-            ),
+            dedup_put_cuckoo_try_insert_empty_us: load(&self.dedup_put_cuckoo_try_insert_empty_us),
             dedup_put_cuckoo_try_insert_empty_max_us: load(
                 &self.dedup_put_cuckoo_try_insert_empty_max_us,
             ),
-            dedup_put_cuckoo_evict_and_insert_us: load(
-                &self.dedup_put_cuckoo_evict_and_insert_us,
-            ),
+            dedup_put_cuckoo_evict_and_insert_us: load(&self.dedup_put_cuckoo_evict_and_insert_us),
             dedup_put_cuckoo_evict_and_insert_max_us: load(
                 &self.dedup_put_cuckoo_evict_and_insert_max_us,
             ),
@@ -662,9 +733,7 @@ impl MetaMetrics {
             dedup_put_cuckoo_page_write_publish_max_us: load(
                 &self.dedup_put_cuckoo_page_write_publish_max_us,
             ),
-            dedup_put_cuckoo_bucket_lock_wait_us: load(
-                &self.dedup_put_cuckoo_bucket_lock_wait_us,
-            ),
+            dedup_put_cuckoo_bucket_lock_wait_us: load(&self.dedup_put_cuckoo_bucket_lock_wait_us),
             dedup_put_cuckoo_bucket_lock_wait_max_us: load(
                 &self.dedup_put_cuckoo_bucket_lock_wait_max_us,
             ),
@@ -815,11 +884,7 @@ impl MetaMetrics {
     }
 
     pub(crate) fn record_flush_io_seal(&self, elapsed: Duration) {
-        record_duration(
-            &self.flush_io_seal_us,
-            &self.flush_io_seal_max_us,
-            elapsed,
-        );
+        record_duration(&self.flush_io_seal_us, &self.flush_io_seal_max_us, elapsed);
     }
 
     pub(crate) fn record_flush_io_page_write(&self, elapsed: Duration) {
@@ -839,11 +904,7 @@ impl MetaMetrics {
     }
 
     pub(crate) fn record_flush_io_sync(&self, elapsed: Duration) {
-        record_duration(
-            &self.flush_io_sync_us,
-            &self.flush_io_sync_max_us,
-            elapsed,
-        );
+        record_duration(&self.flush_io_sync_us, &self.flush_io_sync_max_us, elapsed);
     }
 
     pub(crate) fn record_flush_manifest(&self, elapsed: Duration) {
@@ -912,8 +973,7 @@ impl MetaMetrics {
     }
 
     pub(crate) fn record_rc_drainer_pool_refill(&self) {
-        self.rc_drainer_pool_refills
-            .fetch_add(1, Ordering::Relaxed);
+        self.rc_drainer_pool_refills.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_commit_empty(&self) {
@@ -923,6 +983,12 @@ impl MetaMetrics {
     pub(crate) fn record_commit_attempt(&self, ops: usize) {
         self.commit_attempts.fetch_add(1, Ordering::Relaxed);
         self.commit_ops.fetch_add(ops as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_commit_wal_body_bytes(&self, bytes: usize) {
+        self.commit_wal_body_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        fetch_max(&self.commit_wal_body_bytes_max, bytes as u64);
     }
 
     pub(crate) fn record_commit_success(&self, total: Duration) {
@@ -1116,6 +1182,74 @@ impl MetaMetrics {
             ready_queue_wait,
         );
         record_duration(&self.dedup_lane_exec_us, &self.dedup_lane_exec_max_us, exec);
+    }
+
+    /// Record one completed L2P apply lane task. `queue_wait` is the
+    /// time from `enqueue_task()` to when the worker popped the task.
+    /// `exec` is the wall time spent inside the work() closure.
+    pub(crate) fn record_l2p_apply_lane_task(&self, queue_wait: Duration, exec: Duration) {
+        self.l2p_apply_lane_tasks.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.l2p_apply_lane_queue_wait_us,
+            &self.l2p_apply_lane_queue_wait_max_us,
+            queue_wait,
+        );
+        record_duration(
+            &self.l2p_apply_lane_exec_us,
+            &self.l2p_apply_lane_exec_max_us,
+            exec,
+        );
+    }
+
+    pub(crate) fn record_l2p_apply_lane_idle(&self, idle: Duration) {
+        record_duration(
+            &self.l2p_apply_lane_idle_us,
+            &self.l2p_apply_lane_idle_max_us,
+            idle,
+        );
+    }
+
+    pub(crate) fn record_l2p_apply_lane_queue_depth(&self, depth: usize) {
+        fetch_max(&self.l2p_apply_lane_queue_depth_max, depth as u64);
+    }
+
+    /// Record one completed refcount apply lane task. `pending_set_wait`
+    /// is the time the worker spent in `slot.take()` waiting for the
+    /// commit thread to call `set()`; ~0 for ready (non-pending) tasks.
+    pub(crate) fn record_rc_apply_lane_task(
+        &self,
+        queue_wait: Duration,
+        pending_set_wait: Duration,
+        exec: Duration,
+    ) {
+        self.rc_apply_lane_tasks.fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.rc_apply_lane_queue_wait_us,
+            &self.rc_apply_lane_queue_wait_max_us,
+            queue_wait,
+        );
+        record_duration(
+            &self.rc_apply_lane_pending_set_wait_us,
+            &self.rc_apply_lane_pending_set_wait_max_us,
+            pending_set_wait,
+        );
+        record_duration(
+            &self.rc_apply_lane_exec_us,
+            &self.rc_apply_lane_exec_max_us,
+            exec,
+        );
+    }
+
+    pub(crate) fn record_rc_apply_lane_idle(&self, idle: Duration) {
+        record_duration(
+            &self.rc_apply_lane_idle_us,
+            &self.rc_apply_lane_idle_max_us,
+            idle,
+        );
+    }
+
+    pub(crate) fn record_rc_apply_lane_queue_depth(&self, depth: usize) {
+        fetch_max(&self.rc_apply_lane_queue_depth_max, depth as u64);
     }
 
     pub(crate) fn record_dedup_forward_put(&self, elapsed: Duration) {
@@ -1473,6 +1607,8 @@ impl MetaMetricsSnapshot {
                 "\"commit_errors\":{},",
                 "\"commit_empty\":{},",
                 "\"commit_ops\":{},",
+                "\"commit_wal_body_bytes\":{},",
+                "\"commit_wal_body_bytes_max\":{},",
                 "\"commit_total_us\":{},",
                 "\"commit_total_max_us\":{},",
                 "\"commit_wal_submit_us\":{},",
@@ -1570,6 +1706,24 @@ impl MetaMetricsSnapshot {
                 "\"dedup_lane_ready_queue_wait_max_us\":{},",
                 "\"dedup_lane_exec_us\":{},",
                 "\"dedup_lane_exec_max_us\":{},",
+                "\"l2p_apply_lane_tasks\":{},",
+                "\"l2p_apply_lane_queue_depth_max\":{},",
+                "\"l2p_apply_lane_queue_wait_us\":{},",
+                "\"l2p_apply_lane_queue_wait_max_us\":{},",
+                "\"l2p_apply_lane_exec_us\":{},",
+                "\"l2p_apply_lane_exec_max_us\":{},",
+                "\"l2p_apply_lane_idle_us\":{},",
+                "\"l2p_apply_lane_idle_max_us\":{},",
+                "\"rc_apply_lane_tasks\":{},",
+                "\"rc_apply_lane_queue_depth_max\":{},",
+                "\"rc_apply_lane_queue_wait_us\":{},",
+                "\"rc_apply_lane_queue_wait_max_us\":{},",
+                "\"rc_apply_lane_exec_us\":{},",
+                "\"rc_apply_lane_exec_max_us\":{},",
+                "\"rc_apply_lane_idle_us\":{},",
+                "\"rc_apply_lane_idle_max_us\":{},",
+                "\"rc_apply_lane_pending_set_wait_us\":{},",
+                "\"rc_apply_lane_pending_set_wait_max_us\":{},",
                 "\"dedup_apply_guard_count\":{},",
                 "\"dedup_apply_guard_us\":{},",
                 "\"dedup_apply_guard_max_us\":{},",
@@ -1683,6 +1837,8 @@ impl MetaMetricsSnapshot {
             self.commit_errors,
             self.commit_empty,
             self.commit_ops,
+            self.commit_wal_body_bytes,
+            self.commit_wal_body_bytes_max,
             self.commit_total_us,
             self.commit_total_max_us,
             self.commit_wal_submit_us,
@@ -1780,6 +1936,24 @@ impl MetaMetricsSnapshot {
             self.dedup_lane_ready_queue_wait_max_us,
             self.dedup_lane_exec_us,
             self.dedup_lane_exec_max_us,
+            self.l2p_apply_lane_tasks,
+            self.l2p_apply_lane_queue_depth_max,
+            self.l2p_apply_lane_queue_wait_us,
+            self.l2p_apply_lane_queue_wait_max_us,
+            self.l2p_apply_lane_exec_us,
+            self.l2p_apply_lane_exec_max_us,
+            self.l2p_apply_lane_idle_us,
+            self.l2p_apply_lane_idle_max_us,
+            self.rc_apply_lane_tasks,
+            self.rc_apply_lane_queue_depth_max,
+            self.rc_apply_lane_queue_wait_us,
+            self.rc_apply_lane_queue_wait_max_us,
+            self.rc_apply_lane_exec_us,
+            self.rc_apply_lane_exec_max_us,
+            self.rc_apply_lane_idle_us,
+            self.rc_apply_lane_idle_max_us,
+            self.rc_apply_lane_pending_set_wait_us,
+            self.rc_apply_lane_pending_set_wait_max_us,
             self.dedup_apply_guard_count,
             self.dedup_apply_guard_us,
             self.dedup_apply_guard_max_us,

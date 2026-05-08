@@ -68,7 +68,12 @@ impl Db {
         // wait keeps the pattern symmetric with `drop_snapshot`.
         self.wait_for_global_apply_turn(lsn)?;
 
-        let (shards, roots) = apply_create_volume(&self.page_store, &self.page_cache, shard_count)?;
+        let (shards, roots) = apply_create_volume(
+            &self.page_store,
+            &self.page_cache,
+            shard_count,
+            self.metrics.clone(),
+        )?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
@@ -395,8 +400,13 @@ impl Db {
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
-        let (shards, actual_roots) =
-            build_clone_volume_shards(&src_shard_roots, &self.page_store, &self.page_cache, lsn)?;
+        let (shards, actual_roots) = build_clone_volume_shards(
+            &src_shard_roots,
+            &self.page_store,
+            &self.page_cache,
+            lsn,
+            self.metrics.clone(),
+        )?;
         let shard_count = shards.len() as u32;
 
         {

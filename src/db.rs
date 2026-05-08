@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use xxhash_rust::xxh3::xxh3_64;
@@ -269,6 +270,8 @@ struct ApplyLane {
 struct ApplyLaneInner {
     state: Mutex<ApplyLaneState>,
     cvar: Condvar,
+    kind: ApplyLaneKind,
+    metrics: Arc<MetaMetrics>,
 }
 
 struct ApplyLaneState {
@@ -283,6 +286,10 @@ struct ApplyLaneState {
 struct ApplyLaneTask {
     lsn: Option<Lsn>,
     slot: Arc<ApplyLaneTaskSlot>,
+    /// `Instant::now()` at `enqueue_task` push time, used by the H2
+    /// per-lane queue-wait metric in [`apply_lane_worker`]. `None` for
+    /// maintenance tasks (no queue-wait reporting needed).
+    enqueued_at: Option<Instant>,
 }
 
 struct ApplyLaneTaskSlot {
@@ -295,7 +302,12 @@ struct PendingApplyWork {
 }
 
 impl ApplyLane {
-    fn new(last_applied_lsn: Lsn, kind: ApplyLaneKind, ordinal: usize) -> Self {
+    fn new(
+        last_applied_lsn: Lsn,
+        kind: ApplyLaneKind,
+        ordinal: usize,
+        metrics: Arc<MetaMetrics>,
+    ) -> Self {
         let inner = Arc::new(ApplyLaneInner {
             state: Mutex::new(ApplyLaneState {
                 maintenance: VecDeque::new(),
@@ -306,6 +318,8 @@ impl ApplyLane {
                 shutdown: false,
             }),
             cvar: Condvar::new(),
+            kind,
+            metrics,
         });
         let worker_inner = inner.clone();
         let worker = std::thread::Builder::new()
@@ -350,6 +364,7 @@ impl ApplyLane {
     }
 
     fn enqueue_task(&self, lsn: Lsn, slot: Arc<ApplyLaneTaskSlot>) {
+        let now = Instant::now();
         let mut state = self.inner.state.lock();
         debug_assert!(
             state.last_enqueued_lsn < lsn,
@@ -360,7 +375,15 @@ impl ApplyLane {
         state.queue.push_back(ApplyLaneTask {
             lsn: Some(lsn),
             slot,
+            enqueued_at: Some(now),
         });
+        // Sample queue depth (post-push) for the H2 backlog metric.
+        let depth = state.queue.len() + state.maintenance.len();
+        match self.inner.kind {
+            ApplyLaneKind::L2p => self.inner.metrics.record_l2p_apply_lane_queue_depth(depth),
+            ApplyLaneKind::Refcount => self.inner.metrics.record_rc_apply_lane_queue_depth(depth),
+            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {}
+        }
         self.inner.cvar.notify_one();
     }
 }
@@ -374,6 +397,13 @@ impl ApplyLaneHandle {
     fn enqueue_maintenance(&self, work: ApplyWork) {
         let mut state = self.inner.state.lock();
         state.maintenance.push_back(ApplyLaneTaskSlot::ready(work));
+        // Maintenance pushes also count toward backlog depth.
+        let depth = state.queue.len() + state.maintenance.len();
+        match self.inner.kind {
+            ApplyLaneKind::L2p => self.inner.metrics.record_l2p_apply_lane_queue_depth(depth),
+            ApplyLaneKind::Refcount => self.inner.metrics.record_rc_apply_lane_queue_depth(depth),
+            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {}
+        }
         self.inner.cvar.notify_one();
     }
 }
@@ -456,6 +486,11 @@ impl Drop for PendingApplyWork {
 
 fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
     loop {
+        // Time spent waiting on `inner.cvar` (queue empty) — accumulated
+        // here so a single popped task's "wakeup" cost is the entire
+        // idle window since the last task finished.
+        let mut idle_total = std::time::Duration::ZERO;
+
         let task = {
             let mut state = inner.state.lock();
             loop {
@@ -478,7 +513,11 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
                                 .pop_front()
                                 .expect("maintenance checked non-empty");
                             state.ready_since_maintenance = 0;
-                            break ApplyLaneTask { lsn: None, slot };
+                            break ApplyLaneTask {
+                                lsn: None,
+                                slot,
+                                enqueued_at: None,
+                            };
                         }
                         state.ready_since_maintenance += 1;
                         break state.queue.pop_front().expect("queue checked non-empty");
@@ -489,7 +528,11 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
                             .pop_front()
                             .expect("maintenance checked non-empty");
                         state.ready_since_maintenance = 0;
-                        break ApplyLaneTask { lsn: None, slot };
+                        break ApplyLaneTask {
+                            lsn: None,
+                            slot,
+                            enqueued_at: None,
+                        };
                     }
                     (true, false) => {
                         state.ready_since_maintenance =
@@ -498,12 +541,53 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
                     }
                     (true, true) => {}
                 }
+                let wait_start = Instant::now();
                 inner.cvar.wait(&mut state);
+                idle_total += wait_start.elapsed();
             }
         };
 
+        let popped_at = Instant::now();
+        let queue_wait = task
+            .enqueued_at
+            .map(|t| popped_at.duration_since(t))
+            .unwrap_or_default();
+
+        // For RC tasks enqueued via `enqueue_pending`, `slot.take()`
+        // blocks on the slot's cvar until the commit thread calls
+        // `set()` to fill in the deferred refcount delta. Time it
+        // separately so we can tell apart "lane is starved on commit
+        // handoff" vs "lane is starved by its own backlog".
+        let take_start = Instant::now();
         let work = task.slot.take();
+        let pending_set_wait = take_start.elapsed();
+
+        let exec_start = Instant::now();
         let _ = catch_unwind(AssertUnwindSafe(work));
+        let exec = exec_start.elapsed();
+
+        let is_wal_task = task.lsn.is_some();
+        if is_wal_task {
+            match inner.kind {
+                ApplyLaneKind::L2p => {
+                    inner.metrics.record_l2p_apply_lane_task(queue_wait, exec);
+                    if !idle_total.is_zero() {
+                        inner.metrics.record_l2p_apply_lane_idle(idle_total);
+                    }
+                }
+                ApplyLaneKind::Refcount => {
+                    inner.metrics.record_rc_apply_lane_task(
+                        queue_wait,
+                        pending_set_wait,
+                        exec,
+                    );
+                    if !idle_total.is_zero() {
+                        inner.metrics.record_rc_apply_lane_idle(idle_total);
+                    }
+                }
+                ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {}
+            }
+        }
 
         let Some(lsn) = task.lsn else { continue };
 

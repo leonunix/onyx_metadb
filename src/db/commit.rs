@@ -329,6 +329,7 @@ impl Db {
             }
         };
         timing.encode = encode_started.elapsed();
+        self.metrics.record_commit_wal_body_bytes(body.len());
         let wal_started = std::time::Instant::now();
         let lsn = match self.submit_wal_ops(ops, body, Some(dispatch_footprint)) {
             Ok(lsn) => {
@@ -981,10 +982,10 @@ impl Db {
                                 Some(old_value) => {
                                     let old_pba = old_value.head_pba();
                                     let old_is_zero = old_value.0[27] & 0x02 != 0;
-                                    let push_decref = !old_is_zero
-                                        && (old_pba != new_pba || new_is_zero);
-                                    let push_incref = !new_is_zero
-                                        && (old_pba != new_pba || old_is_zero);
+                                    let push_decref =
+                                        !old_is_zero && (old_pba != new_pba || new_is_zero);
+                                    let push_incref =
+                                        !new_is_zero && (old_pba != new_pba || old_is_zero);
                                     // P0 diagnostic: trace every rc_action push
                                     // so the underflow report can be tied back
                                     // to the originating op's (lba, prev, new).
@@ -1262,30 +1263,26 @@ impl Db {
             }
             Ok(())
         };
-        let flush_pending_puts =
-            |pending_puts: &mut Vec<(Hash8, DedupValue, usize)>,
-             outcomes: &mut Vec<(usize, ApplyOutcome)>|
-             -> Result<()> {
-                if pending_puts.is_empty() {
-                    return Ok(());
-                }
-                let entries: Vec<(Hash8, DedupValue)> = pending_puts
-                    .iter()
-                    .map(|(hash, value, _)| (*hash, *value))
-                    .collect();
-                let mut put_timings = DedupPutStageTimings::default();
-                let started = std::time::Instant::now();
-                dedup_index.put_many_with_metrics(&entries, lsn, &mut put_timings)?;
-                metrics.record_dedup_forward_put_batch(
-                    pending_puts.len() as u64,
-                    started.elapsed(),
-                );
-                metrics.record_dedup_put_stages(put_timings);
-                for (_, _, idx) in pending_puts.drain(..) {
-                    outcomes.push((idx, ApplyOutcome::Dedup));
-                }
-                Ok(())
-            };
+        let flush_pending_puts = |pending_puts: &mut Vec<(Hash8, DedupValue, usize)>,
+                                  outcomes: &mut Vec<(usize, ApplyOutcome)>|
+         -> Result<()> {
+            if pending_puts.is_empty() {
+                return Ok(());
+            }
+            let entries: Vec<(Hash8, DedupValue)> = pending_puts
+                .iter()
+                .map(|(hash, value, _)| (*hash, *value))
+                .collect();
+            let mut put_timings = DedupPutStageTimings::default();
+            let started = std::time::Instant::now();
+            dedup_index.put_many_with_metrics(&entries, lsn, &mut put_timings)?;
+            metrics.record_dedup_forward_put_batch(pending_puts.len() as u64, started.elapsed());
+            metrics.record_dedup_put_stages(put_timings);
+            for (_, _, idx) in pending_puts.drain(..) {
+                outcomes.push((idx, ApplyOutcome::Dedup));
+            }
+            Ok(())
+        };
 
         for idx in indices {
             match &ops[idx] {

@@ -105,9 +105,10 @@ pub(super) fn build_dedup_lanes(
     last_applied: Lsn,
     shard_count: usize,
     kind: ApplyLaneKind,
+    metrics: Arc<MetaMetrics>,
 ) -> Box<[ApplyLane]> {
     (0..shard_count)
-        .map(|sid| ApplyLane::new(last_applied, kind, sid))
+        .map(|sid| ApplyLane::new(last_applied, kind, sid, metrics.clone()))
         .collect::<Vec<_>>()
         .into_boxed_slice()
 }
@@ -146,6 +147,7 @@ pub(super) fn create_shards(
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     shard_count: usize,
+    metrics: Arc<MetaMetrics>,
 ) -> Result<(Vec<Shard>, Box<[PageId]>)> {
     let mut shards = Vec::with_capacity(shard_count);
     let mut roots = Vec::with_capacity(shard_count);
@@ -154,7 +156,7 @@ pub(super) fn create_shards(
         roots.push(rc.meta_page_id());
         shards.push(Shard {
             rc: Arc::new(rc),
-            apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx),
+            apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx, metrics.clone()),
         });
     }
     Ok((shards, roots.into_boxed_slice()))
@@ -165,6 +167,7 @@ pub(super) fn open_shards(
     page_cache: Arc<PageCache>,
     roots: &[PageId],
     _next_gen: Lsn,
+    metrics: Arc<MetaMetrics>,
 ) -> Result<Vec<Shard>> {
     let mut shards = Vec::with_capacity(roots.len());
     for (shard_idx, &meta_page_id) in roots.iter().enumerate() {
@@ -172,7 +175,7 @@ pub(super) fn open_shards(
             crate::refcount::RcShard::open(page_store.clone(), page_cache.clone(), meta_page_id)?;
         shards.push(Shard {
             rc: Arc::new(rc),
-            apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx),
+            apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx, metrics.clone()),
         });
     }
     Ok(shards)
@@ -186,6 +189,7 @@ pub(super) fn make_l2p_shard(
     tree: PagedL2p,
     page_cache: &Arc<PageCache>,
     shard_idx: usize,
+    metrics: Arc<MetaMetrics>,
 ) -> L2pShard {
     let view = crate::paged::ReadView::new(
         tree.root(),
@@ -197,7 +201,7 @@ pub(super) fn make_l2p_shard(
         tree: RwLock::new(tree),
         read_view: RwLock::new(Arc::new(view)),
         active_readers: std::sync::atomic::AtomicUsize::new(0),
-        apply_lane: ApplyLane::new(0, ApplyLaneKind::L2p, shard_idx),
+        apply_lane: ApplyLane::new(0, ApplyLaneKind::L2p, shard_idx, metrics),
     }
 }
 
@@ -205,13 +209,14 @@ pub(super) fn create_l2p_shards(
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     shard_count: usize,
+    metrics: Arc<MetaMetrics>,
 ) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
     let mut shards = Vec::with_capacity(shard_count);
     let mut roots = Vec::with_capacity(shard_count);
     for shard_idx in 0..shard_count {
         let tree = PagedL2p::create_with_cache(page_store.clone(), page_cache.clone())?;
         roots.push(tree.root());
-        shards.push(make_l2p_shard(tree, &page_cache, shard_idx));
+        shards.push(make_l2p_shard(tree, &page_cache, shard_idx, metrics.clone()));
     }
     Ok((shards, roots.into_boxed_slice()))
 }
@@ -221,12 +226,13 @@ pub(super) fn open_l2p_shards(
     page_cache: Arc<PageCache>,
     roots: &[PageId],
     next_gen: Lsn,
+    metrics: Arc<MetaMetrics>,
 ) -> Result<Vec<L2pShard>> {
     let mut shards = Vec::with_capacity(roots.len());
     for (shard_idx, &root) in roots.iter().enumerate() {
         let tree =
             PagedL2p::open_with_cache(page_store.clone(), page_cache.clone(), root, next_gen)?;
-        shards.push(make_l2p_shard(tree, &page_cache, shard_idx));
+        shards.push(make_l2p_shard(tree, &page_cache, shard_idx, metrics.clone()));
     }
     Ok(shards)
 }

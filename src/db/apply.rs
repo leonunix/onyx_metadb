@@ -523,9 +523,10 @@ pub(super) fn apply_create_volume(
     page_store: &Arc<PageStore>,
     page_cache: &Arc<PageCache>,
     shard_count: u32,
+    metrics: Arc<MetaMetrics>,
 ) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
     let n = validate_shard_count(shard_count)?;
-    create_l2p_shards(page_store.clone(), page_cache.clone(), n)
+    create_l2p_shards(page_store.clone(), page_cache.clone(), n, metrics)
 }
 
 /// Apply a `DropVolume` op's page-decref cascade. Reuses
@@ -596,6 +597,7 @@ pub(super) fn build_clone_volume_shards(
     page_store: &Arc<PageStore>,
     page_cache: &Arc<PageCache>,
     created_lsn: Lsn,
+    metrics: Arc<MetaMetrics>,
 ) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
     let mut shards = Vec::with_capacity(src_shard_roots.len());
     let mut actual_roots = Vec::with_capacity(src_shard_roots.len());
@@ -611,7 +613,12 @@ pub(super) fn build_clone_volume_shards(
             )?
         };
         actual_roots.push(tree.root());
-        shards.push(super::helpers::make_l2p_shard(tree, page_cache, shard_idx));
+        shards.push(super::helpers::make_l2p_shard(
+            tree,
+            page_cache,
+            shard_idx,
+            metrics.clone(),
+        ));
     }
     Ok((shards, actual_roots.into_boxed_slice()))
 }

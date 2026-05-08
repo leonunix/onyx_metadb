@@ -269,10 +269,18 @@ impl Db {
         let metrics = Arc::new(MetaMetrics::new());
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
-        let (l2p_shards, l2p_roots) =
-            create_l2p_shards(page_store.clone(), page_cache.clone(), shard_count)?;
-        let (refcount_shards, refcount_roots) =
-            create_shards(page_store.clone(), page_cache.clone(), shard_count)?;
+        let (l2p_shards, l2p_roots) = create_l2p_shards(
+            page_store.clone(),
+            page_cache.clone(),
+            shard_count,
+            metrics.clone(),
+        )?;
+        let (refcount_shards, refcount_roots) = create_shards(
+            page_store.clone(),
+            page_cache.clone(),
+            shard_count,
+            metrics.clone(),
+        )?;
         let dedup_index = Arc::new(crate::dedup::DedupIndex::create(
             page_store.clone(),
             page_cache.clone(),
@@ -329,6 +337,18 @@ impl Db {
         let drainer_cfg = cfg.clone();
         let page_store_for_drainers = page_store.clone();
         let metrics_for_drainers = metrics.clone();
+        let dedup_lanes = build_dedup_lanes(
+            0,
+            dedup_shards as usize,
+            ApplyLaneKind::Dedup,
+            metrics.clone(),
+        );
+        let dedup_maintenance_lanes = build_dedup_lanes(
+            0,
+            dedup_shards as usize,
+            ApplyLaneKind::DedupMaintenance,
+            metrics.clone(),
+        );
         let db = Self {
             page_store,
             page_cache,
@@ -341,12 +361,8 @@ impl Db {
             refcount_shards,
             dedup_index,
             dedup_reverse,
-            dedup_lanes: build_dedup_lanes(0, dedup_shards as usize, ApplyLaneKind::Dedup),
-            dedup_maintenance_lanes: build_dedup_lanes(
-                0,
-                dedup_shards as usize,
-                ApplyLaneKind::DedupMaintenance,
-            ),
+            dedup_lanes,
+            dedup_maintenance_lanes,
             dedup_maintenance_queued: build_dedup_queued_flags(dedup_shards as usize),
             wal,
             apply_gate: ApplyGate::new(),
@@ -451,6 +467,7 @@ impl Db {
                 page_cache.clone(),
                 &entry.l2p_shard_roots,
                 next_gen,
+                metrics.clone(),
             )?;
             volumes.insert(
                 entry.ord,
@@ -462,6 +479,7 @@ impl Db {
             page_cache.clone(),
             &manifest.refcount_shard_roots,
             next_gen,
+            metrics.clone(),
         )?;
         let dedup_index_meta_pid: PageId = manifest
             .dedup_index_shard_heads
@@ -536,8 +554,12 @@ impl Db {
                     match op {
                         WalOp::CreateVolume { ord, shard_count } => {
                             if !volumes.contains_key(ord) {
-                                let (shards, roots) =
-                                    apply_create_volume(&page_store, &page_cache, *shard_count)?;
+                                let (shards, roots) = apply_create_volume(
+                                    &page_store,
+                                    &page_cache,
+                                    *shard_count,
+                                    metrics.clone(),
+                                )?;
                                 volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
                                 manifest.volumes.push(VolumeEntry {
                                     ord: *ord,
@@ -598,6 +620,7 @@ impl Db {
                                     &page_store,
                                     &page_cache,
                                     lsn,
+                                    metrics.clone(),
                                 )?;
                                 let shard_count = shards.len() as u32;
                                 volumes
@@ -766,6 +789,18 @@ impl Db {
         let drainer_cfg = cfg.clone();
         let page_store_for_drainers = page_store.clone();
         let metrics_for_drainers = metrics.clone();
+        let dedup_lanes = build_dedup_lanes(
+            last_applied,
+            manifest_dedup_shards,
+            ApplyLaneKind::Dedup,
+            metrics.clone(),
+        );
+        let dedup_maintenance_lanes = build_dedup_lanes(
+            last_applied,
+            manifest_dedup_shards,
+            ApplyLaneKind::DedupMaintenance,
+            metrics.clone(),
+        );
 
         let db = Self {
             page_store,
@@ -779,16 +814,8 @@ impl Db {
             refcount_shards,
             dedup_index,
             dedup_reverse,
-            dedup_lanes: build_dedup_lanes(
-                last_applied,
-                manifest_dedup_shards,
-                ApplyLaneKind::Dedup,
-            ),
-            dedup_maintenance_lanes: build_dedup_lanes(
-                last_applied,
-                manifest_dedup_shards,
-                ApplyLaneKind::DedupMaintenance,
-            ),
+            dedup_lanes,
+            dedup_maintenance_lanes,
             dedup_maintenance_queued: build_dedup_queued_flags(manifest_dedup_shards),
             wal,
             apply_gate: ApplyGate::new(),
