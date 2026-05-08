@@ -1,6 +1,29 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::config::MAX_APPLY_LANE_SHARDS;
+
+/// Newtype around `[AtomicU64; MAX_APPLY_LANE_SHARDS]` so the H2
+/// per-shard counter arrays can opt into a hand-written `Default` —
+/// the std-library `Default` impl on raw arrays only covers lengths
+/// up to 32, and arrays of `AtomicU64` aren't `Copy` so we can't use
+/// `[AtomicU64::new(0); N]` either.
+#[derive(Debug)]
+struct PerShardCounters([AtomicU64; MAX_APPLY_LANE_SHARDS]);
+
+impl Default for PerShardCounters {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+}
+
+impl std::ops::Deref for PerShardCounters {
+    type Target = [AtomicU64; MAX_APPLY_LANE_SHARDS];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct DedupPutStageTimings {
     pub l0_insert: Duration,
@@ -168,6 +191,28 @@ pub struct MetaMetrics {
     rc_apply_lane_idle_max_us: AtomicU64,
     rc_apply_lane_pending_set_wait_us: AtomicU64,
     rc_apply_lane_pending_set_wait_max_us: AtomicU64,
+    // Per-shard breakdown of the H2 apply-lane counters, indexed by lane
+    // ordinal. Populated alongside the aggregates above; ordinals at or
+    // beyond [`MAX_APPLY_LANE_SHARDS`] only show up in the aggregates.
+    // Used to spot a single hot shard hiding inside a healthy-looking
+    // average (e.g. one PBA-bucket monopolizing rc apply while the
+    // other 15 lanes idle).
+    l2p_apply_lane_shard_tasks: PerShardCounters,
+    l2p_apply_lane_shard_queue_depth_max: PerShardCounters,
+    l2p_apply_lane_shard_queue_wait_us: PerShardCounters,
+    l2p_apply_lane_shard_queue_wait_max_us: PerShardCounters,
+    l2p_apply_lane_shard_exec_us: PerShardCounters,
+    l2p_apply_lane_shard_exec_max_us: PerShardCounters,
+    l2p_apply_lane_shard_idle_us: PerShardCounters,
+    rc_apply_lane_shard_tasks: PerShardCounters,
+    rc_apply_lane_shard_queue_depth_max: PerShardCounters,
+    rc_apply_lane_shard_queue_wait_us: PerShardCounters,
+    rc_apply_lane_shard_queue_wait_max_us: PerShardCounters,
+    rc_apply_lane_shard_exec_us: PerShardCounters,
+    rc_apply_lane_shard_exec_max_us: PerShardCounters,
+    rc_apply_lane_shard_idle_us: PerShardCounters,
+    rc_apply_lane_shard_pending_set_wait_us: PerShardCounters,
+    rc_apply_lane_shard_pending_set_wait_max_us: PerShardCounters,
     dedup_apply_guard_count: AtomicU64,
     dedup_apply_guard_us: AtomicU64,
     dedup_apply_guard_max_us: AtomicU64,
@@ -449,6 +494,22 @@ pub struct MetaMetricsSnapshot {
     pub rc_apply_lane_idle_max_us: u64,
     pub rc_apply_lane_pending_set_wait_us: u64,
     pub rc_apply_lane_pending_set_wait_max_us: u64,
+    pub l2p_apply_lane_shard_tasks: Vec<u64>,
+    pub l2p_apply_lane_shard_queue_depth_max: Vec<u64>,
+    pub l2p_apply_lane_shard_queue_wait_us: Vec<u64>,
+    pub l2p_apply_lane_shard_queue_wait_max_us: Vec<u64>,
+    pub l2p_apply_lane_shard_exec_us: Vec<u64>,
+    pub l2p_apply_lane_shard_exec_max_us: Vec<u64>,
+    pub l2p_apply_lane_shard_idle_us: Vec<u64>,
+    pub rc_apply_lane_shard_tasks: Vec<u64>,
+    pub rc_apply_lane_shard_queue_depth_max: Vec<u64>,
+    pub rc_apply_lane_shard_queue_wait_us: Vec<u64>,
+    pub rc_apply_lane_shard_queue_wait_max_us: Vec<u64>,
+    pub rc_apply_lane_shard_exec_us: Vec<u64>,
+    pub rc_apply_lane_shard_exec_max_us: Vec<u64>,
+    pub rc_apply_lane_shard_idle_us: Vec<u64>,
+    pub rc_apply_lane_shard_pending_set_wait_us: Vec<u64>,
+    pub rc_apply_lane_shard_pending_set_wait_max_us: Vec<u64>,
     pub dedup_apply_guard_count: u64,
     pub dedup_apply_guard_us: u64,
     pub dedup_apply_guard_max_us: u64,
@@ -686,6 +747,36 @@ impl MetaMetrics {
             rc_apply_lane_idle_max_us: load(&self.rc_apply_lane_idle_max_us),
             rc_apply_lane_pending_set_wait_us: load(&self.rc_apply_lane_pending_set_wait_us),
             rc_apply_lane_pending_set_wait_max_us: load(&self.rc_apply_lane_pending_set_wait_max_us),
+            l2p_apply_lane_shard_tasks: load_shards(&self.l2p_apply_lane_shard_tasks),
+            l2p_apply_lane_shard_queue_depth_max: load_shards(
+                &self.l2p_apply_lane_shard_queue_depth_max,
+            ),
+            l2p_apply_lane_shard_queue_wait_us: load_shards(
+                &self.l2p_apply_lane_shard_queue_wait_us,
+            ),
+            l2p_apply_lane_shard_queue_wait_max_us: load_shards(
+                &self.l2p_apply_lane_shard_queue_wait_max_us,
+            ),
+            l2p_apply_lane_shard_exec_us: load_shards(&self.l2p_apply_lane_shard_exec_us),
+            l2p_apply_lane_shard_exec_max_us: load_shards(&self.l2p_apply_lane_shard_exec_max_us),
+            l2p_apply_lane_shard_idle_us: load_shards(&self.l2p_apply_lane_shard_idle_us),
+            rc_apply_lane_shard_tasks: load_shards(&self.rc_apply_lane_shard_tasks),
+            rc_apply_lane_shard_queue_depth_max: load_shards(
+                &self.rc_apply_lane_shard_queue_depth_max,
+            ),
+            rc_apply_lane_shard_queue_wait_us: load_shards(&self.rc_apply_lane_shard_queue_wait_us),
+            rc_apply_lane_shard_queue_wait_max_us: load_shards(
+                &self.rc_apply_lane_shard_queue_wait_max_us,
+            ),
+            rc_apply_lane_shard_exec_us: load_shards(&self.rc_apply_lane_shard_exec_us),
+            rc_apply_lane_shard_exec_max_us: load_shards(&self.rc_apply_lane_shard_exec_max_us),
+            rc_apply_lane_shard_idle_us: load_shards(&self.rc_apply_lane_shard_idle_us),
+            rc_apply_lane_shard_pending_set_wait_us: load_shards(
+                &self.rc_apply_lane_shard_pending_set_wait_us,
+            ),
+            rc_apply_lane_shard_pending_set_wait_max_us: load_shards(
+                &self.rc_apply_lane_shard_pending_set_wait_max_us,
+            ),
             dedup_apply_guard_count: load(&self.dedup_apply_guard_count),
             dedup_apply_guard_us: load(&self.dedup_apply_guard_us),
             dedup_apply_guard_max_us: load(&self.dedup_apply_guard_max_us),
@@ -1186,8 +1277,15 @@ impl MetaMetrics {
 
     /// Record one completed L2P apply lane task. `queue_wait` is the
     /// time from `enqueue_task()` to when the worker popped the task.
-    /// `exec` is the wall time spent inside the work() closure.
-    pub(crate) fn record_l2p_apply_lane_task(&self, queue_wait: Duration, exec: Duration) {
+    /// `exec` is the wall time spent inside the work() closure. `shard`
+    /// is the lane ordinal; per-shard arrays use it to attribute the
+    /// task without collapsing into the aggregate.
+    pub(crate) fn record_l2p_apply_lane_task(
+        &self,
+        shard: usize,
+        queue_wait: Duration,
+        exec: Duration,
+    ) {
         self.l2p_apply_lane_tasks.fetch_add(1, Ordering::Relaxed);
         record_duration(
             &self.l2p_apply_lane_queue_wait_us,
@@ -1199,25 +1297,47 @@ impl MetaMetrics {
             &self.l2p_apply_lane_exec_max_us,
             exec,
         );
+        if let Some(slot) = self.l2p_apply_lane_shard_tasks.get(shard) {
+            slot.fetch_add(1, Ordering::Relaxed);
+            record_duration(
+                &self.l2p_apply_lane_shard_queue_wait_us[shard],
+                &self.l2p_apply_lane_shard_queue_wait_max_us[shard],
+                queue_wait,
+            );
+            record_duration(
+                &self.l2p_apply_lane_shard_exec_us[shard],
+                &self.l2p_apply_lane_shard_exec_max_us[shard],
+                exec,
+            );
+        }
     }
 
-    pub(crate) fn record_l2p_apply_lane_idle(&self, idle: Duration) {
+    pub(crate) fn record_l2p_apply_lane_idle(&self, shard: usize, idle: Duration) {
         record_duration(
             &self.l2p_apply_lane_idle_us,
             &self.l2p_apply_lane_idle_max_us,
             idle,
         );
+        if let Some(slot) = self.l2p_apply_lane_shard_idle_us.get(shard) {
+            let us = idle.as_micros().min(u128::from(u64::MAX)) as u64;
+            slot.fetch_add(us, Ordering::Relaxed);
+        }
     }
 
-    pub(crate) fn record_l2p_apply_lane_queue_depth(&self, depth: usize) {
+    pub(crate) fn record_l2p_apply_lane_queue_depth(&self, shard: usize, depth: usize) {
         fetch_max(&self.l2p_apply_lane_queue_depth_max, depth as u64);
+        if let Some(slot) = self.l2p_apply_lane_shard_queue_depth_max.get(shard) {
+            fetch_max(slot, depth as u64);
+        }
     }
 
     /// Record one completed refcount apply lane task. `pending_set_wait`
     /// is the time the worker spent in `slot.take()` waiting for the
     /// commit thread to call `set()`; ~0 for ready (non-pending) tasks.
+    /// `shard` indexes the per-shard breakdown.
     pub(crate) fn record_rc_apply_lane_task(
         &self,
+        shard: usize,
         queue_wait: Duration,
         pending_set_wait: Duration,
         exec: Duration,
@@ -1238,18 +1358,43 @@ impl MetaMetrics {
             &self.rc_apply_lane_exec_max_us,
             exec,
         );
+        if let Some(slot) = self.rc_apply_lane_shard_tasks.get(shard) {
+            slot.fetch_add(1, Ordering::Relaxed);
+            record_duration(
+                &self.rc_apply_lane_shard_queue_wait_us[shard],
+                &self.rc_apply_lane_shard_queue_wait_max_us[shard],
+                queue_wait,
+            );
+            record_duration(
+                &self.rc_apply_lane_shard_pending_set_wait_us[shard],
+                &self.rc_apply_lane_shard_pending_set_wait_max_us[shard],
+                pending_set_wait,
+            );
+            record_duration(
+                &self.rc_apply_lane_shard_exec_us[shard],
+                &self.rc_apply_lane_shard_exec_max_us[shard],
+                exec,
+            );
+        }
     }
 
-    pub(crate) fn record_rc_apply_lane_idle(&self, idle: Duration) {
+    pub(crate) fn record_rc_apply_lane_idle(&self, shard: usize, idle: Duration) {
         record_duration(
             &self.rc_apply_lane_idle_us,
             &self.rc_apply_lane_idle_max_us,
             idle,
         );
+        if let Some(slot) = self.rc_apply_lane_shard_idle_us.get(shard) {
+            let us = idle.as_micros().min(u128::from(u64::MAX)) as u64;
+            slot.fetch_add(us, Ordering::Relaxed);
+        }
     }
 
-    pub(crate) fn record_rc_apply_lane_queue_depth(&self, depth: usize) {
+    pub(crate) fn record_rc_apply_lane_queue_depth(&self, shard: usize, depth: usize) {
         fetch_max(&self.rc_apply_lane_queue_depth_max, depth as u64);
+        if let Some(slot) = self.rc_apply_lane_shard_queue_depth_max.get(shard) {
+            fetch_max(slot, depth as u64);
+        }
     }
 
     pub(crate) fn record_dedup_forward_put(&self, elapsed: Duration) {
@@ -2066,6 +2211,10 @@ impl MetaMetricsSnapshot {
 
 fn load(value: &AtomicU64) -> u64 {
     value.load(Ordering::Relaxed)
+}
+
+fn load_shards(values: &PerShardCounters) -> Vec<u64> {
+    values.iter().map(load).collect()
 }
 
 fn record_duration(total: &AtomicU64, max: &AtomicU64, elapsed: Duration) {

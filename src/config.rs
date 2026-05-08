@@ -12,6 +12,14 @@ use std::path::PathBuf;
 /// region.
 pub const MAX_DEDUP_SHARDS: u32 = 64;
 
+/// Storage cap for per-shard apply-lane metric arrays. Sized to match
+/// [`MAX_DEDUP_SHARDS`] and to comfortably fit the practical L2P /
+/// refcount shard counts (default 16, configurable via
+/// [`Config::shards_per_partition`]). Lane ordinals at or beyond this
+/// cap fall back to aggregate-only accounting so over-sized configs
+/// stay observable, just less detailed.
+pub const MAX_APPLY_LANE_SHARDS: usize = 64;
+
 /// Page size in bytes. Fixed for v1; not a runtime choice.
 ///
 /// Changing this would require re-encoding every on-disk format constant,

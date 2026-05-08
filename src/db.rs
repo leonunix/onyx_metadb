@@ -271,6 +271,9 @@ struct ApplyLaneInner {
     state: Mutex<ApplyLaneState>,
     cvar: Condvar,
     kind: ApplyLaneKind,
+    /// Lane ordinal (== shard index for L2P / refcount lanes). Used by
+    /// the H2 per-shard metrics to attribute each task to its shard.
+    ordinal: usize,
     metrics: Arc<MetaMetrics>,
 }
 
@@ -319,6 +322,7 @@ impl ApplyLane {
             }),
             cvar: Condvar::new(),
             kind,
+            ordinal,
             metrics,
         });
         let worker_inner = inner.clone();
@@ -380,8 +384,14 @@ impl ApplyLane {
         // Sample queue depth (post-push) for the H2 backlog metric.
         let depth = state.queue.len() + state.maintenance.len();
         match self.inner.kind {
-            ApplyLaneKind::L2p => self.inner.metrics.record_l2p_apply_lane_queue_depth(depth),
-            ApplyLaneKind::Refcount => self.inner.metrics.record_rc_apply_lane_queue_depth(depth),
+            ApplyLaneKind::L2p => self
+                .inner
+                .metrics
+                .record_l2p_apply_lane_queue_depth(self.inner.ordinal, depth),
+            ApplyLaneKind::Refcount => self
+                .inner
+                .metrics
+                .record_rc_apply_lane_queue_depth(self.inner.ordinal, depth),
             ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {}
         }
         self.inner.cvar.notify_one();
@@ -400,8 +410,14 @@ impl ApplyLaneHandle {
         // Maintenance pushes also count toward backlog depth.
         let depth = state.queue.len() + state.maintenance.len();
         match self.inner.kind {
-            ApplyLaneKind::L2p => self.inner.metrics.record_l2p_apply_lane_queue_depth(depth),
-            ApplyLaneKind::Refcount => self.inner.metrics.record_rc_apply_lane_queue_depth(depth),
+            ApplyLaneKind::L2p => self
+                .inner
+                .metrics
+                .record_l2p_apply_lane_queue_depth(self.inner.ordinal, depth),
+            ApplyLaneKind::Refcount => self
+                .inner
+                .metrics
+                .record_rc_apply_lane_queue_depth(self.inner.ordinal, depth),
             ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {}
         }
         self.inner.cvar.notify_one();
@@ -570,19 +586,26 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
         if is_wal_task {
             match inner.kind {
                 ApplyLaneKind::L2p => {
-                    inner.metrics.record_l2p_apply_lane_task(queue_wait, exec);
+                    inner
+                        .metrics
+                        .record_l2p_apply_lane_task(inner.ordinal, queue_wait, exec);
                     if !idle_total.is_zero() {
-                        inner.metrics.record_l2p_apply_lane_idle(idle_total);
+                        inner
+                            .metrics
+                            .record_l2p_apply_lane_idle(inner.ordinal, idle_total);
                     }
                 }
                 ApplyLaneKind::Refcount => {
                     inner.metrics.record_rc_apply_lane_task(
+                        inner.ordinal,
                         queue_wait,
                         pending_set_wait,
                         exec,
                     );
                     if !idle_total.is_zero() {
-                        inner.metrics.record_rc_apply_lane_idle(idle_total);
+                        inner
+                            .metrics
+                            .record_rc_apply_lane_idle(inner.ordinal, idle_total);
                     }
                 }
                 ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {}
