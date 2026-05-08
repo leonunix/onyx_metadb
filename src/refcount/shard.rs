@@ -762,6 +762,13 @@ impl RcShard {
         self.array.iter_live()
     }
 
+    /// Iterate every live entry already present in the backing array.
+    /// The caller is responsible for checkpointing or otherwise
+    /// draining pending deltas first.
+    pub fn iter_live(&self) -> Result<Vec<(Pba, RcEntry)>> {
+        self.array.iter_live()
+    }
+
     /// Number of data pages currently on disk for this shard.
     pub fn allocated_data_pages(&self) -> usize {
         self.array.allocated_data_pages()

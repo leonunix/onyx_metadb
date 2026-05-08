@@ -316,8 +316,23 @@ impl OnyxRefModel {
             let got: Vec<(u64, L2pValue)> = db.range(vol, ..)?.collect::<Result<Vec<_>>>()?;
             let want: Vec<(u64, L2pValue)> = self.volume_l2p(vol).into_iter().collect();
             if got != want {
+                let first_diff = got
+                    .iter()
+                    .zip(want.iter())
+                    .enumerate()
+                    .find(|(_, (got, want))| got != want)
+                    .map(|(idx, (got, want))| format!("idx={idx} got={got:?} want={want:?}"))
+                    .unwrap_or_else(|| {
+                        format!(
+                            "common prefix matched; got_len={} want_len={}",
+                            got.len(),
+                            want.len()
+                        )
+                    });
                 return Err(crate::MetaDbError::Corruption(format!(
-                    "volume {vol} l2p diverged: got={got:?} want={want:?}"
+                    "volume {vol} l2p diverged: got_len={} want_len={} first_diff={first_diff}",
+                    got.len(),
+                    want.len()
                 )));
             }
         }

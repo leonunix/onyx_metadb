@@ -252,6 +252,55 @@ fn l2p_remap_guarded_survives_restart_with_same_decision() {
 }
 
 #[test]
+fn l2p_remap_guard_reject_does_not_replay_after_later_refcount_growth() {
+    let dir = TempDir::new().unwrap();
+    {
+        let mut db = Db::create(dir.path()).unwrap();
+
+        // First checkpoint a baseline so the final reopen replays only
+        // the guarded reject and later refcount growth.
+        remap(&db, 10, remap_val(100, 1), None);
+        db = Db::open(dir.path()).unwrap();
+
+        // rc(100)=1, so this guarded remap is rejected live.
+        let mut tx = db.begin();
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 11, remap_val(100, 2), Some((100, 2)));
+        let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+        assert!(matches!(
+            outcomes.as_slice(),
+            [ApplyOutcome::L2pRemap { applied: false, .. }]
+        ));
+
+        // Later state would satisfy the old guard. WAL replay must not
+        // resurrect the rejected remap at lba=11.
+        remap(&db, 12, remap_val(100, 3), None);
+        assert_eq!(db.get_refcount(100).unwrap(), 2);
+
+        // Audits call iter_refcounts(); that must checkpoint through
+        // Db::flush() rather than persisting refcount pages ahead of
+        // the manifest WAL checkpoint.
+        let refs: Vec<_> = db
+            .iter_refcounts()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(refs.contains(&(100, 2)));
+    }
+
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(db.get_refcount(100).unwrap(), 2);
+    assert_eq!(
+        db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(),
+        Some(remap_val(100, 1))
+    );
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 11).unwrap(), None);
+    assert_eq!(
+        db.get(BOOTSTRAP_VOLUME_ORD, 12).unwrap(),
+        Some(remap_val(100, 3))
+    );
+}
+
+#[test]
 fn l2p_remap_freed_pba_round_trips_through_replay() {
     let dir = TempDir::new().unwrap();
     {

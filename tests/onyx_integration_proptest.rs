@@ -175,14 +175,15 @@ fn run_ops(ops: &[OnyxOp]) -> Result<(), TestCaseError> {
     let mut db = Db::create_with_config(cfg.clone()).unwrap();
     let mut model = OnyxRefModel::default();
     seed_db(&db, &mut model);
+    let assert_every = env_u32("METADB_ONYX_ASSERT_EVERY", 250).max(1) as usize;
 
     for (idx, op) in ops.iter().enumerate() {
         apply_op(op, &mut db, &mut model, &cfg)
             .map_err(|err| TestCaseError::fail(format!("op #{idx} failed: {op:?}: {err}")))?;
-        if idx % 250 == 0 {
+        if idx % assert_every == 0 {
             model
                 .assert_db_matches(&db)
-                .map_err(|err| TestCaseError::fail(err.to_string()))?;
+                .map_err(|err| TestCaseError::fail(format!("op #{idx} after {op:?}: {err}")))?;
         }
     }
     drop(db);

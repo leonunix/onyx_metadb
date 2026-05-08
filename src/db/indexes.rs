@@ -1,5 +1,4 @@
 use super::*;
-use std::sync::atomic::Ordering;
 
 impl Db {
     // -------- refcount + dedup ops --------------------------------------
@@ -309,9 +308,15 @@ impl Db {
     /// exposed so future commits can swap the body for a lazy walker
     /// without touching call sites.
     pub fn iter_refcounts(&self) -> Result<DbRefcountIter> {
+        // Keep the refcount roots and manifest checkpoint aligned.
+        // Flushing shards independently can persist refcount pages
+        // newer than the WAL checkpoint; recovery would then replay
+        // older conditional L2P remaps against a future refcount base.
+        self.flush()?;
+
         let mut all: Vec<(Pba, u32)> = Vec::new();
         for shard in &self.refcount_shards {
-            for (pba, entry) in shard.rc.iter_live_flushed()? {
+            for (pba, entry) in shard.rc.iter_live()? {
                 all.push((pba, entry.rc));
             }
         }
