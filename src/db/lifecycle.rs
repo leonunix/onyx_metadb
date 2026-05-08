@@ -267,6 +267,7 @@ impl Db {
             cfg.index_pin_bytes,
         ));
         let metrics = Arc::new(MetaMetrics::new());
+        page_store.attach_metrics(metrics.clone());
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
         let (l2p_shards, l2p_roots) = create_l2p_shards(
@@ -424,6 +425,7 @@ impl Db {
             cfg.index_pin_bytes,
         ));
         let metrics = Arc::new(MetaMetrics::new());
+        page_store.attach_metrics(metrics.clone());
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_existing(page_store.clone(), faults.clone())?;
         if manifest.volumes.is_empty() {

@@ -352,6 +352,37 @@ pub struct MetaMetrics {
     /// Count of `PageStore::allocate_run` calls made by drainers to
     /// refill their per-shard `PagePool`.
     rc_drainer_pool_refills: AtomicU64,
+
+    // H4: bandwidth counter paired with `flush_pages_written` so a
+    // window snapshot can compute writeback MB/s without assuming
+    // page size. Bumped from `record_flush_io`.
+    flush_io_bytes_total: AtomicU64,
+
+    // H5: page_store io_uring batch counters. `meta_io_write_*`
+    // covers every io_uring write submit (single page, run, sealed
+    // writev, parallel runs); `meta_io_read_*` covers io_uring batch
+    // reads. `*_batch_ops_max` / `*_batch_bytes_max` are the largest
+    // batch the writer/reader has ever submitted in one
+    // `submit_and_wait` round, useful for distinguishing "shallow IO"
+    // (small batch) from "slow IO" (big batch but high `_us`).
+    meta_io_write_calls: AtomicU64,
+    meta_io_write_ops: AtomicU64,
+    meta_io_write_bytes: AtomicU64,
+    meta_io_write_us: AtomicU64,
+    meta_io_write_max_us: AtomicU64,
+    meta_io_write_batch_ops_max: AtomicU64,
+    meta_io_write_batch_bytes_max: AtomicU64,
+
+    meta_io_read_calls: AtomicU64,
+    meta_io_read_ops: AtomicU64,
+    meta_io_read_bytes: AtomicU64,
+    meta_io_read_us: AtomicU64,
+    meta_io_read_max_us: AtomicU64,
+    meta_io_read_batch_ops_max: AtomicU64,
+
+    meta_io_fsync_calls: AtomicU64,
+    meta_io_fsync_us: AtomicU64,
+    meta_io_fsync_max_us: AtomicU64,
 }
 
 /// Why this `Db::flush()` invocation is happening. Tags the metrics so
@@ -616,6 +647,27 @@ pub struct MetaMetricsSnapshot {
     pub rc_drainer_checkpoint_wait_max_us: u64,
     pub rc_drainer_backpressure_fallbacks: u64,
     pub rc_drainer_pool_refills: u64,
+
+    pub flush_io_bytes_total: u64,
+
+    pub meta_io_write_calls: u64,
+    pub meta_io_write_ops: u64,
+    pub meta_io_write_bytes: u64,
+    pub meta_io_write_us: u64,
+    pub meta_io_write_max_us: u64,
+    pub meta_io_write_batch_ops_max: u64,
+    pub meta_io_write_batch_bytes_max: u64,
+
+    pub meta_io_read_calls: u64,
+    pub meta_io_read_ops: u64,
+    pub meta_io_read_bytes: u64,
+    pub meta_io_read_us: u64,
+    pub meta_io_read_max_us: u64,
+    pub meta_io_read_batch_ops_max: u64,
+
+    pub meta_io_fsync_calls: u64,
+    pub meta_io_fsync_us: u64,
+    pub meta_io_fsync_max_us: u64,
 }
 
 impl MetaMetrics {
@@ -899,6 +951,27 @@ impl MetaMetrics {
             rc_drainer_checkpoint_wait_max_us: load(&self.rc_drainer_checkpoint_wait_max_us),
             rc_drainer_backpressure_fallbacks: load(&self.rc_drainer_backpressure_fallbacks),
             rc_drainer_pool_refills: load(&self.rc_drainer_pool_refills),
+
+            flush_io_bytes_total: load(&self.flush_io_bytes_total),
+
+            meta_io_write_calls: load(&self.meta_io_write_calls),
+            meta_io_write_ops: load(&self.meta_io_write_ops),
+            meta_io_write_bytes: load(&self.meta_io_write_bytes),
+            meta_io_write_us: load(&self.meta_io_write_us),
+            meta_io_write_max_us: load(&self.meta_io_write_max_us),
+            meta_io_write_batch_ops_max: load(&self.meta_io_write_batch_ops_max),
+            meta_io_write_batch_bytes_max: load(&self.meta_io_write_batch_bytes_max),
+
+            meta_io_read_calls: load(&self.meta_io_read_calls),
+            meta_io_read_ops: load(&self.meta_io_read_ops),
+            meta_io_read_bytes: load(&self.meta_io_read_bytes),
+            meta_io_read_us: load(&self.meta_io_read_us),
+            meta_io_read_max_us: load(&self.meta_io_read_max_us),
+            meta_io_read_batch_ops_max: load(&self.meta_io_read_batch_ops_max),
+
+            meta_io_fsync_calls: load(&self.meta_io_fsync_calls),
+            meta_io_fsync_us: load(&self.meta_io_fsync_us),
+            meta_io_fsync_max_us: load(&self.meta_io_fsync_max_us),
         }
     }
 
@@ -972,6 +1045,41 @@ impl MetaMetrics {
         record_duration(&self.flush_io_us, &self.flush_io_max_us, elapsed);
         self.flush_pages_written
             .fetch_add(pages as u64, Ordering::Relaxed);
+        let bytes = (pages as u64).saturating_mul(crate::config::PAGE_SIZE as u64);
+        self.flush_io_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_meta_io_write_batch(&self, ops: usize, bytes: usize, elapsed: Duration) {
+        if ops == 0 {
+            return;
+        }
+        self.meta_io_write_calls.fetch_add(1, Ordering::Relaxed);
+        self.meta_io_write_ops
+            .fetch_add(ops as u64, Ordering::Relaxed);
+        self.meta_io_write_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        record_duration(&self.meta_io_write_us, &self.meta_io_write_max_us, elapsed);
+        fetch_max(&self.meta_io_write_batch_ops_max, ops as u64);
+        fetch_max(&self.meta_io_write_batch_bytes_max, bytes as u64);
+    }
+
+    pub(crate) fn record_meta_io_read_batch(&self, ops: usize, bytes: usize, elapsed: Duration) {
+        if ops == 0 {
+            return;
+        }
+        self.meta_io_read_calls.fetch_add(1, Ordering::Relaxed);
+        self.meta_io_read_ops
+            .fetch_add(ops as u64, Ordering::Relaxed);
+        self.meta_io_read_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        record_duration(&self.meta_io_read_us, &self.meta_io_read_max_us, elapsed);
+        fetch_max(&self.meta_io_read_batch_ops_max, ops as u64);
+    }
+
+    pub(crate) fn record_meta_io_fsync(&self, elapsed: Duration) {
+        self.meta_io_fsync_calls.fetch_add(1, Ordering::Relaxed);
+        record_duration(&self.meta_io_fsync_us, &self.meta_io_fsync_max_us, elapsed);
     }
 
     pub(crate) fn record_flush_io_seal(&self, elapsed: Duration) {
@@ -1974,7 +2082,24 @@ impl MetaMetricsSnapshot {
                 "\"rc_drainer_checkpoint_wait_us\":{},",
                 "\"rc_drainer_checkpoint_wait_max_us\":{},",
                 "\"rc_drainer_backpressure_fallbacks\":{},",
-                "\"rc_drainer_pool_refills\":{}",
+                "\"rc_drainer_pool_refills\":{},",
+                "\"flush_io_bytes_total\":{},",
+                "\"meta_io_write_calls\":{},",
+                "\"meta_io_write_ops\":{},",
+                "\"meta_io_write_bytes\":{},",
+                "\"meta_io_write_us\":{},",
+                "\"meta_io_write_max_us\":{},",
+                "\"meta_io_write_batch_ops_max\":{},",
+                "\"meta_io_write_batch_bytes_max\":{},",
+                "\"meta_io_read_calls\":{},",
+                "\"meta_io_read_ops\":{},",
+                "\"meta_io_read_bytes\":{},",
+                "\"meta_io_read_us\":{},",
+                "\"meta_io_read_max_us\":{},",
+                "\"meta_io_read_batch_ops_max\":{},",
+                "\"meta_io_fsync_calls\":{},",
+                "\"meta_io_fsync_us\":{},",
+                "\"meta_io_fsync_max_us\":{}",
                 "}}"
             ),
             self.commit_attempts,
@@ -2205,6 +2330,23 @@ impl MetaMetricsSnapshot {
             self.rc_drainer_checkpoint_wait_max_us,
             self.rc_drainer_backpressure_fallbacks,
             self.rc_drainer_pool_refills,
+            self.flush_io_bytes_total,
+            self.meta_io_write_calls,
+            self.meta_io_write_ops,
+            self.meta_io_write_bytes,
+            self.meta_io_write_us,
+            self.meta_io_write_max_us,
+            self.meta_io_write_batch_ops_max,
+            self.meta_io_write_batch_bytes_max,
+            self.meta_io_read_calls,
+            self.meta_io_read_ops,
+            self.meta_io_read_bytes,
+            self.meta_io_read_us,
+            self.meta_io_read_max_us,
+            self.meta_io_read_batch_ops_max,
+            self.meta_io_fsync_calls,
+            self.meta_io_fsync_us,
+            self.meta_io_fsync_max_us,
         )
     }
 }

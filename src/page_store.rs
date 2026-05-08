@@ -41,7 +41,7 @@ use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,7 @@ use io_uring::{IoUring, opcode, types};
 use crate::config::PAGE_SIZE;
 use crate::epoch::EpochManager;
 use crate::error::{MetaDbError, Result};
+use crate::metrics::MetaMetrics;
 use crate::page::{Page, PageHeader, PageType};
 use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 
@@ -107,6 +108,11 @@ pub struct PageStore {
     /// into large hole-punch extents instead of random single pages.
     /// idempotent / replay path cannot push the same pid twice).
     deferred_free: Mutex<BTreeMap<PageId, DeferredFree>>,
+    /// Set once during `Db` construction (after `MetaMetrics::new`),
+    /// then read-only for the lifetime of the store. Use `Option::ok()`
+    /// in IO paths so unit tests that build a bare `PageStore` still
+    /// work without a metrics handle.
+    metrics: OnceLock<Arc<MetaMetrics>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -291,6 +297,7 @@ impl PageStore {
             grow_chunk,
             epoch: Arc::new(EpochManager::new()),
             deferred_free: Mutex::new(BTreeMap::new()),
+            metrics: OnceLock::new(),
         })
     }
 
@@ -341,6 +348,7 @@ impl PageStore {
             grow_chunk,
             epoch: Arc::new(EpochManager::new()),
             deferred_free: Mutex::new(BTreeMap::new()),
+            metrics: OnceLock::new(),
         })
     }
 
@@ -420,12 +428,25 @@ impl PageStore {
             grow_chunk,
             epoch: Arc::new(EpochManager::new()),
             deferred_free: Mutex::new(BTreeMap::new()),
+            metrics: OnceLock::new(),
         })
     }
 
     /// Path the store was opened from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Attach the parent `Db`'s metrics handle so page-store IO paths
+    /// can record `meta_io_*` counters. Idempotent: calling twice with
+    /// the same handle is fine; calling with different handles is a
+    /// no-op after the first.
+    pub fn attach_metrics(&self, metrics: Arc<MetaMetrics>) {
+        let _ = self.metrics.set(metrics);
+    }
+
+    fn metrics(&self) -> Option<&Arc<MetaMetrics>> {
+        self.metrics.get()
     }
 
     /// Shared epoch coordinator. Lock-free L2P readers `pin()` here
@@ -457,7 +478,12 @@ impl PageStore {
     /// returning.
     pub fn read_page(&self, page_id: PageId) -> Result<Page> {
         self.check_in_range(page_id)?;
-        self.read_pool.read_page(page_id)
+        let started = Instant::now();
+        let page = self.read_pool.read_page(page_id)?;
+        if let Some(metrics) = self.metrics() {
+            metrics.record_meta_io_read_batch(1, PAGE_SIZE, started.elapsed());
+        }
+        Ok(page)
     }
 
     /// Read and verify several pages. On Linux this uses one io_uring submit
@@ -470,7 +496,15 @@ impl PageStore {
         for &page_id in page_ids {
             self.check_in_range(page_id)?;
         }
+        let started = Instant::now();
         let pages = read_pages_raw(&self.file, page_ids, self.read_uring())?;
+        if let Some(metrics) = self.metrics() {
+            metrics.record_meta_io_read_batch(
+                page_ids.len(),
+                page_ids.len() * PAGE_SIZE,
+                started.elapsed(),
+            );
+        }
         for (page_id, page) in page_ids.iter().copied().zip(&pages) {
             page.verify(page_id)?;
         }
@@ -489,8 +523,12 @@ impl PageStore {
     /// called [`Page::seal`] first; `write_page` does not reseal.
     pub fn write_page(&self, page_id: PageId, page: &Page) -> Result<()> {
         self.check_in_range(page_id)?;
+        let started = Instant::now();
         self.file
             .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
+        if let Some(metrics) = self.metrics() {
+            metrics.record_meta_io_write_batch(1, PAGE_SIZE, started.elapsed());
+        }
         Ok(())
     }
 
@@ -509,23 +547,42 @@ impl PageStore {
             .checked_add(pages - 1)
             .ok_or(MetaDbError::OutOfSpace)?;
         self.check_in_range(last)?;
+        let started = Instant::now();
         self.file
             .write_all_at(bytes, start_page * PAGE_SIZE as u64)?;
+        if let Some(metrics) = self.metrics() {
+            metrics.record_meta_io_write_batch(pages as usize, bytes.len(), started.elapsed());
+        }
         Ok(())
     }
 
     /// Write multiple already-sealed page runs, keeping the final
     /// durability boundary at the caller's later [`sync`](Self::sync).
     pub fn write_page_runs_parallel(&self, runs: Vec<(PageId, Vec<u8>)>) -> Result<()> {
-        write_page_runs_raw(&self.file, runs, self.write_uring())
+        let (ops, bytes) = runs.iter().fold((0usize, 0usize), |(o, b), (_, run)| {
+            (o + run.len() / PAGE_SIZE, b + run.len())
+        });
+        let started = Instant::now();
+        write_page_runs_raw(&self.file, runs, self.write_uring())?;
+        if let Some(metrics) = self.metrics() {
+            metrics.record_meta_io_write_batch(ops, bytes, started.elapsed());
+        }
+        Ok(())
     }
 
     pub fn write_sealed_page_runs(&self, mut pages: Vec<(PageId, Arc<Page>)>) -> Result<()> {
         if pages.is_empty() {
             return Ok(());
         }
+        let ops = pages.len();
+        let bytes = ops * PAGE_SIZE;
         pages.sort_unstable_by_key(|(pid, _)| *pid);
-        write_sealed_pages_raw(&self.file, pages, self.write_uring())
+        let started = Instant::now();
+        write_sealed_pages_raw(&self.file, pages, self.write_uring())?;
+        if let Some(metrics) = self.metrics() {
+            metrics.record_meta_io_write_batch(ops, bytes, started.elapsed());
+        }
+        Ok(())
     }
 
     /// Fallback writer for sealed pages. It keeps only one coalesced
@@ -1157,12 +1214,21 @@ impl PageStore {
 
     /// `fdatasync` the page file (content only).
     pub fn sync(&self) -> Result<()> {
-        sync_data_raw(&self.file, self.write_uring())
+        let started = Instant::now();
+        sync_data_raw(&self.file, self.write_uring())?;
+        if let Some(metrics) = self.metrics() {
+            metrics.record_meta_io_fsync(started.elapsed());
+        }
+        Ok(())
     }
 
     /// `fsync` the page file (content + metadata).
     pub fn sync_all(&self) -> Result<()> {
+        let started = Instant::now();
         self.file.sync_all()?;
+        if let Some(metrics) = self.metrics() {
+            metrics.record_meta_io_fsync(started.elapsed());
+        }
         Ok(())
     }
 
