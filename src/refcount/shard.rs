@@ -156,10 +156,7 @@ impl RcShard {
     /// constructor; `Db::open` / `Db::create` calls
     /// [`attach_drainer`](Self::attach_drainer) after WAL replay
     /// completes (deterministic recovery).
-    pub fn create(
-        page_store: Arc<PageStore>,
-        page_cache: Arc<PageCache>,
-    ) -> Result<Self> {
+    pub fn create(page_store: Arc<PageStore>, page_cache: Arc<PageCache>) -> Result<Self> {
         let array = PagedRefcountArray::create(page_store.clone(), page_cache)?;
         Ok(Self::new_with_array(page_store, array))
     }
@@ -876,12 +873,13 @@ impl DrainerWorker {
             }
 
             // ── Heavy work: build sealed pages outside any shard lock ─
-            let entries: Vec<(Pba, Pending)> =
-                drained.iter().map(|(p, pp)| (*p, *pp)).collect();
+            let entries: Vec<(Pba, Pending)> = drained.iter().map(|(p, pp)| (*p, *pp)).collect();
             let prior = self.shard.overlay.snapshot();
             let build_result = {
                 let mut pool = self.shard.page_pool.lock();
-                self.shard.array.build_overlay_pages(entries, &mut pool, &prior)
+                self.shard
+                    .array
+                    .build_overlay_pages(entries, &mut pool, &prior)
             };
             let new_pages = match build_result {
                 Ok(p) => p,
@@ -927,12 +925,8 @@ impl DrainerWorker {
 
             let elapsed = cycle_started.elapsed();
             let overlay_size = self.shard.overlay.approx_size();
-            self.metrics.record_rc_drainer_cycle(
-                drained_len,
-                pages_built,
-                elapsed,
-                overlay_size,
-            );
+            self.metrics
+                .record_rc_drainer_cycle(drained_len, pages_built, elapsed, overlay_size);
             self.state.in_cycle.store(false, Ordering::Release);
             self.state.cv.notify_all();
         }

@@ -383,7 +383,12 @@ impl PagedRefcountArray {
             //   3. hole → fresh page id from pool
             let prior = prior_overlay.get(&page_idx);
             let (page_id, is_fresh, mut page, base_source) = if let Some(entry) = prior {
-                (entry.page_id, entry.is_fresh, (*entry.sealed).clone(), "prior_overlay")
+                (
+                    entry.page_id,
+                    entry.is_fresh,
+                    (*entry.sealed).clone(),
+                    "prior_overlay",
+                )
             } else {
                 let existing_pid = {
                     let inner = self.inner.lock();

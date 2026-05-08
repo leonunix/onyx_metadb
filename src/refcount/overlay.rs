@@ -140,11 +140,7 @@ pub struct PagePool {
 }
 
 impl PagePool {
-    pub fn new(
-        page_store: Arc<PageStore>,
-        refill_count: usize,
-        metrics: Arc<MetaMetrics>,
-    ) -> Self {
+    pub fn new(page_store: Arc<PageStore>, refill_count: usize, metrics: Arc<MetaMetrics>) -> Self {
         Self {
             page_store,
             free: Vec::new(),
@@ -165,9 +161,7 @@ impl PagePool {
         // `allocate_batch` returns a stack-ordered Vec; pop the first
         // we hand out, push the rest into our pool.
         let head = batch.pop().ok_or_else(|| {
-            crate::error::MetaDbError::InvalidArgument(
-                "allocate_batch returned empty vec".into(),
-            )
+            crate::error::MetaDbError::InvalidArgument("allocate_batch returned empty vec".into())
         })?;
         self.free.append(&mut batch);
         Ok(head)

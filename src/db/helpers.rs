@@ -216,7 +216,12 @@ pub(super) fn create_l2p_shards(
     for shard_idx in 0..shard_count {
         let tree = PagedL2p::create_with_cache(page_store.clone(), page_cache.clone())?;
         roots.push(tree.root());
-        shards.push(make_l2p_shard(tree, &page_cache, shard_idx, metrics.clone()));
+        shards.push(make_l2p_shard(
+            tree,
+            &page_cache,
+            shard_idx,
+            metrics.clone(),
+        ));
     }
     Ok((shards, roots.into_boxed_slice()))
 }
@@ -232,7 +237,12 @@ pub(super) fn open_l2p_shards(
     for (shard_idx, &root) in roots.iter().enumerate() {
         let tree =
             PagedL2p::open_with_cache(page_store.clone(), page_cache.clone(), root, next_gen)?;
-        shards.push(make_l2p_shard(tree, &page_cache, shard_idx, metrics.clone()));
+        shards.push(make_l2p_shard(
+            tree,
+            &page_cache,
+            shard_idx,
+            metrics.clone(),
+        ));
     }
     Ok(shards)
 }

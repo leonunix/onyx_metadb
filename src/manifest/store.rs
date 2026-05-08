@@ -21,24 +21,29 @@ pub struct LoadedManifest {
 
 impl ManifestStore {
     /// Load the newest valid manifest slot from disk without mutating the
-    /// page store. Returns `Ok(None)` if neither slot decodes.
+    /// page store. Returns `Ok(None)` if neither slot carries a decodable
+    /// manifest page.
     pub fn load_latest(page_store: &PageStore) -> Result<Option<LoadedManifest>> {
-        let a = load_slot(page_store, MANIFEST_PAGE_A).map(|(sequence, manifest)| LoadedManifest {
-            slot: MANIFEST_PAGE_A,
-            sequence,
-            manifest,
-        });
-        let b = load_slot(page_store, MANIFEST_PAGE_B).map(|(sequence, manifest)| LoadedManifest {
-            slot: MANIFEST_PAGE_B,
-            sequence,
-            manifest,
-        });
-        Ok(match (a, b) {
-            (Some(a), Some(b)) => Some(if a.sequence >= b.sequence { a } else { b }),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        })
+        let mut candidates = [MANIFEST_PAGE_A, MANIFEST_PAGE_B]
+            .into_iter()
+            .filter_map(|slot| load_slot_header(page_store, slot).map(|sequence| (slot, sequence)))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+        for (slot, sequence) in candidates {
+            match load_slot_body(page_store, slot, sequence) {
+                Ok(loaded) => return Ok(Some(loaded)),
+                Err(err) => {
+                    tracing::warn!(
+                        slot,
+                        sequence,
+                        error = %err,
+                        "metadb manifest slot body failed to decode"
+                    );
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Open an existing manifest. Unlike [`open_or_create`](Self::open_or_create),
@@ -142,13 +147,35 @@ impl ManifestStore {
     }
 }
 
-fn load_slot(page_store: &PageStore, slot: PageId) -> Option<(u64, Manifest)> {
+fn load_slot_header(page_store: &PageStore, slot: PageId) -> Option<u64> {
     let page = page_store.read_page_unchecked(slot).ok()?;
     page.verify(slot).ok()?;
     let header = page.header().ok()?;
     if header.page_type != PageType::Manifest {
         return None;
     }
-    let manifest = Manifest::decode(&page, page_store).ok()?;
-    Some((header.generation, manifest))
+    Some(header.generation)
+}
+
+fn load_slot_body(page_store: &PageStore, slot: PageId, sequence: u64) -> Result<LoadedManifest> {
+    let page = page_store.read_page_unchecked(slot)?;
+    page.verify(slot)?;
+    let header = page.header()?;
+    if header.page_type != PageType::Manifest {
+        return Err(MetaDbError::Corruption(format!(
+            "manifest slot {slot} is {:?}, not Manifest",
+            header.page_type,
+        )));
+    }
+    if header.generation != sequence {
+        return Err(MetaDbError::Corruption(format!(
+            "manifest slot {slot} sequence changed while loading: header={} candidate={sequence}",
+            header.generation,
+        )));
+    }
+    Ok(LoadedManifest {
+        slot,
+        sequence,
+        manifest: Manifest::decode(&page, page_store)?,
+    })
 }

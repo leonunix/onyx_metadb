@@ -608,14 +608,18 @@ impl CuckooHash {
         for step in 0..MAX_CUCKOO_CHAIN {
             // Try empty slot first (unlikely but cheap to check).
             let inserted = match timings.as_deref_mut() {
-                Some(t) => self.try_insert_empty_in_page(current_bucket, hash, value, lsn, Some(t))?,
+                Some(t) => {
+                    self.try_insert_empty_in_page(current_bucket, hash, value, lsn, Some(t))?
+                }
                 None => self.try_insert_empty_in_page(current_bucket, hash, value, lsn, None)?,
             };
             if inserted {
                 return Ok(());
             }
             let victim = match timings.as_deref_mut() {
-                Some(t) => self.swap_into_victim_slot(current_bucket, hash, value, step, lsn, Some(t))?,
+                Some(t) => {
+                    self.swap_into_victim_slot(current_bucket, hash, value, step, lsn, Some(t))?
+                }
                 None => self.swap_into_victim_slot(current_bucket, hash, value, step, lsn, None)?,
             };
             hash = victim.0;
@@ -677,7 +681,7 @@ impl CuckooHash {
                     "cuckoo bucket_id {bucket_id} maps to page_idx {page_idx} but page_table \
                      is only {} entries",
                     inner.page_table.len(),
-            )));
+                )));
             }
             if inner.page_table[page_idx] == 0 {
                 let alloc_started = std::time::Instant::now();
@@ -777,9 +781,15 @@ impl CuckooHash {
         let mut page_ops: HashMap<usize, Vec<CuckooPutEntry>> = HashMap::new();
         for entry in entries {
             let (b1, b2) = self.candidate_buckets(&entry.hash);
-            page_ops.entry(bucket_offset(b1).0).or_default().push(*entry);
+            page_ops
+                .entry(bucket_offset(b1).0)
+                .or_default()
+                .push(*entry);
             if bucket_offset(b2).0 != bucket_offset(b1).0 {
-                page_ops.entry(bucket_offset(b2).0).or_default().push(*entry);
+                page_ops
+                    .entry(bucket_offset(b2).0)
+                    .or_default()
+                    .push(*entry);
             }
         }
 
@@ -804,12 +814,9 @@ impl CuckooHash {
             let Some(candidates) = page_ops.get(&page_idx) else {
                 continue;
             };
-            for hash in self.update_put_candidates_on_page_locked(
-                page_idx,
-                candidates,
-                timings,
-                &mut pages,
-            )? {
+            for hash in self
+                .update_put_candidates_on_page_locked(page_idx, candidates, timings, &mut pages)?
+            {
                 applied.insert(hash);
             }
         }
@@ -820,11 +827,7 @@ impl CuckooHash {
                 continue;
             };
             let (inserted_here, hashes) = self.insert_put_candidates_on_page_locked(
-                page_idx,
-                candidates,
-                &applied,
-                timings,
-                &mut pages,
+                page_idx, candidates, &applied, timings, &mut pages,
             )?;
             inserted = inserted.saturating_add(inserted_here);
             for hash in hashes {
@@ -845,7 +848,8 @@ impl CuckooHash {
             state.page.seal();
             dirty_pages.push((state.page_id, Arc::new(state.page.clone())));
         }
-        self.page_store.write_sealed_page_runs(dirty_pages.clone())?;
+        self.page_store
+            .write_sealed_page_runs(dirty_pages.clone())?;
         for (page_id, page) in dirty_pages {
             self.page_cache.replace_or_insert(page_id, page);
         }

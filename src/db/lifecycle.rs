@@ -1121,7 +1121,8 @@ impl Db {
             self.apply_gate.try_write()
         }) else {
             self.metrics.record_flush_gate_wait(gate_started.elapsed());
-            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
             return Ok(false);
         };
         self.metrics.record_flush_gate_wait(gate_started.elapsed());
@@ -1170,7 +1171,8 @@ impl Db {
         }
         drop(l2p_guards);
         drop(apply_guard);
-        self.metrics.record_flush_sample(kind, sample_started.elapsed());
+        self.metrics
+            .record_flush_sample(kind, sample_started.elapsed());
         // Sample workload size: L2P dirty pages snapshotted, refcount
         // delta entries drained, fresh refcount data pages allocated.
         // Recorded after gate release so the cost of these accessors
@@ -1201,7 +1203,8 @@ impl Db {
             // covers indices 0..n correctly.
             self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
-            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
             return Err(err);
         }
 
@@ -1224,7 +1227,8 @@ impl Db {
                         self.metrics.record_flush_io_seal(seal_started.elapsed());
                         self.metrics
                             .record_flush_io(io_started.elapsed(), total_pages_written);
-                        self.metrics.record_flush_total(kind, flush_started.elapsed());
+                        self.metrics
+                            .record_flush_total(kind, flush_started.elapsed());
                         self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
                         self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
                         return Err(err);
@@ -1247,7 +1251,8 @@ impl Db {
                 .record_flush_io_page_write(page_write_started.elapsed());
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
-            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
             return Err(err);
@@ -1274,7 +1279,8 @@ impl Db {
                         .record_flush_io_rc_meta(rc_meta_started.elapsed());
                     self.metrics
                         .record_flush_io(io_started.elapsed(), total_pages_written);
-                    self.metrics.record_flush_total(kind, flush_started.elapsed());
+                    self.metrics
+                        .record_flush_total(kind, flush_started.elapsed());
                     self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
                     self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
                     return Err(err);
@@ -1286,7 +1292,8 @@ impl Db {
             self.metrics.record_flush_io_sync(sync_started.elapsed());
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
-            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
             return Err(err);
@@ -1304,7 +1311,8 @@ impl Db {
             Err(err) => {
                 self.metrics
                     .record_flush_manifest(manifest_started.elapsed());
-                self.metrics.record_flush_total(kind, flush_started.elapsed());
+                self.metrics
+                    .record_flush_total(kind, flush_started.elapsed());
                 drop(manifest_state);
                 self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
                 self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
@@ -1317,7 +1325,8 @@ impl Db {
         {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
-            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
             self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
@@ -1331,7 +1340,8 @@ impl Db {
         ) {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
-            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
             self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
@@ -1344,7 +1354,8 @@ impl Db {
         if let Err(err) = manifest_state.store.commit(&manifest) {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
-            self.metrics.record_flush_total(kind, flush_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
             self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
@@ -1408,13 +1419,15 @@ impl Db {
                 Ok(Err(err)) => {
                     drop(manifest_state);
                     self.metrics.record_flush_install(install_started.elapsed());
-                    self.metrics.record_flush_total(kind, flush_started.elapsed());
+                    self.metrics
+                        .record_flush_total(kind, flush_started.elapsed());
                     return Err(err);
                 }
                 Err(_) => {
                     drop(manifest_state);
                     self.metrics.record_flush_install(install_started.elapsed());
-                    self.metrics.record_flush_total(kind, flush_started.elapsed());
+                    self.metrics
+                        .record_flush_total(kind, flush_started.elapsed());
                     return Err(MetaDbError::Corruption(
                         "checkpoint install lane worker exited before reporting".into(),
                     ));
@@ -1474,7 +1487,8 @@ impl Db {
             );
         }
         self.metrics.record_flush_reclaim(reclaim_started.elapsed());
-        self.metrics.record_flush_total(kind, flush_started.elapsed());
+        self.metrics
+            .record_flush_total(kind, flush_started.elapsed());
         Ok(true)
     }
 

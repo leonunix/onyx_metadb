@@ -812,7 +812,9 @@ impl MetaMetrics {
             rc_apply_lane_idle_us: load(&self.rc_apply_lane_idle_us),
             rc_apply_lane_idle_max_us: load(&self.rc_apply_lane_idle_max_us),
             rc_apply_lane_pending_set_wait_us: load(&self.rc_apply_lane_pending_set_wait_us),
-            rc_apply_lane_pending_set_wait_max_us: load(&self.rc_apply_lane_pending_set_wait_max_us),
+            rc_apply_lane_pending_set_wait_max_us: load(
+                &self.rc_apply_lane_pending_set_wait_max_us,
+            ),
             l2p_apply_lane_shard_tasks: load_shards(&self.l2p_apply_lane_shard_tasks),
             l2p_apply_lane_shard_queue_depth_max: load_shards(
                 &self.l2p_apply_lane_shard_queue_depth_max,

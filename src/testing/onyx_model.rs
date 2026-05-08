@@ -418,10 +418,7 @@ pub fn onyx_hash(seed: u64) -> Hash8 {
     // `Hash8` is 8 bytes (xxh3_64) since commit e7cfeab. The seed is
     // already u64-wide, so a single mix is enough to spread the
     // proptest's small seed values across the fingerprint space.
-    let mixed = seed
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ seed.rotate_left(17)
-        ^ !seed;
+    let mixed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ seed.rotate_left(17) ^ !seed;
     mixed.to_be_bytes()
 }
 
