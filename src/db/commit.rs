@@ -672,6 +672,8 @@ impl Db {
             return Err(err);
         }
         ctx.timing.finish_global_wait = finish_started.elapsed();
+        self.metrics
+            .record_commit_finish_global_wait(ctx.timing.finish_global_wait);
         if ctx.serial_apply {
             self.complete_retained_dispatch(lsn);
         }
@@ -1173,42 +1175,50 @@ impl Db {
             while pos < indices.len() {
                 let idx = indices[pos];
                 if matches!(&ops[idx], WalOp::L2pRemap { guard: None, .. }) {
-                    let WalOp::L2pRemap { lba, new_value, .. } = &ops[idx] else {
-                        unreachable!("matches! above ensures an unguarded remap");
-                    };
-                    let leaf_idx = *lba >> crate::paged::format::LEAF_SHIFT;
                     let mut run_end = pos + 1;
                     while run_end < indices.len() {
-                        let next_idx = indices[run_end];
-                        match &ops[next_idx] {
-                            WalOp::L2pRemap {
-                                lba: next_lba,
-                                guard: None,
-                                ..
-                            } if (*next_lba >> crate::paged::format::LEAF_SHIFT) == leaf_idx => {
-                                run_end += 1;
-                            }
+                        match &ops[indices[run_end]] {
+                            WalOp::L2pRemap { guard: None, .. } => run_end += 1,
                             _ => break,
                         }
                     }
 
-                    if run_end > pos + 1 {
-                        let run_indices = &indices[pos..run_end];
-                        let mut entries = Vec::with_capacity(run_indices.len());
-                        for &run_idx in run_indices {
-                            match &ops[run_idx] {
-                                WalOp::L2pRemap {
-                                    lba,
-                                    new_value,
-                                    guard: None,
-                                    ..
-                                } => entries.push((*lba, *new_value)),
-                                _ => unreachable!("run builder only accepts unguarded remaps"),
-                            }
+                    let mut leaf_runs: Vec<(u64, Vec<usize>)> = Vec::new();
+                    for &run_idx in &indices[pos..run_end] {
+                        let WalOp::L2pRemap {
+                            lba, guard: None, ..
+                        } = &ops[run_idx]
+                        else {
+                            unreachable!("run builder only accepts unguarded remaps");
+                        };
+                        let leaf_idx = *lba >> crate::paged::format::LEAF_SHIFT;
+                        match leaf_runs
+                            .iter_mut()
+                            .find(|(existing_leaf, _)| *existing_leaf == leaf_idx)
+                        {
+                            Some((_, run_indices)) => run_indices.push(run_idx),
+                            None => leaf_runs.push((leaf_idx, vec![run_idx])),
                         }
+                    }
+
+                    for (_, run_indices) in leaf_runs {
+                        let mut entries = Vec::with_capacity(run_indices.len());
+                        for run_idx in &run_indices {
+                            let WalOp::L2pRemap {
+                                lba,
+                                new_value,
+                                guard: None,
+                                ..
+                            } = &ops[*run_idx]
+                            else {
+                                unreachable!("run builder only accepts unguarded remaps");
+                            };
+                            entries.push((*lba, *new_value));
+                        }
+
                         let prev_values =
                             tree.insert_leaf_run_at_lsn_deferred_finish(&entries, lsn)?;
-                        for ((run_idx, (run_lba, run_new_value)), prev) in indices[pos..run_end]
+                        for ((run_idx, (run_lba, run_new_value)), prev) in run_indices
                             .iter()
                             .copied()
                             .zip(entries.into_iter())
@@ -1233,22 +1243,9 @@ impl Db {
                                 },
                             ));
                         }
-                        pos = run_end;
-                        continue;
                     }
 
-                    let prev = tree.insert_at_lsn_deferred_finish(*lba, *new_value, lsn)?;
-                    push_l2p_remap_rc_actions(&mut rc_actions, idx, *lba, prev, *new_value, lsn);
-                    l2p_remap_count += 1;
-                    outcomes.push((
-                        idx,
-                        ApplyOutcome::L2pRemap {
-                            applied: true,
-                            prev,
-                            freed_pba: None,
-                        },
-                    ));
-                    pos += 1;
+                    pos = run_end;
                     continue;
                 }
                 let outcome = match &ops[idx] {
@@ -1336,6 +1333,15 @@ impl Db {
         apply_result?;
         let bucket_elapsed = bucket_started.elapsed();
         let total_l2p_ops = l2p_put_count + l2p_delete_count + l2p_remap_count;
+        metrics.record_apply_l2p_bucket_stages(
+            total_l2p_ops,
+            bucket_elapsed,
+            tree_lock_wait,
+            read_view_prepare,
+            ops_elapsed,
+            finish_elapsed,
+            publish_elapsed,
+        );
         if bucket_elapsed.as_micros() >= 100_000
             || tree_lock_wait.as_micros() >= 100_000
             || read_view_prepare.as_micros() >= 100_000

@@ -402,10 +402,9 @@ impl ApplyLane {
                 .inner
                 .metrics
                 .record_rc_apply_lane_queue_depth(self.inner.ordinal, depth),
-            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => self
-                .inner
-                .metrics
-                .record_dedup_lane_queue_depth(depth),
+            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {
+                self.inner.metrics.record_dedup_lane_queue_depth(depth)
+            }
         }
         self.inner.cvar.notify_one();
     }
@@ -431,10 +430,9 @@ impl ApplyLaneHandle {
                 .inner
                 .metrics
                 .record_rc_apply_lane_queue_depth(self.inner.ordinal, depth),
-            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => self
-                .inner
-                .metrics
-                .record_dedup_lane_queue_depth(depth),
+            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {
+                self.inner.metrics.record_dedup_lane_queue_depth(depth)
+            }
         }
         self.inner.cvar.notify_one();
     }

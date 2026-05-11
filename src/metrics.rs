@@ -76,6 +76,14 @@ pub struct MetaMetrics {
     commit_apply_dedup_enqueue_max_us: AtomicU64,
     commit_apply_dedup_wait_us: AtomicU64,
     commit_apply_dedup_wait_max_us: AtomicU64,
+    // Time spent inside `finish_global_apply` waiting for the previous
+    // LSN to bump `last_applied_lsn`. Lives outside `commit_apply_us`
+    // because it follows the per-lane apply work; previously only
+    // surfaced in the >1s slow-commit warning. Captures the LSN-ordered
+    // ack chain that runs in parallel with apply across shards but
+    // serialises the final bump and notify.
+    commit_finish_global_wait_us: AtomicU64,
+    commit_finish_global_wait_max_us: AtomicU64,
 
     wal_submit_calls: AtomicU64,
     wal_submit_wait_us: AtomicU64,
@@ -147,6 +155,20 @@ pub struct MetaMetrics {
     apply_l2p_range_delete_count: AtomicU64,
     apply_l2p_range_delete_us: AtomicU64,
     apply_l2p_range_delete_max_us: AtomicU64,
+    apply_l2p_bucket_count: AtomicU64,
+    apply_l2p_bucket_ops: AtomicU64,
+    apply_l2p_bucket_total_us: AtomicU64,
+    apply_l2p_bucket_total_max_us: AtomicU64,
+    apply_l2p_bucket_tree_lock_wait_us: AtomicU64,
+    apply_l2p_bucket_tree_lock_wait_max_us: AtomicU64,
+    apply_l2p_bucket_read_view_prepare_us: AtomicU64,
+    apply_l2p_bucket_read_view_prepare_max_us: AtomicU64,
+    apply_l2p_bucket_ops_us: AtomicU64,
+    apply_l2p_bucket_ops_max_us: AtomicU64,
+    apply_l2p_bucket_finish_us: AtomicU64,
+    apply_l2p_bucket_finish_max_us: AtomicU64,
+    apply_l2p_bucket_publish_us: AtomicU64,
+    apply_l2p_bucket_publish_max_us: AtomicU64,
     apply_refcount_count: AtomicU64,
     apply_refcount_us: AtomicU64,
     apply_refcount_max_us: AtomicU64,
@@ -495,6 +517,8 @@ pub struct MetaMetricsSnapshot {
     pub commit_apply_wait_max_us: u64,
     pub commit_apply_gate_wait_us: u64,
     pub commit_apply_gate_wait_max_us: u64,
+    pub commit_finish_global_wait_us: u64,
+    pub commit_finish_global_wait_max_us: u64,
     pub commit_apply_us: u64,
     pub commit_apply_max_us: u64,
     pub commit_apply_l2p_wait_us: u64,
@@ -570,6 +594,20 @@ pub struct MetaMetricsSnapshot {
     pub apply_l2p_range_delete_count: u64,
     pub apply_l2p_range_delete_us: u64,
     pub apply_l2p_range_delete_max_us: u64,
+    pub apply_l2p_bucket_count: u64,
+    pub apply_l2p_bucket_ops: u64,
+    pub apply_l2p_bucket_total_us: u64,
+    pub apply_l2p_bucket_total_max_us: u64,
+    pub apply_l2p_bucket_tree_lock_wait_us: u64,
+    pub apply_l2p_bucket_tree_lock_wait_max_us: u64,
+    pub apply_l2p_bucket_read_view_prepare_us: u64,
+    pub apply_l2p_bucket_read_view_prepare_max_us: u64,
+    pub apply_l2p_bucket_ops_us: u64,
+    pub apply_l2p_bucket_ops_max_us: u64,
+    pub apply_l2p_bucket_finish_us: u64,
+    pub apply_l2p_bucket_finish_max_us: u64,
+    pub apply_l2p_bucket_publish_us: u64,
+    pub apply_l2p_bucket_publish_max_us: u64,
     pub apply_refcount_count: u64,
     pub apply_refcount_us: u64,
     pub apply_refcount_max_us: u64,
@@ -803,6 +841,8 @@ impl MetaMetrics {
             commit_apply_wait_max_us: load(&self.commit_apply_wait_max_us),
             commit_apply_gate_wait_us: load(&self.commit_apply_gate_wait_us),
             commit_apply_gate_wait_max_us: load(&self.commit_apply_gate_wait_max_us),
+            commit_finish_global_wait_us: load(&self.commit_finish_global_wait_us),
+            commit_finish_global_wait_max_us: load(&self.commit_finish_global_wait_max_us),
             commit_apply_us: load(&self.commit_apply_us),
             commit_apply_max_us: load(&self.commit_apply_max_us),
             commit_apply_l2p_wait_us: load(&self.commit_apply_l2p_wait_us),
@@ -878,6 +918,26 @@ impl MetaMetrics {
             apply_l2p_range_delete_count: load(&self.apply_l2p_range_delete_count),
             apply_l2p_range_delete_us: load(&self.apply_l2p_range_delete_us),
             apply_l2p_range_delete_max_us: load(&self.apply_l2p_range_delete_max_us),
+            apply_l2p_bucket_count: load(&self.apply_l2p_bucket_count),
+            apply_l2p_bucket_ops: load(&self.apply_l2p_bucket_ops),
+            apply_l2p_bucket_total_us: load(&self.apply_l2p_bucket_total_us),
+            apply_l2p_bucket_total_max_us: load(&self.apply_l2p_bucket_total_max_us),
+            apply_l2p_bucket_tree_lock_wait_us: load(&self.apply_l2p_bucket_tree_lock_wait_us),
+            apply_l2p_bucket_tree_lock_wait_max_us: load(
+                &self.apply_l2p_bucket_tree_lock_wait_max_us,
+            ),
+            apply_l2p_bucket_read_view_prepare_us: load(
+                &self.apply_l2p_bucket_read_view_prepare_us,
+            ),
+            apply_l2p_bucket_read_view_prepare_max_us: load(
+                &self.apply_l2p_bucket_read_view_prepare_max_us,
+            ),
+            apply_l2p_bucket_ops_us: load(&self.apply_l2p_bucket_ops_us),
+            apply_l2p_bucket_ops_max_us: load(&self.apply_l2p_bucket_ops_max_us),
+            apply_l2p_bucket_finish_us: load(&self.apply_l2p_bucket_finish_us),
+            apply_l2p_bucket_finish_max_us: load(&self.apply_l2p_bucket_finish_max_us),
+            apply_l2p_bucket_publish_us: load(&self.apply_l2p_bucket_publish_us),
+            apply_l2p_bucket_publish_max_us: load(&self.apply_l2p_bucket_publish_max_us),
             apply_refcount_count: load(&self.apply_refcount_count),
             apply_refcount_us: load(&self.apply_refcount_us),
             apply_refcount_max_us: load(&self.apply_refcount_max_us),
@@ -1413,6 +1473,14 @@ impl MetaMetrics {
         );
     }
 
+    pub(crate) fn record_commit_finish_global_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.commit_finish_global_wait_us,
+            &self.commit_finish_global_wait_max_us,
+            elapsed,
+        );
+    }
+
     pub(crate) fn record_commit_apply(&self, elapsed: Duration) {
         record_duration(&self.commit_apply_us, &self.commit_apply_max_us, elapsed);
     }
@@ -1523,6 +1591,50 @@ impl MetaMetrics {
             &self.apply_l2p_range_delete_us,
             &self.apply_l2p_range_delete_max_us,
             elapsed,
+        );
+    }
+
+    pub(crate) fn record_apply_l2p_bucket_stages(
+        &self,
+        ops: u64,
+        total: Duration,
+        tree_lock_wait: Duration,
+        read_view_prepare: Duration,
+        ops_elapsed: Duration,
+        finish: Duration,
+        publish: Duration,
+    ) {
+        self.apply_l2p_bucket_count.fetch_add(1, Ordering::Relaxed);
+        self.apply_l2p_bucket_ops.fetch_add(ops, Ordering::Relaxed);
+        record_duration(
+            &self.apply_l2p_bucket_total_us,
+            &self.apply_l2p_bucket_total_max_us,
+            total,
+        );
+        record_duration(
+            &self.apply_l2p_bucket_tree_lock_wait_us,
+            &self.apply_l2p_bucket_tree_lock_wait_max_us,
+            tree_lock_wait,
+        );
+        record_duration(
+            &self.apply_l2p_bucket_read_view_prepare_us,
+            &self.apply_l2p_bucket_read_view_prepare_max_us,
+            read_view_prepare,
+        );
+        record_duration(
+            &self.apply_l2p_bucket_ops_us,
+            &self.apply_l2p_bucket_ops_max_us,
+            ops_elapsed,
+        );
+        record_duration(
+            &self.apply_l2p_bucket_finish_us,
+            &self.apply_l2p_bucket_finish_max_us,
+            finish,
+        );
+        record_duration(
+            &self.apply_l2p_bucket_publish_us,
+            &self.apply_l2p_bucket_publish_max_us,
+            publish,
         );
     }
 
@@ -1769,11 +1881,7 @@ impl MetaMetrics {
     /// breakdown) because the dedup task closure already records its own
     /// per-task timings via [`record_dedup_lane_task`].
     pub(crate) fn record_dedup_lane_idle(&self, idle: Duration) {
-        record_duration(
-            &self.dedup_lane_idle_us,
-            &self.dedup_lane_idle_max_us,
-            idle,
-        );
+        record_duration(&self.dedup_lane_idle_us, &self.dedup_lane_idle_max_us, idle);
     }
 
     pub(crate) fn record_dedup_lane_wakeups(&self, wakeups: u64, empty_wakeups: u64) {
@@ -2167,6 +2275,8 @@ impl MetaMetricsSnapshot {
                 "\"commit_apply_wait_max_us\":{},",
                 "\"commit_apply_gate_wait_us\":{},",
                 "\"commit_apply_gate_wait_max_us\":{},",
+                "\"commit_finish_global_wait_us\":{},",
+                "\"commit_finish_global_wait_max_us\":{},",
                 "\"commit_apply_us\":{},",
                 "\"commit_apply_max_us\":{},",
                 "\"commit_apply_l2p_wait_us\":{},",
@@ -2242,6 +2352,20 @@ impl MetaMetricsSnapshot {
                 "\"apply_l2p_range_delete_count\":{},",
                 "\"apply_l2p_range_delete_us\":{},",
                 "\"apply_l2p_range_delete_max_us\":{},",
+                "\"apply_l2p_bucket_count\":{},",
+                "\"apply_l2p_bucket_ops\":{},",
+                "\"apply_l2p_bucket_total_us\":{},",
+                "\"apply_l2p_bucket_total_max_us\":{},",
+                "\"apply_l2p_bucket_tree_lock_wait_us\":{},",
+                "\"apply_l2p_bucket_tree_lock_wait_max_us\":{},",
+                "\"apply_l2p_bucket_read_view_prepare_us\":{},",
+                "\"apply_l2p_bucket_read_view_prepare_max_us\":{},",
+                "\"apply_l2p_bucket_ops_us\":{},",
+                "\"apply_l2p_bucket_ops_max_us\":{},",
+                "\"apply_l2p_bucket_finish_us\":{},",
+                "\"apply_l2p_bucket_finish_max_us\":{},",
+                "\"apply_l2p_bucket_publish_us\":{},",
+                "\"apply_l2p_bucket_publish_max_us\":{},",
                 "\"apply_refcount_count\":{},",
                 "\"apply_refcount_us\":{},",
                 "\"apply_refcount_max_us\":{},",
@@ -2438,6 +2562,8 @@ impl MetaMetricsSnapshot {
             self.commit_apply_wait_max_us,
             self.commit_apply_gate_wait_us,
             self.commit_apply_gate_wait_max_us,
+            self.commit_finish_global_wait_us,
+            self.commit_finish_global_wait_max_us,
             self.commit_apply_us,
             self.commit_apply_max_us,
             self.commit_apply_l2p_wait_us,
@@ -2513,6 +2639,20 @@ impl MetaMetricsSnapshot {
             self.apply_l2p_range_delete_count,
             self.apply_l2p_range_delete_us,
             self.apply_l2p_range_delete_max_us,
+            self.apply_l2p_bucket_count,
+            self.apply_l2p_bucket_ops,
+            self.apply_l2p_bucket_total_us,
+            self.apply_l2p_bucket_total_max_us,
+            self.apply_l2p_bucket_tree_lock_wait_us,
+            self.apply_l2p_bucket_tree_lock_wait_max_us,
+            self.apply_l2p_bucket_read_view_prepare_us,
+            self.apply_l2p_bucket_read_view_prepare_max_us,
+            self.apply_l2p_bucket_ops_us,
+            self.apply_l2p_bucket_ops_max_us,
+            self.apply_l2p_bucket_finish_us,
+            self.apply_l2p_bucket_finish_max_us,
+            self.apply_l2p_bucket_publish_us,
+            self.apply_l2p_bucket_publish_max_us,
             self.apply_refcount_count,
             self.apply_refcount_us,
             self.apply_refcount_max_us,

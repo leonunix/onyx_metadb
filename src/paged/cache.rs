@@ -867,6 +867,13 @@ impl PageBuf {
             // Pinned pages shadow LRU lookups.
         } else if is_index {
             self.page_cache.insert(page.pid, page.sealed.clone());
+        } else {
+            // Leaf pages are the hot write working set under Onyx's random
+            // L2P load. Refresh them atomically too: this evicts any stale
+            // recycled incarnation and keeps subsequent applies from falling
+            // back to PageStore misses immediately after each checkpoint.
+            self.page_cache
+                .replace_or_insert(page.pid, page.sealed.clone());
         }
         self.pages_remove(page.pid);
         Some((page.pid, true))
@@ -1085,6 +1092,41 @@ mod tests {
         assert_eq!(fresh.read_level(reused).unwrap(), 0);
         assert_eq!(
             leaf_value_at(fresh.read(reused).unwrap(), 7).unwrap(),
+            Some(v)
+        );
+    }
+
+    #[test]
+    fn checkpoint_install_invalidates_stale_leaf_cache_entry() {
+        let (_d, ps) = mk_store();
+        let page_cache = Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES));
+        let mut old = Page::zeroed();
+        init_index(&mut old, 1, 1);
+        old.seal();
+        ps.write_page(1, &old).unwrap();
+        page_cache.insert(1, Arc::new(old));
+
+        let mut buf = PageBuf::with_cache(ps, page_cache.clone());
+        buf.alloc_pool.push(1);
+        let leaf = buf.alloc_leaf(2).unwrap();
+        assert_eq!(leaf, 1);
+        let v = L2pValue([0x44u8; 28]);
+        leaf_set(buf.modify(leaf, 2).unwrap(), 9, &v).unwrap();
+
+        let flushed = buf.dirty_snapshot().write().unwrap();
+        let mut sealed_pages = Vec::new();
+        flushed.append_sealed_pages(&mut sealed_pages);
+        buf.page_store.write_sealed_page_runs(sealed_pages).unwrap();
+        buf.page_store.sync().unwrap();
+        assert_eq!(
+            buf.install_flushed_snapshot_page(&flushed, 0),
+            Some((leaf, true))
+        );
+
+        let mut fresh = PageBuf::with_cache(buf.page_store.clone(), page_cache);
+        assert_eq!(fresh.read_level(leaf).unwrap(), 0);
+        assert_eq!(
+            leaf_value_at(fresh.read(leaf).unwrap(), 9).unwrap(),
             Some(v)
         );
     }

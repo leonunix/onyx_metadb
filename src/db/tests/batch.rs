@@ -343,6 +343,31 @@ fn bucketed_apply_remap_preserves_same_lba_order() {
 }
 
 #[test]
+fn bucketed_apply_remap_preserves_same_lba_order_when_leaf_grouped() {
+    let (_d, db) = mk_db_with_shards(1);
+    let mut tx = db.begin();
+    for i in 0..8u64 {
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 20_000 + i, rv(20_000 + i, 0), None);
+    }
+    // These target the same leaf but are deliberately not adjacent in
+    // the WAL order. The bucket fast path may group them by leaf; it
+    // still has to preserve intra-LBA last-write-wins semantics.
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 512, rv(10, 1), None);
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 513, rv(11, 1), None);
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 512, rv(20, 1), None);
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 514, rv(12, 1), None);
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 512, rv(30, 1), None);
+    tx.commit().unwrap();
+
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 512).unwrap(), Some(rv(30, 1)));
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 513).unwrap(), Some(rv(11, 1)));
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 514).unwrap(), Some(rv(12, 1)));
+    assert_eq!(db.get_refcount(10).unwrap(), 0);
+    assert_eq!(db.get_refcount(20).unwrap(), 0);
+    assert_eq!(db.get_refcount(30).unwrap(), 1);
+}
+
+#[test]
 fn bucketed_apply_remap_batch_handles_shared_new_pba() {
     let (_d, db) = mk_db_with_shards(8);
     let mut tx = db.begin();
