@@ -301,14 +301,18 @@ pub(super) fn apply_l2p_remap(
             Ok(false)
         };
 
-    let snap_pins_old = match prev {
-        Some(old_value) => {
-            let birth = lookup_birth_lsn(refcount_shards, old_value.head_pba())?;
-            any_snap_pins(old_value, birth, &mut tree)?
+    let snap_pins_old = if snap_infos.is_empty() {
+        false
+    } else {
+        match prev {
+            Some(old_value) => {
+                let birth = lookup_birth_lsn(refcount_shards, old_value.head_pba())?;
+                any_snap_pins(old_value, birth, &mut tree)?
+            }
+            None => false,
         }
-        None => false,
     };
-    let snap_pins_new = if new_is_zero {
+    let snap_pins_new = if new_is_zero || snap_infos.is_empty() {
         false
     } else {
         let birth = lookup_birth_lsn(refcount_shards, new_pba)?;
@@ -676,7 +680,9 @@ pub(super) fn apply_drop_snapshot_pages(
             if matches!(header.page_type, PageType::PagedLeaf) {
                 for i in 0..crate::paged::format::LEAF_ENTRY_COUNT {
                     if crate::paged::format::leaf_bit_set(&page, i) {
-                        freed_leaf_values.push(crate::paged::format::leaf_value_at(&page, i));
+                        if let Some(value) = crate::paged::format::leaf_value_at(&page, i)? {
+                            freed_leaf_values.push(value);
+                        }
                     }
                 }
             }

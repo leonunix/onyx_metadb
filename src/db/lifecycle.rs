@@ -366,6 +366,9 @@ impl Db {
             dedup_maintenance_lanes,
             dedup_maintenance_queued: build_dedup_queued_flags(dedup_shards as usize),
             wal,
+            unlogged_pending_lsn: Mutex::new(None),
+            unlogged_commit_gate: RwLock::new(()),
+            unlogged_commits_enabled: cfg.unlogged_commits_enabled,
             apply_gate: ApplyGate::new(),
             last_applied_lsn: Mutex::new(0),
             commit_cvar: Condvar::new(),
@@ -820,6 +823,9 @@ impl Db {
             dedup_maintenance_lanes,
             dedup_maintenance_queued: build_dedup_queued_flags(manifest_dedup_shards),
             wal,
+            unlogged_pending_lsn: Mutex::new(None),
+            unlogged_commit_gate: RwLock::new(()),
+            unlogged_commits_enabled: cfg.unlogged_commits_enabled,
             apply_gate: ApplyGate::new(),
             last_applied_lsn: Mutex::new(last_applied),
             commit_cvar: Condvar::new(),
@@ -1363,6 +1369,12 @@ impl Db {
         }
         self.metrics
             .record_flush_manifest(manifest_started.elapsed());
+        {
+            let mut unlogged = self.unlogged_pending_lsn.lock();
+            if unlogged.is_some_and(|lsn| lsn <= wal_checkpoint) {
+                *unlogged = None;
+            }
+        }
 
         // Manifest is durable. Install refcount meta chains in memory
         // so subsequent `begin_checkpoint` sees the new chain when

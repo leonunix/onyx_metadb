@@ -281,4 +281,14 @@ impl<'db> Transaction<'db> {
     pub fn commit_with_outcomes(self) -> Result<(Lsn, Vec<ApplyOutcome>)> {
         self.db.commit_ops(&self.ops)
     }
+
+    /// Experimental embedder fast path: apply without writing a WAL record.
+    ///
+    /// The caller must keep an independent durable replay source until a
+    /// metadb checkpoint persists the returned LSN. This is intended for
+    /// Onyx LV2-backed flush commits, not lifecycle or standalone metadata
+    /// operations.
+    pub fn commit_unlogged_with_outcomes(self) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+        self.db.commit_ops_unlogged(&self.ops)
+    }
 }

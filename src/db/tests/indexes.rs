@@ -537,6 +537,31 @@ fn checkpoint_advances_on_flush() {
 }
 
 #[test]
+fn unlogged_commit_survives_reopen_after_flush() {
+    let dir = TempDir::new().unwrap();
+    let applied = {
+        let mut cfg = Config::new(dir.path());
+        cfg.unlogged_commits_enabled = true;
+        let db = Db::create_with_config(cfg).unwrap();
+        let mut tx = db.begin();
+        tx.insert(0, 7, v(7));
+        tx.incref_pba(700, 1);
+        let (lsn, outcomes) = tx.commit_unlogged_with_outcomes().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(db.last_applied_lsn(), lsn);
+        db.flush().unwrap();
+        assert_eq!(db.manifest().checkpoint_lsn, lsn);
+        lsn
+    };
+    let mut cfg = Config::new(dir.path());
+    cfg.unlogged_commits_enabled = true;
+    let db = Db::open_with_config(cfg).unwrap();
+    assert_eq!(db.last_applied_lsn(), applied);
+    assert_eq!(db.get(0, 7).unwrap(), Some(v(7)));
+    assert_eq!(db.get_refcount(700).unwrap(), 1);
+}
+
+#[test]
 fn empty_tx_commit_is_noop() {
     let (_d, db) = mk_db();
     let tx = db.begin();

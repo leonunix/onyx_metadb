@@ -93,12 +93,15 @@ fn check_against_oracle(
 
     for slot in 0..LEAF_ENTRY_COUNT {
         let bit = leaf_bit_set(page, slot);
-        let val = leaf_value_at(page, slot);
+        let val = leaf_value_at(page, slot).map_err(|e| e.to_string())?;
         match oracle.get(&slot) {
             Some(expected) => {
                 if !bit {
                     return Err(format!("oracle says slot {slot} set, page says clear"));
                 }
+                let Some(val) = val else {
+                    return Err(format!("slot {slot} set but decoded as None"));
+                };
                 if &val.0 != expected {
                     return Err(format!(
                         "slot {slot} value mismatch: page={:?} oracle={:?}",
@@ -110,11 +113,8 @@ fn check_against_oracle(
                 if bit {
                     return Err(format!("oracle says slot {slot} clear, page says set"));
                 }
-                if val.0 != [0u8; LEAF_VALUE_SIZE] {
-                    return Err(format!(
-                        "cleared slot {slot} did not return ZERO: {:?}",
-                        &val.0
-                    ));
+                if val.is_some() {
+                    return Err(format!("cleared slot {slot} decoded as value"));
                 }
             }
         }
@@ -167,7 +167,7 @@ proptest! {
             match op {
                 Op::Set { slot, unit_id, offset } => {
                     let v = synth_value(unit_id, offset);
-                    let prev_page = leaf_set(&mut page, slot, &L2pValue(v));
+                    let prev_page = leaf_set(&mut page, slot, &L2pValue(v))?;
                     let prev_oracle = oracle.insert(slot, v);
                     prop_assert_eq!(
                         prev_page.map(|x| x.0),
@@ -177,7 +177,7 @@ proptest! {
                     );
                 }
                 Op::Clear { slot } => {
-                    let prev_page = leaf_clear(&mut page, slot);
+                    let prev_page = leaf_clear(&mut page, slot)?;
                     let prev_oracle = oracle.remove(&slot);
                     prop_assert_eq!(
                         prev_page.map(|x| x.0),
@@ -232,11 +232,11 @@ proptest! {
             match op {
                 Op::Set { slot, unit_id, offset } => {
                     let v = synth_value(unit_id, offset);
-                    leaf_set(&mut page, slot, &L2pValue(v));
+                    leaf_set(&mut page, slot, &L2pValue(v))?;
                     oracle.insert(slot, v);
                 }
                 Op::Clear { slot } => {
-                    leaf_clear(&mut page, slot);
+                    leaf_clear(&mut page, slot)?;
                     oracle.remove(&slot);
                 }
             }
@@ -271,22 +271,27 @@ proptest! {
         let mut page = fresh_leaf();
         for (&slot, &(unit_id, offset)) in &input {
             let v = synth_value(unit_id, offset);
-            leaf_set(&mut page, slot, &L2pValue(v));
+            leaf_set(&mut page, slot, &L2pValue(v))?;
         }
 
         // Read back through the public API.
         for slot in 0..LEAF_ENTRY_COUNT {
             let bit = leaf_bit_set(&page, slot);
-            let val = leaf_value_at(&page, slot);
+            let val = leaf_value_at(&page, slot)?;
             match input.get(&slot) {
                 Some(&(unit_id, offset)) => {
                     let expected = synth_value(unit_id, offset);
                     prop_assert!(bit, "slot {} should be set", slot);
-                    prop_assert_eq!(val.0, expected, "value mismatch slot {}", slot);
+                    prop_assert_eq!(
+                        val.expect("set slot must decode").0,
+                        expected,
+                        "value mismatch slot {}",
+                        slot
+                    );
                 }
                 None => {
                     prop_assert!(!bit, "slot {} should be clear", slot);
-                    prop_assert_eq!(val.0, [0u8; LEAF_VALUE_SIZE]);
+                    prop_assert!(val.is_none());
                 }
             }
         }
@@ -326,7 +331,7 @@ proptest! {
 
         for (slot, unit_id, offset) in ops {
             let v = synth_value(unit_id, offset);
-            leaf_set(&mut page, slot, &L2pValue(v));
+            leaf_set(&mut page, slot, &L2pValue(v))?;
             distinct_unit_ids.insert(unit_id);
 
             // unit_count lives at offset 16 of the payload.

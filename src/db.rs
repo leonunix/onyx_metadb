@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::apply_gate::ApplyGate;
@@ -100,6 +100,16 @@ pub struct Db {
     /// Write-ahead log. All mutations route through here so they survive
     /// crash between checkpoints.
     wal: WalSet,
+    /// Highest unlogged LSN applied in memory but not yet covered by a
+    /// durable checkpoint. This is only for embedder fast paths whose
+    /// recovery source is an upper-layer durable log.
+    unlogged_pending_lsn: Mutex<Option<Lsn>>,
+    /// WAL commits take the write side while they checkpoint any pending
+    /// unlogged work and reserve their own WAL LSN. Unlogged commits take the
+    /// read side, preventing a durable WAL record from landing behind an
+    /// uncheckpointed no-WAL LSN.
+    unlogged_commit_gate: RwLock<()>,
+    unlogged_commits_enabled: bool,
     /// Excludes apply phases from flush / snapshot. Commit takes
     /// `.read()` across the apply + bump; flush / take_snapshot /
     /// drop_snapshot take `.write()` so they observe a quiescent tree

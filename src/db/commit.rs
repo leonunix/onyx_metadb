@@ -22,6 +22,83 @@ struct RcBucketApplyResult {
     remap_freed: Vec<(usize, Pba)>,
 }
 
+fn push_l2p_remap_rc_actions(
+    rc_actions: &mut Vec<RcApplyAction>,
+    op_idx: usize,
+    lba: u64,
+    prev: Option<L2pValue>,
+    new_value: L2pValue,
+    lsn: Lsn,
+) {
+    let value_changed = prev != Some(new_value);
+    if !value_changed {
+        return;
+    }
+    let new_pba = new_value.head_pba();
+    let new_is_zero = new_value.0[27] & 0x02 != 0;
+    match prev {
+        Some(old_value) => {
+            let old_pba = old_value.head_pba();
+            let old_is_zero = old_value.0[27] & 0x02 != 0;
+            let push_decref = !old_is_zero && (old_pba != new_pba || new_is_zero);
+            let push_incref = !new_is_zero && (old_pba != new_pba || old_is_zero);
+            tracing::trace!(
+                target: "onyx_metadb::db::commit::rc_action",
+                op_idx,
+                lba,
+                old_pba,
+                new_pba,
+                old_is_zero,
+                new_is_zero,
+                push_decref,
+                push_incref,
+                lsn,
+                "apply_l2p_bucket: l2p_remap rc_actions (Some prev)"
+            );
+            if push_decref {
+                rc_actions.push(RcApplyAction {
+                    op_idx,
+                    pba: old_pba,
+                    delta: -1,
+                    standalone_refcount: false,
+                    remap_freed_candidate: true,
+                });
+            }
+            if push_incref {
+                rc_actions.push(RcApplyAction {
+                    op_idx,
+                    pba: new_pba,
+                    delta: 1,
+                    standalone_refcount: false,
+                    remap_freed_candidate: false,
+                });
+            }
+        }
+        None => {
+            if !new_is_zero {
+                tracing::trace!(
+                    target: "onyx_metadb::db::commit::rc_action",
+                    op_idx,
+                    lba,
+                    new_pba,
+                    new_is_zero,
+                    push_decref = false,
+                    push_incref = true,
+                    lsn,
+                    "apply_l2p_bucket: l2p_remap rc_actions (None prev)"
+                );
+                rc_actions.push(RcApplyAction {
+                    op_idx,
+                    pba: new_pba,
+                    delta: 1,
+                    standalone_refcount: false,
+                    remap_freed_candidate: false,
+                });
+            }
+        }
+    }
+}
+
 struct LaneDispatchPlan {
     l2p_sorted: Vec<((VolumeOrdinal, usize), Vec<usize>)>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
@@ -37,7 +114,6 @@ struct QueuedLanePlan {
     ops: Arc<Vec<WalOp>>,
     l2p_receivers: Vec<crossbeam_channel::Receiver<Result<L2pBucketApplyResult>>>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
-    rc_pending: Vec<Option<PendingApplyWork>>,
     /// Per-shard dedup op indices. Drained into the per-shard apply
     /// closures during `apply_ops_laned`.
     dedup_buckets: Vec<Vec<usize>>,
@@ -67,6 +143,20 @@ struct CommitTiming {
     apply: std::time::Duration,
     laned: LanedApplyTiming,
     finish_global_wait: std::time::Duration,
+}
+
+struct CommitApplyContext<'a> {
+    commit_started: std::time::Instant,
+    cpu_started: Option<std::time::Duration>,
+    timing: CommitTiming,
+    volumes: HashMap<VolumeOrdinal, Arc<Volume>>,
+    serial_apply: bool,
+    plan: Option<LaneDispatchPlan>,
+    plan_l2p_lanes: usize,
+    plan_rc_lanes: usize,
+    plan_dedup_ops: usize,
+    dispatch_lanes: usize,
+    ops: &'a [WalOp],
 }
 
 struct ActiveApplyGuard<'a> {
@@ -279,6 +369,13 @@ impl Db {
         // registers this footprint while the WAL set still holds its
         // allocator mutex, so every lower LSN's footprint is known before
         // a higher LSN can be assigned.
+        let unlogged_commit_guard = if self.unlogged_commits_enabled {
+            let guard = self.unlogged_commit_gate.write();
+            self.checkpoint_unlogged_before_wal_commit()?;
+            Some(guard)
+        } else {
+            None
+        };
         let plan_started = std::time::Instant::now();
         let volumes = self.volumes.read().clone();
         let serial_apply = self.batch_uses_serial_apply(ops);
@@ -345,6 +442,7 @@ impl Db {
                 return Err(err);
             }
         };
+        drop(unlogged_commit_guard);
         if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
             self.metrics.record_commit_error(commit_started.elapsed());
             self.poison_commit_waiters(&err);
@@ -363,24 +461,161 @@ impl Db {
         timing.dispatch_wait = wait_started.elapsed();
         self.metrics.record_commit_apply_wait(timing.dispatch_wait);
 
+        self.finish_commit_apply(
+            lsn,
+            CommitApplyContext {
+                commit_started,
+                cpu_started,
+                timing,
+                volumes,
+                serial_apply,
+                plan,
+                plan_l2p_lanes,
+                plan_rc_lanes,
+                plan_dedup_ops,
+                dispatch_lanes,
+                ops,
+            },
+            "metadb: slow commit_with_outcomes (>=1s)",
+        )
+    }
+
+    /// Experimental: apply a batch without writing a WAL record.
+    ///
+    /// The caller must keep its own durable replay source until a later
+    /// metadb checkpoint makes this LSN durable. Onyx uses LV2 write-buffer
+    /// entries for that source.
+    pub fn commit_ops_unlogged(&self, ops: &[WalOp]) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+        if ops.is_empty() {
+            self.metrics.record_commit_empty();
+            return Ok((self.last_applied_lsn(), Vec::new()));
+        }
+        if !self.unlogged_commits_enabled {
+            return Err(MetaDbError::InvalidArgument(
+                "unlogged commits are disabled in this metadb config".into(),
+            ));
+        }
+        let commit_started = std::time::Instant::now();
+        let cpu_started = thread_cpu_time();
+        let mut timing = CommitTiming::default();
+        self.metrics.record_commit_attempt(ops.len());
+
+        let drop_gate_started = std::time::Instant::now();
+        let _drop_guard = self.drop_gate.read();
+        timing.drop_gate_wait = drop_gate_started.elapsed();
+        self.metrics
+            .record_commit_drop_gate_wait(timing.drop_gate_wait);
+        let _unlogged_commit_guard = self.unlogged_commit_gate.read();
+
+        let plan_started = std::time::Instant::now();
+        let volumes = self.volumes.read().clone();
+        let serial_apply = self.batch_uses_serial_apply(ops);
+        let plan = if serial_apply {
+            None
+        } else {
+            match self.build_lane_dispatch_plan(&volumes, ops) {
+                Ok(plan) => Some(plan),
+                Err(err) => {
+                    self.metrics.record_commit_error(commit_started.elapsed());
+                    self.poison_commit_waiters(&err);
+                    return Err(err);
+                }
+            }
+        };
+        timing.plan = plan_started.elapsed();
+        let plan_l2p_lanes = plan.as_ref().map(|plan| plan.l2p_sorted.len()).unwrap_or(0);
+        let plan_rc_lanes = plan
+            .as_ref()
+            .map(|plan| {
+                plan.rc_enqueued
+                    .iter()
+                    .filter(|enqueued| **enqueued)
+                    .count()
+            })
+            .unwrap_or(0);
+        let plan_dedup_ops = plan
+            .as_ref()
+            .map(|plan| {
+                plan.dedup_buckets
+                    .iter()
+                    .map(|bucket| bucket.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        let dispatch_footprint = plan
+            .as_ref()
+            .map(DispatchFootprint::from_lane_plan)
+            .unwrap_or_else(DispatchFootprint::global);
+        let dispatch_lanes = dispatch_footprint.lanes.len();
+
+        let dispatch_started = std::time::Instant::now();
+        let lsn = match self.wal.reserve_unlogged(|lsn| {
+            self.register_dispatch_intent(lsn, dispatch_footprint);
+        }) {
+            Ok(lsn) => lsn,
+            Err(err) => {
+                self.metrics.record_commit_error(commit_started.elapsed());
+                self.poison_commit_waiters(&err);
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.mark_wal_durable_and_wait_for_dispatch(lsn) {
+            timing.dispatch_wait = dispatch_started.elapsed();
+            self.metrics.record_commit_apply_wait(timing.dispatch_wait);
+            self.metrics.record_commit_error(commit_started.elapsed());
+            return Err(err);
+        }
+        timing.dispatch_wait = dispatch_started.elapsed();
+        self.metrics.record_commit_apply_wait(timing.dispatch_wait);
+
+        let result = self.finish_commit_apply(
+            lsn,
+            CommitApplyContext {
+                commit_started,
+                cpu_started,
+                timing,
+                volumes,
+                serial_apply,
+                plan,
+                plan_l2p_lanes,
+                plan_rc_lanes,
+                plan_dedup_ops,
+                dispatch_lanes,
+                ops,
+            },
+            "metadb: slow unlogged commit_with_outcomes (>=1s)",
+        );
+        if result.is_ok() {
+            let mut pending = self.unlogged_pending_lsn.lock();
+            *pending = Some(pending.map_or(lsn, |prev| prev.max(lsn)));
+        }
+        result
+    }
+
+    fn finish_commit_apply(
+        &self,
+        lsn: Lsn,
+        mut ctx: CommitApplyContext<'_>,
+        slow_message: &'static str,
+    ) -> Result<(Lsn, Vec<ApplyOutcome>)> {
         let apply_gate_started = std::time::Instant::now();
         let apply_guard = self.acquire_commit_apply_gate(lsn);
         let active_apply = self.enter_active_apply(lsn);
-        timing.apply_gate_wait = apply_gate_started.elapsed();
+        ctx.timing.apply_gate_wait = apply_gate_started.elapsed();
         self.metrics
-            .record_commit_apply_gate_wait(timing.apply_gate_wait);
+            .record_commit_apply_gate_wait(ctx.timing.apply_gate_wait);
 
         let apply_started = std::time::Instant::now();
-        let outcomes = if let Some(plan) = plan {
+        let outcomes = if let Some(plan) = ctx.plan {
             let enqueue_started = std::time::Instant::now();
-            let queued_plan = self.enqueue_lane_plan(&volumes, lsn, plan, Arc::new(ops.to_vec()));
-            timing.lane_enqueue = enqueue_started.elapsed();
-            self.complete_retained_dispatch(lsn);
-            match self.apply_ops_laned(lsn, ops.len(), queued_plan) {
+            let queued_plan =
+                self.enqueue_lane_plan(&ctx.volumes, lsn, plan, Arc::new(ctx.ops.to_vec()));
+            ctx.timing.lane_enqueue = enqueue_started.elapsed();
+            match self.apply_ops_laned(lsn, ctx.ops.len(), queued_plan) {
                 Ok((outcomes, laned_timing)) => {
-                    timing.apply = apply_started.elapsed();
-                    timing.laned = laned_timing;
-                    self.metrics.record_commit_apply(timing.apply);
+                    ctx.timing.apply = apply_started.elapsed();
+                    ctx.timing.laned = laned_timing;
+                    self.metrics.record_commit_apply(ctx.timing.apply);
                     self.metrics.record_commit_apply_laned(
                         laned_timing.l2p_wait,
                         laned_timing.rc_enqueue,
@@ -391,86 +626,89 @@ impl Db {
                     outcomes
                 }
                 Err(err) => {
-                    timing.apply = apply_started.elapsed();
-                    self.metrics.record_commit_apply(timing.apply);
-                    self.metrics.record_commit_error(commit_started.elapsed());
+                    ctx.timing.apply = apply_started.elapsed();
+                    self.metrics.record_commit_apply(ctx.timing.apply);
+                    self.metrics
+                        .record_commit_error(ctx.commit_started.elapsed());
                     self.poison_commit_waiters(&err);
                     return Err(err);
                 }
             }
         } else {
             if let Err(err) = self.wait_for_global_apply_turn(lsn) {
-                timing.apply = apply_started.elapsed();
-                self.metrics.record_commit_apply(timing.apply);
-                self.metrics.record_commit_error(commit_started.elapsed());
+                ctx.timing.apply = apply_started.elapsed();
+                self.metrics.record_commit_apply(ctx.timing.apply);
+                self.metrics
+                    .record_commit_error(ctx.commit_started.elapsed());
                 return Err(err);
             }
-            match self.apply_commit_batch(&volumes, lsn, ops) {
+            match self.apply_commit_batch(&ctx.volumes, lsn, ctx.ops) {
                 Ok(outcomes) => {
-                    timing.apply = apply_started.elapsed();
-                    self.metrics.record_commit_apply(timing.apply);
+                    ctx.timing.apply = apply_started.elapsed();
+                    self.metrics.record_commit_apply(ctx.timing.apply);
                     outcomes
                 }
                 Err(err) => {
-                    timing.apply = apply_started.elapsed();
-                    self.metrics.record_commit_apply(timing.apply);
-                    self.metrics.record_commit_error(commit_started.elapsed());
+                    ctx.timing.apply = apply_started.elapsed();
+                    self.metrics.record_commit_apply(ctx.timing.apply);
+                    self.metrics
+                        .record_commit_error(ctx.commit_started.elapsed());
                     self.poison_commit_waiters(&err);
                     return Err(err);
                 }
             }
         };
         if let Err(err) = self.faults.inject(FaultPoint::CommitPostApplyBeforeLsnBump) {
-            self.metrics.record_commit_error(commit_started.elapsed());
+            self.metrics
+                .record_commit_error(ctx.commit_started.elapsed());
             self.poison_commit_waiters(&err);
             return Err(err);
         }
 
-        // Bump BEFORE dropping the gate: if we released the gate first
-        // a concurrent flush could observe `last_applied_lsn = lsn - 1`
-        // while trees already contain op `lsn`, causing recovery to
-        // double-apply on restart (refcount incref is not idempotent).
         let finish_started = std::time::Instant::now();
         if let Err(err) = self.finish_global_apply(lsn) {
-            self.metrics.record_commit_error(commit_started.elapsed());
+            self.metrics
+                .record_commit_error(ctx.commit_started.elapsed());
             return Err(err);
         }
-        timing.finish_global_wait = finish_started.elapsed();
-        if serial_apply {
+        ctx.timing.finish_global_wait = finish_started.elapsed();
+        if ctx.serial_apply {
             self.complete_retained_dispatch(lsn);
         }
         drop(active_apply);
         drop(apply_guard);
-        let total_elapsed = commit_started.elapsed();
+
+        let total_elapsed = ctx.commit_started.elapsed();
         if total_elapsed >= std::time::Duration::from_secs(1) {
-            let cpu_elapsed = cpu_started
+            let cpu_elapsed = ctx
+                .cpu_started
                 .and_then(|started| thread_cpu_time().map(|now| now.saturating_sub(started)));
             let pending = self.pending_state();
             let metrics = self.metrics.snapshot();
             tracing::warn!(
                 lsn,
-                ops = ops.len(),
-                serial_apply,
-                plan_l2p_lanes,
-                plan_rc_lanes,
-                plan_dedup_ops,
-                dispatch_lanes,
+                ops = ctx.ops.len(),
+                serial_apply = ctx.serial_apply,
+                plan_l2p_lanes = ctx.plan_l2p_lanes,
+                plan_rc_lanes = ctx.plan_rc_lanes,
+                plan_dedup_ops = ctx.plan_dedup_ops,
+                dispatch_lanes = ctx.dispatch_lanes,
                 total_ms = total_elapsed.as_millis() as u64,
                 thread_cpu_ms = cpu_elapsed.map(|d| d.as_millis() as u64),
-                drop_gate_wait_us = duration_us(timing.drop_gate_wait),
-                plan_us = duration_us(timing.plan),
-                encode_us = duration_us(timing.encode),
-                wal_submit_us = duration_us(timing.wal_submit),
-                dispatch_wait_us = duration_us(timing.dispatch_wait),
-                apply_gate_wait_us = duration_us(timing.apply_gate_wait),
-                lane_enqueue_us = duration_us(timing.lane_enqueue),
-                apply_us = duration_us(timing.apply),
-                l2p_lane_wait_us = duration_us(timing.laned.l2p_wait),
-                rc_lane_enqueue_us = duration_us(timing.laned.rc_enqueue),
-                rc_lane_wait_us = duration_us(timing.laned.rc_wait),
-                dedup_lane_enqueue_us = duration_us(timing.laned.dedup_enqueue),
-                dedup_lane_wait_us = duration_us(timing.laned.dedup_wait),
-                finish_global_wait_us = duration_us(timing.finish_global_wait),
+                drop_gate_wait_us = duration_us(ctx.timing.drop_gate_wait),
+                plan_us = duration_us(ctx.timing.plan),
+                encode_us = duration_us(ctx.timing.encode),
+                wal_submit_us = duration_us(ctx.timing.wal_submit),
+                dispatch_wait_us = duration_us(ctx.timing.dispatch_wait),
+                apply_gate_wait_us = duration_us(ctx.timing.apply_gate_wait),
+                lane_enqueue_us = duration_us(ctx.timing.lane_enqueue),
+                apply_us = duration_us(ctx.timing.apply),
+                l2p_lane_wait_us = duration_us(ctx.timing.laned.l2p_wait),
+                rc_lane_enqueue_us = duration_us(ctx.timing.laned.rc_enqueue),
+                rc_lane_wait_us = duration_us(ctx.timing.laned.rc_wait),
+                dedup_lane_enqueue_us = duration_us(ctx.timing.laned.dedup_enqueue),
+                dedup_lane_wait_us = duration_us(ctx.timing.laned.dedup_wait),
+                finish_global_wait_us = duration_us(ctx.timing.finish_global_wait),
                 wal_submit_wait_max_us = metrics.wal_submit_wait_max_us,
                 wal_write_max_us = metrics.wal_write_max_us,
                 wal_fsync_max_us = metrics.wal_fsync_max_us,
@@ -485,11 +723,19 @@ impl Db {
                 flush_io_max_us = metrics.flush_io_max_us,
                 flush_install_max_us = metrics.flush_install_max_us,
                 flush_reclaim_max_us = metrics.flush_reclaim_max_us,
-                "metadb: slow commit_with_outcomes (>=1s)"
+                slow_message
             );
         }
         self.metrics.record_commit_success(total_elapsed);
         Ok((lsn, outcomes))
+    }
+
+    fn checkpoint_unlogged_before_wal_commit(&self) -> Result<()> {
+        if self.unlogged_pending_lsn.lock().is_none() {
+            return Ok(());
+        }
+        self.flush()?;
+        Ok(())
     }
 
     fn apply_op(
@@ -864,13 +1110,6 @@ impl Db {
             );
             l2p_receivers.push(rx);
         }
-        let mut rc_pending: Vec<Option<PendingApplyWork>> =
-            (0..plan.rc_enqueued.len()).map(|_| None).collect();
-        for (sid, enqueued) in plan.rc_enqueued.iter().copied().enumerate() {
-            if enqueued {
-                rc_pending[sid] = Some(self.refcount_shards[sid].apply_lane.enqueue_pending(lsn));
-            }
-        }
         // One pending slot per non-empty dedup bucket. Empty buckets
         // get `None`, matching the per-shard layout of `dedup_buckets`.
         let mut dedup_pendings: Vec<Option<PendingApplyWork>> =
@@ -884,7 +1123,6 @@ impl Db {
             ops,
             l2p_receivers,
             rc_buckets: plan.rc_buckets,
-            rc_pending,
             dedup_buckets: plan.dedup_buckets,
             dedup_pendings,
         }
@@ -931,7 +1169,88 @@ impl Db {
         let bucket_started = std::time::Instant::now();
         let ops_started = std::time::Instant::now();
         let ops_result = (|| -> Result<()> {
-            for idx in indices {
+            let mut pos = 0;
+            while pos < indices.len() {
+                let idx = indices[pos];
+                if matches!(&ops[idx], WalOp::L2pRemap { guard: None, .. }) {
+                    let WalOp::L2pRemap { lba, new_value, .. } = &ops[idx] else {
+                        unreachable!("matches! above ensures an unguarded remap");
+                    };
+                    let leaf_idx = *lba >> crate::paged::format::LEAF_SHIFT;
+                    let mut run_end = pos + 1;
+                    while run_end < indices.len() {
+                        let next_idx = indices[run_end];
+                        match &ops[next_idx] {
+                            WalOp::L2pRemap {
+                                lba: next_lba,
+                                guard: None,
+                                ..
+                            } if (*next_lba >> crate::paged::format::LEAF_SHIFT) == leaf_idx => {
+                                run_end += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    if run_end > pos + 1 {
+                        let run_indices = &indices[pos..run_end];
+                        let mut entries = Vec::with_capacity(run_indices.len());
+                        for &run_idx in run_indices {
+                            match &ops[run_idx] {
+                                WalOp::L2pRemap {
+                                    lba,
+                                    new_value,
+                                    guard: None,
+                                    ..
+                                } => entries.push((*lba, *new_value)),
+                                _ => unreachable!("run builder only accepts unguarded remaps"),
+                            }
+                        }
+                        let prev_values =
+                            tree.insert_leaf_run_at_lsn_deferred_finish(&entries, lsn)?;
+                        for ((run_idx, (run_lba, run_new_value)), prev) in indices[pos..run_end]
+                            .iter()
+                            .copied()
+                            .zip(entries.into_iter())
+                            .zip(prev_values.into_iter())
+                            .map(|((idx, entry), prev)| ((idx, entry), prev))
+                        {
+                            push_l2p_remap_rc_actions(
+                                &mut rc_actions,
+                                run_idx,
+                                run_lba,
+                                prev,
+                                run_new_value,
+                                lsn,
+                            );
+                            l2p_remap_count += 1;
+                            outcomes.push((
+                                run_idx,
+                                ApplyOutcome::L2pRemap {
+                                    applied: true,
+                                    prev,
+                                    freed_pba: None,
+                                },
+                            ));
+                        }
+                        pos = run_end;
+                        continue;
+                    }
+
+                    let prev = tree.insert_at_lsn_deferred_finish(*lba, *new_value, lsn)?;
+                    push_l2p_remap_rc_actions(&mut rc_actions, idx, *lba, prev, *new_value, lsn);
+                    l2p_remap_count += 1;
+                    outcomes.push((
+                        idx,
+                        ApplyOutcome::L2pRemap {
+                            applied: true,
+                            prev,
+                            freed_pba: None,
+                        },
+                    ));
+                    pos += 1;
+                    continue;
+                }
                 let outcome = match &ops[idx] {
                     WalOp::L2pPut { lba, value, .. } => {
                         let prev = tree.insert_at_lsn_deferred_finish(*lba, *value, lsn)?;
@@ -970,82 +1289,19 @@ impl Db {
                                         freed_pba: None,
                                     },
                                 ));
+                                pos += 1;
                                 continue;
                             }
                         }
                         let prev = tree.insert_at_lsn_deferred_finish(*lba, *new_value, lsn)?;
-                        let value_changed = prev != Some(*new_value);
-                        if value_changed {
-                            let new_pba = new_value.head_pba();
-                            let new_is_zero = new_value.0[27] & 0x02 != 0;
-                            match prev {
-                                Some(old_value) => {
-                                    let old_pba = old_value.head_pba();
-                                    let old_is_zero = old_value.0[27] & 0x02 != 0;
-                                    let push_decref =
-                                        !old_is_zero && (old_pba != new_pba || new_is_zero);
-                                    let push_incref =
-                                        !new_is_zero && (old_pba != new_pba || old_is_zero);
-                                    // P0 diagnostic: trace every rc_action push
-                                    // so the underflow report can be tied back
-                                    // to the originating op's (lba, prev, new).
-                                    // Filter via `RUST_LOG=onyx_metadb::db::commit::rc_action=trace`.
-                                    tracing::trace!(
-                                        target: "onyx_metadb::db::commit::rc_action",
-                                        op_idx = idx,
-                                        lba = *lba,
-                                        old_pba,
-                                        new_pba,
-                                        old_is_zero,
-                                        new_is_zero,
-                                        push_decref,
-                                        push_incref,
-                                        lsn,
-                                        "apply_l2p_bucket: l2p_remap rc_actions (Some prev)"
-                                    );
-                                    if push_decref {
-                                        rc_actions.push(RcApplyAction {
-                                            op_idx: idx,
-                                            pba: old_pba,
-                                            delta: -1,
-                                            standalone_refcount: false,
-                                            remap_freed_candidate: true,
-                                        });
-                                    }
-                                    if push_incref {
-                                        rc_actions.push(RcApplyAction {
-                                            op_idx: idx,
-                                            pba: new_pba,
-                                            delta: 1,
-                                            standalone_refcount: false,
-                                            remap_freed_candidate: false,
-                                        });
-                                    }
-                                }
-                                None => {
-                                    if !new_is_zero {
-                                        tracing::trace!(
-                                            target: "onyx_metadb::db::commit::rc_action",
-                                            op_idx = idx,
-                                            lba = *lba,
-                                            new_pba,
-                                            new_is_zero,
-                                            push_decref = false,
-                                            push_incref = true,
-                                            lsn,
-                                            "apply_l2p_bucket: l2p_remap rc_actions (None prev)"
-                                        );
-                                        rc_actions.push(RcApplyAction {
-                                            op_idx: idx,
-                                            pba: new_pba,
-                                            delta: 1,
-                                            standalone_refcount: false,
-                                            remap_freed_candidate: false,
-                                        });
-                                    }
-                                }
-                            }
-                        }
+                        push_l2p_remap_rc_actions(
+                            &mut rc_actions,
+                            idx,
+                            *lba,
+                            prev,
+                            *new_value,
+                            lsn,
+                        );
                         l2p_remap_count += 1;
                         ApplyOutcome::L2pRemap {
                             applied: true,
@@ -1056,6 +1312,7 @@ impl Db {
                     other => unreachable!("L2P bucket holds only L2P ops; saw {other:?}"),
                 };
                 outcomes.push((idx, outcome));
+                pos += 1;
             }
             Ok(())
         })();
@@ -1414,21 +1671,25 @@ impl Db {
 
         let mut rc_receivers = Vec::new();
         let rc_enqueue_started = std::time::Instant::now();
-        for sid in 0..plan.rc_pending.len() {
-            let Some(pending) = plan.rc_pending[sid].take() else {
-                continue;
-            };
+        for sid in 0..plan.rc_buckets.len() {
             let actions = std::mem::take(&mut plan.rc_buckets[sid]);
+            if actions.is_empty() {
+                continue;
+            }
             let rc = self.refcount_shards[sid].rc.clone();
             let metrics = self.metrics.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
-            pending.set(Box::new(move || {
-                let result = Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn);
-                let _ = tx.send(result);
-            }));
+            self.refcount_shards[sid].apply_lane.enqueue_ready(
+                lsn,
+                Box::new(move || {
+                    let result = Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn);
+                    let _ = tx.send(result);
+                }),
+            );
             rc_receivers.push(rx);
         }
         timing.rc_enqueue = rc_enqueue_started.elapsed();
+        self.complete_retained_dispatch(lsn);
 
         let mut first_error = None;
         let rc_wait_started = std::time::Instant::now();

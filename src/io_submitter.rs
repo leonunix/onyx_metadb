@@ -196,11 +196,7 @@ impl IoSubmitter {
     /// SQE. The submitter batches arbitrarily many concurrent runs per
     /// ring transition (the old shared-uring path capped at 16
     /// `submit_and_wait` SQEs per chunk).
-    pub(crate) fn submit_write_run(
-        &self,
-        start_page: PageId,
-        pages: Vec<Arc<Page>>,
-    ) -> Result<()> {
+    pub(crate) fn submit_write_run(&self, start_page: PageId, pages: Vec<Arc<Page>>) -> Result<()> {
         self.submit_write_run_async(start_page, pages)?
             .recv()
             .map_err(|_| submitter_dead())?
@@ -256,9 +252,7 @@ impl IoSubmitter {
     }
 
     /// Async variant of [`Self::submit_fsync`].
-    pub(crate) fn submit_fsync_async(
-        &self,
-    ) -> Result<crossbeam_channel::Receiver<Result<()>>> {
+    pub(crate) fn submit_fsync_async(&self) -> Result<crossbeam_channel::Receiver<Result<()>>> {
         let sender = self.sender.as_ref().ok_or_else(submitter_dead)?;
         let (reply_tx, reply_rx) = bounded(1);
         sender
@@ -467,9 +461,7 @@ fn submitter_loop(
     // Drain any straggler ops left in the channel after shutdown.
     while let Ok(op) = rx.try_recv() {
         match op {
-            IoOp::Write { reply, .. }
-            | IoOp::WriteRun { reply, .. }
-            | IoOp::Fsync { reply } => {
+            IoOp::Write { reply, .. } | IoOp::WriteRun { reply, .. } | IoOp::Fsync { reply } => {
                 let _ = reply.send(Err(submitter_dead()));
             }
             IoOp::Shutdown => {}
@@ -504,14 +496,10 @@ fn handle_op(
         } => {
             let uid = *next_uid;
             *next_uid = next_uid.wrapping_add(1);
-            let entry = opcode::Write::new(
-                types::Fd(fd),
-                page.bytes().as_ptr(),
-                PAGE_SIZE as u32,
-            )
-            .offset(page_id * PAGE_SIZE as u64)
-            .build()
-            .user_data(uid);
+            let entry = opcode::Write::new(types::Fd(fd), page.bytes().as_ptr(), PAGE_SIZE as u32)
+                .offset(page_id * PAGE_SIZE as u64)
+                .build()
+                .user_data(uid);
             // SAFETY: `page` (Arc<Page>) is moved into the InflightOp
             // below before we relinquish the SQE; the bytes outlive the
             // kernel's read of the buffer.
@@ -660,10 +648,8 @@ fn decode_cqe_result(kind: InflightKind, result: i32) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn fail_all_inflight<F>(
-    inflight: &mut std::collections::HashMap<u64, InflightOp>,
-    err: F,
-) where
+fn fail_all_inflight<F>(inflight: &mut std::collections::HashMap<u64, InflightOp>, err: F)
+where
     F: Fn() -> MetaDbError,
 {
     for (_, slot) in inflight.drain() {
@@ -695,7 +681,11 @@ mod tests {
 
     fn mk_page(seed: u8) -> Arc<Page> {
         let mut page = Page::new(PageHeader::new(PageType::L2pInternal, 1));
-        for byte in page.bytes_mut().iter_mut().skip(crate::page::PAGE_HEADER_SIZE) {
+        for byte in page
+            .bytes_mut()
+            .iter_mut()
+            .skip(crate::page::PAGE_HEADER_SIZE)
+        {
             *byte = seed;
         }
         page.seal();
@@ -882,7 +872,11 @@ mod tests {
 
             let single = read_page_at(&file, run_start + 32);
             let expected_single = mk_page((tid as u8) * 32 + 16);
-            assert_eq!(single.bytes(), expected_single.bytes(), "tid={tid} single[0]");
+            assert_eq!(
+                single.bytes(),
+                expected_single.bytes(),
+                "tid={tid} single[0]"
+            );
         }
     }
 

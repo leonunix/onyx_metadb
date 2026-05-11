@@ -1326,7 +1326,7 @@ impl PageStore {
     fn check_in_range(&self, page_id: PageId) -> Result<()> {
         let inner = self.inner.lock();
         if page_id >= inner.high_water {
-             return Err(MetaDbError::PageOutOfRange(page_id));
+            return Err(MetaDbError::PageOutOfRange(page_id));
         }
         Ok(())
     }

@@ -60,12 +60,14 @@ struct Args {
     writers: usize,
     readers: usize,
     ops_per_commit: usize,
+    lbas_per_unit: usize,
     reader_batch: usize,
     flush_interval_ms: u64,
     duration_secs: u64,
     warmup_secs: u64,
     lba_space: u64,
     reset: bool,
+    shards: u32,
     wal_lanes: u32,
     group_commit_timeout_us: u64,
     range_scanners: usize,
@@ -89,12 +91,14 @@ impl Args {
             writers: 4,
             readers: 4,
             ops_per_commit: 500,
+            lbas_per_unit: 1,
             reader_batch: 8,
             flush_interval_ms: 5000,
             duration_secs: 300,
             warmup_secs: 30,
             lba_space: 16_000_000,
             reset: false,
+            shards: 16,
             wal_lanes: 1,
             group_commit_timeout_us: 1,
             range_scanners: 1,
@@ -119,6 +123,13 @@ impl Args {
                 "--ops-per-commit" => {
                     a.ops_per_commit = parse_usize(it.next(), "--ops-per-commit")?
                 }
+                "--lbas-per-unit" => {
+                    let v = parse_usize(it.next(), "--lbas-per-unit")?;
+                    if v == 0 {
+                        return Err("--lbas-per-unit must be > 0".into());
+                    }
+                    a.lbas_per_unit = v;
+                }
                 "--reader-batch" => a.reader_batch = parse_usize(it.next(), "--reader-batch")?,
                 "--flush-interval-ms" => {
                     a.flush_interval_ms = parse_u64(it.next(), "--flush-interval-ms")?
@@ -127,6 +138,13 @@ impl Args {
                 "--warmup-secs" => a.warmup_secs = parse_u64(it.next(), "--warmup-secs")?,
                 "--lba-space" => a.lba_space = parse_u64(it.next(), "--lba-space")?,
                 "--reset" => a.reset = true,
+                "--shards" => {
+                    let v = parse_u64(it.next(), "--shards")?;
+                    if v == 0 || v > 256 {
+                        return Err("--shards must be 1..=256".into());
+                    }
+                    a.shards = v as u32;
+                }
                 "--wal-lanes" => {
                     let v = parse_u64(it.next(), "--wal-lanes")?;
                     if v == 0 || v > u32::MAX as u64 {
@@ -245,7 +263,7 @@ fn run() -> Result<bool, String> {
     }
     std::fs::create_dir_all(&args.db_path).map_err(|e| format!("mkdir: {e}"))?;
     let mut cfg = Config::new(&args.db_path);
-    cfg.shards_per_partition = 4;
+    cfg.shards_per_partition = args.shards;
     cfg.wal_lanes = args.wal_lanes;
     cfg.group_commit_timeout_us = args.group_commit_timeout_us;
     cfg.dedup_shards = args.dedup_shards;
@@ -279,6 +297,7 @@ fn run() -> Result<bool, String> {
                 lba_space: args.lba_space,
                 writers: args.writers as u64,
                 ops_per_commit: args.ops_per_commit,
+                lbas_per_unit: args.lbas_per_unit,
                 dedup_enabled: args.dedup_enabled,
                 dedup_hit_pct: args.dedup_hit_pct,
                 cleanup_batch: args.cleanup_batch,
@@ -526,6 +545,12 @@ struct WriterCfg {
     lba_space: u64,
     writers: u64,
     ops_per_commit: usize,
+    /// LBAs that share one PBA per onyx-style "unit". onyx flush_writer
+    /// emits a packed/passthrough unit holding K live LBAs all pointing to
+    /// the same allocated PBA, so RC fanout per commit is
+    /// `ops_per_commit / lbas_per_unit` (one incref per PBA), not
+    /// `ops_per_commit` (one per LBA). 1 = legacy unique-PBA-per-LBA.
+    lbas_per_unit: usize,
     dedup_enabled: bool,
     dedup_hit_pct: u8,
     cleanup_batch: usize,
@@ -680,39 +705,55 @@ fn writer_loop(
         let mut staged_inserts: Vec<(Hash8, Pba)> = Vec::new();
         let mut commit_hits = 0u64;
         let mut commit_misses = 0u64;
-        for _ in 0..cfg.ops_per_commit {
-            let lba = lba_lo + rng.gen_range(0..(lba_hi - lba_lo));
+        // Walk ops_per_commit LBAs in groups of `lbas_per_unit`. All LBAs
+        // in a group share one freshly allocated PBA — same shape as an
+        // onyx flush_writer "unit" holding K live LBAs against one
+        // packed/passthrough PBA. RC fanout per commit therefore scales
+        // with `ops_per_commit / lbas_per_unit`, matching production.
+        let mut emitted = 0usize;
+        while emitted < cfg.ops_per_commit {
+            let group = cfg.lbas_per_unit.min(cfg.ops_per_commit - emitted);
             let try_hit = cfg.dedup_enabled
                 && cfg.dedup_hit_pct > 0
                 && pool.len() > 0
                 && rng.gen_range(0..100u8) < cfg.dedup_hit_pct;
             if try_hit {
                 let (_existing_hash, existing_pba) = pool.sample(&mut rng).unwrap();
-                salt = salt.wrapping_add(1);
-                tx.l2p_remap(
-                    VOL,
-                    lba,
-                    onyx_l2p_value(existing_pba, salt),
-                    Some((existing_pba, 1)),
-                );
-                commit_hits += 1;
+                for _ in 0..group {
+                    let lba = lba_lo + rng.gen_range(0..(lba_hi - lba_lo));
+                    salt = salt.wrapping_add(1);
+                    tx.l2p_remap(
+                        VOL,
+                        lba,
+                        onyx_l2p_value(existing_pba, salt),
+                        Some((existing_pba, 1)),
+                    );
+                    commit_hits += 1;
+                }
             } else if cfg.dedup_enabled {
                 let pba = next_pba;
                 next_pba = next_pba.wrapping_add(1);
-                salt = salt.wrapping_add(1);
                 hash_seq = hash_seq.wrapping_add(1);
                 let hash = onyx_hash(hash_seq);
-                tx.l2p_remap(VOL, lba, onyx_l2p_value(pba, salt), None);
+                for _ in 0..group {
+                    let lba = lba_lo + rng.gen_range(0..(lba_hi - lba_lo));
+                    salt = salt.wrapping_add(1);
+                    tx.l2p_remap(VOL, lba, onyx_l2p_value(pba, salt), None);
+                    commit_misses += 1;
+                }
                 tx.put_dedup(hash, onyx_dedup_value(pba, salt));
                 tx.register_dedup_reverse(pba, hash);
                 staged_inserts.push((hash, pba));
-                commit_misses += 1;
             } else {
                 let pba = next_pba;
                 next_pba = next_pba.wrapping_add(1);
-                salt = salt.wrapping_add(1);
-                tx.l2p_remap(VOL, lba, onyx_l2p_value(pba, salt), None);
+                for _ in 0..group {
+                    let lba = lba_lo + rng.gen_range(0..(lba_hi - lba_lo));
+                    salt = salt.wrapping_add(1);
+                    tx.l2p_remap(VOL, lba, onyx_l2p_value(pba, salt), None);
+                }
             }
+            emitted += group;
         }
         let started = Instant::now();
         let outcomes = match tx.commit_with_outcomes() {

@@ -16,7 +16,10 @@ use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::{MetaDbError, Result};
 use crate::page::{Page, PageType};
 use crate::page_store::{PageStore, RcDeltaWithGen};
-use crate::paged::format::{index_collect_children, init_index, init_leaf, page_level};
+use crate::paged::format::{
+    LEAF_BITMAP_BYTES, index_collect_children, init_index, init_leaf, page_level,
+};
+use crate::paged::leaf_compact;
 use crate::paged::read_view::{PageIdMap, PageIdSet, ReadOverlay, ReadOverlayShard};
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
@@ -275,13 +278,21 @@ impl PageBuf {
     }
 
     fn allocate_local(&mut self) -> Result<PageId> {
-        if let Some(pid) = self.alloc_pool.pop() {
-            return Ok(pid);
-        }
-        self.alloc_pool = self.page_store.allocate_batch(LOCAL_ALLOC_RUN_PAGES)?;
-        self.alloc_pool.pop().ok_or_else(|| {
-            MetaDbError::Corruption("paged page allocator returned an empty batch".into())
-        })
+        let pid = if let Some(pid) = self.alloc_pool.pop() {
+            pid
+        } else {
+            self.alloc_pool = self.page_store.allocate_batch(LOCAL_ALLOC_RUN_PAGES)?;
+            self.alloc_pool.pop().ok_or_else(|| {
+                MetaDbError::Corruption("paged page allocator returned an empty batch".into())
+            })?
+        };
+        // Page ids are recycled by the page store. A previous incarnation may
+        // still be resident, and index pages may be pinned outside the LRU.
+        // New allocations must therefore evict any shared-cache copy before
+        // installing the freshly initialized dirty page in this PageBuf.
+        self.pages_remove(pid);
+        self.page_cache.invalidate(pid);
+        Ok(pid)
     }
 
     /// Underlying page store handle.
@@ -356,6 +367,32 @@ impl PageBuf {
     pub fn clone_private(&mut self, src: PageId, generation: Lsn) -> Result<PageId> {
         let new_pid = self.allocate_local()?;
         let mut page = self.read(src)?.clone();
+        if matches!(page.header()?.page_type, PageType::PagedLeaf) {
+            let payload = page.payload();
+            let version = payload[LEAF_BITMAP_BYTES + 1];
+            if version != leaf_compact::COMPACT_VERSION {
+                return Err(MetaDbError::Corruption(format!(
+                    "paged clone_private source leaf {src} -> {new_pid} lsn {generation}: compact leaf version {version} != {} (key_count={}, page_gen={}, rc={}, payload0={:02x?})",
+                    leaf_compact::COMPACT_VERSION,
+                    page.key_count(),
+                    page.generation(),
+                    page.refcount(),
+                    &payload[..32],
+                )));
+            }
+            let unit_count = payload[LEAF_BITMAP_BYTES] as usize;
+            let cap = leaf_compact::max_units_per_payload(payload.len())
+                .min(leaf_compact::MAX_UNITS_PER_LEAF);
+            if unit_count > cap {
+                return Err(MetaDbError::Corruption(format!(
+                    "paged clone_private source leaf {src} -> {new_pid} lsn {generation}: compact leaf unit_count {unit_count} exceeds payload capacity {cap} (key_count={}, page_gen={}, rc={}, payload0={:02x?})",
+                    page.key_count(),
+                    page.generation(),
+                    page.refcount(),
+                    &payload[..32],
+                )));
+            }
+        }
         page.set_generation(generation);
         page.set_refcount(1);
         self.pages_insert(new_pid, Slot::Dirty(Arc::new(page)));
@@ -607,7 +644,12 @@ impl PageBuf {
         // Allocate the clone and copy bytes. `page.generation = 0`: the
         // new pid is untouched by any WAL op, and any future rc mutation
         // on it will be stamped with the op's lsn at that point.
-        let new_pid = self.page_store.allocate()?;
+        let new_pid = self.allocate_local()?;
+        if new_pid == pid {
+            return Err(MetaDbError::Corruption(format!(
+                "paged: allocator returned live page {pid} for COW clone"
+            )));
+        }
         let mut new_page = Page::zeroed();
         new_page
             .bytes_mut()
@@ -868,6 +910,7 @@ impl DirtySnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PAGE_SIZE;
     use crate::paged::format::{
         L2pValue, index_child_at, index_set_child, leaf_bit_set, leaf_set, leaf_value_at,
     };
@@ -895,7 +938,7 @@ mod tests {
         let mut buf = PageBuf::new(ps.clone());
         let pid = buf.alloc_leaf(1).unwrap();
         let v = L2pValue([0x42u8; 28]);
-        leaf_set(buf.modify(pid, 1).unwrap(), 5, &v);
+        leaf_set(buf.modify(pid, 1).unwrap(), 5, &v).unwrap();
         buf.flush().unwrap();
 
         let mut buf2 = PageBuf::new(ps);
@@ -909,7 +952,7 @@ mod tests {
         let mut buf = PageBuf::new(ps.clone());
         let pid = buf.alloc_leaf(1).unwrap();
         let v = L2pValue([0x42u8; 28]);
-        leaf_set(buf.modify(pid, 1).unwrap(), 5, &v);
+        leaf_set(buf.modify(pid, 1).unwrap(), 5, &v).unwrap();
 
         let flushed = buf.dirty_snapshot().write().unwrap();
         let mut sealed_pages = Vec::new();
@@ -935,10 +978,10 @@ mod tests {
         let pid = buf.alloc_leaf(1).unwrap();
         let first = L2pValue([0x42u8; 28]);
         let second = L2pValue([0x24u8; 28]);
-        leaf_set(buf.modify(pid, 1).unwrap(), 5, &first);
+        leaf_set(buf.modify(pid, 1).unwrap(), 5, &first).unwrap();
 
         let snapshot = buf.dirty_snapshot();
-        leaf_set(buf.modify(pid, 2).unwrap(), 6, &second);
+        leaf_set(buf.modify(pid, 2).unwrap(), 6, &second).unwrap();
         let flushed = snapshot.write().unwrap();
 
         assert_eq!(
@@ -948,8 +991,8 @@ mod tests {
         assert!(buf.contains(pid));
         assert_eq!(buf.dirty_count(), 1);
         let page = buf.read(pid).unwrap();
-        assert_eq!(leaf_value_at(page, 5), first);
-        assert_eq!(leaf_value_at(page, 6), second);
+        assert_eq!(leaf_value_at(page, 5).unwrap(), Some(first));
+        assert_eq!(leaf_value_at(page, 6).unwrap(), Some(second));
     }
 
     #[test]
@@ -978,31 +1021,73 @@ mod tests {
         let mut buf = PageBuf::with_cache(ps.clone(), page_cache.clone());
         let pid = buf.alloc_leaf(1).unwrap();
         let old = L2pValue([0x11u8; 28]);
-        leaf_set(buf.modify(pid, 1).unwrap(), 7, &old);
+        leaf_set(buf.modify(pid, 1).unwrap(), 7, &old).unwrap();
         buf.flush().unwrap();
-        assert_eq!(leaf_value_at(buf.read(pid).unwrap(), 7), old);
+        assert_eq!(leaf_value_at(buf.read(pid).unwrap(), 7).unwrap(), Some(old));
 
         ps.free(pid, 2).unwrap();
         ps.try_reclaim().unwrap();
 
         let reused = ps.allocate().unwrap();
         assert_eq!(reused, pid);
-        let mut page = Page::new(crate::page::PageHeader::new(PageType::PagedLeaf, 3));
+        let mut page = Page::zeroed();
+        init_leaf(&mut page, 3);
         let new = L2pValue([0x22u8; 28]);
-        leaf_set(&mut page, 7, &new);
+        leaf_set(&mut page, 7, &new).unwrap();
         page.seal();
         ps.write_page(reused, &page).unwrap();
 
         let mut stale_buf = PageBuf::with_cache(ps.clone(), page_cache.clone());
         assert_eq!(
-            leaf_value_at(stale_buf.read(reused).unwrap(), 7),
-            old,
+            leaf_value_at(stale_buf.read(reused).unwrap(), 7).unwrap(),
+            Some(old),
             "PageStore-only reclaim leaves the shared cache stale"
         );
 
         page_cache.invalidate(reused);
         let mut fresh_buf = PageBuf::with_cache(ps, page_cache);
-        assert_eq!(leaf_value_at(fresh_buf.read(reused).unwrap(), 7), new);
+        assert_eq!(
+            leaf_value_at(fresh_buf.read(reused).unwrap(), 7).unwrap(),
+            Some(new)
+        );
+    }
+
+    #[test]
+    fn alloc_leaf_invalidates_reused_pinned_index_page() {
+        let (_d, ps) = mk_store();
+        let page_cache = Arc::new(PageCache::new_with_pin_budget(
+            ps.clone(),
+            DEFAULT_PAGE_CACHE_BYTES,
+            PAGE_SIZE as u64,
+        ));
+        let mut buf = PageBuf::with_cache(ps.clone(), page_cache.clone());
+        let idx = buf.alloc_index(1, 1).unwrap();
+        buf.flush().unwrap();
+        assert_eq!(buf.read_level(idx).unwrap(), 1);
+        assert_eq!(page_cache.pinned_pages(), 1);
+
+        ps.free(idx, 2).unwrap();
+        ps.try_reclaim().unwrap();
+        buf.alloc_pool.push(idx);
+
+        let reused = buf.alloc_leaf(3).unwrap();
+        assert_eq!(reused, idx);
+        assert_eq!(
+            page_cache.pinned_pages(),
+            0,
+            "fresh allocation must evict the stale pinned index incarnation"
+        );
+        assert_eq!(buf.read_level(reused).unwrap(), 0);
+        let v = L2pValue([0x33u8; 28]);
+        leaf_set(buf.modify(reused, 3).unwrap(), 7, &v).unwrap();
+        buf.flush().unwrap();
+
+        let mut fresh = PageBuf::with_cache(ps, page_cache);
+        assert_eq!(fresh.read_level(reused).unwrap(), 0);
+        assert_eq!(
+            leaf_value_at(fresh.read(reused).unwrap(), 7).unwrap(),
+            Some(v)
+        );
     }
 
     #[test]
@@ -1044,6 +1129,41 @@ mod tests {
         );
         // Leaf picked up the new parent: rc went from 1 → 2.
         assert_eq!(buf.read(leaf).unwrap().refcount(), 2);
+    }
+
+    #[test]
+    fn cow_clone_invalidates_reused_pinned_index_page() {
+        let (_d, ps) = mk_store();
+        let page_cache = Arc::new(PageCache::new_with_pin_budget(
+            ps.clone(),
+            DEFAULT_PAGE_CACHE_BYTES,
+            PAGE_SIZE as u64,
+        ));
+        let mut buf = PageBuf::with_cache(ps.clone(), page_cache.clone());
+        let stale_idx = buf.alloc_index(1, 1).unwrap();
+        let live_leaf = buf.alloc_leaf(1).unwrap();
+        buf.flush().unwrap();
+        assert_eq!(buf.read_level(stale_idx).unwrap(), 1);
+        assert_eq!(page_cache.pinned_pages(), 1);
+        buf.alloc_pool.clear();
+
+        buf.atomic_incref(live_leaf).unwrap(); // rc(live_leaf) = 2, forcing COW.
+        ps.free(stale_idx, 2).unwrap();
+        ps.try_reclaim().unwrap();
+
+        let new_leaf = buf.cow_for_write(live_leaf, 3).unwrap();
+        assert_eq!(new_leaf, stale_idx);
+        assert_eq!(
+            page_cache.pinned_pages(),
+            0,
+            "COW allocation must evict the stale pinned index incarnation"
+        );
+        assert_eq!(buf.read_level(new_leaf).unwrap(), 0);
+        buf.commit_rc_deltas(3).unwrap();
+        buf.flush().unwrap();
+
+        let mut fresh = PageBuf::with_cache(ps, page_cache);
+        assert_eq!(fresh.read_level(new_leaf).unwrap(), 0);
     }
 
     #[test]

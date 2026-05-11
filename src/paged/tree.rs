@@ -413,6 +413,7 @@ impl PagedL2p {
                 continue;
             }
             let page = cache.get(pid)?;
+            expect_page_level(&page, pid, level, "paged::warmup_index_pages")?;
             if !cache.pin(pid, page.clone()) {
                 stats.skipped_budget = true;
                 // Do not enqueue children once the budget is out: the
@@ -485,7 +486,9 @@ impl PagedL2p {
         let mut level = root_level;
         while level > 0 {
             let slot = slot_in_index(leaf_idx, level);
-            let child = index_child_at(self.buf.read(current)?, slot);
+            let page = self.buf.read(current)?;
+            expect_page_level(page, current, level, "paged::get index")?;
+            let child = index_child_at(page, slot);
             if child == NULL_PAGE {
                 return Ok(None);
             }
@@ -493,10 +496,11 @@ impl PagedL2p {
             level -= 1;
         }
         let leaf = self.buf.read(current)?;
+        expect_page_level(leaf, current, 0, "paged::get leaf")?;
         if !leaf_bit_set(leaf, bit) {
             return Ok(None);
         }
-        Ok(Some(leaf_value_at(leaf, bit)))
+        leaf_value_at(leaf, bit)
     }
 
     fn get_at_level_read_only(
@@ -514,9 +518,10 @@ impl PagedL2p {
         let mut level = root_level;
         while level > 0 {
             let slot = slot_in_index(leaf_idx, level);
-            let child = self
-                .buf
-                .with_page_read_only(current, |page| Ok(index_child_at(page, slot)))?;
+            let child = self.buf.with_page_read_only(current, |page| {
+                expect_page_level(page, current, level, "paged::get_read_only index")?;
+                Ok(index_child_at(page, slot))
+            })?;
             if child == NULL_PAGE {
                 return Ok(None);
             }
@@ -524,10 +529,11 @@ impl PagedL2p {
             level -= 1;
         }
         self.buf.with_page_read_only(current, |leaf| {
+            expect_page_level(leaf, current, 0, "paged::get_read_only leaf")?;
             if !leaf_bit_set(leaf, bit) {
                 return Ok(None);
             }
-            Ok(Some(leaf_value_at(leaf, bit)))
+            leaf_value_at(leaf, bit)
         })
     }
 
@@ -570,6 +576,67 @@ impl PagedL2p {
         let result = self
             .insert_with_lsn_inner(lba, value, lsn, false)
             .map(|outcome| outcome.prev);
+        self.finalize_rc_deltas_deferred_finish(lsn, result)
+    }
+
+    pub(crate) fn insert_leaf_run_at_lsn_deferred_finish(
+        &mut self,
+        entries: &[(u64, L2pValue)],
+        lsn: Lsn,
+    ) -> Result<Vec<Option<L2pValue>>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.advance_next_gen(lsn);
+        let result = (|| -> Result<Vec<Option<L2pValue>>> {
+            let leaf_idx = entries[0].0 >> LEAF_SHIFT;
+            for (lba, _) in entries.iter().skip(1) {
+                let next_leaf_idx = *lba >> LEAF_SHIFT;
+                if next_leaf_idx != leaf_idx {
+                    return Err(MetaDbError::Corruption(format!(
+                        "paged::insert leaf run crossed leaf boundary: first_leaf={leaf_idx} lba={lba} leaf={next_leaf_idx}"
+                    )));
+                }
+            }
+
+            while leaf_idx > max_leaf_idx_at_level(self.root_level) {
+                self.grow_root(lsn)?;
+            }
+
+            let new_root = self.cow_for_write(self.root, lsn)?;
+            let mut current = new_root;
+            let mut level = self.root_level;
+            while level > 0 {
+                let slot = slot_in_index(leaf_idx, level);
+                let child = index_child_at(self.buf.read(current)?, slot);
+                let new_child = if child == NULL_PAGE {
+                    if level == 1 {
+                        self.alloc_leaf_private(lsn)?
+                    } else {
+                        self.alloc_index_private(lsn, level - 1)?
+                    }
+                } else {
+                    self.cow_for_write(child, lsn)?
+                };
+                index_set_child(self.buf.modify(current, lsn)?, slot, new_child);
+                current = new_child;
+                level -= 1;
+            }
+
+            let leaf = self.buf.modify(current, lsn)?;
+            let mut old_values = Vec::with_capacity(entries.len());
+            for (lba, value) in entries {
+                let bit = (*lba & LEAF_MASK) as usize;
+                let old = leaf_set(leaf, bit, value).map_err(|err| {
+                    MetaDbError::Corruption(format!(
+                        "paged::insert leaf run leaf {current} slot {bit} lba {lba} lsn {lsn}: {err}"
+                    ))
+                })?;
+                old_values.push(old);
+            }
+            self.root = new_root;
+            Ok(old_values)
+        })();
         self.finalize_rc_deltas_deferred_finish(lsn, result)
     }
 
@@ -671,7 +738,11 @@ impl PagedL2p {
             level -= 1;
         }
 
-        let old = leaf_set(self.buf.modify(current, lsn)?, bit, &value);
+        let old = leaf_set(self.buf.modify(current, lsn)?, bit, &value).map_err(|err| {
+            MetaDbError::Corruption(format!(
+                "paged::insert leaf {current} slot {bit} lba {lba} lsn {lsn}: {err}"
+            ))
+        })?;
         self.root = new_root;
         Ok(InsertOutcome {
             prev: old,
@@ -792,7 +863,11 @@ impl PagedL2p {
             level -= 1;
         }
 
-        let old = leaf_clear(self.buf.modify(current, lsn)?, bit);
+        let old = leaf_clear(self.buf.modify(current, lsn)?, bit).map_err(|err| {
+            MetaDbError::Corruption(format!(
+                "paged::delete leaf {current} slot {bit} lba {lba} lsn {lsn}: {err}"
+            ))
+        })?;
         debug_assert!(old.is_some(), "paged::delete: pre-check said bit was set");
 
         // Prune upward. Stop at the root or at the first non-empty ancestor.
@@ -902,6 +977,7 @@ impl PagedL2p {
         if level == 0 {
             // Leaf: iterate set bits and filter by range.
             let page = self.buf.read(pid)?;
+            expect_page_level(page, pid, 0, "paged::collect_range leaf")?;
             for i in 0..LEAF_ENTRY_COUNT {
                 if !leaf_bit_set(page, i) {
                     continue;
@@ -910,7 +986,9 @@ impl PagedL2p {
                 if !range.contains(&lba) {
                     continue;
                 }
-                out.push((lba, leaf_value_at(page, i)));
+                if let Some(value) = leaf_value_at(page, i)? {
+                    out.push((lba, value));
+                }
             }
             return Ok(());
         }
@@ -919,6 +997,7 @@ impl PagedL2p {
         // without holding a borrow on `self.buf`.
         let children: Vec<(usize, PageId)> = {
             let page = self.buf.read(pid)?;
+            expect_page_level(page, pid, level, "paged::collect_range index")?;
             (0..INDEX_FANOUT)
                 .filter_map(|i| {
                     let c = index_child_at(page, i);
@@ -1003,10 +1082,17 @@ impl PagedL2p {
                 let page = self.buf.read(pid)?;
                 let header = page.header()?;
                 match header.page_type {
-                    PageType::PagedLeaf => (0..LEAF_ENTRY_COUNT)
-                        .filter(|i| leaf_bit_set(page, *i))
-                        .map(|i| leaf_value_at(page, i))
-                        .collect(),
+                    PageType::PagedLeaf => {
+                        let mut values = Vec::new();
+                        for i in 0..LEAF_ENTRY_COUNT {
+                            if leaf_bit_set(page, i)
+                                && let Some(value) = leaf_value_at(page, i)?
+                            {
+                                values.push(value);
+                            }
+                        }
+                        values
+                    }
                     PageType::PagedIndex => Vec::new(),
                     other => {
                         return Err(MetaDbError::Corruption(format!(
@@ -1162,6 +1248,21 @@ impl PagedL2p {
             .expect("paged::next_gen overflowed u64");
         g
     }
+}
+
+fn expect_page_level(
+    page: &crate::page::Page,
+    pid: PageId,
+    expected_level: u8,
+    context: &'static str,
+) -> Result<()> {
+    let actual = page_level(page)?;
+    if actual != expected_level {
+        return Err(MetaDbError::Corruption(format!(
+            "{context}: page {pid} has level {actual}, expected {expected_level}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

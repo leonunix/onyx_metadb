@@ -64,6 +64,7 @@
 //! `encode` never fails on size grounds. Day 2 wires this directly into
 //! `paged::format` (no dense fallback exists, the project has not shipped).
 
+use crate::error::{MetaDbError, Result};
 use crate::paged::format::{LEAF_BITMAP_BYTES, LEAF_ENTRY_COUNT, LEAF_VALUE_SIZE};
 
 /// Format version stored at offset 17 of the compact payload. Future
@@ -336,6 +337,10 @@ pub(crate) fn decompose_value(v: &[u8; LEAF_VALUE_SIZE]) -> (UnitMeta, EntryDelt
 /// reads, well within an L1 line.
 pub(crate) fn find_or_append_unit(payload: &mut [u8], target: &UnitMeta) -> Option<u8> {
     let count = read_unit_count(payload) as usize;
+    let cap = max_units_per_payload(payload.len()).min(MAX_UNITS_PER_LEAF);
+    if count > cap {
+        return None;
+    }
     for i in 0..count {
         if read_unit(payload, i) == *target {
             return Some(i as u8);
@@ -383,10 +388,16 @@ pub const fn max_units_per_payload(payload_len: usize) -> usize {
 ///    is unchanged).
 /// 4. Overwrite the unit dict with the live units and zero out the
 ///    tail bytes between the new and old `unit_count`.
-pub(crate) fn compact_in_place(payload: &mut [u8]) {
+pub(crate) fn compact_in_place(payload: &mut [u8]) -> Result<()> {
     let old_count = read_unit_count(payload) as usize;
+    let cap = max_units_per_payload(payload.len()).min(MAX_UNITS_PER_LEAF);
+    if old_count > cap {
+        return Err(MetaDbError::Corruption(format!(
+            "compact leaf unit_count {old_count} exceeds payload capacity {cap}"
+        )));
+    }
     if old_count == 0 {
-        return;
+        return Ok(());
     }
     // Discovery-ordered remap from old unit_idx → new unit_idx, plus
     // the cached UnitMeta we'll re-emit. `None` means "old unit was
@@ -401,14 +412,15 @@ pub(crate) fn compact_in_place(payload: &mut [u8]) {
         }
         let (old_idx, entry) = read_entry(payload, slot);
         let old_idx = old_idx as usize;
+        if old_idx >= old_count {
+            return Err(MetaDbError::Corruption(format!(
+                "compact leaf live slot {slot} references unit {old_idx} but dict has {old_count}"
+            )));
+        }
         let new_idx = match remap[old_idx] {
             Some(i) => i,
             None => {
                 // First time we see this old unit — copy it forward.
-                debug_assert!(
-                    old_idx < old_count,
-                    "live entry references unit {old_idx} but dict has {old_count}"
-                );
                 let unit = read_unit(payload, old_idx);
                 let new_idx = live_units.len() as u8;
                 live_units.push(unit);
@@ -434,6 +446,7 @@ pub(crate) fn compact_in_place(payload: &mut [u8]) {
         payload[zero_start..zero_end].fill(0);
     }
     write_unit_count(payload, new_count as u8);
+    Ok(())
 }
 
 /// Decode the value at slot `s` from a payload (no version check —
@@ -441,12 +454,52 @@ pub(crate) fn compact_in_place(payload: &mut [u8]) {
 /// Returns `[0u8; 28]` if the slot's bitmap bit is clear.
 #[inline]
 pub(crate) fn payload_decode_at(payload: &[u8], slot: usize) -> [u8; LEAF_VALUE_SIZE] {
+    payload_decode_at_checked(payload, slot)
+        .ok()
+        .flatten()
+        .unwrap_or([0u8; LEAF_VALUE_SIZE])
+}
+
+pub(crate) fn payload_decode_at_checked(
+    payload: &[u8],
+    slot: usize,
+) -> Result<Option<[u8; LEAF_VALUE_SIZE]>> {
+    if slot >= LEAF_ENTRY_COUNT {
+        return Err(MetaDbError::Corruption(format!(
+            "compact leaf slot {slot} out of range"
+        )));
+    }
+    if payload.len() < COMPACT_UNIT_DICT_OFFSET {
+        return Err(MetaDbError::Corruption(format!(
+            "compact leaf payload too short: {}",
+            payload.len()
+        )));
+    }
+    if payload[LEAF_BITMAP_BYTES + 1] != COMPACT_VERSION {
+        return Err(MetaDbError::Corruption(format!(
+            "compact leaf version {} != {COMPACT_VERSION}",
+            payload[LEAF_BITMAP_BYTES + 1]
+        )));
+    }
     if !payload_bit_set(payload, slot) {
-        return [0u8; LEAF_VALUE_SIZE];
+        return Ok(None);
+    }
+    let unit_count = read_unit_count(payload) as usize;
+    let cap = max_units_per_payload(payload.len()).min(MAX_UNITS_PER_LEAF);
+    if unit_count > cap {
+        return Err(MetaDbError::Corruption(format!(
+            "compact leaf unit_count {unit_count} exceeds payload capacity {cap}"
+        )));
     }
     let (unit_idx, entry) = read_entry(payload, slot);
+    if unit_idx as usize >= unit_count {
+        return Err(MetaDbError::Corruption(format!(
+            "compact leaf slot {slot} references unit {} but dict has {unit_count}",
+            unit_idx
+        )));
+    }
     let unit = read_unit(payload, unit_idx as usize);
-    compose(&unit, &entry)
+    Ok(Some(compose(&unit, &entry)))
 }
 
 // =====================================================================
@@ -919,7 +972,7 @@ mod tests {
 
         // unit_dict still holds 4 units; entries 1 and 3 reference
         // old_idx 1 and 3 respectively.
-        compact_in_place(&mut p);
+        compact_in_place(&mut p).unwrap();
         assert_eq!(read_unit_count(&p), 2);
 
         // Entries 1 and 3 still decode correctly.
@@ -947,7 +1000,7 @@ mod tests {
             write_entry(&mut p, i as usize, idx, &e);
         }
         let before = p.clone();
-        compact_in_place(&mut p);
+        compact_in_place(&mut p).unwrap();
         // Same dict layout, same entries — payload unchanged.
         assert_eq!(p, before);
     }
@@ -968,9 +1021,9 @@ mod tests {
             payload_bit_clear(&mut p, i);
             zero_entry(&mut p, i);
         }
-        compact_in_place(&mut p);
+        compact_in_place(&mut p).unwrap();
         let after_first = p.clone();
-        compact_in_place(&mut p);
+        compact_in_place(&mut p).unwrap();
         assert_eq!(p, after_first);
     }
 
@@ -1038,7 +1091,7 @@ mod tests {
                 Some(i) => i,
                 None => {
                     // Trigger compaction; dead units get reclaimed.
-                    compact_in_place(&mut p);
+                    compact_in_place(&mut p).unwrap();
                     find_or_append_unit(&mut p, &u).expect("compact reclaimed enough room")
                 }
             };
@@ -1060,6 +1113,22 @@ mod tests {
     }
 
     #[test]
+    fn checked_decode_rejects_out_of_range_unit_count() {
+        let mut p = fresh_payload();
+        let v = bv(0x9000, 1, 500, 4096, 1, 0, 0xABCD, 0, 0);
+        let (u, e) = decompose_value(&v);
+        let idx = find_or_append_unit(&mut p, &u).unwrap();
+        payload_bit_set_true(&mut p, 7);
+        write_entry(&mut p, 7, idx, &e);
+
+        let too_many_units = (max_units_per_payload(p.len()) + 1) as u8;
+        write_unit_count(&mut p, too_many_units);
+        let err = payload_decode_at_checked(&p, 7).unwrap_err();
+        assert!(err.to_string().contains("unit_count"));
+        assert!(compact_in_place(&mut p).is_err());
+    }
+
+    #[test]
     fn compact_in_place_zeros_old_dict_tail() {
         let mut p = fresh_payload();
         // Insert 5 units, delete all entries pointing at units 1..4.
@@ -1074,7 +1143,7 @@ mod tests {
             payload_bit_clear(&mut p, i);
             zero_entry(&mut p, i);
         }
-        compact_in_place(&mut p);
+        compact_in_place(&mut p).unwrap();
         // Old dict spanned units [0..5); after compaction only unit 0
         // remains. Bytes for slots 1..5 must be zero so the page CRC
         // doesn't capture stale unit data.

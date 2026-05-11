@@ -146,6 +146,29 @@ impl WalSet {
         }
     }
 
+    /// Reserve one global LSN without writing a WAL record.
+    ///
+    /// Experimental callers use this only for metadata mutations whose
+    /// recovery source is an upper-layer durable log. The caller must make
+    /// sure a durable checkpoint covers the reserved LSN before any later WAL
+    /// record is allowed to survive crash recovery.
+    pub(crate) fn reserve_unlogged<F>(&self, reserve: F) -> Result<Lsn>
+    where
+        F: FnOnce(Lsn),
+    {
+        let mut state = self.state.lock();
+        if let Some(msg) = &state.failed {
+            return Err(MetaDbError::Corruption(format!("wal set failed: {msg}")));
+        }
+        let lsn = state.next_lsn;
+        state.next_lsn = state
+            .next_lsn
+            .checked_add(1)
+            .ok_or(MetaDbError::OutOfSpace)?;
+        reserve(lsn);
+        Ok(lsn)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn shutdown(&self) -> Result<()> {
         let mut first_error = None;

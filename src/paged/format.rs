@@ -251,13 +251,13 @@ pub fn leaf_bit_clear(page: &mut Page, i: usize) {
 }
 
 /// Read the value at entry `i` without consulting the bitmap. Returns
-/// `ZERO` for unset slots by invariant (clear zeroes the slot record).
+/// `None` for unset slots by invariant (clear zeroes the slot record).
 ///
 /// O(1): one fixed-offset entry read + one fixed-offset unit-dict read.
 #[inline]
-pub fn leaf_value_at(page: &Page, i: usize) -> L2pValue {
+pub fn leaf_value_at(page: &Page, i: usize) -> Result<Option<L2pValue>> {
     debug_assert!(i < LEAF_ENTRY_COUNT);
-    L2pValue(leaf_compact::payload_decode_at(page.payload(), i))
+    leaf_compact::payload_decode_at_checked(page.payload(), i).map(|v| v.map(L2pValue))
 }
 
 /// Zero the 3 B entry record at slot `i`. Does not touch the bitmap or
@@ -289,11 +289,32 @@ pub fn leaf_entry_count(page: &Page) -> u16 {
 /// distinct units, which exceeds the 128-slot leaf invariant — so the
 /// retry is guaranteed to succeed and we panic on failure as a hard
 /// invariant violation.
-pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Option<L2pValue> {
+pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pValue>> {
     debug_assert!(i < LEAF_ENTRY_COUNT);
+    if page.payload()[LEAF_BITMAP_BYTES + 1] != leaf_compact::COMPACT_VERSION {
+        return Err(MetaDbError::Corruption(format!(
+            "compact leaf version {} != {} before set slot {i} (key_count={}, page_gen={}, rc={})",
+            page.payload()[LEAF_BITMAP_BYTES + 1],
+            leaf_compact::COMPACT_VERSION,
+            page.key_count(),
+            page.generation(),
+            page.refcount(),
+        )));
+    }
+    let unit_count = page.payload()[LEAF_BITMAP_BYTES] as usize;
+    let cap = leaf_compact::max_units_per_payload(page.payload().len())
+        .min(leaf_compact::MAX_UNITS_PER_LEAF);
+    if unit_count > cap {
+        return Err(MetaDbError::Corruption(format!(
+            "compact leaf unit_count {unit_count} exceeds payload capacity {cap} before set slot {i} (key_count={}, page_gen={}, rc={})",
+            page.key_count(),
+            page.generation(),
+            page.refcount(),
+        )));
+    }
     let was_set = leaf_compact::payload_bit_set(page.payload(), i);
     let old = if was_set {
-        Some(L2pValue(leaf_compact::payload_decode_at(page.payload(), i)))
+        leaf_value_at(page, i)?
     } else {
         None
     };
@@ -303,9 +324,12 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Option<L2pValue> {
         Some(idx) => idx,
         None => {
             // Dict is full of (mostly dead) entries. Reclaim and retry.
-            leaf_compact::compact_in_place(page.payload_mut());
-            leaf_compact::find_or_append_unit(page.payload_mut(), &unit)
-                .expect("compact_in_place freed enough room for one unit")
+            leaf_compact::compact_in_place(page.payload_mut())?;
+            leaf_compact::find_or_append_unit(page.payload_mut(), &unit).ok_or_else(|| {
+                MetaDbError::Corruption(
+                    "compact_in_place did not free enough room for one unit".into(),
+                )
+            })?
         }
     };
     leaf_compact::write_entry(page.payload_mut(), i, unit_idx, &entry);
@@ -315,7 +339,7 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Option<L2pValue> {
         let n = page.key_count().wrapping_add(1);
         page.set_key_count(n);
     }
-    old
+    Ok(old)
 }
 
 /// Clear entry `i`. Returns the previous value if the slot was set,
@@ -326,17 +350,17 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Option<L2pValue> {
 /// units accumulate until the dict fills up; `leaf_set` then runs
 /// `compact_in_place` to reclaim them. This keeps the common-case
 /// clear path O(1).
-pub fn leaf_clear(page: &mut Page, i: usize) -> Option<L2pValue> {
+pub fn leaf_clear(page: &mut Page, i: usize) -> Result<Option<L2pValue>> {
     debug_assert!(i < LEAF_ENTRY_COUNT);
     if !leaf_compact::payload_bit_set(page.payload(), i) {
-        return None;
+        return Ok(None);
     }
-    let old = L2pValue(leaf_compact::payload_decode_at(page.payload(), i));
+    let old = leaf_value_at(page, i)?;
     leaf_compact::payload_bit_clear(page.payload_mut(), i);
     leaf_compact::zero_entry(page.payload_mut(), i);
     let n = page.key_count().saturating_sub(1);
     page.set_key_count(n);
-    Some(old)
+    Ok(old)
 }
 
 // -------- index accessors --------------------------------------------------
@@ -457,31 +481,31 @@ mod tests {
     fn leaf_set_and_get_roundtrip() {
         let mut p = mk_leaf();
         let v = L2pValue([0xABu8; LEAF_VALUE_SIZE]);
-        assert_eq!(leaf_set(&mut p, 5, &v), None);
+        assert_eq!(leaf_set(&mut p, 5, &v).unwrap(), None);
         assert_eq!(leaf_entry_count(&p), 1);
         assert!(leaf_bit_set(&p, 5));
-        assert_eq!(leaf_value_at(&p, 5), v);
+        assert_eq!(leaf_value_at(&p, 5).unwrap(), Some(v));
         // Overwrite returns the previous value.
         let v2 = L2pValue([0xCDu8; LEAF_VALUE_SIZE]);
-        assert_eq!(leaf_set(&mut p, 5, &v2), Some(v));
+        assert_eq!(leaf_set(&mut p, 5, &v2).unwrap(), Some(v));
         assert_eq!(leaf_entry_count(&p), 1); // still 1 entry
-        assert_eq!(leaf_value_at(&p, 5), v2);
+        assert_eq!(leaf_value_at(&p, 5).unwrap(), Some(v2));
     }
 
     #[test]
     fn leaf_clear_zeros_slot_and_decrements_count() {
         let mut p = mk_leaf();
         let v = L2pValue([0x11u8; LEAF_VALUE_SIZE]);
-        leaf_set(&mut p, 3, &v);
-        leaf_set(&mut p, 100, &v);
+        leaf_set(&mut p, 3, &v).unwrap();
+        leaf_set(&mut p, 100, &v).unwrap();
         assert_eq!(leaf_entry_count(&p), 2);
-        assert_eq!(leaf_clear(&mut p, 3), Some(v));
+        assert_eq!(leaf_clear(&mut p, 3).unwrap(), Some(v));
         assert_eq!(leaf_entry_count(&p), 1);
         assert!(!leaf_bit_set(&p, 3));
         // The cleared slot is zeroed.
-        assert_eq!(leaf_value_at(&p, 3), L2pValue::ZERO);
+        assert_eq!(leaf_value_at(&p, 3).unwrap(), None);
         // Clearing an already-clear slot is a no-op.
-        assert_eq!(leaf_clear(&mut p, 3), None);
+        assert_eq!(leaf_clear(&mut p, 3).unwrap(), None);
         assert_eq!(leaf_entry_count(&p), 1);
     }
 
@@ -490,15 +514,15 @@ mod tests {
         let mut p = mk_leaf();
         for i in (0..LEAF_ENTRY_COUNT).step_by(7) {
             let v = L2pValue([i as u8; LEAF_VALUE_SIZE]);
-            leaf_set(&mut p, i, &v);
+            leaf_set(&mut p, i, &v).unwrap();
         }
         for i in 0..LEAF_ENTRY_COUNT {
             if i % 7 == 0 {
                 assert!(leaf_bit_set(&p, i), "slot {i} should be set");
-                assert_eq!(leaf_value_at(&p, i).0[0], i as u8);
+                assert_eq!(leaf_value_at(&p, i).unwrap().unwrap().0[0], i as u8);
             } else {
                 assert!(!leaf_bit_set(&p, i), "slot {i} should be clear");
-                assert_eq!(leaf_value_at(&p, i), L2pValue::ZERO);
+                assert_eq!(leaf_value_at(&p, i).unwrap(), None);
             }
         }
         assert_eq!(leaf_entry_count(&p), (LEAF_ENTRY_COUNT.div_ceil(7)) as u16);
@@ -532,7 +556,7 @@ mod tests {
     #[test]
     fn seal_and_verify_roundtrip_for_both_types() {
         let mut leaf = mk_leaf();
-        leaf_set(&mut leaf, 7, &L2pValue([0x5Au8; LEAF_VALUE_SIZE]));
+        leaf_set(&mut leaf, 7, &L2pValue([0x5Au8; LEAF_VALUE_SIZE])).unwrap();
         leaf.seal();
         leaf.verify(123).unwrap();
 

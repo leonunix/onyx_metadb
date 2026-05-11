@@ -59,6 +59,11 @@ pub struct Config {
     /// streams beat larger batches.
     pub wal_lanes: u32,
 
+    /// Experimental: allow selected embedder transactions to reserve an LSN
+    /// and apply without writing a WAL record. The embedder must keep an
+    /// independent durable replay source until checkpoint. Default off.
+    pub unlogged_commits_enabled: bool,
+
     /// Upper bound on a single group-commit batch, in bytes.
     pub group_commit_max_batch_bytes: usize,
 
@@ -205,6 +210,7 @@ impl Config {
             max_volumes: 1024,
             wal_segment_bytes: 64 * 1024 * 1024,
             wal_lanes: 1,
+            unlogged_commits_enabled: false,
             group_commit_max_batch_bytes: 4 * 1024 * 1024,
             group_commit_timeout_us: 1,
             page_cache_bytes: 512 * 1024 * 1024,

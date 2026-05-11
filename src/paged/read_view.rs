@@ -175,11 +175,11 @@ impl ReadView {
             current = child;
             level -= 1;
         }
-        self.with_page(current, |leaf| {
+        self.with_page_at_level(current, 0, "read_view::get leaf", |leaf| {
             if !leaf_bit_set(leaf, bit) {
                 Ok(None)
             } else {
-                Ok(Some(leaf_value_at(leaf, bit)))
+                leaf_value_at(leaf, bit)
             }
         })
     }
@@ -256,6 +256,7 @@ impl ReadView {
             for mut walk in active.drain(..) {
                 let slot = slot_in_index(walk.leaf_idx, level);
                 let child = if let Some(page) = self.overlay.get(walk.current) {
+                    expect_page_level(page, walk.current, level, "read_view::multi_get index")?;
                     index_child_at(page, slot)
                 } else {
                     let page = disk_iter.next().ok_or_else(|| {
@@ -263,6 +264,12 @@ impl ReadView {
                             "paged read_view multi_get disk page iterator underflow".into(),
                         )
                     })?;
+                    expect_page_level(
+                        page.as_ref(),
+                        walk.current,
+                        level,
+                        "read_view::multi_get index",
+                    )?;
                     index_child_at(page.as_ref(), slot)
                 };
                 if child != NULL_PAGE {
@@ -287,9 +294,10 @@ impl ReadView {
             let mut disk_iter = disk_pages.into_iter();
             for walk in active {
                 if let Some(page) = self.overlay.get(walk.current) {
+                    expect_page_level(page.as_ref(), walk.current, 0, "read_view::multi_get leaf")?;
                     for (out_idx, bit) in walk.members {
                         if leaf_bit_set(page, bit) {
-                            out[out_idx] = Some(leaf_value_at(page, bit));
+                            out[out_idx] = leaf_value_at(page, bit)?;
                         }
                     }
                 } else {
@@ -298,9 +306,10 @@ impl ReadView {
                             "paged read_view multi_get leaf iterator underflow".into(),
                         )
                     })?;
+                    expect_page_level(page.as_ref(), walk.current, 0, "read_view::multi_get leaf")?;
                     for (out_idx, bit) in walk.members {
                         if leaf_bit_set(page.as_ref(), bit) {
-                            out[out_idx] = Some(leaf_value_at(page.as_ref(), bit));
+                            out[out_idx] = leaf_value_at(page.as_ref(), bit)?;
                         }
                     }
                 }
@@ -341,11 +350,11 @@ impl ReadView {
             level -= 1;
         }
 
-        self.with_page(current, |leaf| {
+        self.with_page_at_level(current, 0, "read_view::try_multi_get_same_leaf", |leaf| {
             for &idx in indices {
                 let bit = (lbas[idx] & LEAF_MASK) as usize;
                 if leaf_bit_set(leaf, bit) {
-                    out[idx] = Some(leaf_value_at(leaf, bit));
+                    out[idx] = leaf_value_at(leaf, bit)?;
                 }
             }
             Ok(())
@@ -395,14 +404,16 @@ impl ReadView {
         }
 
         if level == 0 {
-            self.with_page(pid, |leaf| {
+            self.with_page_at_level(pid, 0, "read_view::for_each_range leaf", |leaf| {
                 for i in 0..LEAF_ENTRY_COUNT {
                     if !leaf_bit_set(leaf, i) {
                         continue;
                     }
                     let lba = base_lba + i as u64;
                     if range_contains(range, lba) {
-                        f(lba, leaf_value_at(leaf, i))?;
+                        if let Some(value) = leaf_value_at(leaf, i)? {
+                            f(lba, value)?;
+                        }
                     }
                 }
                 Ok(())
@@ -410,14 +421,15 @@ impl ReadView {
             return Ok(());
         }
 
-        let children = self.with_page(pid, |page| {
-            Ok((0..INDEX_FANOUT)
-                .filter_map(|slot| {
-                    let child = index_child_at(page, slot);
-                    (child != NULL_PAGE).then_some((slot, child))
-                })
-                .collect::<Vec<_>>())
-        })?;
+        let children =
+            self.with_page_at_level(pid, level, "read_view::for_each_range index", |page| {
+                Ok((0..INDEX_FANOUT)
+                    .filter_map(|slot| {
+                        let child = index_child_at(page, slot);
+                        (child != NULL_PAGE).then_some((slot, child))
+                    })
+                    .collect::<Vec<_>>())
+            })?;
         let slot_span = slot_span_for_level(level);
         for (slot, child) in children {
             let child_base = base_lba + (slot as u64) * slot_span;
@@ -437,10 +449,38 @@ impl ReadView {
         f(page.as_ref())
     }
 
+    fn with_page_at_level<T>(
+        &self,
+        pid: PageId,
+        expected_level: u8,
+        context: &'static str,
+        f: impl FnOnce(&Page) -> Result<T>,
+    ) -> Result<T> {
+        self.with_page(pid, |page| {
+            expect_page_level(page, pid, expected_level, context)?;
+            f(page)
+        })
+    }
+
     pub fn read_root_level(page_cache: &PageCache, root: PageId) -> Result<u8> {
         let page = page_cache.get(root)?;
         page_level(page.as_ref())
     }
+}
+
+fn expect_page_level(
+    page: &Page,
+    pid: PageId,
+    expected_level: u8,
+    context: &'static str,
+) -> Result<()> {
+    let actual = page_level(page)?;
+    if actual != expected_level {
+        return Err(crate::error::MetaDbError::Corruption(format!(
+            "{context}: page {pid} has level {actual}, expected {expected_level}"
+        )));
+    }
+    Ok(())
 }
 
 fn slot_span_for_level(level: u8) -> u64 {
