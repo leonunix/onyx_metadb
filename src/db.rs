@@ -402,7 +402,10 @@ impl ApplyLane {
                 .inner
                 .metrics
                 .record_rc_apply_lane_queue_depth(self.inner.ordinal, depth),
-            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {}
+            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => self
+                .inner
+                .metrics
+                .record_dedup_lane_queue_depth(depth),
         }
         self.inner.cvar.notify_one();
     }
@@ -428,7 +431,10 @@ impl ApplyLaneHandle {
                 .inner
                 .metrics
                 .record_rc_apply_lane_queue_depth(self.inner.ordinal, depth),
-            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {}
+            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => self
+                .inner
+                .metrics
+                .record_dedup_lane_queue_depth(depth),
         }
         self.inner.cvar.notify_one();
     }
@@ -511,16 +517,34 @@ impl Drop for PendingApplyWork {
 }
 
 fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
+    // H2 burst tracker: counts tasks processed since the previous time the
+    // worker had to call `cvar.wait()` (i.e., since the queues went empty).
+    // Flushed via `record_*_apply_lane_burst` right before the next wait
+    // and again on shutdown. `tasks / wakeups` then gives the average
+    // burst, with `burst_max` as the tail.
+    let mut tasks_since_wait: u64 = 0;
     loop {
         // Time spent waiting on `inner.cvar` (queue empty) — accumulated
         // here so a single popped task's "wakeup" cost is the entire
         // idle window since the last task finished.
         let mut idle_total = std::time::Duration::ZERO;
+        // Wakeup-shape counters for the upcoming task pop. Aggregated
+        // separately from the burst tracker because a single pop can
+        // span multiple spurious wakeups.
+        let mut wakeups: u64 = 0;
+        let mut empty_wakeups: u64 = 0;
+        // If the inner loop ended a burst before going idle, the burst
+        // length lands here and gets recorded after we process the task.
+        let mut closed_burst: u64 = 0;
 
         let task = {
             let mut state = inner.state.lock();
             loop {
                 if state.shutdown {
+                    if tasks_since_wait > 0 {
+                        record_lane_burst(&inner, tasks_since_wait);
+                        tasks_since_wait = 0;
+                    }
                     return;
                 }
                 match (state.maintenance.is_empty(), state.queue.is_empty()) {
@@ -567,9 +591,22 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
                     }
                     (true, true) => {}
                 }
+                // About to block. Close the open burst exactly once before
+                // the first wait in this pop (subsequent spurious wakeups
+                // don't restart it).
+                if tasks_since_wait > 0 {
+                    closed_burst = tasks_since_wait;
+                    tasks_since_wait = 0;
+                }
                 let wait_start = Instant::now();
                 inner.cvar.wait(&mut state);
                 idle_total += wait_start.elapsed();
+                wakeups += 1;
+                // Spurious / racing wakeup: cvar returned but neither
+                // queue has anything for us.
+                if state.maintenance.is_empty() && state.queue.is_empty() && !state.shutdown {
+                    empty_wakeups += 1;
+                }
             }
         };
 
@@ -591,34 +628,66 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
         let exec_start = Instant::now();
         let _ = catch_unwind(AssertUnwindSafe(work));
         let exec = exec_start.elapsed();
+        tasks_since_wait = tasks_since_wait.saturating_add(1);
 
         let is_wal_task = task.lsn.is_some();
-        if is_wal_task {
-            match inner.kind {
-                ApplyLaneKind::L2p => {
+        match inner.kind {
+            ApplyLaneKind::L2p => {
+                if is_wal_task {
                     inner
                         .metrics
                         .record_l2p_apply_lane_task(inner.ordinal, queue_wait, exec);
-                    if !idle_total.is_zero() {
-                        inner
-                            .metrics
-                            .record_l2p_apply_lane_idle(inner.ordinal, idle_total);
-                    }
                 }
-                ApplyLaneKind::Refcount => {
+                if !idle_total.is_zero() {
+                    inner
+                        .metrics
+                        .record_l2p_apply_lane_idle(inner.ordinal, idle_total);
+                }
+                inner
+                    .metrics
+                    .record_l2p_apply_lane_wakeups(inner.ordinal, wakeups, empty_wakeups);
+                if closed_burst > 0 {
+                    inner
+                        .metrics
+                        .record_l2p_apply_lane_burst(inner.ordinal, closed_burst);
+                }
+            }
+            ApplyLaneKind::Refcount => {
+                if is_wal_task {
                     inner.metrics.record_rc_apply_lane_task(
                         inner.ordinal,
                         queue_wait,
                         pending_set_wait,
                         exec,
                     );
-                    if !idle_total.is_zero() {
-                        inner
-                            .metrics
-                            .record_rc_apply_lane_idle(inner.ordinal, idle_total);
-                    }
                 }
-                ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {}
+                if !idle_total.is_zero() {
+                    inner
+                        .metrics
+                        .record_rc_apply_lane_idle(inner.ordinal, idle_total);
+                }
+                inner
+                    .metrics
+                    .record_rc_apply_lane_wakeups(inner.ordinal, wakeups, empty_wakeups);
+                if closed_burst > 0 {
+                    inner
+                        .metrics
+                        .record_rc_apply_lane_burst(inner.ordinal, closed_burst);
+                }
+            }
+            ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {
+                // Per-task timing is captured inside the dedup closure
+                // via `record_dedup_lane_task`; only the worker-level
+                // wakeup / idle / burst view belongs here.
+                if !idle_total.is_zero() {
+                    inner.metrics.record_dedup_lane_idle(idle_total);
+                }
+                inner
+                    .metrics
+                    .record_dedup_lane_wakeups(wakeups, empty_wakeups);
+                if closed_burst > 0 {
+                    inner.metrics.record_dedup_lane_burst(closed_burst);
+                }
             }
         }
 
@@ -633,6 +702,23 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
         );
         state.last_applied_lsn = lsn;
         inner.cvar.notify_all();
+    }
+}
+
+/// Dispatch a burst record to the kind-specific metric. Called on
+/// shutdown when there's a pending burst we'd otherwise lose. Kept as a
+/// free function so the main worker loop reads top-to-bottom.
+fn record_lane_burst(inner: &ApplyLaneInner, burst: u64) {
+    match inner.kind {
+        ApplyLaneKind::L2p => inner
+            .metrics
+            .record_l2p_apply_lane_burst(inner.ordinal, burst),
+        ApplyLaneKind::Refcount => inner
+            .metrics
+            .record_rc_apply_lane_burst(inner.ordinal, burst),
+        ApplyLaneKind::Dedup | ApplyLaneKind::DedupMaintenance => {
+            inner.metrics.record_dedup_lane_burst(burst);
+        }
     }
 }
 

@@ -587,6 +587,58 @@ fn reopen_replay_advances_last_applied() {
     assert_eq!(db.last_applied_lsn(), committed_lsn + 1);
 }
 
+#[test]
+fn apply_lane_h2_metrics_record_wakeups_and_bursts() {
+    // Smoke test for the H2 apply-lane wakeup / burst counters added on
+    // 2026-05-10. After at least one commit, the L2P lane must have been
+    // woken at least once (the worker starts idle) and refcount taps must
+    // have recorded both an idle wait and a wakeup. After draining and
+    // committing one more op, the next wait must close the burst that
+    // covered the earlier ops.
+    let (_d, db) = mk_db();
+    for i in 0u64..16 {
+        db.insert(0, i, v(i as u8)).unwrap();
+        db.incref_pba(1_000 + i, 1).unwrap();
+    }
+    // Wait a beat so the per-shard lane workers go back to idle on the
+    // cvar. Without this, the burst we just produced hasn't been closed
+    // by a wait and `burst_total` may still be zero.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    // One more op per kind forces a wakeup-then-pop, which records the
+    // burst that closed when the lane parked above.
+    db.insert(0, 1_000, v(0)).unwrap();
+    db.incref_pba(2_000, 1).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let m = db.metrics_snapshot();
+    assert!(
+        m.l2p_apply_lane_wakeups > 0,
+        "L2P lane should wake from cvar at least once: {}",
+        m.l2p_apply_lane_wakeups,
+    );
+    assert!(
+        m.rc_apply_lane_wakeups > 0,
+        "RC lane should wake from cvar at least once: {}",
+        m.rc_apply_lane_wakeups,
+    );
+    assert!(
+        m.l2p_apply_lane_burst_total > 0,
+        "L2P burst total must include closed burst(s): {}",
+        m.l2p_apply_lane_burst_total,
+    );
+    assert!(
+        m.l2p_apply_lane_burst_max > 0,
+        "L2P burst max must be set: {}",
+        m.l2p_apply_lane_burst_max,
+    );
+    assert!(
+        m.l2p_apply_lane_tasks >= m.l2p_apply_lane_burst_total,
+        "tasks ({}) cannot be lower than sum of bursts ({})",
+        m.l2p_apply_lane_tasks,
+        m.l2p_apply_lane_burst_total,
+    );
+}
+
 // -------- phase 6e: dedup_reverse --------
 
 #[test]

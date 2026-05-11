@@ -232,6 +232,13 @@ impl PagedL2p {
     fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
         let effective_rc = self.buf.effective_rc(pid)?;
         if self.private_pages.contains(&pid) && effective_rc <= 1 {
+            if self.checkpoint_protected.contains(&pid) {
+                let new_pid = self.buf.clone_private(pid, lsn)?;
+                self.private_pages.remove(&pid);
+                self.private_pages.insert(new_pid);
+                self.retired_pages.insert(pid);
+                return Ok(new_pid);
+            }
             return Ok(pid);
         }
         if effective_rc <= 1 {
@@ -258,7 +265,11 @@ impl PagedL2p {
     }
 
     fn free_detached(&mut self, pid: PageId, generation: Lsn) -> Result<()> {
-        if self.private_pages.remove(&pid) {
+        if self.checkpoint_protected.contains(&pid) {
+            self.private_pages.remove(&pid);
+            self.retired_pages.insert(pid);
+            self.buf.forget(pid);
+        } else if self.private_pages.remove(&pid) {
             self.buf.free(pid, generation)?;
         } else {
             self.retired_pages.insert(pid);

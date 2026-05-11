@@ -173,6 +173,36 @@ fn snapshot_incref_preserves_old_view_under_writes() {
 }
 
 #[test]
+fn checkpoint_protected_private_pages_cow_before_mutation() {
+    let (_d, ps) = mk_store();
+    let mut t = PagedL2p::create(ps.clone()).unwrap();
+
+    let key = 300u64;
+    t.insert(key, v(1)).unwrap();
+    t.flush().unwrap();
+
+    // Create a new private root/leaf path, then sample it for a
+    // checkpoint without installing the checkpoint yet. This mirrors the
+    // production window where checkpoint IO runs outside the apply gate.
+    t.insert(key, v(2)).unwrap();
+    let checkpoint = t.begin_checkpoint();
+    let snap_root = checkpoint.root;
+    let flushed = checkpoint.write_dirty_pages().unwrap();
+    let mut sealed_pages = Vec::new();
+    flushed.append_sealed_pages(&mut sealed_pages);
+    ps.write_sealed_page_runs(sealed_pages).unwrap();
+
+    // Mutating the same key after begin_checkpoint must not edit the
+    // checkpoint-sampled private pages in place. Otherwise the manifest
+    // would later publish a root whose contents are newer than its WAL
+    // checkpoint boundary.
+    t.insert(key, v(3)).unwrap();
+
+    assert_eq!(t.get(key).unwrap(), Some(v(3)));
+    assert_eq!(t.get_at(snap_root, key).unwrap(), Some(v(2)));
+}
+
+#[test]
 fn range_scan_returns_sorted_hits_within_bounds() {
     let (_d, ps) = mk_store();
     let mut t = PagedL2p::create(ps).unwrap();

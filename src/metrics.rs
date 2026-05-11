@@ -182,6 +182,22 @@ pub struct MetaMetrics {
     l2p_apply_lane_exec_max_us: AtomicU64,
     l2p_apply_lane_idle_us: AtomicU64,
     l2p_apply_lane_idle_max_us: AtomicU64,
+    // H2 wakeup-shape counters (worker-internal view):
+    //   - `wakeups` = number of times the lane worker exited `cvar.wait()`
+    //     looking for a task. Total tasks / wakeups gives the average burst
+    //     size between idle periods.
+    //   - `empty_wakeups` = subset of `wakeups` where the worker resumed
+    //     but both the ready queue and maintenance queue were still empty
+    //     (spurious wake or a wake racing with another consumer). Non-zero
+    //     means lock-contention / spurious-wake noise.
+    //   - `burst_total` / `burst_max` = sum and tail of "tasks processed
+    //     between two adjacent `cvar.wait()` calls", emitted right before
+    //     the next wait or at shutdown. Distinguishes "lane stays hot,
+    //     pops many tasks per wakeup" from "lane wakes per task".
+    l2p_apply_lane_wakeups: AtomicU64,
+    l2p_apply_lane_empty_wakeups: AtomicU64,
+    l2p_apply_lane_burst_total: AtomicU64,
+    l2p_apply_lane_burst_max: AtomicU64,
     rc_apply_lane_tasks: AtomicU64,
     rc_apply_lane_queue_depth_max: AtomicU64,
     rc_apply_lane_queue_wait_us: AtomicU64,
@@ -192,6 +208,21 @@ pub struct MetaMetrics {
     rc_apply_lane_idle_max_us: AtomicU64,
     rc_apply_lane_pending_set_wait_us: AtomicU64,
     rc_apply_lane_pending_set_wait_max_us: AtomicU64,
+    rc_apply_lane_wakeups: AtomicU64,
+    rc_apply_lane_empty_wakeups: AtomicU64,
+    rc_apply_lane_burst_total: AtomicU64,
+    rc_apply_lane_burst_max: AtomicU64,
+    // Dedup apply lanes share `apply_lane_worker` but record their own
+    // task-level metrics from inside the closure (`record_dedup_lane_task`).
+    // The wakeup-shape and idle counters live here so all three lane kinds
+    // have the same H2 view of "how often did the worker have to wait?".
+    dedup_lane_idle_us: AtomicU64,
+    dedup_lane_idle_max_us: AtomicU64,
+    dedup_lane_wakeups: AtomicU64,
+    dedup_lane_empty_wakeups: AtomicU64,
+    dedup_lane_burst_total: AtomicU64,
+    dedup_lane_burst_max: AtomicU64,
+    dedup_lane_queue_depth_max: AtomicU64,
     // Per-shard breakdown of the H2 apply-lane counters, indexed by lane
     // ordinal. Populated alongside the aggregates above; ordinals at or
     // beyond [`MAX_APPLY_LANE_SHARDS`] only show up in the aggregates.
@@ -205,6 +236,10 @@ pub struct MetaMetrics {
     l2p_apply_lane_shard_exec_us: PerShardCounters,
     l2p_apply_lane_shard_exec_max_us: PerShardCounters,
     l2p_apply_lane_shard_idle_us: PerShardCounters,
+    l2p_apply_lane_shard_wakeups: PerShardCounters,
+    l2p_apply_lane_shard_empty_wakeups: PerShardCounters,
+    l2p_apply_lane_shard_burst_total: PerShardCounters,
+    l2p_apply_lane_shard_burst_max: PerShardCounters,
     rc_apply_lane_shard_tasks: PerShardCounters,
     rc_apply_lane_shard_queue_depth_max: PerShardCounters,
     rc_apply_lane_shard_queue_wait_us: PerShardCounters,
@@ -214,6 +249,10 @@ pub struct MetaMetrics {
     rc_apply_lane_shard_idle_us: PerShardCounters,
     rc_apply_lane_shard_pending_set_wait_us: PerShardCounters,
     rc_apply_lane_shard_pending_set_wait_max_us: PerShardCounters,
+    rc_apply_lane_shard_wakeups: PerShardCounters,
+    rc_apply_lane_shard_empty_wakeups: PerShardCounters,
+    rc_apply_lane_shard_burst_total: PerShardCounters,
+    rc_apply_lane_shard_burst_max: PerShardCounters,
     dedup_apply_guard_count: AtomicU64,
     dedup_apply_guard_us: AtomicU64,
     dedup_apply_guard_max_us: AtomicU64,
@@ -543,6 +582,13 @@ pub struct MetaMetricsSnapshot {
     pub dedup_lane_ready_queue_wait_max_us: u64,
     pub dedup_lane_exec_us: u64,
     pub dedup_lane_exec_max_us: u64,
+    pub dedup_lane_idle_us: u64,
+    pub dedup_lane_idle_max_us: u64,
+    pub dedup_lane_wakeups: u64,
+    pub dedup_lane_empty_wakeups: u64,
+    pub dedup_lane_burst_total: u64,
+    pub dedup_lane_burst_max: u64,
+    pub dedup_lane_queue_depth_max: u64,
     pub l2p_apply_lane_tasks: u64,
     pub l2p_apply_lane_queue_depth_max: u64,
     pub l2p_apply_lane_queue_wait_us: u64,
@@ -551,6 +597,10 @@ pub struct MetaMetricsSnapshot {
     pub l2p_apply_lane_exec_max_us: u64,
     pub l2p_apply_lane_idle_us: u64,
     pub l2p_apply_lane_idle_max_us: u64,
+    pub l2p_apply_lane_wakeups: u64,
+    pub l2p_apply_lane_empty_wakeups: u64,
+    pub l2p_apply_lane_burst_total: u64,
+    pub l2p_apply_lane_burst_max: u64,
     pub rc_apply_lane_tasks: u64,
     pub rc_apply_lane_queue_depth_max: u64,
     pub rc_apply_lane_queue_wait_us: u64,
@@ -561,6 +611,10 @@ pub struct MetaMetricsSnapshot {
     pub rc_apply_lane_idle_max_us: u64,
     pub rc_apply_lane_pending_set_wait_us: u64,
     pub rc_apply_lane_pending_set_wait_max_us: u64,
+    pub rc_apply_lane_wakeups: u64,
+    pub rc_apply_lane_empty_wakeups: u64,
+    pub rc_apply_lane_burst_total: u64,
+    pub rc_apply_lane_burst_max: u64,
     pub l2p_apply_lane_shard_tasks: Vec<u64>,
     pub l2p_apply_lane_shard_queue_depth_max: Vec<u64>,
     pub l2p_apply_lane_shard_queue_wait_us: Vec<u64>,
@@ -568,6 +622,10 @@ pub struct MetaMetricsSnapshot {
     pub l2p_apply_lane_shard_exec_us: Vec<u64>,
     pub l2p_apply_lane_shard_exec_max_us: Vec<u64>,
     pub l2p_apply_lane_shard_idle_us: Vec<u64>,
+    pub l2p_apply_lane_shard_wakeups: Vec<u64>,
+    pub l2p_apply_lane_shard_empty_wakeups: Vec<u64>,
+    pub l2p_apply_lane_shard_burst_total: Vec<u64>,
+    pub l2p_apply_lane_shard_burst_max: Vec<u64>,
     pub rc_apply_lane_shard_tasks: Vec<u64>,
     pub rc_apply_lane_shard_queue_depth_max: Vec<u64>,
     pub rc_apply_lane_shard_queue_wait_us: Vec<u64>,
@@ -577,6 +635,10 @@ pub struct MetaMetricsSnapshot {
     pub rc_apply_lane_shard_idle_us: Vec<u64>,
     pub rc_apply_lane_shard_pending_set_wait_us: Vec<u64>,
     pub rc_apply_lane_shard_pending_set_wait_max_us: Vec<u64>,
+    pub rc_apply_lane_shard_wakeups: Vec<u64>,
+    pub rc_apply_lane_shard_empty_wakeups: Vec<u64>,
+    pub rc_apply_lane_shard_burst_total: Vec<u64>,
+    pub rc_apply_lane_shard_burst_max: Vec<u64>,
     pub dedup_apply_guard_count: u64,
     pub dedup_apply_guard_us: u64,
     pub dedup_apply_guard_max_us: u64,
@@ -828,6 +890,13 @@ impl MetaMetrics {
             dedup_lane_ready_queue_wait_max_us: load(&self.dedup_lane_ready_queue_wait_max_us),
             dedup_lane_exec_us: load(&self.dedup_lane_exec_us),
             dedup_lane_exec_max_us: load(&self.dedup_lane_exec_max_us),
+            dedup_lane_idle_us: load(&self.dedup_lane_idle_us),
+            dedup_lane_idle_max_us: load(&self.dedup_lane_idle_max_us),
+            dedup_lane_wakeups: load(&self.dedup_lane_wakeups),
+            dedup_lane_empty_wakeups: load(&self.dedup_lane_empty_wakeups),
+            dedup_lane_burst_total: load(&self.dedup_lane_burst_total),
+            dedup_lane_burst_max: load(&self.dedup_lane_burst_max),
+            dedup_lane_queue_depth_max: load(&self.dedup_lane_queue_depth_max),
             l2p_apply_lane_tasks: load(&self.l2p_apply_lane_tasks),
             l2p_apply_lane_queue_depth_max: load(&self.l2p_apply_lane_queue_depth_max),
             l2p_apply_lane_queue_wait_us: load(&self.l2p_apply_lane_queue_wait_us),
@@ -836,6 +905,10 @@ impl MetaMetrics {
             l2p_apply_lane_exec_max_us: load(&self.l2p_apply_lane_exec_max_us),
             l2p_apply_lane_idle_us: load(&self.l2p_apply_lane_idle_us),
             l2p_apply_lane_idle_max_us: load(&self.l2p_apply_lane_idle_max_us),
+            l2p_apply_lane_wakeups: load(&self.l2p_apply_lane_wakeups),
+            l2p_apply_lane_empty_wakeups: load(&self.l2p_apply_lane_empty_wakeups),
+            l2p_apply_lane_burst_total: load(&self.l2p_apply_lane_burst_total),
+            l2p_apply_lane_burst_max: load(&self.l2p_apply_lane_burst_max),
             rc_apply_lane_tasks: load(&self.rc_apply_lane_tasks),
             rc_apply_lane_queue_depth_max: load(&self.rc_apply_lane_queue_depth_max),
             rc_apply_lane_queue_wait_us: load(&self.rc_apply_lane_queue_wait_us),
@@ -848,6 +921,10 @@ impl MetaMetrics {
             rc_apply_lane_pending_set_wait_max_us: load(
                 &self.rc_apply_lane_pending_set_wait_max_us,
             ),
+            rc_apply_lane_wakeups: load(&self.rc_apply_lane_wakeups),
+            rc_apply_lane_empty_wakeups: load(&self.rc_apply_lane_empty_wakeups),
+            rc_apply_lane_burst_total: load(&self.rc_apply_lane_burst_total),
+            rc_apply_lane_burst_max: load(&self.rc_apply_lane_burst_max),
             l2p_apply_lane_shard_tasks: load_shards(&self.l2p_apply_lane_shard_tasks),
             l2p_apply_lane_shard_queue_depth_max: load_shards(
                 &self.l2p_apply_lane_shard_queue_depth_max,
@@ -861,6 +938,12 @@ impl MetaMetrics {
             l2p_apply_lane_shard_exec_us: load_shards(&self.l2p_apply_lane_shard_exec_us),
             l2p_apply_lane_shard_exec_max_us: load_shards(&self.l2p_apply_lane_shard_exec_max_us),
             l2p_apply_lane_shard_idle_us: load_shards(&self.l2p_apply_lane_shard_idle_us),
+            l2p_apply_lane_shard_wakeups: load_shards(&self.l2p_apply_lane_shard_wakeups),
+            l2p_apply_lane_shard_empty_wakeups: load_shards(
+                &self.l2p_apply_lane_shard_empty_wakeups,
+            ),
+            l2p_apply_lane_shard_burst_total: load_shards(&self.l2p_apply_lane_shard_burst_total),
+            l2p_apply_lane_shard_burst_max: load_shards(&self.l2p_apply_lane_shard_burst_max),
             rc_apply_lane_shard_tasks: load_shards(&self.rc_apply_lane_shard_tasks),
             rc_apply_lane_shard_queue_depth_max: load_shards(
                 &self.rc_apply_lane_shard_queue_depth_max,
@@ -878,6 +961,10 @@ impl MetaMetrics {
             rc_apply_lane_shard_pending_set_wait_max_us: load_shards(
                 &self.rc_apply_lane_shard_pending_set_wait_max_us,
             ),
+            rc_apply_lane_shard_wakeups: load_shards(&self.rc_apply_lane_shard_wakeups),
+            rc_apply_lane_shard_empty_wakeups: load_shards(&self.rc_apply_lane_shard_empty_wakeups),
+            rc_apply_lane_shard_burst_total: load_shards(&self.rc_apply_lane_shard_burst_total),
+            rc_apply_lane_shard_burst_max: load_shards(&self.rc_apply_lane_shard_burst_max),
             dedup_apply_guard_count: load(&self.dedup_apply_guard_count),
             dedup_apply_guard_us: load(&self.dedup_apply_guard_us),
             dedup_apply_guard_max_us: load(&self.dedup_apply_guard_max_us),
@@ -1599,6 +1686,119 @@ impl MetaMetrics {
         }
     }
 
+    /// Record one batch of cvar wakeups observed while the L2P apply lane
+    /// was hunting for its next task. `wakeups` counts every `cvar.wait()`
+    /// return (productive or spurious); `empty_wakeups` is the subset that
+    /// resumed with both queues still empty.
+    pub(crate) fn record_l2p_apply_lane_wakeups(
+        &self,
+        shard: usize,
+        wakeups: u64,
+        empty_wakeups: u64,
+    ) {
+        if wakeups == 0 && empty_wakeups == 0 {
+            return;
+        }
+        self.l2p_apply_lane_wakeups
+            .fetch_add(wakeups, Ordering::Relaxed);
+        self.l2p_apply_lane_empty_wakeups
+            .fetch_add(empty_wakeups, Ordering::Relaxed);
+        if let Some(slot) = self.l2p_apply_lane_shard_wakeups.get(shard) {
+            slot.fetch_add(wakeups, Ordering::Relaxed);
+        }
+        if let Some(slot) = self.l2p_apply_lane_shard_empty_wakeups.get(shard) {
+            slot.fetch_add(empty_wakeups, Ordering::Relaxed);
+        }
+    }
+
+    /// Record one completed burst (tasks processed since the previous
+    /// idle wait) on the L2P apply lane. Together with `wakeups` this
+    /// gives the avg/max number of tasks the lane drains per wakeup.
+    pub(crate) fn record_l2p_apply_lane_burst(&self, shard: usize, burst: u64) {
+        if burst == 0 {
+            return;
+        }
+        self.l2p_apply_lane_burst_total
+            .fetch_add(burst, Ordering::Relaxed);
+        fetch_max(&self.l2p_apply_lane_burst_max, burst);
+        if let Some(slot) = self.l2p_apply_lane_shard_burst_total.get(shard) {
+            slot.fetch_add(burst, Ordering::Relaxed);
+        }
+        if let Some(slot) = self.l2p_apply_lane_shard_burst_max.get(shard) {
+            fetch_max(slot, burst);
+        }
+    }
+
+    pub(crate) fn record_rc_apply_lane_wakeups(
+        &self,
+        shard: usize,
+        wakeups: u64,
+        empty_wakeups: u64,
+    ) {
+        if wakeups == 0 && empty_wakeups == 0 {
+            return;
+        }
+        self.rc_apply_lane_wakeups
+            .fetch_add(wakeups, Ordering::Relaxed);
+        self.rc_apply_lane_empty_wakeups
+            .fetch_add(empty_wakeups, Ordering::Relaxed);
+        if let Some(slot) = self.rc_apply_lane_shard_wakeups.get(shard) {
+            slot.fetch_add(wakeups, Ordering::Relaxed);
+        }
+        if let Some(slot) = self.rc_apply_lane_shard_empty_wakeups.get(shard) {
+            slot.fetch_add(empty_wakeups, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_rc_apply_lane_burst(&self, shard: usize, burst: u64) {
+        if burst == 0 {
+            return;
+        }
+        self.rc_apply_lane_burst_total
+            .fetch_add(burst, Ordering::Relaxed);
+        fetch_max(&self.rc_apply_lane_burst_max, burst);
+        if let Some(slot) = self.rc_apply_lane_shard_burst_total.get(shard) {
+            slot.fetch_add(burst, Ordering::Relaxed);
+        }
+        if let Some(slot) = self.rc_apply_lane_shard_burst_max.get(shard) {
+            fetch_max(slot, burst);
+        }
+    }
+
+    /// Dedup-lane wakeup/idle/burst counters. Aggregate-only (no per-shard
+    /// breakdown) because the dedup task closure already records its own
+    /// per-task timings via [`record_dedup_lane_task`].
+    pub(crate) fn record_dedup_lane_idle(&self, idle: Duration) {
+        record_duration(
+            &self.dedup_lane_idle_us,
+            &self.dedup_lane_idle_max_us,
+            idle,
+        );
+    }
+
+    pub(crate) fn record_dedup_lane_wakeups(&self, wakeups: u64, empty_wakeups: u64) {
+        if wakeups == 0 && empty_wakeups == 0 {
+            return;
+        }
+        self.dedup_lane_wakeups
+            .fetch_add(wakeups, Ordering::Relaxed);
+        self.dedup_lane_empty_wakeups
+            .fetch_add(empty_wakeups, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dedup_lane_burst(&self, burst: u64) {
+        if burst == 0 {
+            return;
+        }
+        self.dedup_lane_burst_total
+            .fetch_add(burst, Ordering::Relaxed);
+        fetch_max(&self.dedup_lane_burst_max, burst);
+    }
+
+    pub(crate) fn record_dedup_lane_queue_depth(&self, depth: usize) {
+        fetch_max(&self.dedup_lane_queue_depth_max, depth as u64);
+    }
+
     pub(crate) fn record_dedup_forward_put(&self, elapsed: Duration) {
         self.dedup_apply_forward_put_count
             .fetch_add(1, Ordering::Relaxed);
@@ -2054,6 +2254,13 @@ impl MetaMetricsSnapshot {
                 "\"dedup_lane_ready_queue_wait_max_us\":{},",
                 "\"dedup_lane_exec_us\":{},",
                 "\"dedup_lane_exec_max_us\":{},",
+                "\"dedup_lane_idle_us\":{},",
+                "\"dedup_lane_idle_max_us\":{},",
+                "\"dedup_lane_wakeups\":{},",
+                "\"dedup_lane_empty_wakeups\":{},",
+                "\"dedup_lane_burst_total\":{},",
+                "\"dedup_lane_burst_max\":{},",
+                "\"dedup_lane_queue_depth_max\":{},",
                 "\"l2p_apply_lane_tasks\":{},",
                 "\"l2p_apply_lane_queue_depth_max\":{},",
                 "\"l2p_apply_lane_queue_wait_us\":{},",
@@ -2062,6 +2269,10 @@ impl MetaMetricsSnapshot {
                 "\"l2p_apply_lane_exec_max_us\":{},",
                 "\"l2p_apply_lane_idle_us\":{},",
                 "\"l2p_apply_lane_idle_max_us\":{},",
+                "\"l2p_apply_lane_wakeups\":{},",
+                "\"l2p_apply_lane_empty_wakeups\":{},",
+                "\"l2p_apply_lane_burst_total\":{},",
+                "\"l2p_apply_lane_burst_max\":{},",
                 "\"rc_apply_lane_tasks\":{},",
                 "\"rc_apply_lane_queue_depth_max\":{},",
                 "\"rc_apply_lane_queue_wait_us\":{},",
@@ -2072,6 +2283,10 @@ impl MetaMetricsSnapshot {
                 "\"rc_apply_lane_idle_max_us\":{},",
                 "\"rc_apply_lane_pending_set_wait_us\":{},",
                 "\"rc_apply_lane_pending_set_wait_max_us\":{},",
+                "\"rc_apply_lane_wakeups\":{},",
+                "\"rc_apply_lane_empty_wakeups\":{},",
+                "\"rc_apply_lane_burst_total\":{},",
+                "\"rc_apply_lane_burst_max\":{},",
                 "\"dedup_apply_guard_count\":{},",
                 "\"dedup_apply_guard_us\":{},",
                 "\"dedup_apply_guard_max_us\":{},",
@@ -2310,6 +2525,13 @@ impl MetaMetricsSnapshot {
             self.dedup_lane_ready_queue_wait_max_us,
             self.dedup_lane_exec_us,
             self.dedup_lane_exec_max_us,
+            self.dedup_lane_idle_us,
+            self.dedup_lane_idle_max_us,
+            self.dedup_lane_wakeups,
+            self.dedup_lane_empty_wakeups,
+            self.dedup_lane_burst_total,
+            self.dedup_lane_burst_max,
+            self.dedup_lane_queue_depth_max,
             self.l2p_apply_lane_tasks,
             self.l2p_apply_lane_queue_depth_max,
             self.l2p_apply_lane_queue_wait_us,
@@ -2318,6 +2540,10 @@ impl MetaMetricsSnapshot {
             self.l2p_apply_lane_exec_max_us,
             self.l2p_apply_lane_idle_us,
             self.l2p_apply_lane_idle_max_us,
+            self.l2p_apply_lane_wakeups,
+            self.l2p_apply_lane_empty_wakeups,
+            self.l2p_apply_lane_burst_total,
+            self.l2p_apply_lane_burst_max,
             self.rc_apply_lane_tasks,
             self.rc_apply_lane_queue_depth_max,
             self.rc_apply_lane_queue_wait_us,
@@ -2328,6 +2554,10 @@ impl MetaMetricsSnapshot {
             self.rc_apply_lane_idle_max_us,
             self.rc_apply_lane_pending_set_wait_us,
             self.rc_apply_lane_pending_set_wait_max_us,
+            self.rc_apply_lane_wakeups,
+            self.rc_apply_lane_empty_wakeups,
+            self.rc_apply_lane_burst_total,
+            self.rc_apply_lane_burst_max,
             self.dedup_apply_guard_count,
             self.dedup_apply_guard_us,
             self.dedup_apply_guard_max_us,

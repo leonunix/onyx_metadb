@@ -36,7 +36,6 @@ enum Slot {
 }
 
 pub(crate) struct DirtySnapshot {
-    page_cache: Arc<PageCache>,
     pages: Vec<DirtySnapshotPage>,
 }
 
@@ -60,17 +59,6 @@ impl DirtySnapshot {
                 sealed: Arc::new(sealed),
             });
         }
-        for page in &flushed {
-            let is_index = matches!(
-                page.sealed.header().map(|h| h.page_type),
-                Ok(PageType::PagedIndex)
-            );
-            if is_index && self.page_cache.pin(page.pid, page.sealed.clone()) {
-                // Pinned pages shadow LRU lookups.
-            } else if is_index {
-                self.page_cache.insert(page.pid, page.sealed.clone());
-            }
-        }
         Ok(FlushedSnapshot { pages: flushed })
     }
 }
@@ -90,6 +78,10 @@ impl FlushedSnapshot {
                 .iter()
                 .map(|page| (page.pid, page.sealed.clone())),
         );
+    }
+
+    fn sealed_page(&self, page_idx: usize) -> Option<&FlushedSnapshotPage> {
+        self.pages.get(page_idx)
     }
 }
 
@@ -847,10 +839,7 @@ impl PageBuf {
             })
             .collect();
         pages.sort_unstable_by_key(|page| page.pid);
-        DirtySnapshot {
-            page_cache: self.page_cache.clone(),
-            pages,
-        }
+        DirtySnapshot { pages }
     }
 
     pub(crate) fn install_flushed_snapshot_page(
@@ -858,17 +847,27 @@ impl PageBuf {
         flushed: &FlushedSnapshot,
         page_idx: usize,
     ) -> Option<(PageId, bool)> {
-        let page = flushed.pages.get(page_idx)?;
+        let page = flushed.sealed_page(page_idx)?;
         let Some(Slot::Dirty(current)) = self.pages.get(&page.pid) else {
             return Some((page.pid, true));
         };
         if !Arc::ptr_eq(current, &page.original) {
             return Some((page.pid, false));
         }
-        // Db::flush has already written and synced the sealed page. Index
-        // pages may be pinned in the shared PageCache; leaves can fault from
-        // PageStore on demand. Drop the tree-local Dirty copy so install does
-        // not defer a large clean-page retain scan to finish_op.
+        // Db::flush has already written and synced the sealed page and
+        // manifest install is now durable. Only at this point is it safe
+        // to refresh PageCache: doing it during the IO phase would expose
+        // future bytes to older ReadViews that still reference a recycled
+        // pid with its previous page level.
+        let is_index = matches!(
+            page.sealed.header().map(|h| h.page_type),
+            Ok(PageType::PagedIndex)
+        );
+        if is_index && self.page_cache.pin(page.pid, page.sealed.clone()) {
+            // Pinned pages shadow LRU lookups.
+        } else if is_index {
+            self.page_cache.insert(page.pid, page.sealed.clone());
+        }
         self.pages_remove(page.pid);
         Some((page.pid, true))
     }

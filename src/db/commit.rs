@@ -1325,10 +1325,12 @@ impl Db {
         let finish_elapsed = finish_started.elapsed();
         tree.set_exclusive_read_overlay_mutation(false);
         let publish_started = std::time::Instant::now();
-        if let Some(mut guard) = read_view_guard.take() {
-            *guard = Arc::new(tree.snapshot_read_view());
-        } else if apply_result.is_ok() {
-            super::apply::publish_l2p_read_view(shard, &tree);
+        if apply_result.is_ok() {
+            if let Some(mut guard) = read_view_guard.take() {
+                *guard = Arc::new(tree.snapshot_read_view());
+            } else {
+                super::apply::publish_l2p_read_view(shard, &tree);
+            }
         }
         let publish_elapsed = publish_started.elapsed();
         apply_result?;
