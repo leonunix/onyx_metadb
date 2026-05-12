@@ -550,7 +550,7 @@ mod tests {
     }
 
     fn val(byte: u8) -> L2pValue {
-        L2pValue([byte; 28])
+        L2pValue([byte; 36])
     }
 
     #[test]

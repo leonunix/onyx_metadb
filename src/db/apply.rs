@@ -62,6 +62,13 @@ pub(super) fn apply_op_bare(
             })?;
             let sid = shard_for_key_l2p(&volume.shards, *lba);
             let mut tree = volume.shards[sid].tree.write();
+            // L2pPut returns the rejecting `cur` as `L2pPrev(Some(cur))`;
+            // caller distinguishes accept vs reject by comparing
+            // `value.seq()` against `cur.seq()`.
+            let cur = tree.get(*lba)?;
+            if seq_guard_rejects(value.seq(), cur.as_ref()) {
+                return Ok(ApplyOutcome::L2pPrev(cur));
+            }
             let prev = tree.insert_at_lsn(*lba, *value, lsn)?;
             publish_l2p_read_view(&volume.shards[sid], &tree);
             Ok(ApplyOutcome::L2pPrev(prev))
@@ -190,6 +197,25 @@ pub(super) fn apply_op_bare(
     }
 }
 
+/// Apply-time CAS gate. Returns true iff `new_seq` is stale relative
+/// to `cur` and the op must be skipped. `seq == 0` on either side is
+/// the no-guard sentinel (legacy callers like `DedupScanner` and
+/// direct `insert`) — the check is bypassed and the op applies. See
+/// `L2pValue::seq` for the wire layout.
+#[inline]
+pub(super) fn seq_guard_rejects(new_seq: u64, cur: Option<&L2pValue>) -> bool {
+    if new_seq == 0 {
+        return false;
+    }
+    match cur {
+        Some(c) => {
+            let cs = c.seq();
+            cs != 0 && new_seq <= cs
+        }
+        None => false,
+    }
+}
+
 /// Apply one [`WalOp::L2pRemap`]. Fuses L2P put + refcount decref(old)
 /// + refcount incref(new) + (optionally) a liveness guard read into one
 /// atomic step — the onyx adapter hot path.
@@ -258,7 +284,16 @@ pub(super) fn apply_l2p_remap(
         }
     }
 
-    // Drive L2P mutation now that the guard passed.
+    let cur = tree.get(lba)?;
+    if seq_guard_rejects(new_value.seq(), cur.as_ref()) {
+        return Ok(ApplyOutcome::L2pRemap {
+            applied: false,
+            prev: cur,
+            freed_pba: None,
+        });
+    }
+
+    // Drive L2P mutation now that both guards passed.
     let prev = tree.insert_at_lsn(lba, new_value, lsn)?;
     let old_pba = prev.map(|p| p.head_pba());
 

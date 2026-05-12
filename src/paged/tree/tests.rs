@@ -9,7 +9,7 @@ fn mk_store() -> (TempDir, Arc<PageStore>) {
 }
 
 fn v(n: u8) -> L2pValue {
-    L2pValue([n; 28])
+    L2pValue([n; 36])
 }
 
 #[test]

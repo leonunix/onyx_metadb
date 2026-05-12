@@ -369,23 +369,29 @@ fn dropping_source_snapshot_keeps_clone_alive() {
 
 #[test]
 fn dropping_source_snapshot_after_clone_keeps_page_refcounts_balanced() {
+    // v2 MAX_UNITS_PER_LEAF = 100; share value bytes across 32-LBA
+    // groups so the leaf (128 LBAs) only references ≤ 4 distinct
+    // UnitMetas. The invariant under test is refcount-balance, not
+    // unit-distinctness.
     let (dir, db) = mk_db();
     let src = db.create_volume().unwrap();
+    let val = |i: u64| -> L2pValue { v(((i / 32) % 251) as u8) };
     for i in 0u64..256 {
-        db.insert(src, i, v((i % 251) as u8)).unwrap();
+        db.insert(src, i, val(i)).unwrap();
     }
     let snap = db.take_snapshot(src).unwrap();
     let clone = db.clone_volume(snap).unwrap();
 
     let _ = db.drop_snapshot(snap).unwrap().unwrap();
     for i in 0u64..256 {
-        assert_eq!(db.get(clone, i).unwrap(), Some(v((i % 251) as u8)));
+        assert_eq!(db.get(clone, i).unwrap(), Some(val(i)));
     }
 
     drop(db);
     let db = Db::open(dir.path()).unwrap();
+    let val = |i: u64| -> L2pValue { v(((i / 32) % 251) as u8) };
     for i in 0u64..256 {
-        assert_eq!(db.get(clone, i).unwrap(), Some(v((i % 251) as u8)));
+        assert_eq!(db.get(clone, i).unwrap(), Some(val(i)));
     }
     db.flush().unwrap();
     let report =

@@ -468,7 +468,10 @@ fn db_refcount_sum(db: &Db) -> onyx_metadb::Result<u64> {
 }
 
 fn audit_pba_refcounts(db: &Db) -> onyx_metadb::Result<()> {
-    let mut versions: BTreeMap<(VolumeOrdinal, u64), BTreeSet<[u8; 28]>> = BTreeMap::new();
+    let mut versions: BTreeMap<
+        (VolumeOrdinal, u64),
+        BTreeSet<[u8; onyx_metadb::paged::format::LEAF_VALUE_SIZE]>,
+    > = BTreeMap::new();
     let mut evidence: BTreeMap<Pba, Vec<String>> = BTreeMap::new();
     for vol in db.volumes() {
         for item in db.range(vol, ..)? {

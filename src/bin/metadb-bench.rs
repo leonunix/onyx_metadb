@@ -858,7 +858,7 @@ fn effective_prefill_keys(cfg: &BenchConfig, fallback_keys: u64, bytes_per_key: 
 }
 
 fn l2p_value_from_pba(pba: Pba) -> L2pValue {
-    let mut out = [0u8; 28];
+    let mut out = [0u8; onyx_metadb::paged::format::LEAF_VALUE_SIZE];
     out[..8].copy_from_slice(&pba.to_be_bytes());
     out[8..16].copy_from_slice(&pba.rotate_left(13).to_be_bytes());
     out[16..24].copy_from_slice(&pba.rotate_left(29).to_be_bytes());

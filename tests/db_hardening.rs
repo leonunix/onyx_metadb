@@ -6,7 +6,7 @@ use onyx_metadb::{Db, DedupValue, Hash8, L2pValue, VerifyOptions, verify_path};
 use tempfile::TempDir;
 
 fn l2p(n: u8) -> L2pValue {
-    let mut x = [0u8; 28];
+    let mut x = [0u8; 36];
     x[0] = n;
     L2pValue(x)
 }
@@ -424,11 +424,12 @@ fn clone_volume_crash_mid_incref_completes_on_recovery() {
 
 // ----------------- L2pRemap crash-safety (SPEC §5.3) ---------------
 
-/// Encode a pba + tag into the 28-byte `L2pValue` the same way tests
-/// in `db::tests` do: head 8 bytes are the target pba BE (Onyx's
-/// `BlockmapValue` contract), byte 8 is a discriminator tag.
+/// Encode a pba + tag into the 36-byte v2 `L2pValue`: head 8 bytes are
+/// the target pba BE (Onyx's `BlockmapValue` contract), byte 8 is a
+/// discriminator tag, trailing 8 bytes are the per-LBA seq (left as
+/// zero — the legacy / no-seq-guard sentinel for these crash tests).
 fn remap_val(pba: u64, tag: u8) -> L2pValue {
-    let mut v = [0u8; 28];
+    let mut v = [0u8; 36];
     v[..8].copy_from_slice(&pba.to_be_bytes());
     v[8] = tag;
     L2pValue(v)

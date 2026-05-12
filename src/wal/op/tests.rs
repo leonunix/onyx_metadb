@@ -1,7 +1,7 @@
 use super::*;
 
 fn v(n: u8) -> L2pValue {
-    let mut x = [0u8; 28];
+    let mut x = [0u8; 36];
     x[0] = n;
     L2pValue(x)
 }
@@ -26,8 +26,8 @@ fn single_op_round_trip() {
         value: v(7),
     }];
     let body = encode_body(&ops);
-    // +1 for the schema version prefix
-    assert_eq!(body.len(), 1 + 1 + 2 + 8 + 28);
+    // +1 for the schema version prefix; v2 L2pValue is 36 B.
+    assert_eq!(body.len(), 1 + 1 + 2 + 8 + 36);
     assert_eq!(body[0], WAL_BODY_SCHEMA_VERSION);
     let decoded = decode_body(&body).unwrap();
     assert_eq!(decoded, ops);
@@ -114,7 +114,7 @@ fn legacy_body_without_schema_version_is_rejected() {
     body.push(TAG_L2P_PUT); // 0x01: not the schema version byte
     body.extend_from_slice(&0u16.to_be_bytes()); // vol_ord
     body.extend_from_slice(&42u64.to_be_bytes()); // lba
-    body.extend_from_slice(&[0u8; 28]); // value
+    body.extend_from_slice(&[0u8; 36]); // value
     match decode_body(&body).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(msg.contains("body version"), "unexpected msg: {msg}");
@@ -156,7 +156,7 @@ fn unknown_tag_is_corruption() {
 
 #[test]
 fn truncated_payload_is_corruption() {
-    // L2P_PUT expects 38 bytes of payload (vol_ord + lba + value);
+    // L2P_PUT expects 46 bytes of payload (vol_ord + lba + value with v2's 36 B);
     // a 10-byte tail is short.
     let body = vec![
         WAL_BODY_SCHEMA_VERSION,
@@ -194,7 +194,8 @@ fn l2p_put_vol_ord_round_trip_max_u16() {
         },
     ];
     let body = encode_body(&ops);
-    assert_eq!(body.len(), 1 + (1 + 2 + 8 + 28) + (1 + 2 + 8));
+    // v2 L2pValue is 36 B; L2pDelete is unchanged.
+    assert_eq!(body.len(), 1 + (1 + 2 + 8 + 36) + (1 + 2 + 8));
     assert_eq!(decode_body(&body).unwrap(), ops);
 }
 
@@ -515,8 +516,9 @@ fn l2p_remap_no_guard_round_trip() {
         guard: None,
     }];
     let body = encode_body(&ops);
-    // schema(1) + tag(1) + vol_ord(2) + lba(8) + value(28) + guard_tag(1)
-    assert_eq!(body.len(), 1 + 40);
+    // schema(1) + tag(1) + vol_ord(2) + lba(8) + value(36) + guard_tag(1)
+    // = 1 + 48 (v2 L2pValue is 36 B).
+    assert_eq!(body.len(), 1 + 48);
     assert_eq!(decode_body(&body).unwrap(), ops);
 }
 
@@ -529,8 +531,8 @@ fn l2p_remap_with_guard_round_trip() {
         guard: Some((0x0123_4567_89AB_CDEF, 5)),
     }];
     let body = encode_body(&ops);
-    // schema(1) + base(40) + pba(8) + min_rc(4)
-    assert_eq!(body.len(), 1 + 52);
+    // schema(1) + base(48) + pba(8) + min_rc(4) = 1 + 60.
+    assert_eq!(body.len(), 1 + 60);
     assert_eq!(decode_body(&body).unwrap(), ops);
 }
 
@@ -578,7 +580,7 @@ fn l2p_remap_truncated_guard_payload_is_corruption() {
     let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_L2P_REMAP];
     body.extend_from_slice(&1u16.to_be_bytes());
     body.extend_from_slice(&2u64.to_be_bytes());
-    body.extend_from_slice(&[0u8; 28]);
+    body.extend_from_slice(&[0u8; 36]);
     body.push(L2P_REMAP_GUARD_SOME);
     body.extend_from_slice(&10u64.to_be_bytes()); // pba — missing min_rc
     match decode_body(&body).unwrap_err() {
@@ -594,7 +596,7 @@ fn l2p_remap_unknown_guard_tag_is_corruption() {
     let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_L2P_REMAP];
     body.extend_from_slice(&0u16.to_be_bytes());
     body.extend_from_slice(&0u64.to_be_bytes());
-    body.extend_from_slice(&[0u8; 28]);
+    body.extend_from_slice(&[0u8; 36]);
     body.push(0x7F); // unrecognised guard discriminator
     match decode_body(&body).unwrap_err() {
         MetaDbError::Corruption(msg) => {
@@ -648,7 +650,7 @@ fn l2p_range_delete_round_trip_preserves_order_and_duplicates() {
     // and duplicates must survive the codec because apply needs
     // to emit one decref per entry (SPEC §4.7).
     fn val(pba: u64) -> L2pValue {
-        let mut v = [0u8; 28];
+        let mut v = [0u8; 36];
         v[..8].copy_from_slice(&pba.to_be_bytes());
         L2pValue(v)
     }
@@ -665,7 +667,7 @@ fn l2p_range_delete_round_trip_preserves_order_and_duplicates() {
         captured: captured.clone(),
     }];
     let body = encode_body(&ops);
-    assert_eq!(body.len(), 1 + 1 + 22 + captured.len() * (8 + 28));
+    assert_eq!(body.len(), 1 + 1 + 22 + captured.len() * (8 + 36));
     match &decode_body(&body).unwrap()[0] {
         WalOp::L2pRangeDelete { captured: c, .. } => assert_eq!(c, &captured),
         other => panic!("expected L2pRangeDelete, got {other:?}"),
@@ -675,7 +677,7 @@ fn l2p_range_delete_round_trip_preserves_order_and_duplicates() {
 #[test]
 fn l2p_range_delete_interleaves_with_other_ops() {
     fn val(pba: u64) -> L2pValue {
-        let mut v = [0u8; 28];
+        let mut v = [0u8; 36];
         v[..8].copy_from_slice(&pba.to_be_bytes());
         L2pValue(v)
     }
@@ -742,7 +744,7 @@ fn l2p_range_delete_truncated_captured_list_is_corruption() {
 #[test]
 fn l2p_range_delete_encoded_len_matches_encode_output() {
     fn val(pba: u64) -> L2pValue {
-        let mut v = [0u8; 28];
+        let mut v = [0u8; 36];
         v[..8].copy_from_slice(&pba.to_be_bytes());
         L2pValue(v)
     }

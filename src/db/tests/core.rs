@@ -32,17 +32,22 @@ fn insert_get_round_trip() {
 
 #[test]
 fn flush_persists_tree_state_via_manifest() {
+    // v2 caps `MAX_UNITS_PER_LEAF` at 100, so a leaf (128 LBAs) cannot
+    // hold 128 distinct UnitMetas — share value bytes across 32-LBA
+    // groups to keep ≤ 4 distinct units per leaf. The test's
+    // invariant is "values round-trip through flush + reopen", and
+    // that still holds with shared values.
     let dir = TempDir::new().unwrap();
     {
         let db = Db::create(dir.path()).unwrap();
         for i in 0u64..500 {
-            db.insert(0, i, v(i as u8)).unwrap();
+            db.insert(0, i, v((i / 32) as u8)).unwrap();
         }
         db.flush().unwrap();
     }
     let db = Db::open(dir.path()).unwrap();
     for i in 0u64..500 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v(i as u8)));
+        assert_eq!(db.get(0, i).unwrap(), Some(v((i / 32) as u8)));
     }
 }
 

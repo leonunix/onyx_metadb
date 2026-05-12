@@ -7,7 +7,7 @@ use onyx_metadb::{Config, Db, L2pValue, VerifyOptions, verify_path};
 use tempfile::TempDir;
 
 fn v(n: u8) -> L2pValue {
-    let mut x = [0u8; 28];
+    let mut x = [0u8; 36];
     x[0] = n;
     L2pValue(x)
 }

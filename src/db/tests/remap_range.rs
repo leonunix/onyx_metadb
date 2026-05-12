@@ -5,7 +5,7 @@ use super::*;
 /// remaining 20 bytes carry `tag` in byte 8 so tests can
 /// distinguish otherwise-identical values that share a pba.
 fn remap_val(pba: Pba, tag: u8) -> L2pValue {
-    let mut v = [0u8; 28];
+    let mut v = [0u8; 36];
     v[..8].copy_from_slice(&pba.to_be_bytes());
     v[8] = tag;
     L2pValue(v)
@@ -331,6 +331,11 @@ fn seed_remaps(db: &Db, start: Lba, count: usize, pba: Pba, tag: u8) {
 
 fn seed_distinct_remaps_batched(db: &Db, total: usize) {
     const OPS_PER_COMMIT: usize = 4096;
+    // Group LBAs into 32-LBA "compression units" so each leaf (128
+    // entries) only references 4 distinct units — well under v2's
+    // MAX_UNITS_PER_LEAF = 100. The test only needs `total` distinct
+    // mappings, not distinct PBAs.
+    const LBAS_PER_UNIT: u64 = 32;
     for chunk_start in (0..total).step_by(OPS_PER_COMMIT) {
         let chunk_end = (chunk_start + OPS_PER_COMMIT).min(total);
         let mut tx = db.begin();
@@ -338,7 +343,7 @@ fn seed_distinct_remaps_batched(db: &Db, total: usize) {
             tx.l2p_remap(
                 BOOTSTRAP_VOLUME_ORD,
                 i as u64,
-                remap_val(100 + i as u64, 0),
+                remap_val(100 + (i as u64 / LBAS_PER_UNIT), 0),
                 None,
             );
         }
@@ -528,9 +533,15 @@ fn range_delete_crosses_shard_boundaries() {
     // With the default shard count (> 1), a contiguous LBA range
     // hits multiple shards. Make sure the apply path visits each
     // shard's tree and every mapping in the range is removed.
+    //
+    // v2 caps `MAX_UNITS_PER_LEAF` at 100, so we share PBA across
+    // 32-LBA chunks to keep ≤ 4 distinct units per 128-LBA leaf.
+    // The shard-cross invariant we care about is "every LBA gets
+    // unmapped and all refcounts settle" — the PBA grouping is
+    // orthogonal to that.
     let (_d, db) = mk_db_with_shards(8);
     for i in 0..200u64 {
-        remap(&db, i, remap_val(1_000 + i, 0), None);
+        remap(&db, i, remap_val(1_000 + (i / 32), 0), None);
     }
     db.range_delete(BOOTSTRAP_VOLUME_ORD, 0, 200).unwrap();
     for i in 0..200u64 {
@@ -539,7 +550,10 @@ fn range_delete_crosses_shard_boundaries() {
             None,
             "lba={i} should be unmapped after range_delete",
         );
-        assert_eq!(db.get_refcount(1_000 + i).unwrap(), 0);
+    }
+    // Refcounts for the (potentially shared) PBAs all collapse to 0.
+    for unit in 0..((200 + 31) / 32) {
+        assert_eq!(db.get_refcount(1_000 + unit).unwrap(), 0);
     }
 }
 

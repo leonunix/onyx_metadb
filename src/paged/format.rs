@@ -83,12 +83,21 @@ use crate::page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageTyp
 use crate::paged::leaf_compact;
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
-/// Bytes per logical L2P value. Matches `btree::L2P_VALUE_SIZE` so the
-/// 28 B `L2pValue` byte buffer is shared. NOTE: in the compact leaf
-/// format an entry on disk is **3 B** (slot record) + a slice of the
-/// 26 B unit-dict entry — `LEAF_VALUE_SIZE` is the *logical* size of
-/// the reconstituted value, not the per-slot on-disk size.
-pub const LEAF_VALUE_SIZE: usize = 28;
+/// Bytes per logical L2P value. The first 28 bytes embed Onyx's
+/// `BlockmapValue` (see `head_pba` contract below). The last 8 bytes
+/// are a big-endian `u64` commit-seq used by metadb's `seq_guard` to
+/// reject stale concurrent commits; see `L2P_SEQ_OFFSET` and
+/// `apply::apply_l2p_remap` for the CAS semantics. In the compact leaf
+/// format an entry on disk is **11 B** (slot record: unit_idx + offset
+/// + seq) + a slice of the 26 B unit-dict entry — `LEAF_VALUE_SIZE` is
+/// the *logical* size of the reconstituted value, not the per-slot
+/// on-disk size.
+pub const LEAF_VALUE_SIZE: usize = 36;
+
+/// Byte offset within an `L2pValue` where the 8-byte big-endian commit
+/// seq lives. Onyx fills this at the adapter boundary; metadb apply
+/// reads it for the seq_guard CAS check.
+pub const L2P_SEQ_OFFSET: usize = 28;
 
 /// Entries per leaf. Chosen as a power of two so addressing is a pair
 /// of bit ops (`lba & 0x7F`, `lba >> 7`).
@@ -130,12 +139,14 @@ const _: () = {
     assert!(PAGE_PAYLOAD_SIZE == 4032);
     assert!(LEAF_ENTRY_COUNT == 128);
     assert!(LEAF_BITMAP_BYTES == 16);
-    // Compact format invariants: bitmap+unit_count+version+entries fit
-    // and the worst-case unit dict (all 128 entries distinct) still
-    // leaves headroom inside the payload.
+    // Compact format invariants. With per-slot record grown to 11 B
+    // (unit_idx + offset_in_unit + seq), the entries region is 1408 B
+    // and the unit-dict offset moves to 1426. The pathological
+    // "128 distinct units" case no longer fits; the encoder caps at
+    // `MAX_UNITS_PER_LEAF` (computed from payload headroom).
     assert!(leaf_compact::COMPACT_HEADER_BYTES == 18);
-    assert!(leaf_compact::COMPACT_UNIT_DICT_OFFSET == 402);
-    assert!(leaf_compact::compact_size(LEAF_ENTRY_COUNT) <= PAGE_PAYLOAD_SIZE);
+    assert!(leaf_compact::COMPACT_UNIT_DICT_OFFSET == 1426);
+    assert!(leaf_compact::compact_size(leaf_compact::MAX_UNITS_PER_LEAF) <= PAGE_PAYLOAD_SIZE);
     assert!(INDEX_FANOUT == 256);
     assert!(INDEX_FANOUT * INDEX_CHILD_SIZE <= PAGE_PAYLOAD_SIZE);
     assert!(1u64.wrapping_shl(LEAF_SHIFT) == LEAF_ENTRY_COUNT as u64);
@@ -180,6 +191,29 @@ impl L2pValue {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&self.0[..8]);
         u64::from_be_bytes(buf)
+    }
+
+    /// Big-endian 8-byte commit-seq stored at `[L2P_SEQ_OFFSET..]`.
+    /// Onyx stamps this from the buffer pool's monotonic per-LBA seq
+    /// when building the value; metadb apply uses it for the seq_guard
+    /// CAS check in `apply_l2p_remap` / `apply_l2p_put`.
+    ///
+    /// `0` is a sentinel meaning "no seq attached" — apply skips the
+    /// CAS check in either direction (incoming or stored). Used by
+    /// legacy callers like `DedupScanner` and direct `insert` that
+    /// don't have a buffer seq to attach.
+    pub fn seq(&self) -> u64 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&self.0[L2P_SEQ_OFFSET..L2P_SEQ_OFFSET + 8]);
+        u64::from_be_bytes(buf)
+    }
+
+    /// Return a copy with the seq field replaced. Onyx's adapter uses
+    /// this to stamp the buffer seq into a freshly-built value before
+    /// pushing the op into a `Transaction`.
+    pub fn with_seq(mut self, seq: u64) -> Self {
+        self.0[L2P_SEQ_OFFSET..L2P_SEQ_OFFSET + 8].copy_from_slice(&seq.to_be_bytes());
+        self
     }
 }
 
@@ -260,9 +294,9 @@ pub fn leaf_value_at(page: &Page, i: usize) -> Result<Option<L2pValue>> {
     leaf_compact::payload_decode_at_checked(page.payload(), i).map(|v| v.map(L2pValue))
 }
 
-/// Zero the 3 B entry record at slot `i`. Does not touch the bitmap or
-/// the unit dictionary. Called from `leaf_clear` so a CRC over the page
-/// doesn't capture stale entry bytes.
+/// Zero the per-slot entry record at slot `i`. Does not touch the
+/// bitmap or the unit dictionary. Called from `leaf_clear` so a CRC
+/// over the page doesn't capture stale entry bytes.
 #[inline]
 pub fn leaf_zero_value(page: &mut Page, i: usize) {
     debug_assert!(i < LEAF_ENTRY_COUNT);
@@ -279,16 +313,13 @@ pub fn leaf_entry_count(page: &Page) -> u16 {
 /// Set entry `i` to `v`. Returns the previous value if the slot was
 /// set, `None` otherwise. Updates the bitmap and the page header
 /// counter; finds or appends the unit-dict record matching `v` and
-/// writes the 3 B per-slot record.
+/// writes the 11 B per-slot record (v2 schema: unit_idx + offset + seq).
 ///
 /// If the unit dict is full when a new unit would be appended, this
 /// function runs `compact_in_place` to drop dead unit entries and
-/// retries. In the worst case (every live entry references a distinct
-/// unit and the dict is already at the payload ceiling) the retry will
-/// also fail; this can only happen if the leaf has more than 139 live
-/// distinct units, which exceeds the 128-slot leaf invariant — so the
-/// retry is guaranteed to succeed and we panic on failure as a hard
-/// invariant violation.
+/// retries. In v2 the payload-bound cap is `MAX_UNITS_PER_LEAF = 100`;
+/// `compact_in_place` after a typical clear cycle frees enough room for
+/// one more unit. A retry that still fails surfaces as `Corruption`.
 pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pValue>> {
     debug_assert!(i < LEAF_ENTRY_COUNT);
     let payload_head = |page: &Page| -> Vec<u8> { page.payload()[..32].to_vec() };

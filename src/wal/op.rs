@@ -35,10 +35,10 @@
 //!
 //! | tag | mnemonic            | payload                                                                             |   size   |
 //! |-----|---------------------|-------------------------------------------------------------------------------------|----------|
-//! | 01  | `L2P_PUT`           | vol_ord (2 B BE) + lba (8 B BE) + value (28 B)                                      |    38    |
+//! | 01  | `L2P_PUT`           | vol_ord (2 B BE) + lba (8 B BE) + value (36 B)                                      |    47    |
 //! | 02  | `L2P_DELETE`        | vol_ord (2 B BE) + lba (8 B BE)                                                     |    10    |
-//! | 03  | `L2P_REMAP`         | vol_ord (2 B BE) + lba (8 B BE) + new_value (28 B) + guard_tag (1 B) + [guard]      | 39 / 51  |
-//! | 04  | `L2P_RANGE_DELETE`  | vol_ord (2 B BE) + start (8 B BE) + end (8 B BE) + count (4 B BE) + (lba,pba)×count | 22+16n   |
+//! | 03  | `L2P_REMAP`         | vol_ord (2 B BE) + lba (8 B BE) + new_value (36 B) + guard_tag (1 B) + [guard]      | 48 / 60  |
+//! | 04  | `L2P_RANGE_DELETE`  | vol_ord (2 B BE) + start (8 B BE) + end (8 B BE) + count (4 B BE) + (lba,value)×count | 22+44n |
 //! | 10  | `DEDUP_PUT`         | hash (32 B) + value (28 B)                                                          |    60    |
 //! | 11  | `DEDUP_DEL`         | hash (32 B)                                                                         |    32    |
 //! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                                                          |    40    |
@@ -56,10 +56,15 @@
 //! `L2P_REMAP` guard: tag `0x00` = no guard (payload ends); tag `0x01`
 //! = guarded, followed by `pba (8 B BE) + min_rc (4 B BE)` — 12 more
 //! bytes. Apply reads `refcount(pba)` and skips the whole op if the
-//! value is `< min_rc` (SPEC §3.1). Guarded payload: 39 + 1 + 12 = 52
-//! bytes including the tag byte (1); unguarded: 39 + 1 = 40 bytes.
-//! SPEC v1 quotes 48 B / 60 B as the totals — the spec text's byte
-//! arithmetic was off by 8; the field layout there is what we match.
+//! value is `< min_rc` (SPEC §3.1). In v2 the `new_value` field is 36 B
+//! (28 B BlockmapValue + 8 B seq_guard), so total record sizes including
+//! the tag byte are 48 B unguarded and 60 B guarded.
+//!
+//! `L2P_*` value fields are 36 B in schema 0xB2 (was 28 B in 0xB1). The
+//! trailing 8 B is a big-endian commit seq used by the apply path's
+//! seq_guard CAS check; see [`paged::format::L2P_SEQ_OFFSET`]. Schema
+//! bump 0xB1 → 0xB2 is a flag day — old WAL bodies are rejected on
+//! recovery and must be drained with the prior binary before upgrading.
 //!
 //! Phase 7 commit 6 put `vol_ord` on L2P ops so apply can route them to
 //! the right per-volume shard group. `vol_ord = 0` is the bootstrap
@@ -90,8 +95,9 @@ use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
 ///    so a future bump becomes `0xB2`, `0xB3`, … and keeps the property
 ///    above.
 ///
-/// Phase A bumps the implicit pre-existing "no prefix" format to v1.
-pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB1;
+/// Phase A bumped the implicit "no prefix" format to v1 (0xB1).
+/// v2 (0xB2): L2pValue grew 28 → 36 B with a per-LBA seq trailer.
+pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB2;
 
 pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;

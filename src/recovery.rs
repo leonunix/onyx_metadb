@@ -492,12 +492,12 @@ mod tests {
                 WalOp::L2pPut {
                     vol_ord: 0,
                     lba: 1,
-                    value: L2pValue([1; 28]),
+                    value: L2pValue([1; 36]),
                 },
                 WalOp::L2pPut {
                     vol_ord: 0,
                     lba: 2,
-                    value: L2pValue([2; 28]),
+                    value: L2pValue([2; 36]),
                 },
             ]);
             wal.submit(body1).unwrap();
@@ -532,9 +532,12 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut seg = SegmentFile::create(dir.path(), 1).unwrap();
-        // Hand-craft a legacy body: bare TAG_L2P_PUT + 38B of zeros.
+        // Hand-craft a legacy body: bare TAG_L2P_PUT + 46B of zeros
+        // (v2 layout = 2 vol_ord + 8 lba + 36 value). The decoder must
+        // reject it on the first byte (TAG_L2P_PUT = 0x01) failing the
+        // schema-version check, regardless of body length.
         let mut legacy_body = vec![TAG_L2P_PUT];
-        legacy_body.extend_from_slice(&[0u8; 38]); // vol_ord + lba + value
+        legacy_body.extend_from_slice(&[0u8; 46]); // vol_ord + lba + value
         let mut framed = Vec::new();
         encode(&mut framed, 1, &legacy_body);
         seg.append(&framed).unwrap();
@@ -566,7 +569,7 @@ mod tests {
                 wal.submit(encode_body(&[WalOp::L2pPut {
                     vol_ord: 0,
                     lba: i,
-                    value: L2pValue([i as u8; 28]),
+                    value: L2pValue([i as u8; 36]),
                 }]))
                 .unwrap();
             }

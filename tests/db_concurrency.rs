@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use xxhash_rust::xxh3::xxh3_64;
 
 fn v(n: u8) -> L2pValue {
-    let mut x = [0u8; 28];
+    let mut x = [0u8; 36];
     x[0] = n;
     L2pValue(x)
 }

@@ -413,7 +413,7 @@ impl ModelRemapOutcome {
 }
 
 pub fn onyx_l2p_value(pba: Pba, salt: u64) -> L2pValue {
-    let mut bytes = [0u8; 28];
+    let mut bytes = [0u8; crate::paged::format::LEAF_VALUE_SIZE];
     bytes[..8].copy_from_slice(&pba.to_be_bytes());
     bytes[8..16].copy_from_slice(&salt.to_be_bytes());
     bytes[16..20].copy_from_slice(&(salt as u32).wrapping_mul(0x9E37_79B9).to_be_bytes());

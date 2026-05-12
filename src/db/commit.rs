@@ -1202,7 +1202,11 @@ impl Db {
                     }
 
                     for (_, run_indices) in leaf_runs {
+                        // Pre-filter entries against the apply-time
+                        // CAS so the leaf-run only mutates the
+                        // accepted subset.
                         let mut entries = Vec::with_capacity(run_indices.len());
+                        let mut accepted_indices = Vec::with_capacity(run_indices.len());
                         for run_idx in &run_indices {
                             let WalOp::L2pRemap {
                                 lba,
@@ -1213,12 +1217,30 @@ impl Db {
                             else {
                                 unreachable!("run builder only accepts unguarded remaps");
                             };
+                            let cur = tree.get_read_only(*lba)?;
+                            if super::apply::seq_guard_rejects(new_value.seq(), cur.as_ref()) {
+                                l2p_remap_count += 1;
+                                outcomes.push((
+                                    *run_idx,
+                                    ApplyOutcome::L2pRemap {
+                                        applied: false,
+                                        prev: cur,
+                                        freed_pba: None,
+                                    },
+                                ));
+                                continue;
+                            }
                             entries.push((*lba, *new_value));
+                            accepted_indices.push(*run_idx);
+                        }
+
+                        if entries.is_empty() {
+                            continue;
                         }
 
                         let prev_values =
                             tree.insert_leaf_run_at_lsn_deferred_finish(&entries, lsn)?;
-                        for ((run_idx, (run_lba, run_new_value)), prev) in run_indices
+                        for ((run_idx, (run_lba, run_new_value)), prev) in accepted_indices
                             .iter()
                             .copied()
                             .zip(entries.into_iter())
@@ -1250,6 +1272,13 @@ impl Db {
                 }
                 let outcome = match &ops[idx] {
                     WalOp::L2pPut { lba, value, .. } => {
+                        let cur = tree.get_read_only(*lba)?;
+                        if super::apply::seq_guard_rejects(value.seq(), cur.as_ref()) {
+                            l2p_put_count += 1;
+                            outcomes.push((idx, ApplyOutcome::L2pPrev(cur)));
+                            pos += 1;
+                            continue;
+                        }
                         let prev = tree.insert_at_lsn_deferred_finish(*lba, *value, lsn)?;
                         l2p_put_count += 1;
                         ApplyOutcome::L2pPrev(prev)
@@ -1289,6 +1318,20 @@ impl Db {
                                 pos += 1;
                                 continue;
                             }
+                        }
+                        let cur = tree.get_read_only(*lba)?;
+                        if super::apply::seq_guard_rejects(new_value.seq(), cur.as_ref()) {
+                            l2p_remap_count += 1;
+                            outcomes.push((
+                                idx,
+                                ApplyOutcome::L2pRemap {
+                                    applied: false,
+                                    prev: cur,
+                                    freed_pba: None,
+                                },
+                            ));
+                            pos += 1;
+                            continue;
                         }
                         let prev = tree.insert_at_lsn_deferred_finish(*lba, *new_value, lsn)?;
                         push_l2p_remap_rc_actions(
@@ -2359,7 +2402,7 @@ mod tests {
     fn small_remap_batches_use_lane_dispatch_not_global_serial() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Db::create(dir.path()).unwrap();
-        let mut raw = [0u8; 28];
+        let mut raw = [0u8; 36];
         raw[..8].copy_from_slice(&123_u64.to_be_bytes());
 
         let ops = [WalOp::L2pRemap {

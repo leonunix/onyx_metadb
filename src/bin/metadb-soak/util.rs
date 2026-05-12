@@ -142,7 +142,7 @@ fn refcount_pba(tid: usize, slot: u64) -> u64 {
 }
 
 fn l2p_value(byte: u8) -> L2pValue {
-    let mut value = [0u8; 28];
+    let mut value = [0u8; onyx_metadb::paged::format::LEAF_VALUE_SIZE];
     value[0] = byte;
     value[1] = byte.wrapping_mul(3);
     L2pValue(value)

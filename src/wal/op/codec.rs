@@ -180,14 +180,20 @@ impl WalOp {
 
     /// Serialized length of this op in bytes.
     pub fn encoded_len(&self) -> usize {
+        // L2pValue is `LEAF_VALUE_SIZE` (36 bytes in v2 schema: 28 B
+        // BlockmapValue + 8 B per-LBA seq). DedupValue is independent
+        // and stays at 28 bytes — never substitute one for the other.
+        const L2P_VALUE_BYTES: usize = crate::paged::format::LEAF_VALUE_SIZE;
         match self {
-            WalOp::L2pPut { .. } => 1 + 2 + 8 + 28,
+            WalOp::L2pPut { .. } => 1 + 2 + 8 + L2P_VALUE_BYTES,
             WalOp::L2pDelete { .. } => 1 + 2 + 8,
             WalOp::L2pRemap { guard, .. } => {
-                let base = 1 + 2 + 8 + 28 + 1;
+                let base = 1 + 2 + 8 + L2P_VALUE_BYTES + 1;
                 base + if guard.is_some() { 8 + 4 } else { 0 }
             }
-            WalOp::L2pRangeDelete { captured, .. } => 1 + 2 + 8 + 8 + 4 + captured.len() * (8 + 28),
+            WalOp::L2pRangeDelete { captured, .. } => {
+                1 + 2 + 8 + 8 + 4 + captured.len() * (8 + L2P_VALUE_BYTES)
+            }
             WalOp::DedupPut { .. } => 1 + 8 + 28,
             WalOp::DedupPutGuarded { .. } => 1 + 8 + 28 + 8 + 4,
             WalOp::DedupDelete { .. } => 1 + 8,
@@ -279,18 +285,21 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
     let payload = &body[1..];
     match tag {
         TAG_L2P_PUT => {
-            require_len(payload, 38, "L2P_PUT")?;
+            const VALUE_SZ: usize = crate::paged::format::LEAF_VALUE_SIZE;
+            const HEAD: usize = 2 + 8;
+            const RECORD: usize = HEAD + VALUE_SZ;
+            require_len(payload, RECORD, "L2P_PUT")?;
             let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
             let lba = u64::from_be_bytes(payload[2..10].try_into().unwrap());
-            let mut v = [0u8; 28];
-            v.copy_from_slice(&payload[10..38]);
+            let mut v = [0u8; VALUE_SZ];
+            v.copy_from_slice(&payload[HEAD..RECORD]);
             Ok((
                 WalOp::L2pPut {
                     vol_ord,
                     lba,
                     value: L2pValue(v),
                 },
-                &payload[38..],
+                &payload[RECORD..],
             ))
         }
         TAG_L2P_DELETE => {
@@ -300,13 +309,18 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             Ok((WalOp::L2pDelete { vol_ord, lba }, &payload[10..]))
         }
         TAG_L2P_REMAP => {
-            // Fixed header before the guard discriminator.
-            require_len(payload, 39, "L2P_REMAP header")?;
+            const VALUE_SZ: usize = crate::paged::format::LEAF_VALUE_SIZE;
+            const HEAD: usize = 2 + 8;
+            const VALUE_END: usize = HEAD + VALUE_SZ;
+            // Fixed header (vol_ord + lba + value) before the guard
+            // discriminator byte.
+            require_len(payload, VALUE_END + 1, "L2P_REMAP header")?;
             let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
             let lba = u64::from_be_bytes(payload[2..10].try_into().unwrap());
-            let mut new_value = [0u8; 28];
-            new_value.copy_from_slice(&payload[10..38]);
-            let guard_tag = payload[38];
+            let mut new_value = [0u8; VALUE_SZ];
+            new_value.copy_from_slice(&payload[HEAD..VALUE_END]);
+            let guard_tag = payload[VALUE_END];
+            let after_tag = VALUE_END + 1;
             match guard_tag {
                 L2P_REMAP_GUARD_NONE => Ok((
                     WalOp::L2pRemap {
@@ -315,12 +329,15 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                         new_value: L2pValue(new_value),
                         guard: None,
                     },
-                    &payload[39..],
+                    &payload[after_tag..],
                 )),
                 L2P_REMAP_GUARD_SOME => {
-                    require_len(&payload[39..], 12, "L2P_REMAP guard payload")?;
-                    let pba = u64::from_be_bytes(payload[39..47].try_into().unwrap());
-                    let min_rc = u32::from_be_bytes(payload[47..51].try_into().unwrap());
+                    let guard_end = after_tag + 12;
+                    require_len(&payload[after_tag..], 12, "L2P_REMAP guard payload")?;
+                    let pba =
+                        u64::from_be_bytes(payload[after_tag..after_tag + 8].try_into().unwrap());
+                    let min_rc =
+                        u32::from_be_bytes(payload[after_tag + 8..guard_end].try_into().unwrap());
                     Ok((
                         WalOp::L2pRemap {
                             vol_ord,
@@ -328,7 +345,7 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                             new_value: L2pValue(new_value),
                             guard: Some((pba, min_rc)),
                         },
-                        &payload[51..],
+                        &payload[guard_end..],
                     ))
                 }
                 other => Err(MetaDbError::Corruption(format!(
@@ -338,12 +355,13 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             }
         }
         TAG_L2P_RANGE_DELETE => {
+            const VALUE_SZ: usize = crate::paged::format::LEAF_VALUE_SIZE;
             require_len(payload, 22, "L2P_RANGE_DELETE header")?;
             let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
             let start = u64::from_be_bytes(payload[2..10].try_into().unwrap());
             let end = u64::from_be_bytes(payload[10..18].try_into().unwrap());
             let count = u32::from_be_bytes(payload[18..22].try_into().unwrap()) as usize;
-            let entry_size = 8 + 28;
+            let entry_size = 8 + VALUE_SZ;
             let body_bytes = count
                 .checked_mul(entry_size)
                 .ok_or_else(|| MetaDbError::Corruption("L2P_RANGE_DELETE count overflow".into()))?;
@@ -352,8 +370,8 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             let mut cursor = 22usize;
             for _ in 0..count {
                 let lba = u64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap());
-                let mut value_bytes = [0u8; 28];
-                value_bytes.copy_from_slice(&payload[cursor + 8..cursor + 8 + 28]);
+                let mut value_bytes = [0u8; VALUE_SZ];
+                value_bytes.copy_from_slice(&payload[cursor + 8..cursor + 8 + VALUE_SZ]);
                 captured.push((lba, L2pValue(value_bytes)));
                 cursor += entry_size;
             }

@@ -972,7 +972,7 @@ mod tests {
         let (_d, ps) = mk_store();
         let mut buf = PageBuf::new(ps.clone());
         let pid = buf.alloc_leaf(1).unwrap();
-        let v = L2pValue([0x42u8; 28]);
+        let v = L2pValue([0x42u8; 36]);
         leaf_set(buf.modify(pid, 1).unwrap(), 5, &v).unwrap();
         buf.flush().unwrap();
 
@@ -986,7 +986,7 @@ mod tests {
         let (_d, ps) = mk_store();
         let mut buf = PageBuf::new(ps.clone());
         let pid = buf.alloc_leaf(1).unwrap();
-        let v = L2pValue([0x42u8; 28]);
+        let v = L2pValue([0x42u8; 36]);
         leaf_set(buf.modify(pid, 1).unwrap(), 5, &v).unwrap();
 
         let flushed = buf.dirty_snapshot().write().unwrap();
@@ -1011,8 +1011,8 @@ mod tests {
         let (_d, ps) = mk_store();
         let mut buf = PageBuf::new(ps);
         let pid = buf.alloc_leaf(1).unwrap();
-        let first = L2pValue([0x42u8; 28]);
-        let second = L2pValue([0x24u8; 28]);
+        let first = L2pValue([0x42u8; 36]);
+        let second = L2pValue([0x24u8; 36]);
         leaf_set(buf.modify(pid, 1).unwrap(), 5, &first).unwrap();
 
         let snapshot = buf.dirty_snapshot();
@@ -1055,7 +1055,7 @@ mod tests {
         let page_cache = Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES));
         let mut buf = PageBuf::with_cache(ps.clone(), page_cache.clone());
         let pid = buf.alloc_leaf(1).unwrap();
-        let old = L2pValue([0x11u8; 28]);
+        let old = L2pValue([0x11u8; 36]);
         leaf_set(buf.modify(pid, 1).unwrap(), 7, &old).unwrap();
         buf.flush().unwrap();
         assert_eq!(leaf_value_at(buf.read(pid).unwrap(), 7).unwrap(), Some(old));
@@ -1067,7 +1067,7 @@ mod tests {
         assert_eq!(reused, pid);
         let mut page = Page::zeroed();
         init_leaf(&mut page, 3);
-        let new = L2pValue([0x22u8; 28]);
+        let new = L2pValue([0x22u8; 36]);
         leaf_set(&mut page, 7, &new).unwrap();
         page.seal();
         ps.write_page(reused, &page).unwrap();
@@ -1113,7 +1113,7 @@ mod tests {
             "fresh allocation must evict the stale pinned index incarnation"
         );
         assert_eq!(buf.read_level(reused).unwrap(), 0);
-        let v = L2pValue([0x33u8; 28]);
+        let v = L2pValue([0x33u8; 36]);
         leaf_set(buf.modify(reused, 3).unwrap(), 7, &v).unwrap();
         buf.flush().unwrap();
 
@@ -1139,7 +1139,7 @@ mod tests {
         buf.alloc_pool.push(1);
         let leaf = buf.alloc_leaf(2).unwrap();
         assert_eq!(leaf, 1);
-        let v = L2pValue([0x44u8; 28]);
+        let v = L2pValue([0x44u8; 36]);
         leaf_set(buf.modify(leaf, 2).unwrap(), 9, &v).unwrap();
 
         let flushed = buf.dirty_snapshot().write().unwrap();

@@ -1,4 +1,4 @@
-//! Onyx-aware compact leaf encoding (v1).
+//! Onyx-aware compact leaf encoding (v2 — per-slot seq for apply-time CAS).
 //!
 //! The legacy dense leaf format stored 128 × 28 B `BlockmapValue` records
 //! back-to-back. Onyx's packer puts consecutive LBAs into the same
@@ -12,21 +12,24 @@
 //!   pba, compression, unit_compressed_size, unit_original_size,
 //!   unit_lba_count, slot_offset, crc32, flags
 //!
-//! Per-entry varying field (only 1 of 9):
-//!   offset_in_unit
+//! Per-entry varying fields:
+//!   offset_in_unit  (u16; which 4 KB LBA within the compressed unit)
+//!   seq             (u64; commit-time monotonic seq for seq_guard CAS,
+//!                   added in 0xB2 schema, sentinel 0 = "no guard")
 //!
 //! # On-disk layout (within the 4032 B leaf payload)
 //!
 //! ```text
-//!   [ 0.. 16]  bitmap          128 bits, LE within each byte
-//!   [16.. 17]  unit_count      u8 (number of live entries in unit dict)
-//!   [17.. 18]  format_version  u8 (= COMPACT_VERSION)
-//!   [18..402]  entries         128 × 3 B (slot-indexed dense array)
-//!     entry @ slot s lives at offset 18 + s*3
-//!       [ 0.. 1]  unit_idx        u8 (index into unit dict)
-//!       [ 1.. 3]  offset_in_unit  u16 BE
+//!   [ 0..  16]  bitmap          128 bits, LE within each byte
+//!   [16..  17]  unit_count      u8 (number of live entries in unit dict)
+//!   [17..  18]  format_version  u8 (= COMPACT_VERSION)
+//!   [18..1426]  entries         128 × 11 B (slot-indexed dense array)
+//!     entry @ slot s lives at offset 18 + s*11
+//!       [ 0..  1]  unit_idx        u8 (index into unit dict)
+//!       [ 1..  3]  offset_in_unit  u16 BE
+//!       [ 3.. 11]  seq             u64 BE  (0 = legacy / no seq_guard)
 //!     Unset slots are zero (caller checks bitmap before reading).
-//!   [402..402+26*N]  unit dict (N = unit_count entries × 26 B)
+//!   [1426..1426+26*N]  unit dict (N = unit_count entries × 26 B)
 //!     per unit:
 //!       [ 0.. 8]  base_pba           u64 BE
 //!       [ 8..12]  unit_compressed_sz u32 BE
@@ -43,26 +46,26 @@
 //! A popcount-indexed entries region is a few hundred B smaller for
 //! sparse leaves but makes `leaf_set` / `leaf_clear` O(N) in the leaf
 //! population because every mutation memmoves the entry array's tail.
-//! With slot-indexed entries we trade 384 B of fixed-size headroom for
+//! With slot-indexed entries we trade 1408 B of fixed-size headroom for
 //! O(1) per-slot reads and writes that touch a fixed payload offset.
 //! Onyx's L2P leaves are densely populated in steady state (sequential
 //! writes; packer fills units), so the overhead only appears for
-//! transient sparse states after random deletes. Steady-state size is
-//! identical: 1-unit and 8-unit leaves both encode in 428 B and 610 B
-//! respectively under either layout.
+//! transient sparse states after random deletes.
 //!
-//! # Worst-case sizes for a 128-entry leaf
+//! # Worst-case sizes for a 128-entry leaf (v2 with seq)
 //!
-//! - empty leaf:    18 +   0 + 384 = 402 B   (vs popcount 18 B)
-//! - 1 unit:        18 +  26 + 384 = 428 B   (8.41x vs dense 3600 B)
-//! - 8 units:       18 + 208 + 384 = 610 B   (5.90x)
-//! - 32 units:      18 + 832 + 384 = 1234 B  (2.92x)
-//! - 64 units:      18 + 1664 + 384 = 2066 B (1.74x)
-//! - 128 units:     18 + 3328 + 384 = 3730 B (0.97x — fits in 4032 B payload)
+//! - empty leaf:    18 +    0 + 1408 = 1426 B
+//! - 1 unit:        18 +   26 + 1408 = 1452 B
+//! - 8 units:       18 +  208 + 1408 = 1634 B
+//! - 32 units:      18 +  832 + 1408 = 2258 B
+//! - 64 units:      18 + 1664 + 1408 = 3090 B
+//! - 100 units:     18 + 2600 + 1408 = 4026 B  (≤ 4032 — payload cap)
 //!
-//! Even the pathological all-distinct-units shape fits the payload, so
-//! `encode` never fails on size grounds. Day 2 wires this directly into
-//! `paged::format` (no dense fallback exists, the project has not shipped).
+//! `MAX_UNITS_PER_LEAF` drops from 256 (v1, u8 cap) to 100 (payload
+//! limit). Onyx typical packing is 32 LBA/unit, so a 128-LBA leaf
+//! references ≤ 8 distinct units in steady state; the cap only
+//! triggers on pathologically fragmented workloads (heavy dedup-hit /
+//! 1-LBA-per-unit).
 
 use crate::error::{MetaDbError, Result};
 use crate::paged::format::{LEAF_BITMAP_BYTES, LEAF_ENTRY_COUNT, LEAF_VALUE_SIZE};
@@ -77,7 +80,8 @@ pub const COMPACT_VERSION: u8 = 1;
 pub const COMPACT_HEADER_BYTES: usize = LEAF_BITMAP_BYTES + 1 + 1; // 18
 
 /// Size of one per-entry slot-indexed record on disk.
-pub const COMPACT_ENTRY_BYTES: usize = 3;
+/// Layout: `[unit_idx:u8 | offset_in_unit:u16 BE | seq:u64 BE]`.
+pub const COMPACT_ENTRY_BYTES: usize = 11;
 
 /// Byte footprint of the slot-indexed entries region (always present).
 pub const COMPACT_ENTRIES_REGION_BYTES: usize = LEAF_ENTRY_COUNT * COMPACT_ENTRY_BYTES;
@@ -98,10 +102,12 @@ pub const COMPACT_UNIT_BYTES: usize = 26;
 /// back to it.
 pub const DENSE_FOOTPRINT_BYTES: usize = LEAF_BITMAP_BYTES + LEAF_ENTRY_COUNT * LEAF_VALUE_SIZE;
 
-/// Maximum number of distinct units a single leaf can reference. Limited
-/// by the per-entry `unit_idx: u8` field; with at most 128 populated
-/// slots, the cap is unreachable for the canonical encoder.
-pub const MAX_UNITS_PER_LEAF: usize = 256;
+/// Maximum number of distinct units a single leaf can reference. With
+/// v2 schema (per-slot seq), the entries region is 1408 B which leaves
+/// `(4032 - 1426) / 26 = 100` units of dict space — that's the binding
+/// cap, well below the u8 `unit_idx` ceiling. Onyx typical packing
+/// keeps real leaves well under this.
+pub const MAX_UNITS_PER_LEAF: usize = 100;
 
 /// Byte offset (within the leaf payload) of unit `i` in the dictionary.
 #[inline]
@@ -116,7 +122,7 @@ pub const fn entry_offset(s: usize) -> usize {
 }
 
 /// Total compact-encoded size for a leaf with `unit_count` units. The
-/// entries region is fixed at 384 B regardless of population.
+/// entries region is fixed at 1408 B regardless of population.
 #[inline]
 pub const fn compact_size(unit_count: usize) -> usize {
     COMPACT_UNIT_DICT_OFFSET + unit_count * COMPACT_UNIT_BYTES
@@ -138,8 +144,10 @@ pub(crate) struct UnitMeta {
 }
 
 impl UnitMeta {
-    /// Decompose a 28 B `BlockmapValue` into (unit-shared, per-entry-varying)
-    /// parts. Layout matches `onyx_storage::meta::schema::encode_blockmap_value`.
+    /// Decompose a 36 B `L2pValue` into (unit-shared, per-entry-varying)
+    /// parts. The first 28 B match
+    /// `onyx_storage::meta::schema::encode_blockmap_value`; the last 8 B
+    /// are a big-endian u64 commit-seq (v2 schema, see crate::paged::format::L2P_SEQ_OFFSET).
     #[inline]
     fn from_value(v: &[u8; LEAF_VALUE_SIZE]) -> (Self, EntryDelta) {
         let unit = UnitMeta {
@@ -154,6 +162,7 @@ impl UnitMeta {
         };
         let entry = EntryDelta {
             offset_in_unit: u16::from_be_bytes(v[19..21].try_into().unwrap()),
+            seq: u64::from_be_bytes(v[28..36].try_into().unwrap()),
         };
         (unit, entry)
     }
@@ -186,11 +195,14 @@ impl UnitMeta {
     }
 }
 
-/// Per-entry delta over its unit. Only `offset_in_unit` differs across
-/// LBAs in the same compression unit.
+/// Per-entry delta over its unit. `offset_in_unit` selects which 4 KB
+/// LBA in the compressed unit this slot maps to; `seq` carries the
+/// commit-time monotonic sequence number used by metadb's `seq_guard`
+/// to reject stale concurrent commits (sentinel 0 = no guard).
 #[derive(Clone, Copy)]
 pub(crate) struct EntryDelta {
     pub(crate) offset_in_unit: u16,
+    pub(crate) seq: u64,
 }
 
 impl EntryDelta {
@@ -198,6 +210,7 @@ impl EntryDelta {
     fn write_to(&self, unit_idx: u8, out: &mut [u8; COMPACT_ENTRY_BYTES]) {
         out[0] = unit_idx;
         out[1..3].copy_from_slice(&self.offset_in_unit.to_be_bytes());
+        out[3..11].copy_from_slice(&self.seq.to_be_bytes());
     }
 
     #[inline]
@@ -205,11 +218,18 @@ impl EntryDelta {
         debug_assert!(buf.len() >= COMPACT_ENTRY_BYTES);
         let unit_idx = buf[0];
         let offset_in_unit = u16::from_be_bytes(buf[1..3].try_into().unwrap());
-        (unit_idx, EntryDelta { offset_in_unit })
+        let seq = u64::from_be_bytes(buf[3..11].try_into().unwrap());
+        (
+            unit_idx,
+            EntryDelta {
+                offset_in_unit,
+                seq,
+            },
+        )
     }
 }
 
-/// Reassemble a 28 B `BlockmapValue` from its unit + entry parts.
+/// Reassemble a 36 B `L2pValue` from its unit + entry parts.
 /// Inverse of `UnitMeta::from_value`.
 #[inline]
 fn compose(unit: &UnitMeta, entry: &EntryDelta) -> [u8; LEAF_VALUE_SIZE] {
@@ -223,6 +243,7 @@ fn compose(unit: &UnitMeta, entry: &EntryDelta) -> [u8; LEAF_VALUE_SIZE] {
     v[21..25].copy_from_slice(&unit.crc32.to_be_bytes());
     v[25..27].copy_from_slice(&unit.slot_offset.to_be_bytes());
     v[27] = unit.flags;
+    v[28..36].copy_from_slice(&entry.seq.to_be_bytes());
     v
 }
 
@@ -279,8 +300,9 @@ pub(crate) fn write_unit(payload: &mut [u8], idx: usize, u: &UnitMeta) {
 
 /// Read the entry record at `slot`. Returns `(unit_idx, EntryDelta)`.
 /// Callers must check the bitmap first; an unset slot's bytes are zero
-/// by invariant but `(0, EntryDelta { offset_in_unit: 0 })` is
-/// indistinguishable from a real entry pointing at unit 0 with offset 0.
+/// by invariant but `(0, EntryDelta { offset_in_unit: 0, seq: 0 })` is
+/// indistinguishable from a real entry pointing at unit 0 with offset 0
+/// and a legacy seq=0 sentinel.
 #[inline]
 pub(crate) fn read_entry(payload: &[u8], slot: usize) -> (u8, EntryDelta) {
     let off = entry_offset(slot);
@@ -296,7 +318,7 @@ pub(crate) fn write_entry(payload: &mut [u8], slot: usize, unit_idx: u8, e: &Ent
     e.write_to(unit_idx, dst);
 }
 
-/// Zero the 3 B entry slot. Does not touch the bitmap.
+/// Zero the per-slot entry record. Does not touch the bitmap.
 #[inline]
 pub(crate) fn zero_entry(payload: &mut [u8], slot: usize) {
     let off = entry_offset(slot);
@@ -320,7 +342,7 @@ pub(crate) fn payload_bit_clear(payload: &mut [u8], slot: usize) {
     payload[slot / 8] &= !(1u8 << (slot % 8));
 }
 
-/// Decompose a 28 B value into (UnitMeta, EntryDelta). Re-export of
+/// Decompose a 36 B value into (UnitMeta, EntryDelta). Re-export of
 /// the private helper for use by the leaf accessors.
 #[inline]
 pub(crate) fn decompose_value(v: &[u8; LEAF_VALUE_SIZE]) -> (UnitMeta, EntryDelta) {
@@ -361,7 +383,7 @@ pub(crate) fn find_or_append_unit(payload: &mut [u8], target: &UnitMeta) -> Opti
 }
 
 /// Maximum unit-dict capacity given the payload size. With 4032 B
-/// payload that's `(4032 - 402) / 26 = 139`.
+/// payload that's `(4032 - 1426) / 26 = 100`.
 #[inline]
 pub const fn max_units_per_payload(payload_len: usize) -> usize {
     if payload_len <= COMPACT_UNIT_DICT_OFFSET {
@@ -522,9 +544,10 @@ pub fn encode(
     // HashMap. We bound the dict to 128 (one per slot) which is well
     // below the u8 unit_idx ceiling.
     let mut units: Vec<UnitMeta> = Vec::with_capacity(8);
-    // Pre-size the output buffer; we'll patch the dict size after.
-    // Worst case is 128 distinct units = 3730 B (still fits in payload).
-    let mut out = vec![0u8; compact_size(LEAF_ENTRY_COUNT)];
+    // Pre-size the output buffer to the v2 worst case (100 distinct
+    // units = 4026 B; the encoder rejects anything past that). We'll
+    // truncate to the actual dict size after.
+    let mut out = vec![0u8; compact_size(MAX_UNITS_PER_LEAF)];
     out[..LEAF_BITMAP_BYTES].copy_from_slice(bitmap);
     out[LEAF_BITMAP_BYTES + 1] = COMPACT_VERSION;
 
@@ -660,8 +683,10 @@ pub fn decode_all(encoded: &[u8]) -> [Option<[u8; LEAF_VALUE_SIZE]>; LEAF_ENTRY_
 mod tests {
     use super::*;
 
-    /// Build a 28 B BlockmapValue matching onyx-storage's
-    /// `encode_blockmap_value` byte layout.
+    /// Build a 36 B L2pValue: bytes [0..28] match onyx-storage's
+    /// `encode_blockmap_value` byte layout, bytes [28..36] are the
+    /// seq field (left as zero by this helper — tests that need a
+    /// specific seq must overwrite bytes [28..36] explicitly).
     pub(crate) fn bv(
         pba: u64,
         compression: u8,
@@ -710,8 +735,8 @@ mod tests {
     fn empty_leaf_round_trips() {
         let (bm, vals) = empty_leaf_input();
         let enc = encode(&bm, &vals);
-        // 18 header + 384 entries (zero) + 0 unit dict = 402.
-        assert_eq!(enc.len(), 402);
+        // 18 header + 1408 entries (zero) + 0 unit dict = 1426.
+        assert_eq!(enc.len(), 1426);
         for s in 0..LEAF_ENTRY_COUNT {
             assert_eq!(decode_at(&enc, s), None);
         }
@@ -736,10 +761,11 @@ mod tests {
             set(&mut bm, &mut vals, i, v);
         }
         let enc = encode(&bm, &vals);
-        // 18 + 384 + 26 = 428
-        assert_eq!(enc.len(), 428);
+        // 18 + 1408 + 26 = 1452 (v2 with per-slot seq)
+        assert_eq!(enc.len(), 1452);
         let cr = DENSE_FOOTPRINT_BYTES as f64 / enc.len() as f64;
-        assert!(cr > 8.0, "CR too low: {cr}");
+        // v1 hit ~8.4x; v2's bigger per-slot record pulls this to ~3.2x.
+        assert!(cr > 3.0, "CR too low: {cr}");
 
         for i in 0..LEAF_ENTRY_COUNT {
             let got = decode_at(&enc, i).expect("set");
@@ -767,10 +793,11 @@ mod tests {
             set(&mut bm, &mut vals, i, v);
         }
         let enc = encode(&bm, &vals);
-        // 18 + 384 + 8*26 = 610
-        assert_eq!(enc.len(), 610);
+        // 18 + 1408 + 8*26 = 1634 (v2 with per-slot seq)
+        assert_eq!(enc.len(), 1634);
         let cr = DENSE_FOOTPRINT_BYTES as f64 / enc.len() as f64;
-        assert!(cr >= 5.0, "8-unit CR {cr} below 5x");
+        // v1 hit ~5.9x; v2's bigger per-slot pulls this to ~2.8x.
+        assert!(cr >= 2.5, "8-unit CR {cr} below 2.5x");
 
         let all = decode_all(&enc);
         for i in 0..LEAF_ENTRY_COUNT {
@@ -810,16 +837,18 @@ mod tests {
 
     #[test]
     fn pathological_distinct_units_fits_payload() {
-        // 128 distinct units => 18 + 384 + 26*128 = 3730 B,
-        // well within the 4032 B leaf payload.
+        // v2 caps at MAX_UNITS_PER_LEAF = 100 (= (4032 - 1426) / 26).
+        // 100 distinct units => 18 + 1408 + 26*100 = 4026 B, exactly at
+        // the 4032 B payload (6 B headroom). Going past 100 distinct
+        // units is rejected by the encoder.
         let (mut bm, mut vals) = empty_leaf_input();
-        for i in 0..LEAF_ENTRY_COUNT {
+        for i in 0..MAX_UNITS_PER_LEAF {
             let v = bv(0x3000 + i as u64, 1, 500, 4096, 1, 0, i as u32, 0, 0);
             set(&mut bm, &mut vals, i, v);
         }
         let enc = encode(&bm, &vals);
-        assert_eq!(enc.len(), 3730);
-        for s in 0..LEAF_ENTRY_COUNT {
+        assert_eq!(enc.len(), 4026);
+        for s in 0..MAX_UNITS_PER_LEAF {
             assert_eq!(decode_at(&enc, s), Some(vals[s]));
         }
     }
@@ -1035,7 +1064,11 @@ mod tests {
         let mut p = fresh_payload();
         let cap = max_units_per_payload(p.len());
 
-        // Fill: each leaf slot 0..min(cap,128) gets its own unit.
+        // Fill: each leaf slot 0..min(cap,128) gets its own unit. With
+        // v2's 11 B per-slot record the payload-bound cap is 100, well
+        // below `LEAF_ENTRY_COUNT = 128`, so we only fill the first
+        // `cap` slots and leave the rest cold to act as overflow-slots
+        // for the second phase.
         let live_slots: Vec<usize> = (0..cap.min(LEAF_ENTRY_COUNT)).collect();
         for &slot in &live_slots {
             let v = bv(
@@ -1054,15 +1087,11 @@ mod tests {
             payload_bit_set_true(&mut p, slot);
             write_entry(&mut p, slot, idx, &e);
         }
-        // If cap > LEAF_ENTRY_COUNT, dict isn't truly full yet — pre-test
-        // requires we filled it. With 4032-byte payload, cap=139 > 128
-        // so we always have headroom; instead, force overflow by adding
-        // a 129th *new* unit (must be done by re-using a slot we'll
-        // first clear so we have a place to write). Skip the overflow
-        // step if cap < LEAF_ENTRY_COUNT (impossible at PAGE_PAYLOAD_SIZE).
-        assert!(
-            cap >= LEAF_ENTRY_COUNT,
-            "regression: dict capacity dropped below 128"
+        // Confirm we filled the dict to its payload-bound cap.
+        assert_eq!(
+            read_unit_count(&p) as usize,
+            cap,
+            "regression: did not saturate dict capacity"
         );
 
         // Now delete half the slots' entries. Their units stay in the
@@ -1154,17 +1183,20 @@ mod tests {
 
     #[test]
     fn fixed_offsets_compile_time_invariants() {
-        // Sanity for layout constants and the fact that even the
-        // worst-case shape fits inside the 4032 B leaf payload.
+        // Sanity for v2 layout constants. With 11 B per-slot records
+        // (unit_idx + offset + seq) the entries region is 1408 B and
+        // the unit-dict offset moves to 1426. The payload-bound cap on
+        // distinct units drops from v1's 139 to v2's 100.
         assert_eq!(COMPACT_HEADER_BYTES, 18);
         assert_eq!(COMPACT_ENTRIES_OFFSET, 18);
-        assert_eq!(COMPACT_UNIT_DICT_OFFSET, 402);
-        assert_eq!(COMPACT_ENTRY_BYTES, 3);
+        assert_eq!(COMPACT_UNIT_DICT_OFFSET, 1426);
+        assert_eq!(COMPACT_ENTRY_BYTES, 11);
         assert_eq!(COMPACT_UNIT_BYTES, 26);
-        assert_eq!(compact_size(0), 402);
-        assert_eq!(compact_size(1), 428);
-        assert_eq!(compact_size(8), 610);
-        assert_eq!(compact_size(128), 3730);
-        assert!(compact_size(128) <= crate::page::PAGE_PAYLOAD_SIZE);
+        assert_eq!(MAX_UNITS_PER_LEAF, 100);
+        assert_eq!(compact_size(0), 1426);
+        assert_eq!(compact_size(1), 1452);
+        assert_eq!(compact_size(8), 1634);
+        assert_eq!(compact_size(MAX_UNITS_PER_LEAF), 4026);
+        assert!(compact_size(MAX_UNITS_PER_LEAF) <= crate::page::PAGE_PAYLOAD_SIZE);
     }
 }
