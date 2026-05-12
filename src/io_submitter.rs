@@ -67,10 +67,14 @@ use crate::types::PageId;
 
 /// Submission-queue depth for the centralised ring. Must accommodate
 /// the worst-case fan-in (one in-flight op per producer on every apply
-/// lane plus the flush thread). 1024 leaves comfortable headroom over
-/// the current shard counts (16 L2P × 16 RC × 8 dedup ≈ 40 producers).
+/// lane plus the flush thread). 8192 leaves headroom for async-dedup
+/// cuckoo bursts that arrive on the same ring as foreground L2P /
+/// refcount writes without saturating the SQ. Earlier sizing at 1024
+/// SQ became the throughput ceiling once dedup_apply was made
+/// fire-and-forget — see `io_submitter_inflight_max=1024` in the
+/// async-dedup baseline diagnostic.
 #[cfg(target_os = "linux")]
-const SQ_ENTRIES: u32 = 1024;
+const SQ_ENTRIES: u32 = 8192;
 
 /// Channel capacity. Sized to twice the SQ so a producer that arrives
 /// while the submitter is mid-batch does not immediately block — the

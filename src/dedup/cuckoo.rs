@@ -49,7 +49,7 @@ use crate::dedup_types::{DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash8};
 use crate::error::{MetaDbError, Result};
 use crate::metrics::DedupPutStageTimings;
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
-use crate::page_store::PageStore;
+use crate::page_store::{IoLaneClass, PageStore};
 use crate::paged_meta;
 use crate::types::{Lsn, PageId};
 
@@ -725,7 +725,7 @@ impl CuckooHash {
         page.write_header(&header);
         page.seal();
         let publish_started = std::time::Instant::now();
-        self.page_store.write_page(page_id, &page)?;
+        self.page_store.write_page_for_class(page_id, &page, IoLaneClass::Dedup)?;
         self.page_cache.replace_or_insert(page_id, Arc::new(page));
         if let Some(t) = timings.as_deref_mut() {
             t.cuckoo_page_write_publish += publish_started.elapsed();
@@ -774,7 +774,7 @@ impl CuckooHash {
             page.write_header(&header);
             page.seal();
             let publish_started = std::time::Instant::now();
-            self.page_store.write_page(page_id, &page)?;
+            self.page_store.write_page_for_class(page_id, &page, IoLaneClass::Dedup)?;
             self.page_cache.replace_or_insert(page_id, Arc::new(page));
             if let Some(t) = timings.as_deref_mut() {
                 t.cuckoo_page_write_publish += publish_started.elapsed();

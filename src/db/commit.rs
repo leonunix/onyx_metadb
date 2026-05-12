@@ -1738,8 +1738,22 @@ impl Db {
         }
 
         // Fan dedup work out across shards. Each non-empty bucket
-        // gets its own apply closure on its shard's lane; we collect
-        // outcomes from all of them before returning.
+        // gets its own apply closure on its shard's lane.
+        //
+        // Hot-path commits only emit `DedupPut` / `DedupPutGuarded` /
+        // `DedupDelete`, all returning the `ApplyOutcome::Dedup`
+        // marker that no caller consumes — they only inspect
+        // `L2pRemap` / `RefcountNew` slots earlier. For those we
+        // enqueue and short-circuit the wait. `DedupCompare*` still
+        // synchronises so the cleanup path's CAS returns its real
+        // `applied` flag.
+        let dedup_async_safe = plan.ops.iter().all(|op| {
+            !matches!(
+                op,
+                WalOp::DedupCompareDelete { .. } | WalOp::DedupComparePut { .. }
+            )
+        });
+
         let mut dedup_receivers: Vec<
             crossbeam_channel::Receiver<Result<Vec<(usize, ApplyOutcome)>>>,
         > = Vec::new();
@@ -1757,38 +1771,74 @@ impl Db {
             let dedup_reverse = self.dedup_reverse.clone();
             let refcount_shards_arc = refcount_shards_arc.clone();
             let metrics = self.metrics.clone();
-            let (tx, rx) = crossbeam_channel::bounded(1);
-            pending.set(Box::new(move || {
-                let ready_queue_wait = ready_at.elapsed();
-                let exec_started = std::time::Instant::now();
-                let outcomes = Self::apply_dedup_indices_to(
-                    dedup_index.as_ref(),
-                    dedup_reverse.as_ref(),
-                    refcount_shards_arc.as_slice(),
-                    metrics.as_ref(),
-                    ops.as_slice(),
-                    bucket,
-                    lsn,
-                );
-                metrics.record_dedup_lane_task(
-                    bucket_ops,
-                    ready_queue_wait,
-                    exec_started.elapsed(),
-                );
-                let _ = tx.send(outcomes);
-            }));
-            dedup_receivers.push(rx);
+            if dedup_async_safe {
+                pending.set(Box::new(move || {
+                    let ready_queue_wait = ready_at.elapsed();
+                    let exec_started = std::time::Instant::now();
+                    let _outcomes = Self::apply_dedup_indices_to(
+                        dedup_index.as_ref(),
+                        dedup_reverse.as_ref(),
+                        refcount_shards_arc.as_slice(),
+                        metrics.as_ref(),
+                        ops.as_slice(),
+                        bucket,
+                        lsn,
+                    );
+                    metrics.record_dedup_lane_task(
+                        bucket_ops,
+                        ready_queue_wait,
+                        exec_started.elapsed(),
+                    );
+                }));
+            } else {
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                pending.set(Box::new(move || {
+                    let ready_queue_wait = ready_at.elapsed();
+                    let exec_started = std::time::Instant::now();
+                    let outcomes = Self::apply_dedup_indices_to(
+                        dedup_index.as_ref(),
+                        dedup_reverse.as_ref(),
+                        refcount_shards_arc.as_slice(),
+                        metrics.as_ref(),
+                        ops.as_slice(),
+                        bucket,
+                        lsn,
+                    );
+                    metrics.record_dedup_lane_task(
+                        bucket_ops,
+                        ready_queue_wait,
+                        exec_started.elapsed(),
+                    );
+                    let _ = tx.send(outcomes);
+                }));
+                dedup_receivers.push(rx);
+            }
         }
         timing.dedup_enqueue = dedup_enqueue_started.elapsed();
         let dedup_wait_started = std::time::Instant::now();
-        for rx in dedup_receivers {
-            let dedup_outcomes = rx.recv().map_err(|_| {
-                MetaDbError::Corruption(
-                    "persistent dedup lane worker failed to return a result".into(),
-                )
-            })??;
-            for (idx, outcome) in dedup_outcomes {
-                outcomes[idx] = Some(outcome);
+        if dedup_async_safe {
+            for (idx, op) in plan.ops.iter().enumerate() {
+                if outcomes[idx].is_none()
+                    && matches!(
+                        op,
+                        WalOp::DedupPut { .. }
+                            | WalOp::DedupPutGuarded { .. }
+                            | WalOp::DedupDelete { .. }
+                    )
+                {
+                    outcomes[idx] = Some(ApplyOutcome::Dedup);
+                }
+            }
+        } else {
+            for rx in dedup_receivers {
+                let dedup_outcomes = rx.recv().map_err(|_| {
+                    MetaDbError::Corruption(
+                        "persistent dedup lane worker failed to return a result".into(),
+                    )
+                })??;
+                for (idx, outcome) in dedup_outcomes {
+                    outcomes[idx] = Some(outcome);
+                }
             }
         }
         timing.dedup_wait = dedup_wait_started.elapsed();

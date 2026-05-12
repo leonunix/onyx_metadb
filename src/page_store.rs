@@ -167,13 +167,42 @@ fn new_rc_locks() -> Box<[Mutex<()>]> {
         .into_boxed_slice()
 }
 
-/// Default pool size. 8 submitters × SQ=1024 SQEs/ring = 8 192
-/// concurrent in-flight IOs on the page file, well within what a
-/// modern NVMe (and the multi-queue block layer) can sustain without
-/// any one ring becoming a serialisation point. Each ring has its own
-/// kernel-side worker, so contention is at the device level rather
-/// than the submitter level.
+/// Default pool size. Single submitter with the larger SQ_ENTRIES
+/// gives one ring deep enough (8192 SQEs) to absorb async-dedup
+/// cuckoo bursts plus foreground L2P / refcount writes without
+/// saturating. fsync fan-out stays at one submit_and_wait round
+/// trip. Higher pool sizes were tested and tank sync-mode throughput
+/// (fan-out fsync cost > benefit at low concurrency) without helping
+/// async-mode beyond what a deeper SQ already covers.
 pub const DEFAULT_IO_SUBMITTER_POOL_SIZE: usize = 1;
+
+/// Per-IO routing class. The pool keeps one [`IoSubmitter`] per
+/// variant so independent write streams cannot saturate one another's
+/// SQ. The hot lane mapping:
+///
+/// * `L2p` — paged radix tree writes from `PagedL2p` (single most
+///   numerous foreground writer; gates commit ack).
+/// * `Refcount` — `paged_meta` writes from refcount delta apply and
+///   the legacy dedup_reverse path (lower volume, also commit-sync).
+/// * `Dedup` — cuckoo page writes from the dedup_index apply lane.
+///   These run async w.r.t. commit ack, so bursts here must not stall
+///   L2p / Refcount writes that commit threads still wait on.
+///
+/// Variant ordinals must be `0..N` and contiguous so the
+/// [`PageStore::io_submitter_for_class`] lookup is a slice index. Add
+/// new variants only when the pool size grows in lockstep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoLaneClass {
+    L2p = 0,
+    Refcount = 1,
+    Dedup = 2,
+}
+
+impl IoLaneClass {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
 
 fn make_io_submitters(file: &File, count: usize) -> Box<[IoSubmitter]> {
     #[cfg(target_os = "linux")]
@@ -513,13 +542,11 @@ impl PageStore {
     /// Pick an `IoSubmitter` for a write of `pid`. Returns `None` when
     /// io_uring is unavailable (callers fall back to pwrite).
     ///
-    /// Routing is intentionally trivial — `pid % pool_size`. Sequential
-    /// pid allocation and `coalesce_sealed_runs` already group adjacent
-    /// pages into the same run, so a single coalesced run lands on one
-    /// submitter (good for `IORING_OP_WRITEV` batching). Runs from
-    /// different shards / different cycles fall on different
-    /// submitters because their pids interleave through the shared
-    /// allocator.
+    /// Legacy hash routing kept for callers that have no natural lane
+    /// class (recovery, verifier tooling, single-writer test
+    /// fixtures). Production hot writers should go through
+    /// [`Self::io_submitter_for_class`] so they pin to their own
+    /// submitter and cannot saturate the SQ of a sibling lane.
     fn io_submitter_for(&self, pid: PageId) -> Option<&IoSubmitter> {
         if self.io_submitters.is_empty() {
             None
@@ -527,6 +554,15 @@ impl PageStore {
             let idx = (pid as usize) % self.io_submitters.len();
             Some(&self.io_submitters[idx])
         }
+    }
+
+    /// Pick the [`IoSubmitter`] reserved for `class`. Returns `None`
+    /// when io_uring is unavailable, or when the pool is smaller than
+    /// expected (pre-upgrade installs / test fixtures that build
+    /// `PageStore` with a forced pool size). In both fallbacks the
+    /// caller drops to `pwrite`, preserving the on-disk contract.
+    fn io_submitter_for_class(&self, class: IoLaneClass) -> Option<&IoSubmitter> {
+        self.io_submitters.get(class.index())
     }
 
     /// Shared epoch coordinator. Lock-free L2P readers `pin()` here
@@ -602,15 +638,24 @@ impl PageStore {
     /// Write `page` at `page_id`. The caller is responsible for having
     /// called [`Page::seal`] first; `write_page` does not reseal.
     pub fn write_page(&self, page_id: PageId, page: &Page) -> Result<()> {
+        self.write_page_for_class(page_id, page, IoLaneClass::L2p)
+    }
+
+    /// Write `page` at `page_id`, routed through the [`IoLaneClass`]
+    /// submitter so dedup / refcount bursts cannot saturate the L2p
+    /// SQ. Caller must have sealed the page; this method does not
+    /// reseal.
+    pub fn write_page_for_class(
+        &self,
+        page_id: PageId,
+        page: &Page,
+        class: IoLaneClass,
+    ) -> Result<()> {
         self.check_in_range(page_id)?;
         let started = Instant::now();
-        // Prefer the centralised io_submitter so cuckoo / paged_meta /
-        // refcount staged single-page writes coalesce with every other
-        // page-file write through one ring. The submitter is sync from
-        // the caller's perspective: returns once the kernel CQE has
-        // been harvested, so subsequent `sync` is durable. Fall back
-        // to direct pwrite when io_uring is unavailable.
-        if let Some(submitter) = self.io_submitter_for(page_id) {
+        if let Some(submitter) = self.io_submitter_for_class(class) {
+            submitter.submit_write(page_id, Arc::new(page.clone()))?;
+        } else if let Some(submitter) = self.io_submitter_for(page_id) {
             submitter.submit_write(page_id, Arc::new(page.clone()))?;
         } else {
             self.file
@@ -660,7 +705,15 @@ impl PageStore {
         Ok(())
     }
 
-    pub fn write_sealed_page_runs(&self, mut pages: Vec<(PageId, Arc<Page>)>) -> Result<()> {
+    pub fn write_sealed_page_runs(&self, pages: Vec<(PageId, Arc<Page>)>) -> Result<()> {
+        self.write_sealed_page_runs_for_class(pages, IoLaneClass::L2p)
+    }
+
+    pub fn write_sealed_page_runs_for_class(
+        &self,
+        mut pages: Vec<(PageId, Arc<Page>)>,
+        class: IoLaneClass,
+    ) -> Result<()> {
         if pages.is_empty() {
             return Ok(());
         }
@@ -668,24 +721,19 @@ impl PageStore {
         let bytes = ops * PAGE_SIZE;
         pages.sort_unstable_by_key(|(pid, _)| *pid);
         let started = Instant::now();
-        // Prefer the centralised submitter pool so flush / cuckoo /
-        // paged sealed writes spread across N parallel io_uring rings
-        // (SQ=1024 each) rather than serialising through a single SQ
-        // that a background writeback burst could saturate. Routing is
-        // `pid % pool_size`: contiguous pid runs land on one
-        // submitter (one `IORING_OP_WRITEV`); non-contiguous runs
-        // naturally distribute across submitters.
-        if !self.io_submitters.is_empty() {
-            // Coalesce contiguous pids into runs (each becomes one
-            // `IORING_OP_WRITEV` SQE). Cap each run at
-            // `MAX_SEALED_WRITE_RUN_PAGES` so the iovec count per
-            // writev stays well under IOV_MAX.
+        // Route through the lane-class submitter so dedup / refcount /
+        // L2p write streams cannot saturate one another's SQ. Falls
+        // back to hash routing (legacy behaviour) when the pool is
+        // smaller than expected, and to pwrite when io_uring is
+        // unavailable.
+        let class_submitter = self.io_submitter_for_class(class);
+        if class_submitter.is_some() || !self.io_submitters.is_empty() {
             let runs = coalesce_sealed_runs(pages, MAX_SEALED_WRITE_RUN_PAGES);
             let receivers: Vec<_> = runs
                 .into_iter()
                 .map(|(start, run_pages)| {
-                    let submitter = self
-                        .io_submitter_for(start)
+                    let submitter = class_submitter
+                        .or_else(|| self.io_submitter_for(start))
                         .expect("io_submitters non-empty above");
                     submitter.submit_write_run_async(start, run_pages)
                 })
