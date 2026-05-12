@@ -83,13 +83,24 @@ pub struct PageStore {
     path: PathBuf,
     file: File,
     read_pool: PageReadPool,
-    /// Centralised submitter for single-page `write_page`. `None` when
-    /// io_uring is unavailable; callers fall back to direct pwrite.
-    /// The previous design's hot path was 99.995% pwrite (cuckoo
-    /// bucket updates, `paged_meta::write_chain`, refcount staged
-    /// pages); routing these through one ring with deep SQ is the
-    /// central perf win targeted by this submitter.
-    io_submitter: Option<IoSubmitter>,
+    /// Pool of io_uring submitters. Each entry owns its own ring +
+    /// worker thread, so concurrent writers from different shards /
+    /// background workers don't share an SQ — a writeback burst on
+    /// one submitter cannot stall commit-apply writes routed to a
+    /// different submitter.
+    ///
+    /// Routing: every write API hashes its `PageId` into the pool
+    /// (`io_submitter_for(pid) = io_submitters[pid as usize % len]`).
+    /// Allocation is sequential, so adjacent pids land on the same
+    /// submitter and coalesce into the same `IORING_OP_WRITEV` SQE;
+    /// non-adjacent runs from disparate shards naturally spread across
+    /// rings. `sync()` fans out `IORING_OP_FSYNC` to every submitter
+    /// in parallel because io_uring fsync only orders writes on the
+    /// same ring.
+    ///
+    /// Empty when io_uring is unavailable (old kernel, sandboxed
+    /// environment); callers fall back to direct pwrite + fdatasync.
+    io_submitters: Box<[IoSubmitter]>,
     #[cfg(target_os = "linux")]
     read_uring: Mutex<Option<IoUring>>,
     #[cfg(target_os = "linux")]
@@ -156,15 +167,36 @@ fn new_rc_locks() -> Box<[Mutex<()>]> {
         .into_boxed_slice()
 }
 
-fn make_io_submitter(file: &File) -> Option<IoSubmitter> {
+/// Default pool size. 8 submitters × SQ=1024 SQEs/ring = 8 192
+/// concurrent in-flight IOs on the page file, well within what a
+/// modern NVMe (and the multi-queue block layer) can sustain without
+/// any one ring becoming a serialisation point. Each ring has its own
+/// kernel-side worker, so contention is at the device level rather
+/// than the submitter level.
+pub const DEFAULT_IO_SUBMITTER_POOL_SIZE: usize = 1;
+
+fn make_io_submitters(file: &File, count: usize) -> Box<[IoSubmitter]> {
     #[cfg(target_os = "linux")]
     {
-        IoSubmitter::start(file.as_raw_fd())
+        let count = count.max(1);
+        let mut subs: Vec<IoSubmitter> = Vec::with_capacity(count);
+        for _ in 0..count {
+            match IoSubmitter::start(file.as_raw_fd()) {
+                Some(sub) => subs.push(sub),
+                None => {
+                    // First submitter failed — io_uring unavailable.
+                    // Bail out empty so callers fall back to pwrite.
+                    return Box::new([]);
+                }
+            }
+        }
+        subs.into_boxed_slice()
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = file;
-        None
+        let _ = count;
+        Box::new([])
     }
 }
 
@@ -300,12 +332,12 @@ impl PageStore {
         // will pre-extend to FIRST_DATA_PAGE + grow_chunk.
         file.set_len(FIRST_DATA_PAGE * PAGE_SIZE as u64)?;
         let read_pool = PageReadPool::start(&file)?;
-        let io_submitter = make_io_submitter(&file);
+        let io_submitters = make_io_submitters(&file, DEFAULT_IO_SUBMITTER_POOL_SIZE);
         Ok(Self {
             path,
             file,
             read_pool,
-            io_submitter,
+            io_submitters,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
             #[cfg(target_os = "linux")]
@@ -347,7 +379,7 @@ impl PageStore {
         }
         let file_end_pages = size / PAGE_SIZE as u64;
         let read_pool = PageReadPool::start(&file)?;
-        let io_submitter = make_io_submitter(&file);
+        let io_submitters = make_io_submitters(&file, DEFAULT_IO_SUBMITTER_POOL_SIZE);
         tracing::info!(
             path = %path.display(),
             high_water_pages = file_end_pages,
@@ -358,7 +390,7 @@ impl PageStore {
             path,
             file,
             read_pool,
-            io_submitter,
+            io_submitters,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
             #[cfg(target_os = "linux")]
@@ -404,7 +436,7 @@ impl PageStore {
         }
         let file_end_pages = size / PAGE_SIZE as u64;
         let read_pool = PageReadPool::start(&file)?;
-        let io_submitter = make_io_submitter(&file);
+        let io_submitters = make_io_submitters(&file, DEFAULT_IO_SUBMITTER_POOL_SIZE);
         // Walk every page in [FIRST_DATA_PAGE, file_end_pages). Typed pages
         // extend the recovered `high_water`; Free pages and all-zero punched
         // holes are reusable. A zero suffix past the last typed page is
@@ -440,7 +472,7 @@ impl PageStore {
             path,
             file,
             read_pool,
-            io_submitter,
+            io_submitters,
             #[cfg(target_os = "linux")]
             read_uring: Mutex::new(new_read_uring()),
             #[cfg(target_os = "linux")]
@@ -468,7 +500,7 @@ impl PageStore {
     /// the same handle is fine; calling with different handles is a
     /// no-op after the first.
     pub fn attach_metrics(&self, metrics: Arc<MetaMetrics>) {
-        if let Some(submitter) = self.io_submitter.as_ref() {
+        for submitter in self.io_submitters.iter() {
             submitter.attach_metrics(Arc::clone(&metrics));
         }
         let _ = self.metrics.set(metrics);
@@ -476,6 +508,25 @@ impl PageStore {
 
     fn metrics(&self) -> Option<&Arc<MetaMetrics>> {
         self.metrics.get()
+    }
+
+    /// Pick an `IoSubmitter` for a write of `pid`. Returns `None` when
+    /// io_uring is unavailable (callers fall back to pwrite).
+    ///
+    /// Routing is intentionally trivial — `pid % pool_size`. Sequential
+    /// pid allocation and `coalesce_sealed_runs` already group adjacent
+    /// pages into the same run, so a single coalesced run lands on one
+    /// submitter (good for `IORING_OP_WRITEV` batching). Runs from
+    /// different shards / different cycles fall on different
+    /// submitters because their pids interleave through the shared
+    /// allocator.
+    fn io_submitter_for(&self, pid: PageId) -> Option<&IoSubmitter> {
+        if self.io_submitters.is_empty() {
+            None
+        } else {
+            let idx = (pid as usize) % self.io_submitters.len();
+            Some(&self.io_submitters[idx])
+        }
     }
 
     /// Shared epoch coordinator. Lock-free L2P readers `pin()` here
@@ -559,7 +610,7 @@ impl PageStore {
         // the caller's perspective: returns once the kernel CQE has
         // been harvested, so subsequent `sync` is durable. Fall back
         // to direct pwrite when io_uring is unavailable.
-        if let Some(submitter) = self.io_submitter.as_ref() {
+        if let Some(submitter) = self.io_submitter_for(page_id) {
             submitter.submit_write(page_id, Arc::new(page.clone()))?;
         } else {
             self.file
@@ -617,13 +668,14 @@ impl PageStore {
         let bytes = ops * PAGE_SIZE;
         pages.sort_unstable_by_key(|(pid, _)| *pid);
         let started = Instant::now();
-        // Prefer the centralised submitter so flush / cuckoo / paged
-        // sealed writes coalesce with single-page write_page traffic
-        // through one ring. The old shared-uring path capped at
-        // `MAX_SEALED_WRITE_URING_RUNS = 16` SQEs per
-        // `submit_and_wait`; the submitter has SQ=1024 and batches
-        // arbitrarily many concurrent runs per ring transition.
-        if let Some(submitter) = self.io_submitter.as_ref() {
+        // Prefer the centralised submitter pool so flush / cuckoo /
+        // paged sealed writes spread across N parallel io_uring rings
+        // (SQ=1024 each) rather than serialising through a single SQ
+        // that a background writeback burst could saturate. Routing is
+        // `pid % pool_size`: contiguous pid runs land on one
+        // submitter (one `IORING_OP_WRITEV`); non-contiguous runs
+        // naturally distribute across submitters.
+        if !self.io_submitters.is_empty() {
             // Coalesce contiguous pids into runs (each becomes one
             // `IORING_OP_WRITEV` SQE). Cap each run at
             // `MAX_SEALED_WRITE_RUN_PAGES` so the iovec count per
@@ -631,7 +683,12 @@ impl PageStore {
             let runs = coalesce_sealed_runs(pages, MAX_SEALED_WRITE_RUN_PAGES);
             let receivers: Vec<_> = runs
                 .into_iter()
-                .map(|(start, run_pages)| submitter.submit_write_run_async(start, run_pages))
+                .map(|(start, run_pages)| {
+                    let submitter = self
+                        .io_submitter_for(start)
+                        .expect("io_submitters non-empty above");
+                    submitter.submit_write_run_async(start, run_pages)
+                })
                 .collect::<Result<Vec<_>>>()?;
             let mut first_err: Option<MetaDbError> = None;
             for rx in receivers {
@@ -1302,8 +1359,40 @@ impl PageStore {
     /// kernel state regardless of the path the writes took.
     pub fn sync(&self) -> Result<()> {
         let started = Instant::now();
-        if let Some(submitter) = self.io_submitter.as_ref() {
-            submitter.submit_fsync()?;
+        if !self.io_submitters.is_empty() {
+            // Fan out `IORING_OP_FSYNC` to every submitter in parallel.
+            // io_uring fsync only orders writes on the same ring, so a
+            // single fsync via submitter[0] would NOT cover the writes
+            // routed to submitter[1..]. Issuing in parallel + waiting
+            // for all replies gives the same "every Ok'd write is
+            // durable" guarantee the previous single-submitter path
+            // gave, just spread across N rings.
+            let receivers: Vec<_> = self
+                .io_submitters
+                .iter()
+                .map(|sub| sub.submit_fsync_async())
+                .collect::<Result<Vec<_>>>()?;
+            let mut first_err: Option<MetaDbError> = None;
+            for rx in receivers {
+                match rx.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                    Err(_) => {
+                        if first_err.is_none() {
+                            first_err = Some(MetaDbError::Io(io::Error::other(
+                                "io submitter dropped fsync reply",
+                            )));
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
         } else {
             self.file.sync_data()?;
         }
