@@ -190,6 +190,39 @@ pub struct Config {
     /// to the priority-1 synchronous drain instead of trying to absorb
     /// a huge final batch into the overlay.
     pub refcount_drainer_backpressure_pages: usize,
+
+    /// Run a background L2P streaming writeback worker that continuously
+    /// seals dirty pages and writes them through the centralised
+    /// `IoSubmitter`, *outside* `apply_gate.write()`. The next `Db::flush`
+    /// then samples a much smaller dirty set — checkpoint's gate-hold
+    /// time becomes dominated by lifecycle bookkeeping rather than by
+    /// clone/seal of accumulated dirty pages.
+    ///
+    /// Crash semantics: writeback is a content-only optimisation. Pages
+    /// written by writeback do NOT advance the durable `checkpoint_lsn`;
+    /// crash recovery still replays WAL from the last manifest-committed
+    /// LSN. The on-disk bytes that the writeback path leaves behind are
+    /// either re-overwritten by replay (if the page is touched after
+    /// `checkpoint_lsn`) or already match the replayed state.
+    pub l2p_writeback_enabled: bool,
+
+    /// Microseconds the streaming writeback worker parks between idle
+    /// cycles (no shard has dirty pages above the threshold). Active
+    /// cycles run back-to-back without sleeping.
+    pub l2p_writeback_idle_sleep_us: u64,
+
+    /// Minimum dirty page count on a shard to trigger a writeback cycle.
+    /// Skips shards with fewer dirty pages so a near-quiescent system
+    /// doesn't pay per-cycle overhead.
+    pub l2p_writeback_min_dirty_pages: usize,
+
+    /// Hard cap on pages a single writeback cycle hands to
+    /// `write_sealed_page_runs` per shard. Caps install-lock hold time:
+    /// `install_writeback` runs under `tree.write()`, and longer holds
+    /// directly delay foreground commit apply on the same shard. With
+    /// the default 8 192, install rarely exceeds 5–10 ms even with
+    /// PageBuf-shaped costs.
+    pub l2p_writeback_max_pages_per_cycle: usize,
 }
 
 impl Config {
@@ -246,6 +279,23 @@ impl Config {
             refcount_drainer_max_entries_per_cycle: 65_536,
             refcount_drainer_alloc_run_size: 64,
             refcount_drainer_backpressure_pages: 8_192,
+            // Streaming writeback ships default-off in this generic
+            // `Config::new` so unit tests that assert on page-allocator
+            // / snapshot state observe a quiescent backend (no
+            // background writes between explicit `flush()` calls).
+            // Production embedders (Onyx) explicitly set this true in
+            // their config — they want the worker to keep dirty
+            // backlog bounded so `Db::flush`'s gate-hold stays small
+            // under sustained mixed write load.
+            l2p_writeback_enabled: false,
+            l2p_writeback_idle_sleep_us: 500,
+            l2p_writeback_min_dirty_pages: 64,
+            // 512 pages per install gives a ~3–6 ms `tree.write()`
+            // hold under typical PageBuf install costs — small enough
+            // not to starve foreground commit apply on the same shard,
+            // large enough that each `IORING_OP_WRITEV` run carries a
+            // useful payload (512 × 4 KiB = 2 MiB).
+            l2p_writeback_max_pages_per_cycle: 512,
         }
     }
 }

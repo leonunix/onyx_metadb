@@ -338,6 +338,14 @@ impl Db {
         let drainer_cfg = cfg.clone();
         let page_store_for_drainers = page_store.clone();
         let metrics_for_drainers = metrics.clone();
+        let page_store_for_writeback = page_store.clone();
+        let metrics_for_writeback = metrics.clone();
+        let writeback_enabled = cfg.l2p_writeback_enabled;
+        let writeback_params = super::streaming_flush::StreamingFlushParams {
+            idle_sleep_us: cfg.l2p_writeback_idle_sleep_us,
+            min_dirty_pages: cfg.l2p_writeback_min_dirty_pages,
+            max_pages_per_cycle: cfg.l2p_writeback_max_pages_per_cycle,
+        };
         let dedup_lanes = build_dedup_lanes(
             0,
             dedup_shards as usize,
@@ -358,7 +366,7 @@ impl Db {
                 store: manifest_store,
                 manifest,
             }),
-            volumes: RwLock::new(volumes),
+            volumes: Arc::new(RwLock::new(volumes)),
             refcount_shards,
             dedup_index,
             dedup_reverse,
@@ -382,6 +390,7 @@ impl Db {
             max_volumes: cfg.max_volumes,
             faults,
             db_path: cfg.path,
+            l2p_writeback: Mutex::new(None),
         };
         // Spawn refcount drainers (priority 3) — fresh DB has no
         // replay to worry about, so we can spawn unconditionally
@@ -394,6 +403,18 @@ impl Db {
                 metrics_for_drainers.clone(),
                 idx,
             );
+        }
+        // Spawn the L2P streaming writeback worker. Default-on; the
+        // config toggle disables it for benchmarking / debugging
+        // checkpoint behaviour without it.
+        if writeback_enabled {
+            let flusher = super::streaming_flush::StreamingFlusher::start(
+                db.volumes.clone(),
+                page_store_for_writeback,
+                metrics_for_writeback,
+                writeback_params,
+            );
+            *db.l2p_writeback.lock() = Some(flusher);
         }
         Ok(db)
     }
@@ -794,6 +815,14 @@ impl Db {
         let drainer_cfg = cfg.clone();
         let page_store_for_drainers = page_store.clone();
         let metrics_for_drainers = metrics.clone();
+        let page_store_for_writeback = page_store.clone();
+        let metrics_for_writeback = metrics.clone();
+        let writeback_enabled = cfg.l2p_writeback_enabled;
+        let writeback_params = super::streaming_flush::StreamingFlushParams {
+            idle_sleep_us: cfg.l2p_writeback_idle_sleep_us,
+            min_dirty_pages: cfg.l2p_writeback_min_dirty_pages,
+            max_pages_per_cycle: cfg.l2p_writeback_max_pages_per_cycle,
+        };
         let dedup_lanes = build_dedup_lanes(
             last_applied,
             manifest_dedup_shards,
@@ -815,7 +844,7 @@ impl Db {
                 store: manifest_store,
                 manifest,
             }),
-            volumes: RwLock::new(volumes),
+            volumes: Arc::new(RwLock::new(volumes)),
             refcount_shards,
             dedup_index,
             dedup_reverse,
@@ -839,6 +868,7 @@ impl Db {
             max_volumes: cfg.max_volumes,
             faults,
             db_path: cfg.path,
+            l2p_writeback: Mutex::new(None),
         };
         db.recompute_all_snap_infos();
         // Spawn refcount drainers AFTER WAL replay finished above so
@@ -850,6 +880,18 @@ impl Db {
                 metrics_for_drainers.clone(),
                 idx,
             );
+        }
+        // Spawn the L2P streaming writeback worker. Same as create:
+        // default-on. Started AFTER WAL replay so it doesn't observe
+        // mid-replay state.
+        if writeback_enabled {
+            let flusher = super::streaming_flush::StreamingFlusher::start(
+                db.volumes.clone(),
+                page_store_for_writeback,
+                metrics_for_writeback,
+                writeback_params,
+            );
+            *db.l2p_writeback.lock() = Some(flusher);
         }
         Ok(db)
     }

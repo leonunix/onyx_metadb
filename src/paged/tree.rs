@@ -326,6 +326,15 @@ impl PagedL2p {
         self.buf.dirty_snapshot()
     }
 
+    /// Bounded variant of [`writeback_dirty_snapshot`]: gather at most
+    /// `max` dirty pages. The streaming flusher uses this so each
+    /// `install_writeback` only holds `tree.write()` long enough for
+    /// `max` pages, keeping the install lock-hold below the level that
+    /// would starve foreground commit apply on the same shard.
+    pub(crate) fn writeback_dirty_snapshot_capped(&self, max: usize) -> DirtySnapshot {
+        self.buf.dirty_snapshot_capped(max)
+    }
+
     /// Install a writeback that has already been written and synced.
     ///
     /// For each page whose `Slot::Dirty(Arc)` still pointer-equals the

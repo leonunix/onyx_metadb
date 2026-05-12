@@ -842,6 +842,35 @@ impl PageBuf {
         DirtySnapshot { pages }
     }
 
+    /// Streaming-writeback variant: gather at most `max` dirty pages
+    /// (in ascending pid order so writeback writes coalesce into
+    /// contiguous `IORING_OP_WRITEV` runs). Bounds the per-cycle work:
+    /// caller can iterate, seal, write, and install in small batches
+    /// so each `install_writeback` only holds `tree.write()` long
+    /// enough for ~`max` pages, leaving room for foreground commit
+    /// apply on the same shard.
+    pub(crate) fn dirty_snapshot_capped(&self, max: usize) -> DirtySnapshot {
+        if max == 0 {
+            return DirtySnapshot { pages: Vec::new() };
+        }
+        let mut pages: Vec<_> = self
+            .pages
+            .iter()
+            .filter_map(|(pid, slot)| match slot {
+                Slot::Dirty(arc) => Some(DirtySnapshotPage {
+                    pid: *pid,
+                    original: arc.clone(),
+                }),
+                Slot::Clean(_) => None,
+            })
+            .collect();
+        pages.sort_unstable_by_key(|page| page.pid);
+        if pages.len() > max {
+            pages.truncate(max);
+        }
+        DirtySnapshot { pages }
+    }
+
     pub(crate) fn install_flushed_snapshot_page(
         &mut self,
         flushed: &FlushedSnapshot,

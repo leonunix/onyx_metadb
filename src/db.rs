@@ -62,7 +62,11 @@ pub struct Db {
     /// `volume.shards.len()`, so shard routing is identical to the pre-7
     /// flat-shard layout as long as every volume is created with the same
     /// shard count.
-    volumes: RwLock<HashMap<VolumeOrdinal, Arc<Volume>>>,
+    ///
+    /// Wrapped in `Arc` so background workers (e.g. the L2P streaming
+    /// writeback in [`streaming_flush`]) can hold a reference and iterate
+    /// volumes from a non-`&self` context.
+    volumes: Arc<RwLock<HashMap<VolumeOrdinal, Arc<Volume>>>>,
     /// PBA refcount B+tree shards (PBA → first 4 bytes = u32 big-endian
     /// refcount, remaining 24 bytes reserved). Refcount is a global running
     /// tally — not per-volume — and stays at the top level for that reason.
@@ -197,6 +201,12 @@ pub struct Db {
     faults: Arc<FaultController>,
     #[allow(dead_code)]
     db_path: PathBuf,
+    /// Background L2P streaming writeback worker (one thread that
+    /// round-robins all volumes' L2P shards). Lifetime is bounded by
+    /// `Db`: started after the rest of the engine is wired up,
+    /// shut down at the top of `Drop` so it can never race against
+    /// page_store / refcount teardown.
+    l2p_writeback: Mutex<Option<streaming_flush::StreamingFlusher>>,
 }
 
 struct ManifestState {
@@ -882,6 +892,7 @@ mod indexes;
 mod l2p;
 mod lifecycle;
 mod snapshot;
+mod streaming_flush;
 mod volume;
 
 pub use snapshot::{DropReport, SnapshotView};
@@ -892,6 +903,14 @@ pub use volume::DropVolumeReport;
 
 impl Drop for Db {
     fn drop(&mut self) {
+        // Stop the L2P streaming writeback worker FIRST. It holds
+        // `Arc<PageStore>` + iterates `volumes`, both of which are
+        // about to drop below; joining the thread here makes sure no
+        // shard `tree.write()` / `page_store.write_sealed_page_runs`
+        // call is in flight when those fields go away.
+        if let Some(mut flusher) = self.l2p_writeback.lock().take() {
+            flusher.stop();
+        }
         // Detach refcount drainers (priority 3) BEFORE the
         // refcount_shards Box drops. Each drainer worker holds an
         // `Arc<RcShard>` that would otherwise prevent

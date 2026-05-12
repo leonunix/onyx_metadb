@@ -479,6 +479,38 @@ pub struct MetaMetrics {
     io_submitter_channel_pending_max: AtomicU64,
     io_submitter_submit_batch_size_max: AtomicU64,
     io_submitter_inflight_max: AtomicU64,
+
+    // L2P streaming writeback (`Config::l2p_writeback_enabled`).
+    // Background worker that continuously seals dirty L2P pages and
+    // writes them through `IoSubmitter`, *outside* `apply_gate.write()`,
+    // so the next `Db::flush` samples a small dirty set and its gate
+    // hold time stays small under high write load.
+    //
+    // `pages_promoted` = pages whose `Arc::ptr_eq` matched on install
+    //   (no commit re-mutated them during the IO window). These are
+    //   moved out of the per-shard dirty set; subsequent reads fault
+    //   from disk / shared `PageCache`.
+    // `pages_kept_dirty` = pages whose Arc was re-mutated between
+    //   snapshot and install. Their bytes are still on disk (stale
+    //   version), but the live tree continues mutating; next cycle
+    //   catches them again. Equivalent to a wasted write.
+    // `io_bytes_total` / `seal_us` / `install_us` are the usual time/
+    // bandwidth break-downs. `cycles_with_work` increments once per
+    // round that actually flushed at least one shard.
+    l2p_writeback_cycles: AtomicU64,
+    l2p_writeback_cycles_with_work: AtomicU64,
+    l2p_writeback_shards_flushed: AtomicU64,
+    l2p_writeback_pages_promoted: AtomicU64,
+    l2p_writeback_pages_kept_dirty: AtomicU64,
+    l2p_writeback_pages_written: AtomicU64,
+    l2p_writeback_io_bytes_total: AtomicU64,
+    l2p_writeback_seal_us: AtomicU64,
+    l2p_writeback_seal_max_us: AtomicU64,
+    l2p_writeback_io_us: AtomicU64,
+    l2p_writeback_io_max_us: AtomicU64,
+    l2p_writeback_install_us: AtomicU64,
+    l2p_writeback_install_max_us: AtomicU64,
+    l2p_writeback_errors: AtomicU64,
 }
 
 /// Why this `Db::flush()` invocation is happening. Tags the metrics so
@@ -814,6 +846,21 @@ pub struct MetaMetricsSnapshot {
     pub io_submitter_channel_pending_max: u64,
     pub io_submitter_submit_batch_size_max: u64,
     pub io_submitter_inflight_max: u64,
+
+    pub l2p_writeback_cycles: u64,
+    pub l2p_writeback_cycles_with_work: u64,
+    pub l2p_writeback_shards_flushed: u64,
+    pub l2p_writeback_pages_promoted: u64,
+    pub l2p_writeback_pages_kept_dirty: u64,
+    pub l2p_writeback_pages_written: u64,
+    pub l2p_writeback_io_bytes_total: u64,
+    pub l2p_writeback_seal_us: u64,
+    pub l2p_writeback_seal_max_us: u64,
+    pub l2p_writeback_io_us: u64,
+    pub l2p_writeback_io_max_us: u64,
+    pub l2p_writeback_install_us: u64,
+    pub l2p_writeback_install_max_us: u64,
+    pub l2p_writeback_errors: u64,
 }
 
 impl MetaMetrics {
@@ -1178,6 +1225,21 @@ impl MetaMetrics {
             io_submitter_channel_pending_max: load(&self.io_submitter_channel_pending_max),
             io_submitter_submit_batch_size_max: load(&self.io_submitter_submit_batch_size_max),
             io_submitter_inflight_max: load(&self.io_submitter_inflight_max),
+
+            l2p_writeback_cycles: load(&self.l2p_writeback_cycles),
+            l2p_writeback_cycles_with_work: load(&self.l2p_writeback_cycles_with_work),
+            l2p_writeback_shards_flushed: load(&self.l2p_writeback_shards_flushed),
+            l2p_writeback_pages_promoted: load(&self.l2p_writeback_pages_promoted),
+            l2p_writeback_pages_kept_dirty: load(&self.l2p_writeback_pages_kept_dirty),
+            l2p_writeback_pages_written: load(&self.l2p_writeback_pages_written),
+            l2p_writeback_io_bytes_total: load(&self.l2p_writeback_io_bytes_total),
+            l2p_writeback_seal_us: load(&self.l2p_writeback_seal_us),
+            l2p_writeback_seal_max_us: load(&self.l2p_writeback_seal_max_us),
+            l2p_writeback_io_us: load(&self.l2p_writeback_io_us),
+            l2p_writeback_io_max_us: load(&self.l2p_writeback_io_max_us),
+            l2p_writeback_install_us: load(&self.l2p_writeback_install_us),
+            l2p_writeback_install_max_us: load(&self.l2p_writeback_install_max_us),
+            l2p_writeback_errors: load(&self.l2p_writeback_errors),
         }
     }
 
@@ -1320,6 +1382,65 @@ impl MetaMetrics {
             &self.io_submitter_channel_pending_max,
             channel_pending as u64,
         );
+    }
+
+    pub(crate) fn record_l2p_writeback_cycle(&self, did_work: bool) {
+        self.l2p_writeback_cycles.fetch_add(1, Ordering::Relaxed);
+        if did_work {
+            self.l2p_writeback_cycles_with_work
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_l2p_writeback_seal(&self, elapsed: Duration, pages: usize) {
+        record_duration(
+            &self.l2p_writeback_seal_us,
+            &self.l2p_writeback_seal_max_us,
+            elapsed,
+        );
+        self.l2p_writeback_shards_flushed
+            .fetch_add(1, Ordering::Relaxed);
+        if pages > 0 {
+            self.l2p_writeback_pages_written
+                .fetch_add(pages as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_l2p_writeback_io(&self, elapsed: Duration, bytes: usize) {
+        record_duration(
+            &self.l2p_writeback_io_us,
+            &self.l2p_writeback_io_max_us,
+            elapsed,
+        );
+        if bytes > 0 {
+            self.l2p_writeback_io_bytes_total
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_l2p_writeback_install(
+        &self,
+        elapsed: Duration,
+        promoted: usize,
+        kept: usize,
+    ) {
+        record_duration(
+            &self.l2p_writeback_install_us,
+            &self.l2p_writeback_install_max_us,
+            elapsed,
+        );
+        if promoted > 0 {
+            self.l2p_writeback_pages_promoted
+                .fetch_add(promoted as u64, Ordering::Relaxed);
+        }
+        if kept > 0 {
+            self.l2p_writeback_pages_kept_dirty
+                .fetch_add(kept as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_l2p_writeback_error(&self) {
+        self.l2p_writeback_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_flush_io_seal(&self, elapsed: Duration) {
@@ -2541,7 +2662,21 @@ impl MetaMetricsSnapshot {
                 "\"io_submitter_sqes_submitted\":{},",
                 "\"io_submitter_channel_pending_max\":{},",
                 "\"io_submitter_submit_batch_size_max\":{},",
-                "\"io_submitter_inflight_max\":{}",
+                "\"io_submitter_inflight_max\":{},",
+                "\"l2p_writeback_cycles\":{},",
+                "\"l2p_writeback_cycles_with_work\":{},",
+                "\"l2p_writeback_shards_flushed\":{},",
+                "\"l2p_writeback_pages_promoted\":{},",
+                "\"l2p_writeback_pages_kept_dirty\":{},",
+                "\"l2p_writeback_pages_written\":{},",
+                "\"l2p_writeback_io_bytes_total\":{},",
+                "\"l2p_writeback_seal_us\":{},",
+                "\"l2p_writeback_seal_max_us\":{},",
+                "\"l2p_writeback_io_us\":{},",
+                "\"l2p_writeback_io_max_us\":{},",
+                "\"l2p_writeback_install_us\":{},",
+                "\"l2p_writeback_install_max_us\":{},",
+                "\"l2p_writeback_errors\":{}",
                 "}}"
             ),
             self.commit_attempts,
@@ -2829,6 +2964,20 @@ impl MetaMetricsSnapshot {
             self.io_submitter_channel_pending_max,
             self.io_submitter_submit_batch_size_max,
             self.io_submitter_inflight_max,
+            self.l2p_writeback_cycles,
+            self.l2p_writeback_cycles_with_work,
+            self.l2p_writeback_shards_flushed,
+            self.l2p_writeback_pages_promoted,
+            self.l2p_writeback_pages_kept_dirty,
+            self.l2p_writeback_pages_written,
+            self.l2p_writeback_io_bytes_total,
+            self.l2p_writeback_seal_us,
+            self.l2p_writeback_seal_max_us,
+            self.l2p_writeback_io_us,
+            self.l2p_writeback_io_max_us,
+            self.l2p_writeback_install_us,
+            self.l2p_writeback_install_max_us,
+            self.l2p_writeback_errors,
         )
     }
 }
