@@ -10,6 +10,13 @@ pub struct AffinityConfig {
     /// Same syntax as the other knobs ("0-3,8,12-15"). Leave empty to
     /// inherit the OS default.
     pub refcount_drainer_cpus: String,
+    /// CPU set for the io_uring submitter threads. With pool>1, each
+    /// submitter thread picks `cpus[ordinal % len]` so distinct
+    /// submitters land on distinct CPUs and Linux mq-block routes
+    /// their writes to distinct NVMe hardware queues. Leave empty to
+    /// inherit the OS default — which makes pool>1 net-regress (the
+    /// scheduler can stack multiple submitters on the same core).
+    pub io_submitter_cpus: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -19,6 +26,12 @@ pub enum ThreadRole {
     RefcountApply,
     DedupApply,
     RefcountDrainer,
+    /// io_uring submitter thread. With pool>1 each ordinal binds to a
+    /// distinct CPU so the kernel mq-block layer routes its IO to a
+    /// different NVMe hardware queue. Without pinning, multiple
+    /// submitter threads can land on the same CPU and serialise via
+    /// runqueue contention — net-worse than pool=1.
+    IoSubmitter,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -28,6 +41,7 @@ struct AffinityLayout {
     refcount_apply: CpuSet,
     dedup_apply: CpuSet,
     refcount_drainer: CpuSet,
+    io_submitter: CpuSet,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -66,6 +80,7 @@ impl AffinityLayout {
             refcount_apply: CpuSet::parse(&config.refcount_apply_cpus),
             dedup_apply: CpuSet::parse(&config.dedup_apply_cpus),
             refcount_drainer: CpuSet::parse(&config.refcount_drainer_cpus),
+            io_submitter: CpuSet::parse(&config.io_submitter_cpus),
         })
         .filter(|layout| {
             !layout.wal.cpus.is_empty()
@@ -73,6 +88,7 @@ impl AffinityLayout {
                 || !layout.refcount_apply.cpus.is_empty()
                 || !layout.dedup_apply.cpus.is_empty()
                 || !layout.refcount_drainer.cpus.is_empty()
+                || !layout.io_submitter.cpus.is_empty()
         })
     }
 
@@ -83,6 +99,7 @@ impl AffinityLayout {
             ThreadRole::RefcountApply => &self.refcount_apply,
             ThreadRole::DedupApply => &self.dedup_apply,
             ThreadRole::RefcountDrainer => &self.refcount_drainer,
+            ThreadRole::IoSubmitter => &self.io_submitter,
         }
     }
 }

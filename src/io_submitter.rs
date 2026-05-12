@@ -159,6 +159,15 @@ impl IoSubmitter {
     /// `fd` must outlive every op submitted through this submitter; in
     /// practice the caller is `PageStore`, which owns the `File`.
     pub(crate) fn start(fd: RawFd) -> Option<Self> {
+        Self::start_with_ordinal(fd, 0)
+    }
+
+    /// Same as [`Self::start`] but pins the submitter thread to the
+    /// `ordinal`-th CPU in the configured `io_submitter_cpus` set. With
+    /// pool>1 each ordinal MUST be distinct so the kernel mq-block
+    /// layer routes each submitter's IO to a different NVMe hardware
+    /// queue. With pool=1 the ordinal is 0 (unbound if no config).
+    pub(crate) fn start_with_ordinal(fd: RawFd, ordinal: usize) -> Option<Self> {
         let ring = match IoUring::new(SQ_ENTRIES) {
             Ok(ring) => ring,
             Err(err) => {
@@ -173,8 +182,14 @@ impl IoSubmitter {
         let metrics: Arc<OnceLock<Arc<MetaMetrics>>> = Arc::new(OnceLock::new());
         let metrics_for_thread = Arc::clone(&metrics);
         let join = std::thread::Builder::new()
-            .name("metadb-io-submitter".into())
-            .spawn(move || submitter_loop(fd, ring, receiver, metrics_for_thread))
+            .name(format!("metadb-io-submitter-{ordinal}"))
+            .spawn(move || {
+                crate::affinity::bind_current(
+                    crate::affinity::ThreadRole::IoSubmitter,
+                    ordinal,
+                );
+                submitter_loop(fd, ring, receiver, metrics_for_thread)
+            })
             .ok()?;
         Some(Self {
             sender: Some(sender),
@@ -292,6 +307,10 @@ impl Drop for IoSubmitter {
 #[cfg(not(target_os = "linux"))]
 impl IoSubmitter {
     pub(crate) fn start(_fd: i32) -> Option<Self> {
+        None
+    }
+
+    pub(crate) fn start_with_ordinal(_fd: i32, _ordinal: usize) -> Option<Self> {
         None
     }
 

@@ -167,13 +167,14 @@ fn new_rc_locks() -> Box<[Mutex<()>]> {
         .into_boxed_slice()
 }
 
-/// Default pool size. Single submitter with the larger SQ_ENTRIES
-/// gives one ring deep enough (8192 SQEs) to absorb async-dedup
-/// cuckoo bursts plus foreground L2P / refcount writes without
-/// saturating. fsync fan-out stays at one submit_and_wait round
-/// trip. Higher pool sizes were tested and tank sync-mode throughput
-/// (fan-out fsync cost > benefit at low concurrency) without helping
-/// async-mode beyond what a deeper SQ already covers.
+/// Default pool size. Pool>1 requires
+/// [`AffinityConfig::io_submitter_cpus`] to pin each submitter to a
+/// distinct CPU — without pinning, multiple submitter threads can
+/// land on the same core and net-regress vs pool=1 (j8 d4 with
+/// pool=3 unbound: 32k LBA/s vs 59k for pool=1). Once a CPU set is
+/// available, callers can flip this up to one submitter per
+/// [`IoLaneClass`] (currently three) for per-class SQ isolation;
+/// SQ=16384 per ring stays the throughput knob.
 pub const DEFAULT_IO_SUBMITTER_POOL_SIZE: usize = 1;
 
 /// Per-IO routing class. The pool keeps one [`IoSubmitter`] per
@@ -209,8 +210,8 @@ fn make_io_submitters(file: &File, count: usize) -> Box<[IoSubmitter]> {
     {
         let count = count.max(1);
         let mut subs: Vec<IoSubmitter> = Vec::with_capacity(count);
-        for _ in 0..count {
-            match IoSubmitter::start(file.as_raw_fd()) {
+        for ordinal in 0..count {
+            match IoSubmitter::start_with_ordinal(file.as_raw_fd(), ordinal) {
                 Some(sub) => subs.push(sub),
                 None => {
                     // First submitter failed — io_uring unavailable.
