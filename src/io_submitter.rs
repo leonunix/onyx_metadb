@@ -65,16 +65,18 @@ use crate::metrics::MetaMetrics;
 use crate::page::Page;
 use crate::types::PageId;
 
-/// Submission-queue depth for the centralised ring. Must accommodate
-/// the worst-case fan-in (one in-flight op per producer on every apply
-/// lane plus the flush thread). 8192 leaves headroom for async-dedup
-/// cuckoo bursts that arrive on the same ring as foreground L2P /
-/// refcount writes without saturating the SQ. Earlier sizing at 1024
-/// SQ became the throughput ceiling once dedup_apply was made
-/// fire-and-forget — see `io_submitter_inflight_max=1024` in the
-/// async-dedup baseline diagnostic.
+/// Submission-queue depth for the centralised ring. Sized for the
+/// async-dedup + foreground-write IO mix: cuckoo page bursts run
+/// concurrently with L2P / refcount writes on the same ring, so the
+/// SQ has to hold a deep enough window to keep producers from
+/// blocking on channel-full back-pressure. Sweep on the nvme-box j8
+/// d4 workload showed throughput peaking at 16384 (≈ +10% over 8192,
+/// +145% over the original 1024 ceiling) before SQ=32768 regressed —
+/// once the per-iteration submit batch grows past what NVMe can
+/// drain in one window, kernel kworkers backlog and the ring goes
+/// idle for long stretches.
 #[cfg(target_os = "linux")]
-const SQ_ENTRIES: u32 = 8192;
+const SQ_ENTRIES: u32 = 16384;
 
 /// Channel capacity. Sized to twice the SQ so a producer that arrives
 /// while the submitter is mid-batch does not immediately block — the
