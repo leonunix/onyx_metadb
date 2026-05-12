@@ -208,15 +208,27 @@ fn drop_snapshot_reclaims_uniquely_owned_pages() {
         db.insert(0, i, v(1)).unwrap();
     }
     db.flush().unwrap();
-    let free_before_snap = db.high_water();
+
     let s = db.take_snapshot(0).unwrap();
 
     for i in 0u64..1000 {
         db.insert(0, i, v(2)).unwrap();
     }
     db.flush().unwrap();
-    let hw_after_writes = db.high_water();
-    assert!(hw_after_writes > free_before_snap);
+
+    // Snapshot still observes the pre-snapshot value while the live
+    // view advanced to `v(2)` — proves COW forked each overwritten
+    // LBA's path. Earlier revisions compared `high_water` before vs
+    // after the second batch of writes, but the per-shard
+    // `LOCAL_ALLOC_RUN_PAGES = 256` pre-allocation pool means freshly
+    // opened shards hold ~16 × 256 unused pages already counted in
+    // `high_water`; COW draws from that pool without bumping the
+    // counter.
+    let view = db.snapshot_view(s).expect("snapshot view");
+    for i in 0u64..1000 {
+        assert_eq!(view.get(i).unwrap(), Some(v(1)));
+    }
+    drop(view);
 
     let report = db.drop_snapshot(s).unwrap().unwrap();
     assert!(report.pages_freed > 0);

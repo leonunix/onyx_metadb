@@ -486,6 +486,12 @@ fn multi_op_tx_commits_atomically_and_all_ops_visible() {
     tx.put_dedup(h(1), dv(9));
     let lsn = tx.commit().unwrap();
     assert!(lsn >= 1);
+    // The hot-path commit emits `DedupPut` alongside L2P + refcount
+    // ops, which routes the dedup apply through the async lane (the
+    // production semantic is eventual-consistency for the dedup
+    // hint table). Drain so the read-after-write assertion below
+    // observes the put.
+    db.wait_apply_idle();
     assert_eq!(db.get(0, 1).unwrap(), Some(v(1)));
     assert_eq!(db.get(0, 2).unwrap(), Some(v(2)));
     assert_eq!(db.get_refcount(10).unwrap(), 3);

@@ -1140,6 +1140,34 @@ impl Db {
             .map(|_| ())
     }
 
+    /// Block until every apply lane has drained the work currently in
+    /// its queue. Provides a read-your-writes sync point for the async
+    /// dedup commit path: after a commit returns, `DedupPut` /
+    /// `DedupPutGuarded` / `DedupDelete` ops may still be queued on a
+    /// dedup lane worker; calling this method waits for them to apply
+    /// so a subsequent `get_dedup` observes the put.
+    ///
+    /// Per-lane drain semantics: snapshot each lane's
+    /// `last_enqueued_lsn` and wait for `last_applied_lsn` to catch
+    /// up. Enqueues that arrive after the snapshot are not waited for,
+    /// so this method is bounded even with concurrent writers.
+    pub fn wait_apply_idle(&self) {
+        for volume in self.volumes.read().values() {
+            for shard in &volume.shards {
+                shard.apply_lane.wait_for_drain();
+            }
+        }
+        for shard in self.refcount_shards.iter() {
+            shard.apply_lane.wait_for_drain();
+        }
+        for lane in self.dedup_lanes.iter() {
+            lane.wait_for_drain();
+        }
+        for lane in self.dedup_maintenance_lanes.iter() {
+            lane.wait_for_drain();
+        }
+    }
+
     /// Best-effort checkpoint for background maintenance. If commits are
     /// currently applying, this returns `Ok(false)` without setting the
     /// apply gate's writer-pending bit, so foreground commit readers keep

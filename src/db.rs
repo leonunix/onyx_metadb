@@ -458,6 +458,21 @@ impl ApplyLane {
         let state = self.inner.state.lock();
         state.queue.len() + state.maintenance.len()
     }
+
+    /// Block until every WAL-tagged task currently enqueued on this
+    /// lane has finished. Snapshots `last_enqueued_lsn` on entry and
+    /// waits for `last_applied_lsn` to catch up to that snapshot;
+    /// later enqueues are not waited for. Lanes that never received
+    /// the target LSN (because their dedup bucket was empty) trivially
+    /// satisfy the snapshot. Used by `Db::wait_apply_idle` to give
+    /// callers a sync point after async dedup commits.
+    fn wait_for_drain(&self) {
+        let mut state = self.inner.state.lock();
+        let target = state.last_enqueued_lsn;
+        while state.last_applied_lsn < target && !state.shutdown {
+            self.inner.cvar.wait(&mut state);
+        }
+    }
 }
 
 impl Drop for ApplyLane {

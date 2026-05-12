@@ -1783,19 +1783,50 @@ impl Db {
         // Fan dedup work out across shards. Each non-empty bucket
         // gets its own apply closure on its shard's lane.
         //
-        // Hot-path commits only emit `DedupPut` / `DedupPutGuarded` /
-        // `DedupDelete`, all returning the `ApplyOutcome::Dedup`
-        // marker that no caller consumes — they only inspect
-        // `L2pRemap` / `RefcountNew` slots earlier. For those we
-        // enqueue and short-circuit the wait. `DedupCompare*` still
-        // synchronises so the cleanup path's CAS returns its real
-        // `applied` flag.
-        let dedup_async_safe = plan.ops.iter().all(|op| {
+        // The async path is valid only when:
+        // 1. The commit carries a non-dedup op (L2P / refcount /
+        //    volume lifecycle) whose outcome the caller is already
+        //    blocked on. Pure-dedup commits — `db.put_dedup` /
+        //    `db.delete_dedup` / `tx` with only dedup ops — must
+        //    synchronise so the caller's follow-up `get_dedup`
+        //    observes the put.
+        // 2. No `DedupCompare*` ops are present — their `applied`
+        //    flag is consumed by the caller (e.g. cleanup CAS path).
+        // 3. No `DedupReverse*` ops are present — the legacy
+        //    dedup_reverse path is read back synchronously by tests
+        //    and the standalone bench/soak harnesses. Onyx's
+        //    production hot path no longer emits these (the
+        //    promote-on-verified-hit design doesn't persist a
+        //    reverse index), so requiring sync here costs nothing in
+        //    the production write path while preserving
+        //    read-your-writes for the legacy callers that remain.
+        //
+        // When async-safe, hot-path callers only inspect `L2pRemap` /
+        // `RefcountNew` outcome slots earlier in the vec; the
+        // `ApplyOutcome::Dedup` marker for the async dedup ops is a
+        // placeholder so the slot is filled.
+        let has_non_dedup_op = plan.ops.iter().any(|op| {
             !matches!(
                 op,
-                WalOp::DedupCompareDelete { .. } | WalOp::DedupComparePut { .. }
+                WalOp::DedupPut { .. }
+                    | WalOp::DedupPutGuarded { .. }
+                    | WalOp::DedupDelete { .. }
+                    | WalOp::DedupCompareDelete { .. }
+                    | WalOp::DedupComparePut { .. }
+                    | WalOp::DedupReversePut { .. }
+                    | WalOp::DedupReverseDelete { .. }
             )
         });
+        let no_sync_required_dedup_ops = plan.ops.iter().all(|op| {
+            !matches!(
+                op,
+                WalOp::DedupCompareDelete { .. }
+                    | WalOp::DedupComparePut { .. }
+                    | WalOp::DedupReversePut { .. }
+                    | WalOp::DedupReverseDelete { .. }
+            )
+        });
+        let dedup_async_safe = has_non_dedup_op && no_sync_required_dedup_ops;
 
         let mut dedup_receivers: Vec<
             crossbeam_channel::Receiver<Result<Vec<(usize, ApplyOutcome)>>>,
