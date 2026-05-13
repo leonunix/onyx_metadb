@@ -200,8 +200,15 @@ pub(super) fn apply_op_bare(
 /// Apply-time CAS gate. Returns true iff `new_seq` is stale relative
 /// to `cur` and the op must be skipped. `seq == 0` on either side is
 /// the no-guard sentinel (legacy callers like `DedupScanner` and
-/// direct `insert`) — the check is bypassed and the op applies. See
-/// `L2pValue::seq` for the wire layout.
+/// direct `insert`) — the check is bypassed and the op applies. The
+/// guard is strict less-than: `new_seq == cur_seq` accepts. Onyx's
+/// buffer seq is globally monotonic per append, so equality only
+/// happens when a recovered buffer entry replays its own previously
+/// committed write (mark_flushed is memory-only — after a clean
+/// shutdown + reopen, the recovered entry is re-flushed even though
+/// L2P already carries its seq). Accepting on equality lets the
+/// retry land instead of leaking the freshly-allocated PBA.
+/// See `L2pValue::seq` for the wire layout.
 #[inline]
 pub(super) fn seq_guard_rejects(new_seq: u64, cur: Option<&L2pValue>) -> bool {
     if new_seq == 0 {
@@ -210,7 +217,7 @@ pub(super) fn seq_guard_rejects(new_seq: u64, cur: Option<&L2pValue>) -> bool {
     match cur {
         Some(c) => {
             let cs = c.seq();
-            cs != 0 && new_seq <= cs
+            cs != 0 && new_seq < cs
         }
         None => false,
     }

@@ -90,8 +90,11 @@ fn seq_guard_higher_first_then_lower_rejects() {
 }
 
 #[test]
-fn seq_guard_equal_seq_rejects() {
-    // Equality is NOT strictly newer → reject.
+fn seq_guard_equal_seq_accepts() {
+    // Equality is the recovery-replay case (mark_flushed is memory-only,
+    // so a recovered buffer entry re-commits its own write with the same
+    // seq already in L2P). The guard accepts on equality so the retry
+    // lands instead of leaking the freshly-allocated PBA.
     let (_d, db) = mk_db();
     let mut tx = db.begin();
     tx.l2p_remap(VOL, 5, v(100, 42), None);
@@ -102,9 +105,9 @@ fn seq_guard_equal_seq_rejects() {
     let (_, outcomes) = tx.commit_with_outcomes().unwrap();
     assert!(matches!(
         outcomes[0],
-        ApplyOutcome::L2pRemap { applied: false, .. }
+        ApplyOutcome::L2pRemap { applied: true, .. }
     ));
-    assert_eq!(db.get(VOL, 5).unwrap().unwrap().head_pba(), 100);
+    assert_eq!(db.get(VOL, 5).unwrap().unwrap().head_pba(), 200);
 }
 
 #[test]
