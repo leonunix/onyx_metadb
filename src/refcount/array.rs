@@ -575,6 +575,10 @@ impl PagedRefcountArray {
     /// [`Self::install_meta_chain`]'s job. The head pid is stable
     /// (`existing_chain[0]`), so the manifest needs no per-flush
     /// update — it always references the head pid recorded at create.
+    ///
+    /// Cold-path shim (snapshot / drop_volume / `RcShard::flush`); the
+    /// flush hot path uses [`Self::build_meta_chain_external`] +
+    /// folds the sealed pages into the global checkpoint batch.
     pub fn write_meta_chain_external(
         &self,
         snapshot_page_table: &[PageId],
@@ -590,6 +594,34 @@ impl PagedRefcountArray {
             snapshot_page_table,
             snapshot_meta_chain,
             free_lsn,
+        )
+    }
+
+    /// Outside-gate, **no-IO** companion of
+    /// [`Self::write_meta_chain_external`]: builds + seals every page in
+    /// the new chain entirely in memory, returning the chain layout for
+    /// the caller to drive a single batched
+    /// [`PageStore::write_sealed_page_runs`] across many shards' meta
+    /// chains. The caller is then responsible for the
+    /// `invalidate + page_store.free` of the trailing pids and the
+    /// `page_cache.replace_or_insert` of the sealed pages.
+    ///
+    /// Used by `flush_with_gate` to fold every refcount shard's
+    /// meta-chain pages into the same global submission as the L2P /
+    /// refcount data pages — replacing N synchronous per-page
+    /// `write_page` round-trips with one io_uring batch.
+    pub fn build_meta_chain_external(
+        &self,
+        snapshot_page_table: &[PageId],
+        snapshot_meta_chain: &[PageId],
+    ) -> Result<(Vec<PageId>, Vec<(PageId, Arc<Page>)>, Vec<PageId>)> {
+        paged_meta::build_chain_pages(
+            &self.page_store,
+            PageType::RefcountArray,
+            META_KEY_COUNT_MARKER,
+            &[],
+            snapshot_page_table,
+            snapshot_meta_chain,
         )
     }
 

@@ -545,21 +545,17 @@ impl Db {
         manifest: &mut Manifest,
         generation: Lsn,
     ) -> Result<DedupManifestUpdate> {
-        // Both dedup_index (cuckoo) and dedup_reverse (paged-array)
-        // write data pages synchronously per op; only their meta
-        // pages can be dirty here. Both meta page ids are stable
-        // across opens — the manifest slots only need to be
-        // re-stamped to the same value.
+        // Cuckoo dedup_index writes data pages synchronously per op;
+        // only its meta page can be dirty here. The meta page id is
+        // stable across opens — the manifest slot only needs to be
+        // re-stamped to the same value. (The legacy `dedup_reverse`
+        // / `paged_reverse` half is gone as of manifest v9.)
         self.dedup_index.flush_meta()?;
-        self.dedup_reverse.flush_meta()?;
         let _ = generation;
         manifest.dedup_index_shard_heads =
             vec![vec![self.dedup_index.meta_page_id()].into_boxed_slice()].into_boxed_slice();
-        manifest.dedup_reverse_shard_heads =
-            vec![vec![self.dedup_reverse.meta_page_id()].into_boxed_slice()].into_boxed_slice();
         Ok(DedupManifestUpdate {
             old_dedup_heads: Vec::new(),
-            old_dedup_reverse_heads: Vec::new(),
         })
     }
 
@@ -568,11 +564,9 @@ impl Db {
         update: DedupManifestUpdate,
         _generation: Lsn,
     ) -> Result<()> {
-        // Cuckoo dedup_index + paged-array dedup_reverse: nothing to
-        // reclaim — both meta page ids are stable across opens and
-        // their data pages are owned inline.
+        // Cuckoo dedup_index: nothing to reclaim — the meta page id
+        // is stable across opens and data pages are owned inline.
         let _ = update.old_dedup_heads;
-        let _ = update.old_dedup_reverse_heads;
         Ok(())
     }
 

@@ -742,7 +742,6 @@ fn writer_loop(
                     commit_misses += 1;
                 }
                 tx.put_dedup(hash, onyx_dedup_value(pba, salt));
-                tx.register_dedup_reverse(pba, hash);
                 staged_inserts.push((hash, pba));
             } else {
                 let pba = next_pba;
@@ -799,12 +798,10 @@ fn writer_loop(
             }
         }
         if cfg.dedup_enabled && pending_cleanup.len() >= cfg.cleanup_batch {
-            let drained: Vec<Pba> = pending_cleanup.drain(..).collect();
-            let n = drained.len() as u64;
-            if let Err(e) = db.cleanup_dedup_for_dead_pbas(&drained) {
-                eprintln!("writer-{wid} cleanup error: {e}");
-                return;
-            }
+            // cleanup_dedup_for_dead_pbas retired in schema 0xB3; drain
+            // the queue to keep ack/stats semantics unchanged.
+            let n = pending_cleanup.len() as u64;
+            pending_cleanup.clear();
             stats.cleanup_calls.fetch_add(1, Ordering::Relaxed);
             stats.cleanup_pbas.fetch_add(n, Ordering::Relaxed);
         }
@@ -813,7 +810,7 @@ fn writer_loop(
     // Final cleanup drain on shutdown.
     if cfg.dedup_enabled && !pending_cleanup.is_empty() {
         let n = pending_cleanup.len() as u64;
-        let _ = db.cleanup_dedup_for_dead_pbas(&pending_cleanup);
+        pending_cleanup.clear();
         stats.cleanup_calls.fetch_add(1, Ordering::Relaxed);
         stats.cleanup_pbas.fetch_add(n, Ordering::Relaxed);
     }
@@ -869,7 +866,6 @@ fn dedup_register_loop(
             salt = salt.wrapping_add(1);
             let hash = onyx_hash(hash_seq);
             tx.put_dedup(hash, onyx_dedup_value(pba, salt));
-            tx.register_dedup_reverse(pba, hash);
         }
         let started = Instant::now();
         if let Err(e) = tx.commit() {

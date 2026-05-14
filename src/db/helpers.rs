@@ -264,25 +264,8 @@ pub(super) fn max_generation_from_two_groups(
     max_generation_from_locked_l2p(a)
 }
 
-/// Encode a `(pba, hash)` pair for storage in the legacy `dedup_reverse`
-/// LSM layout. With an 8-byte hash the key is just the big-endian PBA
-/// and the full hash lives in the value's first 8 bytes; the helpers
-/// stay as a backwards-compatible test affordance for the LSM-era
-/// fixtures. The paged_reverse store does its own packing and never
-/// touches these helpers.
-pub(crate) fn encode_reverse_entry(pba: Pba, hash: &Hash8) -> (Hash8, DedupValue) {
-    let key = pba.to_be_bytes();
-    let mut value = [0u8; 28];
-    value[..8].copy_from_slice(hash);
-    (key, DedupValue(value))
-}
-
-/// Recover the full hash from an entry written by
-/// [`encode_reverse_entry`]. With the 8-byte hash schema the value
-/// alone holds the entire hash; the key is decorative (PBA) and is
-/// not consulted.
-pub(crate) fn decode_reverse_hash(_key: &Hash8, value: &DedupValue) -> Hash8 {
-    let mut hash = [0u8; 8];
-    hash.copy_from_slice(&value.0[..8]);
-    hash
-}
+// `encode_reverse_entry` / `decode_reverse_hash` were retired alongside
+// the `paged_reverse` module + `DedupReverse*` WAL ops (schema v9 /
+// WAL 0xB3). The promote-on-verified-hit cleanup path uses
+// old-mapping read-back instead, so no in-tree caller still needs
+// these helpers.

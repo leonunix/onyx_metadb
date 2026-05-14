@@ -82,10 +82,13 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
                     "METRICS" => Ok(Ack::Onyx(id, db.metrics_json())),
                     "AUDIT_PBA_REFCOUNTS" => audit_pba_refcounts(&db).map(|_| Ack::Ok(id)),
                     "CLEANUP" => {
-                        let pbas = parts
+                        // dedup_reverse / cleanup_dedup_for_dead_pbas were
+                        // retired in schema 0xB3. The harness still drains
+                        // the PBA list to keep ack semantics intact.
+                        let _pbas = parts
                             .map(|part| part.parse::<Pba>().map_err(|e| e.to_string()))
                             .collect::<Result<Vec<_>, _>>()?;
-                        db.cleanup_dedup_for_dead_pbas(&pbas).map(|_| Ack::Ok(id))
+                        Ok(Ack::Ok(id))
                     }
                     "SNAPSHOT" => {
                         let vol_ord =
@@ -287,10 +290,13 @@ impl CleanupBatcher {
         self.cleanup(db, batch)
     }
 
-    fn cleanup(&self, db: &Db, mut batch: Vec<Pba>) -> onyx_metadb::Result<()> {
+    fn cleanup(&self, _db: &Db, mut batch: Vec<Pba>) -> onyx_metadb::Result<()> {
+        // dedup_reverse / cleanup_dedup_for_dead_pbas were retired in
+        // schema 0xB3 (promote-on-verified-hit uses old-mapping read-back
+        // instead). Keep the sort/dedup so the harness still exercises
+        // the batching surface.
         batch.sort_unstable();
         batch.dedup();
-        db.cleanup_dedup_for_dead_pbas(&batch)?;
         Ok(())
     }
 }
@@ -349,7 +355,6 @@ fn execute_worker_op(
             let mut tx = db.begin();
             tx.l2p_remap(op.vol_ord, op.slot, value, Some((pba, 1)));
             tx.put_dedup(onyx_hash(salt), onyx_dedup_value(pba, salt));
-            tx.register_dedup_reverse(pba, onyx_hash(salt));
             tx.commit()?;
         }
         WorkerOpKind::OnyxCleanup { pba } => {
@@ -404,7 +409,6 @@ fn execute_worker_op_ack(
             let mut tx = db.begin();
             tx.l2p_remap(op.vol_ord, op.slot, value, Some((pba, 1)));
             tx.put_dedup(onyx_hash(salt), onyx_dedup_value(pba, salt));
-            tx.register_dedup_reverse(pba, onyx_hash(salt));
             let (_, outcomes) = tx.commit_with_outcomes()?;
             let detail = encode_onyx_outcome(&outcomes[0]);
             if let ApplyOutcome::L2pRemap {

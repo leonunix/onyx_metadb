@@ -45,7 +45,6 @@ pub(super) fn apply_op_bare(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     dedup_index: &crate::dedup::DedupIndex,
-    dedup_reverse: &crate::paged_reverse::PagedReverse,
     page_store: &Arc<PageStore>,
     lsn: Lsn,
     op: &WalOp,
@@ -96,7 +95,6 @@ pub(super) fn apply_op_bare(
             let sid = shard_for_key(refcount_shards, *pba_guard);
             if refcount_shards[sid].rc.get(*pba_guard)? >= *min_rc {
                 dedup_index.put(*hash, *value, lsn)?;
-                dedup_reverse.put(*pba_guard, *hash, lsn)?;
             }
             Ok(ApplyOutcome::Dedup)
         }
@@ -121,14 +119,6 @@ pub(super) fn apply_op_bare(
                 dedup_index.put(*hash, *new_value, lsn)?;
             }
             Ok(ApplyOutcome::DedupCompare { applied })
-        }
-        WalOp::DedupReversePut { pba, hash } => {
-            dedup_reverse.put(*pba, *hash, lsn)?;
-            Ok(ApplyOutcome::Dedup)
-        }
-        WalOp::DedupReverseDelete { pba, hash } => {
-            dedup_reverse.delete(*pba, *hash, lsn)?;
-            Ok(ApplyOutcome::Dedup)
         }
         WalOp::Incref { pba, delta } => {
             let sid = shard_for_key(refcount_shards, *pba);

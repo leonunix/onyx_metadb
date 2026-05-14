@@ -33,7 +33,7 @@ use crate::types::{
 };
 
 /// Version of the current manifest body layout.
-pub const MANIFEST_BODY_VERSION: u32 = 8;
+pub const MANIFEST_BODY_VERSION: u32 = 9;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -61,9 +61,6 @@ const OFF_NEXT_VOLUME_ORD: usize = 40;
 const OFF_SNAPSHOT_COUNT: usize = 44;
 const OFF_VOLUME_COUNT: usize = 48;
 const OFF_VARIABLE_START: usize = 52;
-// v7-only offsets, kept for backward-compat decoding.
-const OFF_V7_DEDUP_LEVEL_COUNT: usize = 24;
-const OFF_V7_DEDUP_REVERSE_LEVEL_COUNT: usize = 28;
 
 /// Per-snapshot row size on disk. v6 packs: id(8) + vol_ord(2) + 6 pad +
 /// l2p_roots_page(8) + created_lsn(8). We keep the row at 32 bytes so
@@ -84,8 +81,6 @@ const _: () = {
     assert!(OFF_NEXT_VOLUME_ORD + 4 == OFF_SNAPSHOT_COUNT);
     assert!(OFF_SNAPSHOT_COUNT + 4 == OFF_VOLUME_COUNT);
     assert!(OFF_VOLUME_COUNT + 4 == OFF_VARIABLE_START);
-    assert!(OFF_V7_DEDUP_LEVEL_COUNT == OFF_DEDUP_SHARDS);
-    assert!(OFF_V7_DEDUP_REVERSE_LEVEL_COUNT == OFF_RESERVED_28);
     assert!(SNAPSHOT_ENTRY_SIZE == 32);
 };
 
@@ -107,10 +102,9 @@ pub fn max_snapshots_for_shards(refcount_shard_count: usize) -> usize {
 /// of the snapshot table.
 ///
 /// `dedup_head_group_count` is the number of manifest head groups
-/// stored for the two dedup structures. This used to equal
-/// `dedup_shards`, but cuckoo dedup_index + paged_reverse now each
-/// have one page-table meta head while `dedup_shards` remains the
-/// apply-lane parallelism.
+/// stored for the dedup_index. v9 retired the legacy paged_reverse
+/// alongside the WAL `DedupReverse*` ops, so only the cuckoo dedup_index
+/// contributes header bytes here.
 pub fn max_snapshots_for_layout(
     refcount_shard_count: usize,
     dedup_head_group_count: usize,
@@ -121,12 +115,9 @@ pub fn max_snapshots_for_layout(
         Some(v) => v,
         None => return 0,
     };
-    // Two indexes (dedup_index + dedup_reverse) each carry one u32
-    // level-count header per manifest head group.
-    let dedup_header_bytes = match dedup_head_group_count
-        .checked_mul(2)
-        .and_then(|v| v.checked_mul(size_of::<u32>()))
-    {
+    // One index (dedup_index) carries one u32 level-count header per
+    // manifest head group.
+    let dedup_header_bytes = match dedup_head_group_count.checked_mul(size_of::<u32>()) {
         Some(v) => v,
         None => return 0,
     };
@@ -188,7 +179,7 @@ pub use volume::{
     encode_volume_entry_inline, volume_entry_inline_size,
 };
 
-/// Decoded manifest body (v8).
+/// Decoded manifest body (v9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub body_version: u32,
@@ -208,9 +199,6 @@ pub struct Manifest {
     /// has one group containing the cuckoo meta page id; the legacy field
     /// name is kept to avoid a wider manifest rename.
     pub dedup_index_shard_heads: Box<[Box<[PageId]>]>,
-    /// `dedup_reverse` meta head groups. In the current paged-array layout
-    /// this has one group containing the reverse-index meta page id.
-    pub dedup_reverse_shard_heads: Box<[Box<[PageId]>]>,
     /// Monotonic counter: next snapshot id to hand out.
     pub next_snapshot_id: u64,
     /// Monotonic counter: next volume ordinal to hand out. Initialised
@@ -236,7 +224,6 @@ impl Manifest {
             refcount_shard_roots: Vec::new().into_boxed_slice(),
             dedup_shards: 1,
             dedup_index_shard_heads: vec![Vec::new().into_boxed_slice()].into_boxed_slice(),
-            dedup_reverse_shard_heads: vec![Vec::new().into_boxed_slice()].into_boxed_slice(),
             next_snapshot_id: 1,
             next_volume_ord: 1,
             snapshots: Vec::new(),
@@ -254,11 +241,6 @@ impl Manifest {
     /// the manifest size budget.
     pub fn total_dedup_index_levels(&self) -> usize {
         self.dedup_index_shard_heads.iter().map(|s| s.len()).sum()
-    }
-
-    /// Sum of level counts across every `dedup_reverse` shard.
-    pub fn total_dedup_reverse_levels(&self) -> usize {
-        self.dedup_reverse_shard_heads.iter().map(|s| s.len()).sum()
     }
 
     /// Find a snapshot by id.
@@ -291,17 +273,13 @@ impl Manifest {
                 "manifest dedup_shards {dedup_shards} must be a positive power of two",
             )));
         }
-        if self.dedup_index_shard_heads.len() != DEDUP_META_HEAD_GROUPS
-            || self.dedup_reverse_shard_heads.len() != DEDUP_META_HEAD_GROUPS
-        {
+        if self.dedup_index_shard_heads.len() != DEDUP_META_HEAD_GROUPS {
             return Err(MetaDbError::InvalidArgument(format!(
-                "manifest dedup meta-head outer length {}/{} must be {DEDUP_META_HEAD_GROUPS}",
+                "manifest dedup meta-head outer length {} must be {DEDUP_META_HEAD_GROUPS}",
                 self.dedup_index_shard_heads.len(),
-                self.dedup_reverse_shard_heads.len(),
             )));
         }
-        let total_dedup_levels =
-            self.total_dedup_index_levels() + self.total_dedup_reverse_levels();
+        let total_dedup_levels = self.total_dedup_index_levels();
 
         let volumes_budget_bytes: usize = self
             .volumes
@@ -367,14 +345,6 @@ impl Manifest {
                 off += 8;
             }
         }
-        for shard_heads in self.dedup_reverse_shard_heads.iter() {
-            p[off..off + 4].copy_from_slice(&(shard_heads.len() as u32).to_le_bytes());
-            off += 4;
-            for head in shard_heads.iter().copied() {
-                p[off..off + 8].copy_from_slice(&head.to_le_bytes());
-                off += 8;
-            }
-        }
         for entry in &self.snapshots {
             p[off..off + 8].copy_from_slice(&entry.id.to_le_bytes());
             p[off + 8..off + 10].copy_from_slice(&entry.vol_ord.to_le_bytes());
@@ -397,88 +367,16 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            8 => Self::decode_v8(page, page_store),
-            7 => Self::decode_v7(page, page_store),
+            9 => Self::decode_v9(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v7 (legacy single-shard \
-                 dedup) and v8 (sharded dedup) are readable — older databases must be rebuilt"
+                "unsupported manifest body version {other}; only v9 is readable — \
+                 older databases (v7/v8 carried the retired dedup_reverse section) \
+                 must be rebuilt"
             ))),
         }
     }
 
-    /// v7 → v8 backward-compatible decode. The v7 layout's flat
-    /// `dedup_level_heads` becomes a single-shard outer entry under v8;
-    /// the next manifest commit upgrades the on-disk body to v8.
-    fn decode_v7(page: &Page, page_store: &PageStore) -> Result<Self> {
-        let p = page.payload();
-        let checkpoint_lsn = u64::from_le_bytes(
-            p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
-                .try_into()
-                .unwrap(),
-        );
-        let free_list_head = u64::from_le_bytes(
-            p[OFF_FREE_LIST_HEAD..OFF_FREE_LIST_HEAD + 8]
-                .try_into()
-                .unwrap(),
-        );
-        let refcount_shard_count =
-            u32::from_le_bytes(p[OFF_SHARD_COUNT..OFF_SHARD_COUNT + 4].try_into().unwrap())
-                as usize;
-        if refcount_shard_count > MAX_SHARD_ROOTS_PER_PAGE {
-            return Err(MetaDbError::Corruption(format!(
-                "manifest refcount shard_count {refcount_shard_count} exceeds page capacity {MAX_SHARD_ROOTS_PER_PAGE}",
-            )));
-        }
-        let dedup_level_count = u32::from_le_bytes(
-            p[OFF_V7_DEDUP_LEVEL_COUNT..OFF_V7_DEDUP_LEVEL_COUNT + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let dedup_reverse_level_count = u32::from_le_bytes(
-            p[OFF_V7_DEDUP_REVERSE_LEVEL_COUNT..OFF_V7_DEDUP_REVERSE_LEVEL_COUNT + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let (next_snapshot_id, next_volume_ord, snapshot_count, volume_count) =
-            decode_tail_counters(p);
-
-        let mut off = OFF_VARIABLE_START;
-        let refcount_shard_roots = read_u64_vec(p, &mut off, refcount_shard_count);
-        let dedup_level_heads = read_u64_vec(p, &mut off, dedup_level_count);
-        let dedup_reverse_level_heads = read_u64_vec(p, &mut off, dedup_reverse_level_count);
-
-        // v7's snapshot/volume capacity calculation does NOT account for
-        // per-shard length headers (those are v8-only). Mirror v7's
-        // budget by passing dedup_shards_count = 0; the resulting cap
-        // is identical to what the v7 encoder enforced.
-        let total_dedup_levels = dedup_level_count + dedup_reverse_level_count;
-        let max_snapshots =
-            max_snapshots_for_layout(refcount_shard_count, 0, total_dedup_levels, 0);
-        if snapshot_count > max_snapshots {
-            return Err(MetaDbError::Corruption(format!(
-                "manifest snapshot_count {snapshot_count} exceeds capacity {max_snapshots}",
-            )));
-        }
-
-        let snapshots = decode_snapshots(p, &mut off, snapshot_count, page_store)?;
-        let volumes = decode_volumes(p, &mut off, volume_count)?;
-
-        Ok(Self {
-            body_version: MANIFEST_BODY_VERSION,
-            checkpoint_lsn,
-            free_list_head,
-            refcount_shard_roots,
-            dedup_shards: 1,
-            dedup_index_shard_heads: vec![dedup_level_heads].into_boxed_slice(),
-            dedup_reverse_shard_heads: vec![dedup_reverse_level_heads].into_boxed_slice(),
-            next_snapshot_id,
-            next_volume_ord,
-            snapshots,
-            volumes,
-        })
-    }
-
-    fn decode_v8(page: &Page, page_store: &PageStore) -> Result<Self> {
+    fn decode_v9(page: &Page, page_store: &PageStore) -> Result<Self> {
         let p = page.payload();
         let checkpoint_lsn = u64::from_le_bytes(
             p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
@@ -524,20 +422,10 @@ impl Manifest {
             dedup_index_shard_heads.push(read_u64_vec(p, &mut off, level_count));
         }
 
-        let mut dedup_reverse_shard_heads = Vec::with_capacity(DEDUP_META_HEAD_GROUPS);
-        let mut total_reverse_levels = 0usize;
-        for _ in 0..DEDUP_META_HEAD_GROUPS {
-            let level_count = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
-            off += 4;
-            total_reverse_levels = total_reverse_levels.saturating_add(level_count);
-            dedup_reverse_shard_heads.push(read_u64_vec(p, &mut off, level_count));
-        }
-
-        let total_dedup_levels = total_index_levels + total_reverse_levels;
         let max_snapshots = max_snapshots_for_layout(
             refcount_shard_count,
             DEDUP_META_HEAD_GROUPS,
-            total_dedup_levels,
+            total_index_levels,
             0,
         );
         if snapshot_count > max_snapshots {
@@ -556,7 +444,6 @@ impl Manifest {
             refcount_shard_roots,
             dedup_shards,
             dedup_index_shard_heads: dedup_index_shard_heads.into_boxed_slice(),
-            dedup_reverse_shard_heads: dedup_reverse_shard_heads.into_boxed_slice(),
             next_snapshot_id,
             next_volume_ord,
             snapshots,

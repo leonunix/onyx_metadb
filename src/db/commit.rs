@@ -225,12 +225,6 @@ fn wal_lane_key(op: &WalOp) -> u64 {
         | WalOp::DedupDelete { hash }
         | WalOp::DedupCompareDelete { hash, .. }
         | WalOp::DedupComparePut { hash, .. } => xxh3_64(hash),
-        WalOp::DedupReversePut { pba, hash } | WalOp::DedupReverseDelete { pba, hash } => {
-            let mut bytes = [0u8; 40];
-            bytes[..8].copy_from_slice(&pba.to_be_bytes());
-            bytes[8..].copy_from_slice(hash);
-            xxh3_64(&bytes)
-        }
         WalOp::Incref { pba, .. } | WalOp::Decref { pba, .. } => xxh3_64(&pba.to_be_bytes()),
         WalOp::DropSnapshot { id, .. } => xxh3_64(&id.to_be_bytes()),
         WalOp::CreateVolume { ord, .. } | WalOp::DropVolume { ord, .. } => {
@@ -752,7 +746,6 @@ impl Db {
             volumes,
             &self.refcount_shards,
             &self.dedup_index,
-            &self.dedup_reverse,
             &self.page_store,
             lsn,
             op,
@@ -1031,15 +1024,6 @@ impl Db {
                 | WalOp::DedupDelete { hash, .. }
                 | WalOp::DedupCompareDelete { hash, .. }
                 | WalOp::DedupComparePut { hash, .. } => {
-                    let sid =
-                        crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
-                    dedup_buckets[sid].push(idx);
-                }
-                WalOp::DedupReversePut { hash, .. } | WalOp::DedupReverseDelete { hash, .. } => {
-                    // Forward and reverse for the same `(hash, pba)`
-                    // pair must land in the same shard so the dedup
-                    // invariant survives a single commit. Route by
-                    // hash here, not the encoded reverse key.
                     let sid =
                         crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
                     dedup_buckets[sid].push(idx);
@@ -1543,7 +1527,6 @@ impl Db {
 
     fn apply_dedup_indices_to(
         dedup_index: &crate::dedup::DedupIndex,
-        dedup_reverse: &crate::paged_reverse::PagedReverse,
         refcount_shards: &[Arc<crate::refcount::RcShard>],
         metrics: &MetaMetrics,
         ops: &[WalOp],
@@ -1552,25 +1535,7 @@ impl Db {
     ) -> Result<Vec<(usize, ApplyOutcome)>> {
         let batch_started = std::time::Instant::now();
         let mut outcomes = Vec::with_capacity(indices.len());
-        let mut reverse_puts: HashMap<Pba, Vec<Hash8>> = HashMap::new();
         let mut pending_puts: Vec<(Hash8, DedupValue, usize)> = Vec::new();
-        let flush_pba = |pba: Pba, reverse_puts: &mut HashMap<Pba, Vec<Hash8>>| -> Result<()> {
-            let Some(hashes) = reverse_puts.remove(&pba) else {
-                return Ok(());
-            };
-            let started = std::time::Instant::now();
-            let count = hashes.len() as u64;
-            dedup_reverse.put_many(pba, &hashes, lsn)?;
-            metrics.record_dedup_reverse_put_batch(count, started.elapsed());
-            Ok(())
-        };
-        let flush_all = |reverse_puts: &mut HashMap<Pba, Vec<Hash8>>| -> Result<()> {
-            let pbas: Vec<Pba> = reverse_puts.keys().copied().collect();
-            for pba in pbas {
-                flush_pba(pba, reverse_puts)?;
-            }
-            Ok(())
-        };
         let flush_pending_puts = |pending_puts: &mut Vec<(Hash8, DedupValue, usize)>,
                                   outcomes: &mut Vec<(usize, ApplyOutcome)>|
          -> Result<()> {
@@ -1595,7 +1560,6 @@ impl Db {
         for idx in indices {
             match &ops[idx] {
                 WalOp::DedupPut { hash, value } => {
-                    flush_all(&mut reverse_puts)?;
                     pending_puts.push((*hash, *value, idx));
                 }
                 WalOp::DedupPutGuarded {
@@ -1617,13 +1581,11 @@ impl Db {
                         dedup_index.put_with_metrics(*hash, *value, lsn, &mut put_timings)?;
                         metrics.record_dedup_forward_put(started.elapsed());
                         metrics.record_dedup_put_stages(put_timings);
-                        reverse_puts.entry(*pba_guard).or_default().push(*hash);
                     }
                     outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupDelete { hash } => {
                     flush_pending_puts(&mut pending_puts, &mut outcomes)?;
-                    flush_all(&mut reverse_puts)?;
                     let started = std::time::Instant::now();
                     dedup_index.delete(hash, lsn)?;
                     metrics.record_dedup_forward_delete(started.elapsed());
@@ -1631,7 +1593,6 @@ impl Db {
                 }
                 WalOp::DedupCompareDelete { hash, old_value } => {
                     flush_pending_puts(&mut pending_puts, &mut outcomes)?;
-                    flush_all(&mut reverse_puts)?;
                     let started = std::time::Instant::now();
                     let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
                     if applied {
@@ -1646,7 +1607,6 @@ impl Db {
                     new_value,
                 } => {
                     flush_pending_puts(&mut pending_puts, &mut outcomes)?;
-                    flush_all(&mut reverse_puts)?;
                     let started = std::time::Instant::now();
                     let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
                     if applied {
@@ -1657,24 +1617,10 @@ impl Db {
                     }
                     outcomes.push((idx, ApplyOutcome::DedupCompare { applied }));
                 }
-                WalOp::DedupReversePut { pba, hash } => {
-                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
-                    reverse_puts.entry(*pba).or_default().push(*hash);
-                    outcomes.push((idx, ApplyOutcome::Dedup));
-                }
-                WalOp::DedupReverseDelete { pba, hash } => {
-                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
-                    flush_pba(*pba, &mut reverse_puts)?;
-                    let started = std::time::Instant::now();
-                    dedup_reverse.delete(*pba, *hash, lsn)?;
-                    metrics.record_dedup_reverse_delete(started.elapsed());
-                    outcomes.push((idx, ApplyOutcome::Dedup));
-                }
                 other => unreachable!("dedup bucket holds only dedup ops; saw {other:?}"),
             };
         }
         flush_pending_puts(&mut pending_puts, &mut outcomes)?;
-        flush_all(&mut reverse_puts)?;
         metrics.record_apply_dedup_batch(outcomes.len() as u64, batch_started.elapsed());
         Ok(outcomes)
     }
@@ -1792,14 +1738,6 @@ impl Db {
         //    observes the put.
         // 2. No `DedupCompare*` ops are present — their `applied`
         //    flag is consumed by the caller (e.g. cleanup CAS path).
-        // 3. No `DedupReverse*` ops are present — the legacy
-        //    dedup_reverse path is read back synchronously by tests
-        //    and the standalone bench/soak harnesses. Onyx's
-        //    production hot path no longer emits these (the
-        //    promote-on-verified-hit design doesn't persist a
-        //    reverse index), so requiring sync here costs nothing in
-        //    the production write path while preserving
-        //    read-your-writes for the legacy callers that remain.
         //
         // When async-safe, hot-path callers only inspect `L2pRemap` /
         // `RefcountNew` outcome slots earlier in the vec; the
@@ -1813,17 +1751,12 @@ impl Db {
                     | WalOp::DedupDelete { .. }
                     | WalOp::DedupCompareDelete { .. }
                     | WalOp::DedupComparePut { .. }
-                    | WalOp::DedupReversePut { .. }
-                    | WalOp::DedupReverseDelete { .. }
             )
         });
         let no_sync_required_dedup_ops = plan.ops.iter().all(|op| {
             !matches!(
                 op,
-                WalOp::DedupCompareDelete { .. }
-                    | WalOp::DedupComparePut { .. }
-                    | WalOp::DedupReversePut { .. }
-                    | WalOp::DedupReverseDelete { .. }
+                WalOp::DedupCompareDelete { .. } | WalOp::DedupComparePut { .. }
             )
         });
         let dedup_async_safe = has_non_dedup_op && no_sync_required_dedup_ops;
@@ -1842,7 +1775,6 @@ impl Db {
             let bucket_ops = bucket.len() as u64;
             let ops = plan.ops.clone();
             let dedup_index = self.dedup_index.clone();
-            let dedup_reverse = self.dedup_reverse.clone();
             let refcount_shards_arc = refcount_shards_arc.clone();
             let metrics = self.metrics.clone();
             if dedup_async_safe {
@@ -1851,7 +1783,6 @@ impl Db {
                     let exec_started = std::time::Instant::now();
                     let _outcomes = Self::apply_dedup_indices_to(
                         dedup_index.as_ref(),
-                        dedup_reverse.as_ref(),
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
                         ops.as_slice(),
@@ -1871,7 +1802,6 @@ impl Db {
                     let exec_started = std::time::Instant::now();
                     let outcomes = Self::apply_dedup_indices_to(
                         dedup_index.as_ref(),
-                        dedup_reverse.as_ref(),
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
                         ops.as_slice(),
@@ -1930,7 +1860,6 @@ impl Db {
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
         dedup_index: &Arc<crate::dedup::DedupIndex>,
-        dedup_reverse: &Arc<crate::paged_reverse::PagedReverse>,
         page_store: &Arc<PageStore>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
@@ -1947,7 +1876,6 @@ impl Db {
                     volumes,
                     refcount_shards,
                     dedup_index.as_ref(),
-                    dedup_reverse.as_ref(),
                     page_store,
                     lsn,
                     op,
@@ -1961,7 +1889,6 @@ impl Db {
             volumes,
             refcount_shards,
             dedup_index,
-            dedup_reverse,
             metrics,
             lsn,
             ops,
@@ -1972,7 +1899,6 @@ impl Db {
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
         dedup_index: &Arc<crate::dedup::DedupIndex>,
-        dedup_reverse: &Arc<crate::paged_reverse::PagedReverse>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
         ops: &[WalOp],
@@ -2013,9 +1939,7 @@ impl Db {
                 | WalOp::DedupPutGuarded { .. }
                 | WalOp::DedupDelete { .. }
                 | WalOp::DedupCompareDelete { .. }
-                | WalOp::DedupComparePut { .. }
-                | WalOp::DedupReversePut { .. }
-                | WalOp::DedupReverseDelete { .. } => {
+                | WalOp::DedupComparePut { .. } => {
                     dedup_idxs.push(idx);
                 }
                 WalOp::DropSnapshot { .. }
@@ -2152,7 +2076,6 @@ impl Db {
 
         for (idx, outcome) in Self::apply_dedup_indices_to(
             dedup_index.as_ref(),
-            dedup_reverse.as_ref(),
             refcount_shards_arc.as_slice(),
             metrics.as_ref(),
             ops.as_slice(),
@@ -2172,7 +2095,6 @@ impl Db {
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
         dedup_index: &Arc<crate::dedup::DedupIndex>,
-        dedup_reverse: &Arc<crate::paged_reverse::PagedReverse>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
         ops: &[WalOp],
@@ -2212,9 +2134,7 @@ impl Db {
                 | WalOp::DedupPutGuarded { .. }
                 | WalOp::DedupDelete { .. }
                 | WalOp::DedupCompareDelete { .. }
-                | WalOp::DedupComparePut { .. }
-                | WalOp::DedupReversePut { .. }
-                | WalOp::DedupReverseDelete { .. } => {
+                | WalOp::DedupComparePut { .. } => {
                     dedup_idxs.push(idx);
                 }
                 WalOp::DropSnapshot { .. }
@@ -2283,7 +2203,6 @@ impl Db {
 
         for (idx, outcome) in Self::apply_dedup_indices_to(
             dedup_index.as_ref(),
-            dedup_reverse.as_ref(),
             refcount_shards_vec.as_slice(),
             metrics.as_ref(),
             ops,
@@ -2313,7 +2232,6 @@ impl Db {
             volumes,
             &self.refcount_shards,
             &self.dedup_index,
-            &self.dedup_reverse,
             &self.metrics,
             lsn,
             ops,
@@ -2354,9 +2272,7 @@ fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Du
         | WalOp::DedupPutGuarded { .. }
         | WalOp::DedupDelete { .. }
         | WalOp::DedupCompareDelete { .. }
-        | WalOp::DedupComparePut { .. }
-        | WalOp::DedupReversePut { .. }
-        | WalOp::DedupReverseDelete { .. } => metrics.record_apply_dedup(elapsed),
+        | WalOp::DedupComparePut { .. } => metrics.record_apply_dedup(elapsed),
         WalOp::DropSnapshot { .. }
         | WalOp::CreateVolume { .. }
         | WalOp::DropVolume { .. }

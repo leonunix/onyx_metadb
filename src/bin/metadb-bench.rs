@@ -513,7 +513,6 @@ fn run_meta_tx(cfg: &BenchConfig, db: Arc<Db>) -> Result<BenchReport, String> {
                     old_entry.live_refs -= 1;
                     if old_entry.live_refs == 0 {
                         tx.delete_dedup(old_entry.hash);
-                        tx.unregister_dedup_reverse(old_entry.pba, old_entry.hash);
                         if let Some(pos) = active_dedup.iter().position(|idx| *idx == old.dedup_idx)
                         {
                             active_dedup.swap_remove(pos);
@@ -542,7 +541,6 @@ fn run_meta_tx(cfg: &BenchConfig, db: Arc<Db>) -> Result<BenchReport, String> {
                     tx.insert(0, lba, l2p_value_from_pba(pba));
                     tx.incref_pba(pba, 1);
                     tx.put_dedup(hash, dedup_value_from_pba(pba));
-                    tx.register_dedup_reverse(pba, hash);
                     dedup_entries.push(DedupEntry {
                         pba,
                         hash,

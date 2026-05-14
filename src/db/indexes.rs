@@ -141,163 +141,17 @@ impl Db {
             .collect())
     }
 
-    // -------- dedup_reverse operations ----------------------------------
-
-    /// Register `hash` as mapped to `pba` in the reverse index. This
-    /// is an LSM put, not a modification of the forward dedup index.
-    /// Callers typically pair it with `put_dedup(hash, value)` inside
-    /// one `begin() / commit()` transaction so both land atomically.
-    pub fn register_dedup_reverse(&self, pba: Pba, hash: Hash8) -> Result<Lsn> {
-        let mut tx = self.begin();
-        tx.register_dedup_reverse(pba, hash);
-        tx.commit()
-    }
-
-    /// Remove the `(pba, hash)` entry from the reverse index.
-    pub fn unregister_dedup_reverse(&self, pba: Pba, hash: Hash8) -> Result<Lsn> {
-        let mut tx = self.begin();
-        tx.unregister_dedup_reverse(pba, hash);
-        tx.commit()
-    }
-
-    /// Every full 32-byte hash currently registered for `pba` in the
-    /// reverse index. Does **not** include tombstoned entries.
-    ///
-    /// Cost: one paged-array point lookup per PBA (one shared
-    /// `PageCache` hit on the warm path, one `read_page` on a cold
-    /// data page). The legacy LSM prefix-scan was the bottleneck of
-    /// `cleanup_dedup_for_pbas_batch`; this path is two orders of
-    /// magnitude faster on a populated index.
-    pub fn scan_dedup_reverse_for_pba(&self, pba: Pba) -> Result<Vec<Hash8>> {
-        self.dedup_reverse.get_hashes(pba)
-    }
-
-    /// Batched [`scan_dedup_reverse_for_pba`]. Returns one
-    /// `Vec<Hash8>` per input PBA, in input order. Each vec carries
-    /// at most one entry under the v1 single-hash-per-PBA invariant
-    /// (see `paged_reverse` module docs); the shape stays plural so
-    /// the caller does not need to change when overflow lands.
-    ///
-    /// Intended caller: writer / dedup cleanup path sweeping dead PBAs
-    /// in a single batch (see onyx-storage `cleanup_dedup_for_pbas_batch`).
-    pub fn multi_scan_dedup_reverse_for_pba(&self, pbas: &[Pba]) -> Result<Vec<Vec<Hash8>>> {
-        self.dedup_reverse.multi_get_hashes(pbas)
-    }
-
-    /// Clean up dedup state for a batch of pbas whose refcount has
-    /// transitioned to zero (SPEC §2.2). Atomic: every `DedupDelete` +
-    /// `DedupReverseDelete` goes into a single [`Transaction`] and
-    /// commits as one WAL record.
-    ///
-    /// Semantics (1:1 with onyx's
-    /// [`cleanup_dedup_for_pbas_batch`](../../../src/meta/store/dedup.rs#L410)):
-    /// 1. [`multi_scan_dedup_reverse_for_pba`](Self::multi_scan_dedup_reverse_for_pba)
-    ///    collects `(pba, hash)` pairs from the reverse index under one
-    ///    LSM reader-drain.
-    /// 2. For each `hash`, [`get_dedup`](Self::get_dedup) checks the
-    ///    forward index: the tombstone is emitted only when the entry
-    ///    still points to the target pba. This handles the race where a
-    ///    concurrent writer re-registered `hash` against a different
-    ///    pba between `drop_snapshot` finishing and this cleanup
-    ///    running — deleting the forward entry there would lose the
-    ///    live mapping.
-    /// 3. A `DedupReverseDelete { pba, hash }` is unconditional: the
-    ///    reverse entry is always stale once `pba` is freed.
-    ///
-    /// Idempotent under replay — both ops are tombstones, and both
-    /// the `get_dedup` probe and the forward check re-read LSM state at
-    /// commit apply time, so running twice is a no-op if the first run
-    /// already landed.
-    ///
-    /// Empty `pbas` returns [`last_applied_lsn`](Self::last_applied_lsn)
-    /// without touching the WAL (mirrors [`range_delete`](Self::range_delete)).
-    pub fn cleanup_dedup_for_dead_pbas(&self, pbas: &[Pba]) -> Result<Lsn> {
-        let total_started = std::time::Instant::now();
-        self.metrics.record_cleanup_call(pbas.len());
-        if pbas.is_empty() {
-            self.metrics.record_cleanup_noop();
-            self.metrics.record_cleanup_success(total_started.elapsed());
-            return Ok(self.last_applied_lsn());
-        }
-
-        let scan_started = std::time::Instant::now();
-        let hashes_per_pba = match self.multi_scan_dedup_reverse_for_pba(pbas) {
-            Ok(hashes_per_pba) => {
-                let hashes_found = hashes_per_pba.iter().map(Vec::len).sum();
-                self.metrics
-                    .record_cleanup_scan(scan_started.elapsed(), hashes_found);
-                hashes_per_pba
-            }
-            Err(err) => {
-                self.metrics.record_cleanup_scan(scan_started.elapsed(), 0);
-                self.metrics.record_cleanup_error(total_started.elapsed());
-                return Err(err);
-            }
-        };
-        let pairs: Vec<(Pba, Hash8)> = pbas
-            .iter()
-            .copied()
-            .zip(hashes_per_pba)
-            .flat_map(|(pba, hashes)| hashes.into_iter().map(move |hash| (pba, hash)))
-            .collect();
-        let forward_entries = if pairs.is_empty() {
-            Vec::new()
-        } else {
-            let hashes: Vec<Hash8> = pairs.iter().map(|(_, hash)| *hash).collect();
-            let check_started = std::time::Instant::now();
-            match self.multi_get_dedup(&hashes) {
-                Ok(entries) => {
-                    self.metrics
-                        .record_cleanup_forward_checks(check_started.elapsed(), hashes.len());
-                    entries
-                }
-                Err(err) => {
-                    self.metrics
-                        .record_cleanup_forward_checks(check_started.elapsed(), hashes.len());
-                    self.metrics.record_cleanup_error(total_started.elapsed());
-                    return Err(err);
-                }
-            }
-        };
-
-        let mut tx = self.begin();
-        let mut forward_tombstones = 0usize;
-        for ((pba, hash), entry) in pairs.into_iter().zip(forward_entries.into_iter()) {
-            // Only drop the forward entry if it still points at
-            // `pba`. Another writer may have re-registered `hash`
-            // against a newer pba in the interval between the
-            // plan-side scan and now — SPEC §4.5 race protection.
-            if let Some(entry) = entry {
-                if entry.head_pba() == pba {
-                    tx.delete_dedup(hash);
-                    forward_tombstones += 1;
-                }
-            }
-            // The reverse entry itself is always stale — regardless
-            // of the forward-index race outcome, the pba is freed.
-            tx.unregister_dedup_reverse(pba, hash);
-        }
-        self.metrics
-            .record_cleanup_tombstones(forward_tombstones, tx.len());
-        if tx.is_empty() {
-            self.metrics.record_cleanup_noop();
-            self.metrics.record_cleanup_success(total_started.elapsed());
-            return Ok(self.last_applied_lsn());
-        }
-        let commit_started = std::time::Instant::now();
-        match tx.commit() {
-            Ok(lsn) => {
-                self.metrics.record_cleanup_commit(commit_started.elapsed());
-                self.metrics.record_cleanup_success(total_started.elapsed());
-                Ok(lsn)
-            }
-            Err(err) => {
-                self.metrics.record_cleanup_commit(commit_started.elapsed());
-                self.metrics.record_cleanup_error(total_started.elapsed());
-                Err(err)
-            }
-        }
-    }
+    // -------- dedup_reverse: retired in schema 0xB3 ---------------------
+    //
+    // The legacy `register_dedup_reverse` / `unregister_dedup_reverse` /
+    // `scan_dedup_reverse_for_pba` / `multi_scan_dedup_reverse_for_pba` /
+    // `cleanup_dedup_for_dead_pbas` API powered the pre-promote-on-verified-hit
+    // dedup cleanup path (prefix-scan reverse → tombstone forward + reverse).
+    // Onyx switched to old-mapping read-back: cleanup re-reads the freed PBA
+    // payload, recomputes the xxh3 hash, and calls
+    // `delete_dedup_index_if_matches`. The reverse index has been inert
+    // since then; the API + the underlying `paged_reverse` module are gone
+    // (see WAL schema 0xB3 / manifest v9 break).
 
     /// Iterate every `(Pba, refcount)` pair across all refcount shards,
     /// sorted by Pba. Refcount is a running tally (global), so there is

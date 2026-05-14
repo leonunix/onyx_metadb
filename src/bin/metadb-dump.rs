@@ -46,7 +46,6 @@ fn run() -> Result<ExitCode, String> {
         "l2p" => cmd_l2p(&rest),
         "refcount" => cmd_refcount(&rest),
         "dedup" => cmd_dedup(&rest),
-        "dedup-reverse" => cmd_dedup_reverse(&rest),
         "snapshots" => cmd_snapshots(&rest),
         _ => {
             print_usage();
@@ -67,7 +66,6 @@ subcommands:
                                                 range scan over L2P
   refcount       <path> <pba>                   point lookup for PBA refcount
   dedup          <path> <hash-hex>              point lookup in dedup_index
-  dedup-reverse  <path> <pba>                   prefix scan dedup_reverse by PBA
   snapshots      <path>                         list registered snapshots"
     );
 }
@@ -117,12 +115,6 @@ fn print_manifest_human(path: &Path, m: &Manifest, high_water: u64, last_applied
             println!("  L{i}: {}", fmt_page(*p));
         }
     }
-    for (s, shard_heads) in m.dedup_reverse_shard_heads.iter().enumerate() {
-        println!("dedup_reverse_shard[{s}] heads ({}):", shard_heads.len());
-        for (i, p) in shard_heads.iter().enumerate() {
-            println!("  L{i}: {}", fmt_page(*p));
-        }
-    }
     println!("next_snapshot_id: {}", m.next_snapshot_id);
     println!("snapshots: {}", m.snapshots.len());
     for entry in &m.snapshots {
@@ -163,16 +155,6 @@ fn print_manifest_json(path: &Path, m: &Manifest, high_water: u64, last_applied:
     println!("  \"dedup_index_shard_heads\": [");
     for (s, shard_heads) in m.dedup_index_shard_heads.iter().enumerate() {
         let comma = if s + 1 < m.dedup_index_shard_heads.len() {
-            ","
-        } else {
-            ""
-        };
-        println!("    {}{comma}", page_array_json(shard_heads));
-    }
-    println!("  ],");
-    println!("  \"dedup_reverse_shard_heads\": [");
-    for (s, shard_heads) in m.dedup_reverse_shard_heads.iter().enumerate() {
-        let comma = if s + 1 < m.dedup_reverse_shard_heads.len() {
             ","
         } else {
             ""
@@ -390,38 +372,6 @@ fn cmd_dedup(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_dedup_reverse(args: &[String]) -> Result<ExitCode, String> {
-    let Parsed {
-        path,
-        json,
-        positional,
-        ..
-    } = parse_flags(args, ParseSpec::one_positional())?;
-    let pba = parse_u64(positional.first(), "pba")? as Pba;
-    let db = open_db(&path)?;
-    let hashes: Vec<Hash8> = db
-        .scan_dedup_reverse_for_pba(pba)
-        .map_err(|e| e.to_string())?;
-    if json {
-        println!("{{");
-        println!("  \"pba\": {pba},");
-        println!("  \"count\": {},", hashes.len());
-        println!("  \"hashes\": [");
-        for (i, h) in hashes.iter().enumerate() {
-            let trailing = if i + 1 == hashes.len() { "" } else { "," };
-            println!("    \"{}\"{trailing}", hex(h));
-        }
-        println!("  ]");
-        println!("}}");
-    } else {
-        println!("pba: {pba}");
-        println!("count: {}", hashes.len());
-        for h in hashes {
-            println!("  {}", hex(&h));
-        }
-    }
-    Ok(ExitCode::SUCCESS)
-}
 
 // -------- snapshots -----------------------------------------------------
 

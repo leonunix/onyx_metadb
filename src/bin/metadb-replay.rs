@@ -130,8 +130,6 @@ struct OpCounts {
     l2p_range_delete: u64,
     dedup_put: u64,
     dedup_delete: u64,
-    dedup_reverse_put: u64,
-    dedup_reverse_delete: u64,
     incref: u64,
     decref: u64,
     drop_snapshot: u64,
@@ -151,8 +149,6 @@ impl OpCounts {
             WalOp::DedupDelete { .. }
             | WalOp::DedupCompareDelete { .. }
             | WalOp::DedupComparePut { .. } => self.dedup_delete += 1,
-            WalOp::DedupReversePut { .. } => self.dedup_reverse_put += 1,
-            WalOp::DedupReverseDelete { .. } => self.dedup_reverse_delete += 1,
             WalOp::Incref { .. } => self.incref += 1,
             WalOp::Decref { .. } => self.decref += 1,
             WalOp::DropSnapshot { .. } => self.drop_snapshot += 1,
@@ -350,12 +346,6 @@ fn fmt_op(op: &WalOp) -> String {
             hex(old_value.0),
             hex(new_value.0)
         ),
-        WalOp::DedupReversePut { pba, hash } => {
-            format!("DedupReversePut pba={pba} hash={}", hex(hash))
-        }
-        WalOp::DedupReverseDelete { pba, hash } => {
-            format!("DedupReverseDelete pba={pba} hash={}", hex(hash))
-        }
         WalOp::Incref { pba, delta } => format!("Incref pba={pba} delta={delta}"),
         WalOp::Decref { pba, delta } => format!("Decref pba={pba} delta={delta}"),
         WalOp::DropSnapshot {
@@ -461,14 +451,6 @@ fn op_json(op: &WalOp) -> String {
             hex(old_value.0),
             hex(new_value.0)
         ),
-        WalOp::DedupReversePut { pba, hash } => format!(
-            "{{\"op\":\"DedupReversePut\",\"pba\":{pba},\"hash\":\"{}\"}}",
-            hex(hash)
-        ),
-        WalOp::DedupReverseDelete { pba, hash } => format!(
-            "{{\"op\":\"DedupReverseDelete\",\"pba\":{pba},\"hash\":\"{}\"}}",
-            hex(hash)
-        ),
         WalOp::Incref { pba, delta } => {
             format!("{{\"op\":\"Incref\",\"pba\":{pba},\"delta\":{delta}}}")
         }
@@ -519,8 +501,6 @@ fn op_tag_list(ops: &[WalOp]) -> String {
             WalOp::DedupDelete { .. } => "DedupDelete",
             WalOp::DedupCompareDelete { .. } => "DedupCompareDelete",
             WalOp::DedupComparePut { .. } => "DedupComparePut",
-            WalOp::DedupReversePut { .. } => "DedupReversePut",
-            WalOp::DedupReverseDelete { .. } => "DedupReverseDelete",
             WalOp::Incref { .. } => "Incref",
             WalOp::Decref { .. } => "Decref",
             WalOp::DropSnapshot { .. } => "DropSnapshot",
@@ -574,8 +554,6 @@ fn print_op_counts_human(c: &OpCounts) {
     eprintln!("  L2pDelete:          {}", c.l2p_delete);
     eprintln!("  DedupPut:           {}", c.dedup_put);
     eprintln!("  DedupDelete:        {}", c.dedup_delete);
-    eprintln!("  DedupReversePut:    {}", c.dedup_reverse_put);
-    eprintln!("  DedupReverseDelete: {}", c.dedup_reverse_delete);
     eprintln!("  Incref:             {}", c.incref);
     eprintln!("  Decref:             {}", c.decref);
     eprintln!("  DropSnapshot:       {}", c.drop_snapshot);
@@ -611,13 +589,11 @@ fn print_summary_json(_cfg: &Config, s: &Summary) {
 
 fn op_counts_json(c: &OpCounts) -> String {
     format!(
-        "{{\"L2pPut\":{},\"L2pDelete\":{},\"DedupPut\":{},\"DedupDelete\":{},\"DedupReversePut\":{},\"DedupReverseDelete\":{},\"Incref\":{},\"Decref\":{},\"DropSnapshot\":{}}}",
+        "{{\"L2pPut\":{},\"L2pDelete\":{},\"DedupPut\":{},\"DedupDelete\":{},\"Incref\":{},\"Decref\":{},\"DropSnapshot\":{}}}",
         c.l2p_put,
         c.l2p_delete,
         c.dedup_put,
         c.dedup_delete,
-        c.dedup_reverse_put,
-        c.dedup_reverse_delete,
         c.incref,
         c.decref,
         c.drop_snapshot,

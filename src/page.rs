@@ -112,12 +112,10 @@ pub enum PageType {
     /// `generation` in the shared header doubles as `last_applied_lsn` for
     /// replay-skip (refcount apply is not idempotent).
     RefcountArray = 10,
-    /// Paged-array dedup reverse data page. Layout is driven by
-    /// [`crate::paged_reverse::array`] constants — for the 8-byte hash
-    /// schema, 168 slots × 24 B per slot. Absent slots stored as the
-    /// all-zero hash sentinel (collision with a real all-zero hash is
-    /// rejected at put time as `Corruption`).
-    DedupReverseArray = 11,
+    // PageType discriminant 11 (`DedupReverseArray`) is retired as of
+    // schema v9. Do not reuse: an older on-disk page that survives the
+    // manifest-version reject would otherwise decode as a different
+    // type.
     /// On-disk cuckoo hash data page for dedup_index. Layout is driven
     /// by [`crate::dedup::cuckoo`] constants (`BUCKETS_PER_PAGE`,
     /// `ENTRY_BYTES`, `PRESENCE_BITMAP_BYTES`); for the 8-byte hash
@@ -143,7 +141,6 @@ impl PageType {
             8 => Self::PagedLeaf,
             9 => Self::PagedIndex,
             10 => Self::RefcountArray,
-            11 => Self::DedupReverseArray,
             12 => Self::CuckooData,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })

@@ -1,11 +1,11 @@
 //! Chained meta-page reader/writer for paged-array indexes.
 //!
-//! `refcount`, `paged_reverse`, and `dedup::cuckoo` all map a sparse
-//! page table (`page_idx -> on-disk PageId`) onto a single meta page.
-//! That capped each shard at ~503 entries — fine for unit tests, far
-//! too small for production sizing (50 M dedup entries, millions of
-//! refcount PBAs). This module factors the chain semantics out so all
-//! three indexes share one implementation.
+//! `refcount` and `dedup::cuckoo` both map a sparse page table
+//! (`page_idx -> on-disk PageId`) onto a single meta page. That
+//! capped each shard at ~503 entries — fine for unit tests, far too
+//! small for production sizing (50 M dedup entries, millions of
+//! refcount PBAs). This module factors the chain semantics out so
+//! both indexes share one implementation.
 //!
 //! # On-disk layout
 //!
@@ -124,28 +124,38 @@ pub fn read_chain(
     })
 }
 
-/// Persist `page_table` across a chain rooted at `existing_chain[0]`.
+/// Build a chain rooted at `existing_chain[0]` for `page_table` without
+/// touching disk: allocates new continuation pages via `page_store` if
+/// the table grew, builds + seals every chain page in memory, and
+/// returns the chain layout for the caller to drive a single batched
+/// `write_sealed_page_runs` (instead of N synchronous `write_page`
+/// calls). Pure CPU + allocator work — no `write_page` / `free`.
 ///
-/// Reuses the existing head + as many continuation pages as needed.
-/// Allocates new continuation pages if the table grew; frees old ones
-/// if it shrank. Returns the new chain (head first).
+/// Returns `(new_chain, sealed_pages, to_free_pids)`:
+/// - `new_chain` — chain order, head first.
+/// - `sealed_pages` — `(pid, Arc<Page>)` for every page in `new_chain`,
+///   already sealed; feed straight into
+///   [`PageStore::write_sealed_page_runs`].
+/// - `to_free_pids` — trailing continuation pages from `existing_chain`
+///   that the caller must `page_store.free(pid, free_lsn)` **after**
+///   the writes are durable, so a crash leaves the old chain still
+///   readable.
 ///
-/// `head_extra` are the module-specific bytes written at the front of
-/// the head page (length must equal whatever `head_extra` was passed
-/// to [`read_chain`] when this chain was last opened).
-pub fn write_chain(
+/// Used by [`write_chain`] (single-chain wrapper) and by
+/// `flush_with_gate` to fold every refcount shard's meta-chain pages
+/// into the same global `write_sealed_page_runs` batch as the L2P +
+/// refcount data pages.
+pub fn build_chain_pages(
     page_store: &PageStore,
-    page_cache: &PageCache,
     page_type: PageType,
     expected_key_count: u16,
     head_extra: &[u8],
     page_table: &[PageId],
     existing_chain: &[PageId],
-    free_lsn: Lsn,
-) -> Result<Vec<PageId>> {
+) -> Result<(Vec<PageId>, Vec<(PageId, Arc<Page>)>, Vec<PageId>)> {
     assert!(
         !existing_chain.is_empty(),
-        "write_chain requires the head meta page to already exist",
+        "build_chain_pages requires the head meta page to already exist",
     );
     let head_cap = head_capacity(head_extra.len());
 
@@ -181,6 +191,7 @@ pub fn write_chain(
         .copied()
         .collect();
 
+    let mut sealed_pages: Vec<(PageId, Arc<Page>)> = Vec::with_capacity(chunks.len());
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         let pid = new_chain[chunk_idx];
         let next_pid = new_chain.get(chunk_idx + 1).copied().unwrap_or(0);
@@ -215,13 +226,64 @@ pub fn write_chain(
             }
         }
         page.seal();
-        page_store.write_page(pid, &page)?;
-        page_cache.replace_or_insert(pid, Arc::new(page));
+        sealed_pages.push((pid, Arc::new(page)));
     }
 
+    Ok((new_chain, sealed_pages, to_free))
+}
+
+/// Persist `page_table` across a chain rooted at `existing_chain[0]`.
+///
+/// Reuses the existing head + as many continuation pages as needed.
+/// Allocates new continuation pages if the table grew; frees old ones
+/// if it shrank. Returns the new chain (head first).
+///
+/// `head_extra` are the module-specific bytes written at the front of
+/// the head page (length must equal whatever `head_extra` was passed
+/// to [`read_chain`] when this chain was last opened).
+///
+/// Thin shim over [`build_chain_pages`] + a single batched
+/// [`PageStore::write_sealed_page_runs`]. Callers that need to fold
+/// multiple chains' pages into one shared submission (e.g.
+/// `flush_with_gate` for refcount shards) should use
+/// `build_chain_pages` directly and submit the merged sealed set
+/// themselves.
+pub fn write_chain(
+    page_store: &PageStore,
+    page_cache: &PageCache,
+    page_type: PageType,
+    expected_key_count: u16,
+    head_extra: &[u8],
+    page_table: &[PageId],
+    existing_chain: &[PageId],
+    free_lsn: Lsn,
+) -> Result<Vec<PageId>> {
+    let (new_chain, sealed_pages, to_free) = build_chain_pages(
+        page_store,
+        page_type,
+        expected_key_count,
+        head_extra,
+        page_table,
+        existing_chain,
+    )?;
+
+    // Single fan-out submission for the whole chain. `write_sealed_page_runs`
+    // sorts + coalesces adjacent pids into per-run `writev` SQEs and
+    // returns once every CQE has been harvested — equivalent to N
+    // separate `write_page` calls but the submitter sees one batch.
+    page_store.write_sealed_page_runs(sealed_pages.clone())?;
+
+    // Page-cache + old-chain reclaim run **after** the bytes are durable
+    // (write_sealed_page_runs Ok = CQEs harvested, see
+    // io_submitter.rs invariants). Free order: invalidate cache before
+    // releasing the pid so a concurrent reader can't pull a stale view
+    // of a recycled page.
     for pid in to_free {
         page_cache.invalidate(pid);
         page_store.free(pid, free_lsn)?;
+    }
+    for (pid, page) in sealed_pages {
+        page_cache.replace_or_insert(pid, page);
     }
 
     Ok(new_chain)

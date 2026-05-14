@@ -60,11 +60,17 @@
 //! (28 B BlockmapValue + 8 B seq_guard), so total record sizes including
 //! the tag byte are 48 B unguarded and 60 B guarded.
 //!
-//! `L2P_*` value fields are 36 B in schema 0xB2 (was 28 B in 0xB1). The
+//! `L2P_*` value fields are 36 B in schema 0xB2+ (was 28 B in 0xB1). The
 //! trailing 8 B is a big-endian commit seq used by the apply path's
 //! seq_guard CAS check; see [`paged::format::L2P_SEQ_OFFSET`]. Schema
-//! bump 0xB1 → 0xB2 is a flag day — old WAL bodies are rejected on
-//! recovery and must be drained with the prior binary before upgrading.
+//! bumps 0xB1 → 0xB2 → 0xB3 are flag days — old WAL bodies are rejected
+//! on recovery and must be drained with the prior binary before upgrading.
+//!
+//! v3 (0xB3): retired the legacy `DedupReversePut` / `DedupReverseDelete`
+//! op codes (tags 0x12 / 0x13) along with the `paged_reverse` module.
+//! Onyx switched to promote-on-verified-hit; the persistent reverse index
+//! has been inert in production since then, and refcount→0 cleanup uses
+//! old-mapping read-back to recompute the hash instead.
 //!
 //! Phase 7 commit 6 put `vol_ord` on L2P ops so apply can route them to
 //! the right per-volume shard group. `vol_ord = 0` is the bootstrap
@@ -97,7 +103,9 @@ use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
 ///
 /// Phase A bumped the implicit "no prefix" format to v1 (0xB1).
 /// v2 (0xB2): L2pValue grew 28 → 36 B with a per-LBA seq trailer.
-pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB2;
+/// v3 (0xB3): retired `DedupReversePut` / `DedupReverseDelete` (tags
+/// 0x12 / 0x13) along with the legacy `paged_reverse` module.
+pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB3;
 
 pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;
@@ -122,8 +130,10 @@ pub const L2P_REMAP_GUARD_NONE: u8 = 0x00;
 pub const L2P_REMAP_GUARD_SOME: u8 = 0x01;
 pub const TAG_DEDUP_PUT: u8 = 0x10;
 pub const TAG_DEDUP_DELETE: u8 = 0x11;
-pub const TAG_DEDUP_REVERSE_PUT: u8 = 0x12;
-pub const TAG_DEDUP_REVERSE_DELETE: u8 = 0x13;
+// Tags 0x12 / 0x13 were `DEDUP_REVERSE_PUT` / `DEDUP_REVERSE_DELETE` and
+// retired in schema 0xB3. Do not reuse — a 0xB2 segment that survives
+// past the WAL_BODY_SCHEMA_VERSION reject would otherwise decode as a
+// different op.
 pub const TAG_DEDUP_PUT_GUARDED: u8 = 0x14;
 pub const TAG_DEDUP_COMPARE_DELETE: u8 = 0x15;
 pub const TAG_DEDUP_COMPARE_PUT: u8 = 0x16;
@@ -218,18 +228,6 @@ pub enum WalOp {
         hash: Hash8,
         old_value: DedupValue,
         new_value: DedupValue,
-    },
-    /// Record that `pba` owns `hash`. Stored in `dedup_reverse` so a
-    /// later `decref_pba → 0` can prefix-scan by PBA and tombstone the
-    /// corresponding `dedup_index` entries.
-    DedupReversePut {
-        pba: Pba,
-        hash: Hash8,
-    },
-    /// Tombstone a `(pba, hash)` entry in `dedup_reverse`.
-    DedupReverseDelete {
-        pba: Pba,
-        hash: Hash8,
     },
     Incref {
         pba: Pba,

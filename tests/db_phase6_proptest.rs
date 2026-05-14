@@ -10,8 +10,7 @@
 //!    failed commit is neither half-applied in memory nor half-visible
 //!    after reopen.
 //!
-//! 3. `decref_to_zero_cleanup_via_dedup_reverse` is the end-to-end
-//!    scenario that motivates the dedup_reverse LSM.
+//! 3. (`decref_to_zero_cleanup_via_dedup_reverse` retired in manifest v9.)
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -330,65 +329,10 @@ fn failed_commit_does_not_apply_to_memory_state() {
     assert_eq!(db.get_dedup(&h(100)).unwrap(), Some(dval(1)));
 }
 
-#[test]
-fn decref_to_zero_cleanup_via_dedup_reverse() {
-    // End-to-end dedup lifecycle:
-    //   - register hash → PBA (forward + reverse + incref in one tx)
-    //   - reader confirms the mapping
-    //   - decref PBA to zero, scan dedup_reverse, tombstone the
-    //     matching dedup_index entry, tombstone the reverse row, all
-    //     in one tx
-    //   - after commit, dedup_index lookup returns None and refcount
-    //     is gone
-    let dir = TempDir::new().unwrap();
-    let db = Db::create(dir.path()).unwrap();
-
-    // Register three hashes mapped to pba=500.
-    let hashes = [h(1), h(2), h(3)];
-    for hash in &hashes {
-        let mut tx = db.begin();
-        tx.put_dedup(*hash, dval(7));
-        tx.register_dedup_reverse(500, *hash);
-        tx.incref_pba(500, 1);
-        tx.commit().unwrap();
-    }
-    assert_eq!(db.get_refcount(500).unwrap(), 3);
-    for hash in &hashes {
-        assert_eq!(db.get_dedup(hash).unwrap(), Some(dval(7)));
-    }
-
-    // Release: build a single cleanup tx that decrefs PBA to zero and
-    // tombstones every dedup_index + dedup_reverse entry that pointed
-    // at it. The `scan` reads outside the tx; between scan and commit
-    // another thread could in principle insert, but we're
-    // single-threaded here and the caller is expected to serialise
-    // via their own logic (or phase 7's transaction isolation).
-    let reverse_hashes = db.scan_dedup_reverse_for_pba(500).unwrap();
-    assert_eq!(reverse_hashes.len(), 3);
-
-    let mut cleanup = db.begin();
-    cleanup.decref_pba(500, 3);
-    for hash in &reverse_hashes {
-        cleanup.delete_dedup(*hash);
-        cleanup.unregister_dedup_reverse(500, *hash);
-    }
-    cleanup.commit().unwrap();
-
-    assert_eq!(db.get_refcount(500).unwrap(), 0);
-    for hash in &hashes {
-        assert_eq!(db.get_dedup(hash).unwrap(), None, "dedup should be gone");
-    }
-    assert!(db.scan_dedup_reverse_for_pba(500).unwrap().is_empty());
-
-    // Cleanup must also survive a crash: reopen and re-check.
-    drop(db);
-    let db = Db::open(dir.path()).unwrap();
-    assert_eq!(db.get_refcount(500).unwrap(), 0);
-    for hash in &hashes {
-        assert_eq!(db.get_dedup(hash).unwrap(), None);
-    }
-    assert!(db.scan_dedup_reverse_for_pba(500).unwrap().is_empty());
-}
+// `decref_to_zero_cleanup_via_dedup_reverse` retired alongside the
+// paged_reverse module + DedupReverse WAL ops (manifest v9 / WAL 0xB3).
+// Promote-on-verified-hit's old-mapping read-back is the replacement
+// cleanup path and is exercised on the onyx side.
 
 // Silence dead_code when the only user of `Arc` is a test that gets
 // disabled under some feature flag.

@@ -6,7 +6,6 @@ fn multi_get_empty_input_returns_empty() {
     assert!(db.multi_get(0, &[]).unwrap().is_empty());
     assert!(db.multi_get_refcount(&[]).unwrap().is_empty());
     assert!(db.multi_get_dedup(&[]).unwrap().is_empty());
-    assert!(db.multi_scan_dedup_reverse_for_pba(&[]).unwrap().is_empty());
 }
 
 #[test]
@@ -98,64 +97,8 @@ fn multi_dedup_entries_are_live_matches_forward_and_refcount() {
     assert_eq!(got, vec![true, false, false, false, true]);
 }
 
-#[test]
-fn multi_scan_dedup_reverse_preserves_order_and_per_pba_rows() {
-    let (_d, db) = mk_db();
-    // pba=10 has two hashes, pba=20 has three, pba=30 has zero.
-    // Flush some to force the cross-layer code path (memtable +
-    // SST) for at least one PBA.
-    db.register_dedup_reverse(10, hash_full(10, 1)).unwrap();
-    db.register_dedup_reverse(10, hash_full(10, 2)).unwrap();
-    let flush_lsn = db.last_applied_lsn();
-    db.dedup_reverse.flush_meta().unwrap();
-    db.register_dedup_reverse(20, hash_full(20, 1)).unwrap();
-    db.register_dedup_reverse(20, hash_full(20, 2)).unwrap();
-    db.register_dedup_reverse(20, hash_full(20, 3)).unwrap();
-
-    // Include a repeated PBA to make sure the batched impl doesn't
-    // de-duplicate or collapse results.
-    let pbas: Vec<Pba> = vec![30, 20, 10, 20];
-    let batched = db.multi_scan_dedup_reverse_for_pba(&pbas).unwrap();
-    assert_eq!(batched.len(), pbas.len());
-    for (i, pba) in pbas.iter().enumerate() {
-        let mut expected = db.scan_dedup_reverse_for_pba(*pba).unwrap();
-        let mut got = batched[i].clone();
-        expected.sort();
-        got.sort();
-        assert_eq!(got, expected, "pba {pba} mismatch");
-    }
-}
-
-#[test]
-fn multi_scan_dedup_reverse_hides_tombstoned_rows_explicitly() {
-    let (_d, db) = mk_db();
-    let p10_a = hash_full(10, 1);
-    let p10_b = hash_full(10, 2);
-    let p10_c = hash_full(10, 3);
-    let p20_a = hash_full(20, 1);
-
-    // Oldest persisted layer.
-    db.register_dedup_reverse(10, p10_a).unwrap();
-    db.register_dedup_reverse(10, p10_b).unwrap();
-    db.register_dedup_reverse(20, p20_a).unwrap();
-    let flush_lsn = db.last_applied_lsn();
-    db.dedup_reverse.flush_meta().unwrap();
-
-    // Newer memtable updates: remove one old row, add a new one.
-    db.unregister_dedup_reverse(10, p10_a).unwrap();
-    db.register_dedup_reverse(10, p10_c).unwrap();
-
-    let pbas: Vec<Pba> = vec![10, 20, 30, 10];
-    let mut got = db.multi_scan_dedup_reverse_for_pba(&pbas).unwrap();
-    for rows in &mut got {
-        rows.sort();
-    }
-
-    assert_eq!(got[0], vec![p10_b, p10_c]);
-    assert_eq!(got[1], vec![p20_a]);
-    assert!(got[2].is_empty());
-    assert_eq!(got[3], vec![p10_b, p10_c]);
-}
+// The `multi_scan_dedup_reverse_*` tests retired alongside the
+// paged_reverse module + DedupReverse WAL ops (manifest v9 / WAL 0xB3).
 
 // -------- P1: bucketed batch apply ----------------------------------
 

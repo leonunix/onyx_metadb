@@ -95,16 +95,6 @@ impl WalOp {
                 out.extend_from_slice(&old_value.0);
                 out.extend_from_slice(&new_value.0);
             }
-            WalOp::DedupReversePut { pba, hash } => {
-                out.push(TAG_DEDUP_REVERSE_PUT);
-                out.extend_from_slice(&pba.to_be_bytes());
-                out.extend_from_slice(hash);
-            }
-            WalOp::DedupReverseDelete { pba, hash } => {
-                out.push(TAG_DEDUP_REVERSE_DELETE);
-                out.extend_from_slice(&pba.to_be_bytes());
-                out.extend_from_slice(hash);
-            }
             WalOp::Incref { pba, delta } => {
                 out.push(TAG_INCREF);
                 out.extend_from_slice(&pba.to_be_bytes());
@@ -199,7 +189,6 @@ impl WalOp {
             WalOp::DedupDelete { .. } => 1 + 8,
             WalOp::DedupCompareDelete { .. } => 1 + 8 + 28,
             WalOp::DedupComparePut { .. } => 1 + 8 + 28 + 28,
-            WalOp::DedupReversePut { .. } | WalOp::DedupReverseDelete { .. } => 1 + 8 + 8,
             WalOp::Incref { .. } | WalOp::Decref { .. } => 1 + 8 + 4,
             WalOp::DropSnapshot {
                 pages, pba_decrefs, ..
@@ -254,8 +243,8 @@ pub fn try_encode_body(ops: &[WalOp]) -> Result<Vec<u8>> {
 /// any short read, or any unknown tag.
 ///
 /// A pre-v1 body starts with an op tag (`≤ 0x42`) rather than
-/// `WAL_BODY_SCHEMA_VERSION` (`0xB1`), so recovery from an old segment
-/// hits the "expected 0xB1" branch before it interprets any payload.
+/// `WAL_BODY_SCHEMA_VERSION` (currently 0xB3), so recovery from an old
+/// segment hits the version-reject branch before it interprets any payload.
 pub fn decode_body(body: &[u8]) -> Result<Vec<WalOp>> {
     let first = *body.first().ok_or_else(|| {
         MetaDbError::Corruption(format!(
@@ -453,18 +442,6 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                 },
                 &payload[64..],
             ))
-        }
-        TAG_DEDUP_REVERSE_PUT | TAG_DEDUP_REVERSE_DELETE => {
-            require_len(payload, 16, "DEDUP_REVERSE")?;
-            let pba = u64::from_be_bytes(payload[..8].try_into().unwrap());
-            let mut hash = [0u8; 8];
-            hash.copy_from_slice(&payload[8..16]);
-            let op = if tag == TAG_DEDUP_REVERSE_PUT {
-                WalOp::DedupReversePut { pba, hash }
-            } else {
-                WalOp::DedupReverseDelete { pba, hash }
-            };
-            Ok((op, &payload[16..]))
         }
         TAG_INCREF | TAG_DECREF => {
             require_len(payload, 12, "INCREF/DECREF")?;

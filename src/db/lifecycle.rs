@@ -293,24 +293,15 @@ impl Db {
             0xDEAD_BEEF_CAFE_F00D,
             0x1234_5678_ABCD_EF01,
         )?);
-        let dedup_reverse = Arc::new(crate::paged_reverse::PagedReverse::create(
-            page_store.clone(),
-            page_cache.clone(),
-        )?);
         manifest.body_version = MANIFEST_BODY_VERSION;
         manifest.refcount_shard_roots = refcount_roots;
         manifest.dedup_shards = dedup_shards;
         // dedup_index: cuckoo meta page id stored under the legacy
         // `dedup_index_shard_heads` slot, single-element box for
-        // compat with the existing decoder (same pattern as
-        // dedup_reverse below).
+        // compat with the existing decoder. The retired
+        // `dedup_reverse_shard_heads` slot is gone (schema v9).
         manifest.dedup_index_shard_heads =
             vec![vec![dedup_index.meta_page_id()].into_boxed_slice()].into_boxed_slice();
-        // dedup_reverse: paged-array stores its meta page id under the
-        // legacy field name, single-element box for compat with
-        // existing decode logic.
-        manifest.dedup_reverse_shard_heads =
-            vec![vec![dedup_reverse.meta_page_id()].into_boxed_slice()].into_boxed_slice();
         // Seed the bootstrap volume so open() / flush() can route
         // through the same volumes table the live `Db` manages.
         manifest.volumes = vec![VolumeEntry {
@@ -369,7 +360,6 @@ impl Db {
             volumes: Arc::new(RwLock::new(volumes)),
             refcount_shards,
             dedup_index,
-            dedup_reverse,
             dedup_lanes,
             dedup_maintenance_lanes,
             dedup_maintenance_queued: build_dedup_queued_flags(dedup_shards as usize),
@@ -512,21 +502,11 @@ impl Db {
             .first()
             .and_then(|s| s.first().copied())
             .unwrap_or(0);
-        let dedup_reverse_meta_pid: PageId = manifest
-            .dedup_reverse_shard_heads
-            .first()
-            .and_then(|s| s.first().copied())
-            .unwrap_or(0);
         let dedup_index = Arc::new(crate::dedup::DedupIndex::open(
             page_store.clone(),
             page_cache.clone(),
             dedup_index_meta_pid,
             cfg.dedup_l1_cache_entries,
-        )?);
-        let dedup_reverse = Arc::new(crate::paged_reverse::PagedReverse::open(
-            page_store.clone(),
-            page_cache.clone(),
-            dedup_reverse_meta_pid,
         )?);
 
         // Replay WAL segments forward from checkpoint_lsn+1 onto the
@@ -566,7 +546,6 @@ impl Db {
                         &volumes,
                         &refcount_shards,
                         &dedup_index,
-                        &dedup_reverse,
                         &page_store,
                         &metrics,
                         lsn,
@@ -680,7 +659,6 @@ impl Db {
                                 &volumes,
                                 &refcount_shards,
                                 &dedup_index,
-                                &dedup_reverse,
                                 &page_store,
                                 lsn,
                                 op,
@@ -749,11 +727,8 @@ impl Db {
             // re-stamped to the same value (kept for layout
             // consistency).
             dedup_index.flush_meta()?;
-            dedup_reverse.flush_meta()?;
             manifest.dedup_index_shard_heads =
                 vec![vec![dedup_index.meta_page_id()].into_boxed_slice()].into_boxed_slice();
-            manifest.dedup_reverse_shard_heads =
-                vec![vec![dedup_reverse.meta_page_id()].into_boxed_slice()].into_boxed_slice();
 
             refresh_manifest_entries(&mut manifest, &sorted, &l2p_guards, &refcount_shards)?;
             manifest.checkpoint_lsn = last_applied;
@@ -847,7 +822,6 @@ impl Db {
             volumes: Arc::new(RwLock::new(volumes)),
             refcount_shards,
             dedup_index,
-            dedup_reverse,
             dedup_lanes,
             dedup_maintenance_lanes,
             dedup_maintenance_queued: build_dedup_queued_flags(manifest_dedup_shards),
@@ -947,20 +921,17 @@ impl Db {
         self.metrics.snapshot()
     }
 
-    pub fn dedup_lsm_stats(&self) -> (crate::LsmStats, crate::LsmStats) {
-        // Both dedup index and dedup reverse moved off LSM; report
-        // zeroed stats so the onyx status formatter keeps its
-        // `(forward, reverse)` shape until the operator-facing
-        // surface is updated. Use [`Db::dedup_tier_sizes`] for the
-        // cuckoo L0/L1 occupancy.
-        (crate::LsmStats::default(), crate::LsmStats::default())
+    pub fn dedup_lsm_stats(&self) -> crate::LsmStats {
+        // Dedup index moved off LSM; report zeroed stats so the onyx
+        // status formatter still has a value to format. Use
+        // [`Db::dedup_tier_sizes`] for the cuckoo L0/L1 occupancy.
+        crate::LsmStats::default()
     }
 
     /// Per-shard dedup stats are unavailable: the cuckoo dedup_index
-    /// has no shard concept and paged-array dedup_reverse uses a
-    /// single page table. Returns empty vecs.
-    pub fn dedup_lsm_stats_per_shard(&self) -> (Vec<crate::LsmStats>, Vec<crate::LsmStats>) {
-        (Vec::new(), Vec::new())
+    /// has no shard concept. Returns an empty vec.
+    pub fn dedup_lsm_stats_per_shard(&self) -> Vec<crate::LsmStats> {
+        Vec::new()
     }
 
     /// Cuckoo dedup_index L0/L1 tier occupancy snapshot.
@@ -1040,7 +1011,7 @@ impl Db {
         let cache = self.cache_stats();
         let metrics = self.metrics_snapshot();
         let pending = self.pending_state();
-        let (dedup_index, dedup_reverse) = self.dedup_lsm_stats();
+        let dedup_index = self.dedup_lsm_stats();
         format!(
             concat!(
                 "{{",
@@ -1048,13 +1019,6 @@ impl Db {
                 "\"high_water\":{},",
                 "\"free_list\":{},",
                 "\"dedup_index\":{{",
-                "\"levels\":{},",
-                "\"ssts\":{},",
-                "\"records\":{},",
-                "\"active_entries\":{},",
-                "\"frozen_entries\":{}",
-                "}},",
-                "\"dedup_reverse\":{{",
                 "\"levels\":{},",
                 "\"ssts\":{},",
                 "\"records\":{},",
@@ -1098,11 +1062,6 @@ impl Db {
             dedup_index.total_records,
             dedup_index.memtable.active_entries,
             dedup_index.memtable.frozen_entries,
-            dedup_reverse.level_count,
-            dedup_reverse.total_ssts,
-            dedup_reverse.total_records,
-            dedup_reverse.memtable.active_entries,
-            dedup_reverse.memtable.frozen_entries,
             cache.hits,
             cache.misses,
             cache.evictions,
@@ -1314,38 +1273,40 @@ impl Db {
             flushed_l2p.push(flushed);
         }
         // Refcount sealed pages flow through the same write_sealed_page_runs
-        // batch as L2P. paged_meta::write_chain (below) handles its own
-        // continuation-page writes; one page_store.sync() covers both.
+        // batch as L2P. Refcount meta-chain pages also fold into the
+        // same batch via `build_meta_chain` (below) — one io_uring
+        // submission covers L2P + RC data + RC meta, replacing N
+        // synchronous per-page writes that used to dominate flush IO.
         for ckpt in &refcount_checkpoints {
             let before = sealed_pages.len();
             ckpt.append_sealed_pages(&mut sealed_pages);
             total_pages_written += sealed_pages.len() - before;
         }
-        let page_write_started = std::time::Instant::now();
-        if let Err(err) = self.page_store.write_sealed_page_runs(sealed_pages) {
-            self.metrics
-                .record_flush_io_page_write(page_write_started.elapsed());
-            self.metrics
-                .record_flush_io(io_started.elapsed(), total_pages_written);
-            self.metrics
-                .record_flush_total(kind, flush_started.elapsed());
-            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
-            return Err(err);
-        }
-        self.metrics
-            .record_flush_io_page_write(page_write_started.elapsed());
-        // Refcount meta-chain rewrite. write_meta_chain_external also
-        // writes pages via page_store.write_page; the subsequent
-        // page_store.sync() makes them durable before manifest commit.
+        // Build the per-shard meta chains in memory (no IO) and fold
+        // every sealed chain page into the global `sealed_pages` batch.
         // The shard's head meta page id is stable across rewrites
-        // (paged_meta::write_chain reuses existing_chain[0]), so the
-        // manifest needs no per-flush update for refcount roots.
+        // (`paged_meta::build_chain_pages` reuses `existing_chain[0]`),
+        // so the manifest needs no per-flush update for refcount roots.
         let mut rc_new_chains: Vec<Vec<PageId>> = Vec::with_capacity(refcount_checkpoints.len());
+        // Trailing continuation pages from the previous chain that we
+        // must release **after** the new chain is durable and the
+        // manifest has committed. `wal_checkpoint` is the durable LSN
+        // used to stamp the deferred-free entry.
+        let mut rc_to_free: Vec<PageId> = Vec::new();
+        // (pid, sealed Arc) for the meta-chain pages of every shard;
+        // re-published into the page cache after `write_sealed_page_runs`
+        // succeeds so subsequent reads don't need to hit disk for the
+        // new chain head/continuation pages.
+        let mut rc_chain_cache_inserts: Vec<(PageId, Arc<crate::page::Page>)> = Vec::new();
         for (shard, ckpt) in self.refcount_shards.iter().zip(refcount_checkpoints.iter()) {
             let rc_meta_started = std::time::Instant::now();
-            match shard.rc.write_meta_chain(ckpt, wal_checkpoint) {
-                Ok(chain) => {
+            match shard.rc.build_meta_chain(ckpt) {
+                Ok((chain, chain_sealed, free_pids)) => {
+                    let added = chain_sealed.len();
+                    rc_chain_cache_inserts.extend(chain_sealed.iter().cloned());
+                    sealed_pages.extend(chain_sealed);
+                    total_pages_written += added;
+                    rc_to_free.extend(free_pids);
                     self.metrics
                         .record_flush_io_rc_meta(rc_meta_started.elapsed());
                     rc_new_chains.push(chain);
@@ -1363,6 +1324,20 @@ impl Db {
                 }
             }
         }
+        let page_write_started = std::time::Instant::now();
+        if let Err(err) = self.page_store.write_sealed_page_runs(sealed_pages) {
+            self.metrics
+                .record_flush_io_page_write(page_write_started.elapsed());
+            self.metrics
+                .record_flush_io(io_started.elapsed(), total_pages_written);
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
+            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+            return Err(err);
+        }
+        self.metrics
+            .record_flush_io_page_write(page_write_started.elapsed());
         let sync_started = std::time::Instant::now();
         if let Err(err) = self.page_store.sync() {
             self.metrics.record_flush_io_sync(sync_started.elapsed());
@@ -1377,6 +1352,14 @@ impl Db {
         self.metrics.record_flush_io_sync(sync_started.elapsed());
         self.metrics
             .record_flush_io(io_started.elapsed(), total_pages_written);
+
+        // RC meta-chain pages are now durable on disk. Re-publish the
+        // sealed bytes into the shared page cache so subsequent reads
+        // hit cache instead of re-reading the just-written pages.
+        // Counterpart to what `paged_meta::write_chain` does inline.
+        for (pid, page) in rc_chain_cache_inserts {
+            self.page_cache.replace_or_insert(pid, page);
+        }
 
         let manifest_started = std::time::Instant::now();
         let mut manifest_state = self.manifest_state.lock();
@@ -1448,11 +1431,29 @@ impl Db {
 
         // Manifest is durable. Install refcount meta chains in memory
         // so subsequent `begin_checkpoint` sees the new chain when
-        // computing `existing_chain` for paged_meta::write_chain.
+        // computing `existing_chain` for paged_meta::build_chain_pages.
         // Direct inner.lock() — no race with `RcShard::stage` which
         // never reads `inner.meta_chain`. Cannot fail.
         for (shard, new_chain) in self.refcount_shards.iter().zip(rc_new_chains.into_iter()) {
             shard.rc.install_meta_chain(new_chain);
+        }
+        // Trailing continuation pages from the old chains can be
+        // released now that the new chains are installed and durable.
+        // Free order: invalidate the cache entry first so a concurrent
+        // reader can't observe a stale page after the pid is recycled.
+        // Errors are logged but don't fail the flush — the pages are
+        // already orphaned in-memory and any leak gets reclaimed at
+        // next open via the free-list walker. Matches the original
+        // `paged_meta::write_chain` semantics.
+        for pid in rc_to_free {
+            self.page_cache.invalidate(pid);
+            if let Err(err) = self.page_store.free(pid, wal_checkpoint) {
+                tracing::warn!(
+                    page_id = pid,
+                    error = %err,
+                    "flush_with_gate: failed to free retired rc-meta chain page"
+                );
+            }
         }
         // Drained deltas have been durably applied + meta chain rotated.
         // Drop checkpoints to release the snapshot bookkeeping; abort

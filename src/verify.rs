@@ -248,19 +248,6 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
     if dedup_index_meta_pid != NULL_PAGE {
         walk_cuckoo_dedup_index(page_store, dedup_index_meta_pid, &mut live)?;
     }
-    // The legacy `dedup_reverse_shard_heads` manifest slot now
-    // carries `[[meta_page_id]]` (single-element box) for the paged
-    // array. Walk the meta page + every data page it indexes + any
-    // overflow pages reachable from those data pages.
-    let dedup_reverse_meta_pid: PageId = manifest
-        .dedup_reverse_shard_heads
-        .first()
-        .and_then(|s| s.first().copied())
-        .unwrap_or(NULL_PAGE);
-    if dedup_reverse_meta_pid != NULL_PAGE {
-        walk_dedup_reverse_paged_array(page_store, dedup_reverse_meta_pid, &mut live)?;
-    }
-
     Ok(live)
 }
 
@@ -351,77 +338,6 @@ fn walk_cuckoo_dedup_index(
                 dh.page_type
             )));
         }
-    }
-    Ok(())
-}
-
-/// Walk the dedup_reverse paged-array meta chain, then each
-/// allocated data page, then every overflow page in the chains those
-/// data pages point at, marking them all as live.
-fn walk_dedup_reverse_paged_array(
-    page_store: &PageStore,
-    meta_pid: PageId,
-    live: &mut LivePages,
-) -> Result<()> {
-    let page_table = crate::paged_meta::walk_chain(
-        page_store,
-        meta_pid,
-        PageType::DedupReverseArray,
-        0xFFFF,
-        0,
-        |pid| live.mark(pid),
-    )?;
-    for pid in page_table {
-        // Same sentinel conventions as cuckoo: 0 marks a hole.
-        if pid == 0 || pid == NULL_PAGE {
-            continue;
-        }
-        live.mark(pid);
-        let data_page = page_store.read_page(pid)?;
-        let dh = data_page.header()?;
-        if dh.page_type != PageType::DedupReverseArray {
-            return Err(MetaDbError::Corruption(format!(
-                "dedup_reverse data page {pid} has wrong type {:?}",
-                dh.page_type
-            )));
-        }
-        // Walk overflow chain reachable from any slot in this data
-        // page. Slot layout (paged_reverse::array): bytes 4..12 of
-        // each 24 B slot is the overflow head pid.
-        for slot in 0..crate::paged_reverse::ENTRIES_PER_PAGE {
-            let s_off = slot * 24;
-            let overflow_pid = u64::from_le_bytes(
-                data_page.payload()[s_off + 4..s_off + 12]
-                    .try_into()
-                    .unwrap(),
-            ) as PageId;
-            if overflow_pid == 0 || overflow_pid == NULL_PAGE {
-                continue;
-            }
-            walk_dedup_reverse_overflow_chain(page_store, overflow_pid, live)?;
-        }
-    }
-    Ok(())
-}
-
-fn walk_dedup_reverse_overflow_chain(
-    page_store: &PageStore,
-    head: PageId,
-    live: &mut LivePages,
-) -> Result<()> {
-    let mut next = head;
-    while next != 0 {
-        live.mark(next);
-        let page = page_store.read_page(next)?;
-        let h = page.header()?;
-        if h.page_type != PageType::DedupReverseArray {
-            return Err(MetaDbError::Corruption(format!(
-                "dedup_reverse overflow page {next} has wrong type {:?}",
-                h.page_type
-            )));
-        }
-        let p = page.payload();
-        next = u64::from_le_bytes(p[2..10].try_into().unwrap()) as PageId;
     }
     Ok(())
 }

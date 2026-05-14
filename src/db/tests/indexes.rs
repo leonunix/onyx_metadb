@@ -315,9 +315,7 @@ fn dedup_put_guarded_respects_refcount_guard() {
     dead_tx.commit().unwrap();
 
     assert_eq!(db.get_dedup(&live_hash).unwrap(), Some(dv(10)));
-    assert_eq!(db.scan_dedup_reverse_for_pba(123).unwrap(), vec![live_hash]);
     assert_eq!(db.get_dedup(&dead_hash).unwrap(), None);
-    assert!(db.scan_dedup_reverse_for_pba(124).unwrap().is_empty());
 }
 
 #[test]
@@ -340,22 +338,8 @@ fn dedup_flush_to_l0_then_read() {
     }
 }
 
-#[test]
-fn dedup_flush_to_l0_flushes_reverse_index_too() {
-    let (_d, db) = mk_db();
-    for i in 0u64..25 {
-        let hash = hash_full(17, i);
-        db.put_dedup(hash, dv(i as u8)).unwrap();
-        db.register_dedup_reverse(17, hash).unwrap();
-    }
-
-    db.flush().unwrap();
-    let mut found = db.scan_dedup_reverse_for_pba(17).unwrap();
-    found.sort();
-    let mut expected: Vec<_> = (0u64..25).map(|i| hash_full(17, i)).collect();
-    expected.sort();
-    assert_eq!(found, expected);
-}
+// `dedup_flush_to_l0_flushes_reverse_index_too` retired alongside the
+// paged_reverse module (manifest v9 / WAL 0xB3).
 
 #[test]
 fn dedup_survives_flush_and_reopen() {
@@ -645,99 +629,10 @@ fn apply_lane_h2_metrics_record_wakeups_and_bursts() {
     );
 }
 
-// -------- phase 6e: dedup_reverse --------
-
-#[test]
-fn reverse_entry_round_trip_recovers_full_hash() {
-    let hash = hash_full(0xAABB_CCDD_1111_2222, 0xDEAD_BEEF_CAFE_F00D);
-    let (key, value) = encode_reverse_entry(42, &hash);
-    assert_eq!(&key[..8], &42u64.to_be_bytes());
-    let back = decode_reverse_hash(&key, &value);
-    assert_eq!(back, hash);
-}
-
-#[test]
-fn register_and_scan_by_pba() {
-    let (_d, db) = mk_db();
-    let h1 = hash_full(1, 100);
-    let h2 = hash_full(2, 200);
-    db.register_dedup_reverse(42, h1).unwrap();
-    db.register_dedup_reverse(42, h2).unwrap();
-    db.register_dedup_reverse(99, hash_full(3, 300)).unwrap();
-
-    let mut found = db.scan_dedup_reverse_for_pba(42).unwrap();
-    found.sort();
-    let mut expected = vec![h1, h2];
-    expected.sort();
-    assert_eq!(found, expected);
-
-    assert_eq!(
-        db.scan_dedup_reverse_for_pba(12345).unwrap(),
-        Vec::<Hash8>::new()
-    );
-}
-
-#[test]
-fn unregister_removes_from_scan() {
-    let (_d, db) = mk_db();
-    let h1 = hash_full(10, 1);
-    let h2 = hash_full(10, 2);
-    db.register_dedup_reverse(7, h1).unwrap();
-    db.register_dedup_reverse(7, h2).unwrap();
-    db.unregister_dedup_reverse(7, h1).unwrap();
-    let found = db.scan_dedup_reverse_for_pba(7).unwrap();
-    assert_eq!(found, vec![h2]);
-}
-
-#[test]
-fn scan_sees_entries_after_flush_to_sst() {
-    let (_d, db) = mk_db();
-    for i in 0u64..25 {
-        db.register_dedup_reverse(17, hash_full(i, i)).unwrap();
-    }
-    // Flush the dedup_reverse memtable so the next scan reads SST data.
-    let lsn = db.last_applied_lsn();
-    db.dedup_reverse.flush_meta().unwrap();
-    let found = db.scan_dedup_reverse_for_pba(17).unwrap();
-    assert_eq!(found.len(), 25);
-}
-
-#[test]
-fn tx_atomically_registers_dedup_index_and_reverse() {
-    let (_d, db) = mk_db();
-    let hash = hash_full(5, 5);
-    let mut tx = db.begin();
-    tx.put_dedup(hash, dv(7));
-    tx.register_dedup_reverse(999, hash);
-    tx.incref_pba(999, 1);
-    tx.commit().unwrap();
-    assert_eq!(db.get_dedup(&hash).unwrap(), Some(dv(7)));
-    assert_eq!(db.scan_dedup_reverse_for_pba(999).unwrap(), vec![hash]);
-    assert_eq!(db.get_refcount(999).unwrap(), 1);
-}
-
-#[test]
-fn dedup_reverse_survives_reopen() {
-    let dir = TempDir::new().unwrap();
-    let h_a = hash_full(77, 1);
-    let h_b = hash_full(77, 2);
-    {
-        let db = Db::create(dir.path()).unwrap();
-        db.register_dedup_reverse(77, h_a).unwrap();
-        db.register_dedup_reverse(77, h_b).unwrap();
-        // flush half so we exercise both WAL-replay AND
-        // SST-reload paths.
-        let lsn = db.last_applied_lsn();
-        db.dedup_reverse.flush_meta().unwrap();
-        db.flush().unwrap();
-        db.register_dedup_reverse(77, hash_full(77, 3)).unwrap();
-    }
-    let db = Db::open(dir.path()).unwrap();
-    let mut found = db.scan_dedup_reverse_for_pba(77).unwrap();
-    found.sort();
-    let mut expected = vec![h_a, h_b, hash_full(77, 3)];
-    expected.sort();
-    assert_eq!(found, expected);
-}
+// The "phase 6e: dedup_reverse" test block (round_trip / register_and_scan /
+// unregister / scan_sees_entries / tx_atomically / survives_reopen) retired
+// alongside the paged_reverse module + DedupReverse WAL ops (manifest v9 /
+// WAL 0xB3). Onyx no longer registers reverse entries — promote-on-verified-hit
+// uses old-mapping read-back instead.
 
 // -------- batch read API --------------------------------------------

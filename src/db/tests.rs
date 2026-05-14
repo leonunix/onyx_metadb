@@ -119,7 +119,6 @@ fn apply_lane_prioritizes_ready_wal_work_with_bounded_maintenance() {
 }
 
 mod batch;
-mod cleanup;
 
 pub(super) fn h(n: u64) -> Hash8 {
     let mut out = [0u8; 8];

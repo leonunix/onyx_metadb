@@ -451,7 +451,6 @@ impl Db {
                 &volumes_map,
                 &self.refcount_shards,
                 &self.dedup_index,
-                &self.dedup_reverse,
                 &self.page_store,
                 lsn,
                 &op,

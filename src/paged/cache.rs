@@ -504,20 +504,41 @@ impl PageBuf {
         // zero we need them for cascade. Read via PageBuf so a Dirty
         // copy wins; `persist_if_dirty` then flushes it to disk so
         // the atomic RMW reads fresh bytes.
-        let children = {
-            let page = self.read(pid)?;
-            let header = page.header()?;
-            match header.page_type {
-                PageType::PagedIndex => index_collect_children(page),
-                PageType::PagedLeaf => Vec::new(),
-                other => {
-                    return Err(MetaDbError::Corruption(format!(
-                        "paged: atomic_decref_one on non-paged page type {other:?} at {pid}"
-                    )));
-                }
-            }
-        };
+        let children = self.read_children_for_decref(pid)?;
         self.persist_if_dirty(pid)?;
+        self.finish_decref_after_persist(pid, children)
+    }
+
+    /// Identical to [`atomic_decref_one`] but skips the
+    /// `persist_if_dirty` step. Used by [`atomic_decref`]'s batched
+    /// cascade after a single `persist_dirty_pages` covered every
+    /// Dirty page the cascade plans to touch — replaces N synchronous
+    /// `write_page` round-trips with one io_uring batch.
+    fn atomic_decref_one_already_persisted(
+        &mut self,
+        pid: PageId,
+    ) -> Result<(DecrefOutcome, Vec<PageId>)> {
+        let children = self.read_children_for_decref(pid)?;
+        self.finish_decref_after_persist(pid, children)
+    }
+
+    fn read_children_for_decref(&mut self, pid: PageId) -> Result<Vec<PageId>> {
+        let page = self.read(pid)?;
+        let header = page.header()?;
+        match header.page_type {
+            PageType::PagedIndex => Ok(index_collect_children(page)),
+            PageType::PagedLeaf => Ok(Vec::new()),
+            other => Err(MetaDbError::Corruption(format!(
+                "paged: atomic_decref on non-paged page type {other:?} at {pid}"
+            ))),
+        }
+    }
+
+    fn finish_decref_after_persist(
+        &mut self,
+        pid: PageId,
+        children: Vec<PageId>,
+    ) -> Result<(DecrefOutcome, Vec<PageId>)> {
         let new_rc = self.page_store.atomic_rc_delta(pid, -1)?;
         self.pages_remove(pid);
         self.page_cache.invalidate(pid);
@@ -533,17 +554,49 @@ impl PageBuf {
 
     /// Cross-tree-safe decref with cascading free, peer of
     /// [`atomic_incref`](Self::atomic_incref). Walks children through
-    /// an explicit worklist; every rc mutation and every free routes
-    /// through [`atomic_decref_one`](Self::atomic_decref_one).
+    /// an explicit worklist; every rc mutation routes through the
+    /// disk-direct RMW path.
+    ///
+    /// Within each outer-loop iteration we first pre-flush every
+    /// currently-worklist-resident Dirty page in **one** batched
+    /// `write_sealed_page_runs` call, then drain the worklist with the
+    /// already-persisted helper. New children whose disk bytes are
+    /// not affected by the parent's RMW don't need to be re-persisted
+    /// — children's RMWs read each child's own pid, which the parent
+    /// never wrote. The batch loop re-acquires the outer iteration
+    /// only when a popped child is itself Dirty in the local buf,
+    /// keeping the read-after-write invariant the original per-step
+    /// `persist_if_dirty` enforced.
     pub fn atomic_decref(&mut self, pid: PageId) -> Result<DecrefOutcome> {
         let mut top: Option<DecrefOutcome> = None;
         let mut worklist: Vec<PageId> = vec![pid];
-        while let Some(p) = worklist.pop() {
-            let (outcome, children) = self.atomic_decref_one(p)?;
-            if top.is_none() {
-                top = Some(outcome);
+        while !worklist.is_empty() {
+            // Single batched persist covering every Dirty pid currently
+            // on the worklist. Replaces N synchronous per-step writes.
+            let dirty: Vec<PageId> = worklist
+                .iter()
+                .copied()
+                .filter(|p| matches!(self.pages.get(p), Some(Slot::Dirty(_))))
+                .collect();
+            if !dirty.is_empty() {
+                self.persist_dirty_pages(&dirty)?;
             }
-            worklist.extend(children);
+            while let Some(p) = worklist.pop() {
+                let (outcome, children) = self.atomic_decref_one_already_persisted(p)?;
+                if top.is_none() {
+                    top = Some(outcome);
+                }
+                let has_dirty_child = children
+                    .iter()
+                    .any(|c| matches!(self.pages.get(c), Some(Slot::Dirty(_))));
+                worklist.extend(children);
+                if has_dirty_child {
+                    // New Dirty pages joined the worklist; break out so
+                    // the outer loop rebatch-persists them before their
+                    // RMW reads disk.
+                    break;
+                }
+            }
         }
         Ok(top.expect("worklist was non-empty"))
     }

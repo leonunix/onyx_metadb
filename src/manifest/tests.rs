@@ -72,7 +72,6 @@ fn commit_then_reopen_recovers_manifest() {
         refcount_shard_roots: bx(&[17, 18, 19, 20]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE, NULL_PAGE]),
-        dedup_reverse_shard_heads: one_shard(&[NULL_PAGE]),
         next_snapshot_id: 5,
         next_volume_ord: 1,
         snapshots: vec![snap(&ps, 1, 0, &[11, 12, 13, 14], 100)],
@@ -236,7 +235,6 @@ fn encode_decode_round_trip_with_refcount_and_dedup() {
         refcount_shard_roots: bx(&[142, 143, 144, 145]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE, 200, 300]),
-        dedup_reverse_shard_heads: one_shard(&[NULL_PAGE, 400]),
         next_snapshot_id: 99,
         next_volume_ord: 1,
         snapshots: vec![
@@ -318,7 +316,6 @@ fn v6_volumes_table_round_trip() {
         refcount_shard_roots: bx(&[50, 51]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[]),
-        dedup_reverse_shard_heads: one_shard(&[]),
         next_snapshot_id: 2,
         next_volume_ord: 3,
         snapshots: vec![snap(&ps, 1, 2, &[100, 101], 10)],
@@ -369,8 +366,8 @@ fn v6_rejects_volume_count_exceeding_capacity() {
 
 #[test]
 fn dedup_n4_encode_decode_round_trip() {
-    // Cuckoo dedup_index / paged_reverse store one meta-head group even
-    // when dedup_shards = 4 keeps four apply lanes.
+    // Cuckoo dedup_index stores one meta-head group even when
+    // dedup_shards = 4 keeps four apply lanes.
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let m = Manifest {
@@ -380,7 +377,6 @@ fn dedup_n4_encode_decode_round_trip() {
         refcount_shard_roots: bx(&[1, 2]),
         dedup_shards: 4,
         dedup_index_shard_heads: one_shard(&[10]),
-        dedup_reverse_shard_heads: one_shard(&[20]),
         next_snapshot_id: 1,
         next_volume_ord: 1,
         snapshots: Vec::new(),
@@ -419,7 +415,7 @@ fn dedup_encode_rejects_meta_head_outer_length_mismatch() {
     m.refcount_shard_roots = bx(&[1, 2]);
     m.volumes = vec![boot_vol(2, &[100, 101])];
     m.dedup_shards = 4;
-    // Cuckoo/reverse use one meta-head group each, regardless of
+    // Cuckoo uses one meta-head group regardless of
     // dedup_shards/apply-lane count.
     m.dedup_index_shard_heads = vec![bx(&[]); 2].into_boxed_slice();
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
@@ -432,76 +428,9 @@ fn dedup_encode_rejects_meta_head_outer_length_mismatch() {
     }
 }
 
-#[test]
-fn decode_v7_body_opens_as_dedup_shards_one() {
-    // Hand-craft a v7 manifest body and verify it decodes to a v8
-    // Manifest with dedup_shards=1 wrapping the v7 flat heads.
-    use super::OFF_BODY_VERSION as OFF_BV;
-    let dir = TempDir::new().unwrap();
-    let ps = mk_store(&dir);
-    // Synthesize a v7 body by encoding a v8 single-shard manifest, then
-    // rewriting the bytes to look like v7 (different version, flat heads
-    // contiguous starting from where v8 wrote shard-0 heads). Easier:
-    // directly write a minimal v7 layout into a Page.
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    let p = page.payload_mut();
-    p.fill(0);
-    // v7 fixed header
-    let v7 = 7u32;
-    p[OFF_BV..OFF_BV + 4].copy_from_slice(&v7.to_le_bytes());
-    // checkpoint_lsn = 42
-    p[super::OFF_CHECKPOINT_LSN..super::OFF_CHECKPOINT_LSN + 8]
-        .copy_from_slice(&42u64.to_le_bytes());
-    // free_list_head
-    p[super::OFF_FREE_LIST_HEAD..super::OFF_FREE_LIST_HEAD + 8]
-        .copy_from_slice(&NULL_PAGE.to_le_bytes());
-    // refcount_shard_count = 1
-    p[super::OFF_SHARD_COUNT..super::OFF_SHARD_COUNT + 4].copy_from_slice(&1u32.to_le_bytes());
-    // v7 dedup_level_count = 2 (flat — both stored at offset 24/28 in
-    // v7; in v8 these slots become dedup_shards / reserved).
-    p[super::OFF_V7_DEDUP_LEVEL_COUNT..super::OFF_V7_DEDUP_LEVEL_COUNT + 4]
-        .copy_from_slice(&2u32.to_le_bytes());
-    p[super::OFF_V7_DEDUP_REVERSE_LEVEL_COUNT..super::OFF_V7_DEDUP_REVERSE_LEVEL_COUNT + 4]
-        .copy_from_slice(&1u32.to_le_bytes());
-    // next_snapshot_id, next_volume_ord
-    p[super::OFF_NEXT_SNAPSHOT_ID..super::OFF_NEXT_SNAPSHOT_ID + 8]
-        .copy_from_slice(&1u64.to_le_bytes());
-    p[super::OFF_NEXT_VOLUME_ORD..super::OFF_NEXT_VOLUME_ORD + 2]
-        .copy_from_slice(&1u16.to_le_bytes());
-    p[super::OFF_SNAPSHOT_COUNT..super::OFF_SNAPSHOT_COUNT + 4]
-        .copy_from_slice(&0u32.to_le_bytes());
-    // volume_count = 1
-    p[super::OFF_VOLUME_COUNT..super::OFF_VOLUME_COUNT + 4].copy_from_slice(&1u32.to_le_bytes());
-
-    let mut off = super::OFF_VARIABLE_START;
-    // refcount_shard_roots[0] = 7
-    p[off..off + 8].copy_from_slice(&7u64.to_le_bytes());
-    off += 8;
-    // dedup_level_heads (flat, 2 entries)
-    p[off..off + 8].copy_from_slice(&100u64.to_le_bytes());
-    off += 8;
-    p[off..off + 8].copy_from_slice(&200u64.to_le_bytes());
-    off += 8;
-    // dedup_reverse_level_heads (flat, 1 entry)
-    p[off..off + 8].copy_from_slice(&NULL_PAGE.to_le_bytes());
-    off += 8;
-    // bootstrap volume entry
-    let boot = boot_vol(1, &[42]);
-    encode_volume_entry_inline(&boot, p, &mut off).unwrap();
-    page.seal();
-
-    let decoded = Manifest::decode(&page, &ps).unwrap();
-    assert_eq!(decoded.dedup_shards, 1);
-    assert_eq!(decoded.dedup_index_shard_heads.len(), 1);
-    assert_eq!(decoded.dedup_reverse_shard_heads.len(), 1);
-    assert_eq!(
-        decoded.dedup_index_shard_heads[0].as_ref(),
-        &[100u64, 200u64]
-    );
-    assert_eq!(decoded.dedup_reverse_shard_heads[0].as_ref(), &[NULL_PAGE]);
-    assert_eq!(decoded.checkpoint_lsn, 42);
-    assert_eq!(decoded.refcount_shard_roots.as_ref(), &[7u64]);
-}
+// `decode_v7_body_opens_as_dedup_shards_one` retired alongside the
+// v7/v8 → v9 schema break: v7/v8 carried the now-retired
+// `dedup_reverse_shard_heads`, and v9 hard-rejects both versions.
 
 #[test]
 fn volume_entry_inline_round_trip() {

@@ -77,14 +77,6 @@ pub struct Db {
     /// apply lanes; in Phase 1 the wrapper holds a single shard and
     /// behaves identically to `Arc<Lsm>`.
     dedup_index: Arc<crate::dedup::DedupIndex>,
-    /// Reverse index: key = `[pba: 8B BE][hash_first_24B]`, value =
-    /// `[hash_last_8B | zero padding]`. Used by PBA refcount → 0 to
-    /// discover and clean up the `dedup_index` entries whose PBA is
-    /// going away. Prefix-scan by 8-byte PBA locates every matching
-    /// row across all shards. Routing for any `(hash, pba)` pair lands
-    /// in the same shard for both forward and reverse indexes, so a
-    /// single dedup-pair commit hits at most one shard.
-    dedup_reverse: Arc<crate::paged_reverse::PagedReverse>,
     /// One FIFO apply lane per dedup shard. Each shard's lane
     /// preserves WAL-order apply for ops within that shard; ops in
     /// disjoint shards run in parallel because they hold disjoint
@@ -794,8 +786,6 @@ struct DedupManifestUpdate {
     /// [`finish_dedup_manifest_update`] which frees them only after
     /// the manifest commit has made the new heads durable.
     old_dedup_heads: Vec<Vec<PageId>>,
-    /// Same for `dedup_reverse`.
-    old_dedup_reverse_heads: Vec<Vec<PageId>>,
 }
 
 /// Iterator over a globally key-ordered range scan assembled from all

@@ -675,6 +675,10 @@ impl RcShard {
 
     /// Outside-gate IO: write a fresh meta chain. Same semantics as
     /// priority 1; drainer-mode and disabled-mode share this path.
+    ///
+    /// Cold-path shim (`RcShard::flush`, snapshot / drop_volume). The
+    /// flush hot path uses [`Self::build_meta_chain`] + folds the
+    /// sealed pages into the global checkpoint batch.
     pub fn write_meta_chain(&self, ckpt: &RcCheckpoint, free_lsn: Lsn) -> Result<Vec<PageId>> {
         if ckpt.is_empty() {
             return Ok(ckpt.snapshot_meta_chain.to_vec());
@@ -683,6 +687,26 @@ impl RcShard {
             ckpt.snapshot_page_table(),
             ckpt.snapshot_meta_chain(),
             free_lsn,
+        )
+    }
+
+    /// Outside-gate, **no-IO** companion of [`Self::write_meta_chain`]:
+    /// builds + seals every page in the new chain entirely in memory
+    /// and returns the chain layout. Callers (currently
+    /// `flush_with_gate`) drive one batched
+    /// [`PageStore::write_sealed_page_runs`] across every shard's
+    /// sealed pages, then walk the per-shard `to_free` lists +
+    /// `install_meta_chain` after the manifest commit is durable.
+    pub fn build_meta_chain(
+        &self,
+        ckpt: &RcCheckpoint,
+    ) -> Result<(Vec<PageId>, Vec<(PageId, Arc<crate::page::Page>)>, Vec<PageId>)> {
+        if ckpt.is_empty() {
+            return Ok((ckpt.snapshot_meta_chain.to_vec(), Vec::new(), Vec::new()));
+        }
+        self.array.build_meta_chain_external(
+            ckpt.snapshot_page_table(),
+            ckpt.snapshot_meta_chain(),
         )
     }
 
