@@ -364,8 +364,14 @@ impl Db {
         // allocator mutex, so every lower LSN's footprint is known before
         // a higher LSN can be assigned.
         let unlogged_commit_guard = if self.unlogged_commits_enabled {
+            let unlogged_gate_started = std::time::Instant::now();
             let guard = self.unlogged_commit_gate.write();
+            self.metrics
+                .record_commit_unlogged_gate_wait(unlogged_gate_started.elapsed());
+            let checkpoint_started = std::time::Instant::now();
             self.checkpoint_unlogged_before_wal_commit()?;
+            self.metrics
+                .record_commit_checkpoint_unlogged(checkpoint_started.elapsed());
             Some(guard)
         } else {
             None
@@ -386,6 +392,7 @@ impl Db {
             }
         };
         timing.plan = plan_started.elapsed();
+        self.metrics.record_commit_plan(timing.plan);
         let plan_l2p_lanes = plan.as_ref().map(|plan| plan.l2p_sorted.len()).unwrap_or(0);
         let plan_rc_lanes = plan
             .as_ref()
@@ -420,6 +427,7 @@ impl Db {
             }
         };
         timing.encode = encode_started.elapsed();
+        self.metrics.record_commit_encode(timing.encode);
         self.metrics.record_commit_wal_body_bytes(body.len());
         let wal_started = std::time::Instant::now();
         let lsn = match self.submit_wal_ops(ops, body, Some(dispatch_footprint)) {
@@ -499,7 +507,10 @@ impl Db {
         timing.drop_gate_wait = drop_gate_started.elapsed();
         self.metrics
             .record_commit_drop_gate_wait(timing.drop_gate_wait);
+        let unlogged_gate_started = std::time::Instant::now();
         let _unlogged_commit_guard = self.unlogged_commit_gate.read();
+        self.metrics
+            .record_commit_unlogged_gate_wait(unlogged_gate_started.elapsed());
 
         let plan_started = std::time::Instant::now();
         let volumes = self.volumes.read().clone();
@@ -517,6 +528,7 @@ impl Db {
             }
         };
         timing.plan = plan_started.elapsed();
+        self.metrics.record_commit_plan(timing.plan);
         let plan_l2p_lanes = plan.as_ref().map(|plan| plan.l2p_sorted.len()).unwrap_or(0);
         let plan_rc_lanes = plan
             .as_ref()
@@ -594,6 +606,7 @@ impl Db {
     ) -> Result<(Lsn, Vec<ApplyOutcome>)> {
         let apply_gate_started = std::time::Instant::now();
         let apply_guard = self.acquire_commit_apply_gate(lsn);
+        let read_held_started = std::time::Instant::now();
         let active_apply = self.enter_active_apply(lsn);
         ctx.timing.apply_gate_wait = apply_gate_started.elapsed();
         self.metrics
@@ -673,6 +686,8 @@ impl Db {
         }
         drop(active_apply);
         drop(apply_guard);
+        self.metrics
+            .record_commit_read_held(read_held_started.elapsed());
 
         let total_elapsed = ctx.commit_started.elapsed();
         if total_elapsed >= std::time::Duration::from_secs(1) {

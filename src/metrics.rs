@@ -85,6 +85,33 @@ pub struct MetaMetrics {
     commit_finish_global_wait_us: AtomicU64,
     commit_finish_global_wait_max_us: AtomicU64,
 
+    // Phase A diagnostic counters — previously only surfaced in slow-commit
+    // WARN logs (>=1s), now aggregated so the avg-case 37 ms gap between
+    // `commit_total_us` and the sum of recorded phases is attributable.
+    //
+    // - `commit_plan_*`: `build_lane_dispatch_plan` (hashmap bucket + sort)
+    // - `commit_encode_*`: `try_encode_body` (WAL serialise)
+    // - `commit_unlogged_gate_wait_*`: time to acquire `unlogged_commit_gate`
+    //   (read for unlogged path, write for logged path)
+    // - `commit_checkpoint_unlogged_*`: time spent inside
+    //   `checkpoint_unlogged_before_wal_commit` (logged path only; calls
+    //   `flush()` if any unlogged LSN is pending — the suspected smoking
+    //   gun behind multi-second logged commits)
+    // - `commit_read_held_*`: total wall time a commit holds
+    //   `apply_gate.read()` (from `acquire_commit_apply_gate` return to
+    //   `drop(apply_guard)`). Single long-held read is what blocks flush's
+    //   write acquisition, cascading into the `apply_gate_wait` spike.
+    commit_plan_us: AtomicU64,
+    commit_plan_max_us: AtomicU64,
+    commit_encode_us: AtomicU64,
+    commit_encode_max_us: AtomicU64,
+    commit_unlogged_gate_wait_us: AtomicU64,
+    commit_unlogged_gate_wait_max_us: AtomicU64,
+    commit_checkpoint_unlogged_us: AtomicU64,
+    commit_checkpoint_unlogged_max_us: AtomicU64,
+    commit_read_held_us: AtomicU64,
+    commit_read_held_max_us: AtomicU64,
+
     wal_submit_calls: AtomicU64,
     wal_submit_wait_us: AtomicU64,
     wal_submit_wait_max_us: AtomicU64,
@@ -563,6 +590,16 @@ pub struct MetaMetricsSnapshot {
     pub commit_apply_dedup_enqueue_max_us: u64,
     pub commit_apply_dedup_wait_us: u64,
     pub commit_apply_dedup_wait_max_us: u64,
+    pub commit_plan_us: u64,
+    pub commit_plan_max_us: u64,
+    pub commit_encode_us: u64,
+    pub commit_encode_max_us: u64,
+    pub commit_unlogged_gate_wait_us: u64,
+    pub commit_unlogged_gate_wait_max_us: u64,
+    pub commit_checkpoint_unlogged_us: u64,
+    pub commit_checkpoint_unlogged_max_us: u64,
+    pub commit_read_held_us: u64,
+    pub commit_read_held_max_us: u64,
     pub wal_submit_calls: u64,
     pub wal_submit_wait_us: u64,
     pub wal_submit_wait_max_us: u64,
@@ -902,6 +939,16 @@ impl MetaMetrics {
             commit_apply_dedup_enqueue_max_us: load(&self.commit_apply_dedup_enqueue_max_us),
             commit_apply_dedup_wait_us: load(&self.commit_apply_dedup_wait_us),
             commit_apply_dedup_wait_max_us: load(&self.commit_apply_dedup_wait_max_us),
+            commit_plan_us: load(&self.commit_plan_us),
+            commit_plan_max_us: load(&self.commit_plan_max_us),
+            commit_encode_us: load(&self.commit_encode_us),
+            commit_encode_max_us: load(&self.commit_encode_max_us),
+            commit_unlogged_gate_wait_us: load(&self.commit_unlogged_gate_wait_us),
+            commit_unlogged_gate_wait_max_us: load(&self.commit_unlogged_gate_wait_max_us),
+            commit_checkpoint_unlogged_us: load(&self.commit_checkpoint_unlogged_us),
+            commit_checkpoint_unlogged_max_us: load(&self.commit_checkpoint_unlogged_max_us),
+            commit_read_held_us: load(&self.commit_read_held_us),
+            commit_read_held_max_us: load(&self.commit_read_held_max_us),
             wal_submit_calls: load(&self.wal_submit_calls),
             wal_submit_wait_us: load(&self.wal_submit_wait_us),
             wal_submit_wait_max_us: load(&self.wal_submit_wait_max_us),
@@ -1604,6 +1651,38 @@ impl MetaMetrics {
 
     pub(crate) fn record_commit_apply(&self, elapsed: Duration) {
         record_duration(&self.commit_apply_us, &self.commit_apply_max_us, elapsed);
+    }
+
+    pub(crate) fn record_commit_plan(&self, elapsed: Duration) {
+        record_duration(&self.commit_plan_us, &self.commit_plan_max_us, elapsed);
+    }
+
+    pub(crate) fn record_commit_encode(&self, elapsed: Duration) {
+        record_duration(&self.commit_encode_us, &self.commit_encode_max_us, elapsed);
+    }
+
+    pub(crate) fn record_commit_unlogged_gate_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.commit_unlogged_gate_wait_us,
+            &self.commit_unlogged_gate_wait_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_commit_checkpoint_unlogged(&self, elapsed: Duration) {
+        record_duration(
+            &self.commit_checkpoint_unlogged_us,
+            &self.commit_checkpoint_unlogged_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_commit_read_held(&self, elapsed: Duration) {
+        record_duration(
+            &self.commit_read_held_us,
+            &self.commit_read_held_max_us,
+            elapsed,
+        );
     }
 
     pub(crate) fn record_commit_apply_laned(
@@ -2410,6 +2489,16 @@ impl MetaMetricsSnapshot {
                 "\"commit_apply_dedup_enqueue_max_us\":{},",
                 "\"commit_apply_dedup_wait_us\":{},",
                 "\"commit_apply_dedup_wait_max_us\":{},",
+                "\"commit_plan_us\":{},",
+                "\"commit_plan_max_us\":{},",
+                "\"commit_encode_us\":{},",
+                "\"commit_encode_max_us\":{},",
+                "\"commit_unlogged_gate_wait_us\":{},",
+                "\"commit_unlogged_gate_wait_max_us\":{},",
+                "\"commit_checkpoint_unlogged_us\":{},",
+                "\"commit_checkpoint_unlogged_max_us\":{},",
+                "\"commit_read_held_us\":{},",
+                "\"commit_read_held_max_us\":{},",
                 "\"wal_submit_calls\":{},",
                 "\"wal_submit_wait_us\":{},",
                 "\"wal_submit_wait_max_us\":{},",
@@ -2711,6 +2800,16 @@ impl MetaMetricsSnapshot {
             self.commit_apply_dedup_enqueue_max_us,
             self.commit_apply_dedup_wait_us,
             self.commit_apply_dedup_wait_max_us,
+            self.commit_plan_us,
+            self.commit_plan_max_us,
+            self.commit_encode_us,
+            self.commit_encode_max_us,
+            self.commit_unlogged_gate_wait_us,
+            self.commit_unlogged_gate_wait_max_us,
+            self.commit_checkpoint_unlogged_us,
+            self.commit_checkpoint_unlogged_max_us,
+            self.commit_read_held_us,
+            self.commit_read_held_max_us,
             self.wal_submit_calls,
             self.wal_submit_wait_us,
             self.wal_submit_wait_max_us,
