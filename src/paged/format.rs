@@ -139,13 +139,14 @@ const _: () = {
     assert!(PAGE_PAYLOAD_SIZE == 4032);
     assert!(LEAF_ENTRY_COUNT == 128);
     assert!(LEAF_BITMAP_BYTES == 16);
-    // Compact format invariants. With per-slot record grown to 11 B
-    // (unit_idx + offset_in_unit + seq), the entries region is 1408 B
-    // and the unit-dict offset moves to 1426. The pathological
-    // "128 distinct units" case no longer fits; the encoder caps at
-    // `MAX_UNITS_PER_LEAF` (computed from payload headroom).
-    assert!(leaf_compact::COMPACT_HEADER_BYTES == 18);
-    assert!(leaf_compact::COMPACT_UNIT_DICT_OFFSET == 1426);
+    // Compact format invariants (v3). With per-slot record at 7 B
+    // (unit_idx + offset_in_unit + u32 seq_delta) and per-leaf
+    // base_seq (8 B) in the header, the entries region is 896 B and
+    // the unit-dict offset moves to 922. The pathological "128
+    // distinct units" case fits at 3994 B with 38 B headroom.
+    assert!(leaf_compact::COMPACT_HEADER_BYTES == 26);
+    assert!(leaf_compact::COMPACT_UNIT_DICT_OFFSET == 922);
+    assert!(leaf_compact::MAX_UNITS_PER_LEAF == LEAF_ENTRY_COUNT);
     assert!(leaf_compact::compact_size(leaf_compact::MAX_UNITS_PER_LEAF) <= PAGE_PAYLOAD_SIZE);
     assert!(INDEX_FANOUT == 256);
     assert!(INDEX_FANOUT * INDEX_CHILD_SIZE <= PAGE_PAYLOAD_SIZE);
@@ -364,19 +365,89 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pVal
     };
 
     let (unit, entry) = leaf_compact::decompose_value(&v.0);
+
+    // Two ways to fail and need to compact:
+    //   (a) unit dict is full → `find_or_append_unit` returns None
+    //   (b) seq_delta would overflow u32 → `try_write_entry` returns
+    //       NeedsRebase
+    //
+    // For (a), if we're overwriting a set slot, the old unit may be
+    // the only thing keeping the dict full; clearing this slot's
+    // bitmap bit before compact lets compact reclaim the orphan if no
+    // other slot references it. We zero the entry record too so the
+    // post-compact unit_idx renumbering doesn't see a dangling ref.
+    // If compact still can't make room (legitimately 128 distinct
+    // live units across other slots), we restore the bit and surface
+    // Corruption.
     let unit_idx = match leaf_compact::find_or_append_unit(page.payload_mut(), &unit) {
         Some(idx) => idx,
         None => {
-            // Dict is full of (mostly dead) entries. Reclaim and retry.
+            if was_set {
+                leaf_compact::payload_bit_clear(page.payload_mut(), i);
+                leaf_compact::zero_entry(page.payload_mut(), i);
+            }
             leaf_compact::compact_in_place(page.payload_mut())?;
-            leaf_compact::find_or_append_unit(page.payload_mut(), &unit).ok_or_else(|| {
-                MetaDbError::Corruption(
-                    "compact_in_place did not free enough room for one unit".into(),
-                )
-            })?
+            let result = leaf_compact::find_or_append_unit(page.payload_mut(), &unit);
+            // Restore the bit so the rest of leaf_set sees the same
+            // pre-state regardless of compact's success — the new
+            // entry/unit will overwrite it; if compact failed,
+            // surfacing Corruption with the slot still marked live is
+            // the consistent state for the caller to retry from.
+            if was_set {
+                leaf_compact::payload_bit_set_true(page.payload_mut(), i);
+            }
+            match result {
+                Some(idx) => idx,
+                None => {
+                    return Err(MetaDbError::Corruption(
+                        "compact_in_place did not free enough room for one unit".into(),
+                    ));
+                }
+            }
         }
     };
-    leaf_compact::write_entry(page.payload_mut(), i, unit_idx, &entry);
+    match leaf_compact::try_write_entry(page.payload_mut(), i, unit_idx, &entry) {
+        leaf_compact::WriteEntryOutcome::Written => {}
+        leaf_compact::WriteEntryOutcome::AdoptedBase { new_base } => {
+            leaf_compact::write_base_seq(page.payload_mut(), new_base);
+        }
+        leaf_compact::WriteEntryOutcome::NeedsRebase => {
+            // Seq delta out of range — either the incoming seq is below
+            // base_seq (caller wrote with a smaller LSN than already on
+            // disk) or above base_seq + u32::MAX (leaf has been alive
+            // long enough to span 4G LSNs). compact_in_place rebases
+            // base_seq to min(live seq, incoming seq); afterwards the
+            // new seq fits as long as the live-seq spread itself stays
+            // under u32::MAX. If it doesn't, surface Corruption — that
+            // means a single leaf's writes legitimately span >4G LSNs,
+            // which shouldn't happen in onyx workloads but is worth
+            // flagging loudly so we don't silently drop a write.
+            leaf_compact::compact_in_place_with_incoming(page.payload_mut(), entry.seq)?;
+            // The unit dict was rewritten by compact_in_place; the unit
+            // we just appended (or matched) may have a new index, so
+            // re-locate it.
+            let unit_idx = leaf_compact::find_or_append_unit(page.payload_mut(), &unit)
+                .ok_or_else(|| {
+                    MetaDbError::Corruption(
+                        "compact_in_place did not free enough room for one unit (post-rebase)"
+                            .into(),
+                    )
+                })?;
+            match leaf_compact::try_write_entry(page.payload_mut(), i, unit_idx, &entry) {
+                leaf_compact::WriteEntryOutcome::Written => {}
+                leaf_compact::WriteEntryOutcome::AdoptedBase { new_base } => {
+                    leaf_compact::write_base_seq(page.payload_mut(), new_base);
+                }
+                leaf_compact::WriteEntryOutcome::NeedsRebase => {
+                    return Err(MetaDbError::Corruption(format!(
+                        "compact leaf seq range spans >4G LSN at slot {i}: cannot encode \
+                         seq_delta even after rebase (base_seq={})",
+                        leaf_compact::read_base_seq(page.payload())
+                    )));
+                }
+            }
+        }
+    }
 
     if !was_set {
         if key_count >= LEAF_ENTRY_COUNT {
@@ -525,6 +596,21 @@ mod tests {
         p
     }
 
+    /// Build an L2pValue with `byte` repeated across non-derived
+    /// fields. The v3 compact encoder drops `unit_lba_count` and
+    /// reconstructs it from `unit_original_size / 4096`, so the input
+    /// must satisfy that invariant. The per-LBA seq trailer is set to
+    /// `byte` as a small monotonic u64 (rather than `byte` repeated 8
+    /// times) so the per-leaf u32 seq_delta encoding doesn't overflow
+    /// when two different `byte` values land in the same leaf.
+    fn v(byte: u8) -> L2pValue {
+        let mut x = [byte; LEAF_VALUE_SIZE];
+        x[13..17].copy_from_slice(&4096u32.to_be_bytes());
+        x[17..19].copy_from_slice(&1u16.to_be_bytes());
+        x[28..36].copy_from_slice(&(byte as u64).to_be_bytes());
+        L2pValue(x)
+    }
+
     #[test]
     fn leaf_header_is_tagged_level_zero() {
         let p = mk_leaf();
@@ -544,26 +630,26 @@ mod tests {
     #[test]
     fn leaf_set_and_get_roundtrip() {
         let mut p = mk_leaf();
-        let v = L2pValue([0xABu8; LEAF_VALUE_SIZE]);
-        assert_eq!(leaf_set(&mut p, 5, &v).unwrap(), None);
+        let v_ab = v(0xAB);
+        assert_eq!(leaf_set(&mut p, 5, &v_ab).unwrap(), None);
         assert_eq!(leaf_entry_count(&p), 1);
         assert!(leaf_bit_set(&p, 5));
-        assert_eq!(leaf_value_at(&p, 5).unwrap(), Some(v));
+        assert_eq!(leaf_value_at(&p, 5).unwrap(), Some(v_ab));
         // Overwrite returns the previous value.
-        let v2 = L2pValue([0xCDu8; LEAF_VALUE_SIZE]);
-        assert_eq!(leaf_set(&mut p, 5, &v2).unwrap(), Some(v));
+        let v_cd = v(0xCD);
+        assert_eq!(leaf_set(&mut p, 5, &v_cd).unwrap(), Some(v_ab));
         assert_eq!(leaf_entry_count(&p), 1); // still 1 entry
-        assert_eq!(leaf_value_at(&p, 5).unwrap(), Some(v2));
+        assert_eq!(leaf_value_at(&p, 5).unwrap(), Some(v_cd));
     }
 
     #[test]
     fn leaf_clear_zeros_slot_and_decrements_count() {
         let mut p = mk_leaf();
-        let v = L2pValue([0x11u8; LEAF_VALUE_SIZE]);
-        leaf_set(&mut p, 3, &v).unwrap();
-        leaf_set(&mut p, 100, &v).unwrap();
+        let v11 = v(0x11);
+        leaf_set(&mut p, 3, &v11).unwrap();
+        leaf_set(&mut p, 100, &v11).unwrap();
         assert_eq!(leaf_entry_count(&p), 2);
-        assert_eq!(leaf_clear(&mut p, 3).unwrap(), Some(v));
+        assert_eq!(leaf_clear(&mut p, 3).unwrap(), Some(v11));
         assert_eq!(leaf_entry_count(&p), 1);
         assert!(!leaf_bit_set(&p, 3));
         // The cleared slot is zeroed.
@@ -577,8 +663,8 @@ mod tests {
     fn leaf_bits_independent_per_slot() {
         let mut p = mk_leaf();
         for i in (0..LEAF_ENTRY_COUNT).step_by(7) {
-            let v = L2pValue([i as u8; LEAF_VALUE_SIZE]);
-            leaf_set(&mut p, i, &v).unwrap();
+            let val = v(i as u8);
+            leaf_set(&mut p, i, &val).unwrap();
         }
         for i in 0..LEAF_ENTRY_COUNT {
             if i % 7 == 0 {
@@ -620,7 +706,7 @@ mod tests {
     #[test]
     fn seal_and_verify_roundtrip_for_both_types() {
         let mut leaf = mk_leaf();
-        leaf_set(&mut leaf, 7, &L2pValue([0x5Au8; LEAF_VALUE_SIZE])).unwrap();
+        leaf_set(&mut leaf, 7, &v(0x5A)).unwrap();
         leaf.seal();
         leaf.verify(123).unwrap();
 

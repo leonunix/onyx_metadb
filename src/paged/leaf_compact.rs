@@ -1,44 +1,55 @@
-//! Onyx-aware compact leaf encoding (v2 — per-slot seq for apply-time CAS).
+//! Onyx-aware compact leaf encoding (v3 — per-leaf base_seq + u32 delta).
 //!
 //! The legacy dense leaf format stored 128 × 28 B `BlockmapValue` records
 //! back-to-back. Onyx's packer puts consecutive LBAs into the same
 //! compression unit, so a single leaf typically references only 1..8
 //! distinct units. That gives us a lot of redundancy to fold out.
 //!
-//! Per-unit shared fields (8 of 9 BlockmapValue fields — including
+//! Per-unit shared fields (7 of 9 BlockmapValue fields — including
 //! `crc32`, which is a unit-level checksum, see
 //! `onyx_storage::buffer::flush::writer::passthrough` for the
 //! construction site):
 //!   pba, compression, unit_compressed_size, unit_original_size,
-//!   unit_lba_count, slot_offset, crc32, flags
+//!   slot_offset, crc32, flags
+//!
+//! `unit_lba_count` is **not stored on disk** in v3; it is reconstructed
+//! on read as `unit_original_size / BLOCK_SIZE_4K`. Onyx's writer always
+//! sets `unit_original_size = lba_count * 4096`, so the round trip is
+//! exact.
 //!
 //! Per-entry varying fields:
 //!   offset_in_unit  (u16; which 4 KB LBA within the compressed unit)
-//!   seq             (u64; commit-time monotonic seq for seq_guard CAS,
-//!                   added in 0xB2 schema, sentinel 0 = "no guard")
+//!   seq_delta       (u32 BE; the full per-LBA commit seq is
+//!                    `base_seq + seq_delta`, where `base_seq` lives in
+//!                    the leaf header. Sentinel `u32::MAX` encodes the
+//!                    "no guard" seq=0 case, preserving the
+//!                    `seq_guard` CAS semantics introduced in 0xB2 WAL.)
 //!
 //! # On-disk layout (within the 4032 B leaf payload)
 //!
 //! ```text
-//!   [ 0..  16]  bitmap          128 bits, LE within each byte
-//!   [16..  17]  unit_count      u8 (number of live entries in unit dict)
-//!   [17..  18]  format_version  u8 (= COMPACT_VERSION)
-//!   [18..1426]  entries         128 × 11 B (slot-indexed dense array)
-//!     entry @ slot s lives at offset 18 + s*11
-//!       [ 0..  1]  unit_idx        u8 (index into unit dict)
-//!       [ 1..  3]  offset_in_unit  u16 BE
-//!       [ 3.. 11]  seq             u64 BE  (0 = legacy / no seq_guard)
+//!   [ 0.. 16]  bitmap          128 bits, LE within each byte
+//!   [16.. 17]  unit_count      u8 (number of live entries in unit dict)
+//!   [17.. 18]  format_version  u8 (= COMPACT_VERSION)
+//!   [18.. 26]  base_seq        u64 BE  (leaf-local seq base, set on
+//!                                       first non-sentinel insert)
+//!   [26..922]  entries         128 × 7 B (slot-indexed dense array)
+//!     entry @ slot s lives at offset 26 + s*7
+//!       [0..1]  unit_idx       u8 (index into unit dict)
+//!       [1..3]  offset_in_unit u16 BE
+//!       [3..7]  seq_delta      u32 BE
+//!                — `u32::MAX` ⇒ full_seq = 0 ("no guard")
+//!                — otherwise   ⇒ full_seq = base_seq + seq_delta
 //!     Unset slots are zero (caller checks bitmap before reading).
-//!   [1426..1426+26*N]  unit dict (N = unit_count entries × 26 B)
+//!   [922..922+24*N]  unit dict (N = unit_count entries × 24 B)
 //!     per unit:
 //!       [ 0.. 8]  base_pba           u64 BE
 //!       [ 8..12]  unit_compressed_sz u32 BE
 //!       [12..16]  unit_original_sz   u32 BE
-//!       [16..18]  unit_lba_count     u16 BE
-//!       [18..20]  slot_offset        u16 BE
-//!       [20..24]  crc32              u32 BE
-//!       [24..25]  compression        u8
-//!       [25..26]  flags              u8
+//!       [16..18]  slot_offset        u16 BE
+//!       [18..22]  crc32              u32 BE
+//!       [22..23]  compression        u8
+//!       [23..24]  flags              u8
 //! ```
 //!
 //! # Why slot-indexed (vs popcount-indexed) entries
@@ -46,26 +57,28 @@
 //! A popcount-indexed entries region is a few hundred B smaller for
 //! sparse leaves but makes `leaf_set` / `leaf_clear` O(N) in the leaf
 //! population because every mutation memmoves the entry array's tail.
-//! With slot-indexed entries we trade 1408 B of fixed-size headroom for
+//! With slot-indexed entries we trade 896 B of fixed-size headroom for
 //! O(1) per-slot reads and writes that touch a fixed payload offset.
 //! Onyx's L2P leaves are densely populated in steady state (sequential
 //! writes; packer fills units), so the overhead only appears for
 //! transient sparse states after random deletes.
 //!
-//! # Worst-case sizes for a 128-entry leaf (v2 with seq)
+//! # Worst-case sizes for a 128-entry leaf (v3)
 //!
-//! - empty leaf:    18 +    0 + 1408 = 1426 B
-//! - 1 unit:        18 +   26 + 1408 = 1452 B
-//! - 8 units:       18 +  208 + 1408 = 1634 B
-//! - 32 units:      18 +  832 + 1408 = 2258 B
-//! - 64 units:      18 + 1664 + 1408 = 3090 B
-//! - 100 units:     18 + 2600 + 1408 = 4026 B  (≤ 4032 — payload cap)
+//! - empty leaf:    26 +    0 +  896 =  922 B
+//! - 1 unit:        26 +   24 +  896 =  946 B
+//! - 8 units:       26 +  192 +  896 = 1114 B
+//! - 32 units:      26 +  768 +  896 = 1690 B
+//! - 64 units:      26 + 1536 +  896 = 2458 B
+//! - 100 units:     26 + 2400 +  896 = 3322 B
+//! - 128 units:     26 + 3072 +  896 = 3994 B  (≤ 4032 — payload cap)
 //!
-//! `MAX_UNITS_PER_LEAF` drops from 256 (v1, u8 cap) to 100 (payload
-//! limit). Onyx typical packing is 32 LBA/unit, so a 128-LBA leaf
-//! references ≤ 8 distinct units in steady state; the cap only
-//! triggers on pathologically fragmented workloads (heavy dedup-hit /
-//! 1-LBA-per-unit).
+//! `MAX_UNITS_PER_LEAF = 128` matches `LEAF_ENTRY_COUNT`, so even a
+//! pathologically fragmented leaf (one unique unit per slot) fits.
+//! The previous v2 cap of 100 left 28 slots un-storable when every
+//! L2pValue was unique — see b-语义路 commit `746ee41` and the
+//! `compact_in_place did not free enough room for one unit` failure
+//! mode it produced under `--refill_buffers` / db_hardening tests.
 
 use crate::error::{MetaDbError, Result};
 use crate::paged::format::{LEAF_BITMAP_BYTES, LEAF_ENTRY_COUNT, LEAF_VALUE_SIZE};
@@ -73,15 +86,31 @@ use crate::paged::format::{LEAF_BITMAP_BYTES, LEAF_ENTRY_COUNT, LEAF_VALUE_SIZE}
 /// Format version stored at offset 17 of the compact payload. Future
 /// schema changes bump this; Day 1 readers reject unknown versions and
 /// surface zeros so a stray on-disk byte cannot pose as a valid value.
-pub const COMPACT_VERSION: u8 = 1;
+///
+/// v1: pre-seq layout (28 B values, 11 B per-slot record, 100 unit cap).
+/// v2: per-slot u64 seq (36 B values, 11 B per-slot record, 100 unit cap).
+/// v3: per-leaf base_seq + u32 delta, drop on-disk lba_count, 128 unit cap.
+pub const COMPACT_VERSION: u8 = 3;
 
-/// Fixed-size fields (bitmap + unit_count + version) at the head of a
-/// compact payload. Always present, even for an empty leaf.
-pub const COMPACT_HEADER_BYTES: usize = LEAF_BITMAP_BYTES + 1 + 1; // 18
+/// Sentinel `seq_delta` value encoding "no seq guard" (full_seq=0).
+pub const SEQ_DELTA_NO_GUARD: u32 = u32::MAX;
+
+/// Onyx 4 KiB block size used to recover `unit_lba_count` from
+/// `unit_original_size`. Must match
+/// `onyx_storage::types::BLOCK_SIZE`.
+pub const BLOCK_SIZE_4K: u32 = 4096;
+
+/// Fixed-size fields at the head of a compact payload. Always present,
+/// even for an empty leaf.
+/// Layout: `[bitmap 16 | unit_count 1 | version 1 | base_seq 8]`.
+pub const COMPACT_HEADER_BYTES: usize = LEAF_BITMAP_BYTES + 1 + 1 + 8; // 26
+
+/// Byte offset of the leaf-local `base_seq` field within the header.
+pub const COMPACT_BASE_SEQ_OFFSET: usize = LEAF_BITMAP_BYTES + 2;
 
 /// Size of one per-entry slot-indexed record on disk.
-/// Layout: `[unit_idx:u8 | offset_in_unit:u16 BE | seq:u64 BE]`.
-pub const COMPACT_ENTRY_BYTES: usize = 11;
+/// Layout: `[unit_idx:u8 | offset_in_unit:u16 BE | seq_delta:u32 BE]`.
+pub const COMPACT_ENTRY_BYTES: usize = 7;
 
 /// Byte footprint of the slot-indexed entries region (always present).
 pub const COMPACT_ENTRIES_REGION_BYTES: usize = LEAF_ENTRY_COUNT * COMPACT_ENTRY_BYTES;
@@ -94,20 +123,25 @@ pub const COMPACT_ENTRIES_OFFSET: usize = COMPACT_HEADER_BYTES;
 pub const COMPACT_UNIT_DICT_OFFSET: usize = COMPACT_ENTRIES_OFFSET + COMPACT_ENTRIES_REGION_BYTES;
 
 /// Size of one unit-dict entry on disk.
-pub const COMPACT_UNIT_BYTES: usize = 26;
+/// Layout: `[base_pba 8 | comp_sz 4 | orig_sz 4 | slot_off 2 | crc32 4 | comp 1 | flags 1]`.
+/// (`unit_lba_count` is derived from `unit_original_size` on decode.)
+pub const COMPACT_UNIT_BYTES: usize = 24;
 
-/// Footprint of the legacy dense format (16 B bitmap + 128 × 28 B
+/// Footprint of the legacy dense format (16 B bitmap + 128 × 36 B
 /// values). Kept as a reference baseline for benches and CR reporting;
 /// the project has no in-service dense leaves, so encode never falls
 /// back to it.
 pub const DENSE_FOOTPRINT_BYTES: usize = LEAF_BITMAP_BYTES + LEAF_ENTRY_COUNT * LEAF_VALUE_SIZE;
 
 /// Maximum number of distinct units a single leaf can reference. With
-/// v2 schema (per-slot seq), the entries region is 1408 B which leaves
-/// `(4032 - 1426) / 26 = 100` units of dict space — that's the binding
-/// cap, well below the u8 `unit_idx` ceiling. Onyx typical packing
-/// keeps real leaves well under this.
-pub const MAX_UNITS_PER_LEAF: usize = 100;
+/// v3 schema (per-leaf base_seq + u32 delta, no on-disk lba_count) the
+/// entries region is 896 B which leaves `(4032 - 26 - 896) / 24 = 129`
+/// units of dict space — but a leaf can have at most `LEAF_ENTRY_COUNT
+/// = 128` distinct units (one per slot), so we cap at 128. Onyx
+/// typical packing keeps real leaves well under this; the cap exists
+/// to absorb pathologically fragmented workloads
+/// (`--refill_buffers` / 1-LBA-per-unit) without losing writes.
+pub const MAX_UNITS_PER_LEAF: usize = 128;
 
 /// Byte offset (within the leaf payload) of unit `i` in the dictionary.
 #[inline]
@@ -128,15 +162,19 @@ pub const fn compact_size(unit_count: usize) -> usize {
     COMPACT_UNIT_DICT_OFFSET + unit_count * COMPACT_UNIT_BYTES
 }
 
-/// Per-unit shared metadata extracted from a 28 B `BlockmapValue`. Two
+/// Per-unit shared metadata extracted from a 36 B `L2pValue`. Two
 /// values share a unit iff every field here is byte-identical. `crc32`
 /// belongs here too — it's a unit-level checksum, not per-LBA.
+///
+/// `unit_lba_count` from the BlockmapValue is **not** stored on disk;
+/// it's recovered on read as `unit_original_size / BLOCK_SIZE_4K`.
+/// Onyx writers always set `unit_original_size = lba_count * 4096`, so
+/// the round trip is exact (asserted in `from_value`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct UnitMeta {
     pub(crate) base_pba: u64,
     pub(crate) unit_compressed_size: u32,
     pub(crate) unit_original_size: u32,
-    pub(crate) unit_lba_count: u16,
     pub(crate) slot_offset: u16,
     pub(crate) crc32: u32,
     pub(crate) compression: u8,
@@ -155,11 +193,20 @@ impl UnitMeta {
             compression: v[8],
             unit_compressed_size: u32::from_be_bytes(v[9..13].try_into().unwrap()),
             unit_original_size: u32::from_be_bytes(v[13..17].try_into().unwrap()),
-            unit_lba_count: u16::from_be_bytes(v[17..19].try_into().unwrap()),
             crc32: u32::from_be_bytes(v[21..25].try_into().unwrap()),
             slot_offset: u16::from_be_bytes(v[25..27].try_into().unwrap()),
             flags: v[27],
         };
+        // Onyx invariant: unit_original_size = unit_lba_count * 4096.
+        // The on-disk dict drops lba_count, so we rely on this to
+        // reconstruct it on decode. If a future writer breaks the
+        // invariant, decode will return a wrong lba_count for the
+        // unaffected callers; debug builds catch it here.
+        debug_assert_eq!(
+            u16::from_be_bytes(v[17..19].try_into().unwrap()) as u32 * BLOCK_SIZE_4K,
+            unit.unit_original_size,
+            "v3 compact encoding requires unit_original_size == lba_count * 4096"
+        );
         let entry = EntryDelta {
             offset_in_unit: u16::from_be_bytes(v[19..21].try_into().unwrap()),
             seq: u64::from_be_bytes(v[28..36].try_into().unwrap()),
@@ -172,11 +219,10 @@ impl UnitMeta {
         out[0..8].copy_from_slice(&self.base_pba.to_be_bytes());
         out[8..12].copy_from_slice(&self.unit_compressed_size.to_be_bytes());
         out[12..16].copy_from_slice(&self.unit_original_size.to_be_bytes());
-        out[16..18].copy_from_slice(&self.unit_lba_count.to_be_bytes());
-        out[18..20].copy_from_slice(&self.slot_offset.to_be_bytes());
-        out[20..24].copy_from_slice(&self.crc32.to_be_bytes());
-        out[24] = self.compression;
-        out[25] = self.flags;
+        out[16..18].copy_from_slice(&self.slot_offset.to_be_bytes());
+        out[18..22].copy_from_slice(&self.crc32.to_be_bytes());
+        out[22] = self.compression;
+        out[23] = self.flags;
     }
 
     #[inline]
@@ -186,12 +232,21 @@ impl UnitMeta {
             base_pba: u64::from_be_bytes(buf[0..8].try_into().unwrap()),
             unit_compressed_size: u32::from_be_bytes(buf[8..12].try_into().unwrap()),
             unit_original_size: u32::from_be_bytes(buf[12..16].try_into().unwrap()),
-            unit_lba_count: u16::from_be_bytes(buf[16..18].try_into().unwrap()),
-            slot_offset: u16::from_be_bytes(buf[18..20].try_into().unwrap()),
-            crc32: u32::from_be_bytes(buf[20..24].try_into().unwrap()),
-            compression: buf[24],
-            flags: buf[25],
+            slot_offset: u16::from_be_bytes(buf[16..18].try_into().unwrap()),
+            crc32: u32::from_be_bytes(buf[18..22].try_into().unwrap()),
+            compression: buf[22],
+            flags: buf[23],
         }
+    }
+
+    /// Reconstruct `unit_lba_count` from `unit_original_size`. Used by
+    /// `compose` to write back into the L2pValue bytes 17..19.
+    #[inline]
+    fn lba_count(&self) -> u16 {
+        // Onyx writers always set original_size = lba_count * 4096;
+        // round up just in case (a non-4K-aligned size shouldn't occur
+        // in production but we don't want to truncate silently).
+        self.unit_original_size.div_ceil(BLOCK_SIZE_4K).min(u16::MAX as u32) as u16
     }
 }
 
@@ -199,26 +254,88 @@ impl UnitMeta {
 /// LBA in the compressed unit this slot maps to; `seq` carries the
 /// commit-time monotonic sequence number used by metadb's `seq_guard`
 /// to reject stale concurrent commits (sentinel 0 = no guard).
-#[derive(Clone, Copy)]
+///
+/// In-memory representation always carries the **full** u64 seq. The
+/// v3 on-disk encoding stores a u32 delta relative to the leaf's
+/// `base_seq` (with `u32::MAX` reserved as the "no guard" sentinel for
+/// full_seq=0). Conversion happens at the `read_entry` /
+/// `write_entry` boundary.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct EntryDelta {
     pub(crate) offset_in_unit: u16,
     pub(crate) seq: u64,
 }
 
+/// Outcome of a (slot, base_seq, full_seq) encode attempt. Callers
+/// use this to drive the rebase loop in [`compact_in_place`] /
+/// [`paged::format::leaf_set`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WriteEntryOutcome {
+    /// Entry written successfully under the existing `base_seq`.
+    Written,
+    /// `base_seq` was 0 and we just adopted the incoming `full_seq` as
+    /// the new base. Callers must write the new base back to the
+    /// payload header.
+    AdoptedBase { new_base: u64 },
+    /// The delta would overflow `u32::MAX` (or underflow because the
+    /// incoming seq is below the current base). The caller must run
+    /// [`compact_in_place`] (which rebases to `min(live seqs, new
+    /// seq)`) and retry.
+    NeedsRebase,
+}
+
 impl EntryDelta {
+    /// Encode this entry into 7 bytes at `out`, using `base_seq` as the
+    /// leaf's seq origin. Returns the outcome so the caller can rebase
+    /// if needed.
+    ///
+    /// Storage:
+    ///   - `self.seq == 0`            → seq_delta = `u32::MAX` (no-guard sentinel)
+    ///   - `base_seq == 0` & `seq>0`  → adopt `base_seq = seq`, seq_delta = 0
+    ///   - else                       → seq_delta = `seq - base_seq`
+    ///                                  (rebase needed if `seq < base_seq`
+    ///                                   or `seq - base_seq >= u32::MAX`).
     #[inline]
-    fn write_to(&self, unit_idx: u8, out: &mut [u8; COMPACT_ENTRY_BYTES]) {
+    fn try_write_to(
+        &self,
+        unit_idx: u8,
+        base_seq: u64,
+        out: &mut [u8; COMPACT_ENTRY_BYTES],
+    ) -> WriteEntryOutcome {
+        let (delta, outcome) = if self.seq == 0 {
+            (SEQ_DELTA_NO_GUARD, WriteEntryOutcome::Written)
+        } else if base_seq == 0 {
+            (0u32, WriteEntryOutcome::AdoptedBase { new_base: self.seq })
+        } else if self.seq < base_seq {
+            return WriteEntryOutcome::NeedsRebase;
+        } else {
+            let diff = self.seq - base_seq;
+            // Reserve u32::MAX as the no-guard sentinel; treat diff at
+            // the sentinel value as overflow so we never collide.
+            if diff >= SEQ_DELTA_NO_GUARD as u64 {
+                return WriteEntryOutcome::NeedsRebase;
+            }
+            (diff as u32, WriteEntryOutcome::Written)
+        };
         out[0] = unit_idx;
         out[1..3].copy_from_slice(&self.offset_in_unit.to_be_bytes());
-        out[3..11].copy_from_slice(&self.seq.to_be_bytes());
+        out[3..7].copy_from_slice(&delta.to_be_bytes());
+        outcome
     }
 
+    /// Decode a 7-byte entry record into `(unit_idx, EntryDelta)` using
+    /// the leaf's `base_seq` to reconstruct the full per-entry seq.
     #[inline]
-    fn read_from(buf: &[u8]) -> (u8, Self) {
+    fn read_from(buf: &[u8], base_seq: u64) -> (u8, Self) {
         debug_assert!(buf.len() >= COMPACT_ENTRY_BYTES);
         let unit_idx = buf[0];
         let offset_in_unit = u16::from_be_bytes(buf[1..3].try_into().unwrap());
-        let seq = u64::from_be_bytes(buf[3..11].try_into().unwrap());
+        let delta = u32::from_be_bytes(buf[3..7].try_into().unwrap());
+        let seq = if delta == SEQ_DELTA_NO_GUARD {
+            0
+        } else {
+            base_seq.wrapping_add(delta as u64)
+        };
         (
             unit_idx,
             EntryDelta {
@@ -230,7 +347,8 @@ impl EntryDelta {
 }
 
 /// Reassemble a 36 B `L2pValue` from its unit + entry parts.
-/// Inverse of `UnitMeta::from_value`.
+/// Inverse of `UnitMeta::from_value`. `unit_lba_count` is recovered
+/// from `unit_original_size / BLOCK_SIZE_4K`.
 #[inline]
 fn compose(unit: &UnitMeta, entry: &EntryDelta) -> [u8; LEAF_VALUE_SIZE] {
     let mut v = [0u8; LEAF_VALUE_SIZE];
@@ -238,7 +356,7 @@ fn compose(unit: &UnitMeta, entry: &EntryDelta) -> [u8; LEAF_VALUE_SIZE] {
     v[8] = unit.compression;
     v[9..13].copy_from_slice(&unit.unit_compressed_size.to_be_bytes());
     v[13..17].copy_from_slice(&unit.unit_original_size.to_be_bytes());
-    v[17..19].copy_from_slice(&unit.unit_lba_count.to_be_bytes());
+    v[17..19].copy_from_slice(&unit.lba_count().to_be_bytes());
     v[19..21].copy_from_slice(&entry.offset_in_unit.to_be_bytes());
     v[21..25].copy_from_slice(&unit.crc32.to_be_bytes());
     v[25..27].copy_from_slice(&unit.slot_offset.to_be_bytes());
@@ -262,8 +380,8 @@ fn compose(unit: &UnitMeta, entry: &EntryDelta) -> [u8; LEAF_VALUE_SIZE] {
 // =====================================================================
 
 /// Stamp the version byte into a freshly-zeroed leaf payload. The
-/// bitmap, unit_count, entries region, and unit dictionary are
-/// expected to already be zero (the caller's `init_leaf` zeroes the
+/// bitmap, unit_count, base_seq, entries region, and unit dictionary
+/// are expected to already be zero (the caller's `init_leaf` zeroes the
 /// page first).
 #[inline]
 pub fn init_payload(payload: &mut [u8]) {
@@ -279,6 +397,25 @@ pub(crate) fn read_unit_count(payload: &[u8]) -> u8 {
 #[inline]
 pub(crate) fn write_unit_count(payload: &mut [u8], n: u8) {
     payload[LEAF_BITMAP_BYTES] = n;
+}
+
+/// Read the leaf-local seq base from the header. Zero means "no
+/// non-sentinel entries have been written yet".
+#[inline]
+pub(crate) fn read_base_seq(payload: &[u8]) -> u64 {
+    u64::from_be_bytes(
+        payload[COMPACT_BASE_SEQ_OFFSET..COMPACT_BASE_SEQ_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    )
+}
+
+/// Write the leaf-local seq base into the header. Callers update this
+/// when an entry adopts a new base or [`compact_in_place`] rebases.
+#[inline]
+pub(crate) fn write_base_seq(payload: &mut [u8], base_seq: u64) {
+    payload[COMPACT_BASE_SEQ_OFFSET..COMPACT_BASE_SEQ_OFFSET + 8]
+        .copy_from_slice(&base_seq.to_be_bytes());
 }
 
 /// Read the unit-dict entry at `idx`. Caller must ensure
@@ -306,16 +443,50 @@ pub(crate) fn write_unit(payload: &mut [u8], idx: usize, u: &UnitMeta) {
 #[inline]
 pub(crate) fn read_entry(payload: &[u8], slot: usize) -> (u8, EntryDelta) {
     let off = entry_offset(slot);
-    EntryDelta::read_from(&payload[off..off + COMPACT_ENTRY_BYTES])
+    let base_seq = read_base_seq(payload);
+    EntryDelta::read_from(&payload[off..off + COMPACT_ENTRY_BYTES], base_seq)
 }
 
+/// Try to write an entry record at `slot`. Returns the outcome so the
+/// caller can adopt a new base / rebase as needed.
 #[inline]
-pub(crate) fn write_entry(payload: &mut [u8], slot: usize, unit_idx: u8, e: &EntryDelta) {
+pub(crate) fn try_write_entry(
+    payload: &mut [u8],
+    slot: usize,
+    unit_idx: u8,
+    e: &EntryDelta,
+) -> WriteEntryOutcome {
+    let base_seq = read_base_seq(payload);
     let off = entry_offset(slot);
     let dst: &mut [u8; COMPACT_ENTRY_BYTES] = (&mut payload[off..off + COMPACT_ENTRY_BYTES])
         .try_into()
         .unwrap();
-    e.write_to(unit_idx, dst);
+    e.try_write_to(unit_idx, base_seq, dst)
+}
+
+/// Write an entry. Returns an error if base_seq adoption or rebase
+/// would be needed — callers that own the payload exclusively (page
+/// rewrites, compact_in_place fallback) use [`try_write_entry`] +
+/// rebase loop instead. This thin wrapper exists because most callers
+/// in this module historically used `write_entry`; they all happen to
+/// be paths where base_seq is already set up correctly.
+#[inline]
+pub(crate) fn write_entry(payload: &mut [u8], slot: usize, unit_idx: u8, e: &EntryDelta) {
+    match try_write_entry(payload, slot, unit_idx, e) {
+        WriteEntryOutcome::Written => {}
+        WriteEntryOutcome::AdoptedBase { new_base } => {
+            write_base_seq(payload, new_base);
+        }
+        WriteEntryOutcome::NeedsRebase => {
+            panic!(
+                "compact leaf write_entry slot={slot} unit={unit_idx} seq={} requires \
+                 rebase (base_seq={}); caller must use try_write_entry + compact_in_place \
+                 loop instead",
+                e.seq,
+                read_base_seq(payload)
+            );
+        }
+    }
 }
 
 /// Zero the per-slot entry record. Does not touch the bitmap.
@@ -355,8 +526,8 @@ pub(crate) fn decompose_value(v: &[u8; LEAF_VALUE_SIZE]) -> (UnitMeta, EntryDelt
 /// which case the caller must run `compact_in_place` and retry).
 ///
 /// "Find" walks the dict linearly. With 1..32 typical units this beats
-/// a HashMap; with a worst-case 139 it's still ~3.6 KiB of sequential
-/// reads, well within an L1 line.
+/// a HashMap; with the v3 worst case of 128 units it's still ~3.1 KiB
+/// of sequential reads, well within an L1 line.
 pub(crate) fn find_or_append_unit(payload: &mut [u8], target: &UnitMeta) -> Option<u8> {
     let count = read_unit_count(payload) as usize;
     let cap = max_units_per_payload(payload.len()).min(MAX_UNITS_PER_LEAF);
@@ -368,7 +539,7 @@ pub(crate) fn find_or_append_unit(payload: &mut [u8], target: &UnitMeta) -> Opti
             return Some(i as u8);
         }
     }
-    // No match — append. Check we can fit one more 26 B record before
+    // No match — append. Check we can fit one more unit record before
     // running off the end of the payload.
     let new_off = unit_offset(count);
     if new_off + COMPACT_UNIT_BYTES > payload.len() {
@@ -382,8 +553,10 @@ pub(crate) fn find_or_append_unit(payload: &mut [u8], target: &UnitMeta) -> Opti
     Some(count as u8)
 }
 
-/// Maximum unit-dict capacity given the payload size. With 4032 B
-/// payload that's `(4032 - 1426) / 26 = 100`.
+/// Maximum unit-dict capacity given the payload size. With v3's 4032 B
+/// payload that's `(4032 - 922) / 24 = 129`, capped at
+/// `MAX_UNITS_PER_LEAF = 128` by the caller (since a leaf can have at
+/// most one unique unit per slot).
 #[inline]
 pub const fn max_units_per_payload(payload_len: usize) -> usize {
     if payload_len <= COMPACT_UNIT_DICT_OFFSET {
@@ -394,23 +567,52 @@ pub const fn max_units_per_payload(payload_len: usize) -> usize {
 }
 
 /// Rebuild the unit dictionary in place, dropping unreferenced units
-/// and renumbering `unit_idx` references in the entries region.
+/// and renumbering `unit_idx` references in the entries region. Also
+/// rebases `base_seq` to `min(live full_seq)` so subsequent inserts
+/// have the maximum possible delta headroom.
+///
+/// See [`compact_in_place_with_incoming`] for the variant that also
+/// accounts for a not-yet-written entry's seq during rebase.
+pub(crate) fn compact_in_place(payload: &mut [u8]) -> Result<()> {
+    compact_in_place_with_incoming(payload, 0)
+}
+
+/// Like [`compact_in_place`] but also folds `incoming_seq` (the seq
+/// of an entry about to be written by the caller) into the
+/// `new_base = min(...)` computation. The caller still does the
+/// follow-up `try_write_entry` itself; this just ensures the rebase
+/// leaves enough delta headroom for the incoming write.
+///
+/// Pass `incoming_seq = 0` to skip incoming-seq consideration (the
+/// behaviour [`compact_in_place`] gives — appropriate when compaction
+/// is purely about reclaiming dead units, not about absorbing a new
+/// out-of-range seq).
 ///
 /// Called when:
 /// - `find_or_append_unit` returns `None` because the dict is full.
+/// - `try_write_entry` returns `NeedsRebase` because the seq delta
+///   would overflow `u32::MAX` (or because the incoming seq is below
+///   the current base).
 /// - The caller wants to reclaim space from dead units (eg. a
 ///   periodic compaction pass).
 ///
 /// Algorithm:
-/// 1. Scan all 128 entry slots. For each set slot, read its old
-///    `unit_idx`. Build `old → new` index translation, allocating a
-///    new index the first time we see each old index.
-/// 2. Re-emit live units to a scratch Vec (preserving discovery order).
-/// 3. Rewrite live entries with their new `unit_idx` (offset_in_unit
-///    is unchanged).
-/// 4. Overwrite the unit dict with the live units and zero out the
+/// 1. Compute `new_base = min(live full_seq among non-sentinel
+///    entries, incoming_seq if non-zero)`. If no candidate seqs
+///    exist, `new_base = 0`.
+/// 2. Scan all 128 entry slots. For each set slot, read its old
+///    `unit_idx` and full seq. Build `old → new` index translation,
+///    allocating a new index the first time we see each old index.
+/// 3. Re-emit live units to a scratch Vec (preserving discovery order).
+/// 4. Rewrite each live entry under the new base_seq (this re-encodes
+///    seq_delta = full_seq - new_base, preserving sentinels).
+/// 5. Overwrite the unit dict with the live units and zero out the
 ///    tail bytes between the new and old `unit_count`.
-pub(crate) fn compact_in_place(payload: &mut [u8]) -> Result<()> {
+/// 6. Write the new base_seq into the header.
+pub(crate) fn compact_in_place_with_incoming(
+    payload: &mut [u8],
+    incoming_seq: u64,
+) -> Result<()> {
     let old_count = read_unit_count(payload) as usize;
     let cap = max_units_per_payload(payload.len()).min(MAX_UNITS_PER_LEAF);
     if old_count > cap {
@@ -419,15 +621,24 @@ pub(crate) fn compact_in_place(payload: &mut [u8]) -> Result<()> {
         )));
     }
     if old_count == 0 {
+        // No units yet — but base_seq may still be nonzero from a prior
+        // population that's been entirely cleared. Reset it so the next
+        // insert can adopt cleanly.
+        write_base_seq(payload, 0);
         return Ok(());
     }
-    // Discovery-ordered remap from old unit_idx → new unit_idx, plus
-    // the cached UnitMeta we'll re-emit. `None` means "old unit was
-    // unused / already remapped to nothing because no live entry
-    // referenced it." 256-wide because the on-disk unit_idx is u8.
-    let mut remap: [Option<u8>; MAX_UNITS_PER_LEAF] = [None; MAX_UNITS_PER_LEAF];
-    let mut live_units: Vec<UnitMeta> = Vec::with_capacity(old_count);
 
+    // Pass 1: collect live entries' (slot, old_idx, full_seq) and the
+    // new base_seq. We need to read entries with the current base_seq
+    // BEFORE rewriting it.
+    let mut live: Vec<(usize, usize, EntryDelta)> = Vec::with_capacity(LEAF_ENTRY_COUNT);
+    let mut new_base: Option<u64> = None;
+    // Fold the incoming-seq (if non-zero) into the min so the post-
+    // compact base accommodates the caller's pending write without a
+    // second rebase round-trip.
+    if incoming_seq != 0 {
+        new_base = Some(incoming_seq);
+    }
     for slot in 0..LEAF_ENTRY_COUNT {
         if !payload_bit_set(payload, slot) {
             continue;
@@ -439,19 +650,57 @@ pub(crate) fn compact_in_place(payload: &mut [u8]) -> Result<()> {
                 "compact leaf live slot {slot} references unit {old_idx} but dict has {old_count}"
             )));
         }
-        let new_idx = match remap[old_idx] {
+        if entry.seq != 0 {
+            new_base = Some(match new_base {
+                Some(b) => b.min(entry.seq),
+                None => entry.seq,
+            });
+        }
+        live.push((slot, old_idx, entry));
+    }
+
+    // Discovery-ordered remap from old unit_idx → new unit_idx. Width
+    // matches the on-disk u8 unit_idx ceiling (256), generous vs cap.
+    let mut remap: [Option<u8>; 256] = [None; 256];
+    let mut live_units: Vec<UnitMeta> = Vec::with_capacity(old_count);
+
+    let resolved_base = new_base.unwrap_or(0);
+    // Write the new base before rewriting entries: try_write_entry
+    // reads base_seq via the payload header.
+    write_base_seq(payload, resolved_base);
+
+    for (slot, old_idx, entry) in &live {
+        let new_idx = match remap[*old_idx] {
             Some(i) => i,
             None => {
                 // First time we see this old unit — copy it forward.
-                let unit = read_unit(payload, old_idx);
+                let unit = read_unit(payload, *old_idx);
                 let new_idx = live_units.len() as u8;
                 live_units.push(unit);
-                remap[old_idx] = Some(new_idx);
+                remap[*old_idx] = Some(new_idx);
                 new_idx
             }
         };
-        // Rewrite entry@slot with the new unit_idx (offset_in_unit unchanged).
-        write_entry(payload, slot, new_idx, &entry);
+        // Re-emit the entry under the new base. With new_base set to
+        // the min of all live full_seqs, every delta is non-negative
+        // and (since deltas were <= u32::MAX-1 at write time, and
+        // shifting all by a constant preserves max-min) still fits.
+        match try_write_entry(payload, *slot, new_idx, entry) {
+            WriteEntryOutcome::Written => {}
+            WriteEntryOutcome::AdoptedBase { new_base } => {
+                // Should not happen: base_seq=0 only when no
+                // non-sentinel entries exist, but we set base = min of
+                // those. If it does happen, propagate the adoption.
+                write_base_seq(payload, new_base);
+            }
+            WriteEntryOutcome::NeedsRebase => {
+                return Err(MetaDbError::Corruption(format!(
+                    "compact leaf seq_delta would overflow u32 even after rebase: \
+                     slot={slot} seq={} base={}",
+                    entry.seq, resolved_base
+                )));
+            }
+        }
     }
 
     // Re-emit dict tightly.
@@ -497,10 +746,10 @@ pub(crate) fn payload_decode_at_checked(
             payload.len()
         )));
     }
-    if payload[LEAF_BITMAP_BYTES + 1] != COMPACT_VERSION {
+    let version = payload[LEAF_BITMAP_BYTES + 1];
+    if version != COMPACT_VERSION {
         return Err(MetaDbError::Corruption(format!(
-            "compact leaf version {} != {COMPACT_VERSION}",
-            payload[LEAF_BITMAP_BYTES + 1]
+            "compact leaf version {version} != {COMPACT_VERSION}"
         )));
     }
     if !payload_bit_set(payload, slot) {
@@ -530,7 +779,7 @@ pub(crate) fn payload_decode_at_checked(
 
 /// Encode a dense `(bitmap, values)` leaf body into the compact form.
 ///
-/// `bitmap` is the 16 B presence bitmap; `values` is the 128 × 28 B
+/// `bitmap` is the 16 B presence bitmap; `values` is the 128 × 36 B
 /// value array (unset slots may be anything — they're skipped via the
 /// bitmap). The output is always strictly smaller than the 4032 B leaf
 /// payload, so encode never fails on size grounds and returns a
@@ -544,13 +793,19 @@ pub fn encode(
     // HashMap. We bound the dict to 128 (one per slot) which is well
     // below the u8 unit_idx ceiling.
     let mut units: Vec<UnitMeta> = Vec::with_capacity(8);
-    // Pre-size the output buffer to the v2 worst case (100 distinct
-    // units = 4026 B; the encoder rejects anything past that). We'll
-    // truncate to the actual dict size after.
+    // Pre-size the output buffer to the v3 worst case (128 distinct
+    // units = 3994 B). We'll truncate to the actual dict size after.
     let mut out = vec![0u8; compact_size(MAX_UNITS_PER_LEAF)];
     out[..LEAF_BITMAP_BYTES].copy_from_slice(bitmap);
     out[LEAF_BITMAP_BYTES + 1] = COMPACT_VERSION;
 
+    // Pass 1: decompose every set slot, compute base_seq = min(live
+    // non-sentinel seqs) so encode produces the same byte pattern as
+    // a leaf populated via the page-level primitives + final
+    // compact_in_place.
+    let mut entries: Vec<(usize, EntryDelta, usize /*unit_idx*/)> =
+        Vec::with_capacity(LEAF_ENTRY_COUNT);
+    let mut base_seq: Option<u64> = None;
     for slot in 0..LEAF_ENTRY_COUNT {
         if (bitmap[slot / 8] >> (slot % 8)) & 1 == 0 {
             continue;
@@ -564,11 +819,29 @@ pub fn encode(
                 units.len() - 1
             }
         };
-        let off = entry_offset(slot);
+        if entry.seq != 0 {
+            base_seq = Some(match base_seq {
+                Some(b) => b.min(entry.seq),
+                None => entry.seq,
+            });
+        }
+        entries.push((slot, entry, unit_idx));
+    }
+    let resolved_base = base_seq.unwrap_or(0);
+    out[COMPACT_BASE_SEQ_OFFSET..COMPACT_BASE_SEQ_OFFSET + 8]
+        .copy_from_slice(&resolved_base.to_be_bytes());
+
+    for (slot, entry, unit_idx) in &entries {
+        let off = entry_offset(*slot);
         let dst: &mut [u8; COMPACT_ENTRY_BYTES] = (&mut out[off..off + COMPACT_ENTRY_BYTES])
             .try_into()
             .unwrap();
-        entry.write_to(unit_idx as u8, dst);
+        let outcome = entry.try_write_to(*unit_idx as u8, resolved_base, dst);
+        debug_assert!(
+            !matches!(outcome, WriteEntryOutcome::NeedsRebase),
+            "encode: seq_delta overflow at slot {slot} seq={} base={resolved_base}",
+            entry.seq
+        );
     }
 
     out[LEAF_BITMAP_BYTES] = units.len() as u8;
@@ -627,9 +900,14 @@ pub fn decode_at(encoded: &[u8], slot: usize) -> Option<[u8; LEAF_VALUE_SIZE]> {
         return None;
     }
     let unit_count = encoded[LEAF_BITMAP_BYTES] as usize;
+    let base_seq = u64::from_be_bytes(
+        encoded[COMPACT_BASE_SEQ_OFFSET..COMPACT_BASE_SEQ_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
     let entry_off = entry_offset(slot);
     let (unit_idx, entry) =
-        EntryDelta::read_from(&encoded[entry_off..entry_off + COMPACT_ENTRY_BYTES]);
+        EntryDelta::read_from(&encoded[entry_off..entry_off + COMPACT_ENTRY_BYTES], base_seq);
     if unit_idx as usize >= unit_count {
         return None;
     }
@@ -656,6 +934,11 @@ pub fn decode_all(encoded: &[u8]) -> [Option<[u8; LEAF_VALUE_SIZE]>; LEAF_ENTRY_
         return out;
     }
     let unit_count = encoded[LEAF_BITMAP_BYTES] as usize;
+    let base_seq = u64::from_be_bytes(
+        encoded[COMPACT_BASE_SEQ_OFFSET..COMPACT_BASE_SEQ_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
 
     let mut units: Vec<UnitMeta> = Vec::with_capacity(unit_count);
     for i in 0..unit_count {
@@ -671,7 +954,8 @@ pub fn decode_all(encoded: &[u8]) -> [Option<[u8; LEAF_VALUE_SIZE]>; LEAF_ENTRY_
             continue;
         }
         let off = entry_offset(slot);
-        let (unit_idx, entry) = EntryDelta::read_from(&encoded[off..off + COMPACT_ENTRY_BYTES]);
+        let (unit_idx, entry) =
+            EntryDelta::read_from(&encoded[off..off + COMPACT_ENTRY_BYTES], base_seq);
         if (unit_idx as usize) < units.len() {
             out[slot] = Some(compose(&units[unit_idx as usize], &entry));
         }
@@ -735,8 +1019,8 @@ mod tests {
     fn empty_leaf_round_trips() {
         let (bm, vals) = empty_leaf_input();
         let enc = encode(&bm, &vals);
-        // 18 header + 1408 entries (zero) + 0 unit dict = 1426.
-        assert_eq!(enc.len(), 1426);
+        // 26 header + 896 entries (zero) + 0 unit dict = 922.
+        assert_eq!(enc.len(), 922);
         for s in 0..LEAF_ENTRY_COUNT {
             assert_eq!(decode_at(&enc, s), None);
         }
@@ -761,11 +1045,11 @@ mod tests {
             set(&mut bm, &mut vals, i, v);
         }
         let enc = encode(&bm, &vals);
-        // 18 + 1408 + 26 = 1452 (v2 with per-slot seq)
-        assert_eq!(enc.len(), 1452);
+        // 26 + 896 + 24 = 946 (v3 with u32 delta + 24B unit)
+        assert_eq!(enc.len(), 946);
         let cr = DENSE_FOOTPRINT_BYTES as f64 / enc.len() as f64;
-        // v1 hit ~8.4x; v2's bigger per-slot record pulls this to ~3.2x.
-        assert!(cr > 3.0, "CR too low: {cr}");
+        // 1 unit / 128 slots: dense=16+128*36=4624, compact=946 → ~4.9x.
+        assert!(cr > 4.0, "CR too low: {cr}");
 
         for i in 0..LEAF_ENTRY_COUNT {
             let got = decode_at(&enc, i).expect("set");
@@ -793,11 +1077,11 @@ mod tests {
             set(&mut bm, &mut vals, i, v);
         }
         let enc = encode(&bm, &vals);
-        // 18 + 1408 + 8*26 = 1634 (v2 with per-slot seq)
-        assert_eq!(enc.len(), 1634);
+        // 26 + 896 + 8*24 = 1114 (v3 with u32 delta + 24B unit)
+        assert_eq!(enc.len(), 1114);
         let cr = DENSE_FOOTPRINT_BYTES as f64 / enc.len() as f64;
-        // v1 hit ~5.9x; v2's bigger per-slot pulls this to ~2.8x.
-        assert!(cr >= 2.5, "8-unit CR {cr} below 2.5x");
+        // 8 units / 128 slots: dense=4624, compact=1114 → ~4.15x.
+        assert!(cr >= 3.5, "8-unit CR {cr} below 3.5x");
 
         let all = decode_all(&enc);
         for i in 0..LEAF_ENTRY_COUNT {
@@ -837,17 +1121,18 @@ mod tests {
 
     #[test]
     fn pathological_distinct_units_fits_payload() {
-        // v2 caps at MAX_UNITS_PER_LEAF = 100 (= (4032 - 1426) / 26).
-        // 100 distinct units => 18 + 1408 + 26*100 = 4026 B, exactly at
-        // the 4032 B payload (6 B headroom). Going past 100 distinct
-        // units is rejected by the encoder.
+        // v3 caps at MAX_UNITS_PER_LEAF = 128 (= LEAF_ENTRY_COUNT).
+        // The payload-bound cap is (4032 - 922) / 24 = 129; we cap at
+        // 128 so every slot can have its own unique unit. 128 distinct
+        // units => 26 + 896 + 24*128 = 3994 B, leaving 38 B headroom in
+        // the 4032 B payload.
         let (mut bm, mut vals) = empty_leaf_input();
         for i in 0..MAX_UNITS_PER_LEAF {
             let v = bv(0x3000 + i as u64, 1, 500, 4096, 1, 0, i as u32, 0, 0);
             set(&mut bm, &mut vals, i, v);
         }
         let enc = encode(&bm, &vals);
-        assert_eq!(enc.len(), 4026);
+        assert_eq!(enc.len(), 3994);
         for s in 0..MAX_UNITS_PER_LEAF {
             assert_eq!(decode_at(&enc, s), Some(vals[s]));
         }
@@ -967,8 +1252,8 @@ mod tests {
     #[test]
     fn find_or_append_unit_returns_none_when_full() {
         let mut p = fresh_payload();
-        let cap = max_units_per_payload(p.len());
-        // Fill up the dict.
+        let cap = max_units_per_payload(p.len()).min(MAX_UNITS_PER_LEAF);
+        // Fill up the dict to MAX_UNITS_PER_LEAF (the binding cap).
         for i in 0..cap {
             let v = bv(0x10_0000 + i as u64, 1, 500, 4096, 1, 0, 0xAA, 0, 0);
             let (u, _) = decompose_value(&v);
@@ -1062,13 +1347,12 @@ mod tests {
         // to free room, then verify a fresh `find_or_append_unit` works
         // again after `compact_in_place`.
         let mut p = fresh_payload();
-        let cap = max_units_per_payload(p.len());
+        let cap = max_units_per_payload(p.len()).min(MAX_UNITS_PER_LEAF);
 
         // Fill: each leaf slot 0..min(cap,128) gets its own unit. With
-        // v2's 11 B per-slot record the payload-bound cap is 100, well
-        // below `LEAF_ENTRY_COUNT = 128`, so we only fill the first
-        // `cap` slots and leave the rest cold to act as overflow-slots
-        // for the second phase.
+        // v3's 7 B per-slot record + 24 B unit + 26 B header the
+        // payload-bound cap is 129, capped at MAX_UNITS_PER_LEAF=128
+        // = LEAF_ENTRY_COUNT, so we fill every slot for full coverage.
         let live_slots: Vec<usize> = (0..cap.min(LEAF_ENTRY_COUNT)).collect();
         for &slot in &live_slots {
             let v = bv(
@@ -1183,20 +1467,24 @@ mod tests {
 
     #[test]
     fn fixed_offsets_compile_time_invariants() {
-        // Sanity for v2 layout constants. With 11 B per-slot records
-        // (unit_idx + offset + seq) the entries region is 1408 B and
-        // the unit-dict offset moves to 1426. The payload-bound cap on
-        // distinct units drops from v1's 139 to v2's 100.
-        assert_eq!(COMPACT_HEADER_BYTES, 18);
-        assert_eq!(COMPACT_ENTRIES_OFFSET, 18);
-        assert_eq!(COMPACT_UNIT_DICT_OFFSET, 1426);
-        assert_eq!(COMPACT_ENTRY_BYTES, 11);
-        assert_eq!(COMPACT_UNIT_BYTES, 26);
-        assert_eq!(MAX_UNITS_PER_LEAF, 100);
-        assert_eq!(compact_size(0), 1426);
-        assert_eq!(compact_size(1), 1452);
-        assert_eq!(compact_size(8), 1634);
-        assert_eq!(compact_size(MAX_UNITS_PER_LEAF), 4026);
+        // Sanity for v3 layout constants. Per-slot records shrink to
+        // 7 B (unit_idx + offset + u32 seq_delta) and the unit-dict
+        // entry shrinks to 24 B (lba_count dropped, recoverable from
+        // unit_original_size / 4096). The 8-byte base_seq lives in
+        // the header. The payload-bound cap on distinct units becomes
+        // 129, capped at 128 = LEAF_ENTRY_COUNT.
+        assert_eq!(COMPACT_HEADER_BYTES, 26);
+        assert_eq!(COMPACT_BASE_SEQ_OFFSET, 18);
+        assert_eq!(COMPACT_ENTRIES_OFFSET, 26);
+        assert_eq!(COMPACT_UNIT_DICT_OFFSET, 922);
+        assert_eq!(COMPACT_ENTRY_BYTES, 7);
+        assert_eq!(COMPACT_UNIT_BYTES, 24);
+        assert_eq!(MAX_UNITS_PER_LEAF, 128);
+        assert_eq!(max_units_per_payload(crate::page::PAGE_PAYLOAD_SIZE), 129);
+        assert_eq!(compact_size(0), 922);
+        assert_eq!(compact_size(1), 946);
+        assert_eq!(compact_size(8), 1114);
+        assert_eq!(compact_size(MAX_UNITS_PER_LEAF), 3994);
         assert!(compact_size(MAX_UNITS_PER_LEAF) <= crate::page::PAGE_PAYLOAD_SIZE);
     }
 }

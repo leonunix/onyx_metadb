@@ -550,7 +550,13 @@ mod tests {
     }
 
     fn val(byte: u8) -> L2pValue {
-        L2pValue([byte; 36])
+        let mut x = [byte; 36];
+        // v3 compact encoder requires unit_original_size = lba_count * 4096
+        // and a u32-delta-fitting seq.
+        x[13..17].copy_from_slice(&4096u32.to_be_bytes());
+        x[17..19].copy_from_slice(&1u16.to_be_bytes());
+        x[28..36].copy_from_slice(&(byte as u64).to_be_bytes());
+        L2pValue(x)
     }
 
     #[test]

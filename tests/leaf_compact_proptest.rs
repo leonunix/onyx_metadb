@@ -200,6 +200,45 @@ proptest! {
     }
 }
 
+// ---------- regression test: 128 unique units, one per slot --------------
+//
+// Pre-v3 layout (compact v2) capped the unit dict at 100 entries; a
+// leaf with 128 distinct L2pValues — one per slot — used to fail at
+// the 101st insert with `compact_in_place did not free enough room
+// for one unit`. The b-语义路 schema bump (per-LBA seq + 36 B values,
+// commit 746ee41) widened the per-slot record from 3 B to 11 B and
+// pushed `MAX_UNITS_PER_LEAF` down from 256 to 100, which is when
+// this corner started firing in production
+// (`--refill_buffers` workloads, `multi_lane_wal_replay_*` tests).
+//
+// v3 raises the cap to 128 = `LEAF_ENTRY_COUNT` by dropping
+// `unit_lba_count` from the on-disk dict (derived from
+// `unit_original_size / 4096`) and shrinking per-slot seq from u64 to
+// u32 delta off a per-leaf `base_seq`. This test bolts that fix in
+// place so a future schema regression that re-introduces the cap
+// fails loudly here rather than in 24-hour soaks.
+#[test]
+fn one_unique_unit_per_slot_round_trips() {
+    let mut page = fresh_leaf();
+    let mut oracle: BTreeMap<usize, [u8; LEAF_VALUE_SIZE]> = BTreeMap::new();
+    for slot in 0..LEAF_ENTRY_COUNT {
+        // Each slot gets its own unit_id (different base_pba etc.)
+        // and its own offset_in_unit. With 128 unique units the unit
+        // dict must be willing to grow to exactly 128 entries.
+        let unit_id = slot as u32 + 1;
+        let offset = (slot as u16) & 0x1F;
+        let mut v = synth_value(unit_id, offset);
+        // Set a small monotonic seq trailer so the per-leaf u32 delta
+        // encoding has plenty of headroom.
+        v[28..36].copy_from_slice(&(slot as u64 + 1).to_be_bytes());
+        leaf_set(&mut page, slot, &L2pValue(v)).expect("128th unique unit must fit");
+        oracle.insert(slot, v);
+        check_against_oracle(&page, &oracle).expect("oracle agreement after each insert");
+    }
+    page.seal();
+    page.verify(789).expect("seal+verify with 128 unique units");
+}
+
 // ---------- proptest 2: high-cardinality stress (compact_in_place) --------
 
 // Insert many distinct units, delete some, insert more — long enough

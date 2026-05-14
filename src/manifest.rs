@@ -33,7 +33,14 @@ use crate::types::{
 };
 
 /// Version of the current manifest body layout.
-pub const MANIFEST_BODY_VERSION: u32 = 9;
+///
+/// v10 (compact leaf v3): the on-disk leaf-payload format changed —
+/// per-leaf `base_seq` (8 B) added to the header, per-slot `seq` shrunk
+/// from u64 to u32 delta, and `unit_lba_count` dropped from the unit
+/// dict (recovered from `unit_original_size / 4096`). Old v9 manifests
+/// are hard-rejected on open. See `paged/leaf_compact.rs` for the new
+/// 128-unit cap that this enables.
+pub const MANIFEST_BODY_VERSION: u32 = 10;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -367,16 +374,17 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            9 => Self::decode_v9(page, page_store),
+            10 => Self::decode_v10(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v9 is readable — \
-                 older databases (v7/v8 carried the retired dedup_reverse section) \
+                "unsupported manifest body version {other}; only v10 is readable — \
+                 older databases (v7/v8 carried the retired dedup_reverse section; \
+                 v9 carried the compact leaf v2 encoding with the 100-unit cap) \
                  must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v9(page: &Page, page_store: &PageStore) -> Result<Self> {
+    fn decode_v10(page: &Page, page_store: &PageStore) -> Result<Self> {
         let p = page.payload();
         let checkpoint_lsn = u64::from_le_bytes(
             p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
