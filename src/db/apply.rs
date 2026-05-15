@@ -654,6 +654,15 @@ pub(super) fn build_clone_volume_shards(
             page_cache,
             shard_idx,
             metrics.clone(),
+            // Cloned volume has no on-disk dirty pages of its own
+            // yet; its shards' content is durable for every LSN at
+            // or before `created_lsn` (because the volume didn't
+            // exist before). Setting `last_flushed_lsn = created_lsn`
+            // keeps `Db::compute_min_last_flushed_lsn` from being
+            // dragged down to 0 by a fresh volume that hasn't been
+            // flushed yet. Subsequent partial flushes bump it as
+            // usual.
+            created_lsn,
         ));
     }
     Ok((shards, actual_roots.into_boxed_slice()))

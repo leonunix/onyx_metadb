@@ -16,6 +16,31 @@ pub(super) fn lock_all_l2p_shards_for<'v>(
         .collect()
 }
 
+/// Partial-sample variant of [`lock_all_l2p_shards_for`]: only
+/// write-locks `(volume_idx, shard_idx)` pairs whose corresponding
+/// `selected[v][s]` is `true`. Lock order is identical (volume then
+/// shard index ascending) so this can interleave with full-sample
+/// callers without deadlock. The returned vector is flat in
+/// `(volume, shard)` ascending order, and only contains guards for
+/// selected shards — callers must zip it against the same
+/// `selected` matrix to map back to `(v, s)` indices.
+pub(super) fn lock_selected_l2p_shards_for<'v>(
+    volumes: &'v [Arc<Volume>],
+    selected: &[Vec<bool>],
+) -> Vec<RwLockWriteGuard<'v, PagedL2p>> {
+    debug_assert_eq!(selected.len(), volumes.len());
+    let mut guards = Vec::new();
+    for (vol, mask) in volumes.iter().zip(selected.iter()) {
+        debug_assert_eq!(mask.len(), vol.shards.len());
+        for (shard_idx, shard) in vol.shards.iter().enumerate() {
+            if mask[shard_idx] {
+                guards.push(shard.tree.write());
+            }
+        }
+    }
+    guards
+}
+
 /// Rebuild `manifest.volumes` and `manifest.refcount_shard_roots` from
 /// the live tree roots held by the supplied guard slices. Used by
 /// `Db::flush` / `Db::take_snapshot` (via the `&self` wrapper) and by
@@ -157,6 +182,7 @@ pub(super) fn create_shards(
         shards.push(Shard {
             rc: Arc::new(rc),
             apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx, metrics.clone()),
+            last_flushed_lsn: AtomicU64::new(0),
         });
     }
     Ok((shards, roots.into_boxed_slice()))
@@ -166,7 +192,7 @@ pub(super) fn open_shards(
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     roots: &[PageId],
-    _next_gen: Lsn,
+    initial_last_flushed_lsn: Lsn,
     metrics: Arc<MetaMetrics>,
 ) -> Result<Vec<Shard>> {
     let mut shards = Vec::with_capacity(roots.len());
@@ -176,6 +202,7 @@ pub(super) fn open_shards(
         shards.push(Shard {
             rc: Arc::new(rc),
             apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx, metrics.clone()),
+            last_flushed_lsn: AtomicU64::new(initial_last_flushed_lsn),
         });
     }
     Ok(shards)
@@ -190,6 +217,7 @@ pub(super) fn make_l2p_shard(
     page_cache: &Arc<PageCache>,
     shard_idx: usize,
     metrics: Arc<MetaMetrics>,
+    initial_last_flushed_lsn: Lsn,
 ) -> L2pShard {
     let view = crate::paged::ReadView::new(
         tree.root(),
@@ -202,6 +230,7 @@ pub(super) fn make_l2p_shard(
         read_view: RwLock::new(Arc::new(view)),
         active_readers: std::sync::atomic::AtomicUsize::new(0),
         apply_lane: ApplyLane::new(0, ApplyLaneKind::L2p, shard_idx, metrics),
+        last_flushed_lsn: AtomicU64::new(initial_last_flushed_lsn),
     }
 }
 
@@ -221,6 +250,7 @@ pub(super) fn create_l2p_shards(
             &page_cache,
             shard_idx,
             metrics.clone(),
+            0,
         ));
     }
     Ok((shards, roots.into_boxed_slice()))
@@ -232,6 +262,7 @@ pub(super) fn open_l2p_shards(
     roots: &[PageId],
     next_gen: Lsn,
     metrics: Arc<MetaMetrics>,
+    initial_last_flushed_lsn: Lsn,
 ) -> Result<Vec<L2pShard>> {
     let mut shards = Vec::with_capacity(roots.len());
     for (shard_idx, &root) in roots.iter().enumerate() {
@@ -242,6 +273,7 @@ pub(super) fn open_l2p_shards(
             &page_cache,
             shard_idx,
             metrics.clone(),
+            initial_last_flushed_lsn,
         ));
     }
     Ok(shards)

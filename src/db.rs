@@ -12,7 +12,7 @@ use std::ops::{Bound, RangeBounds};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -199,6 +199,20 @@ pub struct Db {
     /// shut down at the top of `Drop` so it can never race against
     /// page_store / refcount teardown.
     l2p_writeback: Mutex<Option<streaming_flush::StreamingFlusher>>,
+    /// Round-robin cursor for partial-sample flush selection. Each
+    /// `flush_with_gate` invocation walks the global shard list
+    /// starting from `flush_cursor` and accepts shards in order
+    /// until the cumulative dirty work hits `flush_select_budget`;
+    /// then bumps the cursor past the last accepted shard so the
+    /// next round drains the remainder before revisiting hot
+    /// shards. Combined with the dirty-count gating in
+    /// `select_shards_for_flush`, this caps single-flush sample
+    /// size and prevents cold shards from starving.
+    flush_cursor: AtomicUsize,
+    /// Cumulative `(dirty_l2p_pages + pending_rc_deltas)` cap per
+    /// flush sample. Zero disables partial sampling (every flush is
+    /// a full sample). See `Config::flush_select_budget`.
+    flush_select_budget: usize,
 }
 
 struct ManifestState {
@@ -746,6 +760,14 @@ fn record_lane_burst(inner: &ApplyLaneInner, burst: u64) {
 struct Shard {
     rc: Arc<crate::refcount::RcShard>,
     apply_lane: ApplyLane,
+    /// Highest LSN whose effects on this shard are durable on disk.
+    /// Initialized at open from `manifest.checkpoint_lsn`. Bumped
+    /// to `wal_checkpoint` after a flush selects this shard and
+    /// the manifest commit succeeds. Used by
+    /// `Db::compute_min_last_flushed_lsn` so partial flushes can
+    /// keep `manifest.checkpoint_lsn` truthful for WAL prune /
+    /// recovery start.
+    last_flushed_lsn: AtomicU64,
 }
 
 struct L2pShard {
@@ -756,6 +778,9 @@ struct L2pShard {
     read_view: RwLock<Arc<crate::paged::ReadView>>,
     active_readers: AtomicUsize,
     apply_lane: ApplyLane,
+    /// Highest LSN whose effects on this shard are durable on disk.
+    /// See `Shard::last_flushed_lsn`.
+    last_flushed_lsn: AtomicU64,
 }
 
 /// L2P home for one user-facing volume. Owns its own shard group; shard

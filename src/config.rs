@@ -223,6 +223,20 @@ pub struct Config {
     /// the default 8 192, install rarely exceeds 5–10 ms even with
     /// PageBuf-shaped costs.
     pub l2p_writeback_max_pages_per_cycle: usize,
+
+    /// Per-flush budget on the sum of `(dirty_l2p_pages +
+    /// pending_rc_deltas)` the sample phase will process. When the
+    /// running total crosses this cap during shard selection, the
+    /// remaining shards stay unselected and their roots /
+    /// `last_flushed_lsn` carry over to the next flush. Combined
+    /// with `flush_cursor` round-robin, partial sampling keeps a
+    /// single flush short enough to interleave with commit apply.
+    /// Set to 0 (or any value larger than the live working set) to
+    /// disable partial sampling and force every flush to be full.
+    /// `manifest.checkpoint_lsn` becomes
+    /// `min(per-shard last_flushed_lsn)` so WAL prune / recovery
+    /// remain correct even when most flushes are partial.
+    pub flush_select_budget: usize,
 }
 
 impl Config {
@@ -256,6 +270,11 @@ impl Config {
             direct_io: cfg!(target_os = "linux"),
             page_grow_chunk_pages: 512,
             index_pin_bytes: 512 * 1024 * 1024,
+            // 100 k matches the nvme-box sweep sweet spot for
+            // `flush_dirty_pages_threshold`; partial sampling reuses
+            // the same budget so the early trigger and the per-flush
+            // cap stay aligned by default.
+            flush_select_budget: 100_000,
             rebuild_free_list_on_open: true,
             reclaim_orphans_on_open: true,
             // 1 M buckets × 4 entries = 4 M cuckoo capacity at load

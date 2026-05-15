@@ -27,6 +27,31 @@ fn flush_reclaim_budget(pending_reclaim_pages: usize, pages_written: usize) -> u
         .min(pressure_cap)
 }
 
+/// Per-flush selection of shards that this `flush_with_gate`
+/// invocation will sample. `l2p[v][s]` mirrors
+/// `volumes[v].shards[s]`; `rc[i]` mirrors `refcount_shards[i]`.
+/// True = sample this shard this round, write a new sealed root +
+/// bump its `last_flushed_lsn`. False = leave it alone; its root
+/// in the manifest and its in-memory dirty pages carry over to the
+/// next flush.
+#[derive(Debug, Clone)]
+struct SelectedShards {
+    l2p: Vec<Vec<bool>>,
+    rc: Vec<bool>,
+}
+
+impl SelectedShards {
+    fn l2p_any(&self) -> bool {
+        self.l2p.iter().any(|v| v.iter().any(|s| *s))
+    }
+    fn rc_any(&self) -> bool {
+        self.rc.iter().any(|s| *s)
+    }
+    fn is_empty(&self) -> bool {
+        !self.l2p_any() && !self.rc_any()
+    }
+}
+
 struct CheckpointInstallReceiver {
     kind: &'static str,
     vol_ord: Option<VolumeOrdinal>,
@@ -381,6 +406,8 @@ impl Db {
             faults,
             db_path: cfg.path,
             l2p_writeback: Mutex::new(None),
+            flush_cursor: AtomicUsize::new(0),
+            flush_select_budget: cfg.flush_select_budget,
         };
         // Spawn refcount drainers (priority 3) — fresh DB has no
         // replay to worry about, so we can spawn unconditionally
@@ -475,6 +502,12 @@ impl Db {
         // Earlier versions of the manifest (v3/v4/v5) are not readable —
         // Phase 7 is fresh-install only, and `Manifest::decode` rejects
         // them at the page-layer.
+        // At open, everything ≤ manifest.checkpoint_lsn is durable for
+        // every shard (the manifest is a global cursor under the
+        // pre-partial-flush model). Seed every shard's
+        // last_flushed_lsn from it so subsequent partial flushes can
+        // compute `min(per-shard last_flushed_lsn)` correctly.
+        let initial_last_flushed_lsn = manifest.checkpoint_lsn;
         let mut volumes: HashMap<VolumeOrdinal, Arc<Volume>> =
             HashMap::with_capacity(manifest.volumes.len());
         for entry in &manifest.volumes {
@@ -484,6 +517,7 @@ impl Db {
                 &entry.l2p_shard_roots,
                 next_gen,
                 metrics.clone(),
+                initial_last_flushed_lsn,
             )?;
             volumes.insert(
                 entry.ord,
@@ -494,7 +528,7 @@ impl Db {
             page_store.clone(),
             page_cache.clone(),
             &manifest.refcount_shard_roots,
-            next_gen,
+            initial_last_flushed_lsn,
             metrics.clone(),
         )?;
         let dedup_index_meta_pid: PageId = manifest
@@ -843,6 +877,8 @@ impl Db {
             faults,
             db_path: cfg.path,
             l2p_writeback: Mutex::new(None),
+            flush_cursor: AtomicUsize::new(0),
+            flush_select_budget: cfg.flush_select_budget,
         };
         db.recompute_all_snap_infos();
         // Spawn refcount drainers AFTER WAL replay finished above so
@@ -1142,6 +1178,135 @@ impl Db {
         }
     }
 
+    /// Sum of every shard's `last_flushed_lsn`'s minimum. WAL prune /
+    /// `manifest.checkpoint_lsn` must not advance past this — any op
+    /// at a later LSN may still be pending on at least one
+    /// unflushed shard, and WAL is the only source recovery has for
+    /// it. Walks all L2P shards (across all volumes) plus every RC
+    /// shard, taking the minimum. The min naturally falls to 0 if
+    /// any shard has never been flushed (fresh DB at create-time).
+    pub fn compute_min_last_flushed_lsn(&self) -> Lsn {
+        use std::sync::atomic::Ordering;
+        let mut min_lsn = Lsn::MAX;
+        for volume in self.volumes.read().values() {
+            for shard in &volume.shards {
+                let lsn = shard.last_flushed_lsn.load(Ordering::Acquire);
+                if lsn < min_lsn {
+                    min_lsn = lsn;
+                }
+            }
+        }
+        for shard in &self.refcount_shards {
+            let lsn = shard.last_flushed_lsn.load(Ordering::Acquire);
+            if lsn < min_lsn {
+                min_lsn = lsn;
+            }
+        }
+        if min_lsn == Lsn::MAX { 0 } else { min_lsn }
+    }
+
+    /// Choose which L2P + RC shards this `flush_with_gate` invocation
+    /// will sample. The selection walks all shards in round-robin
+    /// order starting from `flush_cursor`, accepting shards with
+    /// non-zero dirty work until the cumulative work crosses
+    /// `flush_select_budget`. Shards past the budget keep their
+    /// previous root + `last_flushed_lsn`; `manifest.checkpoint_lsn`
+    /// is set to the global min so WAL prune stays safe.
+    ///
+    /// Budget == 0 (or larger than the live working set) yields a
+    /// full-sample selection, preserving the pre-partial behaviour.
+    /// `force_all = true` (forced flush / snapshot / shutdown drain)
+    /// also returns a full selection regardless of budget.
+    fn select_shards_for_flush(
+        &self,
+        volumes: &[Arc<Volume>],
+        force_all: bool,
+    ) -> SelectedShards {
+        use std::sync::atomic::Ordering;
+        let mut l2p: Vec<Vec<bool>> = volumes
+            .iter()
+            .map(|v| vec![false; v.shards.len()])
+            .collect();
+        let mut rc = vec![false; self.refcount_shards.len()];
+
+        if force_all || self.flush_select_budget == 0 {
+            for entry in l2p.iter_mut() {
+                for slot in entry.iter_mut() {
+                    *slot = true;
+                }
+            }
+            for slot in rc.iter_mut() {
+                *slot = true;
+            }
+            return SelectedShards { l2p, rc };
+        }
+
+        // Build a single flat round-robin order across (kind, volume,
+        // shard_idx). Each entry carries the dirty-work estimate so a
+        // single budget pass can stop without revisiting.
+        #[derive(Clone, Copy)]
+        enum Kind {
+            L2p(usize, usize), // volume_idx, shard_idx
+            Rc(usize),
+        }
+        let mut order: Vec<(Kind, usize)> = Vec::new();
+        for (v_idx, vol) in volumes.iter().enumerate() {
+            for (s_idx, shard) in vol.shards.iter().enumerate() {
+                let dirty = shard
+                    .tree
+                    .try_read()
+                    .map(|tree| tree.growth_summary().3)
+                    .unwrap_or(0);
+                order.push((Kind::L2p(v_idx, s_idx), dirty));
+            }
+        }
+        for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
+            let dirty = shard.rc.pending_delta_count();
+            order.push((Kind::Rc(s_idx), dirty));
+        }
+
+        if order.is_empty() {
+            return SelectedShards { l2p, rc };
+        }
+
+        let start = self.flush_cursor.load(Ordering::Relaxed) % order.len();
+        let budget = self.flush_select_budget;
+        let mut taken = 0usize;
+        let mut work = 0usize;
+        let mut cursor_advance = 0usize;
+        for step in 0..order.len() {
+            let idx = (start + step) % order.len();
+            let (kind, dirty) = order[idx];
+            if dirty == 0 {
+                continue;
+            }
+            // First accept always lands even if a single shard alone
+            // exceeds the budget — otherwise a hot shard would never
+            // be drained. After the first, stop once we've exceeded.
+            if taken > 0 && work.saturating_add(dirty) > budget {
+                break;
+            }
+            match kind {
+                Kind::L2p(v, s) => l2p[v][s] = true,
+                Kind::Rc(s) => rc[s] = true,
+            }
+            work = work.saturating_add(dirty);
+            taken += 1;
+            cursor_advance = step + 1;
+        }
+
+        if taken > 0 {
+            let next = (start + cursor_advance) % order.len();
+            self.flush_cursor.store(next, Ordering::Relaxed);
+        }
+        // Note: if every shard had `dirty == 0`, the selection is
+        // empty. `flush_with_gate` short-circuits that case as a
+        // no-op flush (still bumps `last_applied_lsn` checkpoint via
+        // the global min, which is a no-op when nothing changed).
+
+        SelectedShards { l2p, rc }
+    }
+
     /// Best-effort checkpoint for background maintenance. If commits are
     /// currently applying, this returns `Ok(false)` without setting the
     /// apply gate's writer-pending bit, so foreground commit readers keep
@@ -1193,20 +1358,52 @@ impl Db {
         };
         let sample_started = std::time::Instant::now();
         let volumes = self.volumes_snapshot();
+        // Decide which shards this round samples. Forced flushes
+        // (`flush()`, snapshot, shutdown) always select everything;
+        // steady-state `try_flush()` honours the budget cap.
+        let selected = self.select_shards_for_flush(
+            &volumes,
+            matches!(kind, crate::metrics::FlushKind::Forced),
+        );
+        if selected.is_empty() {
+            // Nothing dirty enough to flush this round. Bail out
+            // before locking any shards — release the gate and
+            // record an empty sample. Caller will retry next tick.
+            drop(apply_guard);
+            self.metrics
+                .record_flush_sample(kind, sample_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
+            return Ok(true);
+        }
         let lock_started = std::time::Instant::now();
-        let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
+        let mut l2p_guards = lock_selected_l2p_shards_for(&volumes, &selected.l2p);
         let lock_elapsed = lock_started.elapsed();
         let tree_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
         let wal_checkpoint = *self.last_applied_lsn.lock();
         let l2p_walk_started = std::time::Instant::now();
-        let mut l2p_checkpoints = Vec::with_capacity(volumes.len());
-        for volume in &volumes {
-            let mut checkpoints = Vec::with_capacity(volume.shards.len());
-            for _ in 0..volume.shards.len() {
-                checkpoints.push(l2p_guards.remove(0).begin_checkpoint());
+        // Sparse per-(volume, shard) checkpoint vector. `None`
+        // entries are unselected shards: their root in the manifest
+        // carries over and their `last_flushed_lsn` is unchanged.
+        let mut l2p_checkpoints: Vec<Vec<Option<crate::paged::tree::Checkpoint>>> =
+            Vec::with_capacity(volumes.len());
+        let mut guard_iter = l2p_guards.drain(..);
+        for (v_idx, volume) in volumes.iter().enumerate() {
+            let mut per_volume: Vec<Option<crate::paged::tree::Checkpoint>> =
+                Vec::with_capacity(volume.shards.len());
+            for s_idx in 0..volume.shards.len() {
+                if selected.l2p[v_idx][s_idx] {
+                    let mut guard = guard_iter
+                        .next()
+                        .expect("lock_selected_l2p_shards_for must hand out one guard per selected shard");
+                    per_volume.push(Some(guard.begin_checkpoint()));
+                } else {
+                    per_volume.push(None);
+                }
             }
-            l2p_checkpoints.push(checkpoints);
+            l2p_checkpoints.push(per_volume);
         }
+        debug_assert!(guard_iter.next().is_none());
         let l2p_walk_elapsed = l2p_walk_started.elapsed();
         // Refcount sample: drain delta + stage sealed pages in memory.
         // No disk IO under the gate. Meta-chain rewrite + page writes
@@ -1221,44 +1418,48 @@ impl Db {
         // shards collapses the previously-serial 16× cost into one
         // shard's worth (modulo any skew).
         //
-        // Failure handling preserves the partial-length convention
-        // `abort_rc_checkpoints` expects: `refcount_checkpoints`
-        // contains the first contiguous prefix of successful shards
-        // (in shard order), and any successes that landed past the
-        // first error are aborted individually before falling through
-        // to the existing error path.
+        // Sparse over `selected.rc`: only spawn threads for selected
+        // shards; unselected slots remain `None`. Failure handling
+        // preserves the "first error wins, the rest are individually
+        // aborted" semantics from the pre-partial code.
         let rc_drain_started = std::time::Instant::now();
-        let rc_results: Vec<Result<crate::refcount::shard::RcCheckpoint>> =
+        let rc_results: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> =
             std::thread::scope(|scope| {
-                let handles: Vec<_> = self
-                    .refcount_shards
-                    .iter()
-                    .map(|shard| scope.spawn(move || shard.rc.begin_checkpoint()))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join().unwrap_or_else(|panic_payload| {
-                            std::panic::resume_unwind(panic_payload)
-                        })
-                    })
-                    .collect()
+                let mut handles: Vec<(usize, std::thread::ScopedJoinHandle<_>)> = Vec::new();
+                for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
+                    if selected.rc[s_idx] {
+                        let h = scope.spawn(move || shard.rc.begin_checkpoint());
+                        handles.push((s_idx, h));
+                    }
+                }
+                let mut out: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> =
+                    (0..self.refcount_shards.len()).map(|_| None).collect();
+                for (s_idx, h) in handles {
+                    let result = h.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+                    out[s_idx] = Some(result);
+                }
+                out
             });
         let rc_drain_elapsed = rc_drain_started.elapsed();
-        let mut refcount_checkpoints: Vec<crate::refcount::shard::RcCheckpoint> =
-            Vec::with_capacity(self.refcount_shards.len());
+        let mut refcount_checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>> =
+            (0..self.refcount_shards.len()).map(|_| None).collect();
         let mut sample_err: Option<MetaDbError> = None;
         let mut tail_to_abort: Vec<(usize, crate::refcount::shard::RcCheckpoint)> = Vec::new();
         for (idx, result) in rc_results.into_iter().enumerate() {
-            if sample_err.is_some() {
-                if let Ok(ckpt) = result {
-                    tail_to_abort.push((idx, ckpt));
-                }
-                continue;
-            }
             match result {
-                Ok(ckpt) => refcount_checkpoints.push(ckpt),
-                Err(err) => sample_err = Some(err),
+                None => continue,
+                Some(Ok(ckpt)) => {
+                    if sample_err.is_some() {
+                        tail_to_abort.push((idx, ckpt));
+                    } else {
+                        refcount_checkpoints[idx] = Some(ckpt);
+                    }
+                }
+                Some(Err(err)) => {
+                    if sample_err.is_none() {
+                        sample_err = Some(err);
+                    }
+                }
             }
         }
         for (idx, ckpt) in tail_to_abort {
@@ -1266,7 +1467,6 @@ impl Db {
                 .rc
                 .abort_checkpoint(ckpt, wal_checkpoint);
         }
-        drop(l2p_guards);
         drop(apply_guard);
         self.metrics
             .record_flush_sample(kind, sample_started.elapsed());
@@ -1283,14 +1483,17 @@ impl Db {
         let l2p_dirty_pages: usize = l2p_checkpoints
             .iter()
             .flat_map(|cps| cps.iter())
+            .filter_map(|cp| cp.as_ref())
             .map(|cp| cp.dirty_pages_count())
             .sum();
         let rc_drained_deltas: usize = refcount_checkpoints
             .iter()
+            .filter_map(|c| c.as_ref())
             .map(|c| c.drained_deltas_count())
             .sum();
         let rc_fresh_pages: usize = refcount_checkpoints
             .iter()
+            .filter_map(|c| c.as_ref())
             .map(|c| c.fresh_pages_count())
             .sum();
         self.metrics.record_flush_sample_workload(
@@ -1299,12 +1502,11 @@ impl Db {
             rc_fresh_pages,
         );
         if let Some(err) = sample_err {
-            // Roll back the partial set of refcount checkpoints that
-            // succeeded before the failing shard. `abort_rc_checkpoints`
-            // zips with `self.refcount_shards`, so partial-length input
-            // covers indices 0..n correctly.
-            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+            // Roll back every L2P + RC checkpoint that this partial
+            // sample successfully produced; the unselected `None`
+            // slots are no-ops in the sparse aborters.
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             return Err(err);
@@ -1313,28 +1515,37 @@ impl Db {
         let io_started = std::time::Instant::now();
         let mut total_pages_written = 0usize;
         let mut sealed_pages = Vec::new();
-        let mut flushed_l2p = Vec::with_capacity(l2p_checkpoints.len());
+        // Same sparse layout as `l2p_checkpoints` — `None` for
+        // unselected shards (no IO for them this round).
+        let mut flushed_l2p: Vec<Vec<Option<crate::paged::cache::FlushedSnapshot>>> =
+            Vec::with_capacity(l2p_checkpoints.len());
         for checkpoints in &l2p_checkpoints {
-            let mut flushed = Vec::with_capacity(checkpoints.len());
-            for checkpoint in checkpoints {
-                let seal_started = std::time::Instant::now();
-                match checkpoint.write_dirty_pages() {
-                    Ok(pages) => {
-                        self.metrics.record_flush_io_seal(seal_started.elapsed());
-                        total_pages_written += pages.pages_count();
-                        pages.append_sealed_pages(&mut sealed_pages);
-                        flushed.push(pages);
+            let mut flushed: Vec<Option<crate::paged::cache::FlushedSnapshot>> =
+                Vec::with_capacity(checkpoints.len());
+            for checkpoint_opt in checkpoints {
+                match checkpoint_opt {
+                    Some(checkpoint) => {
+                        let seal_started = std::time::Instant::now();
+                        match checkpoint.write_dirty_pages() {
+                            Ok(pages) => {
+                                self.metrics.record_flush_io_seal(seal_started.elapsed());
+                                total_pages_written += pages.pages_count();
+                                pages.append_sealed_pages(&mut sealed_pages);
+                                flushed.push(Some(pages));
+                            }
+                            Err(err) => {
+                                self.metrics.record_flush_io_seal(seal_started.elapsed());
+                                self.metrics
+                                    .record_flush_io(io_started.elapsed(), total_pages_written);
+                                self.metrics
+                                    .record_flush_total(kind, flush_started.elapsed());
+                                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                                self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+                                return Err(err);
+                            }
+                        }
                     }
-                    Err(err) => {
-                        self.metrics.record_flush_io_seal(seal_started.elapsed());
-                        self.metrics
-                            .record_flush_io(io_started.elapsed(), total_pages_written);
-                        self.metrics
-                            .record_flush_total(kind, flush_started.elapsed());
-                        self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
-                        self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
-                        return Err(err);
-                    }
+                    None => flushed.push(None),
                 }
             }
             flushed_l2p.push(flushed);
@@ -1342,19 +1553,24 @@ impl Db {
         // Refcount sealed pages flow through the same write_sealed_page_runs
         // batch as L2P. Refcount meta-chain pages also fold into the
         // same batch via `build_meta_chain` (below) — one io_uring
-        // submission covers L2P + RC data + RC meta, replacing N
-        // synchronous per-page writes that used to dominate flush IO.
-        for ckpt in &refcount_checkpoints {
-            let before = sealed_pages.len();
-            ckpt.append_sealed_pages(&mut sealed_pages);
-            total_pages_written += sealed_pages.len() - before;
+        // submission covers L2P + RC data + RC meta. Only selected
+        // (= `Some(...)`) RC shards contribute pages this round.
+        for ckpt_opt in &refcount_checkpoints {
+            if let Some(ckpt) = ckpt_opt {
+                let before = sealed_pages.len();
+                ckpt.append_sealed_pages(&mut sealed_pages);
+                total_pages_written += sealed_pages.len() - before;
+            }
         }
         // Build the per-shard meta chains in memory (no IO) and fold
         // every sealed chain page into the global `sealed_pages` batch.
         // The shard's head meta page id is stable across rewrites
         // (`paged_meta::build_chain_pages` reuses `existing_chain[0]`),
-        // so the manifest needs no per-flush update for refcount roots.
-        let mut rc_new_chains: Vec<Vec<PageId>> = Vec::with_capacity(refcount_checkpoints.len());
+        // so the manifest needs no per-flush update for refcount
+        // roots. Sparse: only selected shards rebuild their chain;
+        // unselected shards keep their existing on-disk chain.
+        let mut rc_new_chains: Vec<Option<Vec<PageId>>> =
+            (0..self.refcount_shards.len()).map(|_| None).collect();
         // Trailing continuation pages from the previous chain that we
         // must release **after** the new chain is durable and the
         // manifest has committed. `wal_checkpoint` is the durable LSN
@@ -1365,7 +1581,9 @@ impl Db {
         // succeeds so subsequent reads don't need to hit disk for the
         // new chain head/continuation pages.
         let mut rc_chain_cache_inserts: Vec<(PageId, Arc<crate::page::Page>)> = Vec::new();
-        for (shard, ckpt) in self.refcount_shards.iter().zip(refcount_checkpoints.iter()) {
+        for (s_idx, ckpt_opt) in refcount_checkpoints.iter().enumerate() {
+            let Some(ckpt) = ckpt_opt else { continue };
+            let shard = &self.refcount_shards[s_idx];
             let rc_meta_started = std::time::Instant::now();
             match shard.rc.build_meta_chain(ckpt) {
                 Ok((chain, chain_sealed, free_pids)) => {
@@ -1376,7 +1594,7 @@ impl Db {
                     rc_to_free.extend(free_pids);
                     self.metrics
                         .record_flush_io_rc_meta(rc_meta_started.elapsed());
-                    rc_new_chains.push(chain);
+                    rc_new_chains[s_idx] = Some(chain);
                 }
                 Err(err) => {
                     self.metrics
@@ -1385,8 +1603,8 @@ impl Db {
                         .record_flush_io(io_started.elapsed(), total_pages_written);
                     self.metrics
                         .record_flush_total(kind, flush_started.elapsed());
-                    self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
-                    self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+                    self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                    self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                     return Err(err);
                 }
             }
@@ -1399,8 +1617,8 @@ impl Db {
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
-            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
         self.metrics
@@ -1412,8 +1630,8 @@ impl Db {
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
-            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
         self.metrics.record_flush_io_sync(sync_started.elapsed());
@@ -1440,8 +1658,8 @@ impl Db {
                 self.metrics
                     .record_flush_total(kind, flush_started.elapsed());
                 drop(manifest_state);
-                self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
-                self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                 return Err(err);
             }
         };
@@ -1454,8 +1672,8 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
 
@@ -1469,13 +1687,29 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
-        // The tree generation is a local monotonic counter; checkpoint
-        // LSN must be the durable WAL LSN, not the tree counter.
-        manifest_state.manifest.checkpoint_lsn = wal_checkpoint;
+        // Compute the new global checkpoint_lsn as
+        // `min(per-shard last_flushed_lsn)`, treating every shard
+        // selected this round as if its atomic were already at
+        // `wal_checkpoint`. We can't store to the atomics yet —
+        // that has to wait until after the manifest commit succeeds
+        // — but the computation must reflect the durable state we're
+        // ABOUT to commit. WAL prune downstream uses this value, so
+        // it bounds what we can drop and must stay correct under
+        // partial sampling.
+        //
+        // Full-sample / forced flushes have every selected[*] == true
+        // and the result is simply `wal_checkpoint`, matching the
+        // pre-partial behaviour.
+        let new_checkpoint_lsn = self.compute_min_last_flushed_lsn_after(
+            &volumes,
+            &selected,
+            wal_checkpoint,
+        );
+        manifest_state.manifest.checkpoint_lsn = new_checkpoint_lsn;
         let manifest = manifest_state.manifest.clone();
         if let Err(err) = manifest_state.store.commit(&manifest) {
             self.metrics
@@ -1483,12 +1717,36 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            self.abort_rc_checkpoints(refcount_checkpoints, wal_checkpoint);
-            self.abort_checkpoints(&volumes, &l2p_checkpoints, &[]);
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
         self.metrics
             .record_flush_manifest(manifest_started.elapsed());
+        // Manifest commit is durable. Bump the per-shard
+        // `last_flushed_lsn` for every shard we just committed —
+        // future calls to `compute_min_last_flushed_lsn` will read
+        // these values back. Release ordering pairs with the
+        // Acquire load in `compute_min_last_flushed_lsn`.
+        {
+            use std::sync::atomic::Ordering;
+            for (v_idx, vol) in volumes.iter().enumerate() {
+                for (s_idx, shard) in vol.shards.iter().enumerate() {
+                    if selected.l2p[v_idx][s_idx] {
+                        shard
+                            .last_flushed_lsn
+                            .store(wal_checkpoint, Ordering::Release);
+                    }
+                }
+            }
+            for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
+                if selected.rc[s_idx] {
+                    shard
+                        .last_flushed_lsn
+                        .store(wal_checkpoint, Ordering::Release);
+                }
+            }
+        }
         {
             let mut unlogged = self.unlogged_pending_lsn.lock();
             if unlogged.is_some_and(|lsn| lsn <= wal_checkpoint) {
@@ -1500,9 +1758,13 @@ impl Db {
         // so subsequent `begin_checkpoint` sees the new chain when
         // computing `existing_chain` for paged_meta::build_chain_pages.
         // Direct inner.lock() — no race with `RcShard::stage` which
-        // never reads `inner.meta_chain`. Cannot fail.
-        for (shard, new_chain) in self.refcount_shards.iter().zip(rc_new_chains.into_iter()) {
-            shard.rc.install_meta_chain(new_chain);
+        // never reads `inner.meta_chain`. Sparse: only selected RC
+        // shards get a new chain installed; unselected shards keep
+        // their existing in-memory chain.
+        for (s_idx, chain_opt) in rc_new_chains.into_iter().enumerate() {
+            if let Some(new_chain) = chain_opt {
+                self.refcount_shards[s_idx].rc.install_meta_chain(new_chain);
+            }
         }
         // Trailing continuation pages from the old chains can be
         // released now that the new chains are installed and durable.
@@ -1533,9 +1795,17 @@ impl Db {
             .iter()
             .zip(l2p_checkpoints.into_iter().zip(flushed_l2p.into_iter()))
         {
-            for (sid, (checkpoint, flushed)) in
+            for (sid, (checkpoint_opt, flushed_opt)) in
                 checkpoints.into_iter().zip(flushed.into_iter()).enumerate()
             {
+                // Sparse: unselected shards have `None` on both
+                // sides (the L2P walk pushed None when not selected,
+                // and the IO loop preserved that shape). Skip them
+                // entirely — there's nothing to install when no
+                // dirty pages were sealed for this shard.
+                let (Some(checkpoint), Some(flushed)) = (checkpoint_opt, flushed_opt) else {
+                    continue;
+                };
                 let flushed_pages = flushed.pages_count();
                 let state = Arc::new(Mutex::new(CheckpointInstallState::new(
                     flushed,
@@ -1642,36 +1912,81 @@ impl Db {
         Ok(true)
     }
 
-    fn abort_checkpoints(
+    /// Sparse-checkpoint variant of the L2P abort path: walks the
+    /// `Option<Checkpoint>` matrix and only aborts shards that
+    /// actually produced a checkpoint this round. Unselected slots
+    /// (`None`) are no-ops — those shards never began a sample, so
+    /// there's nothing to roll back.
+    fn abort_checkpoints_sparse(
         &self,
         volumes: &[Arc<Volume>],
-        l2p_checkpoints: &[Vec<crate::paged::tree::Checkpoint>],
-        _refcount_checkpoints: &[()],
+        l2p_checkpoints: &[Vec<Option<crate::paged::tree::Checkpoint>>],
     ) {
         for (volume, checkpoints) in volumes.iter().zip(l2p_checkpoints.iter()) {
-            for (shard, checkpoint) in volume.shards.iter().zip(checkpoints.iter()) {
-                shard.tree.write().abort_checkpoint(checkpoint);
+            for (shard, checkpoint_opt) in volume.shards.iter().zip(checkpoints.iter()) {
+                if let Some(checkpoint) = checkpoint_opt {
+                    shard.tree.write().abort_checkpoint(checkpoint);
+                }
             }
         }
-        // Refcount abort runs through `abort_rc_checkpoints` (separate
-        // call) because refcount checkpoints carry a `StagedDeltas`
-        // payload, not a `()` placeholder.
     }
 
-    /// Roll back a partially-completed refcount checkpoint cycle.
-    /// For each `RcCheckpoint`: restore drained deltas, free fresh
-    /// page ids, invalidate touched cache entries. Best-effort —
-    /// failures are logged and do not propagate. The retry path uses
-    /// per-slot replay-skip in `stage_deltas_in_memory` to converge
-    /// even when sealed pages were already written to disk.
-    fn abort_rc_checkpoints(
+    /// Sparse-checkpoint variant of the RC abort path. Same shape
+    /// as the L2P version: walk the `Option<RcCheckpoint>` slice
+    /// indexed by shard, abort only `Some(...)` entries.
+    fn abort_rc_checkpoints_sparse(
         &self,
-        checkpoints: Vec<crate::refcount::shard::RcCheckpoint>,
+        checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>>,
         free_lsn: Lsn,
     ) {
-        for (shard, ckpt) in self.refcount_shards.iter().zip(checkpoints.into_iter()) {
-            shard.rc.abort_checkpoint(ckpt, free_lsn);
+        for (s_idx, ckpt_opt) in checkpoints.into_iter().enumerate() {
+            if let Some(ckpt) = ckpt_opt {
+                self.refcount_shards[s_idx]
+                    .rc
+                    .abort_checkpoint(ckpt, free_lsn);
+            }
         }
+    }
+
+    /// Project what `compute_min_last_flushed_lsn` will return after
+    /// this round's atomic stores land — substitute `wal_checkpoint`
+    /// for selected shards (which we're about to commit), keep the
+    /// current atomic for unselected shards. Lets us compute
+    /// `manifest.checkpoint_lsn` correctly while still holding the
+    /// manifest lock, before storing the new atomics (the stores
+    /// can't happen before the commit because a commit failure
+    /// would leave them lying).
+    fn compute_min_last_flushed_lsn_after(
+        &self,
+        volumes: &[Arc<Volume>],
+        selected: &SelectedShards,
+        wal_checkpoint: Lsn,
+    ) -> Lsn {
+        use std::sync::atomic::Ordering;
+        let mut min_lsn = Lsn::MAX;
+        for (v_idx, vol) in volumes.iter().enumerate() {
+            for (s_idx, shard) in vol.shards.iter().enumerate() {
+                let candidate = if selected.l2p[v_idx][s_idx] {
+                    wal_checkpoint
+                } else {
+                    shard.last_flushed_lsn.load(Ordering::Acquire)
+                };
+                if candidate < min_lsn {
+                    min_lsn = candidate;
+                }
+            }
+        }
+        for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
+            let candidate = if selected.rc[s_idx] {
+                wal_checkpoint
+            } else {
+                shard.last_flushed_lsn.load(Ordering::Acquire)
+            };
+            if candidate < min_lsn {
+                min_lsn = candidate;
+            }
+        }
+        if min_lsn == Lsn::MAX { 0 } else { min_lsn }
     }
 
     /// Drain everything currently safe to physically free (i.e. tagged
@@ -1730,7 +2045,7 @@ mod tests {
 fn refresh_manifest_from_checkpoints(
     manifest: &mut Manifest,
     volumes: &[Arc<Volume>],
-    l2p_checkpoints: &[Vec<crate::paged::tree::Checkpoint>],
+    l2p_checkpoints: &[Vec<Option<crate::paged::tree::Checkpoint>>],
 ) -> Result<()> {
     manifest.body_version = MANIFEST_BODY_VERSION;
     if volumes.len() != l2p_checkpoints.len() {
@@ -1740,6 +2055,9 @@ fn refresh_manifest_from_checkpoints(
             l2p_checkpoints.len()
         )));
     }
+    // Snapshot the prior root for every (vol_ord, shard) so we can
+    // fall back on it for unselected shards. Vec lookup is O(volumes)
+    // but the live volume count is small (≤ max_volumes).
     let mut new_entries = Vec::with_capacity(volumes.len());
     for (volume, checkpoints) in volumes.iter().zip(l2p_checkpoints.iter()) {
         if volume.shards.len() != checkpoints.len() {
@@ -1750,14 +2068,39 @@ fn refresh_manifest_from_checkpoints(
                 volume.shards.len()
             )));
         }
+        // The previous manifest already records this volume's roots
+        // (volume create / clone pushed an entry before any flush
+        // committed). Borrow that prior root slice for unselected
+        // shards so the manifest reflects "this shard wasn't
+        // re-flushed this round". A volume that's brand-new and
+        // genuinely missing from the prior manifest falls back to
+        // the in-memory tree root (must be readable while holding
+        // `apply_gate.write()`).
+        let prior_roots: Option<&[PageId]> = manifest
+            .volumes
+            .iter()
+            .find(|e| e.ord == volume.ord)
+            .map(|e| e.l2p_shard_roots.as_ref());
+        let mut roots = Vec::with_capacity(volume.shards.len());
+        for (s_idx, ck_opt) in checkpoints.iter().enumerate() {
+            let root = match ck_opt {
+                Some(ck) => ck.root,
+                None => prior_roots
+                    .and_then(|pr| pr.get(s_idx).copied())
+                    .unwrap_or_else(|| {
+                        volume.shards[s_idx]
+                            .tree
+                            .try_read()
+                            .map(|t| t.root())
+                            .unwrap_or(crate::types::NULL_PAGE)
+                    }),
+            };
+            roots.push(root);
+        }
         new_entries.push(VolumeEntry {
             ord: volume.ord,
             shard_count: volume.shards.len() as u32,
-            l2p_shard_roots: checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.root)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            l2p_shard_roots: roots.into_boxed_slice(),
             created_lsn: volume.created_lsn,
             flags: volume.flags.load(std::sync::atomic::Ordering::Relaxed),
         });
