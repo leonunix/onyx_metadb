@@ -1196,20 +1196,61 @@ impl Db {
         // Refcount sample: drain delta + stage sealed pages in memory.
         // No disk IO under the gate. Meta-chain rewrite + page writes
         // happen in the IO phase below; install runs post-manifest.
+        //
+        // Per-shard `begin_checkpoint` is independent — each shard
+        // touches only its own DeltaMap, page_table, overlay, and
+        // page_pool. The only shared resource is `page_store.allocate`
+        // (priority-1 path) / `page_store.allocate_batch` (drainer
+        // mode), both under a short global mutex that is far from
+        // saturation at the observed ~7.5k alloc/s. Parallelizing across
+        // shards collapses the previously-serial 16× cost into one
+        // shard's worth (modulo any skew).
+        //
+        // Failure handling preserves the partial-length convention
+        // `abort_rc_checkpoints` expects: `refcount_checkpoints`
+        // contains the first contiguous prefix of successful shards
+        // (in shard order), and any successes that landed past the
+        // first error are aborted individually before falling through
+        // to the existing error path.
         let rc_drain_started = std::time::Instant::now();
+        let rc_results: Vec<Result<crate::refcount::shard::RcCheckpoint>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = self
+                    .refcount_shards
+                    .iter()
+                    .map(|shard| scope.spawn(move || shard.rc.begin_checkpoint()))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|panic_payload| {
+                            std::panic::resume_unwind(panic_payload)
+                        })
+                    })
+                    .collect()
+            });
+        let rc_drain_elapsed = rc_drain_started.elapsed();
         let mut refcount_checkpoints: Vec<crate::refcount::shard::RcCheckpoint> =
             Vec::with_capacity(self.refcount_shards.len());
         let mut sample_err: Option<MetaDbError> = None;
-        for shard in &self.refcount_shards {
-            match shard.rc.begin_checkpoint() {
-                Ok(ckpt) => refcount_checkpoints.push(ckpt),
-                Err(err) => {
-                    sample_err = Some(err);
-                    break;
+        let mut tail_to_abort: Vec<(usize, crate::refcount::shard::RcCheckpoint)> = Vec::new();
+        for (idx, result) in rc_results.into_iter().enumerate() {
+            if sample_err.is_some() {
+                if let Ok(ckpt) = result {
+                    tail_to_abort.push((idx, ckpt));
                 }
+                continue;
+            }
+            match result {
+                Ok(ckpt) => refcount_checkpoints.push(ckpt),
+                Err(err) => sample_err = Some(err),
             }
         }
-        let rc_drain_elapsed = rc_drain_started.elapsed();
+        for (idx, ckpt) in tail_to_abort {
+            self.refcount_shards[idx]
+                .rc
+                .abort_checkpoint(ckpt, wal_checkpoint);
+        }
         drop(l2p_guards);
         drop(apply_guard);
         self.metrics
