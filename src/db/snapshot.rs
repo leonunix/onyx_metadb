@@ -25,6 +25,14 @@ impl Db {
         // Resolve the target volume before touching manifest state so an
         // unknown ordinal short-circuits with a clean `InvalidArgument`.
         let target = self.volume(vol_ord)?;
+        // B2: drain L2P buffer into tree so the roots we sample below
+        // reflect every LSN ≤ last_applied_lsn. Without this,
+        // `SnapshotView.get` (which walks tree only) would miss
+        // committed-but-uncompacted writes. Compactor calls its own
+        // `tree.write()` per shard — safe here because we haven't
+        // acquired any per-shard guards yet, only apply_gate.write.
+        // No-op when `l2p_buffer_enabled = false`.
+        self.force_compact_l2p_buffers()?;
         let mut manifest_state = self.manifest_state.lock();
         let volumes = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
@@ -289,6 +297,18 @@ impl Db {
         // open would then fail inside `open_l2p_shards` reading a
         // Free page. Commit a refreshed manifest (snapshot still
         // present) so reopen always finds current roots.
+        //
+        // B2: drain L2P buffer first so `diff_subtrees` below sees the
+        // post-buffer current root (otherwise post-snapshot overwrites
+        // sitting in buffer would be invisible to the diff and the
+        // snapshot's old PBA would not be decref'd). Also required for
+        // checkpoint_lsn safety: this path advances
+        // `manifest.checkpoint_lsn = last_applied_lsn`; if any buffer
+        // entry sits at LSN ≤ last_applied_lsn the recovery cursor
+        // would skip past it. Compaction here advances each shard's
+        // `compacted_lsn` ≥ last_applied_lsn (apply_gate.write held),
+        // closing the gap. No-op when buffer disabled.
+        self.force_compact_l2p_buffers()?;
         let volumes_snap = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes_snap);
         flush_locked_l2p_shards(&mut l2p_guards)?;

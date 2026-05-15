@@ -373,4 +373,133 @@ fn b2_buffer_no_flush_reopen_replays_from_wal() {
     }
 }
 
+// -------- B2 Phase 4: snapshot + range_delete with buffer --------
+
+#[test]
+fn b2_buffer_take_snapshot_force_compacts_target() {
+    // Snapshot must see post-commit / pre-compaction writes that
+    // still live in the L2P buffer. `take_snapshot` calls
+    // `force_compact_l2p_buffers` so the sampled roots reflect every
+    // committed LSN.
+    let (_d, db) = mk_db_with_buffer();
+    for i in 0u64..200 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(0).unwrap();
+    // Post-snapshot writes land in buffer; snapshot view must not see them.
+    for i in 0u64..200 {
+        db.insert(0, i, v(99)).unwrap();
+    }
+    db.insert(0, 999, v(7)).unwrap();
+    let view = db.snapshot_view(snap).unwrap();
+    for i in 0u64..200 {
+        assert_eq!(view.get(i).unwrap(), Some(v(i as u8)));
+    }
+    assert_eq!(view.get(999).unwrap(), None);
+}
+
+#[test]
+fn b2_buffer_snapshot_survives_reopen() {
+    // The post-snapshot buffer must survive WAL replay across reopen,
+    // and the snapshot view itself must still resolve correctly
+    // against the rebuilt tree.
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.l2p_buffer_soft_entries = 4;
+    cfg.l2p_buffer_max_interval_ms = 50;
+    let snap_id = {
+        let db = Db::create_with_config(cfg.clone()).unwrap();
+        for i in 0u64..100 {
+            db.insert(0, i, v(1)).unwrap();
+        }
+        let id = db.take_snapshot(0).unwrap();
+        for i in 0u64..100 {
+            db.insert(0, i, v(2)).unwrap();
+        }
+        db.flush().unwrap();
+        id
+    };
+    let db = Db::open_with_config(cfg).unwrap();
+    let view = db.snapshot_view(snap_id).unwrap();
+    for i in 0u64..100 {
+        assert_eq!(view.get(i).unwrap(), Some(v(1)));
+    }
+    for i in 0u64..100 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v(2)));
+    }
+}
+
+#[test]
+fn b2_buffer_drop_snapshot_with_buffer_overwrites() {
+    // Drop must compute decrefs correctly even when post-snapshot
+    // overwrites still live in the buffer (i.e., the snapshot's old
+    // PBA refcount drops to zero because no live mapping references
+    // it anymore — `diff_subtrees` must see the post-buffer current
+    // root, which `force_compact_l2p_buffers` guarantees).
+    let (_d, db) = mk_db_with_buffer();
+    for i in 0u64..1000 {
+        db.insert(0, i, v(1)).unwrap();
+    }
+    db.flush().unwrap();
+    let s = db.take_snapshot(0).unwrap();
+    for i in 0u64..1000 {
+        db.insert(0, i, v(2)).unwrap();
+    }
+    // Snapshot still observes pre-snapshot values; live observes post.
+    let view = db.snapshot_view(s).unwrap();
+    for i in 0u64..1000 {
+        assert_eq!(view.get(i).unwrap(), Some(v(1)));
+    }
+    drop(view);
+    let report = db.drop_snapshot(s).unwrap().unwrap();
+    assert!(report.pages_freed > 0);
+    assert_eq!(report.freed_leaf_values.len(), 1000);
+    assert!(report.freed_leaf_values.iter().all(|val| *val == v(1)));
+    for i in 0u64..1000 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v(2)));
+    }
+}
+
+#[test]
+fn b2_buffer_range_delete_drains_buffer() {
+    // `range_delete` calls `force_compact_l2p_buffers` so the scan
+    // sees buffer-only entries that haven't compacted yet. Use the
+    // L2pRemap path so RC bookkeeping matches what `range_delete`
+    // expects when it decref's captured values.
+    fn remap_val(pba: Pba, tag: u8) -> L2pValue {
+        let mut v = [0u8; 36];
+        v[..8].copy_from_slice(&pba.to_be_bytes());
+        v[8] = tag;
+        L2pValue(v)
+    }
+    let (_d, db) = mk_db_with_buffer();
+    for i in 0u64..50 {
+        let mut tx = db.begin();
+        tx.l2p_remap(0, i, remap_val(100 + i, i as u8), None);
+        tx.commit_with_outcomes().unwrap();
+    }
+    // No flush — many writes likely still live in the buffer.
+    db.range_delete(0, 10, 40).unwrap();
+    for i in 0u64..10 {
+        assert_eq!(db.get(0, i).unwrap(), Some(remap_val(100 + i, i as u8)));
+    }
+    for i in 10u64..40 {
+        assert_eq!(db.get(0, i).unwrap(), None);
+    }
+    for i in 40u64..50 {
+        assert_eq!(db.get(0, i).unwrap(), Some(remap_val(100 + i, i as u8)));
+    }
+    // RC reflects deletions: surviving pbas keep rc=1, deleted ones go to 0.
+    for i in 0u64..10 {
+        assert_eq!(db.get_refcount(100 + i).unwrap(), 1);
+    }
+    for i in 10u64..40 {
+        assert_eq!(db.get_refcount(100 + i).unwrap(), 0);
+    }
+    for i in 40u64..50 {
+        assert_eq!(db.get_refcount(100 + i).unwrap(), 1);
+    }
+}
+
 // -------- phase 7 commit 8: volume lifecycle --------

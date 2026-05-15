@@ -391,6 +391,18 @@ impl Db {
         self.metrics
             .record_range_delete_apply_gate_wait(apply_gate_started.elapsed());
 
+        // B2: drain L2P buffer into tree so the per-shard `tree.range`
+        // scan below sees buffer-only entries. Apply_gate.write
+        // excludes concurrent commits, so no new buffer entries land
+        // between this drain and the scan. Safe to call here because
+        // we hold no per-shard write guards yet — `force_compact_l2p_buffers`
+        // takes them one at a time. No-op when buffer disabled.
+        if let Err(err) = self.force_compact_l2p_buffers() {
+            self.metrics
+                .record_range_delete_error(total_started.elapsed());
+            return Err(err);
+        }
+
         let volume = match self.volume(vol_ord) {
             Ok(volume) => volume,
             Err(err) => {
