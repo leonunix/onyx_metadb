@@ -219,6 +219,18 @@ pub struct Db {
     /// Wrapped in `Mutex` so `Drop` can take + stop the worker
     /// even from a `&self` context.
     async_reclaim: Mutex<Option<async_reclaim::AsyncReclaim>>,
+    /// B2 background compactor that drains per-shard L2P buffers into
+    /// the paged radix tree. `None` when `l2p_buffer_enabled = false`
+    /// — in that case commits write directly to the tree and the
+    /// buffer is never populated.
+    l2p_compactor: Mutex<Option<l2p_compactor::L2pCompactor>>,
+    /// Whether the B2 buffered-commit path is active. Read by
+    /// commit and read paths to decide whether to consult the L2P
+    /// buffer or go straight to the tree.
+    l2p_buffer_enabled: bool,
+    /// Compactor params captured at Db construction so the worker
+    /// can be (re)started without re-reading the full Config.
+    l2p_compactor_params: l2p_compactor::L2pCompactorParams,
 }
 
 struct ManifestState {
@@ -787,6 +799,15 @@ struct L2pShard {
     /// Highest LSN whose effects on this shard are durable on disk.
     /// See `Shard::last_flushed_lsn`.
     last_flushed_lsn: AtomicU64,
+    /// In-memory write buffer (B2 buffered-commit path). Constructed
+    /// for every shard but only populated when `use_buffer = true`.
+    /// See [`crate::db::l2p_buffer`] for the concurrency model.
+    l2p_buffer: Arc<crate::db::l2p_buffer::L2pBuffer>,
+    /// When `true`, commit path inserts into `l2p_buffer` instead of
+    /// mutating `tree`; read path consults `l2p_buffer` first. Set
+    /// from `Config::l2p_buffer_enabled` at shard construction and
+    /// never mutated after open.
+    use_buffer: bool,
 }
 
 /// L2P home for one user-facing volume. Owns its own shard group; shard
@@ -933,6 +954,8 @@ mod commit;
 mod helpers;
 mod indexes;
 mod l2p;
+mod l2p_buffer;
+mod l2p_compactor;
 mod lifecycle;
 mod snapshot;
 mod streaming_flush;
@@ -953,6 +976,14 @@ impl Drop for Db {
         // call is in flight when those fields go away.
         if let Some(mut flusher) = self.l2p_writeback.lock().take() {
             flusher.stop();
+        }
+        // Stop the L2P buffer compactor before volume trees / page
+        // cache go away. The compactor holds clones of the volume
+        // map, runs `tree.write()` on shards, and calls
+        // `publish_l2p_read_view`; joining it here ensures no
+        // in-flight cycle outlives the L2pShard fields.
+        if let Some(mut worker) = self.l2p_compactor.lock().take() {
+            worker.stop();
         }
         // Stop the async reclaim worker before page_store /
         // page_cache go away. It holds `Arc<PageStore>` +

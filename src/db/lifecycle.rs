@@ -300,6 +300,7 @@ impl Db {
             page_cache.clone(),
             shard_count,
             metrics.clone(),
+            cfg.l2p_buffer_enabled,
         )?;
         let (refcount_shards, refcount_roots) = create_shards(
             page_store.clone(),
@@ -414,6 +415,12 @@ impl Db {
             flush_cursor: AtomicUsize::new(0),
             flush_select_budget: cfg.flush_select_budget,
             async_reclaim: Mutex::new(None),
+            l2p_compactor: Mutex::new(None),
+            l2p_buffer_enabled: cfg.l2p_buffer_enabled,
+            l2p_compactor_params: crate::db::l2p_compactor::L2pCompactorParams {
+                soft_entries: cfg.l2p_buffer_soft_entries,
+                max_interval_ms: cfg.l2p_buffer_max_interval_ms,
+            },
         };
         // Spawn refcount drainers (priority 3) — fresh DB has no
         // replay to worry about, so we can spawn unconditionally
@@ -443,6 +450,12 @@ impl Db {
         // `page_store` / `page_cache` are torn down.
         if async_reclaim_enabled {
             db.start_async_reclaim(async_reclaim_params);
+        }
+        // Spawn the B2 L2P buffer compactor when enabled. A fresh DB
+        // has no replay so we can spawn unconditionally — the worker
+        // is a no-op until commits start populating the buffer.
+        if db.l2p_buffer_enabled {
+            db.start_l2p_compactor();
         }
         Ok(db)
     }
@@ -529,6 +542,7 @@ impl Db {
                 next_gen,
                 metrics.clone(),
                 initial_last_flushed_lsn,
+                cfg.l2p_buffer_enabled,
             )?;
             volumes.insert(
                 entry.ord,
@@ -609,6 +623,7 @@ impl Db {
                                     &page_cache,
                                     *shard_count,
                                     metrics.clone(),
+                                    cfg.l2p_buffer_enabled,
                                 )?;
                                 volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
                                 manifest.volumes.push(VolumeEntry {
@@ -671,6 +686,7 @@ impl Db {
                                     &page_cache,
                                     lsn,
                                     metrics.clone(),
+                                    cfg.l2p_buffer_enabled,
                                 )?;
                                 let shard_count = shards.len() as u32;
                                 volumes
@@ -896,6 +912,12 @@ impl Db {
             flush_cursor: AtomicUsize::new(0),
             flush_select_budget: cfg.flush_select_budget,
             async_reclaim: Mutex::new(None),
+            l2p_compactor: Mutex::new(None),
+            l2p_buffer_enabled: cfg.l2p_buffer_enabled,
+            l2p_compactor_params: crate::db::l2p_compactor::L2pCompactorParams {
+                soft_entries: cfg.l2p_buffer_soft_entries,
+                max_interval_ms: cfg.l2p_buffer_max_interval_ms,
+            },
         };
         db.recompute_all_snap_infos();
         // Spawn refcount drainers AFTER WAL replay finished above so
@@ -925,6 +947,16 @@ impl Db {
         // visibility. Drop joins it before page_store teardown.
         if async_reclaim_enabled {
             db.start_async_reclaim(async_reclaim_params);
+        }
+        // Spawn the B2 L2P buffer compactor AFTER WAL replay so the
+        // worker only observes post-replay state. Recovery's
+        // `apply_op_bare` populates the buffer; the post-replay
+        // flush at the bottom of `open_with_config_and_faults` is
+        // expected to force-compact via the same path, but we start
+        // the worker afterwards so the compactor itself doesn't
+        // race the post-replay flush's `tree.write()`.
+        if db.l2p_buffer_enabled {
+            db.start_l2p_compactor();
         }
         Ok(db)
     }
@@ -958,6 +990,90 @@ impl Db {
     /// reclaim paths.
     fn async_reclaim_active(&self) -> bool {
         self.async_reclaim.lock().is_some()
+    }
+
+    /// Start the B2 L2P buffer compactor. Caller (`Db::create` /
+    /// `Db::open`) checks `cfg.l2p_buffer_enabled`.
+    fn start_l2p_compactor(&self) {
+        let worker = super::l2p_compactor::L2pCompactor::start(
+            self.volumes.clone(),
+            self.metrics.clone(),
+            self.l2p_compactor_params,
+        );
+        *self.l2p_compactor.lock() = Some(worker);
+    }
+
+    /// Force-compact every L2P shard's buffer into its tree
+    /// synchronously. Called from `flush_with_gate` (with
+    /// `apply_gate.write()` held) and from the post-replay path in
+    /// `open_with_config_and_faults` (before the background compactor
+    /// is started). Skips shards whose buffer is empty.
+    ///
+    /// Returns the first error encountered; any successfully
+    /// compacted shards have already advanced their `compacted_lsn`.
+    pub(super) fn force_compact_l2p_buffers(&self) -> Result<()> {
+        use std::time::Instant;
+        if !self.l2p_buffer_enabled {
+            return Ok(());
+        }
+        let vols: Vec<Arc<Volume>> = {
+            let map = self.volumes.read();
+            let mut out: Vec<Arc<Volume>> = map.values().cloned().collect();
+            out.sort_by_key(|v| v.ord);
+            out
+        };
+        for vol in vols {
+            for shard in &vol.shards {
+                if !shard.use_buffer {
+                    continue;
+                }
+                let swap = match shard.l2p_buffer.swap_for_compaction() {
+                    Some(h) => h,
+                    None => continue,
+                };
+                let started = Instant::now();
+                let mut tree = shard.tree.write();
+                let apply_result: Result<()> = shard.l2p_buffer.with_draining(|d| -> Result<()> {
+                    let draining = match d {
+                        Some(map) => map,
+                        None => return Ok(()),
+                    };
+                    let mut entries: Vec<(u64, &super::l2p_buffer::BufferEntry)> = draining
+                        .iter()
+                        .map(|(lba, e)| (*lba, e))
+                        .collect();
+                    entries.sort_by_key(|(lba, _)| *lba);
+                    for (lba, entry) in entries {
+                        if entry.tombstone {
+                            tree.delete_at_lsn(lba, entry.lsn)?;
+                        } else {
+                            tree.insert_at_lsn(lba, entry.value, entry.lsn)?;
+                        }
+                    }
+                    Ok(())
+                });
+                match apply_result {
+                    Ok(()) => {
+                        super::apply::publish_l2p_read_view(shard, &tree);
+                        drop(tree);
+                        shard.l2p_buffer.finish_compaction(swap.max_lsn);
+                        self.metrics.record_l2p_buffer_compaction(
+                            swap.count,
+                            started.elapsed(),
+                        );
+                    }
+                    Err(err) => {
+                        drop(tree);
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn l2p_buffer_enabled(&self) -> bool {
+        self.l2p_buffer_enabled
     }
 
     /// Current cached manifest (as of the last durable manifest commit).
@@ -1248,6 +1364,14 @@ impl Db {
                 if lsn < min_lsn {
                     min_lsn = lsn;
                 }
+                // B2: buffer-compaction term. See
+                // `compute_min_last_flushed_lsn_after` for the rationale.
+                if shard.use_buffer {
+                    let buf_lsn = shard.l2p_buffer.compacted_lsn();
+                    if buf_lsn < min_lsn {
+                        min_lsn = buf_lsn;
+                    }
+                }
             }
         }
         for shard in &self.refcount_shards {
@@ -1395,6 +1519,19 @@ impl Db {
             return Ok(false);
         };
         self.metrics.record_flush_gate_wait(gate_started.elapsed());
+
+        // B2: force-compact all L2P buffers so the sample phase
+        // observes a tree that reflects every committed LSN up to
+        // `last_applied_lsn`. After this call, each shard's
+        // `buffer.compacted_lsn` matches its tree's last applied
+        // generation, so `compute_min_last_flushed_lsn_after` can
+        // safely use `wal_checkpoint` as a per-shard projected LSN
+        // without underestimating durability. Holding
+        // `apply_gate.write()` above ensures no concurrent commits
+        // can re-populate the buffer between this call and the
+        // sample step. No-op when `l2p_buffer_enabled = false`.
+        self.force_compact_l2p_buffers()?;
+
         // RAII guard: every refcount shard's `begin_checkpoint` below
         // preempts that shard's drainer (priority-3 drainer-mode). The
         // drainer is left parked and must be resumed before flush
@@ -2046,6 +2183,21 @@ impl Db {
                 };
                 if candidate < min_lsn {
                     min_lsn = candidate;
+                }
+                // B2 buffer-compaction term: any uncompacted entry
+                // in this shard's buffer represents a committed LSN
+                // not yet durable in the tree. Crash recovery will
+                // rebuild it from WAL, so `checkpoint_lsn` must not
+                // advance past `buffer.compacted_lsn`. When
+                // `flush_with_gate` force-compacts at the top, this
+                // term equals `last_applied_lsn` and doesn't bind;
+                // it's the safety net for the (future) path where
+                // force-compact is skipped.
+                if shard.use_buffer {
+                    let buf_lsn = shard.l2p_buffer.compacted_lsn();
+                    if buf_lsn < min_lsn {
+                        min_lsn = buf_lsn;
+                    }
                 }
             }
         }

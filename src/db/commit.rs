@@ -884,6 +884,15 @@ impl Db {
     }
 
     fn batch_uses_serial_apply(&self, ops: &[WalOp]) -> bool {
+        // B2 buffer path: force serial apply so all L2P writes go
+        // through `apply_op_bare → apply_l2p_remap` where the
+        // use_buffer branch is implemented. Phase 3 MVP avoids
+        // converting the laned `apply_l2p_bucket` batch-tree code.
+        // Phase 5 will revisit if profiling shows laned throughput
+        // mattering on this path.
+        if self.l2p_buffer_enabled {
+            return true;
+        }
         self.batch_requires_serial_apply(ops)
     }
 

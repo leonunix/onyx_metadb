@@ -60,16 +60,31 @@ pub(super) fn apply_op_bare(
                 MetaDbError::Corruption(format!("L2pPut for unknown volume ord {vol_ord}"))
             })?;
             let sid = shard_for_key_l2p(&volume.shards, *lba);
+            let use_buffer = volume.shards[sid].use_buffer;
             let mut tree = volume.shards[sid].tree.write();
             // L2pPut returns the rejecting `cur` as `L2pPrev(Some(cur))`;
             // caller distinguishes accept vs reject by comparing
             // `value.seq()` against `cur.seq()`.
-            let cur = tree.get(*lba)?;
+            let cur = if use_buffer {
+                match volume.shards[sid].l2p_buffer.lookup(*lba) {
+                    crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
+                    crate::db::l2p_buffer::BufferLookup::Tombstone => None,
+                    crate::db::l2p_buffer::BufferLookup::Absent => tree.get(*lba)?,
+                }
+            } else {
+                tree.get(*lba)?
+            };
             if seq_guard_rejects(value.seq(), cur.as_ref()) {
                 return Ok(ApplyOutcome::L2pPrev(cur));
             }
-            let prev = tree.insert_at_lsn(*lba, *value, lsn)?;
-            publish_l2p_read_view(&volume.shards[sid], &tree);
+            let prev = if use_buffer {
+                volume.shards[sid].l2p_buffer.insert(*lba, *value, lsn);
+                cur
+            } else {
+                let p = tree.insert_at_lsn(*lba, *value, lsn)?;
+                publish_l2p_read_view(&volume.shards[sid], &tree);
+                p
+            };
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::L2pDelete { vol_ord, lba } => {
@@ -77,9 +92,21 @@ pub(super) fn apply_op_bare(
                 MetaDbError::Corruption(format!("L2pDelete for unknown volume ord {vol_ord}"))
             })?;
             let sid = shard_for_key_l2p(&volume.shards, *lba);
+            let use_buffer = volume.shards[sid].use_buffer;
             let mut tree = volume.shards[sid].tree.write();
-            let prev = tree.delete_at_lsn(*lba, lsn)?;
-            publish_l2p_read_view(&volume.shards[sid], &tree);
+            let prev = if use_buffer {
+                let cur = match volume.shards[sid].l2p_buffer.lookup(*lba) {
+                    crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
+                    crate::db::l2p_buffer::BufferLookup::Tombstone => None,
+                    crate::db::l2p_buffer::BufferLookup::Absent => tree.get(*lba)?,
+                };
+                volume.shards[sid].l2p_buffer.insert_tombstone(*lba, lsn);
+                cur
+            } else {
+                let p = tree.delete_at_lsn(*lba, lsn)?;
+                publish_l2p_read_view(&volume.shards[sid], &tree);
+                p
+            };
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::DedupPut { hash, value } => {
@@ -259,6 +286,7 @@ pub(super) fn apply_l2p_remap(
     let l2p_sid = shard_for_key_l2p(&volume.shards, lba);
     let new_pba = new_value.head_pba();
     let new_is_zero = new_value.0[27] & 0x02 != 0;
+    let use_buffer = volume.shards[l2p_sid].use_buffer;
 
     // Guard check is done after the L2P shard mutex is taken but
     // before any mutation, so the "guard passed" decision and the
@@ -267,6 +295,12 @@ pub(super) fn apply_l2p_remap(
     // shard; that shard may differ from `new_pba` / `old_pba`'s
     // shards — we acquire all needed refcount shards up front in
     // sorted order to avoid cross-shard deadlock.
+    //
+    // In the B2 buffer path the tree write lock STILL protects against
+    // concurrent compactor cycles on this shard. Per-shard apply
+    // serialisation comes from the apply lane (one worker per shard),
+    // not from this lock. The lock prevents commits from racing the
+    // compactor's `tree.write()` mid-cycle.
     let mut tree = volume.shards[l2p_sid].tree.write();
 
     if let Some((gp, min_rc)) = guard {
@@ -281,7 +315,16 @@ pub(super) fn apply_l2p_remap(
         }
     }
 
-    let cur = tree.get(lba)?;
+    // Read current value: buffer-first when B2 is active, else tree.
+    let cur = if use_buffer {
+        match volume.shards[l2p_sid].l2p_buffer.lookup(lba) {
+            crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
+            crate::db::l2p_buffer::BufferLookup::Tombstone => None,
+            crate::db::l2p_buffer::BufferLookup::Absent => tree.get(lba)?,
+        }
+    } else {
+        tree.get(lba)?
+    };
     if seq_guard_rejects(new_value.seq(), cur.as_ref()) {
         return Ok(ApplyOutcome::L2pRemap {
             applied: false,
@@ -290,8 +333,17 @@ pub(super) fn apply_l2p_remap(
         });
     }
 
-    // Drive L2P mutation now that both guards passed.
-    let prev = tree.insert_at_lsn(lba, new_value, lsn)?;
+    // Drive the mutation. In B2 the prev value we just read IS the
+    // pre-write state — buffer.insert is a swap, so `cur` (read above)
+    // equals what tree.insert_at_lsn would have returned.
+    let prev = if use_buffer {
+        volume.shards[l2p_sid]
+            .l2p_buffer
+            .insert(lba, new_value, lsn);
+        cur
+    } else {
+        tree.insert_at_lsn(lba, new_value, lsn)?
+    };
     let old_pba = prev.map(|p| p.head_pba());
 
     // Snapshot-pin check: does any live snap of `vol_ord` map `lba`
@@ -353,7 +405,13 @@ pub(super) fn apply_l2p_remap(
 
     // Publish here — snap_pins above needed `&mut tree`; below this
     // line the function only touches refcount shards.
-    publish_l2p_read_view(&volume.shards[l2p_sid], &tree);
+    //
+    // B2 path: the compactor will publish on its next cycle, so commit
+    // here only needs to make the buffer entry observable, which
+    // `buffer.insert` did atomically above.
+    if !use_buffer {
+        publish_l2p_read_view(&volume.shards[l2p_sid], &tree);
+    }
 
     // Decision: rc[head_pba] changes only when the tuple is gained /
     // lost from the union of (live ∪ all snaps). `prev != Some(new)`
@@ -560,9 +618,10 @@ pub(super) fn apply_create_volume(
     page_cache: &Arc<PageCache>,
     shard_count: u32,
     metrics: Arc<MetaMetrics>,
+    use_buffer: bool,
 ) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
     let n = validate_shard_count(shard_count)?;
-    create_l2p_shards(page_store.clone(), page_cache.clone(), n, metrics)
+    create_l2p_shards(page_store.clone(), page_cache.clone(), n, metrics, use_buffer)
 }
 
 /// Apply a `DropVolume` op's page-decref cascade. Reuses
@@ -634,6 +693,7 @@ pub(super) fn build_clone_volume_shards(
     page_cache: &Arc<PageCache>,
     created_lsn: Lsn,
     metrics: Arc<MetaMetrics>,
+    use_buffer: bool,
 ) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
     let mut shards = Vec::with_capacity(src_shard_roots.len());
     let mut actual_roots = Vec::with_capacity(src_shard_roots.len());
@@ -663,6 +723,7 @@ pub(super) fn build_clone_volume_shards(
             // flushed yet. Subsequent partial flushes bump it as
             // usual.
             created_lsn,
+            use_buffer,
         ));
     }
     Ok((shards, actual_roots.into_boxed_slice()))

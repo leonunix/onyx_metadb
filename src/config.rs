@@ -191,6 +191,30 @@ pub struct Config {
     /// a huge final batch into the overlay.
     pub refcount_drainer_backpressure_pages: usize,
 
+    /// Enable the B2 in-memory L2P buffer + periodic compaction path.
+    /// When `false` (default), commits mutate the paged radix tree
+    /// in-line (Phase 0 behaviour). When `true`, commits insert into
+    /// the per-shard `L2pBuffer` and a background compactor folds it
+    /// into the tree on its own cadence. See
+    /// [`crate::db::l2p_buffer`] + [`docs/DESIGN.md §B2`].
+    pub l2p_buffer_enabled: bool,
+
+    /// Soft threshold (per-shard active entry count). When
+    /// `active.len()` crosses this, the compactor is woken to run a
+    /// cycle. Default `64_000` ≈ 5 MB/shard at ~80 B/entry.
+    pub l2p_buffer_soft_entries: usize,
+
+    /// Hard threshold (per-shard active entry count). When
+    /// `active.len()` crosses this, commits to that shard block on a
+    /// Condvar until the compactor swaps the active map. Bounds
+    /// peak memory at the cost of brief commit stalls.
+    pub l2p_buffer_hard_entries: usize,
+
+    /// Maximum wall time the compactor may wait between cycles even
+    /// when no entry threshold is crossed. Bounds `checkpoint_lsn`
+    /// lag and WAL retention on idle systems.
+    pub l2p_buffer_max_interval_ms: u64,
+
     /// Run a background L2P streaming writeback worker that continuously
     /// seals dirty pages and writes them through the centralised
     /// `IoSubmitter`, *outside* `apply_gate.write()`. The next `Db::flush`
@@ -346,6 +370,24 @@ impl Config {
             refcount_drainer_max_entries_per_cycle: 65_536,
             refcount_drainer_alloc_run_size: 64,
             refcount_drainer_backpressure_pages: 8_192,
+            // B2 buffer ships default-off. Phase 1 lands the
+            // infrastructure; Phase 3 flips behaviour (commit writes
+            // buffer only); Phase 5 may flip default to true after
+            // nvme-box validation. See
+            // /root/.claude/plans/ticklish-sparking-barto.md.
+            l2p_buffer_enabled: false,
+            // 64 K entries soft trigger ≈ 5 MB / shard. Compactor
+            // wakes when any shard crosses this. Same magnitude as
+            // `refcount_drainer_threshold_entries`.
+            l2p_buffer_soft_entries: 64_000,
+            // 512 K entries hard trigger ≈ 40 MB / shard. Commit
+            // backpressure kicks in past this; bounds peak per-shard
+            // RAM at ~40 MB worst case.
+            l2p_buffer_hard_entries: 512_000,
+            // 30 s wall-clock floor — even on an idle system the
+            // compactor will fire at least this often so
+            // `checkpoint_lsn` and WAL retention don't drift.
+            l2p_buffer_max_interval_ms: 30_000,
             // Streaming writeback ships default-off in this generic
             // `Config::new` so unit tests that assert on page-allocator
             // / snapshot state observe a quiescent backend (no

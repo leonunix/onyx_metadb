@@ -218,6 +218,7 @@ pub(super) fn make_l2p_shard(
     shard_idx: usize,
     metrics: Arc<MetaMetrics>,
     initial_last_flushed_lsn: Lsn,
+    use_buffer: bool,
 ) -> L2pShard {
     let view = crate::paged::ReadView::new(
         tree.root(),
@@ -231,6 +232,8 @@ pub(super) fn make_l2p_shard(
         active_readers: std::sync::atomic::AtomicUsize::new(0),
         apply_lane: ApplyLane::new(0, ApplyLaneKind::L2p, shard_idx, metrics),
         last_flushed_lsn: AtomicU64::new(initial_last_flushed_lsn),
+        l2p_buffer: Arc::new(crate::db::l2p_buffer::L2pBuffer::new(initial_last_flushed_lsn)),
+        use_buffer,
     }
 }
 
@@ -239,6 +242,7 @@ pub(super) fn create_l2p_shards(
     page_cache: Arc<PageCache>,
     shard_count: usize,
     metrics: Arc<MetaMetrics>,
+    use_buffer: bool,
 ) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
     let mut shards = Vec::with_capacity(shard_count);
     let mut roots = Vec::with_capacity(shard_count);
@@ -251,6 +255,7 @@ pub(super) fn create_l2p_shards(
             shard_idx,
             metrics.clone(),
             0,
+            use_buffer,
         ));
     }
     Ok((shards, roots.into_boxed_slice()))
@@ -263,6 +268,7 @@ pub(super) fn open_l2p_shards(
     next_gen: Lsn,
     metrics: Arc<MetaMetrics>,
     initial_last_flushed_lsn: Lsn,
+    use_buffer: bool,
 ) -> Result<Vec<L2pShard>> {
     let mut shards = Vec::with_capacity(roots.len());
     for (shard_idx, &root) in roots.iter().enumerate() {
@@ -274,6 +280,7 @@ pub(super) fn open_l2p_shards(
             shard_idx,
             metrics.clone(),
             initial_last_flushed_lsn,
+            use_buffer,
         ));
     }
     Ok(shards)

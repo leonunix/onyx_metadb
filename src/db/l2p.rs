@@ -99,7 +99,35 @@ impl Db {
             self.metrics
                 .record_l2p_multi_get_view(view_started.elapsed());
             let walk_started = std::time::Instant::now();
-            view.multi_get_into(lbas, &order[start..end], out)?;
+            if volume.shards[sid].use_buffer {
+                // B2: buffer-first per LBA in this shard's batch.
+                // Tombstones suppress the tree walk; Present fills in;
+                // Absent falls through to a batched tree.multi_get_into
+                // on the remaining indices.
+                let buffer = &volume.shards[sid].l2p_buffer;
+                let mut tree_indices: Vec<usize> = Vec::with_capacity(end - start);
+                for &idx in &order[start..end] {
+                    match buffer.lookup(lbas[idx]) {
+                        crate::db::l2p_buffer::BufferLookup::Present(v) => {
+                            out[idx] = Some(v);
+                            self.metrics.record_l2p_buffer_lookup_hit();
+                        }
+                        crate::db::l2p_buffer::BufferLookup::Tombstone => {
+                            out[idx] = None;
+                            self.metrics.record_l2p_buffer_lookup_hit();
+                        }
+                        crate::db::l2p_buffer::BufferLookup::Absent => {
+                            tree_indices.push(idx);
+                            self.metrics.record_l2p_buffer_lookup_miss();
+                        }
+                    }
+                }
+                if !tree_indices.is_empty() {
+                    view.multi_get_into(lbas, &tree_indices, out)?;
+                }
+            } else {
+                view.multi_get_into(lbas, &order[start..end], out)?;
+            }
             let tree_walk = walk_started.elapsed();
             self.metrics.record_l2p_multi_get_tree(tree_walk);
             // `pin_wait` is recorded once per shard so the metric's
@@ -123,7 +151,25 @@ impl Db {
         let pin_wait = pin_started.elapsed();
         let volume = self.volume(vol_ord)?;
         let sid = shard_for_key_l2p(&volume.shards, lba);
-        let (view, _active_read) = acquire_l2p_read_view(&volume.shards[sid]);
+        let shard = &volume.shards[sid];
+        if shard.use_buffer {
+            match shard.l2p_buffer.lookup(lba) {
+                crate::db::l2p_buffer::BufferLookup::Present(v) => {
+                    self.metrics.record_l2p_buffer_lookup_hit();
+                    self.metrics.record_l2p_get(pin_wait, Duration::ZERO);
+                    return Ok(Some(v));
+                }
+                crate::db::l2p_buffer::BufferLookup::Tombstone => {
+                    self.metrics.record_l2p_buffer_lookup_hit();
+                    self.metrics.record_l2p_get(pin_wait, Duration::ZERO);
+                    return Ok(None);
+                }
+                crate::db::l2p_buffer::BufferLookup::Absent => {
+                    self.metrics.record_l2p_buffer_lookup_miss();
+                }
+            }
+        }
+        let (view, _active_read) = acquire_l2p_read_view(shard);
         let walk_started = std::time::Instant::now();
         let result = view.get(lba);
         let tree_walk = walk_started.elapsed();

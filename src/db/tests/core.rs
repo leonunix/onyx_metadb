@@ -265,4 +265,112 @@ fn multiple_snapshots_isolated() {
     assert_eq!(db.get(0, 5).unwrap(), Some(v(3)));
 }
 
+// -------- B2: L2P buffer + periodic compaction --------
+
+fn mk_db_with_buffer() -> (TempDir, Db) {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    // Use a very small soft trigger so the compactor runs frequently
+    // in tests, exercising swap → apply → publish quickly.
+    cfg.l2p_buffer_soft_entries = 4;
+    cfg.l2p_buffer_max_interval_ms = 50;
+    let db = Db::create_with_config(cfg).unwrap();
+    (dir, db)
+}
+
+#[test]
+fn b2_buffer_insert_visible_to_get() {
+    let (_d, db) = mk_db_with_buffer();
+    db.insert(0, 10, v(7)).unwrap();
+    assert_eq!(db.get(0, 10).unwrap(), Some(v(7)));
+}
+
+#[test]
+fn b2_buffer_overwrite_visible_to_get() {
+    let (_d, db) = mk_db_with_buffer();
+    db.insert(0, 10, v(7)).unwrap();
+    db.insert(0, 10, v(8)).unwrap();
+    assert_eq!(db.get(0, 10).unwrap(), Some(v(8)));
+}
+
+#[test]
+fn b2_buffer_delete_visible_to_get() {
+    let (_d, db) = mk_db_with_buffer();
+    db.insert(0, 10, v(7)).unwrap();
+    db.delete(0, 10).unwrap();
+    assert_eq!(db.get(0, 10).unwrap(), None);
+}
+
+#[test]
+fn b2_buffer_multi_get_partial_buffer_partial_tree() {
+    let (_d, db) = mk_db_with_buffer();
+    // Insert 200 entries (well above soft threshold of 4) so the
+    // compactor will fold some into the tree while the most recent
+    // ones may still live in the buffer.
+    for i in 0u64..200 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    let mut keys: Vec<u64> = (0..200).collect();
+    keys.reverse();
+    let values = db.multi_get(0, &keys).unwrap();
+    for (i, key) in keys.iter().enumerate() {
+        assert_eq!(values[i], Some(v(*key as u8)));
+    }
+}
+
+#[test]
+fn b2_buffer_flush_then_get_consistent() {
+    let (_d, db) = mk_db_with_buffer();
+    for i in 0u64..50 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    for i in 0u64..50 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v(i as u8)));
+    }
+}
+
+#[test]
+fn b2_buffer_flush_reopen_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.l2p_buffer_soft_entries = 4;
+    cfg.l2p_buffer_max_interval_ms = 50;
+    {
+        let db = Db::create_with_config(cfg.clone()).unwrap();
+        for i in 0u64..100 {
+            db.insert(0, i, v(i as u8)).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let db = Db::open_with_config(cfg).unwrap();
+    for i in 0u64..100 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v(i as u8)));
+    }
+}
+
+#[test]
+fn b2_buffer_no_flush_reopen_replays_from_wal() {
+    // Skip the explicit flush so the buffer's contents are
+    // recreated only from WAL replay on reopen.
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.l2p_buffer_soft_entries = 4;
+    cfg.l2p_buffer_max_interval_ms = 50;
+    {
+        let db = Db::create_with_config(cfg.clone()).unwrap();
+        for i in 0u64..30 {
+            db.insert(0, i, v(i as u8)).unwrap();
+        }
+        // No flush — close while buffer may still hold entries.
+    }
+    let db = Db::open_with_config(cfg).unwrap();
+    for i in 0u64..30 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v(i as u8)));
+    }
+}
+
 // -------- phase 7 commit 8: volume lifecycle --------

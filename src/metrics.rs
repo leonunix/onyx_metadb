@@ -427,6 +427,18 @@ pub struct MetaMetrics {
     async_reclaim_reclaimed_pages: AtomicU64,
     async_reclaim_cycle_us: AtomicU64,
     async_reclaim_cycle_max_us: AtomicU64,
+    // B2 L2P buffer (default-off). When enabled, commits insert into
+    // an in-memory hashmap and a background compactor periodically
+    // folds it into the paged radix tree. These counters are summed
+    // across shards.
+    l2p_buffer_active_entries: AtomicU64,
+    l2p_buffer_compaction_cycles: AtomicU64,
+    l2p_buffer_compaction_entries: AtomicU64,
+    l2p_buffer_compaction_us: AtomicU64,
+    l2p_buffer_compaction_max_us: AtomicU64,
+    l2p_buffer_lookup_hits: AtomicU64,
+    l2p_buffer_lookup_misses_to_tree: AtomicU64,
+    l2p_buffer_backpressure_blocks: AtomicU64,
     // Sample-phase workload size. Together with `flush_calls`, these
     // let dashboards compute per-flush averages and watch trajectories
     // of the dirty / drained / freshly-allocated counts that drive the
@@ -865,6 +877,14 @@ pub struct MetaMetricsSnapshot {
     pub async_reclaim_reclaimed_pages: u64,
     pub async_reclaim_cycle_us: u64,
     pub async_reclaim_cycle_max_us: u64,
+    pub l2p_buffer_active_entries: u64,
+    pub l2p_buffer_compaction_cycles: u64,
+    pub l2p_buffer_compaction_entries: u64,
+    pub l2p_buffer_compaction_us: u64,
+    pub l2p_buffer_compaction_max_us: u64,
+    pub l2p_buffer_lookup_hits: u64,
+    pub l2p_buffer_lookup_misses_to_tree: u64,
+    pub l2p_buffer_backpressure_blocks: u64,
     pub flush_sample_l2p_dirty_pages: u64,
     pub flush_sample_l2p_dirty_pages_max: u64,
     pub flush_sample_rc_drained_deltas: u64,
@@ -1265,6 +1285,14 @@ impl MetaMetrics {
             async_reclaim_reclaimed_pages: load(&self.async_reclaim_reclaimed_pages),
             async_reclaim_cycle_us: load(&self.async_reclaim_cycle_us),
             async_reclaim_cycle_max_us: load(&self.async_reclaim_cycle_max_us),
+            l2p_buffer_active_entries: load(&self.l2p_buffer_active_entries),
+            l2p_buffer_compaction_cycles: load(&self.l2p_buffer_compaction_cycles),
+            l2p_buffer_compaction_entries: load(&self.l2p_buffer_compaction_entries),
+            l2p_buffer_compaction_us: load(&self.l2p_buffer_compaction_us),
+            l2p_buffer_compaction_max_us: load(&self.l2p_buffer_compaction_max_us),
+            l2p_buffer_lookup_hits: load(&self.l2p_buffer_lookup_hits),
+            l2p_buffer_lookup_misses_to_tree: load(&self.l2p_buffer_lookup_misses_to_tree),
+            l2p_buffer_backpressure_blocks: load(&self.l2p_buffer_backpressure_blocks),
             flush_sample_l2p_dirty_pages: load(&self.flush_sample_l2p_dirty_pages),
             flush_sample_l2p_dirty_pages_max: load(&self.flush_sample_l2p_dirty_pages_max),
             flush_sample_rc_drained_deltas: load(&self.flush_sample_rc_drained_deltas),
@@ -1639,6 +1667,30 @@ impl MetaMetrics {
             &self.async_reclaim_cycle_max_us,
             elapsed,
         );
+    }
+
+    /// One L2P buffer compaction cycle completed. `entries` is the
+    /// number of `(lba, value, lsn)` tuples drained from the
+    /// `draining` slot into the paged radix tree on this shard cycle.
+    pub(crate) fn record_l2p_buffer_compaction(&self, entries: usize, elapsed: Duration) {
+        self.l2p_buffer_compaction_cycles
+            .fetch_add(1, Ordering::Relaxed);
+        self.l2p_buffer_compaction_entries
+            .fetch_add(entries as u64, Ordering::Relaxed);
+        record_duration(
+            &self.l2p_buffer_compaction_us,
+            &self.l2p_buffer_compaction_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_l2p_buffer_lookup_hit(&self) {
+        self.l2p_buffer_lookup_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_l2p_buffer_lookup_miss(&self) {
+        self.l2p_buffer_lookup_misses_to_tree
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// One refcount drainer cycle completed. `entries`/`pages` are the

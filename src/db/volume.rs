@@ -73,6 +73,7 @@ impl Db {
             &self.page_cache,
             shard_count,
             self.metrics.clone(),
+            self.l2p_buffer_enabled,
         )?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
@@ -406,6 +407,7 @@ impl Db {
             &self.page_cache,
             lsn,
             self.metrics.clone(),
+            self.l2p_buffer_enabled,
         )?;
         let shard_count = shards.len() as u32;
 
