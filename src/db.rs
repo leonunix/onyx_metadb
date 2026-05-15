@@ -264,6 +264,12 @@ pub struct PendingState {
     pub rc_retired_pages: usize,
     pub rc_pagebuf_total: usize,
     pub rc_pagebuf_dirty: usize,
+    /// Sum of `RcShard::pending_delta_count` across all shards. This
+    /// is the work the next flush sample phase will drain, so the
+    /// watermark thread uses it (alongside `l2p_pagebuf_dirty`) to
+    /// threshold-trigger a checkpoint before the queue grows large
+    /// enough to dominate `flush_sample_us`.
+    pub rc_pending_deltas: usize,
 }
 
 #[derive(Clone, Copy)]

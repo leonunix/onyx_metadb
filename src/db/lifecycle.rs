@@ -981,6 +981,7 @@ impl Db {
         let rc_retired_pages = 0usize;
         let rc_pagebuf_total = 0usize;
         let rc_pagebuf_dirty = 0usize;
+        let mut rc_pending_deltas = 0usize;
         for shard in &self.refcount_shards {
             rc_apply_queue += shard.apply_lane.queue_len();
             // Paged-array refcount has no COW / private / retired
@@ -989,6 +990,7 @@ impl Db {
             // still sees a "how big is this shard" gauge; the other
             // BTree-specific dials stay zero.
             rc_private_pages += shard.rc.allocated_data_pages();
+            rc_pending_deltas += shard.rc.pending_delta_count();
         }
         PendingState {
             dispatch_pending,
@@ -1004,7 +1006,20 @@ impl Db {
             rc_retired_pages,
             rc_pagebuf_total,
             rc_pagebuf_dirty,
+            rc_pending_deltas,
         }
+    }
+
+    /// Estimated total dirty work the next flush sample would have
+    /// to drain: L2P dirty page buffer + in-memory RC deltas. Used
+    /// by the watermark thread to decide whether to trigger an early
+    /// checkpoint ahead of the periodic 1s tick, capping single-flush
+    /// sample/IO cost.
+    pub fn dirty_pages_estimate(&self) -> usize {
+        let pending = self.pending_state();
+        pending
+            .l2p_pagebuf_dirty
+            .saturating_add(pending.rc_pending_deltas)
     }
 
     pub fn metrics_json(&self) -> String {

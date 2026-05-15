@@ -797,6 +797,22 @@ impl RcShard {
     pub fn allocated_data_pages(&self) -> usize {
         self.array.allocated_data_pages()
     }
+
+    /// Best-effort count of in-memory rc deltas awaiting a checkpoint
+    /// drain. Used by the watermark thread to threshold-trigger
+    /// `try_flush` so a single sample doesn't accumulate millions of
+    /// deltas (sample_max scales linearly with this count — see
+    /// [[parallel-rc-drain-landed]]).
+    ///
+    /// `try_lock` rather than `lock` so a slow shard doesn't stall
+    /// the diag/watermark path; an undercounted shard just means
+    /// the trigger lags by one tick.
+    pub fn pending_delta_count(&self) -> usize {
+        self.delta_active
+            .try_lock()
+            .map(|d| d.len())
+            .unwrap_or(0)
+    }
 }
 
 impl Drop for RcShard {
