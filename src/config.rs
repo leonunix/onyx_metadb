@@ -237,6 +237,26 @@ pub struct Config {
     /// `min(per-shard last_flushed_lsn)` so WAL prune / recovery
     /// remain correct even when most flushes are partial.
     pub flush_select_budget: usize,
+
+    /// Run `page_store.try_reclaim_limit` + page-cache invalidation
+    /// in a background worker instead of inline at the end of
+    /// `flush_with_gate`. The worker drains `deferred_free` in
+    /// `async_reclaim_max_pages_per_cycle`-sized chunks, woken by
+    /// every successful flush. Off-critical-path reclaim removes
+    /// the dominant ~35% slice of `flush_total_max` so the
+    /// dispatcher can fire the next flush sooner.
+    pub async_reclaim_enabled: bool,
+    /// Worker per-cycle cap (pages). Larger reduces per-page
+    /// overhead at the cost of longer per-cycle NVMe burst; smaller
+    /// smooths the queue at the cost of more cycles. The default is
+    /// tuned for the same NVMe profile that drove the in-line
+    /// reclaim budget heuristic.
+    pub async_reclaim_max_pages_per_cycle: usize,
+    /// Max milliseconds the worker parks when `deferred_free` is
+    /// empty. Notifications from `flush_with_gate` cut this short
+    /// via a condvar, so under load the worker stays hot and only
+    /// hits this on truly idle systems.
+    pub async_reclaim_idle_interval_ms: u64,
 }
 
 impl Config {
@@ -275,6 +295,34 @@ impl Config {
             // the same budget so the early trigger and the per-flush
             // cap stay aligned by default.
             flush_select_budget: 100_000,
+            // Async reclaim defaults OFF. 2026-05-15 nvme-box A/B
+            // showed two failure modes — neither version delivered
+            // a usable win:
+            //   v1 (tight-loop worker): correctness preserved but
+            //   the worker continuously consumes NVMe bandwidth for
+            //   zero-stamped Free page writes + punch_hole, starving
+            //   foreground flush IO. READ IOPS -26 % vs the
+            //   threshold-only baseline; io_max went 27 s → 67 s.
+            //   v2 (one-cycle-per-notify worker): NVMe contention
+            //   gone but introduced 72 967 `refcount underflow` /
+            //   `rc.stage failed` errors within the first 15 s of
+            //   the run. Decoupling reclaim cadence from flush
+            //   cadence breaks an invariant somewhere in the
+            //   page_store + L2P remap path (root cause not
+            //   pinned down — see `async_reclaim_underflow`
+            //   memory). The infrastructure is left in tree for
+            //   future investigation; do NOT enable until the
+            //   underflow is understood.
+            async_reclaim_enabled: false,
+            // 65 536 pages = 256 MiB per cycle. Caps single-cycle
+            // NVMe burst while still amortising the per-page
+            // overhead (lock + zero-write + cache invalidate).
+            async_reclaim_max_pages_per_cycle: 65_536,
+            // 50 ms idle parking: short enough that a quiet system
+            // still drains `deferred_free` within ~50 ms after the
+            // last flush even if `notify()` was missed; long
+            // enough not to busy-loop on otherwise-idle pages.
+            async_reclaim_idle_interval_ms: 50,
             rebuild_free_list_on_open: true,
             reclaim_orphans_on_open: true,
             // 1 M buckets × 4 entries = 4 M cuckoo capacity at load

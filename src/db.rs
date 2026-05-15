@@ -213,6 +213,12 @@ pub struct Db {
     /// flush sample. Zero disables partial sampling (every flush is
     /// a full sample). See `Config::flush_select_budget`.
     flush_select_budget: usize,
+    /// Background worker that drains `page_store.deferred_free`.
+    /// `None` when async reclaim is disabled (config knob) — in
+    /// that case `flush_with_gate` falls back to in-line reclaim.
+    /// Wrapped in `Mutex` so `Drop` can take + stop the worker
+    /// even from a `&self` context.
+    async_reclaim: Mutex<Option<async_reclaim::AsyncReclaim>>,
 }
 
 struct ManifestState {
@@ -922,6 +928,7 @@ fn ref_bound(bound: &Bound<u64>) -> Bound<&u64> {
 }
 
 mod apply;
+mod async_reclaim;
 mod commit;
 mod helpers;
 mod indexes;
@@ -946,6 +953,13 @@ impl Drop for Db {
         // call is in flight when those fields go away.
         if let Some(mut flusher) = self.l2p_writeback.lock().take() {
             flusher.stop();
+        }
+        // Stop the async reclaim worker before page_store /
+        // page_cache go away. It holds `Arc<PageStore>` +
+        // `Arc<PageCache>` clones; join it here so the page-store
+        // teardown doesn't race against in-flight reclaim writes.
+        if let Some(mut worker) = self.async_reclaim.lock().take() {
+            worker.stop();
         }
         // Detach refcount drainers (priority 3) BEFORE the
         // refcount_shards Box drops. Each drainer worker holds an

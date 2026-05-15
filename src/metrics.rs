@@ -419,6 +419,14 @@ pub struct MetaMetrics {
     flush_reclaim_selected_pages: AtomicU64,
     flush_reclaim_reclaimed_pages: AtomicU64,
     flush_reclaim_blocked_pages: AtomicU64,
+    // Background reclaim worker (default-on). Same physical work
+    // as the old in-line `flush_with_gate` reclaim, just off the
+    // critical path.
+    async_reclaim_cycles: AtomicU64,
+    async_reclaim_selected_pages: AtomicU64,
+    async_reclaim_reclaimed_pages: AtomicU64,
+    async_reclaim_cycle_us: AtomicU64,
+    async_reclaim_cycle_max_us: AtomicU64,
     // Sample-phase workload size. Together with `flush_calls`, these
     // let dashboards compute per-flush averages and watch trajectories
     // of the dirty / drained / freshly-allocated counts that drive the
@@ -852,6 +860,11 @@ pub struct MetaMetricsSnapshot {
     pub flush_reclaim_selected_pages: u64,
     pub flush_reclaim_reclaimed_pages: u64,
     pub flush_reclaim_blocked_pages: u64,
+    pub async_reclaim_cycles: u64,
+    pub async_reclaim_selected_pages: u64,
+    pub async_reclaim_reclaimed_pages: u64,
+    pub async_reclaim_cycle_us: u64,
+    pub async_reclaim_cycle_max_us: u64,
     pub flush_sample_l2p_dirty_pages: u64,
     pub flush_sample_l2p_dirty_pages_max: u64,
     pub flush_sample_rc_drained_deltas: u64,
@@ -1247,6 +1260,11 @@ impl MetaMetrics {
             flush_reclaim_selected_pages: load(&self.flush_reclaim_selected_pages),
             flush_reclaim_reclaimed_pages: load(&self.flush_reclaim_reclaimed_pages),
             flush_reclaim_blocked_pages: load(&self.flush_reclaim_blocked_pages),
+            async_reclaim_cycles: load(&self.async_reclaim_cycles),
+            async_reclaim_selected_pages: load(&self.async_reclaim_selected_pages),
+            async_reclaim_reclaimed_pages: load(&self.async_reclaim_reclaimed_pages),
+            async_reclaim_cycle_us: load(&self.async_reclaim_cycle_us),
+            async_reclaim_cycle_max_us: load(&self.async_reclaim_cycle_max_us),
             flush_sample_l2p_dirty_pages: load(&self.flush_sample_l2p_dirty_pages),
             flush_sample_l2p_dirty_pages_max: load(&self.flush_sample_l2p_dirty_pages_max),
             flush_sample_rc_drained_deltas: load(&self.flush_sample_rc_drained_deltas),
@@ -1597,6 +1615,30 @@ impl MetaMetrics {
             .fetch_add(reclaimed as u64, Ordering::Relaxed);
         self.flush_reclaim_blocked_pages
             .fetch_add(blocked as u64, Ordering::Relaxed);
+    }
+
+    /// One background reclaim cycle completed. `selected` /
+    /// `reclaimed` are the counts returned by the page store;
+    /// `elapsed` is the wall-time of the worker iteration. Tracks
+    /// the cost we moved off the `flush_with_gate` critical path
+    /// — `async_reclaim_cycle_max_us` is what `flush_reclaim_max_us`
+    /// used to be, just on a background thread.
+    pub(crate) fn record_async_reclaim_cycle(
+        &self,
+        selected: usize,
+        reclaimed: usize,
+        elapsed: Duration,
+    ) {
+        self.async_reclaim_cycles.fetch_add(1, Ordering::Relaxed);
+        self.async_reclaim_selected_pages
+            .fetch_add(selected as u64, Ordering::Relaxed);
+        self.async_reclaim_reclaimed_pages
+            .fetch_add(reclaimed as u64, Ordering::Relaxed);
+        record_duration(
+            &self.async_reclaim_cycle_us,
+            &self.async_reclaim_cycle_max_us,
+            elapsed,
+        );
     }
 
     /// One refcount drainer cycle completed. `entries`/`pages` are the

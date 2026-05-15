@@ -362,6 +362,11 @@ impl Db {
             min_dirty_pages: cfg.l2p_writeback_min_dirty_pages,
             max_pages_per_cycle: cfg.l2p_writeback_max_pages_per_cycle,
         };
+        let async_reclaim_enabled = cfg.async_reclaim_enabled;
+        let async_reclaim_params = super::async_reclaim::AsyncReclaimParams {
+            max_pages_per_cycle: cfg.async_reclaim_max_pages_per_cycle,
+            idle_interval_ms: cfg.async_reclaim_idle_interval_ms,
+        };
         let dedup_lanes = build_dedup_lanes(
             0,
             dedup_shards as usize,
@@ -408,6 +413,7 @@ impl Db {
             l2p_writeback: Mutex::new(None),
             flush_cursor: AtomicUsize::new(0),
             flush_select_budget: cfg.flush_select_budget,
+            async_reclaim: Mutex::new(None),
         };
         // Spawn refcount drainers (priority 3) — fresh DB has no
         // replay to worry about, so we can spawn unconditionally
@@ -432,6 +438,11 @@ impl Db {
                 writeback_params,
             );
             *db.l2p_writeback.lock() = Some(flusher);
+        }
+        // Spawn the async reclaim worker. Drop will stop it before
+        // `page_store` / `page_cache` are torn down.
+        if async_reclaim_enabled {
+            db.start_async_reclaim(async_reclaim_params);
         }
         Ok(db)
     }
@@ -832,6 +843,11 @@ impl Db {
             min_dirty_pages: cfg.l2p_writeback_min_dirty_pages,
             max_pages_per_cycle: cfg.l2p_writeback_max_pages_per_cycle,
         };
+        let async_reclaim_enabled = cfg.async_reclaim_enabled;
+        let async_reclaim_params = super::async_reclaim::AsyncReclaimParams {
+            max_pages_per_cycle: cfg.async_reclaim_max_pages_per_cycle,
+            idle_interval_ms: cfg.async_reclaim_idle_interval_ms,
+        };
         let dedup_lanes = build_dedup_lanes(
             last_applied,
             manifest_dedup_shards,
@@ -879,6 +895,7 @@ impl Db {
             l2p_writeback: Mutex::new(None),
             flush_cursor: AtomicUsize::new(0),
             flush_select_budget: cfg.flush_select_budget,
+            async_reclaim: Mutex::new(None),
         };
         db.recompute_all_snap_infos();
         // Spawn refcount drainers AFTER WAL replay finished above so
@@ -903,7 +920,44 @@ impl Db {
             );
             *db.l2p_writeback.lock() = Some(flusher);
         }
+        // Spawn the async reclaim worker AFTER WAL replay so the
+        // reclaim epoch state reflects the post-replay shard
+        // visibility. Drop joins it before page_store teardown.
+        if async_reclaim_enabled {
+            db.start_async_reclaim(async_reclaim_params);
+        }
         Ok(db)
+    }
+
+    /// Start the background reclaim worker. Caller (`Db::create`
+    /// / `Db::open`) checks `cfg.async_reclaim_enabled` before
+    /// invoking; this method assumes the knob was true so it can
+    /// stay on `&self` without re-reading config.
+    fn start_async_reclaim(&self, params: super::async_reclaim::AsyncReclaimParams) {
+        let worker = super::async_reclaim::AsyncReclaim::start(
+            self.page_store.clone(),
+            self.page_cache.clone(),
+            self.metrics.clone(),
+            params,
+        );
+        *self.async_reclaim.lock() = Some(worker);
+    }
+
+    /// Wake the background reclaim worker (if any). Called from
+    /// `flush_with_gate` once a flush makes new
+    /// `deferred_free` entries safe to reclaim. Idempotent — the
+    /// worker condvar coalesces multiple notifications.
+    fn notify_async_reclaim(&self) {
+        if let Some(worker) = &*self.async_reclaim.lock() {
+            worker.notify();
+        }
+    }
+
+    /// True iff the background reclaim worker is active. Used by
+    /// `flush_with_gate` to decide between inline and async
+    /// reclaim paths.
+    fn async_reclaim_active(&self) -> bool {
+        self.async_reclaim.lock().is_some()
     }
 
     /// Current cached manifest (as of the last durable manifest commit).
@@ -1880,31 +1934,50 @@ impl Db {
 
         let reclaim_started = std::time::Instant::now();
         let deferred_before = self.page_store.deferred_free_len();
-        let reclaim_budget = flush_reclaim_budget(deferred_before, total_pages_written);
-        let reclaim_outcome = self.reclaim_freed_pages_budget(reclaim_budget)?;
-        crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
-        let deferred_after = self.page_store.deferred_free_len();
-        let blocked = reclaim_budget
-            .min(deferred_before)
-            .saturating_sub(reclaim_outcome.selected);
-        self.metrics.record_flush_reclaim_pages(
-            reclaim_budget,
-            reclaim_outcome.selected,
-            reclaim_outcome.reclaimed.len(),
-            blocked,
-        );
-        if deferred_before >= 1_048_576
-            && reclaim_outcome.selected < (reclaim_budget / 4).min(deferred_before)
-        {
-            tracing::debug!(
-                deferred_before,
-                deferred_after,
+        if self.async_reclaim_active() {
+            // Background worker owns the actual reclaim. Just
+            // wake it; the wall-time recorded under
+            // `flush_reclaim_max_us` becomes the notify cost (µs)
+            // and the real reclaim cost is tracked under
+            // `async_reclaim_cycle_max_us` in the worker. This
+            // removes the ~35 % slice of `flush_total_max` that
+            // the inline reclaim used to own — the dispatcher
+            // can fire the next flush as soon as WAL prune
+            // returns.
+            self.notify_async_reclaim();
+            // WAL prune is fast (file removal) and depends on
+            // `wal_checkpoint`, which this flush just made
+            // durable via the manifest commit. Keep it inline so
+            // recovery's replay-from-`checkpoint_lsn` doesn't
+            // chase stale segments.
+            crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
+        } else {
+            let reclaim_budget = flush_reclaim_budget(deferred_before, total_pages_written);
+            let reclaim_outcome = self.reclaim_freed_pages_budget(reclaim_budget)?;
+            crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
+            let deferred_after = self.page_store.deferred_free_len();
+            let blocked = reclaim_budget
+                .min(deferred_before)
+                .saturating_sub(reclaim_outcome.selected);
+            self.metrics.record_flush_reclaim_pages(
                 reclaim_budget,
-                selected = reclaim_outcome.selected,
-                reclaimed = reclaim_outcome.reclaimed.len(),
-                safe_below = reclaim_outcome.safe_below,
-                "metadb: reclaim selected few pages under backlog"
+                reclaim_outcome.selected,
+                reclaim_outcome.reclaimed.len(),
+                blocked,
             );
+            if deferred_before >= 1_048_576
+                && reclaim_outcome.selected < (reclaim_budget / 4).min(deferred_before)
+            {
+                tracing::debug!(
+                    deferred_before,
+                    deferred_after,
+                    reclaim_budget,
+                    selected = reclaim_outcome.selected,
+                    reclaimed = reclaim_outcome.reclaimed.len(),
+                    safe_below = reclaim_outcome.safe_below,
+                    "metadb: reclaim selected few pages under backlog"
+                );
+            }
         }
         self.metrics.record_flush_reclaim(reclaim_started.elapsed());
         self.metrics
