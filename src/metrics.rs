@@ -388,6 +388,16 @@ pub struct MetaMetrics {
     flush_sample_max_us_steady: AtomicU64,
     flush_sample_us_forced: AtomicU64,
     flush_sample_max_us_forced: AtomicU64,
+    // Sample-phase sub-breakdown (kind-agnostic). All three regions
+    // run under `apply_gate.write()` so their sum is the gate hold
+    // time. Use the trio to locate which region dominates a tail
+    // sample: lock-acquire wait vs L2P dirty-set walk vs RC delta drain.
+    flush_sample_lock_us: AtomicU64,
+    flush_sample_lock_max_us: AtomicU64,
+    flush_sample_l2p_walk_us: AtomicU64,
+    flush_sample_l2p_walk_max_us: AtomicU64,
+    flush_sample_rc_drain_us: AtomicU64,
+    flush_sample_rc_drain_max_us: AtomicU64,
     flush_io_us: AtomicU64,
     flush_io_max_us: AtomicU64,
     flush_io_seal_us: AtomicU64,
@@ -815,6 +825,12 @@ pub struct MetaMetricsSnapshot {
     pub flush_sample_max_us_steady: u64,
     pub flush_sample_us_forced: u64,
     pub flush_sample_max_us_forced: u64,
+    pub flush_sample_lock_us: u64,
+    pub flush_sample_lock_max_us: u64,
+    pub flush_sample_l2p_walk_us: u64,
+    pub flush_sample_l2p_walk_max_us: u64,
+    pub flush_sample_rc_drain_us: u64,
+    pub flush_sample_rc_drain_max_us: u64,
     pub flush_io_us: u64,
     pub flush_io_max_us: u64,
     pub flush_io_seal_us: u64,
@@ -1204,6 +1220,12 @@ impl MetaMetrics {
             flush_sample_max_us_steady: load(&self.flush_sample_max_us_steady),
             flush_sample_us_forced: load(&self.flush_sample_us_forced),
             flush_sample_max_us_forced: load(&self.flush_sample_max_us_forced),
+            flush_sample_lock_us: load(&self.flush_sample_lock_us),
+            flush_sample_lock_max_us: load(&self.flush_sample_lock_max_us),
+            flush_sample_l2p_walk_us: load(&self.flush_sample_l2p_walk_us),
+            flush_sample_l2p_walk_max_us: load(&self.flush_sample_l2p_walk_max_us),
+            flush_sample_rc_drain_us: load(&self.flush_sample_rc_drain_us),
+            flush_sample_rc_drain_max_us: load(&self.flush_sample_rc_drain_max_us),
             flush_io_us: load(&self.flush_io_us),
             flush_io_max_us: load(&self.flush_io_max_us),
             flush_io_seal_us: load(&self.flush_io_seal_us),
@@ -1328,6 +1350,36 @@ impl MetaMetrics {
             ),
         };
         record_duration(us_slot, max_slot, elapsed);
+    }
+
+    /// Sample-phase sub-breakdown. `lock` is the time waiting for every
+    /// L2P shard write lock; `l2p_walk` is the dirty-set snapshot loop
+    /// over all `(volume, shard)` pairs; `rc_drain` is the per-shard
+    /// `RcShard::begin_checkpoint` loop. All three add up to
+    /// `flush_sample_us` (modulo a few ns of timer overhead); a sum that
+    /// diverges by more than that means the instrumentation is missing
+    /// a region.
+    pub(crate) fn record_flush_sample_breakdown(
+        &self,
+        lock: Duration,
+        l2p_walk: Duration,
+        rc_drain: Duration,
+    ) {
+        record_duration(
+            &self.flush_sample_lock_us,
+            &self.flush_sample_lock_max_us,
+            lock,
+        );
+        record_duration(
+            &self.flush_sample_l2p_walk_us,
+            &self.flush_sample_l2p_walk_max_us,
+            l2p_walk,
+        );
+        record_duration(
+            &self.flush_sample_rc_drain_us,
+            &self.flush_sample_rc_drain_max_us,
+            rc_drain,
+        );
     }
 
     /// Record sample-phase workload size for one flush. Called from the

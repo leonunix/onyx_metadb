@@ -1178,9 +1178,12 @@ impl Db {
         };
         let sample_started = std::time::Instant::now();
         let volumes = self.volumes_snapshot();
+        let lock_started = std::time::Instant::now();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
+        let lock_elapsed = lock_started.elapsed();
         let tree_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
         let wal_checkpoint = *self.last_applied_lsn.lock();
+        let l2p_walk_started = std::time::Instant::now();
         let mut l2p_checkpoints = Vec::with_capacity(volumes.len());
         for volume in &volumes {
             let mut checkpoints = Vec::with_capacity(volume.shards.len());
@@ -1189,9 +1192,11 @@ impl Db {
             }
             l2p_checkpoints.push(checkpoints);
         }
+        let l2p_walk_elapsed = l2p_walk_started.elapsed();
         // Refcount sample: drain delta + stage sealed pages in memory.
         // No disk IO under the gate. Meta-chain rewrite + page writes
         // happen in the IO phase below; install runs post-manifest.
+        let rc_drain_started = std::time::Instant::now();
         let mut refcount_checkpoints: Vec<crate::refcount::shard::RcCheckpoint> =
             Vec::with_capacity(self.refcount_shards.len());
         let mut sample_err: Option<MetaDbError> = None;
@@ -1204,10 +1209,16 @@ impl Db {
                 }
             }
         }
+        let rc_drain_elapsed = rc_drain_started.elapsed();
         drop(l2p_guards);
         drop(apply_guard);
         self.metrics
             .record_flush_sample(kind, sample_started.elapsed());
+        self.metrics.record_flush_sample_breakdown(
+            lock_elapsed,
+            l2p_walk_elapsed,
+            rc_drain_elapsed,
+        );
         // Sample workload size: L2P dirty pages snapshotted, refcount
         // delta entries drained, fresh refcount data pages allocated.
         // Recorded after gate release so the cost of these accessors

@@ -152,6 +152,17 @@ def print_window(name: str, rows: list[dict]) -> None:
             f" rc_drained {int(lm.get('flush_sample_rc_drained_deltas_max', 0)):,}"
             f" rc_fresh {int(lm.get('flush_sample_rc_fresh_pages_max', 0)):,}"
         )
+        print(
+            f"    sample breakdown max: lock {int(lm.get('flush_sample_lock_max_us', 0)):,} us"
+            f"  l2p_walk {int(lm.get('flush_sample_l2p_walk_max_us', 0)):,} us"
+            f"  rc_drain {int(lm.get('flush_sample_rc_drain_max_us', 0)):,} us"
+        )
+        if flush_calls:
+            print(
+                f"    sample breakdown avg: lock {int(lm.get('flush_sample_lock_us', 0)) / flush_calls:,.1f} us"
+                f"  l2p_walk {int(lm.get('flush_sample_l2p_walk_us', 0)) / flush_calls:,.1f} us"
+                f"  rc_drain {int(lm.get('flush_sample_rc_drain_us', 0)) / flush_calls:,.1f} us"
+            )
     if range_delete_calls or cleanup_calls:
         print(f"  op-kind hotspots")
         if range_delete_calls:
