@@ -43,6 +43,57 @@ use crate::types::VolumeOrdinal;
 use super::Volume;
 use super::apply::publish_l2p_read_view;
 
+/// Apply every `draining` entry into `tree`. Groups by leaf so that
+/// inserts touching the same leaf share one CoW (matches the laned
+/// bucket's `insert_leaf_run_at_lsn_deferred_finish` optimisation).
+/// Tombstones go through `delete_at_lsn_deferred_finish` individually
+/// because no leaf-run delete API exists today; deletes are rare on
+/// the L2P hot path so this is acceptable. Finalises deferred RC
+/// deltas in `finish_batch_apply` at the end.
+pub(super) fn compact_drain_into_tree(
+    tree: &mut crate::paged::PagedL2p,
+    draining: &HashMap<u64, super::l2p_buffer::BufferEntry>,
+) -> crate::Result<()> {
+    use crate::paged::format::LEAF_SHIFT;
+    if draining.is_empty() {
+        return Ok(());
+    }
+    // (leaf_idx) -> (insert run sorted by lba, tombstone list)
+    let mut by_leaf: HashMap<u64, (Vec<(u64, crate::paged::L2pValue, crate::types::Lsn)>, Vec<(u64, crate::types::Lsn)>)> =
+        HashMap::with_capacity(draining.len() / 32 + 1);
+    for (lba, entry) in draining {
+        let leaf_idx = *lba >> LEAF_SHIFT;
+        let bucket = by_leaf.entry(leaf_idx).or_default();
+        if entry.tombstone {
+            bucket.1.push((*lba, entry.lsn));
+        } else {
+            bucket.0.push((*lba, entry.value, entry.lsn));
+        }
+    }
+    // Process in leaf-idx order for determinism / better page locality.
+    let mut leaf_indices: Vec<u64> = by_leaf.keys().copied().collect();
+    leaf_indices.sort_unstable();
+    for leaf_idx in leaf_indices {
+        let (mut inserts, tombstones) = by_leaf.remove(&leaf_idx).expect("leaf present");
+        if !inserts.is_empty() {
+            inserts.sort_unstable_by_key(|(lba, _, _)| *lba);
+            // All inserts in this group share `leaf_idx`. Use max LSN
+            // of the group as the run's stamp so any prior-LSN replay
+            // of these entries is correctly suppressed by
+            // `page.generation >= lsn`.
+            let max_lsn = inserts.iter().map(|(_, _, l)| *l).max().unwrap_or(0);
+            let entries: Vec<(u64, crate::paged::L2pValue)> =
+                inserts.iter().map(|(lba, v, _)| (*lba, *v)).collect();
+            tree.insert_leaf_run_at_lsn_deferred_finish(&entries, max_lsn)?;
+        }
+        for (lba, lsn) in tombstones {
+            tree.delete_at_lsn_deferred_finish(lba, lsn)?;
+        }
+    }
+    tree.finish_batch_apply()?;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct L2pCompactorParams {
     pub soft_entries: usize,
@@ -140,6 +191,14 @@ fn run_worker(inner: Arc<L2pCompactorInner>) {
 /// One sweep over every L2P shard. When `size_gated`, a shard is only
 /// compacted if `active.len() >= soft_entries`; when false, every shard
 /// with non-empty active is compacted (used by `force_compact_all`).
+///
+/// Shards are processed **serially**. A parallel implementation was
+/// tried (std::thread::scope fan-out) but with `flush_dirty_pages_threshold`
+/// gating, the simultaneous wave of dirty tree pages from 16 shards
+/// triggered flush immediately and crashed throughput (-67% IOPS,
+/// onyx buffer hard-backpressured). Serial pacing distributes dirty
+/// page production over the sweep wall time, giving flush a chance to
+/// stay ahead.
 fn compact_one_pass(inner: &L2pCompactorInner, size_gated: bool) {
     let vols: Vec<Arc<Volume>> = {
         let map = inner.volumes.read();
@@ -178,17 +237,7 @@ fn compact_shard(inner: &L2pCompactorInner, shard: &super::L2pShard) {
                 Some(d) => d,
                 None => return Ok(()),
             };
-            let mut entries: Vec<(u64, &super::l2p_buffer::BufferEntry)> =
-                draining.iter().map(|(lba, e)| (*lba, e)).collect();
-            entries.sort_by_key(|(lba, _)| *lba);
-            for (lba, entry) in entries {
-                if entry.tombstone {
-                    tree.delete_at_lsn(lba, entry.lsn)?;
-                } else {
-                    tree.insert_at_lsn(lba, entry.value, entry.lsn)?;
-                }
-            }
-            Ok(())
+            compact_drain_into_tree(&mut tree, draining)
         });
     match apply_result {
         Ok(()) => {

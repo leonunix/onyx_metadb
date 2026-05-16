@@ -1038,19 +1038,7 @@ impl Db {
                         Some(map) => map,
                         None => return Ok(()),
                     };
-                    let mut entries: Vec<(u64, &super::l2p_buffer::BufferEntry)> = draining
-                        .iter()
-                        .map(|(lba, e)| (*lba, e))
-                        .collect();
-                    entries.sort_by_key(|(lba, _)| *lba);
-                    for (lba, entry) in entries {
-                        if entry.tombstone {
-                            tree.delete_at_lsn(lba, entry.lsn)?;
-                        } else {
-                            tree.insert_at_lsn(lba, entry.value, entry.lsn)?;
-                        }
-                    }
-                    Ok(())
+                    super::l2p_compactor::compact_drain_into_tree(&mut tree, draining)
                 });
                 match apply_result {
                     Ok(()) => {

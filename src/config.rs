@@ -378,7 +378,10 @@ impl Config {
             l2p_buffer_enabled: false,
             // 64 K entries soft trigger ≈ 5 MB / shard. Compactor
             // wakes when any shard crosses this. Same magnitude as
-            // `refcount_drainer_threshold_entries`.
+            // `refcount_drainer_threshold_entries`. Smaller values
+            // (e.g. 16 K) appeared attractive ("fold often, fold
+            // small") but the more frequent cycles compete with
+            // flush's apply_gate.write hold and net regress p9999.
             l2p_buffer_soft_entries: 64_000,
             // 512 K entries hard trigger ≈ 40 MB / shard. Commit
             // backpressure kicks in past this; bounds peak per-shard

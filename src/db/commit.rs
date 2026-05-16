@@ -884,15 +884,11 @@ impl Db {
     }
 
     fn batch_uses_serial_apply(&self, ops: &[WalOp]) -> bool {
-        // B2 buffer path: force serial apply so all L2P writes go
-        // through `apply_op_bare → apply_l2p_remap` where the
-        // use_buffer branch is implemented. Phase 3 MVP avoids
-        // converting the laned `apply_l2p_bucket` batch-tree code.
-        // Phase 5 will revisit if profiling shows laned throughput
-        // mattering on this path.
-        if self.l2p_buffer_enabled {
-            return true;
-        }
+        // B2: laned `apply_l2p_bucket` is buffer-aware (see
+        // `apply_l2p_bucket_buffer`); the buffer path no longer forces
+        // serial. Snapshot-bearing volumes still need serial via the
+        // unchanged `batch_requires_serial_apply` rule (snap-pin walk
+        // lives in `apply_l2p_remap`).
         self.batch_requires_serial_apply(ops)
     }
 
@@ -1150,6 +1146,17 @@ impl Db {
         let mut outcomes = Vec::with_capacity(indices.len());
         let mut rc_actions = Vec::new();
         let shard = &volume.shards[sid];
+        if shard.use_buffer {
+            return Self::apply_l2p_bucket_buffer(
+                volume.clone(),
+                sid,
+                indices,
+                lsn,
+                ops,
+                refcount_shards,
+                metrics,
+            );
+        }
         let tree_lock_started = std::time::Instant::now();
         let mut tree = shard.tree.write();
         let tree_lock_wait = tree_lock_started.elapsed();
@@ -1414,6 +1421,185 @@ impl Db {
                 finish_us = duration_us(finish_elapsed),
                 publish_us = duration_us(publish_elapsed),
                 "metadb: slow l2p apply bucket"
+            );
+        }
+        if total_l2p_ops > 0 {
+            let total_us = bucket_elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+            let put_us = total_us.saturating_mul(l2p_put_count) / total_l2p_ops;
+            let delete_us = total_us.saturating_mul(l2p_delete_count) / total_l2p_ops;
+            let remap_us = total_us.saturating_sub(put_us).saturating_sub(delete_us);
+            metrics.record_apply_l2p_put_batch(
+                l2p_put_count,
+                std::time::Duration::from_micros(put_us),
+            );
+            metrics.record_apply_l2p_delete_batch(
+                l2p_delete_count,
+                std::time::Duration::from_micros(delete_us),
+            );
+            metrics.record_apply_l2p_remap_batch(
+                l2p_remap_count,
+                std::time::Duration::from_micros(remap_us),
+            );
+        }
+        Ok(L2pBucketApplyResult {
+            outcomes,
+            rc_actions,
+        })
+    }
+
+    /// B2 buffer variant of [`Self::apply_l2p_bucket`]. Same lane / per-shard
+    /// dispatch contract, but writes land in `shard.l2p_buffer` instead of
+    /// the paged tree. We don't hold `tree.write()` here: the buffer's own
+    /// `Mutex<HashMap>` serialises concurrent inserts on this shard, and the
+    /// background compactor is the only writer to the tree. RC bookkeeping
+    /// is identical to the tree path — staged at commit time so that
+    /// snapshot semantics and per-shard refcount apply lanes behave
+    /// unchanged.
+    fn apply_l2p_bucket_buffer(
+        volume: Arc<Volume>,
+        sid: usize,
+        indices: Vec<usize>,
+        lsn: Lsn,
+        ops: &[WalOp],
+        refcount_shards: &[Arc<crate::refcount::RcShard>],
+        metrics: &MetaMetrics,
+    ) -> Result<L2pBucketApplyResult> {
+        use super::l2p_buffer::BufferLookup;
+        let shard = &volume.shards[sid];
+        let mut outcomes = Vec::with_capacity(indices.len());
+        let mut rc_actions = Vec::new();
+        // Snapshot the current published read view once. Lookups for `cur`
+        // fall through to this view on buffer miss. Compactor publishes a
+        // new view on each cycle; capturing once per-bucket is safe because
+        // any committed-but-uncompacted state we'd miss in this view still
+        // shows up in `shard.l2p_buffer.lookup`.
+        let read_view_prepare_started = std::time::Instant::now();
+        let read_view: Arc<crate::paged::ReadView> = shard.read_view.read().clone();
+        let read_view_prepare = read_view_prepare_started.elapsed();
+        let mut l2p_put_count = 0u64;
+        let mut l2p_delete_count = 0u64;
+        let mut l2p_remap_count = 0u64;
+        let bucket_started = std::time::Instant::now();
+        let ops_started = std::time::Instant::now();
+        let ops_result = (|| -> Result<()> {
+            for &idx in &indices {
+                let outcome = match &ops[idx] {
+                    WalOp::L2pPut { lba, value, .. } => {
+                        let cur = match shard.l2p_buffer.lookup(*lba) {
+                            BufferLookup::Present(v) => Some(v),
+                            BufferLookup::Tombstone => None,
+                            BufferLookup::Absent => read_view.get(*lba)?,
+                        };
+                        if super::apply::seq_guard_rejects(value.seq(), cur.as_ref()) {
+                            l2p_put_count += 1;
+                            outcomes.push((idx, ApplyOutcome::L2pPrev(cur)));
+                            continue;
+                        }
+                        shard.l2p_buffer.insert(*lba, *value, lsn);
+                        l2p_put_count += 1;
+                        ApplyOutcome::L2pPrev(cur)
+                    }
+                    WalOp::L2pDelete { lba, .. } => {
+                        let cur = match shard.l2p_buffer.lookup(*lba) {
+                            BufferLookup::Present(v) => Some(v),
+                            BufferLookup::Tombstone => None,
+                            BufferLookup::Absent => read_view.get(*lba)?,
+                        };
+                        shard.l2p_buffer.insert_tombstone(*lba, lsn);
+                        l2p_delete_count += 1;
+                        ApplyOutcome::L2pPrev(cur)
+                    }
+                    WalOp::L2pRemap {
+                        lba,
+                        new_value,
+                        guard,
+                        ..
+                    } => {
+                        // RC-guarded remap: verify target pba refcount
+                        // before mutating. Same lock-order rule as the
+                        // tree-mode bucket (rc shard lookup only — buffer
+                        // mutation needs no L2P lock).
+                        if let Some((gp, min_rc)) = guard {
+                            let gp_sid =
+                                (xxh3_64(&gp.to_be_bytes()) as usize) % refcount_shards.len();
+                            let cur_rc = refcount_shards[gp_sid].get(*gp)?;
+                            if cur_rc < *min_rc {
+                                l2p_remap_count += 1;
+                                outcomes.push((
+                                    idx,
+                                    ApplyOutcome::L2pRemap {
+                                        applied: false,
+                                        prev: None,
+                                        freed_pba: None,
+                                    },
+                                ));
+                                continue;
+                            }
+                        }
+                        let cur = match shard.l2p_buffer.lookup(*lba) {
+                            BufferLookup::Present(v) => Some(v),
+                            BufferLookup::Tombstone => None,
+                            BufferLookup::Absent => read_view.get(*lba)?,
+                        };
+                        if super::apply::seq_guard_rejects(new_value.seq(), cur.as_ref()) {
+                            l2p_remap_count += 1;
+                            outcomes.push((
+                                idx,
+                                ApplyOutcome::L2pRemap {
+                                    applied: false,
+                                    prev: cur,
+                                    freed_pba: None,
+                                },
+                            ));
+                            continue;
+                        }
+                        shard.l2p_buffer.insert(*lba, *new_value, lsn);
+                        push_l2p_remap_rc_actions(
+                            &mut rc_actions,
+                            idx,
+                            *lba,
+                            cur,
+                            *new_value,
+                            lsn,
+                        );
+                        l2p_remap_count += 1;
+                        ApplyOutcome::L2pRemap {
+                            applied: true,
+                            prev: cur,
+                            freed_pba: None,
+                        }
+                    }
+                    other => unreachable!("L2P bucket holds only L2P ops; saw {other:?}"),
+                };
+                outcomes.push((idx, outcome));
+            }
+            Ok(())
+        })();
+        let ops_elapsed = ops_started.elapsed();
+        ops_result?;
+        let bucket_elapsed = bucket_started.elapsed();
+        let total_l2p_ops = l2p_put_count + l2p_delete_count + l2p_remap_count;
+        metrics.record_apply_l2p_bucket_stages(
+            total_l2p_ops,
+            bucket_elapsed,
+            std::time::Duration::ZERO,
+            read_view_prepare,
+            ops_elapsed,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
+        if bucket_elapsed.as_micros() >= 100_000 || ops_elapsed.as_micros() >= 100_000 {
+            tracing::warn!(
+                vol_ord = volume.ord,
+                shard = sid,
+                lsn,
+                indices = total_l2p_ops,
+                put = l2p_put_count,
+                delete = l2p_delete_count,
+                remap = l2p_remap_count,
+                total_us = duration_us(bucket_elapsed),
+                ops_us = duration_us(ops_elapsed),
+                "metadb: slow l2p apply bucket (buffer)"
             );
         }
         if total_l2p_ops > 0 {
