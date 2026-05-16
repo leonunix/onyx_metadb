@@ -40,7 +40,7 @@ use crate::types::{
 /// dict (recovered from `unit_original_size / 4096`). Old v9 manifests
 /// are hard-rejected on open. See `paged/leaf_compact.rs` for the new
 /// 128-unit cap that this enables.
-pub const MANIFEST_BODY_VERSION: u32 = 10;
+pub const MANIFEST_BODY_VERSION: u32 = 11;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -122,6 +122,10 @@ pub fn max_snapshots_for_layout(
         Some(v) => v,
         None => return 0,
     };
+    // v11: per-refcount-shard `durable_seq[i]: Lsn` array mirrors
+    // `refcount_shard_roots`, written immediately after the roots. Same
+    // length (refcount_shard_count), same element size (8 B).
+    let refcount_durable_seq_bytes = refcount_bytes;
     // One index (dedup_index) carries one u32 level-count header per
     // manifest head group.
     let dedup_header_bytes = match dedup_head_group_count.checked_mul(size_of::<u32>()) {
@@ -134,6 +138,7 @@ pub fn max_snapshots_for_layout(
     };
     let used = match OFF_VARIABLE_START
         .checked_add(refcount_bytes)
+        .and_then(|v| v.checked_add(refcount_durable_seq_bytes))
         .and_then(|v| v.checked_add(dedup_header_bytes))
         .and_then(|v| v.checked_add(dedup_bytes))
         .and_then(|v| v.checked_add(volumes_budget_bytes))
@@ -199,6 +204,18 @@ pub struct Manifest {
     /// manifest top level. Per-volume L2P roots live inside
     /// [`volumes`](Self::volumes) instead.
     pub refcount_shard_roots: Box<[PageId]>,
+    /// Per-refcount-shard durable LSN watermark. `durable_seq[i]` is the
+    /// highest LSN whose refcount-shard `i` deltas are on disk. Same
+    /// length as `refcount_shard_roots`.
+    ///
+    /// Stage 1 (Tier 2.B) of the manifest v11 schema: the global
+    /// `checkpoint_lsn` equals `min(refcount_durable_seq[..] ∪ each
+    /// volume's l2p_shard_durable_seq[..])`. WAL prune, recovery, and
+    /// onyx buffer reclaim still consume `checkpoint_lsn`, so this
+    /// array is observability-only for now. Stage 2 will flip
+    /// consumers to per-shard reads so partial sample can re-enable
+    /// without pinning the global floor on cold shards.
+    pub refcount_durable_seq: Box<[Lsn]>,
     /// Number of dedup apply lanes. Power of two, recorded at create time;
     /// changing it requires recreating the database.
     pub dedup_shards: u32,
@@ -229,6 +246,7 @@ impl Manifest {
             checkpoint_lsn: 0,
             free_list_head: NULL_PAGE,
             refcount_shard_roots: Vec::new().into_boxed_slice(),
+            refcount_durable_seq: Vec::new().into_boxed_slice(),
             dedup_shards: 1,
             dedup_index_shard_heads: vec![Vec::new().into_boxed_slice()].into_boxed_slice(),
             next_snapshot_id: 1,
@@ -266,7 +284,57 @@ impl Manifest {
         self.encode(&mut probe)
     }
 
+    /// Stage 1 (Tier 2.B) tripwire: `checkpoint_lsn` must equal the
+    /// min of every per-shard `durable_seq` (refcount + each volume's
+    /// L2P shards) that this manifest carries. Returns `Err` so the
+    /// debug build can fail the commit before writing a drifted page;
+    /// release builds skip the check (caller is responsible for
+    /// gating).
+    fn assert_durable_seq_invariant(&self) -> Result<()> {
+        // Empty manifest (`Manifest::empty()` before any shards are
+        // wired up): nothing to check. Real manifests always have at
+        // least one refcount shard by the time they're committed.
+        let mut min_seen: Option<Lsn> = None;
+        for &v in self.refcount_durable_seq.iter() {
+            min_seen = Some(min_seen.map_or(v, |m| m.min(v)));
+        }
+        for vol in &self.volumes {
+            for &v in vol.l2p_shard_durable_seq.iter() {
+                min_seen = Some(min_seen.map_or(v, |m| m.min(v)));
+            }
+        }
+        if let Some(m) = min_seen
+            && m != self.checkpoint_lsn
+        {
+            return Err(MetaDbError::Corruption(format!(
+                "manifest durable_seq invariant broken: min(per-shard)={m}, \
+                 checkpoint_lsn={}",
+                self.checkpoint_lsn
+            )));
+        }
+        if self.refcount_durable_seq.len() != self.refcount_shard_roots.len() {
+            return Err(MetaDbError::Corruption(format!(
+                "manifest refcount_durable_seq length {} != refcount_shard_roots length {}",
+                self.refcount_durable_seq.len(),
+                self.refcount_shard_roots.len(),
+            )));
+        }
+        for vol in &self.volumes {
+            if vol.l2p_shard_durable_seq.len() != vol.l2p_shard_roots.len() {
+                return Err(MetaDbError::Corruption(format!(
+                    "manifest volume {} l2p_shard_durable_seq length {} != \
+                     l2p_shard_roots length {}",
+                    vol.ord,
+                    vol.l2p_shard_durable_seq.len(),
+                    vol.l2p_shard_roots.len(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn encode(&self, page: &mut Page) -> Result<()> {
+        self.assert_durable_seq_invariant()?;
         let refcount_shard_count = self.refcount_shard_roots.len();
         if refcount_shard_count > MAX_SHARD_ROOTS_PER_PAGE {
             return Err(MetaDbError::InvalidArgument(format!(
@@ -344,6 +412,12 @@ impl Manifest {
             p[off..off + 8].copy_from_slice(&root.to_le_bytes());
             off += 8;
         }
+        // v11: per-refcount-shard durable_seq follows the roots array.
+        // Length is implied by refcount_shard_count; no header.
+        for seq in self.refcount_durable_seq.iter().copied() {
+            p[off..off + 8].copy_from_slice(&seq.to_le_bytes());
+            off += 8;
+        }
         for shard_heads in self.dedup_index_shard_heads.iter() {
             p[off..off + 4].copy_from_slice(&(shard_heads.len() as u32).to_le_bytes());
             off += 4;
@@ -375,16 +449,25 @@ impl Manifest {
         );
         match body_version {
             10 => Self::decode_v10(page, page_store),
+            11 => Self::decode_v11(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v10 is readable — \
-                 older databases (v7/v8 carried the retired dedup_reverse section; \
-                 v9 carried the compact leaf v2 encoding with the 100-unit cap) \
-                 must be rebuilt"
+                "unsupported manifest body version {other}; only v10 (lazy-upgrade) \
+                 and v11 are readable — older databases (v7/v8 carried the retired \
+                 dedup_reverse section; v9 carried the compact leaf v2 encoding with \
+                 the 100-unit cap) must be rebuilt"
             ))),
         }
     }
 
     fn decode_v10(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 10)
+    }
+
+    fn decode_v11(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 11)
+    }
+
+    fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {
         let p = page.payload();
         let checkpoint_lsn = u64::from_le_bytes(
             p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
@@ -420,6 +503,15 @@ impl Manifest {
 
         let mut off = OFF_VARIABLE_START;
         let refcount_shard_roots = read_u64_vec(p, &mut off, refcount_shard_count);
+        // v11 stores per-refcount-shard durable_seq right after the
+        // roots array; v10 has no on-disk array and we synthesise it
+        // from `checkpoint_lsn` (Stage 1 upgrade path: next manifest
+        // commit re-encodes with the actual atomics).
+        let refcount_durable_seq: Box<[Lsn]> = if version >= 11 {
+            read_u64_vec(p, &mut off, refcount_shard_count)
+        } else {
+            vec![checkpoint_lsn; refcount_shard_count].into_boxed_slice()
+        };
 
         let mut dedup_index_shard_heads = Vec::with_capacity(DEDUP_META_HEAD_GROUPS);
         let mut total_index_levels = 0usize;
@@ -443,13 +535,23 @@ impl Manifest {
         }
 
         let snapshots = decode_snapshots(p, &mut off, snapshot_count, page_store)?;
-        let volumes = decode_volumes(p, &mut off, volume_count)?;
+        let mut volumes = decode_volumes(p, &mut off, volume_count, version)?;
+        if version < 11 {
+            // v10 upgrade: backfill every volume's per-L2P-shard
+            // durable_seq from the single `checkpoint_lsn`. The next
+            // commit re-encodes as v11 with real per-shard atomics.
+            for vol in &mut volumes {
+                vol.l2p_shard_durable_seq =
+                    vec![checkpoint_lsn; vol.shard_count as usize].into_boxed_slice();
+            }
+        }
 
         Ok(Self {
             body_version: MANIFEST_BODY_VERSION,
             checkpoint_lsn,
             free_list_head,
             refcount_shard_roots,
+            refcount_durable_seq,
             dedup_shards,
             dedup_index_shard_heads: dedup_index_shard_heads.into_boxed_slice(),
             next_snapshot_id,
@@ -514,10 +616,15 @@ fn decode_snapshots(
     Ok(snapshots)
 }
 
-fn decode_volumes(p: &[u8], off: &mut usize, volume_count: usize) -> Result<Vec<VolumeEntry>> {
+fn decode_volumes(
+    p: &[u8],
+    off: &mut usize,
+    volume_count: usize,
+    body_version: u32,
+) -> Result<Vec<VolumeEntry>> {
     let mut volumes = Vec::with_capacity(volume_count);
     for _ in 0..volume_count {
-        let entry = decode_volume_entry_inline(p, off)?;
+        let entry = decode_volume_entry_inline(p, off, body_version)?;
         volumes.push(entry);
     }
     Ok(volumes)

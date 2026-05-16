@@ -321,7 +321,11 @@ impl Db {
             0x1234_5678_ABCD_EF01,
         )?);
         manifest.body_version = MANIFEST_BODY_VERSION;
+        let refcount_count = refcount_roots.len();
         manifest.refcount_shard_roots = refcount_roots;
+        // Fresh database: no flush has happened yet, every shard's
+        // durable_seq is 0 (matches the empty `checkpoint_lsn`).
+        manifest.refcount_durable_seq = vec![0; refcount_count].into_boxed_slice();
         manifest.dedup_shards = dedup_shards;
         // dedup_index: cuckoo meta page id stored under the legacy
         // `dedup_index_shard_heads` slot, single-element box for
@@ -331,10 +335,12 @@ impl Db {
             vec![vec![dedup_index.meta_page_id()].into_boxed_slice()].into_boxed_slice();
         // Seed the bootstrap volume so open() / flush() can route
         // through the same volumes table the live `Db` manages.
+        let bootstrap_shard_count = l2p_roots.len();
         manifest.volumes = vec![VolumeEntry {
             ord: BOOTSTRAP_VOLUME_ORD,
-            shard_count: l2p_roots.len() as u32,
+            shard_count: bootstrap_shard_count as u32,
             l2p_shard_roots: l2p_roots,
+            l2p_shard_durable_seq: vec![0; bootstrap_shard_count].into_boxed_slice(),
             created_lsn: 0,
             flags: 0,
         }];
@@ -536,12 +542,14 @@ impl Db {
         // Earlier versions of the manifest (v3/v4/v5) are not readable —
         // Phase 7 is fresh-install only, and `Manifest::decode` rejects
         // them at the page-layer.
-        // At open, everything ≤ manifest.checkpoint_lsn is durable for
-        // every shard (the manifest is a global cursor under the
-        // pre-partial-flush model). Seed every shard's
-        // last_flushed_lsn from it so subsequent partial flushes can
-        // compute `min(per-shard last_flushed_lsn)` correctly.
-        let initial_last_flushed_lsn = manifest.checkpoint_lsn;
+        // v11 manifest persists per-shard `durable_seq` so we can
+        // restore each shard's `last_flushed_lsn` atomic
+        // independently rather than collapsing through the global
+        // `checkpoint_lsn`. v10 manifests upgrade lazily: `decode_v10`
+        // synthesised every shard's value as `checkpoint_lsn`, so
+        // this path is identical-by-construction on first open of an
+        // older database and the next flush re-encodes as v11 with
+        // real per-shard values.
         let mut volumes: HashMap<VolumeOrdinal, Arc<Volume>> =
             HashMap::with_capacity(manifest.volumes.len());
         for entry in &manifest.volumes {
@@ -551,7 +559,7 @@ impl Db {
                 &entry.l2p_shard_roots,
                 next_gen,
                 metrics.clone(),
-                initial_last_flushed_lsn,
+                &entry.l2p_shard_durable_seq,
                 cfg.l2p_buffer_enabled,
             )?;
             volumes.insert(
@@ -563,7 +571,7 @@ impl Db {
             page_store.clone(),
             page_cache.clone(),
             &manifest.refcount_shard_roots,
-            initial_last_flushed_lsn,
+            &manifest.refcount_durable_seq,
             metrics.clone(),
         )?;
         let dedup_index_meta_pid: PageId = manifest
@@ -636,10 +644,13 @@ impl Db {
                                     cfg.l2p_buffer_enabled,
                                 )?;
                                 volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
+                                let durable_seqs =
+                                    vec![lsn; *shard_count as usize].into_boxed_slice();
                                 manifest.volumes.push(VolumeEntry {
                                     ord: *ord,
                                     shard_count: *shard_count,
                                     l2p_shard_roots: roots,
+                                    l2p_shard_durable_seq: durable_seqs,
                                     created_lsn: lsn,
                                     flags: 0,
                                 });
@@ -701,10 +712,13 @@ impl Db {
                                 let shard_count = shards.len() as u32;
                                 volumes
                                     .insert(*new_ord, Arc::new(Volume::new(*new_ord, shards, lsn)));
+                                let durable_seqs =
+                                    vec![lsn; shard_count as usize].into_boxed_slice();
                                 manifest.volumes.push(VolumeEntry {
                                     ord: *new_ord,
                                     shard_count,
                                     l2p_shard_roots: actual_roots,
+                                    l2p_shard_durable_seq: durable_seqs,
                                     created_lsn: lsn,
                                     flags: 0,
                                 });
@@ -801,7 +815,19 @@ impl Db {
             manifest.dedup_index_shard_heads =
                 vec![vec![dedup_index.meta_page_id()].into_boxed_slice()].into_boxed_slice();
 
-            refresh_manifest_entries(&mut manifest, &sorted, &l2p_guards, &refcount_shards)?;
+            // Post-replay manifest refresh: everything ≤ `last_applied`
+            // has just been re-applied and is durable as soon as
+            // `manifest_store.commit` below succeeds. The per-shard
+            // atomics aren't bumped on the recovery path, so override
+            // with `last_applied` so the v11 invariant
+            // `min(durable_seq[]) == checkpoint_lsn` holds.
+            refresh_manifest_entries(
+                &mut manifest,
+                &sorted,
+                &l2p_guards,
+                &refcount_shards,
+                Some(last_applied),
+            )?;
             manifest.checkpoint_lsn = last_applied;
             manifest_store.commit(&manifest)?;
             commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
@@ -1900,6 +1926,28 @@ impl Db {
             wal_checkpoint,
         );
         manifest_state.manifest.checkpoint_lsn = new_checkpoint_lsn;
+        // Tier 2.B Stage 1: persist per-shard durable_seq alongside
+        // the global checkpoint_lsn. Same inputs as the min()
+        // computation above, but expanded into per-shard arrays.
+        // `assert_durable_seq_invariant` (called from `encode`) will
+        // confirm `min(durable_seq[]) == checkpoint_lsn` before the
+        // page is written to disk.
+        if let Err(err) = refresh_manifest_durable_seq(
+            &mut manifest_state.manifest,
+            &volumes,
+            &self.refcount_shards,
+            &selected,
+            wal_checkpoint,
+        ) {
+            self.metrics
+                .record_flush_manifest(manifest_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
+            drop(manifest_state);
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+            return Err(err);
+        }
         let manifest = manifest_state.manifest.clone();
         if let Err(err) = manifest_state.store.commit(&manifest) {
             self.metrics
@@ -2321,10 +2369,27 @@ fn refresh_manifest_from_checkpoints(
             };
             roots.push(root);
         }
+        // Preserve the prior per-shard durable_seq for the moment;
+        // `refresh_manifest_durable_seq` below overwrites each entry
+        // with the post-flush per-shard value (selected →
+        // wal_checkpoint, unselected → prior atomic). We start from
+        // the prior manifest's array (or zeros if missing) so
+        // unselected shards have a sensible value even if the live
+        // atomics haven't been advanced yet for this round.
+        let prior_durable_seq: Option<&[Lsn]> = manifest
+            .volumes
+            .iter()
+            .find(|e| e.ord == volume.ord)
+            .map(|e| e.l2p_shard_durable_seq.as_ref());
+        let durable_seq: Box<[Lsn]> = match prior_durable_seq {
+            Some(seqs) if seqs.len() == volume.shards.len() => seqs.to_vec().into_boxed_slice(),
+            _ => vec![0; volume.shards.len()].into_boxed_slice(),
+        };
         new_entries.push(VolumeEntry {
             ord: volume.ord,
             shard_count: volume.shards.len() as u32,
             l2p_shard_roots: roots.into_boxed_slice(),
+            l2p_shard_durable_seq: durable_seq,
             created_lsn: volume.created_lsn,
             flags: volume.flags.load(std::sync::atomic::Ordering::Relaxed),
         });
@@ -2333,5 +2398,80 @@ fn refresh_manifest_from_checkpoints(
     // refcount_shard_roots are stamped at create/open time and never
     // change across flushes (paged-array meta page id is stable);
     // leave whatever the manifest already carries untouched.
+    Ok(())
+}
+
+/// Tier 2.B Stage 1: rewrite every per-shard `durable_seq` in the
+/// manifest to reflect the durable state we're about to commit. This
+/// mirrors the inputs to [`Db::compute_min_last_flushed_lsn_after`]:
+/// selected shards advance to `wal_checkpoint`; unselected shards keep
+/// their existing atomic. Must be called AFTER
+/// [`refresh_manifest_from_checkpoints`] so the per-volume entries are
+/// already shaped correctly, and BEFORE the manifest store commit so
+/// the new arrays land on disk.
+///
+/// Stage 1 invariant: `checkpoint_lsn == min(all durable_seq[])`. The
+/// `Manifest::assert_durable_seq_invariant` tripwire fires on the next
+/// `encode` if this is violated.
+fn refresh_manifest_durable_seq(
+    manifest: &mut Manifest,
+    volumes: &[Arc<Volume>],
+    refcount_shards: &[Shard],
+    selected: &SelectedShards,
+    wal_checkpoint: Lsn,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    if manifest.volumes.len() != volumes.len() {
+        return Err(MetaDbError::Corruption(format!(
+            "refresh_manifest_durable_seq: manifest volume count {} != live count {}",
+            manifest.volumes.len(),
+            volumes.len(),
+        )));
+    }
+    for (v_idx, vol) in volumes.iter().enumerate() {
+        let entry = &mut manifest.volumes[v_idx];
+        if entry.ord != vol.ord {
+            return Err(MetaDbError::Corruption(format!(
+                "refresh_manifest_durable_seq: manifest volume[{v_idx}] ord {} != live ord {}",
+                entry.ord, vol.ord,
+            )));
+        }
+        if entry.l2p_shard_durable_seq.len() != vol.shards.len() {
+            entry.l2p_shard_durable_seq = vec![0; vol.shards.len()].into_boxed_slice();
+        }
+        for (s_idx, shard) in vol.shards.iter().enumerate() {
+            let tree_lsn = if selected.l2p[v_idx][s_idx] {
+                wal_checkpoint
+            } else {
+                shard.last_flushed_lsn.load(Ordering::Acquire)
+            };
+            // Same B2 buffer term as `compute_min_last_flushed_lsn_after`:
+            // any uncompacted buffer entry represents committed-but-
+            // not-tree-durable state; WAL replay rebuilds it, so the
+            // per-shard durable_seq must not advance past
+            // `buffer.compacted_lsn`. `flush_with_gate` force-compacts
+            // before this runs so the term equals `last_applied_lsn`
+            // in normal flushes; it's the safety net for paths that
+            // skip force-compact.
+            let lsn = if shard.use_buffer {
+                tree_lsn.min(shard.l2p_buffer.compacted_lsn())
+            } else {
+                tree_lsn
+            };
+            entry.l2p_shard_durable_seq[s_idx] = lsn;
+        }
+    }
+    if manifest.refcount_durable_seq.len() != refcount_shards.len() {
+        manifest.refcount_durable_seq =
+            vec![0; refcount_shards.len()].into_boxed_slice();
+    }
+    for (s_idx, shard) in refcount_shards.iter().enumerate() {
+        let lsn = if selected.rc[s_idx] {
+            wal_checkpoint
+        } else {
+            shard.last_flushed_lsn.load(Ordering::Acquire)
+        };
+        manifest.refcount_durable_seq[s_idx] = lsn;
+    }
     Ok(())
 }

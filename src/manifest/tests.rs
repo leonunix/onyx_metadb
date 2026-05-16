@@ -38,10 +38,18 @@ fn snap(
 }
 
 fn boot_vol(shard_count: u32, roots: &[PageId]) -> VolumeEntry {
+    boot_vol_at(shard_count, roots, 0)
+}
+
+/// `boot_vol` variant that stamps every per-shard durable_seq slot to
+/// `checkpoint_lsn`, satisfying [`Manifest::assert_durable_seq_invariant`]
+/// when the surrounding manifest's `checkpoint_lsn` is non-zero.
+fn boot_vol_at(shard_count: u32, roots: &[PageId], checkpoint_lsn: Lsn) -> VolumeEntry {
     VolumeEntry {
         ord: 0,
         shard_count,
         l2p_shard_roots: bx(roots),
+        l2p_shard_durable_seq: vec![checkpoint_lsn; shard_count as usize].into_boxed_slice(),
         created_lsn: 0,
         flags: 0,
     }
@@ -70,12 +78,13 @@ fn commit_then_reopen_recovers_manifest() {
         checkpoint_lsn: 1234,
         free_list_head: 99,
         refcount_shard_roots: bx(&[17, 18, 19, 20]),
+        refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE, NULL_PAGE]),
         next_snapshot_id: 5,
         next_volume_ord: 1,
         snapshots: vec![snap(&ps, 1, 0, &[11, 12, 13, 14], 100)],
-        volumes: vec![boot_vol(4, &[7, 8, 9, 10])],
+        volumes: vec![boot_vol_at(4, &[7, 8, 9, 10], 1234)],
     };
     store.commit(&m).unwrap();
     drop(store);
@@ -233,6 +242,12 @@ fn encode_decode_round_trip_with_refcount_and_dedup() {
         checkpoint_lsn: 0xDEAD_BEEF_CAFE,
         free_list_head: 1234,
         refcount_shard_roots: bx(&[142, 143, 144, 145]),
+        refcount_durable_seq: bx(&[
+            0xDEAD_BEEF_CAFE,
+            0xDEAD_BEEF_CAFE,
+            0xDEAD_BEEF_CAFE,
+            0xDEAD_BEEF_CAFE,
+        ]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE, 200, 300]),
         next_snapshot_id: 99,
@@ -241,7 +256,7 @@ fn encode_decode_round_trip_with_refcount_and_dedup() {
             snap(&ps, 1, 0, &[10, 11, 12, 13], 100),
             snap(&ps, 5, 0, &[20, 21, 22, 23], 500),
         ],
-        volumes: vec![boot_vol(4, &[42, 43, 44, 45])],
+        volumes: vec![boot_vol_at(4, &[42, 43, 44, 45], 0xDEAD_BEEF_CAFE)],
     };
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 7));
     m.encode(&mut page).unwrap();
@@ -257,6 +272,7 @@ fn encode_rejects_oversized_snapshot_table() {
     let ps = mk_store(&dir);
     let mut m = Manifest::empty();
     m.refcount_shard_roots = bx(&[1, 2, 3, 4]);
+    m.refcount_durable_seq = bx(&[0, 0, 0, 0]);
     let cap = max_snapshots_for_shards(m.shard_count());
     assert!(cap > 0);
     for i in 0..(cap + 1) as u64 {
@@ -272,6 +288,7 @@ fn find_snapshot_locates_by_id() {
     let ps = mk_store(&dir);
     let mut m = Manifest::empty();
     m.refcount_shard_roots = bx(&[1, 2, 3, 4]);
+    m.refcount_durable_seq = bx(&[0, 0, 0, 0]);
     m.snapshots.push(snap(&ps, 7, 0, &[42, 43, 44, 45], 100));
     assert_eq!(m.find_snapshot(7).unwrap().id, 7);
     assert_eq!(
@@ -314,17 +331,19 @@ fn v6_volumes_table_round_trip() {
         checkpoint_lsn: 10,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[50, 51]),
+        refcount_durable_seq: bx(&[10, 10]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[]),
         next_snapshot_id: 2,
         next_volume_ord: 3,
         snapshots: vec![snap(&ps, 1, 2, &[100, 101], 10)],
         volumes: vec![
-            boot_vol(2, &[200, 201]),
+            boot_vol_at(2, &[200, 201], 10),
             VolumeEntry {
                 ord: 2,
                 shard_count: 2,
                 l2p_shard_roots: bx(&[300, 301]),
+                l2p_shard_durable_seq: bx(&[10, 10]),
                 created_lsn: 7,
                 flags: VOLUME_FLAG_DROP_PENDING,
             },
@@ -347,6 +366,7 @@ fn v6_rejects_volume_count_exceeding_capacity() {
     let ps = mk_store(&dir);
     let mut m = Manifest::empty();
     m.refcount_shard_roots = bx(&[1]);
+    m.refcount_durable_seq = bx(&[0]);
     // Start with just the bootstrap — this sets the baseline volume budget.
     m.volumes.push(boot_vol(1, &[10]));
     let baseline_budget: usize = m
@@ -375,12 +395,13 @@ fn dedup_n4_encode_decode_round_trip() {
         checkpoint_lsn: 100,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
+        refcount_durable_seq: bx(&[100, 100]),
         dedup_shards: 4,
         dedup_index_shard_heads: one_shard(&[10]),
         next_snapshot_id: 1,
         next_volume_ord: 1,
         snapshots: Vec::new(),
-        volumes: vec![boot_vol(2, &[100, 101])],
+        volumes: vec![boot_vol_at(2, &[100, 101], 100)],
     };
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
     m.encode(&mut page).unwrap();
@@ -395,6 +416,7 @@ fn dedup_encode_rejects_non_power_of_two_shards() {
     let _ps = mk_store(&dir);
     let mut m = Manifest::empty();
     m.refcount_shard_roots = bx(&[1, 2]);
+    m.refcount_durable_seq = bx(&[0, 0]);
     m.volumes = vec![boot_vol(2, &[100, 101])];
     m.dedup_shards = 3;
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
@@ -413,6 +435,7 @@ fn dedup_encode_rejects_meta_head_outer_length_mismatch() {
     let _ps = mk_store(&dir);
     let mut m = Manifest::empty();
     m.refcount_shard_roots = bx(&[1, 2]);
+    m.refcount_durable_seq = bx(&[0, 0]);
     m.volumes = vec![boot_vol(2, &[100, 101])];
     m.dedup_shards = 4;
     // Cuckoo uses one meta-head group regardless of
@@ -438,6 +461,7 @@ fn volume_entry_inline_round_trip() {
         ord: 42,
         shard_count: 4,
         l2p_shard_roots: bx(&[100, 101, 102, 103]),
+        l2p_shard_durable_seq: bx(&[10, 11, 12, 13]),
         created_lsn: 0xABCD_1234,
         flags: VOLUME_FLAG_DROP_PENDING,
     };
@@ -446,7 +470,7 @@ fn volume_entry_inline_round_trip() {
     encode_volume_entry_inline(&entry, &mut buf, &mut off).unwrap();
     assert_eq!(off, buf.len());
     let mut off = 0;
-    let decoded = decode_volume_entry_inline(&buf, &mut off).unwrap();
+    let decoded = decode_volume_entry_inline(&buf, &mut off, MANIFEST_BODY_VERSION).unwrap();
     assert_eq!(decoded, entry);
     assert_eq!(off, buf.len());
 }
@@ -457,6 +481,7 @@ fn volume_entry_inline_rejects_shard_count_mismatch() {
         ord: 1,
         shard_count: 2,
         l2p_shard_roots: bx(&[7]), // length 1, but shard_count 2
+        l2p_shard_durable_seq: bx(&[0, 0]),
         created_lsn: 10,
         flags: 0,
     };
@@ -474,6 +499,7 @@ fn volume_entry_inline_rejects_buffer_too_small() {
         ord: 9,
         shard_count: 16,
         l2p_shard_roots: bx(&[1; 16]),
+        l2p_shard_durable_seq: bx(&[0; 16]),
         created_lsn: 0,
         flags: 0,
     };
@@ -487,11 +513,12 @@ fn volume_entry_inline_rejects_buffer_too_small() {
 
 #[test]
 fn volume_entry_decode_rejects_truncated_roots() {
-    // Encode a legit entry, then lop the final root off the buffer.
+    // Encode a legit entry, then lop the final durable_seq off the buffer.
     let entry = VolumeEntry {
         ord: 3,
         shard_count: 3,
         l2p_shard_roots: bx(&[11, 22, 33]),
+        l2p_shard_durable_seq: bx(&[1, 2, 3]),
         created_lsn: 7,
         flags: 0,
     };
@@ -501,7 +528,7 @@ fn volume_entry_decode_rejects_truncated_roots() {
     buf.truncate(buf.len() - 8);
     let mut off = 0;
     assert!(matches!(
-        decode_volume_entry_inline(&buf, &mut off),
+        decode_volume_entry_inline(&buf, &mut off, MANIFEST_BODY_VERSION),
         Err(MetaDbError::Corruption(_))
     ));
 }
@@ -515,6 +542,7 @@ fn volume_entry_many_back_to_back() {
             ord: 0,
             shard_count: 2,
             l2p_shard_roots: bx(&[10, 11]),
+            l2p_shard_durable_seq: bx(&[1, 2]),
             created_lsn: 100,
             flags: 0,
         },
@@ -522,6 +550,7 @@ fn volume_entry_many_back_to_back() {
             ord: 1,
             shard_count: 4,
             l2p_shard_roots: bx(&[20, 21, 22, 23]),
+            l2p_shard_durable_seq: bx(&[3, 4, 5, 6]),
             created_lsn: 200,
             flags: VOLUME_FLAG_DROP_PENDING,
         },
@@ -529,6 +558,7 @@ fn volume_entry_many_back_to_back() {
             ord: 65534,
             shard_count: 1,
             l2p_shard_roots: bx(&[NULL_PAGE]),
+            l2p_shard_durable_seq: bx(&[7]),
             created_lsn: 300,
             flags: 0,
         },
@@ -545,8 +575,224 @@ fn volume_entry_many_back_to_back() {
     assert_eq!(off, total);
     let mut off = 0;
     for expected in &entries {
-        let got = decode_volume_entry_inline(&buf, &mut off).unwrap();
+        let got = decode_volume_entry_inline(&buf, &mut off, MANIFEST_BODY_VERSION).unwrap();
         assert_eq!(&got, expected);
     }
     assert_eq!(off, total);
+}
+
+// ── Tier 2.B Stage 1: per-shard durable_seq[] tests ─────────────────
+
+/// Diverging per-shard `durable_seq` values must round-trip through
+/// v11 encode/decode. `checkpoint_lsn` is set to `min(per-shard)` so
+/// the `assert_durable_seq_invariant` tripwire stays satisfied.
+#[test]
+fn v11_per_shard_durable_seq_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    // Refcount shards have diverging durable_seq values 5, 7, 6, 9.
+    // Bootstrap volume's L2P shards: 8, 5, 11, 6. min = 5.
+    let m = Manifest {
+        body_version: MANIFEST_BODY_VERSION,
+        checkpoint_lsn: 5,
+        free_list_head: NULL_PAGE,
+        refcount_shard_roots: bx(&[10, 11, 12, 13]),
+        refcount_durable_seq: bx(&[5, 7, 6, 9]),
+        dedup_shards: 1,
+        dedup_index_shard_heads: one_shard(&[]),
+        next_snapshot_id: 1,
+        next_volume_ord: 1,
+        snapshots: Vec::new(),
+        volumes: vec![VolumeEntry {
+            ord: 0,
+            shard_count: 4,
+            l2p_shard_roots: bx(&[20, 21, 22, 23]),
+            l2p_shard_durable_seq: bx(&[8, 5, 11, 6]),
+            created_lsn: 0,
+            flags: 0,
+        }],
+    };
+    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
+    m.encode(&mut page).unwrap();
+    page.seal();
+    let decoded = Manifest::decode(&page, &ps).unwrap();
+    assert_eq!(decoded, m);
+    assert_eq!(decoded.refcount_durable_seq.as_ref(), &[5, 7, 6, 9]);
+    assert_eq!(
+        decoded.volumes[0].l2p_shard_durable_seq.as_ref(),
+        &[8, 5, 11, 6]
+    );
+}
+
+/// Encoding refuses to commit a manifest whose `min(durable_seq[]) !=
+/// checkpoint_lsn`. The probe encoder catches drift before the page
+/// hits disk, so the soak gate fails fast on any consumer that
+/// forgets to keep the two in sync.
+#[test]
+fn encode_rejects_durable_seq_drift_from_checkpoint_lsn() {
+    let dir = TempDir::new().unwrap();
+    let _ps = mk_store(&dir);
+    let m = Manifest {
+        body_version: MANIFEST_BODY_VERSION,
+        checkpoint_lsn: 42,
+        free_list_head: NULL_PAGE,
+        refcount_shard_roots: bx(&[1, 2]),
+        // Intentionally lower than checkpoint_lsn — drift the
+        // invariant should catch.
+        refcount_durable_seq: bx(&[42, 7]),
+        dedup_shards: 1,
+        dedup_index_shard_heads: one_shard(&[]),
+        next_snapshot_id: 1,
+        next_volume_ord: 1,
+        snapshots: Vec::new(),
+        volumes: vec![boot_vol_at(2, &[3, 4], 42)],
+    };
+    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
+    let err = m.encode(&mut page).unwrap_err();
+    match err {
+        MetaDbError::Corruption(msg) => {
+            assert!(msg.contains("durable_seq invariant broken"), "{msg}");
+        }
+        e => panic!("expected Corruption, got {e}"),
+    }
+}
+
+/// Encoding also rejects a length mismatch between
+/// `refcount_shard_roots` and `refcount_durable_seq` — the two arrays
+/// must stay paired.
+#[test]
+fn encode_rejects_refcount_durable_seq_length_mismatch() {
+    let dir = TempDir::new().unwrap();
+    let _ps = mk_store(&dir);
+    let m = Manifest {
+        body_version: MANIFEST_BODY_VERSION,
+        checkpoint_lsn: 0,
+        free_list_head: NULL_PAGE,
+        refcount_shard_roots: bx(&[1, 2, 3]),
+        refcount_durable_seq: bx(&[0, 0]), // wrong length
+        dedup_shards: 1,
+        dedup_index_shard_heads: one_shard(&[]),
+        next_snapshot_id: 1,
+        next_volume_ord: 1,
+        snapshots: Vec::new(),
+        volumes: vec![boot_vol(2, &[10, 11])],
+    };
+    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
+    let err = m.encode(&mut page).unwrap_err();
+    match err {
+        MetaDbError::Corruption(msg) => {
+            assert!(msg.contains("refcount_durable_seq length"), "{msg}");
+        }
+        e => panic!("expected Corruption, got {e}"),
+    }
+}
+
+/// Hand-rolled v10 manifest encoder so we can verify the v10→v11
+/// upgrade path without keeping the deprecated encoder in production.
+/// Mirrors `Manifest::encode` minus the `refcount_durable_seq` tail
+/// and minus each volume's `l2p_shard_durable_seq` tail.
+fn encode_v10_for_test(m: &Manifest, page: &mut Page) {
+    let p = page.payload_mut();
+    p.fill(0);
+    p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].copy_from_slice(&10u32.to_le_bytes());
+    p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
+        .copy_from_slice(&m.checkpoint_lsn.to_le_bytes());
+    p[OFF_FREE_LIST_HEAD..OFF_FREE_LIST_HEAD + 8].copy_from_slice(&m.free_list_head.to_le_bytes());
+    p[OFF_SHARD_COUNT..OFF_SHARD_COUNT + 4]
+        .copy_from_slice(&(m.refcount_shard_roots.len() as u32).to_le_bytes());
+    p[OFF_DEDUP_SHARDS..OFF_DEDUP_SHARDS + 4].copy_from_slice(&m.dedup_shards.to_le_bytes());
+    p[OFF_NEXT_SNAPSHOT_ID..OFF_NEXT_SNAPSHOT_ID + 8]
+        .copy_from_slice(&m.next_snapshot_id.to_le_bytes());
+    p[OFF_NEXT_VOLUME_ORD..OFF_NEXT_VOLUME_ORD + 2]
+        .copy_from_slice(&m.next_volume_ord.to_le_bytes());
+    p[OFF_SNAPSHOT_COUNT..OFF_SNAPSHOT_COUNT + 4]
+        .copy_from_slice(&(m.snapshots.len() as u32).to_le_bytes());
+    p[OFF_VOLUME_COUNT..OFF_VOLUME_COUNT + 4]
+        .copy_from_slice(&(m.volumes.len() as u32).to_le_bytes());
+    let mut off = OFF_VARIABLE_START;
+    for root in m.refcount_shard_roots.iter().copied() {
+        p[off..off + 8].copy_from_slice(&root.to_le_bytes());
+        off += 8;
+    }
+    // v10 omits refcount_durable_seq here.
+    for shard_heads in m.dedup_index_shard_heads.iter() {
+        p[off..off + 4].copy_from_slice(&(shard_heads.len() as u32).to_le_bytes());
+        off += 4;
+        for head in shard_heads.iter().copied() {
+            p[off..off + 8].copy_from_slice(&head.to_le_bytes());
+            off += 8;
+        }
+    }
+    for entry in &m.snapshots {
+        p[off..off + 8].copy_from_slice(&entry.id.to_le_bytes());
+        p[off + 8..off + 10].copy_from_slice(&entry.vol_ord.to_le_bytes());
+        p[off + 16..off + 24].copy_from_slice(&entry.l2p_roots_page.to_le_bytes());
+        p[off + 24..off + 32].copy_from_slice(&entry.created_lsn.to_le_bytes());
+        off += SNAPSHOT_ENTRY_SIZE;
+    }
+    // v10 volume entry inline: fixed header + roots tail, no
+    // durable_seq tail.
+    for entry in &m.volumes {
+        p[off..off + 2].copy_from_slice(&entry.ord.to_le_bytes());
+        p[off + 2..off + 6].copy_from_slice(&entry.shard_count.to_le_bytes());
+        p[off + 6..off + 14].copy_from_slice(&entry.created_lsn.to_le_bytes());
+        p[off + 14] = entry.flags;
+        p[off + 15] = 0;
+        off += VOLUME_ENTRY_FIXED_SIZE;
+        for root in entry.l2p_shard_roots.iter().copied() {
+            p[off..off + 8].copy_from_slice(&root.to_le_bytes());
+            off += 8;
+        }
+    }
+}
+
+/// A v10 manifest (no on-disk per-shard durable_seq arrays) must
+/// upgrade on decode by synthesising every per-shard value from
+/// `checkpoint_lsn`. The invariant `min(durable_seq[]) == checkpoint_lsn`
+/// holds by construction, so the next encode re-emits cleanly as v11.
+#[test]
+fn v10_manifest_decodes_with_durable_seq_backfilled_from_checkpoint_lsn() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let checkpoint_lsn: Lsn = 99;
+    let m = Manifest {
+        body_version: MANIFEST_BODY_VERSION,
+        checkpoint_lsn,
+        free_list_head: NULL_PAGE,
+        refcount_shard_roots: bx(&[1, 2, 3]),
+        // Decoder ignores this on v10 — value doesn't matter.
+        refcount_durable_seq: bx(&[]),
+        dedup_shards: 1,
+        dedup_index_shard_heads: one_shard(&[]),
+        next_snapshot_id: 1,
+        next_volume_ord: 1,
+        snapshots: Vec::new(),
+        volumes: vec![VolumeEntry {
+            ord: 0,
+            shard_count: 2,
+            l2p_shard_roots: bx(&[10, 11]),
+            // Same: decoder ignores this on v10.
+            l2p_shard_durable_seq: bx(&[]),
+            created_lsn: 0,
+            flags: 0,
+        }],
+    };
+    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
+    encode_v10_for_test(&m, &mut page);
+    page.seal();
+
+    let decoded = Manifest::decode(&page, &ps).unwrap();
+    // Per-shard arrays synthesised from checkpoint_lsn.
+    assert_eq!(decoded.refcount_durable_seq.as_ref(), &[99, 99, 99]);
+    assert_eq!(decoded.volumes[0].l2p_shard_durable_seq.as_ref(), &[99, 99]);
+    // Re-encoding must succeed (invariant holds) and emit v11.
+    let mut page2 = Page::new(PageHeader::new(PageType::Manifest, 1));
+    decoded.encode(&mut page2).unwrap();
+    page2.seal();
+    let body_version = u32::from_le_bytes(
+        page2.payload()[OFF_BODY_VERSION..OFF_BODY_VERSION + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(body_version, MANIFEST_BODY_VERSION);
 }

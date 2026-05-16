@@ -79,7 +79,16 @@ impl Db {
         // volume layout `encode()` will see at commit time.
         let dedup_update =
             self.prepare_dedup_manifest_update(&mut manifest_state.manifest, created_lsn)?;
-        self.refresh_manifest_from_locked(&mut manifest_state.manifest, &volumes, &l2p_guards)?;
+        // Per-shard durable_seq must match the about-to-be-committed
+        // `checkpoint_lsn = last_applied_lsn` (`created_lsn` here) so
+        // the encode-time invariant `min(durable_seq[]) == checkpoint_lsn`
+        // holds for both the probe encode below and the real commit.
+        self.refresh_manifest_from_locked(
+            &mut manifest_state.manifest,
+            &volumes,
+            &l2p_guards,
+            Some(created_lsn),
+        )?;
 
         // Pre-check: does the projected manifest (with the new snapshot
         // entry appended) still fit in one page? Failures after this
@@ -320,7 +329,12 @@ impl Db {
             let mut mstate = self.manifest_state.lock();
             let dedup_update =
                 self.prepare_dedup_manifest_update(&mut mstate.manifest, dedup_generation)?;
-            self.refresh_manifest_from_locked(&mut mstate.manifest, &volumes_snap, &l2p_guards)?;
+            self.refresh_manifest_from_locked(
+                &mut mstate.manifest,
+                &volumes_snap,
+                &l2p_guards,
+                Some(checkpoint_lsn),
+            )?;
             mstate.manifest.checkpoint_lsn = checkpoint_lsn;
             let manifest = mstate.manifest.clone();
             mstate.store.commit(&manifest)?;

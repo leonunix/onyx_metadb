@@ -51,6 +51,7 @@ pub(super) fn refresh_manifest_entries(
     volumes: &[Arc<Volume>],
     l2p_guards: &[RwLockWriteGuard<'_, PagedL2p>],
     refcount_shards: &[Shard],
+    durable_override: Option<Lsn>,
 ) -> Result<()> {
     manifest.body_version = MANIFEST_BODY_VERSION;
     let expected_total: usize = volumes.iter().map(|v| v.shards.len()).sum();
@@ -65,14 +66,37 @@ pub(super) fn refresh_manifest_entries(
     let mut new_entries = Vec::with_capacity(volumes.len());
     for vol in volumes {
         let mut roots = Vec::with_capacity(vol.shards.len());
-        for _ in 0..vol.shards.len() {
+        let mut durable_seqs = Vec::with_capacity(vol.shards.len());
+        for shard in vol.shards.iter() {
             roots.push(l2p_guards[guard_cursor].root());
+            // Capture the per-L2P-shard durable_seq. v11 (Tier 2.B
+            // Stage 1) persists this alongside `l2p_shard_roots` so
+            // each shard's watermark survives crash recovery without
+            // collapsing through the global `checkpoint_lsn`.
+            //
+            // `durable_override` is supplied by drop_volume /
+            // take_snapshot / drop_snapshot, which have flushed every
+            // shard inline and are about to write `manifest
+            // .checkpoint_lsn = last_applied_lsn`. In that context
+            // every shard IS durable up to the override LSN even
+            // though the per-shard atomics aren't bumped yet (they're
+            // bumped only by `flush_with_gate`'s post-commit loop).
+            // Reading atomics would otherwise leave the manifest's
+            // durable_seq lagging the new checkpoint_lsn, violating
+            // the Stage 1 invariant.
+            let seq = durable_override.unwrap_or_else(|| {
+                shard
+                    .last_flushed_lsn
+                    .load(std::sync::atomic::Ordering::Acquire)
+            });
+            durable_seqs.push(seq);
             guard_cursor += 1;
         }
         new_entries.push(VolumeEntry {
             ord: vol.ord,
             shard_count: vol.shards.len() as u32,
             l2p_shard_roots: roots.into_boxed_slice(),
+            l2p_shard_durable_seq: durable_seqs.into_boxed_slice(),
             created_lsn: vol.created_lsn,
             flags: vol.flags.load(std::sync::atomic::Ordering::Relaxed),
         });
@@ -81,6 +105,17 @@ pub(super) fn refresh_manifest_entries(
     manifest.refcount_shard_roots = refcount_shards
         .iter()
         .map(|shard| shard.rc.meta_page_id())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    manifest.refcount_durable_seq = refcount_shards
+        .iter()
+        .map(|shard| {
+            durable_override.unwrap_or_else(|| {
+                shard
+                    .last_flushed_lsn
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
+        })
         .collect::<Vec<_>>()
         .into_boxed_slice();
     Ok(())
@@ -192,9 +227,17 @@ pub(super) fn open_shards(
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     roots: &[PageId],
-    initial_last_flushed_lsn: Lsn,
+    initial_last_flushed_lsn: &[Lsn],
     metrics: Arc<MetaMetrics>,
 ) -> Result<Vec<Shard>> {
+    if initial_last_flushed_lsn.len() != roots.len() {
+        return Err(MetaDbError::Corruption(format!(
+            "open_shards: per-shard last_flushed_lsn slice length {} does not match \
+             roots length {}",
+            initial_last_flushed_lsn.len(),
+            roots.len(),
+        )));
+    }
     let mut shards = Vec::with_capacity(roots.len());
     for (shard_idx, &meta_page_id) in roots.iter().enumerate() {
         let rc =
@@ -202,7 +245,7 @@ pub(super) fn open_shards(
         shards.push(Shard {
             rc: Arc::new(rc),
             apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx, metrics.clone()),
-            last_flushed_lsn: AtomicU64::new(initial_last_flushed_lsn),
+            last_flushed_lsn: AtomicU64::new(initial_last_flushed_lsn[shard_idx]),
         });
     }
     Ok(shards)
@@ -267,9 +310,17 @@ pub(super) fn open_l2p_shards(
     roots: &[PageId],
     next_gen: Lsn,
     metrics: Arc<MetaMetrics>,
-    initial_last_flushed_lsn: Lsn,
+    initial_last_flushed_lsn: &[Lsn],
     use_buffer: bool,
 ) -> Result<Vec<L2pShard>> {
+    if initial_last_flushed_lsn.len() != roots.len() {
+        return Err(MetaDbError::Corruption(format!(
+            "open_l2p_shards: per-shard last_flushed_lsn slice length {} does not match \
+             roots length {}",
+            initial_last_flushed_lsn.len(),
+            roots.len(),
+        )));
+    }
     let mut shards = Vec::with_capacity(roots.len());
     for (shard_idx, &root) in roots.iter().enumerate() {
         let tree =
@@ -279,7 +330,7 @@ pub(super) fn open_l2p_shards(
             &page_cache,
             shard_idx,
             metrics.clone(),
-            initial_last_flushed_lsn,
+            initial_last_flushed_lsn[shard_idx],
             use_buffer,
         ));
     }

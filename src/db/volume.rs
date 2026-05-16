@@ -46,11 +46,18 @@ impl Db {
             // probe `take_snapshot` runs before its own irreversible
             // side effects.
             let mut probe = mstate.manifest.clone();
+            // Probe durable_seq matches the probe manifest's
+            // checkpoint_lsn so the v11 `min(durable_seq[]) ==
+            // checkpoint_lsn` invariant fires only on the real
+            // capacity miss (the size check above), not on a
+            // synthetic per-shard mismatch the probe itself created.
+            let probe_lsn = probe.checkpoint_lsn;
             probe.volumes.push(VolumeEntry {
                 ord,
                 shard_count,
                 l2p_shard_roots: vec![crate::types::NULL_PAGE; shard_count as usize]
                     .into_boxed_slice(),
+                l2p_shard_durable_seq: vec![probe_lsn; shard_count as usize].into_boxed_slice(),
                 created_lsn: 0,
                 flags: 0,
             });
@@ -97,10 +104,15 @@ impl Db {
 
         {
             let mut mstate = self.manifest_state.lock();
+            let durable_seqs = vec![lsn; shard_count as usize].into_boxed_slice();
             mstate.manifest.volumes.push(VolumeEntry {
                 ord,
                 shard_count,
                 l2p_shard_roots: roots,
+                // Fresh volume: every L2P shard is durable at the
+                // CreateVolume LSN (manifest commit is about to make
+                // it so). Subsequent flushes will advance these.
+                l2p_shard_durable_seq: durable_seqs,
                 created_lsn: lsn,
                 flags: 0,
             });
@@ -217,7 +229,12 @@ impl Db {
             let mut mstate = self.manifest_state.lock();
             let dedup_update =
                 self.prepare_dedup_manifest_update(&mut mstate.manifest, dedup_generation)?;
-            self.refresh_manifest_from_locked(&mut mstate.manifest, &volumes_snap, &l2p_guards)?;
+            self.refresh_manifest_from_locked(
+                &mut mstate.manifest,
+                &volumes_snap,
+                &l2p_guards,
+                Some(checkpoint_lsn),
+            )?;
             mstate.manifest.volumes.retain(|v| v.ord != vol_ord);
             mstate.manifest.checkpoint_lsn = checkpoint_lsn;
             let manifest = mstate.manifest.clone();
@@ -345,10 +362,16 @@ impl Db {
             // capacity, so reject before any irreversible WAL submit /
             // page refcount bump.
             let mut probe = mstate.manifest.clone();
+            // Same probe-vs-real-encode rationale as `create_volume`:
+            // stamp probe durable_seq to the probe's checkpoint_lsn
+            // so the invariant guards the snapshot-table capacity
+            // check rather than a synthetic mismatch.
+            let probe_lsn = probe.checkpoint_lsn;
             probe.volumes.push(VolumeEntry {
                 ord: new_ord,
                 shard_count: shard_count as u32,
                 l2p_shard_roots: vec![crate::types::NULL_PAGE; shard_count].into_boxed_slice(),
+                l2p_shard_durable_seq: vec![probe_lsn; shard_count].into_boxed_slice(),
                 created_lsn: 0,
                 flags: 0,
             });
@@ -423,10 +446,15 @@ impl Db {
 
         {
             let mut mstate = self.manifest_state.lock();
+            let durable_seqs = vec![lsn; shard_count as usize].into_boxed_slice();
             mstate.manifest.volumes.push(VolumeEntry {
                 ord: new_ord,
                 shard_count,
                 l2p_shard_roots: actual_roots,
+                // CloneVolume creates a fresh per-volume L2P at the
+                // CloneVolume LSN; the manifest commit makes that
+                // durable. Future flushes advance per-shard.
+                l2p_shard_durable_seq: durable_seqs,
                 created_lsn: lsn,
                 flags: 0,
             });
@@ -592,13 +620,27 @@ impl Db {
     /// cursor and is only ever advanced by code paths that have taken
     /// `apply_gate.write()` (flush / take_snapshot / drop_snapshot) and
     /// therefore have an authoritative reading of `last_applied_lsn`.
+    ///
+    /// `durable_override` is Stage 1 (Tier 2.B) plumbing: callers
+    /// that just flushed every shard and are about to write
+    /// `manifest.checkpoint_lsn = last_applied_lsn` pass `Some(lsn)`
+    /// so the persisted per-shard `durable_seq` arrays match the new
+    /// checkpoint. Passing `None` reads atomics (used by `flush_with_gate`
+    /// post-commit and by `open` recovery).
     pub(super) fn refresh_manifest_from_locked(
         &self,
         manifest: &mut Manifest,
         volumes: &[Arc<Volume>],
         l2p_guards: &[RwLockWriteGuard<'_, PagedL2p>],
+        durable_override: Option<Lsn>,
     ) -> Result<()> {
-        refresh_manifest_entries(manifest, volumes, l2p_guards, &self.refcount_shards)
+        refresh_manifest_entries(
+            manifest,
+            volumes,
+            l2p_guards,
+            &self.refcount_shards,
+            durable_override,
+        )
     }
 
     pub(super) fn current_generation(&self) -> Lsn {
