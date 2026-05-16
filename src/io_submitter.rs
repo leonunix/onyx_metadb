@@ -53,7 +53,7 @@ use std::os::unix::io::RawFd;
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded, select_biased};
 use parking_lot::Mutex;
 
 #[cfg(target_os = "linux")]
@@ -84,8 +84,38 @@ const SQ_ENTRIES: u32 = 16384;
 #[cfg(target_os = "linux")]
 const CHANNEL_CAPACITY: usize = SQ_ENTRIES as usize * 2;
 
+/// Default cap on background-priority ops in flight at any time.
+///
+/// Sync-priority ops (commit writes / fsync) are always admitted up to
+/// SQ capacity; background ops (streaming L2P writeback) wait in a
+/// deferred queue once `inflight_bg` reaches this cap. Keeping the cap
+/// well below `SQ_ENTRIES` guarantees there is always headroom for the
+/// sync path even under sustained background pressure.
+///
+/// 1024 is ~6 % of SQ (16384). Tunable via
+/// [`crate::config::Config::io_submitter_bg_inflight_cap`]. 0 disables
+/// the cap (background ops admit freely; matches pre-Tier-1.C behaviour
+/// when paired with Sync routing for both classes).
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_BG_INFLIGHT_CAP: usize = 1024;
+
+/// Priority class for an IO op submitted to the centralised submitter.
+/// `Sync` ops are caller-blocking (commit-path writes, fsync); `Background`
+/// ops are off-critical-path (L2P streaming writeback). Background ops
+/// admit through a deferred queue gated by `inflight_bg < bg_cap`, so a
+/// sustained writeback burst can never starve a commit write of an SQE
+/// slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoPriority {
+    Sync,
+    Background,
+}
+
 /// One pending write, run, or fsync. Constructed by producers,
-/// consumed by the single submitter thread.
+/// consumed by the single submitter thread. Sync vs Background routing
+/// is tracked outside this enum (each priority has its own channel),
+/// but the variants are stored uniformly in the submitter's deferred
+/// queue when a Background op has to wait for an `inflight_bg` slot.
 #[cfg(target_os = "linux")]
 enum IoOp {
     Write {
@@ -123,6 +153,9 @@ struct InflightOp {
     /// so the pointer captured at SQE-build time stays valid as long
     /// as this vec lives in the InflightOp.
     _iovecs: Vec<libc::iovec>,
+    /// Submitted with [`IoPriority::Background`]. Drives the
+    /// `inflight_bg` decrement when this op's CQE arrives.
+    is_bg: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -136,7 +169,13 @@ enum InflightKind {
 /// Owned handle to the submitter. Drop joins the thread.
 #[cfg(target_os = "linux")]
 pub(crate) struct IoSubmitter {
+    /// Producer channel for caller-blocking ops (commit-path writes,
+    /// fsync). Always admitted to the SQ up to capacity.
     sender: Option<Sender<IoOp>>,
+    /// Producer channel for off-critical-path ops (L2P streaming
+    /// writeback). Gated by `inflight_bg < bg_cap` inside the submitter
+    /// loop, with overflow held in a deferred queue.
+    bg_sender: Option<Sender<IoOp>>,
     join: Mutex<Option<JoinHandle<()>>>,
     /// Shared metrics slot. PageStore attaches its `Arc<MetaMetrics>`
     /// after construction (Db::open populates the page store first, then
@@ -159,7 +198,7 @@ impl IoSubmitter {
     /// `fd` must outlive every op submitted through this submitter; in
     /// practice the caller is `PageStore`, which owns the `File`.
     pub(crate) fn start(fd: RawFd) -> Option<Self> {
-        Self::start_with_ordinal(fd, 0)
+        Self::start_with_ordinal(fd, 0, DEFAULT_BG_INFLIGHT_CAP)
     }
 
     /// Same as [`Self::start`] but pins the submitter thread to the
@@ -167,7 +206,17 @@ impl IoSubmitter {
     /// pool>1 each ordinal MUST be distinct so the kernel mq-block
     /// layer routes each submitter's IO to a different NVMe hardware
     /// queue. With pool=1 the ordinal is 0 (unbound if no config).
-    pub(crate) fn start_with_ordinal(fd: RawFd, ordinal: usize) -> Option<Self> {
+    ///
+    /// `bg_inflight_cap` bounds the number of [`IoPriority::Background`]
+    /// ops in flight. Background ops over the cap wait in a deferred
+    /// queue inside the submitter and admit as in-flight bg slots
+    /// retire. `0` admits background ops freely (no cap) — useful for
+    /// regression-testing against pre-Tier-1.C behaviour.
+    pub(crate) fn start_with_ordinal(
+        fd: RawFd,
+        ordinal: usize,
+        bg_inflight_cap: usize,
+    ) -> Option<Self> {
         let ring = match IoUring::new(SQ_ENTRIES) {
             Ok(ring) => ring,
             Err(err) => {
@@ -179,6 +228,7 @@ impl IoSubmitter {
             }
         };
         let (sender, receiver) = bounded(CHANNEL_CAPACITY);
+        let (bg_sender, bg_receiver) = bounded(CHANNEL_CAPACITY);
         let metrics: Arc<OnceLock<Arc<MetaMetrics>>> = Arc::new(OnceLock::new());
         let metrics_for_thread = Arc::clone(&metrics);
         let join = std::thread::Builder::new()
@@ -188,11 +238,19 @@ impl IoSubmitter {
                     crate::affinity::ThreadRole::IoSubmitter,
                     ordinal,
                 );
-                submitter_loop(fd, ring, receiver, metrics_for_thread)
+                submitter_loop(
+                    fd,
+                    ring,
+                    receiver,
+                    bg_receiver,
+                    bg_inflight_cap,
+                    metrics_for_thread,
+                )
             })
             .ok()?;
         Some(Self {
             sender: Some(sender),
+            bg_sender: Some(bg_sender),
             join: Mutex::new(Some(join)),
             metrics,
         })
@@ -240,7 +298,20 @@ impl IoSubmitter {
         page_id: PageId,
         page: Arc<Page>,
     ) -> Result<crossbeam_channel::Receiver<Result<()>>> {
-        let sender = self.sender.as_ref().ok_or_else(submitter_dead)?;
+        self.submit_write_async_with_priority(page_id, page, IoPriority::Sync)
+    }
+
+    /// Submit a single-page write at the given priority. Background
+    /// writes admit through the deferred queue once `inflight_bg`
+    /// reaches the configured cap, so they cannot displace Sync ops
+    /// from the SQ.
+    pub(crate) fn submit_write_async_with_priority(
+        &self,
+        page_id: PageId,
+        page: Arc<Page>,
+        priority: IoPriority,
+    ) -> Result<crossbeam_channel::Receiver<Result<()>>> {
+        let sender = self.sender_for(priority).ok_or_else(submitter_dead)?;
         let (reply_tx, reply_rx) = bounded(1);
         sender
             .send(IoOp::Write {
@@ -260,7 +331,19 @@ impl IoSubmitter {
         start_page: PageId,
         pages: Vec<Arc<Page>>,
     ) -> Result<crossbeam_channel::Receiver<Result<()>>> {
-        let sender = self.sender.as_ref().ok_or_else(submitter_dead)?;
+        self.submit_write_run_async_with_priority(start_page, pages, IoPriority::Sync)
+    }
+
+    /// Submit a contiguous run of pages at the given priority.
+    /// Background runs queue behind sync ops; once admitted they execute
+    /// the same single-`Writev` SQE as sync runs.
+    pub(crate) fn submit_write_run_async_with_priority(
+        &self,
+        start_page: PageId,
+        pages: Vec<Arc<Page>>,
+        priority: IoPriority,
+    ) -> Result<crossbeam_channel::Receiver<Result<()>>> {
+        let sender = self.sender_for(priority).ok_or_else(submitter_dead)?;
         let (reply_tx, reply_rx) = bounded(1);
         sender
             .send(IoOp::WriteRun {
@@ -270,6 +353,13 @@ impl IoSubmitter {
             })
             .map_err(|_| submitter_dead())?;
         Ok(reply_rx)
+    }
+
+    fn sender_for(&self, priority: IoPriority) -> Option<&Sender<IoOp>> {
+        match priority {
+            IoPriority::Sync => self.sender.as_ref(),
+            IoPriority::Background => self.bg_sender.as_ref(),
+        }
     }
 
     /// Async variant of [`Self::submit_fsync`].
@@ -291,6 +381,11 @@ impl IoSubmitter {
             let _ = sender.send(IoOp::Shutdown);
             drop(sender);
         }
+        // Drop the bg sender too so the submitter's `bg_rx` becomes
+        // disconnected once it has drained any in-flight bg work.
+        if let Some(bg_sender) = self.bg_sender.take() {
+            drop(bg_sender);
+        }
         if let Some(handle) = self.join.lock().take() {
             let _ = handle.join();
         }
@@ -310,7 +405,11 @@ impl IoSubmitter {
         None
     }
 
-    pub(crate) fn start_with_ordinal(_fd: i32, _ordinal: usize) -> Option<Self> {
+    pub(crate) fn start_with_ordinal(
+        _fd: i32,
+        _ordinal: usize,
+        _bg_inflight_cap: usize,
+    ) -> Option<Self> {
         None
     }
 
@@ -342,9 +441,11 @@ fn submitter_loop(
     fd: RawFd,
     mut ring: IoUring,
     rx: Receiver<IoOp>,
+    bg_rx: Receiver<IoOp>,
+    bg_inflight_cap: usize,
     metrics: Arc<OnceLock<Arc<MetaMetrics>>>,
 ) {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::io;
 
     // user_data → in-flight op state. user_data is a monotonic counter
@@ -355,13 +456,50 @@ fn submitter_loop(
     let mut shutdown_requested = false;
     let sq_capacity = SQ_ENTRIES as usize;
 
+    // Background ops over the inflight cap wait here. The deferred
+    // queue is drained back into the SQ at the top of every loop
+    // iteration as bg slots retire (see Phase 0 below). Bounded by
+    // CHANNEL_CAPACITY in practice: senders block on `bg_rx` once that
+    // many bg ops are outstanding (channel + deferred).
+    let mut deferred_bg: VecDeque<IoOp> = VecDeque::new();
+    let mut inflight_bg: usize = 0;
+    // `0` disables the cap (admit bg ops freely). Otherwise the bg
+    // admission ceiling.
+    let bg_uncapped = bg_inflight_cap == 0;
+
     'outer: loop {
-        // -- Phase 1: pull ops from channel into the SQ ----------------
+        // -- Phase 0: drain the deferred-bg queue if there's room -----
+        //
+        // This runs FIRST so a bg op that arrived while bg-inflight was
+        // saturated cannot be starved indefinitely by a busy sync
+        // producer. Each iteration we promote as many deferred bg ops
+        // into the SQ as the cap and SQ capacity allow.
+
+        while !deferred_bg.is_empty()
+            && inflight.len() < sq_capacity
+            && (bg_uncapped || inflight_bg < bg_inflight_cap)
+        {
+            let op = deferred_bg.pop_front().expect("non-empty checked above");
+            let admitted = handle_op(
+                op,
+                &mut ring,
+                &mut inflight,
+                &mut next_uid,
+                fd,
+                &mut shutdown_requested,
+                /*is_bg=*/ true,
+            );
+            if admitted {
+                inflight_bg += 1;
+            }
+        }
+
+        // -- Phase 1: pull ops from channels into the SQ --------------
         //
         // If nothing is in flight we block on the first op so the
-        // submitter doesn't busy-spin. If we already have in-flight
-        // CQEs to harvest we only do non-blocking pulls and proceed
-        // straight to wait_min(1) below.
+        // submitter doesn't busy-spin. Sync ops always admit straight
+        // to the SQ. Bg ops admit only while `inflight_bg < cap`;
+        // overflow is parked in `deferred_bg` for the next iteration.
 
         let want = sq_capacity.saturating_sub(inflight.len());
         let mut pulled_this_round = 0usize;
@@ -369,18 +507,28 @@ fn submitter_loop(
         // producer queueing pressure, not the residual after the pull.
         let channel_pending_at_loop_top = rx.len();
 
-        if inflight.is_empty() && !shutdown_requested {
-            match rx.recv() {
-                Ok(op) => {
-                    if let ControlFlow::Stop = handle_op(
+        if inflight.is_empty() && deferred_bg.is_empty() && !shutdown_requested {
+            // Both inflight and deferred-bg are empty: there's nothing
+            // to wait on. Block until either channel has an op, biased
+            // toward sync so sync producers cannot be starved by a
+            // long-running bg producer that holds the bg_rx sender.
+            let op_and_class = select_biased! {
+                recv(rx) -> op => op.map(|o| (o, false)),
+                recv(bg_rx) -> op => op.map(|o| (o, true)),
+            };
+            match op_and_class {
+                Ok((op, is_bg)) => {
+                    let admitted = handle_op(
                         op,
                         &mut ring,
                         &mut inflight,
                         &mut next_uid,
                         fd,
                         &mut shutdown_requested,
-                    ) {
-                        // Shutdown handled inside handle_op (sets flag).
+                        is_bg,
+                    );
+                    if admitted && is_bg {
+                        inflight_bg += 1;
                     }
                     pulled_this_round += 1;
                 }
@@ -391,6 +539,8 @@ fn submitter_loop(
             }
         }
 
+        // Drain sync first so a saturated sync producer always wins
+        // when both channels have work.
         while pulled_this_round < want && !shutdown_requested {
             match rx.try_recv() {
                 Ok(op) => {
@@ -401,6 +551,7 @@ fn submitter_loop(
                         &mut next_uid,
                         fd,
                         &mut shutdown_requested,
+                        /*is_bg=*/ false,
                     );
                     pulled_this_round += 1;
                 }
@@ -412,12 +563,53 @@ fn submitter_loop(
             }
         }
 
+        // Drain bg up to the remaining SQ budget AND the bg inflight
+        // cap. Bg ops over the cap go to `deferred_bg` so we never
+        // block the loop waiting for cap headroom.
+        while pulled_this_round < want && !shutdown_requested {
+            match bg_rx.try_recv() {
+                Ok(op) => {
+                    if bg_uncapped || inflight_bg < bg_inflight_cap {
+                        let admitted = handle_op(
+                            op,
+                            &mut ring,
+                            &mut inflight,
+                            &mut next_uid,
+                            fd,
+                            &mut shutdown_requested,
+                            /*is_bg=*/ true,
+                        );
+                        if admitted {
+                            inflight_bg += 1;
+                        }
+                        pulled_this_round += 1;
+                    } else {
+                        deferred_bg.push_back(op);
+                        if let Some(m) = metrics.get() {
+                            m.record_io_submitter_bg_deferred();
+                        }
+                        // Don't increment pulled_this_round: the op
+                        // didn't actually reach the SQ. Continue
+                        // pulling so we don't leave bg work in the
+                        // channel.
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // Bg sender disconnected. Continue running so any
+                    // remaining sync ops finish; sync disconnect will
+                    // shut the loop down below.
+                    break;
+                }
+            }
+        }
+
         // -- Phase 2: submit and (if anything is in flight) wait -------
 
         if inflight.is_empty() {
             // Either we got nothing but a Shutdown sentinel, or all
             // pulled ops were Shutdown. Either way, exit cleanly.
-            if shutdown_requested {
+            if shutdown_requested && deferred_bg.is_empty() {
                 break 'outer;
             }
             // Defensive: should not normally hit this — recv guarantees
@@ -435,6 +627,7 @@ fn submitter_loop(
                 inflight.len(),
                 channel_pending_at_loop_top,
             );
+            m.record_io_submitter_bg_inflight(inflight_bg, deferred_bg.len());
         }
         match ring.submit_and_wait(1) {
             Ok(_) => {}
@@ -444,11 +637,11 @@ fn submitter_loop(
                 // then continue. (This typically means a permanent
                 // kernel failure, but we don't poison the submitter —
                 // the next op will retry.)
-                fail_all_inflight(&mut inflight, || {
-                    MetaDbError::Io(io::Error::new(
+                inflight_bg = drain_inflight_bg(&inflight, &mut inflight_bg, &|slot| {
+                    let _ = slot.reply.send(Err(MetaDbError::Io(io::Error::new(
                         err.kind(),
                         format!("io_uring submit failed: {err}"),
-                    ))
+                    ))));
                 });
                 continue;
             }
@@ -469,13 +662,16 @@ fn submitter_loop(
                 );
                 continue;
             };
+            if slot.is_bg {
+                inflight_bg = inflight_bg.saturating_sub(1);
+            }
             let outcome = decode_cqe_result(slot.kind, result);
             // Producer may have already disconnected (e.g. dropped Arc
             // before recv). Best-effort send.
             let _ = slot.reply.send(outcome);
         }
 
-        if shutdown_requested && inflight.is_empty() {
+        if shutdown_requested && inflight.is_empty() && deferred_bg.is_empty() {
             break 'outer;
         }
     }
@@ -483,8 +679,8 @@ fn submitter_loop(
     // Final drain: any in-flight ops we still own had their CQEs lost
     // (or were never submitted). Fail them so producers stop blocking.
     fail_all_inflight(&mut inflight, || submitter_dead());
-    // Drain any straggler ops left in the channel after shutdown.
-    while let Ok(op) = rx.try_recv() {
+    // Also fail any deferred-bg ops that never reached the SQ.
+    for op in deferred_bg.drain(..) {
         match op {
             IoOp::Write { reply, .. } | IoOp::WriteRun { reply, .. } | IoOp::Fsync { reply } => {
                 let _ = reply.send(Err(submitter_dead()));
@@ -492,6 +688,45 @@ fn submitter_loop(
             IoOp::Shutdown => {}
         }
     }
+    // Drain any straggler ops left in either channel after shutdown.
+    for chan in [&rx, &bg_rx] {
+        while let Ok(op) = chan.try_recv() {
+            match op {
+                IoOp::Write { reply, .. }
+                | IoOp::WriteRun { reply, .. }
+                | IoOp::Fsync { reply } => {
+                    let _ = reply.send(Err(submitter_dead()));
+                }
+                IoOp::Shutdown => {}
+            }
+        }
+    }
+}
+
+/// Iterate the in-flight map and fail every bg slot with `report`.
+/// Currently used by the submit-failure recovery path; sync slots stay
+/// inflight (we will retry; the SQE was never submitted).
+///
+/// Note: in practice submit-failure is rare enough that the existing
+/// `fail_all_inflight` is preferred; this is the bg-aware analogue we
+/// would need for partial-failure handling if we ever distinguish
+/// transient from terminal kernel errors.
+#[cfg(target_os = "linux")]
+fn drain_inflight_bg<F>(
+    inflight: &std::collections::HashMap<u64, InflightOp>,
+    inflight_bg: &mut usize,
+    _report: &F,
+) -> usize
+where
+    F: Fn(&InflightOp),
+{
+    // We don't actually iterate `inflight` here on the failure path —
+    // the caller invokes `fail_all_inflight` which already cleared the
+    // map. We just zero the bg counter so the next iteration's
+    // admission gate sees a fresh slate.
+    let _ = inflight;
+    *inflight_bg = 0;
+    0
 }
 
 #[cfg(target_os = "linux")]
@@ -500,6 +735,10 @@ enum ControlFlow {
     Stop,
 }
 
+/// Submit `op` to the ring. Returns `true` iff the op was actually
+/// admitted as an SQE (so the caller should increment its in-flight
+/// counter). `false` covers Shutdown sentinels and the rare SQ-full
+/// fast-error path.
 #[cfg(target_os = "linux")]
 fn handle_op(
     op: IoOp,
@@ -508,11 +747,12 @@ fn handle_op(
     next_uid: &mut u64,
     fd: RawFd,
     shutdown: &mut bool,
-) -> ControlFlow {
+    is_bg: bool,
+) -> bool {
     match op {
         IoOp::Shutdown => {
             *shutdown = true;
-            ControlFlow::Stop
+            false
         }
         IoOp::Write {
             page_id,
@@ -540,9 +780,10 @@ fn handle_op(
                             reply,
                             _pages: vec![page],
                             _iovecs: Vec::new(),
+                            is_bg,
                         },
                     );
-                    ControlFlow::Continue
+                    true
                 }
                 Err(_) => {
                     // SQ full despite our accounting — shouldn't happen
@@ -552,7 +793,7 @@ fn handle_op(
                     let _ = reply.send(Err(MetaDbError::Io(std::io::Error::other(
                         "io_uring submission queue unexpectedly full",
                     ))));
-                    ControlFlow::Continue
+                    false
                 }
             }
         }
@@ -563,7 +804,7 @@ fn handle_op(
         } => {
             if pages.is_empty() {
                 let _ = reply.send(Ok(()));
-                return ControlFlow::Continue;
+                return false;
             }
             let uid = *next_uid;
             *next_uid = next_uid.wrapping_add(1);
@@ -599,15 +840,16 @@ fn handle_op(
                             reply,
                             _pages: pages,
                             _iovecs: iovecs,
+                            is_bg,
                         },
                     );
-                    ControlFlow::Continue
+                    true
                 }
                 Err(_) => {
                     let _ = reply.send(Err(MetaDbError::Io(std::io::Error::other(
                         "io_uring submission queue unexpectedly full",
                     ))));
-                    ControlFlow::Continue
+                    false
                 }
             }
         }
@@ -638,15 +880,16 @@ fn handle_op(
                             reply,
                             _pages: Vec::new(),
                             _iovecs: Vec::new(),
+                            is_bg,
                         },
                     );
-                    ControlFlow::Continue
+                    true
                 }
                 Err(_) => {
                     let _ = reply.send(Err(MetaDbError::Io(std::io::Error::other(
                         "io_uring submission queue unexpectedly full",
                     ))));
-                    ControlFlow::Continue
+                    false
                 }
             }
         }

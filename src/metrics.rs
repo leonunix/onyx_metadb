@@ -471,6 +471,15 @@ pub struct MetaMetrics {
     /// Count of `PageStore::allocate_run` calls made by drainers to
     /// refill their per-shard `PagePool`.
     rc_drainer_pool_refills: AtomicU64,
+    /// Worker park-loop wake events: how many times the worker exited
+    /// the park to attempt a cycle. Compare against `rc_drainer_cycles`:
+    /// `wakes > cycles` → worker is alive but most wakes saw empty
+    /// `delta_active` (likely preempted by checkpoint between ticks).
+    rc_drainer_wakes: AtomicU64,
+    /// Worker observed `preempt=true` and entered the preempt branch.
+    /// Each checkpoint typically yields exactly one preempt per shard;
+    /// large counts → checkpoint cadence dominates the drainer schedule.
+    rc_drainer_preempts: AtomicU64,
 
     // H4: bandwidth counter paired with `flush_pages_written` so a
     // window snapshot can compute writeback MB/s without assuming
@@ -536,6 +545,19 @@ pub struct MetaMetrics {
     io_submitter_channel_pending_max: AtomicU64,
     io_submitter_submit_batch_size_max: AtomicU64,
     io_submitter_inflight_max: AtomicU64,
+    /// Background-priority ops the submitter parked in its deferred
+    /// queue because `inflight_bg` had reached the configured cap.
+    /// Compare against `io_submitter_sqes_submitted` (specifically the
+    /// bg subset) to see how often the gate fired.
+    io_submitter_bg_deferred: AtomicU64,
+    /// Peak `inflight_bg` count observed across all submitter loop
+    /// iterations. Approaches the configured cap whenever a writeback
+    /// burst saturates the gate.
+    io_submitter_bg_inflight_max: AtomicU64,
+    /// Peak depth of the deferred-bg queue observed inside the
+    /// submitter. A non-zero peak means writeback producers ran ahead
+    /// of bg admission for at least one iteration.
+    io_submitter_bg_deferred_max: AtomicU64,
 
     // L2P streaming writeback (`Config::l2p_writeback_enabled`).
     // Background worker that continuously seals dirty L2P pages and
@@ -568,6 +590,11 @@ pub struct MetaMetrics {
     l2p_writeback_install_us: AtomicU64,
     l2p_writeback_install_max_us: AtomicU64,
     l2p_writeback_errors: AtomicU64,
+    /// Cycles the streaming-flush worker skipped because the global
+    /// `dirty_pages_target` gate was not crossed. Compare against
+    /// `l2p_writeback_cycles` to see how often the target gate kept
+    /// the worker quiet vs. how often it actually swept shards.
+    l2p_writeback_target_skips: AtomicU64,
 }
 
 /// Why this `Db::flush()` invocation is happening. Tags the metrics so
@@ -901,6 +928,8 @@ pub struct MetaMetricsSnapshot {
     pub rc_drainer_checkpoint_wait_max_us: u64,
     pub rc_drainer_backpressure_fallbacks: u64,
     pub rc_drainer_pool_refills: u64,
+    pub rc_drainer_wakes: u64,
+    pub rc_drainer_preempts: u64,
 
     pub flush_io_bytes_total: u64,
 
@@ -929,6 +958,9 @@ pub struct MetaMetricsSnapshot {
 
     pub io_submitter_iterations: u64,
     pub io_submitter_sqes_submitted: u64,
+    pub io_submitter_bg_deferred: u64,
+    pub io_submitter_bg_inflight_max: u64,
+    pub io_submitter_bg_deferred_max: u64,
     pub io_submitter_channel_pending_max: u64,
     pub io_submitter_submit_batch_size_max: u64,
     pub io_submitter_inflight_max: u64,
@@ -947,6 +979,7 @@ pub struct MetaMetricsSnapshot {
     pub l2p_writeback_install_us: u64,
     pub l2p_writeback_install_max_us: u64,
     pub l2p_writeback_errors: u64,
+    pub l2p_writeback_target_skips: u64,
 }
 
 impl MetaMetrics {
@@ -1309,6 +1342,8 @@ impl MetaMetrics {
             rc_drainer_checkpoint_wait_max_us: load(&self.rc_drainer_checkpoint_wait_max_us),
             rc_drainer_backpressure_fallbacks: load(&self.rc_drainer_backpressure_fallbacks),
             rc_drainer_pool_refills: load(&self.rc_drainer_pool_refills),
+            rc_drainer_wakes: load(&self.rc_drainer_wakes),
+            rc_drainer_preempts: load(&self.rc_drainer_preempts),
 
             flush_io_bytes_total: load(&self.flush_io_bytes_total),
 
@@ -1337,6 +1372,9 @@ impl MetaMetrics {
 
             io_submitter_iterations: load(&self.io_submitter_iterations),
             io_submitter_sqes_submitted: load(&self.io_submitter_sqes_submitted),
+            io_submitter_bg_deferred: load(&self.io_submitter_bg_deferred),
+            io_submitter_bg_inflight_max: load(&self.io_submitter_bg_inflight_max),
+            io_submitter_bg_deferred_max: load(&self.io_submitter_bg_deferred_max),
             io_submitter_channel_pending_max: load(&self.io_submitter_channel_pending_max),
             io_submitter_submit_batch_size_max: load(&self.io_submitter_submit_batch_size_max),
             io_submitter_inflight_max: load(&self.io_submitter_inflight_max),
@@ -1355,6 +1393,7 @@ impl MetaMetrics {
             l2p_writeback_install_us: load(&self.l2p_writeback_install_us),
             l2p_writeback_install_max_us: load(&self.l2p_writeback_install_max_us),
             l2p_writeback_errors: load(&self.l2p_writeback_errors),
+            l2p_writeback_target_skips: load(&self.l2p_writeback_target_skips),
         }
     }
 
@@ -1529,6 +1568,19 @@ impl MetaMetrics {
         );
     }
 
+    /// Called once per bg op the submitter has to park in its deferred
+    /// queue because `inflight_bg` is at the cap.
+    pub(crate) fn record_io_submitter_bg_deferred(&self) {
+        self.io_submitter_bg_deferred.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sampled once per submitter iteration. Tracks the bg admission
+    /// gate's high-water marks.
+    pub(crate) fn record_io_submitter_bg_inflight(&self, inflight_bg: usize, deferred: usize) {
+        fetch_max(&self.io_submitter_bg_inflight_max, inflight_bg as u64);
+        fetch_max(&self.io_submitter_bg_deferred_max, deferred as u64);
+    }
+
     pub(crate) fn record_l2p_writeback_cycle(&self, did_work: bool) {
         self.l2p_writeback_cycles.fetch_add(1, Ordering::Relaxed);
         if did_work {
@@ -1586,6 +1638,11 @@ impl MetaMetrics {
 
     pub(crate) fn record_l2p_writeback_error(&self) {
         self.l2p_writeback_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_l2p_writeback_target_skip(&self) {
+        self.l2p_writeback_target_skips
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_flush_io_seal(&self, elapsed: Duration) {
@@ -1727,6 +1784,14 @@ impl MetaMetrics {
 
     pub(crate) fn record_rc_drainer_pool_refill(&self) {
         self.rc_drainer_pool_refills.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_rc_drainer_wake(&self) {
+        self.rc_drainer_wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_rc_drainer_preempt(&self) {
+        self.rc_drainer_preempts.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_commit_empty(&self) {
@@ -2873,6 +2938,8 @@ impl MetaMetricsSnapshot {
                 "\"rc_drainer_checkpoint_wait_max_us\":{},",
                 "\"rc_drainer_backpressure_fallbacks\":{},",
                 "\"rc_drainer_pool_refills\":{},",
+                "\"rc_drainer_wakes\":{},",
+                "\"rc_drainer_preempts\":{},",
                 "\"flush_io_bytes_total\":{},",
                 "\"meta_io_write_calls\":{},",
                 "\"meta_io_write_ops\":{},",
@@ -2898,6 +2965,9 @@ impl MetaMetricsSnapshot {
                 "\"io_submitter_channel_pending_max\":{},",
                 "\"io_submitter_submit_batch_size_max\":{},",
                 "\"io_submitter_inflight_max\":{},",
+                "\"io_submitter_bg_deferred\":{},",
+                "\"io_submitter_bg_inflight_max\":{},",
+                "\"io_submitter_bg_deferred_max\":{},",
                 "\"l2p_writeback_cycles\":{},",
                 "\"l2p_writeback_cycles_with_work\":{},",
                 "\"l2p_writeback_shards_flushed\":{},",
@@ -2911,7 +2981,8 @@ impl MetaMetricsSnapshot {
                 "\"l2p_writeback_io_max_us\":{},",
                 "\"l2p_writeback_install_us\":{},",
                 "\"l2p_writeback_install_max_us\":{},",
-                "\"l2p_writeback_errors\":{}",
+                "\"l2p_writeback_errors\":{},",
+                "\"l2p_writeback_target_skips\":{}",
                 "}}"
             ),
             self.commit_attempts,
@@ -3184,6 +3255,8 @@ impl MetaMetricsSnapshot {
             self.rc_drainer_checkpoint_wait_max_us,
             self.rc_drainer_backpressure_fallbacks,
             self.rc_drainer_pool_refills,
+            self.rc_drainer_wakes,
+            self.rc_drainer_preempts,
             self.flush_io_bytes_total,
             self.meta_io_write_calls,
             self.meta_io_write_ops,
@@ -3209,6 +3282,9 @@ impl MetaMetricsSnapshot {
             self.io_submitter_channel_pending_max,
             self.io_submitter_submit_batch_size_max,
             self.io_submitter_inflight_max,
+            self.io_submitter_bg_deferred,
+            self.io_submitter_bg_inflight_max,
+            self.io_submitter_bg_deferred_max,
             self.l2p_writeback_cycles,
             self.l2p_writeback_cycles_with_work,
             self.l2p_writeback_shards_flushed,
@@ -3223,6 +3299,7 @@ impl MetaMetricsSnapshot {
             self.l2p_writeback_install_us,
             self.l2p_writeback_install_max_us,
             self.l2p_writeback_errors,
+            self.l2p_writeback_target_skips,
         )
     }
 }

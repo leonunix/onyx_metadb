@@ -434,12 +434,29 @@ impl RcShard {
         metrics: Arc<MetaMetrics>,
         shard_idx: usize,
     ) {
+        // Log every entry so an attach failure (config disabled,
+        // already attached, or never called) is visible in engine.log
+        // without having to grep for negative space.
         if !cfg.refcount_drainer_enabled {
+            tracing::info!(
+                shard = shard_idx,
+                "rc-drainer: attach skipped — refcount_drainer_enabled=false"
+            );
             return;
         }
         if self.drainer.lock().is_some() {
+            tracing::info!(
+                shard = shard_idx,
+                "rc-drainer: attach skipped — already attached"
+            );
             return;
         }
+        tracing::info!(
+            shard = shard_idx,
+            interval_ms = cfg.refcount_drainer_interval_ms,
+            threshold = cfg.refcount_drainer_threshold_entries,
+            "rc-drainer: attaching drainer thread"
+        );
         // Re-construct the pool with the real metrics handle so
         // `record_rc_drainer_pool_refill` surfaces correctly.
         {
@@ -840,6 +857,16 @@ impl DrainerWorker {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
         let interval = Duration::from_millis(self.interval_ms);
+        tracing::info!(
+            shard = self.shard_idx,
+            interval_ms = self.interval_ms,
+            threshold = self.threshold_entries,
+            "rc-drainer: worker thread entered run loop"
+        );
+        // Track local cycle count so we can emit a one-shot "first
+        // cycle completed" log per shard (confirms the cycle path
+        // actually fires, not just the wake path).
+        let mut cycle_count: u64 = 0;
         loop {
             // Park until tick / threshold / preempt / shutdown.
             {
@@ -849,6 +876,7 @@ impl DrainerWorker {
                         return;
                     }
                     if self.state.preempt.load(Ordering::Acquire) {
+                        self.metrics.record_rc_drainer_preempt();
                         self.state.in_cycle.store(false, Ordering::Release);
                         self.state.preempt_done.store(true, Ordering::Release);
                         self.state.cv.notify_all();
@@ -874,6 +902,12 @@ impl DrainerWorker {
                     }
                 }
             }
+
+            // Exited the park: we are about to attempt a cycle.
+            // Comparing `wakes` to `cycles` discriminates "worker dead"
+            // (wakes=0) vs "spinning, never finds work" (wakes>0,
+            // cycles=0) vs "preempted out" (preempts ≈ wakes).
+            self.metrics.record_rc_drainer_wake();
 
             // Run one cycle.
             self.state.in_cycle.store(true, Ordering::Release);
@@ -974,6 +1008,20 @@ impl DrainerWorker {
             let overlay_size = self.shard.overlay.approx_size();
             self.metrics
                 .record_rc_drainer_cycle(drained_len, pages_built, elapsed, overlay_size);
+            cycle_count += 1;
+            // One-shot log per shard confirming the cycle path actually
+            // fires (the bare metric counter doesn't distinguish "first
+            // ever cycle" from "ongoing"; this lets us catch a shard
+            // whose worker thread started but never reached a cycle).
+            if cycle_count == 1 {
+                tracing::info!(
+                    shard = self.shard_idx,
+                    drained_len,
+                    pages_built,
+                    elapsed_us = elapsed.as_micros() as u64,
+                    "rc-drainer: first cycle completed"
+                );
+            }
             self.state.in_cycle.store(false, Ordering::Release);
             self.state.cv.notify_all();
         }

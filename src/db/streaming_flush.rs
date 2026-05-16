@@ -85,6 +85,11 @@ pub(super) struct StreamingFlushParams {
     pub idle_sleep_us: u64,
     pub min_dirty_pages: usize,
     pub max_pages_per_cycle: usize,
+    /// Global L2P-dirty-page target. While the sum of every shard's
+    /// `dirty_page_count()` stays below this value, the worker parks at
+    /// `idle_sleep_us` without scanning shards. 0 disables the gate
+    /// (preserves the per-shard `min_dirty_pages` behaviour).
+    pub dirty_pages_target: usize,
 }
 
 pub(super) struct StreamingFlusher {
@@ -166,6 +171,36 @@ fn flush_one_pass(inner: &StreamingFlusherInner) -> bool {
         out
     };
 
+    // Global target gate: keep the worker quiet while the dirty backlog
+    // is small enough that the next foreground checkpoint can absorb it
+    // cheaply. Skips both the per-shard work below AND the per-shard
+    // `tree.read().dirty_page_count()` call inside the loop when the
+    // sum is below target. The pre-pass cost is one read-lock per
+    // shard, the same shape as the existing loop's first action — so
+    // this stays cheap even when the gate trips.
+    let target = inner.params.dirty_pages_target;
+    if target > 0 {
+        let mut total: usize = 0;
+        for vol in &vols {
+            for shard in vol.shards.iter() {
+                if inner.shutdown.load(Ordering::Acquire) {
+                    return false;
+                }
+                total = total.saturating_add(shard.tree.read().dirty_page_count());
+                if total >= target {
+                    break;
+                }
+            }
+            if total >= target {
+                break;
+            }
+        }
+        if total < target {
+            inner.metrics.record_l2p_writeback_target_skip();
+            return false;
+        }
+    }
+
     let mut did_work = false;
     for vol in &vols {
         for shard in vol.shards.iter() {
@@ -221,7 +256,10 @@ fn flush_one_shard_chunk(inner: &StreamingFlusherInner, shard: &super::L2pShard)
     flushed.append_sealed_pages(&mut page_runs);
 
     let io_started = Instant::now();
-    if let Err(err) = inner.page_store.write_sealed_page_runs(page_runs) {
+    if let Err(err) = inner
+        .page_store
+        .write_sealed_page_runs_background(page_runs)
+    {
         inner.metrics.record_l2p_writeback_error();
         tracing::warn!(?err, "metadb: l2p writeback write_sealed_page_runs failed");
         return false;

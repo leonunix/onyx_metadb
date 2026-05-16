@@ -282,9 +282,10 @@ impl Db {
         let dedup_shards = validate_dedup_shards(cfg.dedup_shards)?;
         std::fs::create_dir_all(&cfg.path)?;
         let pages_path = page_file(&cfg.path);
-        let page_store = Arc::new(PageStore::create_with_grow_chunk(
+        let page_store = Arc::new(PageStore::create_with_grow_chunk_and_bg_cap(
             &pages_path,
             cfg.page_grow_chunk_pages,
+            cfg.io_submitter_bg_inflight_cap,
         )?);
         let page_cache = Arc::new(PageCache::new_with_pin_budget(
             page_store.clone(),
@@ -362,6 +363,7 @@ impl Db {
             idle_sleep_us: cfg.l2p_writeback_idle_sleep_us,
             min_dirty_pages: cfg.l2p_writeback_min_dirty_pages,
             max_pages_per_cycle: cfg.l2p_writeback_max_pages_per_cycle,
+            dirty_pages_target: cfg.flush_dirty_pages_target,
         };
         let async_reclaim_enabled = cfg.async_reclaim_enabled;
         let async_reclaim_params = super::async_reclaim::AsyncReclaimParams {
@@ -480,9 +482,17 @@ impl Db {
     pub fn open_with_config_and_faults(cfg: Config, faults: Arc<FaultController>) -> Result<Self> {
         let pages_path = page_file(&cfg.path);
         let page_store = Arc::new(if cfg.rebuild_free_list_on_open {
-            PageStore::open_with_grow_chunk(&pages_path, cfg.page_grow_chunk_pages)?
+            PageStore::open_with_grow_chunk_and_bg_cap(
+                &pages_path,
+                cfg.page_grow_chunk_pages,
+                cfg.io_submitter_bg_inflight_cap,
+            )?
         } else {
-            PageStore::open_fast_with_grow_chunk(&pages_path, cfg.page_grow_chunk_pages)?
+            PageStore::open_fast_with_grow_chunk_and_bg_cap(
+                &pages_path,
+                cfg.page_grow_chunk_pages,
+                cfg.io_submitter_bg_inflight_cap,
+            )?
         });
         let page_cache = Arc::new(PageCache::new_with_pin_budget(
             page_store.clone(),
@@ -858,6 +868,7 @@ impl Db {
             idle_sleep_us: cfg.l2p_writeback_idle_sleep_us,
             min_dirty_pages: cfg.l2p_writeback_min_dirty_pages,
             max_pages_per_cycle: cfg.l2p_writeback_max_pages_per_cycle,
+            dirty_pages_target: cfg.flush_dirty_pages_target,
         };
         let async_reclaim_enabled = cfg.async_reclaim_enabled;
         let async_reclaim_params = super::async_reclaim::AsyncReclaimParams {

@@ -155,11 +155,12 @@ pub struct Config {
 
     /// Run a per-shard background drainer that absorbs `RcShard.delta`
     /// into a sealed-page staging overlay outside `apply_gate.write()`.
-    /// When enabled, `Db::flush()` sample-phase work shrinks to
-    /// "preempt drainer + small final-drain catch-up + atomic overlay
-    /// snapshot" instead of doing the heavy clone-and-apply loop in-
-    /// gate. When disabled (the safe default), `RcShard` reverts to
-    /// the priority-1 path verbatim.
+    /// When enabled (the default), `Db::flush()` sample-phase work
+    /// shrinks to "preempt drainer + small final-drain catch-up +
+    /// atomic overlay snapshot" instead of doing the heavy clone-and-
+    /// apply loop in-gate. When disabled, `RcShard` reverts to the
+    /// priority-1 path verbatim — kept as an escape hatch for soak
+    /// bisection.
     pub refcount_drainer_enabled: bool,
 
     /// Drainer cycle interval. Each shard's drainer parks for at most
@@ -247,6 +248,32 @@ pub struct Config {
     /// the default 8 192, install rarely exceeds 5–10 ms even with
     /// PageBuf-shaped costs.
     pub l2p_writeback_max_pages_per_cycle: usize,
+
+    /// Global L2P-dirty target that gates the streaming writeback worker.
+    /// The worker stays parked while the per-shard dirty page total is
+    /// below this value — keeps the writeback IO submitter quiet under
+    /// light load and concentrates work above the target, where the
+    /// next foreground checkpoint would otherwise pay a large sample.
+    /// Paired with `flush_dirty_pages_threshold` on the onyx side
+    /// (`target/trigger` duality): writeback wakes at target, the
+    /// apply-gate flush still kicks in at the higher trigger.
+    /// 0 disables the gate (writeback runs whenever `min_dirty_pages`
+    /// per-shard is met). Only effective when
+    /// `l2p_writeback_enabled = true`.
+    pub flush_dirty_pages_target: usize,
+
+    /// Cap on background-priority ops in flight at the centralised
+    /// [`crate::io_submitter::IoSubmitter`]. Sync-priority ops (commit
+    /// writes / fsync) always admit up to SQ capacity; background ops
+    /// (L2P streaming writeback) wait in a deferred queue once
+    /// `inflight_bg` reaches this cap. Keeps a sustained writeback
+    /// burst from displacing commit writes from the SQ — without it,
+    /// enabling `l2p_writeback_enabled` regresses commit-write p99
+    /// (validated 2026-05-16 on nvme-box: writeback off vs on,
+    /// READ p99 +50 % / WRITE p99 +117 % at SQ=16384).
+    /// 0 disables the cap (admit bg ops freely; matches pre-Tier-1.C
+    /// behaviour for regression A/Bs).
+    pub io_submitter_bg_inflight_cap: usize,
 
     /// Per-flush budget on the sum of `(dirty_l2p_pages +
     /// pending_rc_deltas)` the sample phase will process. When the
@@ -362,9 +389,15 @@ impl Config {
             // ~64 B, so 64 K ≈ 4 MiB. Production should bump in
             // lock-step with the working-set size.
             dedup_l1_cache_entries: 64_000,
-            // Drainer ships default-off. Soak validation flips to
-            // true after multi-hour A/B comparison vs priority-1.
-            refcount_drainer_enabled: false,
+            // Drainer ships **default-on** (Tier 1.A,
+            // `/root/.claude/plans/ticklish-sparking-barto.md`). The
+            // background drainer absorbs `RcShard.delta_active` into
+            // a sealed-page overlay outside `apply_gate.write()` so
+            // `flush()`'s sample-phase rc_drain shrinks from ~2 s
+            // (priority-1 verbatim) to <100 ms. Flip back to `false`
+            // to recover the priority-1 path verbatim — overlay
+            // memory and drainer threads are cleaned up on drop.
+            refcount_drainer_enabled: true,
             refcount_drainer_interval_ms: 50,
             refcount_drainer_threshold_entries: 4_096,
             refcount_drainer_max_entries_per_cycle: 65_536,
@@ -408,6 +441,16 @@ impl Config {
             // large enough that each `IORING_OP_WRITEV` run carries a
             // useful payload (512 × 4 KiB = 2 MiB).
             l2p_writeback_max_pages_per_cycle: 512,
+            // Streaming writeback target gate default: 0 = disabled
+            // (writeback runs whenever per-shard `min_dirty_pages` is
+            // met). Production embedders set this to e.g. 100 k so
+            // writeback amortises pageouts only above the level where
+            // the next checkpoint sample would be expensive anyway.
+            flush_dirty_pages_target: 0,
+            // Default bg inflight cap matches DEFAULT_BG_INFLIGHT_CAP
+            // in `io_submitter.rs` (~6 % of SQ=16384). Tunable via
+            // `Config::io_submitter_bg_inflight_cap`; 0 disables.
+            io_submitter_bg_inflight_cap: 1024,
         }
     }
 }

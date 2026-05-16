@@ -205,13 +205,13 @@ impl IoLaneClass {
     }
 }
 
-fn make_io_submitters(file: &File, count: usize) -> Box<[IoSubmitter]> {
+fn make_io_submitters(file: &File, count: usize, bg_inflight_cap: usize) -> Box<[IoSubmitter]> {
     #[cfg(target_os = "linux")]
     {
         let count = count.max(1);
         let mut subs: Vec<IoSubmitter> = Vec::with_capacity(count);
         for ordinal in 0..count {
-            match IoSubmitter::start_with_ordinal(file.as_raw_fd(), ordinal) {
+            match IoSubmitter::start_with_ordinal(file.as_raw_fd(), ordinal, bg_inflight_cap) {
                 Some(sub) => subs.push(sub),
                 None => {
                     // First submitter failed — io_uring unavailable.
@@ -226,6 +226,7 @@ fn make_io_submitters(file: &File, count: usize) -> Box<[IoSubmitter]> {
     {
         let _ = file;
         let _ = count;
+        let _ = bg_inflight_cap;
         Box::new([])
     }
 }
@@ -345,6 +346,21 @@ impl PageStore {
     /// many pages are pre-reserved on each file extension; see module
     /// docs. Must be `>= 1`. Fails if the file already exists.
     pub fn create_with_grow_chunk(path: impl AsRef<Path>, grow_chunk: u64) -> Result<Self> {
+        Self::create_with_grow_chunk_and_bg_cap(
+            path,
+            grow_chunk,
+            crate::io_submitter::DEFAULT_BG_INFLIGHT_CAP,
+        )
+    }
+
+    /// As [`Self::create_with_grow_chunk`] but with an explicit cap on
+    /// background-priority ops in flight at the centralised submitter.
+    /// 0 disables the cap (admits bg ops freely).
+    pub fn create_with_grow_chunk_and_bg_cap(
+        path: impl AsRef<Path>,
+        grow_chunk: u64,
+        bg_inflight_cap: usize,
+    ) -> Result<Self> {
         if grow_chunk == 0 {
             return Err(MetaDbError::InvalidArgument(
                 "page store grow_chunk must be >= 1".into(),
@@ -362,7 +378,11 @@ impl PageStore {
         // will pre-extend to FIRST_DATA_PAGE + grow_chunk.
         file.set_len(FIRST_DATA_PAGE * PAGE_SIZE as u64)?;
         let read_pool = PageReadPool::start(&file)?;
-        let io_submitters = make_io_submitters(&file, DEFAULT_IO_SUBMITTER_POOL_SIZE);
+        let io_submitters = make_io_submitters(
+            &file,
+            DEFAULT_IO_SUBMITTER_POOL_SIZE,
+            bg_inflight_cap,
+        );
         Ok(Self {
             path,
             file,
@@ -388,6 +408,21 @@ impl PageStore {
     /// Fast-open an existing page store with the caller's grow chunk. See
     /// [`open_fast`](Self::open_fast) for the tradeoff.
     pub fn open_fast_with_grow_chunk(path: impl AsRef<Path>, grow_chunk: u64) -> Result<Self> {
+        Self::open_fast_with_grow_chunk_and_bg_cap(
+            path,
+            grow_chunk,
+            crate::io_submitter::DEFAULT_BG_INFLIGHT_CAP,
+        )
+    }
+
+    /// As [`Self::open_fast_with_grow_chunk`] but with an explicit cap
+    /// on background-priority ops in flight at the centralised submitter.
+    /// 0 disables the cap (admits bg ops freely).
+    pub fn open_fast_with_grow_chunk_and_bg_cap(
+        path: impl AsRef<Path>,
+        grow_chunk: u64,
+        bg_inflight_cap: usize,
+    ) -> Result<Self> {
         if grow_chunk == 0 {
             return Err(MetaDbError::InvalidArgument(
                 "page store grow_chunk must be >= 1".into(),
@@ -409,7 +444,11 @@ impl PageStore {
         }
         let file_end_pages = size / PAGE_SIZE as u64;
         let read_pool = PageReadPool::start(&file)?;
-        let io_submitters = make_io_submitters(&file, DEFAULT_IO_SUBMITTER_POOL_SIZE);
+        let io_submitters = make_io_submitters(
+            &file,
+            DEFAULT_IO_SUBMITTER_POOL_SIZE,
+            bg_inflight_cap,
+        );
         tracing::info!(
             path = %path.display(),
             high_water_pages = file_end_pages,
@@ -445,6 +484,21 @@ impl PageStore {
     /// over from a crashed pre-extend is truncated back before the
     /// store is returned.
     pub fn open_with_grow_chunk(path: impl AsRef<Path>, grow_chunk: u64) -> Result<Self> {
+        Self::open_with_grow_chunk_and_bg_cap(
+            path,
+            grow_chunk,
+            crate::io_submitter::DEFAULT_BG_INFLIGHT_CAP,
+        )
+    }
+
+    /// As [`Self::open_with_grow_chunk`] but with an explicit cap on
+    /// background-priority ops in flight at the centralised submitter.
+    /// 0 disables the cap (admits bg ops freely).
+    pub fn open_with_grow_chunk_and_bg_cap(
+        path: impl AsRef<Path>,
+        grow_chunk: u64,
+        bg_inflight_cap: usize,
+    ) -> Result<Self> {
         if grow_chunk == 0 {
             return Err(MetaDbError::InvalidArgument(
                 "page store grow_chunk must be >= 1".into(),
@@ -466,7 +520,11 @@ impl PageStore {
         }
         let file_end_pages = size / PAGE_SIZE as u64;
         let read_pool = PageReadPool::start(&file)?;
-        let io_submitters = make_io_submitters(&file, DEFAULT_IO_SUBMITTER_POOL_SIZE);
+        let io_submitters = make_io_submitters(
+            &file,
+            DEFAULT_IO_SUBMITTER_POOL_SIZE,
+            bg_inflight_cap,
+        );
         // Walk every page in [FIRST_DATA_PAGE, file_end_pages). Typed pages
         // extend the recovered `high_water`; Free pages and all-zero punched
         // holes are reusable. A zero suffix past the last typed page is
@@ -707,13 +765,45 @@ impl PageStore {
     }
 
     pub fn write_sealed_page_runs(&self, pages: Vec<(PageId, Arc<Page>)>) -> Result<()> {
-        self.write_sealed_page_runs_for_class(pages, IoLaneClass::L2p)
+        self.write_sealed_page_runs_for_class_and_priority(
+            pages,
+            IoLaneClass::L2p,
+            crate::io_submitter::IoPriority::Sync,
+        )
+    }
+
+    /// Background-priority variant routed for streaming-writeback. The
+    /// submitter parks runs in its deferred queue once `inflight_bg`
+    /// reaches the configured cap, so sustained writeback cannot
+    /// starve commit-path writes of SQE slots.
+    pub fn write_sealed_page_runs_background(
+        &self,
+        pages: Vec<(PageId, Arc<Page>)>,
+    ) -> Result<()> {
+        self.write_sealed_page_runs_for_class_and_priority(
+            pages,
+            IoLaneClass::L2p,
+            crate::io_submitter::IoPriority::Background,
+        )
     }
 
     pub fn write_sealed_page_runs_for_class(
         &self,
+        pages: Vec<(PageId, Arc<Page>)>,
+        class: IoLaneClass,
+    ) -> Result<()> {
+        self.write_sealed_page_runs_for_class_and_priority(
+            pages,
+            class,
+            crate::io_submitter::IoPriority::Sync,
+        )
+    }
+
+    pub fn write_sealed_page_runs_for_class_and_priority(
+        &self,
         mut pages: Vec<(PageId, Arc<Page>)>,
         class: IoLaneClass,
+        priority: crate::io_submitter::IoPriority,
     ) -> Result<()> {
         if pages.is_empty() {
             return Ok(());
@@ -736,7 +826,7 @@ impl PageStore {
                     let submitter = class_submitter
                         .or_else(|| self.io_submitter_for(start))
                         .expect("io_submitters non-empty above");
-                    submitter.submit_write_run_async(start, run_pages)
+                    submitter.submit_write_run_async_with_priority(start, run_pages, priority)
                 })
                 .collect::<Result<Vec<_>>>()?;
             let mut first_err: Option<MetaDbError> = None;
