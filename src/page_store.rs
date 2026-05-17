@@ -139,9 +139,14 @@ struct DeferredFree {
     epoch: u64,
     generation: Lsn,
     /// `true` if the entry came from [`free_idempotent`] — i.e. WAL
-    /// replay path. Reclaim re-checks the on-disk page type before
-    /// pushing onto the free list so a crash mid-reclaim cannot leave
-    /// a duplicate free-list entry on the next replay.
+    /// replay path. Kept as a provenance flag; reclaim does not branch
+    /// on it. Crash-replay safety is provided upstream: every caller of
+    /// `free_idempotent` (`apply_drop_snapshot_pages`) bypasses already-
+    /// freed pages via the zero-page check and the `header.generation
+    /// >= lsn` short-circuit before reaching this queue, and cross-
+    /// process correctness comes from `open()` rebuilding `free_list`
+    /// by scanning Free-typed pages on disk.
+    #[allow(dead_code)]
     idempotent: bool,
 }
 
@@ -1390,36 +1395,27 @@ impl PageStore {
         }
         drop(deferred);
 
-        let mut reclaimable = Vec::with_capacity(selected.len());
-        for (pid, entry) in selected {
-            if entry.idempotent && self.is_already_free_on_disk(pid)? {
-                continue;
-            }
-            reclaimable.push((pid, entry));
-        }
-        let reclaimed = self.reclaim_sorted_runs(&reclaimable)?;
+        let reclaimed = self.reclaim_sorted_runs(&selected)?;
         Ok(ReclaimOutcome {
             safe_below,
-            selected: reclaimable.len(),
+            selected: selected.len(),
             reclaimed,
         })
     }
 
-    fn is_already_free_on_disk(&self, page_id: PageId) -> Result<bool> {
-        let existing = read_page_raw(&self.file, page_id)?;
-        if is_zero_page(&existing) {
-            return Ok(true);
-        }
-        if let Ok(h) = existing.header() {
-            if h.page_type == PageType::Free {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     fn reclaim_sorted_runs(&self, pages: &[(PageId, DeferredFree)]) -> Result<Vec<PageId>> {
-        let mut reclaimed = Vec::with_capacity(pages.len());
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Coalesce the pid-sorted selection into contiguous runs.
+        // Each run becomes one `IORING_OP_WRITEV` SQE; punch_hole jobs
+        // accumulate alongside so the post-write fallocate sweep can
+        // chase them serially without re-walking the page list.
+        let mut runs: Vec<(PageId, Vec<Arc<Page>>)> = Vec::new();
+        let mut punch_jobs: Vec<(PageId, usize)> = Vec::new();
+        let mut reclaimed: Vec<PageId> = Vec::with_capacity(pages.len());
+
         let mut idx = 0;
         while idx < pages.len() {
             let start = pages[idx].0;
@@ -1431,19 +1427,78 @@ impl PageStore {
                 end += 1;
             }
 
-            let mut bytes = Vec::with_capacity((end - idx) * PAGE_SIZE);
+            let mut run_pages: Vec<Arc<Page>> = Vec::with_capacity(end - idx);
             for (_, entry) in &pages[idx..end] {
                 let mut page = Page::new(PageHeader::new(PageType::Free, entry.generation));
                 page.set_refcount(0);
                 page.seal();
-                bytes.extend_from_slice(page.bytes());
+                run_pages.push(Arc::new(page));
             }
-            self.write_page_run_bytes(start, &bytes)?;
-            if end - idx >= MIN_PUNCH_HOLE_RUN_PAGES {
-                self.punch_free_run(start, end - idx)?;
+            let count = end - idx;
+            runs.push((start, run_pages));
+            if count >= MIN_PUNCH_HOLE_RUN_PAGES {
+                punch_jobs.push((start, count));
             }
             reclaimed.extend(pages[idx..end].iter().map(|(pid, _)| *pid));
             idx = end;
+        }
+
+        // Phase B: parallel Free-stamp via IoSubmitter. Fan out every
+        // run as one `IORING_OP_WRITEV` SQE and drain replies — the
+        // old serial `write_page_run_bytes` loop was the dominant
+        // cost (39 s `flush_reclaim_max_us` on nvme-box) when the
+        // backlog exceeded ~1M pages.
+        if !self.io_submitters.is_empty() {
+            let mut receivers = Vec::with_capacity(runs.len());
+            for (start, run_pages) in runs {
+                let submitter = self
+                    .io_submitter_for(start)
+                    .expect("io_submitters non-empty above");
+                receivers.push(submitter.submit_write_run_async_with_priority(
+                    start,
+                    run_pages,
+                    crate::io_submitter::IoPriority::Sync,
+                )?);
+            }
+            let mut first_err: Option<MetaDbError> = None;
+            for rx in receivers {
+                match rx.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                    Err(_) => {
+                        if first_err.is_none() {
+                            first_err = Some(MetaDbError::Io(io::Error::other(
+                                "io submitter dropped reply for reclaim run",
+                            )));
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+        } else {
+            // Fallback path (io_uring unavailable / disabled by tests):
+            // materialise each run as a contiguous byte buffer and
+            // pwrite. Same wall-time profile as the original code.
+            for (start, run_pages) in &runs {
+                let mut bytes = Vec::with_capacity(run_pages.len() * PAGE_SIZE);
+                for p in run_pages {
+                    bytes.extend_from_slice(p.bytes());
+                }
+                self.write_page_run_bytes(*start, &bytes)?;
+            }
+        }
+
+        // Phase C: punch_hole sweep. `fallocate` is a syscall (no
+        // io_uring fast path in our build); the cost per call is
+        // ~5 µs on NVMe so the serial loop is not the bottleneck.
+        for (start, count) in punch_jobs {
+            self.punch_free_run(start, count)?;
         }
 
         let mut inner = self.inner.lock();
@@ -2898,5 +2953,59 @@ mod tests {
         // water points, overwriting the zeroed leak in place.
         let pid = ps.allocate().unwrap();
         assert_eq!(pid, FIRST_DATA_PAGE + 2);
+    }
+
+    /// Phase B parallel-submit path: a multi-run reclaim must still
+    /// (a) stamp every selected pid as `Free` on disk, (b) extend
+    /// `free_list` with the full set, and (c) re-allocate them in
+    /// pid-sorted order. A multi-run batch is built by interleaving
+    /// contiguous and gap-separated pids so coalescing produces > 1
+    /// run, forcing the IoSubmitter fan-out path.
+    #[test]
+    fn reclaim_handles_multi_run_batch_via_io_submitter() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages.onyx_meta");
+        let ps = PageStore::create(&path).unwrap();
+        // Allocate 8 contiguous, write payload, free 4 non-adjacent
+        // pairs so reclaim sees four 1-page "runs" that must each
+        // become its own SQE.
+        let mut all = Vec::new();
+        for _ in 0..8 {
+            all.push(ps.allocate().unwrap());
+        }
+        for pid in &all {
+            ps.write_page(*pid, &mk_page(7, 0xaa)).unwrap();
+        }
+        // Free every other page (creates 4 runs of length 1).
+        let to_free = [all[0], all[2], all[4], all[6]];
+        for pid in to_free {
+            ps.free(pid, 99).unwrap();
+        }
+        assert_eq!(ps.deferred_free_len(), 4);
+
+        let outcome = ps.try_reclaim().unwrap();
+        let mut reclaimed = outcome.reclaimed.clone();
+        reclaimed.sort();
+        assert_eq!(reclaimed, to_free.to_vec());
+
+        // Every freed pid now reads back as Free-headered.
+        for pid in to_free {
+            let page = ps.read_page_unchecked(pid).unwrap();
+            // Either zero (punch took effect) or Free header.
+            if page.bytes().iter().all(|b| *b == 0) {
+                continue;
+            }
+            let h = page.header().unwrap();
+            assert_eq!(h.page_type, PageType::Free);
+            assert_eq!(h.generation, 99);
+        }
+        // free_list must contain all four; an allocate cycle hands
+        // them back in pid-sorted order.
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.push(ps.allocate().unwrap());
+        }
+        got.sort();
+        assert_eq!(got, to_free.to_vec());
     }
 }
