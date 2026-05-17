@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, RwLock};
 
+use crate::affinity::{self, ThreadRole};
 use crate::metrics::MetaMetrics;
 use crate::types::VolumeOrdinal;
 
@@ -174,6 +175,7 @@ impl Drop for L2pCompactor {
 }
 
 fn run_worker(inner: Arc<L2pCompactorInner>) {
+    affinity::bind_current(ThreadRole::L2pCompactor, 0);
     let max_interval = Duration::from_millis(inner.params.max_interval_ms.max(1));
     while !inner.shutdown.load(Ordering::Acquire) {
         compact_one_pass(&inner, /* size_gated = */ true);

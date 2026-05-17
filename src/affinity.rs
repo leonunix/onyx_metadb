@@ -10,6 +10,12 @@ pub struct AffinityConfig {
     /// Same syntax as the other knobs ("0-3,8,12-15"). Leave empty to
     /// inherit the OS default.
     pub refcount_drainer_cpus: String,
+    /// CPU set for the L2P buffer compactor (single serial thread).
+    /// Pinning to 1–2 CPUs on the same NUMA node as `l2p_apply_cpus`
+    /// stops the scheduler from co-locating the compactor on an
+    /// apply-lane CPU during flush — without this, apply-lane
+    /// exec-max tails rise noticeably in the flush window.
+    pub l2p_compactor_cpus: String,
     /// CPU set for the io_uring submitter threads. With pool>1, each
     /// submitter thread picks `cpus[ordinal % len]` so distinct
     /// submitters land on distinct CPUs and Linux mq-block routes
@@ -26,6 +32,10 @@ pub enum ThreadRole {
     RefcountApply,
     DedupApply,
     RefcountDrainer,
+    /// L2P buffer compactor (single serial thread). Bound to a small
+    /// dedicated CPU set so the kernel scheduler cannot co-locate it
+    /// on an apply-lane CPU during a flush window.
+    L2pCompactor,
     /// io_uring submitter thread. With pool>1 each ordinal binds to a
     /// distinct CPU so the kernel mq-block layer routes its IO to a
     /// different NVMe hardware queue. Without pinning, multiple
@@ -41,6 +51,7 @@ struct AffinityLayout {
     refcount_apply: CpuSet,
     dedup_apply: CpuSet,
     refcount_drainer: CpuSet,
+    l2p_compactor: CpuSet,
     io_submitter: CpuSet,
 }
 
@@ -80,6 +91,7 @@ impl AffinityLayout {
             refcount_apply: CpuSet::parse(&config.refcount_apply_cpus),
             dedup_apply: CpuSet::parse(&config.dedup_apply_cpus),
             refcount_drainer: CpuSet::parse(&config.refcount_drainer_cpus),
+            l2p_compactor: CpuSet::parse(&config.l2p_compactor_cpus),
             io_submitter: CpuSet::parse(&config.io_submitter_cpus),
         })
         .filter(|layout| {
@@ -88,6 +100,7 @@ impl AffinityLayout {
                 || !layout.refcount_apply.cpus.is_empty()
                 || !layout.dedup_apply.cpus.is_empty()
                 || !layout.refcount_drainer.cpus.is_empty()
+                || !layout.l2p_compactor.cpus.is_empty()
                 || !layout.io_submitter.cpus.is_empty()
         })
     }
@@ -99,6 +112,7 @@ impl AffinityLayout {
             ThreadRole::RefcountApply => &self.refcount_apply,
             ThreadRole::DedupApply => &self.dedup_apply,
             ThreadRole::RefcountDrainer => &self.refcount_drainer,
+            ThreadRole::L2pCompactor => &self.l2p_compactor,
             ThreadRole::IoSubmitter => &self.io_submitter,
         }
     }
