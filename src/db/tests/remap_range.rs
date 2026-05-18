@@ -713,3 +713,151 @@ fn drop_snapshot_skips_decref_when_pba_refcount_already_zero() {
         "filter dropped decrefs for rc=0 snap pba",
     );
 }
+
+// ---------- WalOp::L2pRemapRange (range-shaped remap) ----------
+
+fn remap_range(
+    db: &Db,
+    start_lba: Lba,
+    values: Vec<L2pValue>,
+) -> (Box<[bool]>, Box<[Option<L2pValue>]>, Vec<Pba>) {
+    let mut tx = db.begin();
+    tx.l2p_remap_range(BOOTSTRAP_VOLUME_ORD, start_lba, values.into_boxed_slice());
+    let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+    assert_eq!(outcomes.len(), 1, "one range op in, one outcome out");
+    match outcomes.into_iter().next().unwrap() {
+        ApplyOutcome::L2pRemapRange {
+            applied,
+            prevs,
+            freed_pbas,
+        } => (applied, prevs, freed_pbas),
+        other => panic!("expected L2pRemapRange outcome, got {other:?}"),
+    }
+}
+
+#[test]
+fn l2p_remap_range_writes_each_lba_and_increfs_distinct_pbas() {
+    let (_d, db) = mk_db();
+    let values = (0..4u8).map(|i| remap_val(100 + i as u64, i)).collect();
+    let (applied, prevs, freed) = remap_range(&db, 10, values);
+    assert_eq!(applied.len(), 4);
+    assert!(applied.iter().all(|a| *a));
+    assert!(prevs.iter().all(|p| p.is_none()));
+    assert!(freed.is_empty());
+    for i in 0..4u8 {
+        let want = remap_val(100 + i as u64, i);
+        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10 + i as u64).unwrap(), Some(want));
+        assert_eq!(db.get_refcount(100 + i as u64).unwrap(), 1);
+    }
+}
+
+#[test]
+fn l2p_remap_range_overwrite_collects_freed_pbas() {
+    let (_d, db) = mk_db();
+    // Seed each LBA with a distinct pba (refcount=1 each).
+    let first: Vec<_> = (0..4u8).map(|i| remap_val(100 + i as u64, 1)).collect();
+    let _ = remap_range(&db, 10, first.clone());
+    for i in 0..4u8 {
+        assert_eq!(db.get_refcount(100 + i as u64).unwrap(), 1);
+    }
+
+    // Overwrite the same 4 LBAs with new distinct pbas. Each old
+    // pba's refcount should drop to 0 and be reported in freed_pbas.
+    let second: Vec<_> = (0..4u8).map(|i| remap_val(200 + i as u64, 2)).collect();
+    let (applied, prevs, freed) = remap_range(&db, 10, second);
+    assert!(applied.iter().all(|a| *a));
+    assert_eq!(prevs.len(), 4);
+    for (i, prev) in prevs.iter().enumerate() {
+        assert_eq!(*prev, Some(first[i]));
+    }
+    let mut freed_sorted = freed.clone();
+    freed_sorted.sort();
+    assert_eq!(freed_sorted, vec![100, 101, 102, 103]);
+    for i in 0..4u8 {
+        assert_eq!(db.get_refcount(100 + i as u64).unwrap(), 0);
+        assert_eq!(db.get_refcount(200 + i as u64).unwrap(), 1);
+    }
+}
+
+#[test]
+fn l2p_remap_range_crosses_l2p_shard_boundary() {
+    // LEAF_SHIFT=7 → 128 LBAs per leaf, and shard_for_key_l2p hashes
+    // leaf_idx. Starting at LBA 120, a count-32 range walks across
+    // leaf 0 (LBAs [120..128)) and leaf 1 (LBAs [128..152)) — which
+    // typically routes to two different shards. The range op must
+    // handle both shards.
+    let (_d, db) = mk_db();
+    let values: Vec<_> = (0..32u8).map(|i| remap_val(500 + i as u64, i)).collect();
+    let (applied, prevs, freed) = remap_range(&db, 120, values);
+    assert!(applied.iter().all(|a| *a));
+    assert!(prevs.iter().all(|p| p.is_none()));
+    assert!(freed.is_empty());
+    for i in 0..32u8 {
+        let want = remap_val(500 + i as u64, i);
+        assert_eq!(
+            db.get(BOOTSTRAP_VOLUME_ORD, 120 + i as u64).unwrap(),
+            Some(want)
+        );
+        assert_eq!(db.get_refcount(500 + i as u64).unwrap(), 1);
+    }
+}
+
+#[test]
+fn l2p_remap_range_snapshot_pin_suppresses_decref_per_lba() {
+    let (_d, db) = mk_db();
+    // Seed LBAs 10..14 each with distinct pbas.
+    let seed: Vec<_> = (0..4u8).map(|i| remap_val(700 + i as u64, 1)).collect();
+    let _ = remap_range(&db, 10, seed.clone());
+    let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+    // Now remap all 4 to a single new pba (range with shared head_pba
+    // in the new values is legal). Snapshot pins each old pba → no
+    // freed_pbas; new pba refcount counts all 4.
+    let new_values: Vec<_> = (0..4).map(|i| remap_val(900, 10 + i)).collect();
+    let (_applied, _prevs, freed) = remap_range(&db, 10, new_values);
+    assert!(
+        freed.is_empty(),
+        "snapshot pins old pbas; decref must be suppressed per LBA"
+    );
+    for i in 0..4u8 {
+        assert_eq!(db.get_refcount(700 + i as u64).unwrap(), 1);
+    }
+    assert_eq!(db.get_refcount(900).unwrap(), 4);
+    // Drop snapshot → old pbas can be reclaimed.
+    db.drop_snapshot(snap).unwrap();
+    for i in 0..4u8 {
+        assert_eq!(db.get_refcount(700 + i as u64).unwrap(), 0);
+    }
+}
+
+#[test]
+fn l2p_remap_range_stale_seq_per_lba_rejection() {
+    // The seq_guard runs per LBA. If one LBA's new_value has a stale
+    // seq it gets rejected (applied[i] = false, prev[i] = the current
+    // value) while sibling LBAs in the same range apply normally.
+    let (_d, db) = mk_db();
+    // First write: seq=10 for all 4 LBAs.
+    let fresh: Vec<_> = (0..4)
+        .map(|i| {
+            let mut v = remap_val(100 + i as u64, 1).0;
+            // L2P_SEQ_OFFSET is the trailing 8 B (bytes 28..36) per
+            // SPEC §3.1; matches L2pValue::seq().
+            v[28..36].copy_from_slice(&10u64.to_be_bytes());
+            L2pValue(v)
+        })
+        .collect();
+    let _ = remap_range(&db, 10, fresh);
+    // Second write: seq=5 on LBA 1, seq=20 on the rest.
+    let mixed: Vec<_> = (0..4)
+        .map(|i| {
+            let mut v = remap_val(200 + i as u64, 2).0;
+            let seq: u64 = if i == 1 { 5 } else { 20 };
+            v[28..36].copy_from_slice(&seq.to_be_bytes());
+            L2pValue(v)
+        })
+        .collect();
+    let (applied, _prevs, _freed) = remap_range(&db, 10, mixed);
+    assert_eq!(applied[0], true, "fresh seq accepted on LBA 10");
+    assert_eq!(applied[1], false, "stale seq rejected on LBA 11");
+    assert_eq!(applied[2], true);
+    assert_eq!(applied[3], true);
+}

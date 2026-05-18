@@ -179,6 +179,16 @@ pub struct MetaMetrics {
     apply_l2p_remap_count: AtomicU64,
     apply_l2p_remap_us: AtomicU64,
     apply_l2p_remap_max_us: AtomicU64,
+    /// Per-range-op stats for `WalOp::L2pRemapRange`. `count` is the
+    /// number of range ops applied; `lbas` is the total LBA count
+    /// across all of them. `us_per_op = us / count` shows the
+    /// commit-side bucket-assembly + WAL-decode amortization; `us_per_lba`
+    /// vs `apply_l2p_remap_us / apply_l2p_remap_count` shows the
+    /// per-LBA work cost difference (the part still scaling with N).
+    apply_l2p_remap_range_count: AtomicU64,
+    apply_l2p_remap_range_lbas: AtomicU64,
+    apply_l2p_remap_range_us: AtomicU64,
+    apply_l2p_remap_range_max_us: AtomicU64,
     apply_l2p_range_delete_count: AtomicU64,
     apply_l2p_range_delete_us: AtomicU64,
     apply_l2p_range_delete_max_us: AtomicU64,
@@ -717,6 +727,10 @@ pub struct MetaMetricsSnapshot {
     pub apply_l2p_remap_count: u64,
     pub apply_l2p_remap_us: u64,
     pub apply_l2p_remap_max_us: u64,
+    pub apply_l2p_remap_range_count: u64,
+    pub apply_l2p_remap_range_lbas: u64,
+    pub apply_l2p_remap_range_us: u64,
+    pub apply_l2p_remap_range_max_us: u64,
     pub apply_l2p_range_delete_count: u64,
     pub apply_l2p_range_delete_us: u64,
     pub apply_l2p_range_delete_max_us: u64,
@@ -1091,6 +1105,10 @@ impl MetaMetrics {
             apply_l2p_remap_count: load(&self.apply_l2p_remap_count),
             apply_l2p_remap_us: load(&self.apply_l2p_remap_us),
             apply_l2p_remap_max_us: load(&self.apply_l2p_remap_max_us),
+            apply_l2p_remap_range_count: load(&self.apply_l2p_remap_range_count),
+            apply_l2p_remap_range_lbas: load(&self.apply_l2p_remap_range_lbas),
+            apply_l2p_remap_range_us: load(&self.apply_l2p_remap_range_us),
+            apply_l2p_remap_range_max_us: load(&self.apply_l2p_remap_range_max_us),
             apply_l2p_range_delete_count: load(&self.apply_l2p_range_delete_count),
             apply_l2p_range_delete_us: load(&self.apply_l2p_range_delete_us),
             apply_l2p_range_delete_max_us: load(&self.apply_l2p_range_delete_max_us),
@@ -2005,6 +2023,51 @@ impl MetaMetrics {
         );
     }
 
+    /// Record the apply of one `WalOp::L2pRemapRange` covering `lba_count`
+    /// LBAs. `count` (ops) increments once per range op; `lbas` accumulates
+    /// the total LBA work amortized over those ops, so dashboards can
+    /// compare `us / count` (per-range-op cost) vs `us / lbas` (per-LBA cost).
+    pub(crate) fn record_apply_l2p_remap_range(&self, lba_count: u64, elapsed: Duration) {
+        self.apply_l2p_remap_range_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.apply_l2p_remap_range_lbas
+            .fetch_add(lba_count, Ordering::Relaxed);
+        record_duration(
+            &self.apply_l2p_remap_range_us,
+            &self.apply_l2p_remap_range_max_us,
+            elapsed,
+        );
+    }
+
+    /// Laned-path attribution helper: bump op count by `ops` without touching
+    /// lbas/us. Paired with `record_apply_l2p_remap_range_lane_work` so an
+    /// op may produce one count + multiple shard-bucket work contributions.
+    pub(crate) fn record_apply_l2p_remap_range_lane_ops(&self, ops: u64) {
+        self.apply_l2p_remap_range_count
+            .fetch_add(ops, Ordering::Relaxed);
+    }
+
+    /// Laned-path attribution helper: a single shard bucket's range-LBA
+    /// contribution. Adds `lbas` and prorated `elapsed` without bumping the
+    /// op count (one range op can span multiple shards, so shards must not
+    /// each count themselves).
+    pub(crate) fn record_apply_l2p_remap_range_lane_work(
+        &self,
+        lbas: u64,
+        elapsed: Duration,
+    ) {
+        if lbas == 0 {
+            return;
+        }
+        self.apply_l2p_remap_range_lbas
+            .fetch_add(lbas, Ordering::Relaxed);
+        record_duration(
+            &self.apply_l2p_remap_range_us,
+            &self.apply_l2p_remap_range_max_us,
+            elapsed,
+        );
+    }
+
     pub(crate) fn record_apply_l2p_bucket_stages(
         &self,
         ops: u64,
@@ -2770,6 +2833,10 @@ impl MetaMetricsSnapshot {
                 "\"apply_l2p_remap_count\":{},",
                 "\"apply_l2p_remap_us\":{},",
                 "\"apply_l2p_remap_max_us\":{},",
+                "\"apply_l2p_remap_range_count\":{},",
+                "\"apply_l2p_remap_range_lbas\":{},",
+                "\"apply_l2p_remap_range_us\":{},",
+                "\"apply_l2p_remap_range_max_us\":{},",
                 "\"apply_l2p_range_delete_count\":{},",
                 "\"apply_l2p_range_delete_us\":{},",
                 "\"apply_l2p_range_delete_max_us\":{},",
@@ -3087,6 +3154,10 @@ impl MetaMetricsSnapshot {
             self.apply_l2p_remap_count,
             self.apply_l2p_remap_us,
             self.apply_l2p_remap_max_us,
+            self.apply_l2p_remap_range_count,
+            self.apply_l2p_remap_range_lbas,
+            self.apply_l2p_remap_range_us,
+            self.apply_l2p_remap_range_max_us,
             self.apply_l2p_range_delete_count,
             self.apply_l2p_range_delete_us,
             self.apply_l2p_range_delete_max_us,

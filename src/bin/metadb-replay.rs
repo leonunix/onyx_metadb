@@ -128,6 +128,7 @@ struct OpCounts {
     l2p_delete: u64,
     l2p_remap: u64,
     l2p_range_delete: u64,
+    l2p_remap_range: u64,
     dedup_put: u64,
     dedup_delete: u64,
     incref: u64,
@@ -145,6 +146,7 @@ impl OpCounts {
             WalOp::L2pDelete { .. } => self.l2p_delete += 1,
             WalOp::L2pRemap { .. } => self.l2p_remap += 1,
             WalOp::L2pRangeDelete { .. } => self.l2p_range_delete += 1,
+            WalOp::L2pRemapRange { .. } => self.l2p_remap_range += 1,
             WalOp::DedupPut { .. } | WalOp::DedupPutGuarded { .. } => self.dedup_put += 1,
             WalOp::DedupDelete { .. }
             | WalOp::DedupCompareDelete { .. }
@@ -317,6 +319,14 @@ fn fmt_op(op: &WalOp) -> String {
             "L2pRangeDelete vol={vol_ord} [{start}..{end}) captured={}",
             captured.len()
         ),
+        WalOp::L2pRemapRange {
+            vol_ord,
+            start_lba,
+            values,
+        } => format!(
+            "L2pRemapRange vol={vol_ord} start_lba={start_lba} count={}",
+            values.len(),
+        ),
         WalOp::DedupPut { hash, value } => {
             format!("DedupPut hash={} value={}", hex(hash), hex(value.0))
         }
@@ -418,6 +428,14 @@ fn op_json(op: &WalOp) -> String {
             "{{\"op\":\"L2pRangeDelete\",\"vol_ord\":{vol_ord},\"start\":{start},\"end\":{end},\"captured_count\":{}}}",
             captured.len()
         ),
+        WalOp::L2pRemapRange {
+            vol_ord,
+            start_lba,
+            values,
+        } => format!(
+            "{{\"op\":\"L2pRemapRange\",\"vol_ord\":{vol_ord},\"start_lba\":{start_lba},\"count\":{}}}",
+            values.len(),
+        ),
         WalOp::DedupPut { hash, value } => format!(
             "{{\"op\":\"DedupPut\",\"hash\":\"{}\",\"value\":\"{}\"}}",
             hex(hash),
@@ -496,6 +514,7 @@ fn op_tag_list(ops: &[WalOp]) -> String {
             WalOp::L2pDelete { .. } => "L2pDelete",
             WalOp::L2pRemap { .. } => "L2pRemap",
             WalOp::L2pRangeDelete { .. } => "L2pRangeDelete",
+            WalOp::L2pRemapRange { .. } => "L2pRemapRange",
             WalOp::DedupPut { .. } => "DedupPut",
             WalOp::DedupPutGuarded { .. } => "DedupPutGuarded",
             WalOp::DedupDelete { .. } => "DedupDelete",

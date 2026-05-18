@@ -59,6 +59,23 @@ impl WalOp {
                     out.extend_from_slice(&value.0);
                 }
             }
+            WalOp::L2pRemapRange {
+                vol_ord,
+                start_lba,
+                values,
+            } => {
+                out.push(TAG_L2P_REMAP_RANGE);
+                out.extend_from_slice(&vol_ord.to_be_bytes());
+                out.extend_from_slice(&start_lba.to_be_bytes());
+                let count: u32 = values
+                    .len()
+                    .try_into()
+                    .expect("L2pRemapRange values count fits in u32");
+                out.extend_from_slice(&count.to_be_bytes());
+                for value in values.iter() {
+                    out.extend_from_slice(&value.0);
+                }
+            }
             WalOp::DedupPut { hash, value } => {
                 out.push(TAG_DEDUP_PUT);
                 out.extend_from_slice(hash);
@@ -184,6 +201,7 @@ impl WalOp {
             WalOp::L2pRangeDelete { captured, .. } => {
                 1 + 2 + 8 + 8 + 4 + captured.len() * (8 + L2P_VALUE_BYTES)
             }
+            WalOp::L2pRemapRange { values, .. } => 1 + 2 + 8 + 4 + values.len() * L2P_VALUE_BYTES,
             WalOp::DedupPut { .. } => 1 + 8 + 28,
             WalOp::DedupPutGuarded { .. } => 1 + 8 + 28 + 8 + 4,
             WalOp::DedupDelete { .. } => 1 + 8,
@@ -370,6 +388,44 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                     start,
                     end,
                     captured,
+                },
+                &payload[cursor..],
+            ))
+        }
+        TAG_L2P_REMAP_RANGE => {
+            const VALUE_SZ: usize = crate::paged::format::LEAF_VALUE_SIZE;
+            require_len(payload, 14, "L2P_REMAP_RANGE header")?;
+            let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
+            let start_lba = u64::from_be_bytes(payload[2..10].try_into().unwrap());
+            let count = u32::from_be_bytes(payload[10..14].try_into().unwrap()) as usize;
+            if count > MAX_REMAP_RANGE_LBAS {
+                return Err(MetaDbError::Corruption(format!(
+                    "L2P_REMAP_RANGE count {count} exceeds MAX_REMAP_RANGE_LBAS {}",
+                    MAX_REMAP_RANGE_LBAS,
+                )));
+            }
+            if count == 0 {
+                return Err(MetaDbError::Corruption(
+                    "L2P_REMAP_RANGE count must be > 0".into(),
+                ));
+            }
+            let body_bytes = count
+                .checked_mul(VALUE_SZ)
+                .ok_or_else(|| MetaDbError::Corruption("L2P_REMAP_RANGE count overflow".into()))?;
+            require_len(&payload[14..], body_bytes, "L2P_REMAP_RANGE values")?;
+            let mut values: Vec<L2pValue> = Vec::with_capacity(count);
+            let mut cursor = 14usize;
+            for _ in 0..count {
+                let mut value_bytes = [0u8; VALUE_SZ];
+                value_bytes.copy_from_slice(&payload[cursor..cursor + VALUE_SZ]);
+                values.push(L2pValue(value_bytes));
+                cursor += VALUE_SZ;
+            }
+            Ok((
+                WalOp::L2pRemapRange {
+                    vol_ord,
+                    start_lba,
+                    values: values.into_boxed_slice(),
                 },
                 &payload[cursor..],
             ))

@@ -774,3 +774,109 @@ fn clone_volume_truncated_roots_is_corruption() {
         e => panic!("{e}"),
     }
 }
+
+#[test]
+fn l2p_remap_range_round_trip_small() {
+    fn val(seed: u8) -> L2pValue {
+        let mut v = [0u8; 36];
+        v[0] = seed;
+        v[35] = seed.wrapping_mul(3);
+        L2pValue(v)
+    }
+    let values: Box<[L2pValue]> = (0..5).map(|i| val(i as u8 + 1)).collect();
+    let ops = vec![WalOp::L2pRemapRange {
+        vol_ord: 9,
+        start_lba: 12345,
+        values,
+    }];
+    let body = encode_body(&ops);
+    // schema(1) + tag(1) + vol_ord(2) + start_lba(8) + count(4) + 5*36
+    assert_eq!(body.len(), 1 + 1 + 2 + 8 + 4 + 5 * 36);
+    assert_eq!(body[0], WAL_BODY_SCHEMA_VERSION);
+    let decoded = decode_body(&body).unwrap();
+    assert_eq!(decoded, ops);
+}
+
+#[test]
+fn l2p_remap_range_round_trip_max_cap() {
+    fn val(i: u32) -> L2pValue {
+        let mut v = [0u8; 36];
+        v[..4].copy_from_slice(&i.to_be_bytes());
+        L2pValue(v)
+    }
+    let values: Box<[L2pValue]> = (0..MAX_REMAP_RANGE_LBAS as u32).map(val).collect();
+    let ops = vec![WalOp::L2pRemapRange {
+        vol_ord: 0,
+        start_lba: 1_000_000,
+        values,
+    }];
+    let body = encode_body(&ops);
+    let decoded = decode_body(&body).unwrap();
+    assert_eq!(decoded, ops);
+}
+
+#[test]
+fn l2p_remap_range_encoded_len_matches_encode_output() {
+    fn val(seed: u8) -> L2pValue {
+        let mut v = [0u8; 36];
+        v[0] = seed;
+        L2pValue(v)
+    }
+    let values: Box<[L2pValue]> = (0..32).map(|i| val(i as u8)).collect();
+    let op = WalOp::L2pRemapRange {
+        vol_ord: 3,
+        start_lba: 99,
+        values,
+    };
+    let expected = op.encoded_len();
+    let mut buf = Vec::new();
+    op.encode(&mut buf);
+    assert_eq!(buf.len(), expected);
+}
+
+#[test]
+fn l2p_remap_range_decode_rejects_oversized_count() {
+    // Hand-encode a body that claims count > MAX_REMAP_RANGE_LBAS but
+    // doesn't include the bytes. The cap check must fire before the
+    // length check, so we don't need to provide the body.
+    let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_L2P_REMAP_RANGE];
+    body.extend_from_slice(&0u16.to_be_bytes()); // vol_ord
+    body.extend_from_slice(&0u64.to_be_bytes()); // start_lba
+    body.extend_from_slice(&((MAX_REMAP_RANGE_LBAS as u32) + 1).to_be_bytes());
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => assert!(
+            msg.contains("MAX_REMAP_RANGE_LBAS"),
+            "unexpected msg: {msg}"
+        ),
+        e => panic!("{e}"),
+    }
+}
+
+#[test]
+fn l2p_remap_range_decode_rejects_zero_count() {
+    let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_L2P_REMAP_RANGE];
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&0u64.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes());
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => assert!(msg.contains("must be > 0"), "{msg}"),
+        e => panic!("{e}"),
+    }
+}
+
+#[test]
+fn l2p_remap_range_decode_rejects_truncated_values() {
+    // claim count=3 but only provide 2 values
+    let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_L2P_REMAP_RANGE];
+    body.extend_from_slice(&1u16.to_be_bytes()); // vol_ord
+    body.extend_from_slice(&100u64.to_be_bytes()); // start_lba
+    body.extend_from_slice(&3u32.to_be_bytes()); // count=3
+    body.extend_from_slice(&[0u8; 36]); // value[0]
+    body.extend_from_slice(&[0u8; 36]); // value[1]
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(msg.contains("L2P_REMAP_RANGE values"), "{msg}")
+        }
+        e => panic!("{e}"),
+    }
+}

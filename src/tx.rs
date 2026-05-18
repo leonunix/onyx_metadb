@@ -99,6 +99,27 @@ pub enum ApplyOutcome {
     /// `freed_pbas` lists pbas whose refcount transitioned from `>0`
     /// to `0` during the apply. Order is undefined.
     RangeDelete { freed_pbas: Vec<Pba> },
+    /// Outcome of [`WalOp::L2pRemapRange`] — one outcome per range op
+    /// (mirrors the `outcomes.len() == ops.len()` contract above).
+    ///
+    /// * `applied[i]` mirrors `L2pRemap.applied` per LBA: `false` iff
+    ///   that LBA's `seq_guard` rejected the new value (a newer write
+    ///   already landed). Range ops are always unguarded, so this is
+    ///   the only source of per-LBA rejection.
+    /// * `prevs[i]` is the pre-image at `start_lba + i`. On a rejected
+    ///   LBA `prevs[i]` is the value that rejected the new one (i.e.
+    ///   the current live mapping with `seq > new_seq`); on a success
+    ///   it's the pre-mutation value (or `None` if the LBA was unmapped).
+    /// * `freed_pbas` lists distinct PBAs whose refcount transitioned
+    ///   from `>0` to `0` during this range's apply, aggregated across
+    ///   all accepted LBAs. Onyx uses it to feed `SpaceAllocator` +
+    ///   dedup-index cleanup, identical to the per-LBA
+    ///   `L2pRemap.freed_pba` aggregation path.
+    L2pRemapRange {
+        applied: Box<[bool]>,
+        prevs: Box<[Option<L2pValue>]>,
+        freed_pbas: Vec<Pba>,
+    },
 }
 
 /// A batch of ops to be committed atomically.
@@ -178,6 +199,39 @@ impl<'db> Transaction<'db> {
             lba,
             new_value,
             guard,
+        });
+        self
+    }
+
+    /// Range-shaped variant of [`l2p_remap`](Self::l2p_remap): apply the
+    /// same per-LBA remap semantics to `[start_lba .. start_lba + values.len())`
+    /// of `vol_ord` in a single WAL record. Always unguarded; the dedup
+    /// hit path keeps using [`l2p_remap`](Self::l2p_remap) with a guard.
+    ///
+    /// Onyx's passthrough writer emits exactly one range op per
+    /// CompressedUnit (LBAs are contiguous by construction). This
+    /// amortizes the per-op WAL bytes, tag-dispatch, seq-guard check,
+    /// and commit-side bucket-assembly across the range — the apply
+    /// path's existing leaf-run batching does the actual tree work
+    /// (one descend + CoW cascade per `leaf_idx = lba >> 7`).
+    ///
+    /// `values.len() ≤ crate::wal::op::MAX_REMAP_RANGE_LBAS`. The Box
+    /// is moved into the op; callers building from a `Vec` should call
+    /// `.into_boxed_slice()` once and forward.
+    pub fn l2p_remap_range(
+        &mut self,
+        vol_ord: VolumeOrdinal,
+        start_lba: Lba,
+        values: Box<[L2pValue]>,
+    ) -> &mut Self {
+        debug_assert!(
+            !values.is_empty(),
+            "l2p_remap_range called with empty values",
+        );
+        self.ops.push(WalOp::L2pRemapRange {
+            vol_ord,
+            start_lba,
+            values,
         });
         self
     }

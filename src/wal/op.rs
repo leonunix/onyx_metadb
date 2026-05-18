@@ -39,6 +39,7 @@
 //! | 02  | `L2P_DELETE`        | vol_ord (2 B BE) + lba (8 B BE)                                                     |    10    |
 //! | 03  | `L2P_REMAP`         | vol_ord (2 B BE) + lba (8 B BE) + new_value (36 B) + guard_tag (1 B) + [guard]      | 48 / 60  |
 //! | 04  | `L2P_RANGE_DELETE`  | vol_ord (2 B BE) + start (8 B BE) + end (8 B BE) + count (4 B BE) + (lba,value)×count | 22+44n |
+//! | 05  | `L2P_REMAP_RANGE`   | vol_ord (2 B BE) + start_lba (8 B BE) + count (4 B BE) + value×count (36 B each)    | 15+36n   |
 //! | 10  | `DEDUP_PUT`         | hash (32 B) + value (28 B)                                                          |    60    |
 //! | 11  | `DEDUP_DEL`         | hash (32 B)                                                                         |    32    |
 //! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                                                          |    40    |
@@ -105,12 +106,18 @@ use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
 /// v2 (0xB2): L2pValue grew 28 → 36 B with a per-LBA seq trailer.
 /// v3 (0xB3): retired `DedupReversePut` / `DedupReverseDelete` (tags
 /// 0x12 / 0x13) along with the legacy `paged_reverse` module.
-pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB3;
+/// v4 (0xB4): added `L2pRemapRange` (tag 0x05) — range-shaped variant
+/// of `L2pRemap` that carries N contiguous LBAs in one record so the
+/// commit-side bucket assembly and WAL bytes amortize across the range.
+/// Stage 1 emits it only from the passthrough writer path; packed and
+/// dedup-hit paths keep using per-LBA `L2pRemap`.
+pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB4;
 
 pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;
 pub const TAG_L2P_REMAP: u8 = 0x03;
 pub const TAG_L2P_RANGE_DELETE: u8 = 0x04;
+pub const TAG_L2P_REMAP_RANGE: u8 = 0x05;
 
 /// Maximum `captured` entries in a single `L2pRangeDelete` WAL record.
 /// Larger ranges are auto-split by [`Db::range_delete`] so the WAL
@@ -118,6 +125,13 @@ pub const TAG_L2P_RANGE_DELETE: u8 = 0x04;
 /// count field in the on-disk encoding; 65536 is well below `u32::MAX`
 /// and keeps the largest body under ~1 MiB (`22 + 16*65536`).
 pub const MAX_RANGE_DELETE_CAPTURED: usize = 65536;
+
+/// Maximum LBAs in a single `L2pRemapRange` WAL record. Onyx's passthrough
+/// writer is bounded by `coalesce_max_lbas = 32`; 4096 leaves a comfortable
+/// defensive ceiling without bloating the worst-case body
+/// (`15 + 36*4096 ≈ 144 KiB`). Decoders reject larger counts so a corrupt
+/// length prefix can't drive an allocation explosion.
+pub const MAX_REMAP_RANGE_LBAS: usize = 4096;
 
 /// `L2P_REMAP` guard discriminator: no guard — apply runs
 /// unconditionally, matching `L2pPut + Incref + Decref` fused into one
@@ -202,6 +216,27 @@ pub enum WalOp {
         start: Lba,
         end: Lba,
         captured: Vec<(Lba, L2pValue)>,
+    },
+    /// Range-shaped variant of [`L2pRemap`](Self::L2pRemap): apply the
+    /// same per-LBA remap semantics to `[start_lba .. start_lba + values.len())`
+    /// of one volume in a single WAL record. Always unguarded; the dedup
+    /// hit path keeps using per-LBA `L2pRemap` because dedup hits are
+    /// scattered (different LBAs → different existing PBAs) and benefit
+    /// nothing from range coalescing.
+    ///
+    /// Each `values[i]` is the full 36 B `L2pValue` for `start_lba + i`.
+    /// Per `BlockmapValue` layout (SPEC §3.1) the head 8 B is the target
+    /// PBA — same contract `L2pRemap` already relies on for the decref /
+    /// incref decision table.
+    ///
+    /// `values.len() ≤ MAX_REMAP_RANGE_LBAS`; decoders reject larger
+    /// counts. Apply re-uses the existing leaf-run batching in
+    /// `apply_l2p_bucket` — N LBAs that share one `leaf_idx = lba >> 7`
+    /// collapse to one tree descend + CoW cascade.
+    L2pRemapRange {
+        vol_ord: VolumeOrdinal,
+        start_lba: Lba,
+        values: Box<[L2pValue]>,
     },
     DedupPut {
         hash: Hash8,

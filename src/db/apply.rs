@@ -189,6 +189,19 @@ pub(super) fn apply_op_bare(
             captured,
             &snap_info_for_vol(*vol_ord),
         ),
+        WalOp::L2pRemapRange {
+            vol_ord,
+            start_lba,
+            values,
+        } => apply_l2p_remap_range(
+            volumes,
+            refcount_shards,
+            lsn,
+            *vol_ord,
+            *start_lba,
+            values,
+            &snap_info_for_vol(*vol_ord),
+        ),
         WalOp::DropSnapshot {
             id: _,
             pages,
@@ -455,6 +468,198 @@ pub(super) fn apply_l2p_remap(
         applied: true,
         prev,
         freed_pba,
+    })
+}
+
+/// Apply one [`WalOp::L2pRemapRange`]: per-LBA L2P remap semantics over
+/// `[start_lba .. start_lba + values.len())` of one volume, all under
+/// one apply call. Equivalent in net effect to N calls of
+/// [`apply_l2p_remap`] with `guard = None` on each LBA, with three
+/// amortizations:
+///
+/// 1. **Tree write lock per shard, not per LBA**: LBAs are bucketed by
+///    L2P shard once, then each shard's tree is locked once for the
+///    whole bucket. Onyx's passthrough caller produces contiguous LBAs
+///    that usually land in one shard (and often one leaf, since
+///    `shard_for_key_l2p` hashes `lba >> LEAF_SHIFT`).
+/// 2. **Refcount net delta across the range**: incref/decref pairs that
+///    cancel within the same range never touch the refcount shard.
+///    Same per-PBA net-delta collapse that the per-LBA path uses, just
+///    aggregated over more LBAs.
+/// 3. **WAL / op-dispatch / bucket-assembly cost**: the entire range is
+///    one record, one outcome slot, one apply-lane dispatch.
+///
+/// Range ops are always unguarded; the dedup-hit path that needs a
+/// guard keeps emitting per-LBA `L2pRemap`. The snap-pin check stays
+/// per-LBA inside the range — a range-aware snap-pin walk is the
+/// Stage 2 amortization tracked as `metadb_leaf_pin_todo`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_l2p_remap_range(
+    volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+    refcount_shards: &[Shard],
+    lsn: Lsn,
+    vol_ord: VolumeOrdinal,
+    start_lba: Lba,
+    values: &[L2pValue],
+    snap_infos: &[SnapInfo],
+) -> Result<ApplyOutcome> {
+    let volume = volumes.get(&vol_ord).ok_or_else(|| {
+        MetaDbError::Corruption(format!("L2pRemapRange for unknown volume ord {vol_ord}"))
+    })?;
+
+    let n = values.len();
+    debug_assert!(n > 0, "L2pRemapRange with empty values reached apply");
+
+    // Bucket LBAs by L2P shard so each shard's tree mutex is taken once
+    // for the whole range. Mirrors apply_l2p_range_delete's shape.
+    let shard_count = volume.shards.len();
+    let mut shard_buckets: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
+    for i in 0..n {
+        let lba = start_lba + i as u64;
+        shard_buckets[shard_for_key_l2p(&volume.shards, lba)].push(i);
+    }
+
+    let mut prevs: Vec<Option<L2pValue>> = vec![None; n];
+    let mut applied: Vec<bool> = vec![false; n];
+
+    // Net per-PBA delta across the whole range. Same collapse logic as
+    // apply_l2p_remap, just summed over N LBAs: identical PBA on both
+    // sides of an overwrite (same head_pba but different other bytes
+    // → seq trailer differs) won't transiently hit rc=0 mid-range.
+    let mut net_delta: HashMap<Pba, i32> = HashMap::new();
+
+    for (l2p_sid, indices) in shard_buckets.iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        let use_buffer = volume.shards[l2p_sid].use_buffer;
+        let mut tree = volume.shards[l2p_sid].tree.write();
+
+        for &i in indices {
+            let lba = start_lba + i as u64;
+            let new_value = values[i];
+            let new_pba = new_value.head_pba();
+            let new_is_zero = new_value.0[27] & 0x02 != 0;
+
+            // Buffer-first lookup matching apply_l2p_remap's path.
+            let cur = if use_buffer {
+                match volume.shards[l2p_sid].l2p_buffer.lookup(lba) {
+                    crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
+                    crate::db::l2p_buffer::BufferLookup::Tombstone => None,
+                    crate::db::l2p_buffer::BufferLookup::Absent => tree.get(lba)?,
+                }
+            } else {
+                tree.get(lba)?
+            };
+
+            if seq_guard_rejects(new_value.seq(), cur.as_ref()) {
+                // Stale write — leave L2P untouched; surface the rejecting
+                // value as prev so onyx-side cleanup logic still sees a
+                // per-LBA outcome slot. applied stays false (default).
+                prevs[i] = cur;
+                continue;
+            }
+
+            let prev = if use_buffer {
+                volume.shards[l2p_sid]
+                    .l2p_buffer
+                    .insert(lba, new_value, lsn);
+                cur
+            } else {
+                tree.insert_at_lsn(lba, new_value, lsn)?
+            };
+            prevs[i] = prev;
+            applied[i] = true;
+            let old_pba = prev.map(|p| p.head_pba());
+
+            // Snap-pin check: per-LBA, same shape as apply_l2p_remap.
+            // The closure captures snap_infos + l2p_sid (which doubles
+            // as snap_sid because shard_for_key_l2p is volume-agnostic).
+            let snap_sid = l2p_sid;
+            let any_snap_pins = |target: L2pValue,
+                                 target_birth: Option<Lsn>,
+                                 tree: &mut PagedL2p|
+             -> Result<bool> {
+                for s in snap_infos {
+                    if let Some(b) = target_birth {
+                        if b > s.created_lsn {
+                            continue;
+                        }
+                    }
+                    let snap_root = s.l2p_shard_roots[snap_sid];
+                    if let Some(snap_val) = tree.get_at(snap_root, lba)? {
+                        if snap_val == target {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
+            };
+
+            let snap_pins_old = if snap_infos.is_empty() {
+                false
+            } else {
+                match prev {
+                    Some(old_value) => {
+                        let birth =
+                            lookup_birth_lsn(refcount_shards, old_value.head_pba())?;
+                        any_snap_pins(old_value, birth, &mut tree)?
+                    }
+                    None => false,
+                }
+            };
+            let snap_pins_new = if new_is_zero || snap_infos.is_empty() {
+                false
+            } else {
+                let birth = lookup_birth_lsn(refcount_shards, new_pba)?;
+                any_snap_pins(new_value, birth, &mut tree)?
+            };
+
+            let value_changed = prev != Some(new_value);
+            let live_loses_old = prev.is_some() && value_changed;
+            let live_gains_new = value_changed;
+            let old_is_zero =
+                prev.is_some_and(|old_value| old_value.0[27] & 0x02 != 0);
+            let do_decref = live_loses_old && !old_is_zero && !snap_pins_old;
+            let do_incref = live_gains_new && !new_is_zero && !snap_pins_new;
+
+            if do_decref {
+                let pba = old_pba.expect("do_decref implies prev.is_some()");
+                *net_delta.entry(pba).or_insert(0) -= 1;
+            }
+            if do_incref {
+                *net_delta.entry(new_pba).or_insert(0) += 1;
+            }
+        }
+
+        // Publish once per shard, after all LBAs in this bucket mutated.
+        if !use_buffer {
+            publish_l2p_read_view(&volume.shards[l2p_sid], &tree);
+        }
+    }
+
+    // Apply refcount deltas in shard-sorted order to avoid cross-shard
+    // deadlock with other paths that follow the same convention.
+    let mut touched: Vec<(usize, Pba, i32)> = net_delta
+        .into_iter()
+        .filter(|(_, delta)| *delta != 0)
+        .map(|(pba, delta)| (shard_for_key(refcount_shards, pba), pba, delta))
+        .collect();
+    touched.sort_by_key(|(sid, _, _)| *sid);
+
+    let mut freed_pbas: Vec<Pba> = Vec::new();
+    for (sid, pba, delta) in touched {
+        let (pre, new) =
+            refcount_shards[sid].rc.stage(pba, i64::from(delta), lsn)?;
+        if new == 0 && pre > 0 {
+            freed_pbas.push(pba);
+        }
+    }
+
+    Ok(ApplyOutcome::L2pRemapRange {
+        applied: applied.into_boxed_slice(),
+        prevs: prevs.into_boxed_slice(),
+        freed_pbas,
     })
 }
 
