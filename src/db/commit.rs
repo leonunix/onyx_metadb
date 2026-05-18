@@ -1323,16 +1323,14 @@ impl Db {
         let tree_lock_wait = tree_lock_started.elapsed();
         let read_view_prepare_started = std::time::Instant::now();
         let mut read_view_guard = if shard.active_readers.load(Ordering::Acquire) == 0
-            && let Some(mut guard) = shard.read_view.try_write()
+            && let Some(guard) = shard.read_view.try_write()
         {
+            // Holding the write guard blocks new readers until the
+            // post-apply snapshot is published. Do not replace the current
+            // view with an empty overlay here: the pre-apply root may already
+            // reference dirty pages from earlier commits that have not been
+            // checkpointed to the page store yet.
             if shard.active_readers.load(Ordering::Acquire) == 0 {
-                *guard = Arc::new(crate::paged::ReadView::new(
-                    tree.root(),
-                    tree.root_level(),
-                    crate::paged::ReadOverlay::empty_shared(),
-                    tree.page_cache().clone(),
-                ));
-                tree.set_exclusive_read_overlay_mutation(true);
                 Some(guard)
             } else {
                 None
