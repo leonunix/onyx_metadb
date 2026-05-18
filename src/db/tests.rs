@@ -2,8 +2,14 @@ use super::*;
 use tempfile::TempDir;
 
 pub(super) fn v(n: u8) -> L2pValue {
-    let mut x = [0u8; 36];
+    let mut x = [0u8; crate::paged::format::LEAF_VALUE_SIZE];
     x[0] = n;
+    // Pin the birth_lsn trailer to a small non-zero u64 so the apply
+    // path's birth_lsn stamping (replaces 0 sentinel with apply lsn)
+    // doesn't perturb the value bytes underneath round-trip assertions
+    // throughout the test suite. The exact value doesn't matter — only
+    // that it's non-zero so the stamp pass preserves it.
+    x[crate::paged::format::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(x)
 }
 

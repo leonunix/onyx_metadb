@@ -27,8 +27,9 @@ type RefcountRef = BTreeMap<u64, u32>;
 type DedupRef = BTreeMap<Hash8, DedupValue>;
 
 fn l2p(n: u8) -> L2pValue {
-    let mut x = [0u8; 36];
+    let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
     x[0] = n;
+    x[onyx_metadb::paged::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(x)
 }
 

@@ -200,43 +200,44 @@ proptest! {
     }
 }
 
-// ---------- regression test: 128 unique units, one per slot --------------
+// ---------- regression test: 110 unique units, one per slot (v4 cap) -----
 //
 // Pre-v3 layout (compact v2) capped the unit dict at 100 entries; a
 // leaf with 128 distinct L2pValues — one per slot — used to fail at
-// the 101st insert with `compact_in_place did not free enough room
-// for one unit`. The b-语义路 schema bump (per-LBA seq + 36 B values,
-// commit 746ee41) widened the per-slot record from 3 B to 11 B and
-// pushed `MAX_UNITS_PER_LEAF` down from 256 to 100, which is when
-// this corner started firing in production
-// (`--refill_buffers` workloads, `multi_lane_wal_replay_*` tests).
+// the 101st insert. v3 raised the cap to 128 by dropping on-disk
+// `unit_lba_count` and shrinking per-slot seq from u64 to u32 delta.
 //
-// v3 raises the cap to 128 = `LEAF_ENTRY_COUNT` by dropping
-// `unit_lba_count` from the on-disk dict (derived from
-// `unit_original_size / 4096`) and shrinking per-slot seq from u64 to
-// u32 delta off a per-leaf `base_seq`. This test bolts that fix in
-// place so a future schema regression that re-introduces the cap
-// fails loudly here rather than in 24-hour soaks.
+// v4 (Phase 1 of [[no-refcount-hot-path-design]]) adds a per-leaf
+// 8 B `base_birth_lsn` and a per-unit 4 B `birth_delta`, tightening
+// `MAX_UNITS_PER_LEAF` back to 110. This test still pins down "the
+// pathological 1-LBA-per-unit run fills the dict to its declared
+// cap"; once a continuation-page overflow mechanism lands we'll be
+// able to raise it back to LEAF_ENTRY_COUNT.
 #[test]
 fn one_unique_unit_per_slot_round_trips() {
+    use onyx_metadb::paged::leaf_compact::MAX_UNITS_PER_LEAF;
     let mut page = fresh_leaf();
     let mut oracle: BTreeMap<usize, [u8; LEAF_VALUE_SIZE]> = BTreeMap::new();
-    for slot in 0..LEAF_ENTRY_COUNT {
+    for slot in 0..MAX_UNITS_PER_LEAF {
         // Each slot gets its own unit_id (different base_pba etc.)
-        // and its own offset_in_unit. With 128 unique units the unit
-        // dict must be willing to grow to exactly 128 entries.
+        // and its own offset_in_unit. With MAX_UNITS_PER_LEAF unique
+        // units the unit dict must be willing to grow to exactly that
+        // many entries.
         let unit_id = slot as u32 + 1;
         let offset = (slot as u16) & 0x1F;
         let mut v = synth_value(unit_id, offset);
         // Set a small monotonic seq trailer so the per-leaf u32 delta
         // encoding has plenty of headroom.
         v[28..36].copy_from_slice(&(slot as u64 + 1).to_be_bytes());
-        leaf_set(&mut page, slot, &L2pValue(v)).expect("128th unique unit must fit");
+        // Set a small monotonic birth_lsn trailer so the per-unit u32
+        // birth_delta encoding has the same headroom.
+        v[36..44].copy_from_slice(&(slot as u64 + 1).to_be_bytes());
+        leaf_set(&mut page, slot, &L2pValue(v)).expect("cap-th unique unit must fit");
         oracle.insert(slot, v);
         check_against_oracle(&page, &oracle).expect("oracle agreement after each insert");
     }
     page.seal();
-    page.verify(789).expect("seal+verify with 128 unique units");
+    page.verify(789).expect("seal+verify at MAX_UNITS_PER_LEAF");
 }
 
 // ---------- proptest 2: high-cardinality stress (compact_in_place) --------

@@ -381,18 +381,23 @@ fn b2_buffer_take_snapshot_force_compacts_target() {
     // still live in the L2P buffer. `take_snapshot` calls
     // `force_compact_l2p_buffers` so the sampled roots reflect every
     // committed LSN.
+    //
+    // NB: capped at 100 LBAs (rather than 200) so leaf 0 never holds
+    // more than MAX_UNITS_PER_LEAF=110 unique units — see
+    // `leaf_compact::MAX_UNITS_PER_LEAF` docs for the v4 cap and the
+    // pathological 1-LBA-per-unit fallback story.
     let (_d, db) = mk_db_with_buffer();
-    for i in 0u64..200 {
+    for i in 0u64..100 {
         db.insert(0, i, v(i as u8)).unwrap();
     }
     let snap = db.take_snapshot(0).unwrap();
     // Post-snapshot writes land in buffer; snapshot view must not see them.
-    for i in 0u64..200 {
+    for i in 0u64..100 {
         db.insert(0, i, v(99)).unwrap();
     }
     db.insert(0, 999, v(7)).unwrap();
     let view = db.snapshot_view(snap).unwrap();
-    for i in 0u64..200 {
+    for i in 0u64..100 {
         assert_eq!(view.get(i).unwrap(), Some(v(i as u8)));
     }
     assert_eq!(view.get(999).unwrap(), None);
@@ -468,7 +473,7 @@ fn b2_buffer_range_delete_drains_buffer() {
     // L2pRemap path so RC bookkeeping matches what `range_delete`
     // expects when it decref's captured values.
     fn remap_val(pba: Pba, tag: u8) -> L2pValue {
-        let mut v = [0u8; 36];
+        let mut v = [0u8; crate::paged::format::LEAF_VALUE_SIZE];
         v[..8].copy_from_slice(&pba.to_be_bytes());
         v[8] = tag;
         L2pValue(v)

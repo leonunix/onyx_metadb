@@ -7,8 +7,9 @@ use onyx_metadb::{Config, Db, L2pValue, VerifyOptions, verify_path};
 use tempfile::TempDir;
 
 fn v(n: u8) -> L2pValue {
-    let mut x = [0u8; 36];
+    let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
     x[0] = n;
+    x[onyx_metadb::paged::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(x)
 }
 
@@ -138,20 +139,22 @@ fn drop_volume_while_snapshot_exists_is_refused() {
 /// `header=N+1, expected=N`.
 ///
 /// To trigger the capacity-check failure deterministically we dial
-/// `shards_per_partition` up to 240 — with one bootstrap volume that
-/// leaves room for exactly 4 snapshot entries in the v6 manifest.
-/// The 5th `take_snapshot` must fail *atomically*: page refcounts
-/// must not leak.
+/// `shards_per_partition` up to a value that leaves only a handful of
+/// snapshot rows in the manifest payload. v11+ added per-shard
+/// durable_seq (8 B per shard, doubling per-shard overhead from 8 →
+/// 16 B), so the v6-era "240 shards → 4 snapshots" sizing no longer
+/// fits even one volume entry. 100 shards under the current layout
+/// (v12) leaves room for ~20 snapshots — still well under the test's
+/// `taken <= 64` guard, and well above `taken >= 1`.
 #[test]
 fn take_snapshot_capacity_failure_does_not_leak_refcount() {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
-    cfg.shards_per_partition = 240;
+    cfg.shards_per_partition = 100;
     cfg.direct_io = false;
     let db = Db::create_with_config(cfg).unwrap();
 
-    // Take snapshots on the bootstrap volume (ord 0) until the cap is
-    // hit. With 240 shards and 1 volume, max_snapshots = 4.
+    // Take snapshots on the bootstrap volume (ord 0) until the cap is hit.
     let mut taken = 0usize;
     let err = loop {
         match db.take_snapshot(0) {

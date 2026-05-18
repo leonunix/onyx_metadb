@@ -747,20 +747,18 @@ fn encode_v10_for_test(m: &Manifest, page: &mut Page) {
 }
 
 /// A v10 manifest (no on-disk per-shard durable_seq arrays) must
-/// upgrade on decode by synthesising every per-shard value from
-/// `checkpoint_lsn`. The invariant `min(durable_seq[]) == checkpoint_lsn`
-/// holds by construction, so the next encode re-emits cleanly as v11.
+/// v10 manifests carry compact leaf v3 in the paged tree, which is
+/// wire-incompatible with v4. The Phase 1 flag-day cutover (manifest
+/// v12 ↔ leaf v4) hard-rejects v10/v11 instead of lazy-upgrading.
 #[test]
-fn v10_manifest_decodes_with_durable_seq_backfilled_from_checkpoint_lsn() {
+fn v10_manifest_is_rejected_after_flag_day_to_v12() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
-    let checkpoint_lsn: Lsn = 99;
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
-        checkpoint_lsn,
+        checkpoint_lsn: 99,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2, 3]),
-        // Decoder ignores this on v10 — value doesn't matter.
         refcount_durable_seq: bx(&[]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[]),
@@ -771,7 +769,6 @@ fn v10_manifest_decodes_with_durable_seq_backfilled_from_checkpoint_lsn() {
             ord: 0,
             shard_count: 2,
             l2p_shard_roots: bx(&[10, 11]),
-            // Same: decoder ignores this on v10.
             l2p_shard_durable_seq: bx(&[]),
             created_lsn: 0,
             flags: 0,
@@ -781,18 +778,13 @@ fn v10_manifest_decodes_with_durable_seq_backfilled_from_checkpoint_lsn() {
     encode_v10_for_test(&m, &mut page);
     page.seal();
 
-    let decoded = Manifest::decode(&page, &ps).unwrap();
-    // Per-shard arrays synthesised from checkpoint_lsn.
-    assert_eq!(decoded.refcount_durable_seq.as_ref(), &[99, 99, 99]);
-    assert_eq!(decoded.volumes[0].l2p_shard_durable_seq.as_ref(), &[99, 99]);
-    // Re-encoding must succeed (invariant holds) and emit v11.
-    let mut page2 = Page::new(PageHeader::new(PageType::Manifest, 1));
-    decoded.encode(&mut page2).unwrap();
-    page2.seal();
-    let body_version = u32::from_le_bytes(
-        page2.payload()[OFF_BODY_VERSION..OFF_BODY_VERSION + 4]
-            .try_into()
-            .unwrap(),
-    );
-    assert_eq!(body_version, MANIFEST_BODY_VERSION);
+    match Manifest::decode(&page, &ps).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(
+                msg.contains("body version") || msg.contains("v12"),
+                "expected v10-rejection message, got: {msg}"
+            );
+        }
+        e => panic!("expected Corruption from v10 manifest, got {e}"),
+    }
 }

@@ -2992,7 +2992,7 @@ mod tests {
     fn small_remap_batches_use_lane_dispatch_not_global_serial() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = Db::create(dir.path()).unwrap();
-        let mut raw = [0u8; 36];
+        let mut raw = [0u8; crate::paged::format::LEAF_VALUE_SIZE];
         raw[..8].copy_from_slice(&123_u64.to_be_bytes());
 
         let ops = [WalOp::L2pRemap {

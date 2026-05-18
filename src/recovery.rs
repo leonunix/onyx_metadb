@@ -492,12 +492,12 @@ mod tests {
                 WalOp::L2pPut {
                     vol_ord: 0,
                     lba: 1,
-                    value: L2pValue([1; 36]),
+                    value: L2pValue([1; crate::paged::format::LEAF_VALUE_SIZE]),
                 },
                 WalOp::L2pPut {
                     vol_ord: 0,
                     lba: 2,
-                    value: L2pValue([2; 36]),
+                    value: L2pValue([2; crate::paged::format::LEAF_VALUE_SIZE]),
                 },
             ]);
             wal.submit(body1).unwrap();
@@ -569,7 +569,7 @@ mod tests {
                 wal.submit(encode_body(&[WalOp::L2pPut {
                     vol_ord: 0,
                     lba: i,
-                    value: L2pValue([i as u8; 36]),
+                    value: L2pValue([i as u8; crate::paged::format::LEAF_VALUE_SIZE]),
                 }]))
                 .unwrap();
             }

@@ -6,8 +6,9 @@ use onyx_metadb::{Db, DedupValue, Hash8, L2pValue, VerifyOptions, verify_path};
 use tempfile::TempDir;
 
 fn l2p(n: u8) -> L2pValue {
-    let mut x = [0u8; 36];
+    let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
     x[0] = n;
+    x[onyx_metadb::paged::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(x)
 }
 
@@ -28,7 +29,7 @@ fn clean_db_passes_verifier() {
     let dir = TempDir::new().unwrap();
     let db = Db::create(dir.path()).unwrap();
     for i in 0..32u64 {
-        db.insert(0, i, l2p(i as u8)).unwrap();
+        db.insert(0, i, l2p((i % 64) as u8)).unwrap();
         db.put_dedup(h(10_000 + i), dval(i as u8)).unwrap();
         db.incref_pba(20_000 + i, 1).unwrap();
     }
@@ -108,12 +109,12 @@ fn manifest_swap_crash_reclaims_orphans_on_open() {
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
             for i in 0..64u64 {
-                db.insert(0, i, l2p(i as u8)).unwrap();
+                db.insert(0, i, l2p((i % 64) as u8)).unwrap();
                 db.put_dedup(h(i), dval(i as u8)).unwrap();
             }
             db.flush().unwrap();
             for i in 64..128u64 {
-                db.insert(0, i, l2p(i as u8)).unwrap();
+                db.insert(0, i, l2p((i % 64) as u8)).unwrap();
                 db.put_dedup(h(i), dval(i as u8)).unwrap();
             }
             faults.install(
@@ -127,7 +128,7 @@ fn manifest_swap_crash_reclaims_orphans_on_open() {
 
     let db = Db::open(dir.path()).unwrap();
     for i in 0..128u64 {
-        assert_eq!(db.get(0, i).unwrap(), Some(l2p(i as u8)));
+        assert_eq!(db.get(0, i).unwrap(), Some(l2p((i % 64) as u8)));
         assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dval(i as u8)));
     }
     drop(db);
@@ -234,7 +235,7 @@ fn drop_snapshot_crash_at_manifest_commit_preserves_refcount_consistency() {
             // multiple index/leaf pages so the snapshot genuinely shares
             // pages with the current tree (not just a single root).
             for i in 0..512u64 {
-                db.insert(0, i, l2p(i as u8)).unwrap();
+                db.insert(0, i, l2p((i % 64) as u8)).unwrap();
             }
             db.flush().unwrap();
 
@@ -262,7 +263,7 @@ fn drop_snapshot_crash_at_manifest_commit_preserves_refcount_consistency() {
     // tree structure implies.
     let db = Db::open(dir.path()).unwrap();
     for i in 0..512u64 {
-        assert_eq!(db.get(0, i).unwrap(), Some(l2p(i as u8)));
+        assert_eq!(db.get(0, i).unwrap(), Some(l2p((i % 64) as u8)));
     }
     drop(db);
 
@@ -338,7 +339,7 @@ fn drop_volume_crash_after_wal_before_apply_recovers() {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
             let ord = db.create_volume().unwrap();
             for i in 0u64..32 {
-                db.insert(ord, i, l2p(i as u8)).unwrap();
+                db.insert(ord, i, l2p((i % 64) as u8)).unwrap();
             }
             db.flush().unwrap();
 
@@ -382,7 +383,7 @@ fn clone_volume_crash_mid_incref_completes_on_recovery() {
     let setup = |path: &std::path::Path| {
         let db = Db::create(path).unwrap();
         for i in 0u64..16 {
-            db.insert(0, i, l2p(i as u8)).unwrap();
+            db.insert(0, i, l2p((i % 64) as u8)).unwrap();
         }
         let sid = db.take_snapshot(0).unwrap();
         db.flush().unwrap();
@@ -410,7 +411,7 @@ fn clone_volume_crash_mid_incref_completes_on_recovery() {
     );
     let clone = 1;
     for i in 0u64..16 {
-        assert_eq!(db.get(clone, i).unwrap(), Some(l2p(i as u8)));
+        assert_eq!(db.get(clone, i).unwrap(), Some(l2p((i % 64) as u8)));
     }
     drop(db);
 
@@ -424,14 +425,17 @@ fn clone_volume_crash_mid_incref_completes_on_recovery() {
 
 // ----------------- L2pRemap crash-safety (SPEC §5.3) ---------------
 
-/// Encode a pba + tag into the 36-byte v2 `L2pValue`: head 8 bytes are
+/// Encode a pba + tag into the 44-byte v4 `L2pValue`: head 8 bytes are
 /// the target pba BE (Onyx's `BlockmapValue` contract), byte 8 is a
 /// discriminator tag, trailing 8 bytes are the per-LBA seq (left as
-/// zero — the legacy / no-seq-guard sentinel for these crash tests).
+/// zero — the legacy / no-seq-guard sentinel for these crash tests),
+/// final 8 bytes are birth_lsn (set non-zero so apply's stamp-if-zero
+/// pass doesn't perturb byte-equality checks across crash/replay).
 fn remap_val(pba: u64, tag: u8) -> L2pValue {
-    let mut v = [0u8; 36];
+    let mut v = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
     v[..8].copy_from_slice(&pba.to_be_bytes());
     v[8] = tag;
+    v[onyx_metadb::paged::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(v)
 }
 
@@ -761,10 +765,13 @@ fn drop_snapshot_crash_mid_page_cascade_recovers_consistent_refcounts() {
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
             // Enough writes to guarantee multi-page L2P trees so the
-            // drop_snapshot page cascade is non-trivial.
+            // drop_snapshot page cascade is non-trivial. Use LBA = i*4
+            // to spread 256 unique PBAs across multiple leaves and stay
+            // under the v4 MAX_UNITS_PER_LEAF=110 cap (32 unique units
+            // per leaf at this stride).
             for i in 0u64..256 {
                 let mut tx = db.begin();
-                tx.l2p_remap(0, i, remap_val(100 + i, 0), None);
+                tx.l2p_remap(0, i * 4, remap_val(100 + i, 0), None);
                 tx.commit().unwrap();
             }
             db.flush().unwrap();
@@ -773,7 +780,7 @@ fn drop_snapshot_crash_mid_page_cascade_recovers_consistent_refcounts() {
             // on the live path. pba_decrefs will contain these 128 pbas.
             for i in 0u64..128 {
                 let mut tx = db.begin();
-                tx.l2p_remap(0, i, remap_val(500 + i, 0), None);
+                tx.l2p_remap(0, i * 4, remap_val(500 + i, 0), None);
                 tx.commit().unwrap();
             }
             // Force the panic midway through the page cascade.

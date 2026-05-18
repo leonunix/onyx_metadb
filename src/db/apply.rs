@@ -77,11 +77,12 @@ pub(super) fn apply_op_bare(
             if seq_guard_rejects(value.seq(), cur.as_ref()) {
                 return Ok(ApplyOutcome::L2pPrev(cur));
             }
+            let stamped = stamp_birth_lsn(*value, lsn);
             let prev = if use_buffer {
-                volume.shards[sid].l2p_buffer.insert(*lba, *value, lsn);
+                volume.shards[sid].l2p_buffer.insert(*lba, stamped, lsn);
                 cur
             } else {
-                let p = tree.insert_at_lsn(*lba, *value, lsn)?;
+                let p = tree.insert_at_lsn(*lba, stamped, lsn)?;
                 publish_l2p_read_view(&volume.shards[sid], &tree);
                 p
             };
@@ -253,6 +254,23 @@ pub(super) fn seq_guard_rejects(new_seq: u64, cur: Option<&L2pValue>) -> bool {
     }
 }
 
+/// Stamp the incoming value with the current apply `lsn` as its
+/// `birth_lsn` if the caller did not already attach one (sentinel 0).
+/// Promote / dedup-hit / scanner-remap callers carry the source PBA's
+/// original birth_lsn in the value and want it preserved; fresh writes
+/// arrive with birth_lsn=0 and get stamped here so Phase 2's per-volume
+/// dead-list emitter ([[no-refcount-hot-path-design]]) can read it
+/// directly off `ApplyOutcome::L2pRemap.prev` without an extra
+/// refcount-shard lookup.
+#[inline]
+pub(super) fn stamp_birth_lsn(value: L2pValue, lsn: Lsn) -> L2pValue {
+    if value.birth_lsn() == 0 {
+        value.with_birth_lsn(lsn)
+    } else {
+        value
+    }
+}
+
 /// Apply one [`WalOp::L2pRemap`]. Fuses L2P put + refcount decref(old)
 /// + refcount incref(new) + (optionally) a liveness guard read into one
 /// atomic step — the onyx adapter hot path.
@@ -345,6 +363,7 @@ pub(super) fn apply_l2p_remap(
             freed_pba: None,
         });
     }
+    let new_value = stamp_birth_lsn(new_value, lsn);
 
     // Drive the mutation. In B2 the prev value we just read IS the
     // pre-write state — buffer.insert is a swap, so `cur` (read above)
@@ -559,6 +578,7 @@ pub(super) fn apply_l2p_remap_range(
                 prevs[i] = cur;
                 continue;
             }
+            let new_value = stamp_birth_lsn(new_value, lsn);
 
             let prev = if use_buffer {
                 volume.shards[l2p_sid]

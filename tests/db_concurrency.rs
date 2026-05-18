@@ -12,8 +12,9 @@ use tempfile::TempDir;
 use xxhash_rust::xxh3::xxh3_64;
 
 fn v(n: u8) -> L2pValue {
-    let mut x = [0u8; 36];
+    let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
     x[0] = n;
+    x[onyx_metadb::paged::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(x)
 }
 
@@ -101,8 +102,12 @@ fn multi_lane_wal_replay_survives_reopen_without_flush() {
     let mut expected = BTreeMap::new();
     let db = Db::create_with_config(cfg.clone()).unwrap();
     let mut commits = 0u64;
+    // Keep distinct values per leaf below MAX_UNITS_PER_LEAF=110
+    // (v4 cap). `key % 64` gives 64 distinct values; 4 keys map to
+    // each value within a leaf (leaf_idx = lba >> 7 ⇒ 128 LBAs per
+    // leaf, 64 unique values within each leaf).
     for key in 0..512u64 {
-        let value = v((key % 251) as u8);
+        let value = v((key % 64) as u8);
         db.insert(0, key, value).unwrap();
         expected.insert(key, value);
         commits += 1;

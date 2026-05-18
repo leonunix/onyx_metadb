@@ -17,8 +17,9 @@ use tempfile::TempDir;
 type Ref = BTreeMap<u64, L2pValue>;
 
 fn v_of(n: u8) -> L2pValue {
-    let mut x = [0u8; 36];
+    let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
     x[0] = n;
+    x[onyx_metadb::paged::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(x)
 }
 

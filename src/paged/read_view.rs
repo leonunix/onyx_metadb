@@ -550,12 +550,13 @@ mod tests {
     }
 
     fn val(byte: u8) -> L2pValue {
-        let mut x = [byte; 36];
-        // v3 compact encoder requires unit_original_size = lba_count * 4096
-        // and a u32-delta-fitting seq.
+        let mut x = [byte; crate::paged::format::LEAF_VALUE_SIZE];
+        // v4 compact encoder requires unit_original_size = lba_count * 4096
+        // and u32-delta-fitting seq / birth_lsn.
         x[13..17].copy_from_slice(&4096u32.to_be_bytes());
         x[17..19].copy_from_slice(&1u16.to_be_bytes());
         x[28..36].copy_from_slice(&(byte as u64).to_be_bytes());
+        x[36..44].copy_from_slice(&(byte as u64).to_be_bytes());
         L2pValue(x)
     }
 

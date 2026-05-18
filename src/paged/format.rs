@@ -84,20 +84,28 @@ use crate::paged::leaf_compact;
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
 /// Bytes per logical L2P value. The first 28 bytes embed Onyx's
-/// `BlockmapValue` (see `head_pba` contract below). The last 8 bytes
+/// `BlockmapValue` (see `head_pba` contract below). The next 8 bytes
 /// are a big-endian `u64` commit-seq used by metadb's `seq_guard` to
 /// reject stale concurrent commits; see `L2P_SEQ_OFFSET` and
-/// `apply::apply_l2p_remap` for the CAS semantics. In the compact leaf
-/// format an entry on disk is **11 B** (slot record: unit_idx + offset
-/// + seq) + a slice of the 26 B unit-dict entry — `LEAF_VALUE_SIZE` is
-/// the *logical* size of the reconstituted value, not the per-slot
-/// on-disk size.
-pub const LEAF_VALUE_SIZE: usize = 36;
+/// `apply::apply_l2p_remap` for the CAS semantics. The final 8 bytes
+/// are a big-endian `u64` birth_lsn — the WAL LSN at which the PBA was
+/// first L2P-pointed by this volume. Stamped at apply time when
+/// incoming birth_lsn is `0`; preserved otherwise (promote / scanner
+/// paths that carry the source PBA's birth). Powers Phase 2's per-
+/// volume dead-list emission ([[no-refcount-hot-path-design]]).
+pub const LEAF_VALUE_SIZE: usize = 44;
 
 /// Byte offset within an `L2pValue` where the 8-byte big-endian commit
 /// seq lives. Onyx fills this at the adapter boundary; metadb apply
 /// reads it for the seq_guard CAS check.
 pub const L2P_SEQ_OFFSET: usize = 28;
+
+/// Byte offset within an `L2pValue` where the 8-byte big-endian
+/// `birth_lsn` lives. Apply stamps `lsn` here when the incoming value
+/// has `birth_lsn() == 0` (fresh write); for non-zero incoming values
+/// the field is preserved (promote / scanner remaps carry the source
+/// PBA's original birth).
+pub const L2P_BIRTH_OFFSET: usize = 36;
 
 /// Entries per leaf. Chosen as a power of two so addressing is a pair
 /// of bit ops (`lba & 0x7F`, `lba >> 7`).
@@ -139,14 +147,16 @@ const _: () = {
     assert!(PAGE_PAYLOAD_SIZE == 4032);
     assert!(LEAF_ENTRY_COUNT == 128);
     assert!(LEAF_BITMAP_BYTES == 16);
-    // Compact format invariants (v3). With per-slot record at 7 B
-    // (unit_idx + offset_in_unit + u32 seq_delta) and per-leaf
-    // base_seq (8 B) in the header, the entries region is 896 B and
-    // the unit-dict offset moves to 922. The pathological "128
-    // distinct units" case fits at 3994 B with 38 B headroom.
-    assert!(leaf_compact::COMPACT_HEADER_BYTES == 26);
-    assert!(leaf_compact::COMPACT_UNIT_DICT_OFFSET == 922);
-    assert!(leaf_compact::MAX_UNITS_PER_LEAF == LEAF_ENTRY_COUNT);
+    // Compact format invariants (v4). Header is 34 B (bitmap 16 +
+    // unit_count 1 + version 1 + base_seq 8 + base_birth_lsn 8).
+    // Per-slot record stays 7 B (unit_idx + offset_in_unit + u32
+    // seq_delta). Unit-dict entry grew from 24 → 28 B with the 4 B
+    // per-unit `birth_delta`. To keep the worst-case under the
+    // 4032 B payload cap the per-leaf unit cap drops to 110 (worst
+    // case 34 + 896 + 3080 = 4010 B, 22 B headroom).
+    assert!(leaf_compact::COMPACT_HEADER_BYTES == 34);
+    assert!(leaf_compact::COMPACT_UNIT_DICT_OFFSET == 930);
+    assert!(leaf_compact::MAX_UNITS_PER_LEAF == 110);
     assert!(leaf_compact::compact_size(leaf_compact::MAX_UNITS_PER_LEAF) <= PAGE_PAYLOAD_SIZE);
     assert!(INDEX_FANOUT == 256);
     assert!(INDEX_FANOUT * INDEX_CHILD_SIZE <= PAGE_PAYLOAD_SIZE);
@@ -158,9 +168,11 @@ const _: () = {
 /// Level byte lives at type-header offset 0.
 const TYPE_HDR_LEVEL: usize = 0;
 
-/// 28-byte opaque value stored against each L2P key. The engine treats
-/// this as opaque bytes — Onyx encodes its `BlockmapValue` into these
-/// 28 bytes in the embedder layer.
+/// 44-byte opaque value stored against each L2P key. The engine treats
+/// the first 28 bytes as opaque (Onyx encodes its `BlockmapValue`
+/// there), the next 8 as `commit_seq` (seq_guard CAS), and the last 8
+/// as `birth_lsn` (set by metadb's apply path on fresh writes; see
+/// [`L2P_BIRTH_OFFSET`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct L2pValue(pub [u8; LEAF_VALUE_SIZE]);
 
@@ -214,6 +226,24 @@ impl L2pValue {
     /// pushing the op into a `Transaction`.
     pub fn with_seq(mut self, seq: u64) -> Self {
         self.0[L2P_SEQ_OFFSET..L2P_SEQ_OFFSET + 8].copy_from_slice(&seq.to_be_bytes());
+        self
+    }
+
+    /// Big-endian 8-byte `birth_lsn` stored at `[L2P_BIRTH_OFFSET..]`.
+    /// `0` is the "not yet stamped" sentinel; metadb apply replaces it
+    /// with the current apply lsn before inserting. Non-zero values
+    /// (carried by promote / scanner remaps) are preserved across
+    /// apply so a dedup-shared PBA keeps its original first-write lsn.
+    pub fn birth_lsn(&self) -> Lsn {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&self.0[L2P_BIRTH_OFFSET..L2P_BIRTH_OFFSET + 8]);
+        u64::from_be_bytes(buf)
+    }
+
+    /// Return a copy with the `birth_lsn` field replaced.
+    pub fn with_birth_lsn(mut self, birth_lsn: Lsn) -> Self {
+        self.0[L2P_BIRTH_OFFSET..L2P_BIRTH_OFFSET + 8]
+            .copy_from_slice(&birth_lsn.to_be_bytes());
         self
     }
 }
@@ -386,7 +416,17 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pVal
                 leaf_compact::payload_bit_clear(page.payload_mut(), i);
                 leaf_compact::zero_entry(page.payload_mut(), i);
             }
-            leaf_compact::compact_in_place(page.payload_mut())?;
+            // Three ways `find_or_append_unit` returns None:
+            //   - dict is full (reclaim dead units via compact)
+            //   - target.birth_lsn would underflow / overflow the leaf
+            //     base_birth_lsn (rebase by folding in target.birth_lsn)
+            // Pass both `incoming_seq=0` and the unit's birth so the
+            // compact pass covers either reason in one shot.
+            leaf_compact::compact_in_place_full(
+                page.payload_mut(),
+                0,
+                unit.birth_lsn,
+            )?;
             let result = leaf_compact::find_or_append_unit(page.payload_mut(), &unit);
             // Restore the bit so the rest of leaf_set sees the same
             // pre-state regardless of compact's success — the new
@@ -415,14 +455,20 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pVal
             // Seq delta out of range — either the incoming seq is below
             // base_seq (caller wrote with a smaller LSN than already on
             // disk) or above base_seq + u32::MAX (leaf has been alive
-            // long enough to span 4G LSNs). compact_in_place rebases
-            // base_seq to min(live seq, incoming seq); afterwards the
-            // new seq fits as long as the live-seq spread itself stays
-            // under u32::MAX. If it doesn't, surface Corruption — that
-            // means a single leaf's writes legitimately span >4G LSNs,
-            // which shouldn't happen in onyx workloads but is worth
-            // flagging loudly so we don't silently drop a write.
-            leaf_compact::compact_in_place_with_incoming(page.payload_mut(), entry.seq)?;
+            // long enough to span 4G LSNs). compact_in_place_full
+            // rebases base_seq to min(live seq, incoming seq) and
+            // base_birth_lsn to min(live birth, incoming birth);
+            // afterwards the new seq fits as long as the live-seq
+            // spread itself stays under u32::MAX. If it doesn't,
+            // surface Corruption — that means a single leaf's writes
+            // legitimately span >4G LSNs, which shouldn't happen in
+            // onyx workloads but is worth flagging loudly so we don't
+            // silently drop a write.
+            leaf_compact::compact_in_place_full(
+                page.payload_mut(),
+                entry.seq,
+                unit.birth_lsn,
+            )?;
             // The unit dict was rewritten by compact_in_place; the unit
             // we just appended (or matched) may have a new index, so
             // re-locate it.
@@ -597,17 +643,19 @@ mod tests {
     }
 
     /// Build an L2pValue with `byte` repeated across non-derived
-    /// fields. The v3 compact encoder drops `unit_lba_count` and
+    /// fields. The v4 compact encoder drops `unit_lba_count` and
     /// reconstructs it from `unit_original_size / 4096`, so the input
-    /// must satisfy that invariant. The per-LBA seq trailer is set to
-    /// `byte` as a small monotonic u64 (rather than `byte` repeated 8
-    /// times) so the per-leaf u32 seq_delta encoding doesn't overflow
-    /// when two different `byte` values land in the same leaf.
+    /// must satisfy that invariant. The per-LBA seq trailer and the
+    /// per-PBA `birth_lsn` are set to `byte` as a small monotonic u64
+    /// (rather than `byte` repeated 8 times) so the per-leaf u32
+    /// `seq_delta` / `birth_delta` encodings don't overflow when two
+    /// different `byte` values land in the same leaf.
     fn v(byte: u8) -> L2pValue {
         let mut x = [byte; LEAF_VALUE_SIZE];
         x[13..17].copy_from_slice(&4096u32.to_be_bytes());
         x[17..19].copy_from_slice(&1u16.to_be_bytes());
         x[28..36].copy_from_slice(&(byte as u64).to_be_bytes());
+        x[36..44].copy_from_slice(&(byte as u64).to_be_bytes());
         L2pValue(x)
     }
 

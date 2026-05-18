@@ -225,7 +225,7 @@ fn bucketed_apply_large_pure_l2p_batch() {
 }
 
 fn rv(pba: Pba, tag: u8) -> L2pValue {
-    let mut raw = [0u8; 36];
+    let mut raw = [0u8; crate::paged::format::LEAF_VALUE_SIZE];
     raw[..8].copy_from_slice(&pba.to_be_bytes());
     raw[8] = tag;
     L2pValue(raw)

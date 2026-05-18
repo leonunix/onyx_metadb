@@ -37,10 +37,15 @@ use crate::types::{
 /// v10 (compact leaf v3): the on-disk leaf-payload format changed —
 /// per-leaf `base_seq` (8 B) added to the header, per-slot `seq` shrunk
 /// from u64 to u32 delta, and `unit_lba_count` dropped from the unit
-/// dict (recovered from `unit_original_size / 4096`). Old v9 manifests
-/// are hard-rejected on open. See `paged/leaf_compact.rs` for the new
-/// 128-unit cap that this enables.
-pub const MANIFEST_BODY_VERSION: u32 = 11;
+/// dict (recovered from `unit_original_size / 4096`).
+///
+/// v12 (compact leaf v4): added per-leaf `base_birth_lsn` (8 B) to the
+/// header and per-unit `birth_delta` (4 B) to the unit dict, growing
+/// `LEAF_VALUE_SIZE` 36 → 44 B and tightening `MAX_UNITS_PER_LEAF`
+/// from 128 → 110. Powers Phase 1 of the
+/// [[no-refcount-hot-path-design]] dead-list mechanism. Old v11 (and
+/// earlier) manifests are hard-rejected on open — no on-disk migration.
+pub const MANIFEST_BODY_VERSION: u32 = 12;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -448,23 +453,18 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            10 => Self::decode_v10(page, page_store),
-            11 => Self::decode_v11(page, page_store),
+            12 => Self::decode_v12(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v10 (lazy-upgrade) \
-                 and v11 are readable — older databases (v7/v8 carried the retired \
-                 dedup_reverse section; v9 carried the compact leaf v2 encoding with \
-                 the 100-unit cap) must be rebuilt"
+                "unsupported manifest body version {other}; only v12 (compact leaf v4) \
+                 is readable — older databases (v7/v8 carried the retired dedup_reverse \
+                 section; v9 carried the compact leaf v2 encoding with the 100-unit cap; \
+                 v10/v11 used compact leaf v3 which predates birth_lsn) must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v10(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 10)
-    }
-
-    fn decode_v11(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 11)
+    fn decode_v12(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 12)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {

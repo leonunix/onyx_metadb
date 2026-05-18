@@ -5,9 +5,12 @@ use super::*;
 /// remaining 20 bytes carry `tag` in byte 8 so tests can
 /// distinguish otherwise-identical values that share a pba.
 fn remap_val(pba: Pba, tag: u8) -> L2pValue {
-    let mut v = [0u8; 36];
+    let mut v = [0u8; crate::paged::format::LEAF_VALUE_SIZE];
     v[..8].copy_from_slice(&pba.to_be_bytes());
     v[8] = tag;
+    // Non-zero birth_lsn trailer so the apply path's stamp-if-zero
+    // logic doesn't perturb byte-equality assertions.
+    v[crate::paged::format::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(v)
 }
 
