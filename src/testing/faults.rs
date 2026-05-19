@@ -95,6 +95,28 @@ pub enum FaultPoint {
     /// repopulates, and the next flush writes a fresh segment linked
     /// to the manifest's tail.
     DeadListPostManifestBeforeNextFlush,
+    /// Phase 3 (no-refcount-hot-path) Lineage GC fault: the head
+    /// segment's records have all been verified reclaim-eligible
+    /// and the new manifest body has been assembled, but the
+    /// durable commit hasn't fired yet. A crash here leaves the
+    /// manifest pointing at the original head — recovery is
+    /// identical to "GC pass never ran". No leak, no orphan.
+    LineageGcPostFreePbasBeforeManifest,
+    /// Phase 3 Lineage GC fault: the manifest commit landed with a
+    /// new `dead_list_head_pid` and the atomics have been promoted,
+    /// but the old head segment's pages haven't been
+    /// `page_store.free_many`-ed yet. A crash here leaves the old
+    /// segment pages allocated but unreferenced (orphans). The
+    /// next `Db::open` rebuilds the free list by scanning the page
+    /// file, so orphans land on the free list at startup and get
+    /// reclaimed lazily. Phase 5 page_store reconciliation closes
+    /// this hole tightly; Phase 3 accepts the lazy reclaim.
+    LineageGcPostHeadAdvanceBeforeFree,
+    /// Phase 3 Lineage GC fault: mid-way through reading a head
+    /// segment's pages (e.g. one of the continuation pages errored
+    /// or the worker was killed). No side effect — the GC pass
+    /// hadn't yet mutated anything.
+    LineageGcMidSegmentRead,
 }
 
 impl FaultPoint {
@@ -117,6 +139,9 @@ impl FaultPoint {
             Self::CloneVolumeMidIncref => "clone_volume.mid_incref",
             Self::DeadListPostSegWriteBeforeManifest => "deadlist.post_seg_write.before_manifest",
             Self::DeadListPostManifestBeforeNextFlush => "deadlist.post_manifest.before_next_flush",
+            Self::LineageGcPostFreePbasBeforeManifest => "lineage_gc.post_free_pbas.before_manifest",
+            Self::LineageGcPostHeadAdvanceBeforeFree => "lineage_gc.post_head_advance.before_free",
+            Self::LineageGcMidSegmentRead => "lineage_gc.mid_segment_read",
         }
     }
 }

@@ -137,6 +137,7 @@ struct OpCounts {
     create_volume: u64,
     drop_volume: u64,
     clone_volume: u64,
+    free_pbas: u64,
 }
 
 impl OpCounts {
@@ -157,6 +158,7 @@ impl OpCounts {
             WalOp::CreateVolume { .. } => self.create_volume += 1,
             WalOp::DropVolume { .. } => self.drop_volume += 1,
             WalOp::CloneVolume { .. } => self.clone_volume += 1,
+            WalOp::FreePbas { .. } => self.free_pbas += 1,
         }
     }
 }
@@ -384,6 +386,9 @@ fn fmt_op(op: &WalOp) -> String {
             "CloneVolume src={src_ord} new={new_ord} snap={src_snap_id} shards={}",
             src_shard_roots.len()
         ),
+        WalOp::FreePbas { vol_ord, pbas } => {
+            format!("FreePbas vol={vol_ord} count={}", pbas.len())
+        }
     }
 }
 
@@ -503,6 +508,10 @@ fn op_json(op: &WalOp) -> String {
              \"src_snap_id\":{src_snap_id},\"shards\":{}}}",
             src_shard_roots.len()
         ),
+        WalOp::FreePbas { vol_ord, pbas } => format!(
+            "{{\"op\":\"FreePbas\",\"vol_ord\":{vol_ord},\"count\":{}}}",
+            pbas.len()
+        ),
     }
 }
 
@@ -526,6 +535,7 @@ fn op_tag_list(ops: &[WalOp]) -> String {
             WalOp::CreateVolume { .. } => "CreateVolume",
             WalOp::DropVolume { .. } => "DropVolume",
             WalOp::CloneVolume { .. } => "CloneVolume",
+            WalOp::FreePbas { .. } => "FreePbas",
         })
         .collect();
     tags.dedup();

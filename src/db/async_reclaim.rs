@@ -1,54 +1,79 @@
-//! Background reclaim of the `page_store.deferred_free` queue.
+//! Background reclaim of `page_store.deferred_free` + Phase 3 Lineage GC.
 //!
-//! Goal: keep deferred-free draining off the `flush_with_gate`
-//! critical path. The in-line reclaim used to occupy 23 s of
-//! `flush_total_max` on nvme-box (mostly NVMe writes for the
-//! zero-stamped Free pages plus FALLOCATE_PUNCH_HOLE syscalls) and
-//! monopolise the flush thread so the dispatcher couldn't start
-//! the next flush. Moving reclaim to a background worker lets the
-//! next flush run while reclaim catches up, raising overall flush
-//! cadence without changing what reclaim does or its correctness
-//! guarantees.
+//! ## Two passes per cycle
+//!
+//! 1. **Deferred-free reclaim**: keeps the page_store's deferred_free
+//!    queue draining off the `flush_with_gate` critical path. Same
+//!    semantics as the original priority-1 worker.
+//! 2. **Lineage GC** (Phase 3 of [[no-refcount-hot-path-design]],
+//!    default-on once a [`LineageGcCtx`] is wired in via
+//!    [`AsyncReclaim::start_with_lineage_gc`]): per volume, try to
+//!    advance the dead-list chain's `head_pid` past the oldest
+//!    segment whose records have all been freed by the hot path (rc
+//!    already 0) and no snapshot pins their `(birth, death)`
+//!    interval. Phase 3 doesn't emit `WalOp::FreePbas` itself — the
+//!    hot path still owns rc decref — so GC's only mutation is
+//!    chain truncation. Phase 5 will fold `WalOp::FreePbas`
+//!    emission into the same pass.
 //!
 //! ## Correctness
 //!
-//! The worker just calls `page_store.try_reclaim_limit(...)` and
-//! invalidates the returned page-cache entries — the same two
-//! operations the in-line path did. Order and ownership rules are
-//! unchanged:
+//! Reclaim pass: unchanged. `try_reclaim_limit` writes zero-filled
+//! Free pages then extends `inner.free_list`; we follow with
+//! `page_cache.invalidate(pid)` so stale cache bytes can't shadow
+//! the new content after the allocator hands the pid back out.
 //!
-//! 1. `try_reclaim_limit` writes the zero-filled Free pages, then
-//!    extends `inner.free_list` with the reclaimed pids.
-//! 2. We then `page_cache.invalidate(pid)` so any stale cached
-//!    page bytes can't shadow the new content after the allocator
-//!    hands the pid back out.
-//!
-//! Concurrent flushes still see consistent state — flush
-//! allocators pop already-reclaimed pids from the free list,
-//! deferred-free entries that haven't been reclaimed yet stay in
-//! `deferred_free` and don't enter `free_list` until the worker
-//! processes them. The only observable change is "when": instead
-//! of "right at the end of this flush" it's "soon, on the
-//! background thread."
+//! Lineage GC pass: `head_pid` is only mutated by this worker, so
+//! the read/decide/commit sequence is single-threaded. New segments
+//! are appended at `tail_pid` by `flush_with_gate` under
+//! `apply_gate.write()`; the GC commit re-acquires
+//! `apply_gate.write()` to serialize against flush so that locating
+//! "the segment newer than head" reads a stable tail. Manifest
+//! commits go through the same `manifest_state.store.commit` path
+//! that `flush_with_gate` uses, so a crash mid-pass leaves the
+//! chain in a state recovery's manifest walk can decode.
 //!
 //! ## Lifecycle
 //!
-//! Started by `Db::start_async_reclaim()` after the rest of `Db`
-//! is wired up. Stopped by `Db::drop` (or `Db::stop_async_reclaim`)
-//! before `page_store` / `page_cache` are torn down. The worker
-//! reads its own clones of `Arc<PageStore>` and `Arc<PageCache>`,
-//! so no `Arc<Db>` cycle.
+//! Started by [`Db::start_async_reclaim`] after the rest of `Db` is
+//! wired up. Stopped by `Db::drop` before `page_store` / `page_cache`
+//! tear down. The worker holds clones of all the Arcs it needs
+//! (page_store, page_cache, metrics, optional LineageGcCtx fields);
+//! it never holds an `Arc<Db>` reference, so the cycle stays clean.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 
+use super::Volume;
+use crate::apply_gate::ApplyGate;
 use crate::cache::PageCache;
+use crate::deadlist::{SegmentHeader, read_segment_records, walk_chain_segments};
+use crate::error::{MetaDbError, Result};
 use crate::metrics::MetaMetrics;
 use crate::page_store::PageStore;
+use crate::refcount::RcShard;
+use crate::testing::faults::{FaultController, FaultPoint};
+use crate::types::{Lsn, NULL_PAGE, PageId, VolumeOrdinal};
+
+/// Background-worker view of the Db state Phase 3's Lineage GC pass
+/// needs. All fields are `Arc`-cloneable so the worker can hold its
+/// own handles without an `Arc<Db>` cycle.
+pub(super) struct LineageGcCtx {
+    pub volumes: Arc<RwLock<HashMap<VolumeOrdinal, Arc<Volume>>>>,
+    pub manifest_state: Arc<Mutex<crate::db::ManifestState>>,
+    pub apply_gate: Arc<ApplyGate>,
+    /// `rc.clone()` for every refcount shard, in shard-index order. The
+    /// GC pass reads `rc.get(pba)` to skip records whose hot-path
+    /// refcount hasn't yet dropped to 0 (Phase 3 plumbing-only — Phase
+    /// 5 will move the decref into GC and remove this check).
+    pub refcount_shards_rc: Vec<Arc<RcShard>>,
+    pub faults: Arc<FaultController>,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AsyncReclaimParams {
@@ -83,6 +108,10 @@ struct AsyncReclaimInner {
     /// only — not part of correctness — but lets dashboards
     /// confirm the worker is actually running.
     last_cycle_us: AtomicU64,
+    /// Optional Phase 3 Lineage GC context. `None` means the
+    /// lineage_gc pass is skipped (legacy embedders that don't
+    /// wire up Db's manifest/apply_gate handles).
+    lineage_gc: Option<LineageGcCtx>,
 }
 
 impl AsyncReclaim {
@@ -91,6 +120,16 @@ impl AsyncReclaim {
         page_cache: Arc<PageCache>,
         metrics: Arc<MetaMetrics>,
         params: AsyncReclaimParams,
+    ) -> Self {
+        Self::start_with_lineage_gc(page_store, page_cache, metrics, params, None)
+    }
+
+    pub(super) fn start_with_lineage_gc(
+        page_store: Arc<PageStore>,
+        page_cache: Arc<PageCache>,
+        metrics: Arc<MetaMetrics>,
+        params: AsyncReclaimParams,
+        lineage_gc: Option<LineageGcCtx>,
     ) -> Self {
         let inner = Arc::new(AsyncReclaimInner {
             page_store,
@@ -101,6 +140,7 @@ impl AsyncReclaim {
             signal: Mutex::new(0),
             signal_cvar: Condvar::new(),
             last_cycle_us: AtomicU64::new(0),
+            lineage_gc,
         });
         let inner_thread = inner.clone();
         let handle = thread::Builder::new()
@@ -142,14 +182,10 @@ fn run_worker(inner: Arc<AsyncReclaimInner>) {
     let idle = Duration::from_millis(inner.params.idle_interval_ms.max(1));
     let mut last_seen_signal = 0u64;
     while !inner.shutdown.load(Ordering::Acquire) {
-        // ONE cycle per wakeup (notify or idle tick). Tight-looping
-        // here would burn through NVMe bandwidth continuously and
-        // starve foreground flush IO — `flush_with_gate` calls
-        // `notify_async_reclaim` once per flush, so this matches
-        // the inline-reclaim pace (one budget-sized chunk per
-        // flush) while letting the flush thread return early.
-        // Drain backlog naturally over many flush notifications,
-        // not within a single worker burst.
+        // PASS 1: drain deferred_free. ONE cycle per wakeup; tight
+        // looping would burn NVMe bandwidth and starve foreground
+        // flush IO. Backlog drains naturally over multiple
+        // notifications.
         if inner.page_store.deferred_free_len() > 0 {
             let started = Instant::now();
             match inner
@@ -177,6 +213,17 @@ fn run_worker(inner: Arc<AsyncReclaimInner>) {
                 }
             }
         }
+        // PASS 2: Phase 3 Lineage GC. Walks each volume's dead-list
+        // head segment and (if every record is reclaim-eligible)
+        // commits a manifest update that advances `head_pid` past
+        // it, then deferred-frees the segment's pages back to the
+        // page store (which the next pass will reclaim). No
+        // mutation if no volume is eligible.
+        if let Some(ctx) = &inner.lineage_gc {
+            if let Err(err) = lineage_gc_cycle(&inner.page_store, ctx) {
+                tracing::warn!(error = %err, "metadb: lineage GC cycle failed");
+            }
+        }
         // Park until notified or until the idle interval elapses.
         let mut sig = inner.signal.lock();
         if *sig == last_seen_signal {
@@ -184,4 +231,272 @@ fn run_worker(inner: Arc<AsyncReclaimInner>) {
         }
         last_seen_signal = *sig;
     }
+}
+
+/// One pass of Phase 3's Lineage GC: try to advance every volume's
+/// `dead_list_head_pid` by one segment when the head segment is
+/// fully reclaim-eligible. Returns the number of volumes whose head
+/// advanced. Per-volume failures are logged and don't abort the
+/// cycle — chain advancement is best-effort.
+fn lineage_gc_cycle(page_store: &Arc<PageStore>, ctx: &LineageGcCtx) -> Result<usize> {
+    let vol_handles: Vec<(VolumeOrdinal, Arc<Volume>)> = {
+        let guard = ctx.volumes.read();
+        guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+    let mut advanced = 0;
+    for (vol_ord, vol) in vol_handles {
+        match try_advance_head_one(page_store, ctx, &vol, vol_ord) {
+            Ok(true) => advanced += 1,
+            Ok(false) => continue,
+            Err(err) => {
+                tracing::warn!(
+                    vol_ord = vol_ord,
+                    error = %err,
+                    "lineage GC: per-volume cycle failed"
+                );
+                continue;
+            }
+        }
+    }
+    Ok(advanced)
+}
+
+fn try_advance_head_one(
+    page_store: &Arc<PageStore>,
+    ctx: &LineageGcCtx,
+    vol: &Volume,
+    vol_ord: VolumeOrdinal,
+) -> Result<bool> {
+    let head = vol.dead_list_head_pid.load(Ordering::Acquire);
+    if head == NULL_PAGE {
+        return Ok(false);
+    }
+
+    // 1. Read the head segment's pages.
+    let head_page = page_store.read_page(head)?;
+    if head_page.header()?.page_type != crate::page::PageType::DeadListSegment {
+        return Err(MetaDbError::Corruption(format!(
+            "lineage GC: head_pid {head} is not a DeadListSegment page"
+        )));
+    }
+    let header = SegmentHeader::decode(head_page.payload())?;
+    let seg_page_count = header.seg_page_count as u64;
+    let mut cont_pages = Vec::with_capacity(seg_page_count as usize - 1);
+    for i in 1..seg_page_count {
+        cont_pages.push(page_store.read_page(head + i)?);
+    }
+    let cont_refs: Vec<&[u8]> = cont_pages.iter().map(|p| &p.payload()[..]).collect();
+    let records = read_segment_records(head_page.payload(), &cont_refs)?;
+
+    // Fault A: between segment read and snapshot-list capture. A
+    // crash here is identical to "GC was about to start but never
+    // ran" — no side effect.
+    ctx.faults.inject(FaultPoint::LineageGcMidSegmentRead)?;
+
+    // 2. Snapshot the active snapshot LSNs for this volume. New
+    // snapshots that arrive after this read have `created_lsn >
+    // current_lsn > death_lsn` for every record here, so they
+    // can't pin anything we're about to decide on; missing them is
+    // safe. `drop_snapshot` runs under `drop_gate.write()` and is
+    // serialized with `manifest_state.lock()` for commits, so the
+    // snapshot list is stable during this critical section.
+    let snap_lsns: Vec<Lsn> = {
+        let mst = ctx.manifest_state.lock();
+        mst.manifest
+            .snapshots
+            .iter()
+            .filter(|s| s.vol_ord == vol_ord)
+            .map(|s| s.created_lsn)
+            .collect()
+    };
+
+    // 3. Check every record: must be unpinned by any active
+    // snapshot AND the hot path must have already brought the rc
+    // to 0. If any record fails either check, leave the segment
+    // alone — it'll be re-evaluated on the next cycle (e.g. after
+    // a drop_snapshot or further hot-path decrefs).
+    let n_shards = ctx.refcount_shards_rc.len();
+    debug_assert!(n_shards > 0, "lineage GC: refcount_shards_rc must be non-empty");
+    for rec in &records {
+        if snap_pinned(&snap_lsns, rec.birth_lsn, rec.death_lsn) {
+            return Ok(false);
+        }
+        let sid = (xxhash_rust::xxh3::xxh3_64(&rec.pba.to_be_bytes()) as usize) % n_shards;
+        let rc = ctx.refcount_shards_rc[sid].get(rec.pba)?;
+        if rc > 0 {
+            return Ok(false);
+        }
+    }
+
+    // 4. Locate the segment "newer than head" by walking the chain
+    // from tail. Under apply_gate.write (acquired below) flush
+    // cannot extend the chain mid-walk, so the walk's view is
+    // consistent with the manifest we'll mutate.
+    let tail = vol.dead_list_tail_pid.load(Ordering::Acquire);
+    if tail == NULL_PAGE {
+        // Head set but tail clear is a Phase 2 invariant violation;
+        // log and bail rather than write a corrupt manifest.
+        return Err(MetaDbError::Corruption(format!(
+            "lineage GC: vol_ord {vol_ord} has head_pid={head} but tail_pid=NULL_PAGE"
+        )));
+    }
+    advance_head_pid_durable(
+        page_store,
+        ctx,
+        vol,
+        vol_ord,
+        head,
+        seg_page_count as u32,
+        tail,
+    )?;
+    Ok(true)
+}
+
+fn snap_pinned(snap_lsns: &[Lsn], birth_lsn: Lsn, death_lsn: Lsn) -> bool {
+    snap_lsns
+        .iter()
+        .any(|&s| s >= birth_lsn && s < death_lsn)
+}
+
+fn advance_head_pid_durable(
+    page_store: &Arc<PageStore>,
+    ctx: &LineageGcCtx,
+    vol: &Volume,
+    vol_ord: VolumeOrdinal,
+    old_head: PageId,
+    head_page_count: u32,
+    tail_pid: PageId,
+) -> Result<()> {
+    // Take apply_gate.write to exclude flush_with_gate — both
+    // touch VolumeEntry's `dead_list_*_pid` fields and the same
+    // manifest commit slot.
+    let _gate = ctx.apply_gate.write();
+
+    // Re-read head under the gate. Only this worker mutates
+    // head_pid, so it should be unchanged — but if another GC
+    // cycle (or a future Phase 4 step) advanced it, bail out
+    // cleanly rather than overwrite.
+    let cur_head = vol.dead_list_head_pid.load(Ordering::Acquire);
+    if cur_head != old_head {
+        return Ok(());
+    }
+
+    // Walk the chain under the gate so the tail is stable. Bound
+    // by `old_head` so we don't try to read freed pages from a
+    // prior GC advance (the new head's `prev_seg_pid` still points
+    // at the freed older segment until a future flush rewrites the
+    // segment header, which Phase 3 doesn't do). If the chain has
+    // a single segment (head == tail) we'll be returning both
+    // anchors to NULL_PAGE.
+    let segs = walk_chain_segments(tail_pid, old_head, |pid| page_store.read_page(pid))?;
+    let last = segs.last().ok_or_else(|| {
+        MetaDbError::Corruption(format!(
+            "lineage GC: chain walk for vol_ord {vol_ord} returned no segments"
+        ))
+    })?;
+    if last.page_id != old_head {
+        return Err(MetaDbError::Corruption(format!(
+            "lineage GC: chain walk's oldest segment {} doesn't match head {}",
+            last.page_id, old_head
+        )));
+    }
+    // segs is tail-first (newest-first); the segment "newer than head"
+    // is segs[len-2] when present.
+    let new_head_pid = if segs.len() < 2 {
+        NULL_PAGE
+    } else {
+        segs[segs.len() - 2].page_id
+    };
+
+    // Mutate the manifest copy, commit, then promote atomics.
+    let manifest_for_commit = {
+        let mut mstate = ctx.manifest_state.lock();
+        let entry = mstate
+            .manifest
+            .volumes
+            .iter_mut()
+            .find(|v| v.ord == vol_ord)
+            .ok_or_else(|| {
+                MetaDbError::Corruption(format!(
+                    "lineage GC: vol_ord {vol_ord} not in manifest"
+                ))
+            })?;
+        entry.dead_list_head_pid = new_head_pid;
+        if new_head_pid == NULL_PAGE {
+            // Chain becomes empty; tail goes too.
+            entry.dead_list_tail_pid = NULL_PAGE;
+        }
+        mstate.manifest.clone()
+    };
+
+    // Fault: pages-to-reclaim already chosen, manifest body
+    // assembled, but the durable commit hasn't gone through yet.
+    // Recovery sees the old head_pid (intact) and the segment
+    // pages still live in page_store — no leak, just GC pass
+    // didn't make progress.
+    ctx.faults
+        .inject(FaultPoint::LineageGcPostFreePbasBeforeManifest)?;
+
+    {
+        let mut mstate = ctx.manifest_state.lock();
+        mstate.store.commit(&manifest_for_commit)?;
+    }
+
+    // Manifest commit is durable. Promote atomics so subsequent
+    // flushes see the new head/tail. Release ordering pairs with
+    // the Acquire reads in flush_with_gate / record_dead.
+    vol.dead_list_head_pid
+        .store(new_head_pid, Ordering::Release);
+    if new_head_pid == NULL_PAGE {
+        vol.dead_list_tail_pid.store(NULL_PAGE, Ordering::Release);
+    }
+
+    // Fault: manifest committed, atomics promoted, but segment
+    // pages haven't been deferred-freed yet. Recovery sees the
+    // new head_pid in the manifest; the old segment pages are
+    // orphans in the page_store free-list scan and get reclaimed
+    // at next open. Phase 5 page_store GC reconciliation closes
+    // this leak window properly; Phase 3 accepts it.
+    ctx.faults
+        .inject(FaultPoint::LineageGcPostHeadAdvanceBeforeFree)?;
+
+    // Drop the gate before the page_store.free_many call — it goes
+    // through `deferred_free` which has its own internal lock and
+    // doesn't need apply_gate held.
+    drop(_gate);
+
+    // Free the old head segment's pages. The generation argument
+    // is the page's own birth generation (read out of the head
+    // page header earlier) — using a stale value is safe because
+    // the manifest commit makes the new head_pid durable, so no
+    // subsequent reader will load this segment again.
+    let generation = mstate_checkpoint_lsn(ctx);
+    let pids: Vec<PageId> = (0..head_page_count as u64)
+        .map(|i| old_head + i)
+        .collect();
+    page_store.free_many(&pids, generation)?;
+
+    Ok(())
+}
+
+/// Read the manifest's current `checkpoint_lsn` for use as a
+/// page_store.free generation. Held briefly under
+/// `manifest_state.lock()`; correctness here only requires the value
+/// be >= the segment pages' own generation, which is always true
+/// because the segment was written by a flush whose
+/// `checkpoint_lsn` predates the most recent manifest commit.
+fn mstate_checkpoint_lsn(ctx: &LineageGcCtx) -> Lsn {
+    ctx.manifest_state.lock().manifest.checkpoint_lsn
+}
+
+/// Test-only synchronous driver for the Phase 3 Lineage GC pass.
+/// Identical to what the background worker runs once per cycle;
+/// exposed so `db::tests::lineage_gc` can assert head_pid
+/// advancement without racing the worker.
+#[cfg(test)]
+pub(super) fn test_run_lineage_gc_cycle(
+    page_store: &Arc<PageStore>,
+    ctx: &LineageGcCtx,
+) -> Result<usize> {
+    lineage_gc_cycle(page_store, ctx)
 }

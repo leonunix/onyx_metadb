@@ -418,10 +418,10 @@ impl Db {
             page_store,
             page_cache,
             metrics,
-            manifest_state: Mutex::new(ManifestState {
+            manifest_state: Arc::new(Mutex::new(ManifestState {
                 store: manifest_store,
                 manifest,
-            }),
+            })),
             volumes: Arc::new(RwLock::new(volumes)),
             refcount_shards,
             dedup_index,
@@ -432,7 +432,7 @@ impl Db {
             unlogged_pending_lsn: Mutex::new(None),
             unlogged_commit_gate: RwLock::new(()),
             unlogged_commits_enabled: cfg.unlogged_commits_enabled,
-            apply_gate: ApplyGate::new(),
+            apply_gate: Arc::new(ApplyGate::new()),
             last_applied_lsn: Mutex::new(0),
             commit_cvar: Condvar::new(),
             active_apply_lsns: Mutex::new(BTreeSet::new()),
@@ -954,10 +954,10 @@ impl Db {
             page_store,
             page_cache,
             metrics,
-            manifest_state: Mutex::new(ManifestState {
+            manifest_state: Arc::new(Mutex::new(ManifestState {
                 store: manifest_store,
                 manifest,
-            }),
+            })),
             volumes: Arc::new(RwLock::new(volumes)),
             refcount_shards,
             dedup_index,
@@ -968,7 +968,7 @@ impl Db {
             unlogged_pending_lsn: Mutex::new(None),
             unlogged_commit_gate: RwLock::new(()),
             unlogged_commits_enabled: cfg.unlogged_commits_enabled,
-            apply_gate: ApplyGate::new(),
+            apply_gate: Arc::new(ApplyGate::new()),
             last_applied_lsn: Mutex::new(last_applied),
             commit_cvar: Condvar::new(),
             active_apply_lsns: Mutex::new(BTreeSet::new()),
@@ -1038,12 +1038,31 @@ impl Db {
     /// / `Db::open`) checks `cfg.async_reclaim_enabled` before
     /// invoking; this method assumes the knob was true so it can
     /// stay on `&self` without re-reading config.
+    ///
+    /// Also wires up the Phase 3 (no-refcount-hot-path) Lineage GC
+    /// pass via [`LineageGcCtx`]. The pass piggybacks on the same
+    /// worker thread + condvar that drains `deferred_free`; Phase 3
+    /// notifications come from `flush_with_gate` (after tail
+    /// advancement) and `drop_snapshot` (which may un-pin records),
+    /// both routed through [`notify_async_reclaim`].
     fn start_async_reclaim(&self, params: super::async_reclaim::AsyncReclaimParams) {
-        let worker = super::async_reclaim::AsyncReclaim::start(
+        let lineage_gc = super::async_reclaim::LineageGcCtx {
+            volumes: self.volumes.clone(),
+            manifest_state: self.manifest_state.clone(),
+            apply_gate: self.apply_gate.clone(),
+            refcount_shards_rc: self
+                .refcount_shards
+                .iter()
+                .map(|shard| shard.rc.clone())
+                .collect(),
+            faults: self.faults.clone(),
+        };
+        let worker = super::async_reclaim::AsyncReclaim::start_with_lineage_gc(
             self.page_store.clone(),
             self.page_cache.clone(),
             self.metrics.clone(),
             params,
+            Some(lineage_gc),
         );
         *self.async_reclaim.lock() = Some(worker);
     }
@@ -1052,7 +1071,7 @@ impl Db {
     /// `flush_with_gate` once a flush makes new
     /// `deferred_free` entries safe to reclaim. Idempotent — the
     /// worker condvar coalesces multiple notifications.
-    fn notify_async_reclaim(&self) {
+    pub(super) fn notify_async_reclaim(&self) {
         if let Some(worker) = &*self.async_reclaim.lock() {
             worker.notify();
         }

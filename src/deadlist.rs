@@ -329,6 +329,84 @@ where
     Ok(pids)
 }
 
+/// Walk a volume's segment chain from `tail_pid` backward through
+/// `prev_seg_pid` links and return per-segment metadata in tail-first
+/// (newest-first) order. Each [`SegmentInfo`] records the segment's
+/// starting `page_id` and `seg_page_count`. The walk terminates when
+/// it visits the segment at `head_pid` (the authoritative chain
+/// boundary in the manifest) OR when a segment's `prev_seg_pid` is
+/// `NULL_PAGE`.
+///
+/// Phase 3 Lineage GC uses this to locate the "segment newer than the
+/// current head" when advancing `head_pid`: that's the second-to-last
+/// element of the returned vec (the head segment is the last). If the
+/// chain has a single segment, advancing past it sets head/tail back to
+/// `NULL_PAGE`.
+///
+/// **The `head_pid` parameter is load-bearing**: a previous GC cycle
+/// may have reclaimed an even-older segment but left the current
+/// head's stale `prev_seg_pid` pointing at the freed page. Without
+/// the boundary, the walk would read a freed/unknown-type page and
+/// fail. Callers without that hazard (`drop_volume`,
+/// `metadb-verify`) keep using [`walk_chain_pages`] which walks
+/// until `prev_seg_pid == NULL_PAGE`.
+pub fn walk_chain_segments<F>(
+    tail_pid: PageId,
+    head_pid: PageId,
+    read_page: F,
+) -> Result<Vec<SegmentInfo>>
+where
+    F: Fn(PageId) -> Result<Page>,
+{
+    let mut segs = Vec::new();
+    if tail_pid == NULL_PAGE {
+        return Ok(segs);
+    }
+    let mut cur = tail_pid;
+    loop {
+        let page = read_page(cur)?;
+        let h = page.header()?;
+        if h.page_type != PageType::DeadListSegment {
+            return Err(MetaDbError::Corruption(format!(
+                "dead-list chain page {cur} has wrong page_type {:?}",
+                h.page_type
+            )));
+        }
+        let header = SegmentHeader::decode(page.payload())?;
+        segs.push(SegmentInfo {
+            page_id: cur,
+            seg_page_count: header.seg_page_count,
+        });
+        if cur == head_pid {
+            // Reached the authoritative head boundary; don't follow
+            // `prev_seg_pid` further (it may still point at a freed
+            // segment from a prior GC advance).
+            break;
+        }
+        if header.prev_seg_pid == NULL_PAGE {
+            // Chain terminates before reaching the manifest-declared
+            // head_pid. Either head_pid is stale or the chain is
+            // corrupt; surface as Corruption rather than silently
+            // returning a partial walk.
+            return Err(MetaDbError::Corruption(format!(
+                "dead-list chain walk reached NULL_PAGE without visiting head_pid {head_pid}"
+            )));
+        }
+        cur = header.prev_seg_pid;
+    }
+    Ok(segs)
+}
+
+/// One segment's identity, returned by [`walk_chain_segments`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentInfo {
+    /// First page of the segment's contiguous page run.
+    pub page_id: PageId,
+    /// Number of pages this segment owns (>= 1). The full pid range is
+    /// `[page_id .. page_id + seg_page_count)`.
+    pub seg_page_count: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

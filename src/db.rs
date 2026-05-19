@@ -50,7 +50,13 @@ pub struct Db {
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     metrics: Arc<MetaMetrics>,
-    manifest_state: Mutex<ManifestState>,
+    /// Wrapped in `Arc` so background workers (e.g. the Lineage GC pass
+    /// inside [`async_reclaim`]) can clone the handle at start-up and
+    /// perform their own short manifest commits without holding an
+    /// `Arc<Db>` reference (which would create a circular shutdown).
+    /// All access still goes through the same `Mutex<ManifestState>`,
+    /// so lock semantics are unchanged.
+    manifest_state: Arc<Mutex<ManifestState>>,
     /// Per-volume L2P paged radix-tree shard groups. Phase B commit 5 always
     /// contains exactly one entry for [`BOOTSTRAP_VOLUME_ORD`]; commit 6/7
     /// introduce real `create_volume` / `drop_volume` / `clone_volume` traffic
@@ -114,7 +120,10 @@ pub struct Db {
     /// lock, so concurrent submitters land in the same WAL group-commit
     /// batch. Apply order is restored by the LSN-ordered condvar queue
     /// below, not by serialising WAL submits.
-    apply_gate: ApplyGate,
+    /// Wrapped in `Arc` for the same reason as `manifest_state`: lets
+    /// background workers clone the handle and acquire `read()` /
+    /// `write()` without depending on `Arc<Db>`.
+    apply_gate: Arc<ApplyGate>,
     /// LSN of the most recent op applied to in-memory state. Initialised
     /// from `manifest.checkpoint_lsn` on open (the manifest promises that
     /// every LSN at or below this value is already reflected in the
@@ -1073,6 +1082,26 @@ impl Db {
     /// on a higher-level decoder.
     pub(crate) fn test_read_page(&self, pid: PageId) -> Result<crate::page::Page> {
         self.page_store.read_page(pid)
+    }
+
+    /// Test helper: synchronously drive one Phase 3 Lineage GC cycle
+    /// (same logic the `metadb-async-reclaim` worker runs in the
+    /// background) and return the number of volumes whose `head_pid`
+    /// advanced. Used by `db::tests::lineage_gc` to assert chain
+    /// truncation without racing the background worker.
+    pub(crate) fn test_run_lineage_gc_cycle(&self) -> Result<usize> {
+        let ctx = async_reclaim::LineageGcCtx {
+            volumes: self.volumes.clone(),
+            manifest_state: self.manifest_state.clone(),
+            apply_gate: self.apply_gate.clone(),
+            refcount_shards_rc: self
+                .refcount_shards
+                .iter()
+                .map(|shard| shard.rc.clone())
+                .collect(),
+            faults: self.faults.clone(),
+        };
+        async_reclaim::test_run_lineage_gc_cycle(&self.page_store, &ctx)
     }
 }
 

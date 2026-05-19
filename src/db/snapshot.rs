@@ -548,6 +548,12 @@ impl Db {
         // until the long reader departs.
         self.reclaim_freed_pages()?;
 
+        // Wake the Phase 3 Lineage GC pass — dropping a snapshot may
+        // have un-pinned dead-list records whose `[birth, death)`
+        // interval overlapped the snapshot's `created_lsn`. The next
+        // GC cycle can advance `head_pid` past those segments.
+        self.notify_async_reclaim();
+
         Ok(Some(DropReport {
             snapshot_id: id,
             freed_leaf_values,
