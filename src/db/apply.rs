@@ -86,6 +86,7 @@ pub(super) fn apply_op_bare(
                 publish_l2p_read_view(&volume.shards[sid], &tree);
                 p
             };
+            record_dead(volume, prev, lsn);
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::L2pDelete { vol_ord, lba } => {
@@ -271,6 +272,26 @@ pub(super) fn stamp_birth_lsn(value: L2pValue, lsn: Lsn) -> L2pValue {
     }
 }
 
+/// Emit `(prev.head_pba, prev.birth_lsn, death_lsn=lsn)` into the
+/// volume's in-memory dead-list buffer if `prev` represents a real
+/// mapping (i.e. not a `FLAG_ZERO` placeholder). The buffer is drained
+/// at the next checkpoint flush; WAL replay re-emits whatever hasn't
+/// been written to a segment yet, so this hook is safe to fire from
+/// both live commit and recovery paths.
+#[inline]
+pub(super) fn record_dead(volume: &Volume, prev: Option<L2pValue>, death_lsn: Lsn) {
+    if let Some(old) = prev {
+        if old.0[27] & 0x02 != 0 {
+            return;
+        }
+        volume.dead_list.push(crate::deadlist::DeadRecord {
+            pba: old.head_pba(),
+            birth_lsn: old.birth_lsn(),
+            death_lsn,
+        });
+    }
+}
+
 /// Apply one [`WalOp::L2pRemap`]. Fuses L2P put + refcount decref(old)
 /// + refcount incref(new) + (optionally) a liveness guard read into one
 /// atomic step — the onyx adapter hot path.
@@ -376,6 +397,7 @@ pub(super) fn apply_l2p_remap(
     } else {
         tree.insert_at_lsn(lba, new_value, lsn)?
     };
+    record_dead(volume, prev, lsn);
     let old_pba = prev.map(|p| p.head_pba());
 
     // Snapshot-pin check: does any live snap of `vol_ord` map `lba`
@@ -588,6 +610,7 @@ pub(super) fn apply_l2p_remap_range(
             } else {
                 tree.insert_at_lsn(lba, new_value, lsn)?
             };
+            record_dead(volume, prev, lsn);
             prevs[i] = prev;
             applied[i] = true;
             let old_pba = prev.map(|p| p.head_pba());

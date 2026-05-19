@@ -824,6 +824,18 @@ struct Volume {
     shards: Vec<L2pShard>,
     created_lsn: Lsn,
     flags: AtomicU8,
+    /// In-memory dead-list append buffer. Apply path pushes here under
+    /// `apply_gate.read()`; checkpoint flush drains under `apply_gate.write()`.
+    /// See [`crate::deadlist`].
+    dead_list: Arc<crate::deadlist::DeadListState>,
+    /// Persistent anchor of the volume's dead-list chain (oldest segment).
+    /// Loaded from `VolumeEntry.dead_list_head_pid` on `Db::open`, advanced
+    /// by Phase 3 GC. `NULL_PAGE` while the chain is empty.
+    dead_list_head_pid: AtomicU64,
+    /// Persistent anchor of the volume's dead-list chain (newest segment).
+    /// Loaded from `VolumeEntry.dead_list_tail_pid` on `Db::open`, advanced
+    /// on every checkpoint flush that writes a new segment.
+    dead_list_tail_pid: AtomicU64,
 }
 
 impl Volume {
@@ -833,6 +845,27 @@ impl Volume {
             shards,
             created_lsn,
             flags: AtomicU8::new(0),
+            dead_list: Arc::new(crate::deadlist::DeadListState::new()),
+            dead_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            dead_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
+        }
+    }
+
+    fn with_dead_list_anchor(
+        ord: VolumeOrdinal,
+        shards: Vec<L2pShard>,
+        created_lsn: Lsn,
+        head_pid: crate::types::PageId,
+        tail_pid: crate::types::PageId,
+    ) -> Self {
+        Self {
+            ord,
+            shards,
+            created_lsn,
+            flags: AtomicU8::new(0),
+            dead_list: Arc::new(crate::deadlist::DeadListState::new()),
+            dead_list_head_pid: AtomicU64::new(head_pid),
+            dead_list_tail_pid: AtomicU64::new(tail_pid),
         }
     }
 }
@@ -1002,6 +1035,44 @@ impl Drop for Db {
         }
         // ApplyLanes have their own Drop that joins their workers;
         // they fire automatically when the Box goes out of scope.
+    }
+}
+
+#[cfg(test)]
+impl Db {
+    /// Test helper: drain and return the in-memory dead-list buffer
+    /// for one volume. Used by Phase 2 tests in `db::tests::dead_list`
+    /// to inspect per-emit records without going through a flush.
+    pub(crate) fn test_drain_dead_list(
+        &self,
+        vol_ord: VolumeOrdinal,
+    ) -> Option<Vec<crate::deadlist::DeadRecord>> {
+        self.volumes.read().get(&vol_ord).map(|v| v.dead_list.drain())
+    }
+
+    /// Test helper: snapshot the volume's `(dead_list_head_pid,
+    /// dead_list_tail_pid)` anchors. Used to assert that a flush
+    /// advanced them and that a chain extension picked up the prior
+    /// tail as the new segment's `prev_seg_pid`.
+    pub(crate) fn test_dead_list_anchors(
+        &self,
+        vol_ord: VolumeOrdinal,
+    ) -> Option<(PageId, PageId)> {
+        self.volumes.read().get(&vol_ord).map(|v| {
+            (
+                v.dead_list_head_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                v.dead_list_tail_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        })
+    }
+
+    /// Test helper: read a page through the underlying `PageStore` so
+    /// dead-list tests can inspect raw segment bytes without depending
+    /// on a higher-level decoder.
+    pub(crate) fn test_read_page(&self, pid: PageId) -> Result<crate::page::Page> {
+        self.page_store.read_page(pid)
     }
 }
 

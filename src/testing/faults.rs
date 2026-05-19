@@ -80,6 +80,21 @@ pub enum FaultPoint {
     /// been incref'd and sealed to disk, the rest have not. Exercises
     /// the generation-stamp idempotency guard on CloneVolume replay.
     CloneVolumeMidIncref,
+    /// During [`flush_with_gate`], dead-list segment pages have been
+    /// written + `page_store.sync()` returned successfully, but the
+    /// manifest commit hasn't yet captured the new `dead_list_tail_pid`.
+    /// A crash here leaves the segment pages as durable orphans — the
+    /// next open's manifest still points at the old tail. Phase 2
+    /// accepts the leak; the test fixture asserts L2P / RC state stays
+    /// self-consistent.
+    DeadListPostSegWriteBeforeManifest,
+    /// During [`flush_with_gate`], the manifest commit succeeded with
+    /// the new `dead_list_tail_pid`, but no subsequent flush has run
+    /// yet. A crash here is the steady-state recovery case: WAL replay
+    /// re-emits dead records since the new checkpoint, the buffer
+    /// repopulates, and the next flush writes a fresh segment linked
+    /// to the manifest's tail.
+    DeadListPostManifestBeforeNextFlush,
 }
 
 impl FaultPoint {
@@ -100,6 +115,8 @@ impl FaultPoint {
             Self::CreateVolumePostWalBeforeManifest => "create_volume.post_wal.before_manifest",
             Self::DropVolumePostWalBeforeApply => "drop_volume.post_wal.before_apply",
             Self::CloneVolumeMidIncref => "clone_volume.mid_incref",
+            Self::DeadListPostSegWriteBeforeManifest => "deadlist.post_seg_write.before_manifest",
+            Self::DeadListPostManifestBeforeNextFlush => "deadlist.post_manifest.before_next_flush",
         }
     }
 }

@@ -26,15 +26,26 @@ pub struct VolumeEntry {
     pub l2p_shard_durable_seq: Box<[Lsn]>,
     pub created_lsn: Lsn,
     pub flags: u8,
+    /// Oldest dead-list segment page (Phase 2 / [[no-refcount-hot-path-design]]).
+    /// `NULL_PAGE` while the chain is empty. Phase 3 GC consumes from here
+    /// forward via the segment's `prev_seg_pid` back-link.
+    pub dead_list_head_pid: PageId,
+    /// Newest dead-list segment page (apply-time append anchor for the next
+    /// checkpoint flush). `NULL_PAGE` while the chain is empty.
+    pub dead_list_tail_pid: PageId,
 }
 
 /// Size of a [`VolumeEntry`]'s fixed header when encoded inline. The
 /// variable `l2p_shard_roots` tail follows immediately.
+///
+/// v13 grew the fixed header by 16 B (dead-list head/tail page ids).
 pub const VOLUME_ENTRY_FIXED_SIZE: usize = 2 /* ord */
     + 4 /* shard_count */
     + 8 /* created_lsn */
     + 1 /* flags */
-    + 1 /* reserved / alignment */;
+    + 1 /* reserved / alignment */
+    + 8 /* dead_list_head_pid */
+    + 8 /* dead_list_tail_pid */;
 
 /// Inline-encoded byte length of a volume entry with the given shard count.
 ///
@@ -83,6 +94,8 @@ pub fn encode_volume_entry_inline(
     buf[*off + 6..*off + 14].copy_from_slice(&entry.created_lsn.to_le_bytes());
     buf[*off + 14] = entry.flags;
     buf[*off + 15] = 0; // reserved
+    buf[*off + 16..*off + 24].copy_from_slice(&entry.dead_list_head_pid.to_le_bytes());
+    buf[*off + 24..*off + 32].copy_from_slice(&entry.dead_list_tail_pid.to_le_bytes());
     *off += VOLUME_ENTRY_FIXED_SIZE;
     for root in entry.l2p_shard_roots.iter().copied() {
         buf[*off..*off + 8].copy_from_slice(&root.to_le_bytes());
@@ -117,6 +130,8 @@ pub fn decode_volume_entry_inline(
     let created_lsn = u64::from_le_bytes(buf[*off + 6..*off + 14].try_into().unwrap());
     let flags = buf[*off + 14];
     // buf[*off + 15] reserved
+    let dead_list_head_pid = u64::from_le_bytes(buf[*off + 16..*off + 24].try_into().unwrap());
+    let dead_list_tail_pid = u64::from_le_bytes(buf[*off + 24..*off + 32].try_into().unwrap());
     *off += VOLUME_ENTRY_FIXED_SIZE;
     let needed_roots = shard_count as usize * size_of::<PageId>();
     if buf.len() < *off + needed_roots {
@@ -158,5 +173,7 @@ pub fn decode_volume_entry_inline(
         l2p_shard_durable_seq,
         created_lsn,
         flags,
+        dead_list_head_pid,
+        dead_list_tail_pid,
     })
 }

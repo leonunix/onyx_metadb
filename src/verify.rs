@@ -205,6 +205,12 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
             let tree = PagedL2p::open(page_store.clone(), root, 1)?;
             tree.check_invariants()?;
         }
+        walk_dead_list_chain(
+            page_store,
+            volume.dead_list_head_pid,
+            volume.dead_list_tail_pid,
+            &mut live,
+        )?;
     }
     for &meta_pid in manifest.refcount_shard_roots.iter() {
         if meta_pid == NULL_PAGE {
@@ -304,6 +310,86 @@ fn walk_paged_tree(
             "page {root} has unexpected type {other:?} in paged tree walk"
         ))),
     }
+}
+
+/// Walk a volume's dead-list segment chain backward from `tail_pid`
+/// through each segment's `prev_seg_pid`, marking every chain page as
+/// live and validating segment-header invariants (magic, non-empty
+/// record_count, monotonic LSN ranges across the chain, terminator).
+/// No-op if `tail_pid == NULL_PAGE`.
+fn walk_dead_list_chain(
+    page_store: &PageStore,
+    head_pid: PageId,
+    tail_pid: PageId,
+    live: &mut LivePages,
+) -> Result<()> {
+    if tail_pid == NULL_PAGE {
+        if head_pid != NULL_PAGE {
+            return Err(MetaDbError::Corruption(format!(
+                "dead-list chain: tail_pid=NULL_PAGE but head_pid={head_pid} (only one anchor set)"
+            )));
+        }
+        return Ok(());
+    }
+    if head_pid == NULL_PAGE {
+        return Err(MetaDbError::Corruption(format!(
+            "dead-list chain: head_pid=NULL_PAGE but tail_pid={tail_pid} (only one anchor set)"
+        )));
+    }
+    let mut cur = tail_pid;
+    let mut prev_min_lsn: Option<Lsn> = None;
+    let mut seen_chain: HashSet<PageId> = HashSet::new();
+    let mut reached_head = false;
+    loop {
+        if !seen_chain.insert(cur) {
+            return Err(MetaDbError::Corruption(format!(
+                "dead-list chain has a cycle at page {cur}"
+            )));
+        }
+        let page = page_store.read_page(cur)?;
+        let header = page.header()?;
+        if header.page_type != PageType::DeadListSegment {
+            return Err(MetaDbError::Corruption(format!(
+                "dead-list chain page {cur} has wrong page_type {:?}",
+                header.page_type
+            )));
+        }
+        let seg = crate::deadlist::SegmentHeader::decode(page.payload())?;
+        if let Some(prev_min) = prev_min_lsn {
+            if seg.max_lsn >= prev_min {
+                return Err(MetaDbError::Corruption(format!(
+                    "dead-list segment at {cur} max_lsn={} >= next segment min_lsn={prev_min} (chain must be strictly older going backward)",
+                    seg.max_lsn
+                )));
+            }
+        }
+        for i in 0..seg.seg_page_count as u64 {
+            live.mark(cur + i);
+        }
+        if cur == head_pid {
+            reached_head = true;
+            if seg.prev_seg_pid != NULL_PAGE {
+                return Err(MetaDbError::Corruption(format!(
+                    "dead-list head segment at {cur} has non-NULL prev_seg_pid={}",
+                    seg.prev_seg_pid
+                )));
+            }
+            break;
+        }
+        if seg.prev_seg_pid == NULL_PAGE {
+            return Err(MetaDbError::Corruption(format!(
+                "dead-list segment at {cur} terminates chain (prev=NULL) before reaching head_pid={head_pid}"
+            )));
+        }
+        prev_min_lsn = Some(seg.min_lsn);
+        cur = seg.prev_seg_pid;
+    }
+    if !reached_head {
+        return Err(MetaDbError::Corruption(format!(
+            "dead-list chain walk did not reach head_pid={head_pid} (tail={tail_pid})"
+        )));
+    }
+    Ok(())
 }
 
 /// Walk the dedup_index cuckoo meta chain + every allocated data

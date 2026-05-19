@@ -60,6 +60,8 @@ impl Db {
                 l2p_shard_durable_seq: vec![probe_lsn; shard_count as usize].into_boxed_slice(),
                 created_lsn: 0,
                 flags: 0,
+                dead_list_head_pid: crate::types::NULL_PAGE,
+                dead_list_tail_pid: crate::types::NULL_PAGE,
             });
             probe.check_encodable()?;
             (ord, shard_count)
@@ -115,6 +117,8 @@ impl Db {
                 l2p_shard_durable_seq: durable_seqs,
                 created_lsn: lsn,
                 flags: 0,
+                dead_list_head_pid: crate::types::NULL_PAGE,
+                dead_list_tail_pid: crate::types::NULL_PAGE,
             });
             mstate.manifest.next_volume_ord = ord
                 .checked_add(1)
@@ -205,6 +209,26 @@ impl Db {
             }
             pages.extend(tree.collect_drop_pages(root)?);
         }
+        // Phase 2 dead-list: walk the volume's segment chain backward
+        // from its tail and add every chain page id to the drop
+        // payload, so `apply_drop_volume` releases them via the same
+        // `free_idempotent` path that reclaims tree pages. The chain
+        // also picks up any in-memory buffer entries; those records
+        // are now obsolete and discarded (the volume itself is gone).
+        let tail = volume
+            .dead_list_tail_pid
+            .load(std::sync::atomic::Ordering::Acquire);
+        if tail != crate::types::NULL_PAGE {
+            let page_store = self.page_store.clone();
+            let chain_pids = crate::deadlist::walk_chain_pages(tail, |pid| {
+                page_store.read_page(pid)
+            })?;
+            pages.extend(chain_pids);
+        }
+        // Discard the volume's outstanding dead-list buffer — it
+        // describes overwrites that targeted this volume's own LBAs,
+        // which are about to disappear.
+        let _ = volume.dead_list.drain();
 
         // Commit a manifest that:
         //   (a) reflects current roots for every surviving volume
@@ -374,6 +398,8 @@ impl Db {
                 l2p_shard_durable_seq: vec![probe_lsn; shard_count].into_boxed_slice(),
                 created_lsn: 0,
                 flags: 0,
+                dead_list_head_pid: crate::types::NULL_PAGE,
+                dead_list_tail_pid: crate::types::NULL_PAGE,
             });
             probe.check_encodable()?;
             (entry.vol_ord, entry.l2p_shard_roots.to_vec(), new_ord)
@@ -457,6 +483,13 @@ impl Db {
                 l2p_shard_durable_seq: durable_seqs,
                 created_lsn: lsn,
                 flags: 0,
+                // Clones start with an empty dead-list. The parent's
+                // chain still correctly describes the parent's overwrite
+                // history; the clone's L2P starts fresh so its first
+                // overwrite is recorded against its own chain (not the
+                // parent's).
+                dead_list_head_pid: crate::types::NULL_PAGE,
+                dead_list_tail_pid: crate::types::NULL_PAGE,
             });
             mstate.manifest.next_volume_ord = new_ord
                 .checked_add(1)

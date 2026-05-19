@@ -99,6 +99,12 @@ pub(super) fn refresh_manifest_entries(
             l2p_shard_durable_seq: durable_seqs.into_boxed_slice(),
             created_lsn: vol.created_lsn,
             flags: vol.flags.load(std::sync::atomic::Ordering::Relaxed),
+            dead_list_head_pid: vol
+                .dead_list_head_pid
+                .load(std::sync::atomic::Ordering::Acquire),
+            dead_list_tail_pid: vol
+                .dead_list_tail_pid
+                .load(std::sync::atomic::Ordering::Acquire),
         });
     }
     manifest.volumes = new_entries;

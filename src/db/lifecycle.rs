@@ -59,6 +59,30 @@ struct CheckpointInstallReceiver {
     rx: crossbeam_channel::Receiver<Result<Vec<PageId>>>,
 }
 
+/// One volume's drained dead-list records during a flush round.
+/// Carried from the drain step (under `apply_gate.write()`) through
+/// segment build + IO + manifest commit. On any failure between drain
+/// and commit, `records` is moved back into the volume's buffer via
+/// `restore_front` (see [`crate::deadlist::DeadListState::restore_front`]).
+struct DeadListDrainEntry {
+    vol: Arc<Volume>,
+    records: Vec<crate::deadlist::DeadRecord>,
+    old_head: PageId,
+    old_tail: PageId,
+}
+
+/// One volume's allocated segment in the IO phase: the contiguous page
+/// run handed out by `page_store.allocate_run`. Used both for tracking
+/// what to free on rollback and what to commit into the volume's
+/// `dead_list_*_pid` atomics + manifest after sync succeeds.
+struct DeadListSegmentPlan {
+    vol: Arc<Volume>,
+    start_pid: PageId,
+    page_count: u32,
+    old_head: PageId,
+    old_tail: PageId,
+}
+
 /// Drop guard installed at the top of `Db::flush_with_gate`. Every
 /// per-shard `RcShard::begin_checkpoint` preempts that shard's
 /// priority-3 drainer thread; the drainer is left parked and must be
@@ -343,6 +367,8 @@ impl Db {
             l2p_shard_durable_seq: vec![0; bootstrap_shard_count].into_boxed_slice(),
             created_lsn: 0,
             flags: 0,
+            dead_list_head_pid: crate::types::NULL_PAGE,
+            dead_list_tail_pid: crate::types::NULL_PAGE,
         }];
         manifest.next_volume_ord = BOOTSTRAP_VOLUME_ORD + 1;
         manifest_store.commit(&manifest)?;
@@ -564,7 +590,13 @@ impl Db {
             )?;
             volumes.insert(
                 entry.ord,
-                Arc::new(Volume::new(entry.ord, shards, entry.created_lsn)),
+                Arc::new(Volume::with_dead_list_anchor(
+                    entry.ord,
+                    shards,
+                    entry.created_lsn,
+                    entry.dead_list_head_pid,
+                    entry.dead_list_tail_pid,
+                )),
             );
         }
         let refcount_shards = open_shards(
@@ -653,6 +685,8 @@ impl Db {
                                     l2p_shard_durable_seq: durable_seqs,
                                     created_lsn: lsn,
                                     flags: 0,
+                                    dead_list_head_pid: crate::types::NULL_PAGE,
+                                    dead_list_tail_pid: crate::types::NULL_PAGE,
                                 });
                                 mutated_volumes = true;
                             }
@@ -721,6 +755,8 @@ impl Db {
                                     l2p_shard_durable_seq: durable_seqs,
                                     created_lsn: lsn,
                                     flags: 0,
+                                    dead_list_head_pid: crate::types::NULL_PAGE,
+                                    dead_list_tail_pid: crate::types::NULL_PAGE,
                                 });
                                 mutated_volumes = true;
                             }
@@ -1581,7 +1617,30 @@ impl Db {
             &volumes,
             matches!(kind, crate::metrics::FlushKind::Forced),
         );
-        if selected.is_empty() {
+        // Drain per-volume dead-list buffers while still holding
+        // `apply_gate.write()` — late drainers would race new apply
+        // ops pushing into the same buffer. The drained records are
+        // either flushed to a new segment below (then committed via
+        // the manifest tail/head atomics post-sync) or restored to
+        // the front of the buffer if any subsequent step fails.
+        let mut drained_deadlists: Vec<DeadListDrainEntry> = Vec::new();
+        for vol in &volumes {
+            let records = vol.dead_list.drain();
+            if records.is_empty() {
+                continue;
+            }
+            drained_deadlists.push(DeadListDrainEntry {
+                vol: vol.clone(),
+                records,
+                old_head: vol
+                    .dead_list_head_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                old_tail: vol
+                    .dead_list_tail_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+            });
+        }
+        if selected.is_empty() && drained_deadlists.is_empty() {
             // Nothing dirty enough to flush this round. Bail out
             // before locking any shards — release the gate and
             // record an empty sample. Caller will retry next tick.
@@ -1825,10 +1884,70 @@ impl Db {
                 }
             }
         }
+        // Build per-volume dead-list segments and fold them into the
+        // same `sealed_pages` batch as L2P + RC. Allocate contiguous
+        // runs per volume (Phase 2 / [[no-refcount-hot-path-design]]).
+        // The plan vector is owned across the IO + manifest section
+        // so failures can restore drained records back into the
+        // buffers and free the allocated page runs.
+        let mut dead_list_plans: Vec<DeadListSegmentPlan> =
+            Vec::with_capacity(drained_deadlists.len());
+        let mut dead_list_alloc_err: Option<MetaDbError> = None;
+        for entry in &drained_deadlists {
+            let page_count = crate::deadlist::segment_pages_for(entry.records.len());
+            if page_count == 0 {
+                continue;
+            }
+            match self.page_store.allocate_run(page_count) {
+                Ok(start_pid) => {
+                    let pages = crate::deadlist::build_segment_pages(
+                        start_pid,
+                        &entry.records,
+                        entry.old_tail,
+                        wal_checkpoint,
+                    );
+                    for (pid, page) in pages {
+                        sealed_pages.push((pid, Arc::new(page)));
+                    }
+                    total_pages_written += page_count;
+                    dead_list_plans.push(DeadListSegmentPlan {
+                        vol: entry.vol.clone(),
+                        start_pid,
+                        page_count: page_count as u32,
+                        old_head: entry.old_head,
+                        old_tail: entry.old_tail,
+                    });
+                }
+                Err(err) => {
+                    dead_list_alloc_err = Some(err);
+                    break;
+                }
+            }
+        }
+        if let Some(err) = dead_list_alloc_err {
+            self.rollback_dead_list_drain(
+                &mut drained_deadlists,
+                &dead_list_plans,
+                wal_checkpoint,
+            );
+            self.metrics
+                .record_flush_io(io_started.elapsed(), total_pages_written);
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+            return Err(err);
+        }
+
         let page_write_started = std::time::Instant::now();
         if let Err(err) = self.page_store.write_sealed_page_runs(sealed_pages) {
             self.metrics
                 .record_flush_io_page_write(page_write_started.elapsed());
+            self.rollback_dead_list_drain(
+                &mut drained_deadlists,
+                &dead_list_plans,
+                wal_checkpoint,
+            );
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics
@@ -1842,6 +1961,11 @@ impl Db {
         let sync_started = std::time::Instant::now();
         if let Err(err) = self.page_store.sync() {
             self.metrics.record_flush_io_sync(sync_started.elapsed());
+            self.rollback_dead_list_drain(
+                &mut drained_deadlists,
+                &dead_list_plans,
+                wal_checkpoint,
+            );
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics
@@ -1853,6 +1977,27 @@ impl Db {
         self.metrics.record_flush_io_sync(sync_started.elapsed());
         self.metrics
             .record_flush_io(io_started.elapsed(), total_pages_written);
+        // Dead-list segment pages are now durable on disk. The
+        // manifest still references the OLD tails until the commit
+        // below; if it fails we restore drained records to the
+        // buffer and free the just-allocated runs. Phase 2 leaves
+        // the on-disk segment bytes as orphans if the manifest
+        // never commits (Phase 5 page_store GC reconciliation).
+        if let Err(err) = self
+            .faults
+            .inject(FaultPoint::DeadListPostSegWriteBeforeManifest)
+        {
+            self.rollback_dead_list_drain(
+                &mut drained_deadlists,
+                &dead_list_plans,
+                wal_checkpoint,
+            );
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+            return Err(err);
+        }
 
         // RC meta-chain pages are now durable on disk. Re-publish the
         // sealed bytes into the shared page cache so subsequent reads
@@ -1861,6 +2006,23 @@ impl Db {
         for (pid, page) in rc_chain_cache_inserts {
             self.page_cache.replace_or_insert(pid, page);
         }
+
+        // Build the dead-list head/tail override map. Atomic stores
+        // on each volume's `dead_list_*_pid` are deferred until the
+        // manifest commit succeeds — failure paths between here and
+        // commit only need `rollback_dead_list_drain` (restore buffer
+        // + free pages), they do NOT need to revert atomics.
+        let dead_list_overrides: HashMap<VolumeOrdinal, (PageId, PageId)> = dead_list_plans
+            .iter()
+            .map(|plan| {
+                let new_head = if plan.old_head == crate::types::NULL_PAGE {
+                    plan.start_pid
+                } else {
+                    plan.old_head
+                };
+                (plan.vol.ord, (new_head, plan.start_pid))
+            })
+            .collect();
 
         let manifest_started = std::time::Instant::now();
         let mut manifest_state = self.manifest_state.lock();
@@ -1874,6 +2036,11 @@ impl Db {
                 self.metrics
                     .record_flush_total(kind, flush_started.elapsed());
                 drop(manifest_state);
+                self.rollback_dead_list_drain(
+                    &mut drained_deadlists,
+                    &dead_list_plans,
+                    wal_checkpoint,
+                );
                 self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
                 self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                 return Err(err);
@@ -1888,6 +2055,11 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
+            self.rollback_dead_list_drain(
+                &mut drained_deadlists,
+                &dead_list_plans,
+                wal_checkpoint,
+            );
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
@@ -1897,12 +2069,18 @@ impl Db {
             &mut manifest_state.manifest,
             &volumes,
             &l2p_checkpoints,
+            &dead_list_overrides,
         ) {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
+            self.rollback_dead_list_drain(
+                &mut drained_deadlists,
+                &dead_list_plans,
+                wal_checkpoint,
+            );
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
@@ -1944,6 +2122,11 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
+            self.rollback_dead_list_drain(
+                &mut drained_deadlists,
+                &dead_list_plans,
+                wal_checkpoint,
+            );
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
@@ -1955,12 +2138,37 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
+            self.rollback_dead_list_drain(
+                &mut drained_deadlists,
+                &dead_list_plans,
+                wal_checkpoint,
+            );
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
         self.metrics
             .record_flush_manifest(manifest_started.elapsed());
+
+        // Manifest commit is durable. Promote per-volume dead-list
+        // tail/head atomics so subsequent apply ops link new
+        // segments off the new tail. This must happen AFTER
+        // `manifest_state.store.commit` succeeds — if it failed and
+        // we'd already stored, the in-memory atomic would race ahead
+        // of the durable manifest and the next flush would link a
+        // new segment to an orphaned tail.
+        for plan in &dead_list_plans {
+            if plan.old_head == crate::types::NULL_PAGE {
+                plan.vol
+                    .dead_list_head_pid
+                    .store(plan.start_pid, std::sync::atomic::Ordering::Release);
+            }
+            plan.vol
+                .dead_list_tail_pid
+                .store(plan.start_pid, std::sync::atomic::Ordering::Release);
+        }
+        self.faults
+            .inject(FaultPoint::DeadListPostManifestBeforeNextFlush)?;
         // Manifest commit is durable. Bump the per-shard
         // `last_flushed_lsn` for every shard we just committed —
         // future calls to `compute_min_last_flushed_lsn` will read
@@ -2188,6 +2396,39 @@ impl Db {
         }
     }
 
+    /// Restore drained dead-list records back to their volume buffers
+    /// and free the allocated segment runs. Used by every failure path
+    /// in [`flush_with_gate`] between the drain step and a successful
+    /// manifest commit. Best-effort: `page_store.free` errors are
+    /// logged but not propagated (the failing flush's error is already
+    /// the primary report). The drained `entry.records` is moved out
+    /// via `mem::take` so a second rollback call is a no-op.
+    fn rollback_dead_list_drain(
+        &self,
+        drained: &mut [DeadListDrainEntry],
+        plans: &[DeadListSegmentPlan],
+        free_lsn: Lsn,
+    ) {
+        for entry in drained.iter_mut() {
+            let records = std::mem::take(&mut entry.records);
+            if !records.is_empty() {
+                entry.vol.dead_list.restore_front(records);
+            }
+        }
+        for plan in plans {
+            for i in 0..plan.page_count as u64 {
+                if let Err(err) = self.page_store.free(plan.start_pid + i, free_lsn) {
+                    tracing::warn!(
+                        page_id = plan.start_pid + i,
+                        vol_ord = u32::from(plan.vol.ord),
+                        error = %err,
+                        "flush_with_gate: failed to free rolled-back dead-list page"
+                    );
+                }
+            }
+        }
+    }
+
     /// Sparse-checkpoint variant of the RC abort path. Same shape
     /// as the L2P version: walk the `Option<RcCheckpoint>` slice
     /// indexed by shard, abort only `Some(...)` entries.
@@ -2318,6 +2559,7 @@ fn refresh_manifest_from_checkpoints(
     manifest: &mut Manifest,
     volumes: &[Arc<Volume>],
     l2p_checkpoints: &[Vec<Option<crate::paged::tree::Checkpoint>>],
+    dead_list_overrides: &HashMap<VolumeOrdinal, (PageId, PageId)>,
 ) -> Result<()> {
     manifest.body_version = MANIFEST_BODY_VERSION;
     if volumes.len() != l2p_checkpoints.len() {
@@ -2385,6 +2627,18 @@ fn refresh_manifest_from_checkpoints(
             Some(seqs) if seqs.len() == volume.shards.len() => seqs.to_vec().into_boxed_slice(),
             _ => vec![0; volume.shards.len()].into_boxed_slice(),
         };
+        let (dead_list_head_pid, dead_list_tail_pid) =
+            match dead_list_overrides.get(&volume.ord) {
+                Some((h, t)) => (*h, *t),
+                None => (
+                    volume
+                        .dead_list_head_pid
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    volume
+                        .dead_list_tail_pid
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+            };
         new_entries.push(VolumeEntry {
             ord: volume.ord,
             shard_count: volume.shards.len() as u32,
@@ -2392,6 +2646,8 @@ fn refresh_manifest_from_checkpoints(
             l2p_shard_durable_seq: durable_seq,
             created_lsn: volume.created_lsn,
             flags: volume.flags.load(std::sync::atomic::Ordering::Relaxed),
+            dead_list_head_pid,
+            dead_list_tail_pid,
         });
     }
     manifest.volumes = new_entries;

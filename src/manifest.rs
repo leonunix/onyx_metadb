@@ -45,7 +45,14 @@ use crate::types::{
 /// from 128 → 110. Powers Phase 1 of the
 /// [[no-refcount-hot-path-design]] dead-list mechanism. Old v11 (and
 /// earlier) manifests are hard-rejected on open — no on-disk migration.
-pub const MANIFEST_BODY_VERSION: u32 = 12;
+///
+/// v13 (per-volume dead-list): added `dead_list_head_pid` and
+/// `dead_list_tail_pid` (16 B total) to each `VolumeEntry`'s fixed
+/// header. Anchors the append-only chain of segment pages that records
+/// every L2P overwrite's `(pba, birth_lsn, death_lsn)` triple for
+/// Phase 2 of the [[no-refcount-hot-path-design]]. Old v12 manifests
+/// are hard-rejected on open — no on-disk migration.
+pub const MANIFEST_BODY_VERSION: u32 = 13;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -453,18 +460,20 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            12 => Self::decode_v12(page, page_store),
+            13 => Self::decode_v13(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v12 (compact leaf v4) \
-                 is readable — older databases (v7/v8 carried the retired dedup_reverse \
-                 section; v9 carried the compact leaf v2 encoding with the 100-unit cap; \
-                 v10/v11 used compact leaf v3 which predates birth_lsn) must be rebuilt"
+                "unsupported manifest body version {other}; only v13 (per-volume \
+                 dead-list) is readable — older databases (v7/v8 carried the retired \
+                 dedup_reverse section; v9 carried the compact leaf v2 encoding with \
+                 the 100-unit cap; v10/v11 used compact leaf v3 which predates \
+                 birth_lsn; v12 had birth_lsn but no per-volume dead-list anchor) \
+                 must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v12(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 12)
+    fn decode_v13(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 13)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {

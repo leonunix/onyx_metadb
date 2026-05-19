@@ -1488,6 +1488,7 @@ impl Db {
                 {
                     let b = &batch_lbas[batch_i];
                     let is_range = b.range_offset.is_some();
+                    super::apply::record_dead(&volume, prev, lsn);
                     push_l2p_remap_rc_actions(
                         &mut rc_actions,
                         b.op_idx,
@@ -1555,6 +1556,7 @@ impl Db {
                             continue;
                         }
                         let prev = tree.insert_at_lsn_deferred_finish(*lba, *value, lsn)?;
+                        super::apply::record_dead(&volume, prev, lsn);
                         l2p_put_count += 1;
                         ApplyOutcome::L2pPrev(prev)
                     }
@@ -1607,6 +1609,7 @@ impl Db {
                             continue;
                         }
                         let prev = tree.insert_at_lsn_deferred_finish(*lba, *new_value, lsn)?;
+                        super::apply::record_dead(&volume, prev, lsn);
                         push_l2p_remap_rc_actions(
                             &mut rc_actions,
                             idx,
@@ -1783,6 +1786,7 @@ impl Db {
                             continue;
                         }
                         shard.l2p_buffer.insert(lba, new_value, lsn);
+                        super::apply::record_dead(&volume, cur, lsn);
                         push_l2p_remap_rc_actions(
                             &mut rc_actions,
                             *op_idx,
@@ -1824,6 +1828,7 @@ impl Db {
                             continue;
                         }
                         shard.l2p_buffer.insert(*lba, *value, lsn);
+                        super::apply::record_dead(&volume, cur, lsn);
                         l2p_put_count += 1;
                         ApplyOutcome::L2pPrev(cur)
                     }
@@ -1882,6 +1887,7 @@ impl Db {
                             continue;
                         }
                         shard.l2p_buffer.insert(*lba, *new_value, lsn);
+                        super::apply::record_dead(&volume, cur, lsn);
                         push_l2p_remap_rc_actions(
                             &mut rc_actions,
                             idx,

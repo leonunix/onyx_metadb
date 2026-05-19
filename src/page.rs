@@ -124,6 +124,13 @@ pub enum PageType {
     /// Disambiguated from the cuckoo *meta* page by `key_count`
     /// (data pages set 0; the meta page sets `0xFFFF`).
     CuckooData = 12,
+    /// Per-volume dead-list segment: append-only chain of
+    /// `(pba, birth_lsn, death_lsn)` triples emitted by L2P overwrites.
+    /// First page of a segment carries a 40 B header at payload offset 0
+    /// (magic "DEDS" + record_count + min/max lsn + prev_seg_pid + page_count);
+    /// continuation pages within the same segment-run are all records.
+    /// Layout owned by [`crate::deadlist`].
+    DeadListSegment = 13,
 }
 
 impl PageType {
@@ -142,6 +149,7 @@ impl PageType {
             9 => Self::PagedIndex,
             10 => Self::RefcountArray,
             12 => Self::CuckooData,
+            13 => Self::DeadListSegment,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }

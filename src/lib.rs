@@ -28,6 +28,7 @@ pub mod apply_gate;
 pub mod cache;
 pub mod config;
 pub mod db;
+pub mod deadlist;
 pub mod dedup;
 pub mod dedup_types;
 pub mod epoch;

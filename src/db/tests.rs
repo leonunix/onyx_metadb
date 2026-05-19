@@ -160,6 +160,7 @@ pub(super) fn dedup_val(n: u8) -> DedupValue {
 }
 
 mod core;
+mod dead_list;
 mod indexes;
 mod remap_range;
 mod volume;

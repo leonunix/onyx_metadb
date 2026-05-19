@@ -52,6 +52,8 @@ fn boot_vol_at(shard_count: u32, roots: &[PageId], checkpoint_lsn: Lsn) -> Volum
         l2p_shard_durable_seq: vec![checkpoint_lsn; shard_count as usize].into_boxed_slice(),
         created_lsn: 0,
         flags: 0,
+        dead_list_head_pid: NULL_PAGE,
+        dead_list_tail_pid: NULL_PAGE,
     }
 }
 
@@ -346,6 +348,8 @@ fn v6_volumes_table_round_trip() {
                 l2p_shard_durable_seq: bx(&[10, 10]),
                 created_lsn: 7,
                 flags: VOLUME_FLAG_DROP_PENDING,
+                dead_list_head_pid: NULL_PAGE,
+                dead_list_tail_pid: NULL_PAGE,
             },
         ],
     };
@@ -464,6 +468,8 @@ fn volume_entry_inline_round_trip() {
         l2p_shard_durable_seq: bx(&[10, 11, 12, 13]),
         created_lsn: 0xABCD_1234,
         flags: VOLUME_FLAG_DROP_PENDING,
+        dead_list_head_pid: NULL_PAGE,
+        dead_list_tail_pid: NULL_PAGE,
     };
     let mut buf = vec![0u8; volume_entry_inline_size(entry.shard_count as usize)];
     let mut off = 0;
@@ -484,6 +490,8 @@ fn volume_entry_inline_rejects_shard_count_mismatch() {
         l2p_shard_durable_seq: bx(&[0, 0]),
         created_lsn: 10,
         flags: 0,
+        dead_list_head_pid: NULL_PAGE,
+        dead_list_tail_pid: NULL_PAGE,
     };
     let mut buf = vec![0u8; 256];
     let mut off = 0;
@@ -502,6 +510,8 @@ fn volume_entry_inline_rejects_buffer_too_small() {
         l2p_shard_durable_seq: bx(&[0; 16]),
         created_lsn: 0,
         flags: 0,
+        dead_list_head_pid: NULL_PAGE,
+        dead_list_tail_pid: NULL_PAGE,
     };
     let mut buf = vec![0u8; VOLUME_ENTRY_FIXED_SIZE + 8]; // one root worth
     let mut off = 0;
@@ -521,6 +531,8 @@ fn volume_entry_decode_rejects_truncated_roots() {
         l2p_shard_durable_seq: bx(&[1, 2, 3]),
         created_lsn: 7,
         flags: 0,
+        dead_list_head_pid: NULL_PAGE,
+        dead_list_tail_pid: NULL_PAGE,
     };
     let mut buf = vec![0u8; volume_entry_inline_size(3)];
     let mut off = 0;
@@ -545,6 +557,8 @@ fn volume_entry_many_back_to_back() {
             l2p_shard_durable_seq: bx(&[1, 2]),
             created_lsn: 100,
             flags: 0,
+            dead_list_head_pid: NULL_PAGE,
+            dead_list_tail_pid: NULL_PAGE,
         },
         VolumeEntry {
             ord: 1,
@@ -553,6 +567,8 @@ fn volume_entry_many_back_to_back() {
             l2p_shard_durable_seq: bx(&[3, 4, 5, 6]),
             created_lsn: 200,
             flags: VOLUME_FLAG_DROP_PENDING,
+            dead_list_head_pid: NULL_PAGE,
+            dead_list_tail_pid: NULL_PAGE,
         },
         VolumeEntry {
             ord: 65534,
@@ -561,6 +577,8 @@ fn volume_entry_many_back_to_back() {
             l2p_shard_durable_seq: bx(&[7]),
             created_lsn: 300,
             flags: 0,
+            dead_list_head_pid: NULL_PAGE,
+            dead_list_tail_pid: NULL_PAGE,
         },
     ];
     let total: usize = entries
@@ -610,6 +628,8 @@ fn v11_per_shard_durable_seq_round_trip() {
             l2p_shard_durable_seq: bx(&[8, 5, 11, 6]),
             created_lsn: 0,
             flags: 0,
+            dead_list_head_pid: NULL_PAGE,
+            dead_list_tail_pid: NULL_PAGE,
         }],
     };
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
@@ -772,6 +792,8 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
             l2p_shard_durable_seq: bx(&[]),
             created_lsn: 0,
             flags: 0,
+            dead_list_head_pid: NULL_PAGE,
+            dead_list_tail_pid: NULL_PAGE,
         }],
     };
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));

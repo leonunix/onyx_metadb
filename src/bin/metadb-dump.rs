@@ -96,8 +96,13 @@ fn print_manifest_human(path: &Path, m: &Manifest, high_water: u64, last_applied
     println!("volumes ({}):", m.volumes.len());
     for entry in &m.volumes {
         println!(
-            "  ord={} shard_count={} created_lsn={} flags={:#04x}",
-            entry.ord, entry.shard_count, entry.created_lsn, entry.flags,
+            "  ord={} shard_count={} created_lsn={} flags={:#04x} dead_list_head={} dead_list_tail={}",
+            entry.ord,
+            entry.shard_count,
+            entry.created_lsn,
+            entry.flags,
+            fmt_page(entry.dead_list_head_pid),
+            fmt_page(entry.dead_list_tail_pid),
         );
         for (i, p) in entry.l2p_shard_roots.iter().enumerate() {
             println!("    [{i}] {}", fmt_page(*p));
@@ -138,11 +143,13 @@ fn print_manifest_json(path: &Path, m: &Manifest, high_water: u64, last_applied:
     for (i, vol) in m.volumes.iter().enumerate() {
         let comma = if i + 1 < m.volumes.len() { "," } else { "" };
         println!(
-            "    {{\"ord\":{},\"shard_count\":{},\"created_lsn\":{},\"flags\":{},\"l2p_shard_roots\":{}}}{comma}",
+            "    {{\"ord\":{},\"shard_count\":{},\"created_lsn\":{},\"flags\":{},\"dead_list_head\":{},\"dead_list_tail\":{},\"l2p_shard_roots\":{}}}{comma}",
             vol.ord,
             vol.shard_count,
             vol.created_lsn,
             vol.flags,
+            page_json(vol.dead_list_head_pid),
+            page_json(vol.dead_list_tail_pid),
             page_array_json(&vol.l2p_shard_roots),
         );
     }
