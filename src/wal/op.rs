@@ -53,6 +53,7 @@
 //! | 40  | `CREATE_VOLUME`     | ord (2 B BE) + shard_count (4 B BE)                                                 |     6    |
 //! | 41  | `DROP_VOLUME`       | ord (2 B BE) + count (4 B BE) + pid×count                                           |   6+8n   |
 //! | 42  | `CLONE_VOLUME`      | src_ord (2 B BE) + new_ord (2 B BE) + snap_id (8 B BE) + shard_count (4 B BE) + pid×shard_count | 16+8n |
+//! | 43  | `FREE_PBAS`         | vol_ord (2 B BE) + count (4 B BE) + pba×count                                       |   6+8n   |
 //!
 //! `L2P_REMAP` guard: tag `0x00` = no guard (payload ends); tag `0x01`
 //! = guarded, followed by `pba (8 B BE) + min_rc (4 B BE)` — 12 more
@@ -111,7 +112,13 @@ use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
 /// commit-side bucket assembly and WAL bytes amortize across the range.
 /// Stage 1 emits it only from the passthrough writer path; packed and
 /// dedup-hit paths keep using per-LBA `L2pRemap`.
-pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB4;
+/// v5 (0xB5): added `FreePbas` (tag 0x43) — Phase 3 (no-refcount-hot-path)
+/// plumbing for the Lineage GC consumer to batch-emit PBA free decisions
+/// once Phase 5 pulls hot-path refcount writes out of `apply_l2p_remap`.
+/// The current binary emits this op only as a forward-looking smoke test;
+/// production GC paths in Phase 3 are gated default-off behind a config
+/// flag. Apply is idempotent (decref-if-positive + free-on-zero).
+pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB5;
 
 pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;
@@ -157,6 +164,16 @@ pub const TAG_DROP_SNAPSHOT: u8 = 0x30;
 pub const TAG_CREATE_VOLUME: u8 = 0x40;
 pub const TAG_DROP_VOLUME: u8 = 0x41;
 pub const TAG_CLONE_VOLUME: u8 = 0x42;
+pub const TAG_FREE_PBAS: u8 = 0x43;
+
+/// Maximum PBAs in a single [`WalOp::FreePbas`] record. The Lineage GC
+/// worker batches at most one dead-list segment's worth of records per
+/// emission, and a Phase 2 segment holds ≤ ~10k records (166 in the head
+/// page + 168 per continuation page × `seg_page_count`). 65536 gives
+/// plenty of slack for future segment sizing without bloating the record
+/// (`6 + 8 * 65536 ≈ 512 KiB`). Decoders reject larger counts to bound
+/// allocation under a corrupt length prefix.
+pub const MAX_FREE_PBAS_PER_OP: usize = 65536;
 
 /// One mutation op as stored in a WAL record body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -329,6 +346,23 @@ pub enum WalOp {
         new_ord: VolumeOrdinal,
         src_snap_id: SnapshotId,
         src_shard_roots: Vec<PageId>,
+    },
+    /// Phase 3 (no-refcount-hot-path) plumbing for the Lineage GC
+    /// consumer. Emits the PBAs that GC has decided are dead based on
+    /// dead-list semantics + snapshot-pin fast filter. Apply is
+    /// **idempotent**: for each pba, read the current refcount, skip the
+    /// op if the refcount is positive (some other reference still pins
+    /// it — Phase 3 keeps RC apply on the hot path, so this is normal),
+    /// otherwise free the PBA via the existing rc=0 free path and
+    /// surface it in [`ApplyOutcome::FreePbas`]. Replay is safe because
+    /// onyx-side retire is a set operation.
+    ///
+    /// `vol_ord` is carried for replay observability — apply itself
+    /// doesn't consult per-volume state; the PBA refcount table is
+    /// global.
+    FreePbas {
+        vol_ord: VolumeOrdinal,
+        pbas: Box<[Pba]>,
     },
 }
 

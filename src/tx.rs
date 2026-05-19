@@ -120,6 +120,19 @@ pub enum ApplyOutcome {
         prevs: Box<[Option<L2pValue>]>,
         freed_pbas: Vec<Pba>,
     },
+    /// Outcome of [`WalOp::FreePbas`] — Phase 3 (no-refcount-hot-path)
+    /// plumbing for the Lineage GC consumer. `freed_pbas` is the subset
+    /// of the op's `pbas` whose refcount transitioned from `>0` to `0`
+    /// during this apply. Onyx-side cleanup coalesces sorted PBAs into
+    /// `retire_one` / `retire_extent` calls, mirroring the path that
+    /// today serves `L2pRemap.freed_pba` / `RangeDelete.freed_pbas`.
+    ///
+    /// Empty `freed_pbas` is normal in Phase 3: the hot path is still
+    /// authoritative for refcount writes, so most GC-emitted `FreePbas`
+    /// records find the PBA already at refcount 0 (already freed) and
+    /// return no work. Phase 5 will pull hot-path RC decref out and this
+    /// list becomes the only retire source.
+    FreePbas { freed_pbas: Box<[Pba]> },
 }
 
 /// A batch of ops to be committed atomically.
@@ -297,6 +310,21 @@ impl<'db> Transaction<'db> {
     /// Buffer a refcount decrement.
     pub fn decref_pba(&mut self, pba: Pba, delta: u32) -> &mut Self {
         self.ops.push(WalOp::Decref { pba, delta });
+        self
+    }
+
+    /// Phase 3 (no-refcount-hot-path) Lineage GC emitter. Buffers a
+    /// [`WalOp::FreePbas`] that asks apply to decref each pba by 1 and
+    /// surface those that hit refcount 0 in
+    /// [`ApplyOutcome::FreePbas.freed_pbas`]. Apply is idempotent
+    /// (rc stage clamps at 0), so replaying the same op never
+    /// underflows.
+    ///
+    /// `pbas` may be empty — the op then commits as a no-op but the
+    /// outcome slot is still present (`ApplyOutcome::FreePbas { freed_pbas: [] }`),
+    /// preserving the index correspondence callers rely on.
+    pub fn free_pbas(&mut self, vol_ord: VolumeOrdinal, pbas: Box<[Pba]>) -> &mut Self {
+        self.ops.push(WalOp::FreePbas { vol_ord, pbas });
         self
     }
 

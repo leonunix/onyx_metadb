@@ -880,3 +880,80 @@ fn l2p_remap_range_decode_rejects_truncated_values() {
         e => panic!("{e}"),
     }
 }
+
+#[test]
+fn free_pbas_round_trip() {
+    let ops = vec![WalOp::FreePbas {
+        vol_ord: 3,
+        pbas: vec![100u64, 200, 300, 400, 500].into_boxed_slice(),
+    }];
+    let body = encode_body(&ops);
+    // schema(1) + tag(1) + vol_ord(2) + count(4) + 5*pba(8)
+    assert_eq!(body.len(), 1 + 1 + 2 + 4 + 5 * 8);
+    assert_eq!(decode_body(&body).unwrap(), ops);
+}
+
+#[test]
+fn free_pbas_empty_round_trip() {
+    let ops = vec![WalOp::FreePbas {
+        vol_ord: 0,
+        pbas: Box::<[u64]>::default(),
+    }];
+    let body = encode_body(&ops);
+    assert_eq!(body.len(), 1 + 1 + 2 + 4);
+    assert_eq!(decode_body(&body).unwrap(), ops);
+}
+
+#[test]
+fn free_pbas_encoded_len_matches_encode_output() {
+    let op = WalOp::FreePbas {
+        vol_ord: 7,
+        pbas: vec![1u64, 2, 3].into_boxed_slice(),
+    };
+    let mut buf = Vec::new();
+    op.encode(&mut buf);
+    assert_eq!(buf.len(), op.encoded_len());
+}
+
+#[test]
+fn free_pbas_truncated_header_is_corruption() {
+    // tag + 4 bytes (not enough for vol_ord(2) + count(4) = 6).
+    let body = vec![WAL_BODY_SCHEMA_VERSION, TAG_FREE_PBAS, 0, 0, 0, 0];
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(msg.contains("FREE_PBAS header"), "{msg}")
+        }
+        e => panic!("{e}"),
+    }
+}
+
+#[test]
+fn free_pbas_truncated_pba_list_is_corruption() {
+    // Header advertises count=3 but only one pba follows.
+    let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_FREE_PBAS];
+    body.extend_from_slice(&7u16.to_be_bytes()); // vol_ord
+    body.extend_from_slice(&3u32.to_be_bytes()); // count=3
+    body.extend_from_slice(&42u64.to_be_bytes()); // pba[0]; pba[1]/pba[2] missing
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(msg.contains("FREE_PBAS pba list"), "{msg}")
+        }
+        e => panic!("{e}"),
+    }
+}
+
+#[test]
+fn free_pbas_count_over_cap_is_corruption() {
+    let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_FREE_PBAS];
+    body.extend_from_slice(&0u16.to_be_bytes()); // vol_ord
+    body.extend_from_slice(&((MAX_FREE_PBAS_PER_OP + 1) as u32).to_be_bytes());
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(
+                msg.contains("MAX_FREE_PBAS_PER_OP") && msg.contains("FREE_PBAS"),
+                "{msg}"
+            )
+        }
+        e => panic!("{e}"),
+    }
+}

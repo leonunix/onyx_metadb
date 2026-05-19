@@ -182,6 +182,18 @@ impl WalOp {
                     out.extend_from_slice(&pid.to_be_bytes());
                 }
             }
+            WalOp::FreePbas { vol_ord, pbas } => {
+                out.push(TAG_FREE_PBAS);
+                out.extend_from_slice(&vol_ord.to_be_bytes());
+                let count: u32 = pbas
+                    .len()
+                    .try_into()
+                    .expect("FreePbas count fits in u32");
+                out.extend_from_slice(&count.to_be_bytes());
+                for pba in pbas.iter() {
+                    out.extend_from_slice(&pba.to_be_bytes());
+                }
+            }
         }
     }
 
@@ -216,6 +228,7 @@ impl WalOp {
             WalOp::CloneVolume {
                 src_shard_roots, ..
             } => 1 + 2 + 2 + 8 + 4 + src_shard_roots.len() * 8,
+            WalOp::FreePbas { pbas, .. } => 1 + 2 + 4 + pbas.len() * 8,
         }
     }
 }
@@ -603,6 +616,35 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                     new_ord,
                     src_snap_id,
                     src_shard_roots: roots,
+                },
+                &payload[cursor..],
+            ))
+        }
+        TAG_FREE_PBAS => {
+            require_len(payload, 6, "FREE_PBAS header")?;
+            let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
+            let count = u32::from_be_bytes(payload[2..6].try_into().unwrap()) as usize;
+            if count > MAX_FREE_PBAS_PER_OP {
+                return Err(MetaDbError::Corruption(format!(
+                    "FREE_PBAS count {count} exceeds MAX_FREE_PBAS_PER_OP {}",
+                    MAX_FREE_PBAS_PER_OP,
+                )));
+            }
+            let pbas_bytes = count
+                .checked_mul(8)
+                .ok_or_else(|| MetaDbError::Corruption("FREE_PBAS count overflow".into()))?;
+            require_len(&payload[6..], pbas_bytes, "FREE_PBAS pba list")?;
+            let mut pbas = Vec::with_capacity(count);
+            let mut cursor = 6usize;
+            for _ in 0..count {
+                let pba = u64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap());
+                pbas.push(pba);
+                cursor += 8;
+            }
+            Ok((
+                WalOp::FreePbas {
+                    vol_ord,
+                    pbas: pbas.into_boxed_slice(),
                 },
                 &payload[cursor..],
             ))

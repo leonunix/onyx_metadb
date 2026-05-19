@@ -342,6 +342,11 @@ fn wal_lane_key(op: &WalOp) -> u64 {
             xxh3_64(&ord.to_be_bytes())
         }
         WalOp::CloneVolume { new_ord, .. } => xxh3_64(&new_ord.to_be_bytes()),
+        // FreePbas applies global-shape changes to the refcount table
+        // and isn't routable on a single lane; the caller forces it into
+        // the global lane via [`OpFootprint::global = true`] (see
+        // `op_footprint`).
+        WalOp::FreePbas { vol_ord, .. } => xxh3_64(&vol_ord.to_be_bytes()),
     }
 }
 
@@ -1213,7 +1218,8 @@ impl Db {
                 | WalOp::CreateVolume { .. }
                 | WalOp::DropVolume { .. }
                 | WalOp::CloneVolume { .. }
-                | WalOp::L2pRangeDelete { .. } => {
+                | WalOp::L2pRangeDelete { .. }
+                | WalOp::FreePbas { .. } => {
                     return Err(MetaDbError::Corruption(
                         "lifecycle op reached lane dispatch path".into(),
                     ));
@@ -2542,7 +2548,8 @@ impl Db {
                 | WalOp::CreateVolume { .. }
                 | WalOp::DropVolume { .. }
                 | WalOp::CloneVolume { .. }
-                | WalOp::L2pRangeDelete { .. } => {
+                | WalOp::L2pRangeDelete { .. }
+                | WalOp::FreePbas { .. } => {
                     unreachable!(
                         "lifecycle op must not reach apply_ops_grouped_to_lanes"
                     );
@@ -2776,7 +2783,8 @@ impl Db {
                 | WalOp::CreateVolume { .. }
                 | WalOp::DropVolume { .. }
                 | WalOp::CloneVolume { .. }
-                | WalOp::L2pRangeDelete { .. } => {
+                | WalOp::L2pRangeDelete { .. }
+                | WalOp::FreePbas { .. } => {
                     unreachable!("lifecycle op must not reach apply_ops_grouped_to");
                 }
             }
@@ -2923,7 +2931,8 @@ fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Du
         WalOp::DropSnapshot { .. }
         | WalOp::CreateVolume { .. }
         | WalOp::DropVolume { .. }
-        | WalOp::CloneVolume { .. } => {}
+        | WalOp::CloneVolume { .. }
+        | WalOp::FreePbas { .. } => {}
     }
 }
 

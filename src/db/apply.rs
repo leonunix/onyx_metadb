@@ -226,7 +226,57 @@ pub(super) fn apply_op_bare(
             "Phase 7 volume-lifecycle WAL op for ord {ord} hit the commit-6 apply path; \
              commit 8/9 implements these — this binary is too old to replay it"
         ))),
+        // Phase 3 (no-refcount-hot-path) plumbing: Lineage GC emits
+        // [`WalOp::FreePbas`] when it has decided a batch of PBAs are
+        // dead per dead-list + snapshot-pin semantics. Apply is
+        // idempotent: for each pba, decref by 1 via the existing rc
+        // stage path. If the staged result reaches 0, the PBA is
+        // surfaced in `ApplyOutcome::FreePbas.freed_pbas` for onyx-side
+        // retire. If the rc was already 0 or never present (hot path
+        // already freed it, or another GC cycle beat us), `stage` does
+        // not underflow because `RcStage::stage` clamps at 0.
+        WalOp::FreePbas { vol_ord: _, pbas } => apply_free_pbas(refcount_shards, lsn, pbas),
     }
+}
+
+/// Apply a batched `WalOp::FreePbas`: for each pba, attempt a refcount
+/// decref by 1 via the existing rc shard path. PBAs that drop to 0 by
+/// this op are returned in the outcome so onyx-side cleanup can
+/// retire them. PBAs whose current refcount is already 0 or absent
+/// (hot path freed them, or this op is being replayed) are silently
+/// skipped — rc would underflow, and onyx-side retire is a set
+/// operation so a missed surface is fine.
+///
+/// Phase 3 plumbing: most GC-emitted FreePbas records will hit the
+/// "already 0" branch because the hot path still owns refcount.
+/// Phase 5 will pull hot-path RC decref out, at which point this op
+/// becomes the primary mechanism by which PBAs transition to free.
+pub(super) fn apply_free_pbas(
+    refcount_shards: &[Shard],
+    lsn: Lsn,
+    pbas: &[Pba],
+) -> Result<ApplyOutcome> {
+    let mut freed: Vec<Pba> = Vec::new();
+    for &pba in pbas {
+        let sid = shard_for_key(refcount_shards, pba);
+        // Peek current rc (pending merged with base). `rc.get` does
+        // not mutate state and never underflows. Skip the decref
+        // when rc is already 0 — the PBA has already been freed (by
+        // the hot path, by drop_snapshot's cascade, or by an earlier
+        // GC cycle) and a second decref would surface a spurious
+        // underflow error.
+        let cur = refcount_shards[sid].rc.get(pba)?;
+        if cur == 0 {
+            continue;
+        }
+        let (_, new) = refcount_shards[sid].rc.stage(pba, -1, lsn)?;
+        if new == 0 {
+            freed.push(pba);
+        }
+    }
+    Ok(ApplyOutcome::FreePbas {
+        freed_pbas: freed.into_boxed_slice(),
+    })
 }
 
 /// Apply-time CAS gate. Returns true iff `new_seq` is stale relative
@@ -1157,6 +1207,11 @@ pub(super) fn batch_contains_lifecycle_op(ops: &[WalOp]) -> bool {
                 // the bucketed path safe if a future caller routes
                 // it through here by mistake.
                 | WalOp::L2pRangeDelete { .. }
+                // FreePbas is the Phase 3 (no-refcount-hot-path)
+                // Lineage GC emitter. Its apply path is the serial
+                // `apply_op` arm, which forwards to `apply_free_pbas`;
+                // it never participates in the bucketed lane path.
+                | WalOp::FreePbas { .. }
         )
     })
 }
