@@ -957,3 +957,149 @@ fn free_pbas_count_over_cap_is_corruption() {
         e => panic!("{e}"),
     }
 }
+
+// ── Phase 4 Step 5: PromotionChunk / PromotionComplete codec round-trips ──
+
+#[test]
+fn promotion_chunk_round_trip_with_cursor() {
+    let ops = vec![WalOp::PromotionChunk {
+        vol_ord: 4,
+        pba_increfs: vec![10u64, 20, 30, 40].into_boxed_slice(),
+        next_cursor: Some(0x1234_5678_DEAD_BEEF),
+    }];
+    let body = encode_body(&ops);
+    // schema(1) + tag(1) + vol_ord(2) + count(4) + 4*pba(8) + cursor_tag(1) + lba(8)
+    assert_eq!(body.len(), 1 + 1 + 2 + 4 + 4 * 8 + 1 + 8);
+    assert_eq!(decode_body(&body).unwrap(), ops);
+}
+
+#[test]
+fn promotion_chunk_round_trip_no_cursor() {
+    let ops = vec![WalOp::PromotionChunk {
+        vol_ord: 1,
+        pba_increfs: vec![7u64, 8, 9].into_boxed_slice(),
+        next_cursor: None,
+    }];
+    let body = encode_body(&ops);
+    // schema(1) + tag(1) + vol_ord(2) + count(4) + 3*pba(8) + cursor_tag(1)
+    assert_eq!(body.len(), 1 + 1 + 2 + 4 + 3 * 8 + 1);
+    assert_eq!(decode_body(&body).unwrap(), ops);
+}
+
+#[test]
+fn promotion_chunk_empty_pba_list_round_trip() {
+    let ops = vec![WalOp::PromotionChunk {
+        vol_ord: 0,
+        pba_increfs: Box::<[u64]>::default(),
+        next_cursor: Some(0),
+    }];
+    let body = encode_body(&ops);
+    assert_eq!(decode_body(&body).unwrap(), ops);
+}
+
+#[test]
+fn promotion_chunk_encoded_len_matches_encode_output() {
+    for next_cursor in [None, Some(42u64)] {
+        let op = WalOp::PromotionChunk {
+            vol_ord: 9,
+            pba_increfs: vec![1u64, 2, 3, 4, 5].into_boxed_slice(),
+            next_cursor,
+        };
+        let mut buf = Vec::new();
+        op.encode(&mut buf);
+        assert_eq!(buf.len(), op.encoded_len());
+    }
+}
+
+#[test]
+fn promotion_chunk_count_over_cap_is_corruption() {
+    let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_PROMOTION_CHUNK];
+    body.extend_from_slice(&0u16.to_be_bytes()); // vol_ord
+    body.extend_from_slice(&((MAX_PROMOTION_CHUNK_PBAS + 1) as u32).to_be_bytes());
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(
+                msg.contains("MAX_PROMOTION_CHUNK_PBAS") && msg.contains("PROMOTION_CHUNK"),
+                "{msg}"
+            )
+        }
+        e => panic!("{e}"),
+    }
+}
+
+#[test]
+fn promotion_chunk_truncated_header_is_corruption() {
+    // tag + 4 bytes (not enough for vol_ord(2) + count(4) = 6).
+    let body = vec![WAL_BODY_SCHEMA_VERSION, TAG_PROMOTION_CHUNK, 0, 0, 0, 0];
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(msg.contains("PROMOTION_CHUNK header"), "{msg}")
+        }
+        e => panic!("{e}"),
+    }
+}
+
+#[test]
+fn promotion_chunk_unknown_cursor_tag_is_corruption() {
+    let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_PROMOTION_CHUNK];
+    body.extend_from_slice(&0u16.to_be_bytes()); // vol_ord
+    body.extend_from_slice(&0u32.to_be_bytes()); // count=0
+    body.push(0xFF); // bogus cursor discriminator
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(
+                msg.contains("PROMOTION_CHUNK") && msg.contains("cursor tag"),
+                "{msg}"
+            )
+        }
+        e => panic!("{e}"),
+    }
+}
+
+#[test]
+fn promotion_chunk_cursor_some_truncated_is_corruption() {
+    // count=0, cursor_tag=SOME, but missing 8-byte lba payload.
+    let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_PROMOTION_CHUNK];
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes());
+    body.push(PROMOTION_CHUNK_CURSOR_SOME);
+    // The count-list-plus-cursor-tag length check above already
+    // consumes through cursor_tag, so add three trailing bytes to
+    // force the "cursor payload" branch to fail on its own.
+    body.extend_from_slice(&[0u8, 0, 0]);
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(msg.contains("PROMOTION_CHUNK cursor payload"), "{msg}")
+        }
+        e => panic!("{e}"),
+    }
+}
+
+#[test]
+fn promotion_complete_round_trip() {
+    let ops = vec![WalOp::PromotionComplete { vol_ord: 11 }];
+    let body = encode_body(&ops);
+    // schema(1) + tag(1) + vol_ord(2)
+    assert_eq!(body.len(), 1 + 1 + 2);
+    assert_eq!(decode_body(&body).unwrap(), ops);
+}
+
+#[test]
+fn promotion_complete_encoded_len_matches_encode_output() {
+    let op = WalOp::PromotionComplete { vol_ord: 5 };
+    let mut buf = Vec::new();
+    op.encode(&mut buf);
+    assert_eq!(buf.len(), op.encoded_len());
+}
+
+#[test]
+fn promotion_complete_truncated_is_corruption() {
+    // Only one byte after tag (vol_ord needs two).
+    let body = vec![WAL_BODY_SCHEMA_VERSION, TAG_PROMOTION_COMPLETE, 0];
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(msg.contains("PROMOTION_COMPLETE"), "{msg}")
+        }
+        e => panic!("{e}"),
+    }
+}

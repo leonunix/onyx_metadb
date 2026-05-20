@@ -1,14 +1,22 @@
-//! Phase 3 (no-refcount-hot-path) plumbing: WalOp::FreePbas + apply
-//! idempotency.
+//! [[no-refcount-hot-path-design]] Phase 4 Step 3: WalOp::FreePbas
+//! apply path with exclusive/shared split.
 //!
-//! The hot path is unchanged in Phase 3, so a real Lineage GC worker
-//! that emits these ops live alongside `apply_l2p_remap` would
-//! generate FreePbas records whose target PBAs are usually already at
-//! refcount 0 (hot path freed them inline). These tests verify the
-//! apply path handles that case correctly (idempotent skip) and that
-//! a PBA whose refcount is brought to 0 by FreePbas itself is
-//! surfaced in `ApplyOutcome::FreePbas.freed_pbas` for onyx-side
-//! retire.
+//! Contract (post Step 3): `apply_free_pbas` classifies each PBA by
+//! current refcount.
+//!
+//! - `rc > 0` ⇒ **shared** (referenced by dedup_index or by a
+//!   pending hot-path incref/decref pair). Decref by 1; surface if it
+//!   reaches 0.
+//! - `rc == 0` ⇒ **exclusive** (never put_dedup'd; hot-path either
+//!   already decref'd it to 0 in Phase 4, or never touched rc in
+//!   Phase 5). Surface directly; do not touch rc.
+//!
+//! Phase 3's old "skip on rc=0" defensive branch is gone — that
+//! branch collapsed Phase 5's exclusive surface (the primary retire
+//! signal once hot-path RC goes away) with Phase 4's "already
+//! retired by hot path" no-op. Step 3 separates them so onyx-side
+//! retire is the union of L2pRemap surfaces (Phase 4) **plus**
+//! exclusive FreePbas surfaces (Phase 5).
 
 use super::mk_db;
 use crate::ApplyOutcome;
@@ -38,34 +46,52 @@ fn free_pbas_empty_is_no_op() {
 }
 
 #[test]
-fn free_pbas_unknown_pba_skipped() {
-    // PBA with no refcount entry (rc=0): apply_free_pbas's `cur == 0`
-    // guard skips the decref entirely. No underflow error is raised
-    // and the PBA is not surfaced in `freed_pbas` (the hot path or
-    // a prior GC cycle has already retired it, or it was never
-    // allocated).
+fn free_pbas_unknown_pba_surfaces_as_exclusive() {
+    // PBA with no refcount entry (rc=0). Phase 4 Step 3 classifies it
+    // as exclusive and surfaces it without touching rc. (Phase 3 used
+    // to skip this case entirely; Step 3 changes the contract.)
     let (_d, db) = mk_db();
     let mut tx = db.begin();
     tx.free_pbas(0, vec![999u64].into_boxed_slice());
     let (_lsn, outcomes) = tx.commit_with_outcomes().unwrap();
-    assert_free_outcome(&outcomes[0], &[]);
+    assert_eq!(db.get_refcount(999).unwrap(), 0);
+    assert_free_outcome(&outcomes[0], &[999]);
 }
 
 #[test]
-fn free_pbas_brings_rc_to_zero_and_surfaces_pba() {
+fn free_pbas_shared_decrefs_global_rc() {
+    // Shared PBA (rc>0 from a dedup-like Incref): FreePbas takes the
+    // shared branch, decref by 1, rc→0 surfaces it. This is the
+    // Phase-5 dedup-retire path exercised through the apply API.
     let (_d, db) = mk_db();
-    // Seed rc=1 for pba 42 via the existing Incref tx API.
     let mut tx = db.begin();
     tx.incref_pba(42, 1);
     tx.commit().unwrap();
     assert_eq!(db.get_refcount(42).unwrap(), 1);
 
-    // FreePbas drives rc=1 → rc=0; the pba surfaces.
     let mut tx = db.begin();
     tx.free_pbas(0, vec![42u64].into_boxed_slice());
     let (_lsn, outcomes) = tx.commit_with_outcomes().unwrap();
     assert_eq!(db.get_refcount(42).unwrap(), 0);
     assert_free_outcome(&outcomes[0], &[42]);
+}
+
+#[test]
+fn free_pbas_exclusive_bypasses_rc() {
+    // Exclusive PBA (rc=0 from the start, no dedup entry): Step 3
+    // surfaces it without touching rc. Important for Phase 5 where
+    // exclusive PBAs never get their rc bumped by the hot path —
+    // GC must surface them via FreePbas without underflowing.
+    let (_d, db) = mk_db();
+    assert_eq!(db.get_refcount(7777).unwrap(), 0);
+
+    let mut tx = db.begin();
+    tx.free_pbas(0, vec![7777u64].into_boxed_slice());
+    let (_lsn, outcomes) = tx.commit_with_outcomes().unwrap();
+
+    // rc untouched (stays 0; no underflow surfaced).
+    assert_eq!(db.get_refcount(7777).unwrap(), 0);
+    assert_free_outcome(&outcomes[0], &[7777]);
 }
 
 #[test]
@@ -89,9 +115,10 @@ fn free_pbas_leaves_positive_rc_alone() {
 
 #[test]
 fn free_pbas_is_idempotent_on_already_zero() {
-    // Apply FreePbas twice for the same pba. First brings rc to 0
-    // and surfaces it; second finds rc already 0, surfaces it again
-    // (onyx side dedups via retire set semantics).
+    // Apply FreePbas twice for the same pba. First takes the shared
+    // branch (rc=1→0) and surfaces; second finds rc=0 and surfaces
+    // again via the exclusive branch. Onyx-side retire dedups via
+    // set semantics so duplicate surfaces are harmless.
     let (_d, db) = mk_db();
     let mut tx = db.begin();
     tx.incref_pba(11, 1);
@@ -106,18 +133,18 @@ fn free_pbas_is_idempotent_on_already_zero() {
     let mut tx2 = db.begin();
     tx2.free_pbas(0, vec![11u64].into_boxed_slice());
     let (_lsn2, outcomes2) = tx2.commit_with_outcomes().unwrap();
-    // Idempotent: no panic, no underflow, still rc=0. Second pass
-    // sees `cur == 0`, skips entirely, surfaces nothing.
+    // No panic, no underflow; rc stays 0. Second pass classifies the
+    // PBA as exclusive and re-surfaces.
     assert_eq!(db.get_refcount(11).unwrap(), 0);
-    assert_free_outcome(&outcomes2[0], &[]);
+    assert_free_outcome(&outcomes2[0], &[11]);
 }
 
 #[test]
 fn free_pbas_batched_mixed_outcomes() {
     let (_d, db) = mk_db();
-    // pba 100: rc=1 (will free)
-    // pba 200: rc=2 (will decrement to 1, not surfaced)
-    // pba 300: never inserted (ghost-free, surfaced)
+    // pba 100: rc=1 (shared, decref to 0, surfaces)
+    // pba 200: rc=2 (shared, decref to 1, NOT surfaced)
+    // pba 300: rc=0 (exclusive, surfaces directly without touching rc)
     let mut tx = db.begin();
     tx.incref_pba(100, 1);
     tx.incref_pba(200, 2);
@@ -129,7 +156,5 @@ fn free_pbas_batched_mixed_outcomes() {
     assert_eq!(db.get_refcount(100).unwrap(), 0);
     assert_eq!(db.get_refcount(200).unwrap(), 1);
     assert_eq!(db.get_refcount(300).unwrap(), 0);
-    // pba=100 surfaces (rc 1→0). pba=200 doesn't (rc 2→1). pba=300
-    // doesn't (skipped, was never refcounted).
-    assert_free_outcome(&outcomes[0], &[100]);
+    assert_free_outcome(&outcomes[0], &[100, 300]);
 }

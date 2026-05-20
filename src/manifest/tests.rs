@@ -54,6 +54,9 @@ fn boot_vol_at(shard_count: u32, roots: &[PageId], checkpoint_lsn: Lsn) -> Volum
         flags: 0,
         dead_list_head_pid: NULL_PAGE,
         dead_list_tail_pid: NULL_PAGE,
+        parent_vol_ord: None,
+        branched_at_lsn: 0,
+        promotion_cursor: None,
     }
 }
 
@@ -350,6 +353,9 @@ fn v6_volumes_table_round_trip() {
                 flags: VOLUME_FLAG_DROP_PENDING,
                 dead_list_head_pid: NULL_PAGE,
                 dead_list_tail_pid: NULL_PAGE,
+                parent_vol_ord: None,
+                branched_at_lsn: 0,
+                promotion_cursor: None,
             },
         ],
     };
@@ -470,6 +476,9 @@ fn volume_entry_inline_round_trip() {
         flags: VOLUME_FLAG_DROP_PENDING,
         dead_list_head_pid: NULL_PAGE,
         dead_list_tail_pid: NULL_PAGE,
+        parent_vol_ord: None,
+        branched_at_lsn: 0,
+        promotion_cursor: None,
     };
     let mut buf = vec![0u8; volume_entry_inline_size(entry.shard_count as usize)];
     let mut off = 0;
@@ -492,6 +501,9 @@ fn volume_entry_inline_rejects_shard_count_mismatch() {
         flags: 0,
         dead_list_head_pid: NULL_PAGE,
         dead_list_tail_pid: NULL_PAGE,
+        parent_vol_ord: None,
+        branched_at_lsn: 0,
+        promotion_cursor: None,
     };
     let mut buf = vec![0u8; 256];
     let mut off = 0;
@@ -512,6 +524,9 @@ fn volume_entry_inline_rejects_buffer_too_small() {
         flags: 0,
         dead_list_head_pid: NULL_PAGE,
         dead_list_tail_pid: NULL_PAGE,
+        parent_vol_ord: None,
+        branched_at_lsn: 0,
+        promotion_cursor: None,
     };
     let mut buf = vec![0u8; VOLUME_ENTRY_FIXED_SIZE + 8]; // one root worth
     let mut off = 0;
@@ -533,6 +548,9 @@ fn volume_entry_decode_rejects_truncated_roots() {
         flags: 0,
         dead_list_head_pid: NULL_PAGE,
         dead_list_tail_pid: NULL_PAGE,
+        parent_vol_ord: None,
+        branched_at_lsn: 0,
+        promotion_cursor: None,
     };
     let mut buf = vec![0u8; volume_entry_inline_size(3)];
     let mut off = 0;
@@ -559,6 +577,9 @@ fn volume_entry_many_back_to_back() {
             flags: 0,
             dead_list_head_pid: NULL_PAGE,
             dead_list_tail_pid: NULL_PAGE,
+            parent_vol_ord: None,
+            branched_at_lsn: 0,
+            promotion_cursor: None,
         },
         VolumeEntry {
             ord: 1,
@@ -569,6 +590,9 @@ fn volume_entry_many_back_to_back() {
             flags: VOLUME_FLAG_DROP_PENDING,
             dead_list_head_pid: NULL_PAGE,
             dead_list_tail_pid: NULL_PAGE,
+            parent_vol_ord: None,
+            branched_at_lsn: 0,
+            promotion_cursor: None,
         },
         VolumeEntry {
             ord: 65534,
@@ -579,6 +603,9 @@ fn volume_entry_many_back_to_back() {
             flags: 0,
             dead_list_head_pid: NULL_PAGE,
             dead_list_tail_pid: NULL_PAGE,
+            parent_vol_ord: None,
+            branched_at_lsn: 0,
+            promotion_cursor: None,
         },
     ];
     let total: usize = entries
@@ -630,6 +657,9 @@ fn v11_per_shard_durable_seq_round_trip() {
             flags: 0,
             dead_list_head_pid: NULL_PAGE,
             dead_list_tail_pid: NULL_PAGE,
+            parent_vol_ord: None,
+            branched_at_lsn: 0,
+            promotion_cursor: None,
         }],
     };
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
@@ -794,6 +824,9 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
             flags: 0,
             dead_list_head_pid: NULL_PAGE,
             dead_list_tail_pid: NULL_PAGE,
+            parent_vol_ord: None,
+            branched_at_lsn: 0,
+            promotion_cursor: None,
         }],
     };
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
@@ -808,5 +841,88 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
             );
         }
         e => panic!("expected Corruption from v10 manifest, got {e}"),
+    }
+}
+
+// ── Phase 4 Step 1: lineage fields on VolumeEntry ───────────────────
+
+/// A v14 `VolumeEntry` with a non-trivial lineage trio must round-trip
+/// inline encode/decode without losing `parent_vol_ord` /
+/// `branched_at_lsn` / `promotion_cursor`. Exercises every Option
+/// variant for the two sentinel-encoded fields.
+#[test]
+fn v14_volume_entry_round_trip_carries_lineage_fields() {
+    let entry = VolumeEntry {
+        ord: 17,
+        shard_count: 3,
+        l2p_shard_roots: bx(&[100, 101, 102]),
+        l2p_shard_durable_seq: bx(&[5, 6, 7]),
+        created_lsn: 0xCAFE_BABE,
+        flags: VOLUME_FLAG_DROP_PENDING,
+        dead_list_head_pid: 0x1111_2222_3333_4444,
+        dead_list_tail_pid: 0x5555_6666_7777_8888,
+        parent_vol_ord: Some(9),
+        branched_at_lsn: 0xDEAD_BEEF,
+        promotion_cursor: Some(0x1234),
+    };
+    let size = volume_entry_inline_size(entry.shard_count as usize);
+    let mut buf = vec![0u8; size];
+    let mut off = 0;
+    encode_volume_entry_inline(&entry, &mut buf, &mut off).unwrap();
+    assert_eq!(off, size);
+    let mut off = 0;
+    let decoded = decode_volume_entry_inline(&buf, &mut off, MANIFEST_BODY_VERSION).unwrap();
+    assert_eq!(decoded, entry);
+    assert_eq!(off, size);
+
+    // The Option::None encoding (INVALID_VOLUME / PROMOTION_CURSOR_NONE
+    // sentinels) must round-trip as `None`, not as `Some(sentinel_value)`.
+    let bare = VolumeEntry {
+        ord: 0,
+        shard_count: 1,
+        l2p_shard_roots: bx(&[NULL_PAGE]),
+        l2p_shard_durable_seq: bx(&[0]),
+        created_lsn: 0,
+        flags: 0,
+        dead_list_head_pid: NULL_PAGE,
+        dead_list_tail_pid: NULL_PAGE,
+        parent_vol_ord: None,
+        branched_at_lsn: 0,
+        promotion_cursor: None,
+    };
+    let size = volume_entry_inline_size(bare.shard_count as usize);
+    let mut buf = vec![0u8; size];
+    let mut off = 0;
+    encode_volume_entry_inline(&bare, &mut buf, &mut off).unwrap();
+    let mut off = 0;
+    let decoded = decode_volume_entry_inline(&buf, &mut off, MANIFEST_BODY_VERSION).unwrap();
+    assert_eq!(decoded, bare);
+    assert!(decoded.parent_vol_ord.is_none());
+    assert!(decoded.promotion_cursor.is_none());
+}
+
+/// Old (pre-Phase 4) v13 manifests are flag-day rejected by the v14
+/// decoder so a downgraded binary that ran briefly on the same on-disk
+/// state can't be silently re-promoted.
+#[test]
+fn v13_manifest_is_rejected_after_flag_day_to_v14() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
+    {
+        let p = page.payload_mut();
+        // Plant a v13 version stamp; the rest of the body can stay zero —
+        // the version dispatch fires before any of it is read.
+        p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].copy_from_slice(&13u32.to_le_bytes());
+    }
+    page.seal();
+    match Manifest::decode(&page, &ps).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(
+                msg.contains("unsupported manifest body version") && msg.contains("v14"),
+                "expected v13-rejection message mentioning v14, got: {msg}"
+            );
+        }
+        e => panic!("expected Corruption from v13 manifest, got {e}"),
     }
 }

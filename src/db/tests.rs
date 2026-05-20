@@ -164,5 +164,6 @@ mod dead_list;
 mod free_pbas;
 mod indexes;
 mod lineage_gc;
+mod promotion;
 mod remap_range;
 mod volume;

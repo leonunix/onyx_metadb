@@ -138,6 +138,8 @@ struct OpCounts {
     drop_volume: u64,
     clone_volume: u64,
     free_pbas: u64,
+    promotion_chunk: u64,
+    promotion_complete: u64,
 }
 
 impl OpCounts {
@@ -159,6 +161,8 @@ impl OpCounts {
             WalOp::DropVolume { .. } => self.drop_volume += 1,
             WalOp::CloneVolume { .. } => self.clone_volume += 1,
             WalOp::FreePbas { .. } => self.free_pbas += 1,
+            WalOp::PromotionChunk { .. } => self.promotion_chunk += 1,
+            WalOp::PromotionComplete { .. } => self.promotion_complete += 1,
         }
     }
 }
@@ -389,6 +393,21 @@ fn fmt_op(op: &WalOp) -> String {
         WalOp::FreePbas { vol_ord, pbas } => {
             format!("FreePbas vol={vol_ord} count={}", pbas.len())
         }
+        WalOp::PromotionChunk {
+            vol_ord,
+            pba_increfs,
+            next_cursor,
+        } => format!(
+            "PromotionChunk vol={vol_ord} increfs={} next_cursor={}",
+            pba_increfs.len(),
+            match next_cursor {
+                Some(lba) => format!("Some({lba})"),
+                None => "None".to_string(),
+            }
+        ),
+        WalOp::PromotionComplete { vol_ord } => {
+            format!("PromotionComplete vol={vol_ord}")
+        }
     }
 }
 
@@ -512,6 +531,23 @@ fn op_json(op: &WalOp) -> String {
             "{{\"op\":\"FreePbas\",\"vol_ord\":{vol_ord},\"count\":{}}}",
             pbas.len()
         ),
+        WalOp::PromotionChunk {
+            vol_ord,
+            pba_increfs,
+            next_cursor,
+        } => {
+            let cursor_json = match next_cursor {
+                Some(lba) => format!("{lba}"),
+                None => "null".to_string(),
+            };
+            format!(
+                "{{\"op\":\"PromotionChunk\",\"vol_ord\":{vol_ord},\"increfs\":{},\"next_cursor\":{cursor_json}}}",
+                pba_increfs.len()
+            )
+        }
+        WalOp::PromotionComplete { vol_ord } => {
+            format!("{{\"op\":\"PromotionComplete\",\"vol_ord\":{vol_ord}}}")
+        }
     }
 }
 
@@ -536,6 +572,8 @@ fn op_tag_list(ops: &[WalOp]) -> String {
             WalOp::DropVolume { .. } => "DropVolume",
             WalOp::CloneVolume { .. } => "CloneVolume",
             WalOp::FreePbas { .. } => "FreePbas",
+            WalOp::PromotionChunk { .. } => "PromotionChunk",
+            WalOp::PromotionComplete { .. } => "PromotionComplete",
         })
         .collect();
     tags.dedup();

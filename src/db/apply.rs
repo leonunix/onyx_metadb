@@ -226,31 +226,142 @@ pub(super) fn apply_op_bare(
             "Phase 7 volume-lifecycle WAL op for ord {ord} hit the commit-6 apply path; \
              commit 8/9 implements these — this binary is too old to replay it"
         ))),
-        // Phase 3 (no-refcount-hot-path) plumbing: Lineage GC emits
-        // [`WalOp::FreePbas`] when it has decided a batch of PBAs are
-        // dead per dead-list + snapshot-pin semantics. Apply is
-        // idempotent: for each pba, decref by 1 via the existing rc
-        // stage path. If the staged result reaches 0, the PBA is
-        // surfaced in `ApplyOutcome::FreePbas.freed_pbas` for onyx-side
-        // retire. If the rc was already 0 or never present (hot path
-        // already freed it, or another GC cycle beat us), `stage` does
-        // not underflow because `RcStage::stage` clamps at 0.
+        // [[no-refcount-hot-path-design]] Phase 4 Step 3: Lineage GC
+        // (or any caller) emits [`WalOp::FreePbas`] for a batch of
+        // PBAs whose dead-list records have cleared snap-pin and
+        // descendant pin. Apply classifies each PBA into shared
+        // (rc>0, decref by 1) or exclusive (rc=0, surface without
+        // touching rc); see [`apply_free_pbas`] for the full contract.
         WalOp::FreePbas { vol_ord: _, pbas } => apply_free_pbas(refcount_shards, lsn, pbas),
+        // [[no-refcount-hot-path-design]] Phase 4 Step 5: background
+        // promotion walker chunk. Bare layer only mutates the
+        // refcount table (incref each PBA by 1) and the volume's
+        // in-memory `promotion_cursor`. The manifest mirror lives in
+        // the live `apply_op` wrapper (and the lifecycle replay path),
+        // mirroring the `DropSnapshot` split.
+        WalOp::PromotionChunk {
+            vol_ord,
+            pba_increfs,
+            next_cursor,
+        } => apply_promotion_chunk(
+            volumes,
+            refcount_shards,
+            lsn,
+            *vol_ord,
+            pba_increfs,
+            *next_cursor,
+        ),
+        // [[no-refcount-hot-path-design]] Phase 4 Step 5: walker
+        // finish. Bare layer clears the volume's in-memory
+        // `parent_vol_ord` and `promotion_cursor`; the manifest mirror
+        // happens in the wrapper.
+        WalOp::PromotionComplete { vol_ord } => {
+            apply_promotion_complete(volumes, *vol_ord)
+        }
     }
 }
 
-/// Apply a batched `WalOp::FreePbas`: for each pba, attempt a refcount
-/// decref by 1 via the existing rc shard path. PBAs that drop to 0 by
-/// this op are returned in the outcome so onyx-side cleanup can
-/// retire them. PBAs whose current refcount is already 0 or absent
-/// (hot path freed them, or this op is being replayed) are silently
-/// skipped — rc would underflow, and onyx-side retire is a set
-/// operation so a missed surface is fine.
+/// [[no-refcount-hot-path-design]] Phase 4 Step 5 walker chunk apply.
+/// Increfs each PBA in `pba_increfs` by 1 against the global refcount
+/// table (the increfs are batched into the WAL-record group commit,
+/// not into a separate per-incref record). Advances the volume's
+/// in-memory `promotion_cursor` to `next_cursor`.
 ///
-/// Phase 3 plumbing: most GC-emitted FreePbas records will hit the
-/// "already 0" branch because the hot path still owns refcount.
-/// Phase 5 will pull hot-path RC decref out, at which point this op
-/// becomes the primary mechanism by which PBAs transition to free.
+/// Idempotency: WAL replay only applies records strictly above the
+/// previous `checkpoint_lsn`, and the walker emits at most one chunk
+/// per volume per LSN, so a record at LSN `L` is applied at most once
+/// across crashes. Within a record the per-PBA `rc.stage(pba, 1, lsn)`
+/// is non-idempotent — re-staging would double-count — but the
+/// "checkpoint_lsn cutoff" makes that condition unreachable.
+pub(super) fn apply_promotion_chunk(
+    volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+    refcount_shards: &[Shard],
+    lsn: Lsn,
+    vol_ord: VolumeOrdinal,
+    pba_increfs: &[Pba],
+    next_cursor: Option<crate::types::Lba>,
+) -> Result<ApplyOutcome> {
+    let volume = volumes.get(&vol_ord).ok_or_else(|| {
+        MetaDbError::Corruption(format!(
+            "PromotionChunk for unknown volume ord {vol_ord}"
+        ))
+    })?;
+    let mut applied = 0usize;
+    for &pba in pba_increfs {
+        let sid = shard_for_key(refcount_shards, pba);
+        refcount_shards[sid].rc.stage(pba, 1, lsn)?;
+        applied += 1;
+    }
+    *volume.promotion_cursor.write() = next_cursor;
+    Ok(ApplyOutcome::PromotionChunk {
+        increfs_applied: applied,
+        cursor_advanced_to: next_cursor,
+    })
+}
+
+/// [[no-refcount-hot-path-design]] Phase 4 Step 5 walker finish apply.
+/// Clears the clone's in-memory `parent_vol_ord` and `promotion_cursor`
+/// — after this record the parent volume's Lineage GC stops treating
+/// this clone's `branched_at_lsn` as a pin point.
+///
+/// Idempotent: re-applying after a crash sees both fields already
+/// `None` and is a no-op. `branched_at_lsn` deliberately stays — the
+/// clone's COW-shared L2P still records data born below that LSN, and
+/// reset-to-zero would be misleading even if no GC consumer reads it
+/// post-promotion.
+pub(super) fn apply_promotion_complete(
+    volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+    vol_ord: VolumeOrdinal,
+) -> Result<ApplyOutcome> {
+    let volume = volumes.get(&vol_ord).ok_or_else(|| {
+        MetaDbError::Corruption(format!(
+            "PromotionComplete for unknown volume ord {vol_ord}"
+        ))
+    })?;
+    *volume.parent_vol_ord.write() = None;
+    *volume.promotion_cursor.write() = None;
+    Ok(ApplyOutcome::PromotionComplete)
+}
+
+/// Apply a batched `WalOp::FreePbas` with exclusive/shared split
+/// ([[no-refcount-hot-path-design]] Phase 4 Step 3).
+///
+/// For each PBA we classify by **current refcount**:
+///
+/// - **Shared** (`rc > 0`): some other lineage still references this
+///   PBA via the dedup_index (in Phase 5 only `DedupPut` and the
+///   promotion walker bump global rc, so `rc > 0` is the definitive
+///   "shared via dedup" signal). Decref by 1; if the staged result
+///   reaches 0 the PBA surfaces in `freed_pbas` and onyx-side cleanup
+///   retires it + deletes the dedup_index entry.
+/// - **Exclusive** (`rc == 0`): no other lineage references this PBA
+///   — it was never put into `dedup_index` and the hot path never
+///   bumped its rc (Phase 5) or has already brought it to 0 (Phase
+///   4). Surface directly **without** touching rc. Touching it would
+///   underflow.
+///
+/// Phase 4 default: hot-path RC is still on, so a Phase-4-built GC
+/// segment's records arrive here with rc already 0 (hot path's
+/// `L2pRemap` decref ran). They take the **exclusive** branch and
+/// surface so onyx can do the retire that previously rode on the
+/// `L2pRemap` outcome.
+///
+/// Replay idempotency: re-applying the same `WalOp::FreePbas` after a
+/// crash sees rc=0 for everything it already drained on the first
+/// pass; those PBAs surface again. Onyx-side retire is a set, so
+/// duplicate surfaces are harmless. The previous Phase 3 defensive
+/// `if cur == 0 { continue }` guard collapsed exclusive PBAs with
+/// already-freed shared PBAs into a single "skip" — Phase 4 separates
+/// them because Phase 5 will need the exclusive surface to be the
+/// **primary** retire signal (the hot-path `L2pRemap` retire path
+/// goes away).
+///
+/// We don't query `dedup_index.contains(pba)` here even though the
+/// design says `is_shared = dedup_index.contains(pba) || rc > 0`:
+/// the on-disk dedup_index is hash-keyed with no PBA-reverse lookup,
+/// and in Phase 5 only `DedupPut` bumps rc, so `rc > 0` already
+/// implies "in dedup_index". The OR is redundant given the
+/// promotion-walker discipline planned in Step 5.
 pub(super) fn apply_free_pbas(
     refcount_shards: &[Shard],
     lsn: Lsn,
@@ -260,13 +371,12 @@ pub(super) fn apply_free_pbas(
     for &pba in pbas {
         let sid = shard_for_key(refcount_shards, pba);
         // Peek current rc (pending merged with base). `rc.get` does
-        // not mutate state and never underflows. Skip the decref
-        // when rc is already 0 — the PBA has already been freed (by
-        // the hot path, by drop_snapshot's cascade, or by an earlier
-        // GC cycle) and a second decref would surface a spurious
-        // underflow error.
+        // not mutate state and never underflows.
         let cur = refcount_shards[sid].rc.get(pba)?;
         if cur == 0 {
+            // Exclusive — never refcounted (no dedup entry, no hot-
+            // path bump still pending). Surface without touching rc.
+            freed.push(pba);
             continue;
         }
         let (_, new) = refcount_shards[sid].rc.stage(pba, -1, lsn)?;
@@ -1212,6 +1322,17 @@ pub(super) fn batch_contains_lifecycle_op(ops: &[WalOp]) -> bool {
                 // `apply_op` arm, which forwards to `apply_free_pbas`;
                 // it never participates in the bucketed lane path.
                 | WalOp::FreePbas { .. }
+                // PromotionChunk / PromotionComplete are the Phase 4
+                // Step 5 (no-refcount-hot-path) walker emissions. They
+                // mutate the in-memory manifest (`promotion_cursor` and
+                // `parent_vol_ord`), so apply must run on the serial
+                // `apply_op` path that holds `manifest_state` —
+                // identical pattern to `DropSnapshot`. PromotionChunk
+                // also stages global rc bumps, but routing that through
+                // the laned path would split the manifest mirror from
+                // the rc bump across thread boundaries.
+                | WalOp::PromotionChunk { .. }
+                | WalOp::PromotionComplete { .. }
         )
     })
 }

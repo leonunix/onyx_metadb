@@ -216,3 +216,236 @@ fn lineage_gc_advance_survives_reopen() {
     assert_eq!(head_reopen, NULL_PAGE);
     assert_eq!(tail_reopen, NULL_PAGE);
 }
+
+// ── Phase 4 Step 2: cross-volume snap_pin via descendant.branched_at_lsn ──
+
+// A clone's `branched_at_lsn` must pin parent dead-list records whose
+// `[birth, death)` window contains it — otherwise the parent's GC
+// would free a PBA the clone still observes through its COW-shared
+// L2P (the background promotion walker has not yet run, so the global
+// rc hasn't been bumped for the clone's lineage).
+#[test]
+fn phase4_lineage_gc_pins_parent_pba_via_descendant_branched_lsn() {
+    use super::BOOTSTRAP_VOLUME_ORD;
+
+    let (_d, db) = mk_db();
+    // Write a batch of LBAs on the parent. These birth_lsns will be
+    // bracketed by the snapshot we take next.
+    for i in 0u64..16 {
+        db.insert(BOOTSTRAP_VOLUME_ORD, i, v(i as u8)).unwrap();
+    }
+    // Snapshot + clone establish the lineage. The clone's
+    // `branched_at_lsn` equals the snapshot's `created_lsn`, which
+    // sits strictly above every prior birth_lsn.
+    let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+    let _clone = db.clone_volume(snap).unwrap();
+    // Drop the snapshot — without Phase 4's descendant pin, the
+    // parent's GC would now happily free the PBAs that the clone
+    // still references via the COW L2P. Phase 4 must hold them
+    // because `clone.parent_vol_ord == Some(parent)` and the
+    // clone's `branched_at_lsn ∈ [birth, death)` for every record
+    // about to be emitted by the parent's overwrites.
+    db.drop_snapshot(snap).unwrap();
+
+    // Now overwrite the parent's LBAs — each L2pRemap emits a dead
+    // record into the bootstrap volume's chain with `death_lsn`
+    // strictly above the snapshot's `created_lsn` (= clone's
+    // branched_at_lsn).
+    for i in 0u64..16 {
+        db.insert(BOOTSTRAP_VOLUME_ORD, i, v((i as u8).wrapping_add(1)))
+            .unwrap();
+    }
+    db.flush().unwrap();
+    let (head_before, _) = dead_list_anchors(&db, BOOTSTRAP_VOLUME_ORD);
+    assert_ne!(head_before, NULL_PAGE);
+
+    let advanced = db.test_run_lineage_gc_cycle().unwrap();
+    assert_eq!(
+        advanced, 0,
+        "cross-volume snap_pin (descendant.branched_at_lsn) must \
+         block the parent's GC even though no snapshot is left"
+    );
+    let (head_after, _) = dead_list_anchors(&db, BOOTSTRAP_VOLUME_ORD);
+    assert_eq!(head_after, head_before, "head_pid must not advance");
+}
+
+// ── Phase 4 Step 4: GC emits WalOp::FreePbas when flag is on ──
+
+fn mk_db_with_emit_freepbas(flag: bool) -> (tempfile::TempDir, Db) {
+    use crate::Config;
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.lineage_gc_emit_freepbas = flag;
+    let db = Db::create_with_config(cfg).unwrap();
+    (dir, db)
+}
+
+// Flag ON: GC emits a `WalOp::FreePbas` for each advancing volume.
+// We can't observe the outcome directly (the driver discards it), so
+// the contract test is "the cycle advanced AND the LSN advanced past
+// the writes' last LSN", which is only possible if GC committed at
+// least one WAL record.
+#[test]
+fn gc_emits_freepbas_when_flag_on() {
+    let (_d, db) = mk_db_with_emit_freepbas(true);
+    for i in 0u64..32 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    for i in 0u64..32 {
+        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
+    }
+    db.flush().unwrap();
+
+    let lsn_before_gc = db.last_applied_lsn();
+    let (head_before, _) = dead_list_anchors(&db, 0);
+    assert_ne!(head_before, NULL_PAGE, "writes should have built a segment");
+
+    let advanced = db.test_run_lineage_gc_cycle().unwrap();
+    assert_eq!(advanced, 1);
+
+    // Chain truncated (same as flag-OFF) AND the FreePbas commit
+    // advanced last_applied_lsn (only happens under flag ON).
+    let (head_after, tail_after) = dead_list_anchors(&db, 0);
+    assert_eq!(head_after, NULL_PAGE);
+    assert_eq!(tail_after, NULL_PAGE);
+    let lsn_after_gc = db.last_applied_lsn();
+    assert!(
+        lsn_after_gc > lsn_before_gc,
+        "flag-ON GC must commit a WalOp::FreePbas (lsn {lsn_before_gc} -> {lsn_after_gc})"
+    );
+}
+
+// Flag OFF (the default): GC does chain truncation only — no WAL
+// record, no LSN advance.
+#[test]
+fn gc_does_not_emit_freepbas_when_flag_off() {
+    let (_d, db) = mk_db_with_emit_freepbas(false);
+    for i in 0u64..32 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    for i in 0u64..32 {
+        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
+    }
+    db.flush().unwrap();
+
+    let lsn_before_gc = db.last_applied_lsn();
+    let (head_before, _) = dead_list_anchors(&db, 0);
+    assert_ne!(head_before, NULL_PAGE);
+
+    let advanced = db.test_run_lineage_gc_cycle().unwrap();
+    assert_eq!(advanced, 1);
+
+    let (head_after, tail_after) = dead_list_anchors(&db, 0);
+    assert_eq!(head_after, NULL_PAGE);
+    assert_eq!(tail_after, NULL_PAGE);
+    let lsn_after_gc = db.last_applied_lsn();
+    assert_eq!(
+        lsn_after_gc, lsn_before_gc,
+        "flag-OFF GC must not commit any WAL record"
+    );
+}
+
+// Phase 4 Step 7: a registered `freed_pbas_sink` receives the
+// `ApplyOutcome::FreePbas.freed_pbas` set produced by the GC cycle's
+// internal `WalOp::FreePbas` apply. Verifies the sink fires exactly
+// once with a non-empty list and is keyed by the GC'd volume ordinal.
+#[test]
+fn freed_pbas_sink_receives_lineage_gc_outcomes() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    let (_d, db) = mk_db_with_emit_freepbas(true);
+    for i in 0u64..16 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    for i in 0u64..16 {
+        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
+    }
+    db.flush().unwrap();
+
+    let captured: Arc<Mutex<Vec<(crate::types::VolumeOrdinal, Vec<crate::types::Pba>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    db.set_freed_pbas_sink(Arc::new(move |vol_ord, pbas| {
+        captured_clone.lock().unwrap().push((vol_ord, pbas));
+    }));
+
+    let advanced = db.test_run_lineage_gc_cycle().unwrap();
+    assert_eq!(advanced, 1);
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "sink should fire exactly once per advancing volume, got {captured:?}"
+    );
+    let (vol_ord, pbas) = &captured[0];
+    assert_eq!(*vol_ord, 0);
+    assert!(!pbas.is_empty(), "GC cycle freed nothing: {pbas:?}");
+}
+
+// Flag OFF: no `WalOp::FreePbas` is committed, so the sink must not
+// fire even when registered. Guards against accidentally surfacing
+// chain-truncation work as if it were a retire signal.
+#[test]
+fn freed_pbas_sink_silent_when_flag_off() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    let (_d, db) = mk_db_with_emit_freepbas(false);
+    for i in 0u64..16 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    for i in 0u64..16 {
+        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
+    }
+    db.flush().unwrap();
+
+    let calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let calls_clone = calls.clone();
+    db.set_freed_pbas_sink(Arc::new(move |_v, _p| {
+        *calls_clone.lock().unwrap() += 1;
+    }));
+
+    let advanced = db.test_run_lineage_gc_cycle().unwrap();
+    assert_eq!(advanced, 1);
+    assert_eq!(*calls.lock().unwrap(), 0);
+}
+
+// Once the clone's `parent_vol_ord` is cleared (the Step 5 background
+// promotion walker's last act after PromotionComplete), the parent's
+// GC must resume — the descendant no longer counts as a pin point.
+#[test]
+fn phase4_lineage_gc_resumes_after_promotion_clears_parent_vol_ord() {
+    use super::BOOTSTRAP_VOLUME_ORD;
+
+    let (_d, db) = mk_db();
+    for i in 0u64..16 {
+        db.insert(BOOTSTRAP_VOLUME_ORD, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+    let clone = db.clone_volume(snap).unwrap();
+    db.drop_snapshot(snap).unwrap();
+    for i in 0u64..16 {
+        db.insert(BOOTSTRAP_VOLUME_ORD, i, v((i as u8).wrapping_add(1)))
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    // First cycle: descendant pin still active, parent GC blocked.
+    assert_eq!(db.test_run_lineage_gc_cycle().unwrap(), 0);
+
+    // Simulate the background promotion walker finishing: clear the
+    // descendant's parent edge. Phase 5 wires this through a real
+    // `WalOp::PromotionComplete` apply; for Step 2 the test helper
+    // mutates manifest + in-memory state directly.
+    db.test_clear_parent_vol_ord(clone);
+
+    // Second cycle: parent now has no pinning descendant, so head
+    // advance is unblocked.
+    let advanced = db.test_run_lineage_gc_cycle().unwrap();
+    assert_eq!(advanced, 1);
+    let (head_after, tail_after) = dead_list_anchors(&db, BOOTSTRAP_VOLUME_ORD);
+    assert_eq!(head_after, NULL_PAGE);
+    assert_eq!(tail_after, NULL_PAGE);
+}

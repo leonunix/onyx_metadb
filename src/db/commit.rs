@@ -347,6 +347,13 @@ fn wal_lane_key(op: &WalOp) -> u64 {
         // the global lane via [`OpFootprint::global = true`] (see
         // `op_footprint`).
         WalOp::FreePbas { vol_ord, .. } => xxh3_64(&vol_ord.to_be_bytes()),
+        // PromotionChunk / PromotionComplete are global-footprint
+        // lifecycle ops (same reason as FreePbas: they mutate the
+        // refcount table + the in-memory manifest's lineage edges).
+        // The lane key is used only to pick a WAL writer lane; we hash
+        // by vol_ord so different volumes' walker commits can fan out.
+        WalOp::PromotionChunk { vol_ord, .. }
+        | WalOp::PromotionComplete { vol_ord } => xxh3_64(&vol_ord.to_be_bytes()),
     }
 }
 
@@ -903,6 +910,36 @@ impl Db {
                 self.recompute_snap_info(vol);
             }
         }
+        // Phase 4 Step 5: mirror walker-driven manifest mutations into
+        // `manifest_state` so the next checkpoint persists them. The
+        // bare layer already advanced `Volume::promotion_cursor` /
+        // cleared `parent_vol_ord`; here we propagate the same change
+        // into the in-memory manifest. Lock order: apply_gate.read →
+        // manifest_state (same as DropSnapshot).
+        match op {
+            WalOp::PromotionChunk {
+                vol_ord,
+                next_cursor,
+                ..
+            } => {
+                let mut mstate = self.manifest_state.lock();
+                if let Some(entry) =
+                    mstate.manifest.volumes.iter_mut().find(|e| e.ord == *vol_ord)
+                {
+                    entry.promotion_cursor = *next_cursor;
+                }
+            }
+            WalOp::PromotionComplete { vol_ord } => {
+                let mut mstate = self.manifest_state.lock();
+                if let Some(entry) =
+                    mstate.manifest.volumes.iter_mut().find(|e| e.ord == *vol_ord)
+                {
+                    entry.parent_vol_ord = None;
+                    entry.promotion_cursor = None;
+                }
+            }
+            _ => {}
+        }
         Ok(outcome)
     }
 
@@ -1219,7 +1256,9 @@ impl Db {
                 | WalOp::DropVolume { .. }
                 | WalOp::CloneVolume { .. }
                 | WalOp::L2pRangeDelete { .. }
-                | WalOp::FreePbas { .. } => {
+                | WalOp::FreePbas { .. }
+                | WalOp::PromotionChunk { .. }
+                | WalOp::PromotionComplete { .. } => {
                     return Err(MetaDbError::Corruption(
                         "lifecycle op reached lane dispatch path".into(),
                     ));
@@ -2549,7 +2588,9 @@ impl Db {
                 | WalOp::DropVolume { .. }
                 | WalOp::CloneVolume { .. }
                 | WalOp::L2pRangeDelete { .. }
-                | WalOp::FreePbas { .. } => {
+                | WalOp::FreePbas { .. }
+                | WalOp::PromotionChunk { .. }
+                | WalOp::PromotionComplete { .. } => {
                     unreachable!(
                         "lifecycle op must not reach apply_ops_grouped_to_lanes"
                     );
@@ -2784,7 +2825,9 @@ impl Db {
                 | WalOp::DropVolume { .. }
                 | WalOp::CloneVolume { .. }
                 | WalOp::L2pRangeDelete { .. }
-                | WalOp::FreePbas { .. } => {
+                | WalOp::FreePbas { .. }
+                | WalOp::PromotionChunk { .. }
+                | WalOp::PromotionComplete { .. } => {
                     unreachable!("lifecycle op must not reach apply_ops_grouped_to");
                 }
             }
@@ -2932,7 +2975,9 @@ fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Du
         | WalOp::CreateVolume { .. }
         | WalOp::DropVolume { .. }
         | WalOp::CloneVolume { .. }
-        | WalOp::FreePbas { .. } => {}
+        | WalOp::FreePbas { .. }
+        | WalOp::PromotionChunk { .. }
+        | WalOp::PromotionComplete { .. } => {}
     }
 }
 

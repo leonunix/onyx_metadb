@@ -58,7 +58,7 @@ use crate::metrics::MetaMetrics;
 use crate::page_store::PageStore;
 use crate::refcount::RcShard;
 use crate::testing::faults::{FaultController, FaultPoint};
-use crate::types::{Lsn, NULL_PAGE, PageId, VolumeOrdinal};
+use crate::types::{Lsn, NULL_PAGE, PageId, Pba, VolumeOrdinal};
 
 /// Background-worker view of the Db state Phase 3's Lineage GC pass
 /// needs. All fields are `Arc`-cloneable so the worker can hold its
@@ -73,6 +73,16 @@ pub(super) struct LineageGcCtx {
     /// 5 will move the decref into GC and remove this check).
     pub refcount_shards_rc: Vec<Arc<RcShard>>,
     pub faults: Arc<FaultController>,
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 4. When true, the
+    /// FreePbas-emitting GC driver (`Db::run_lineage_gc_cycle_inner`,
+    /// reachable from `Db::test_run_lineage_gc_cycle` today and from
+    /// the background worker in Phase 5) emits a
+    /// [`crate::wal::WalOp::FreePbas`] for every dead record retired
+    /// before truncating the chain. The background worker on its own
+    /// (this module's `lineage_gc_cycle`) cannot reach `Db::commit_ops`,
+    /// so it keeps Phase 3 behavior regardless of this flag — Phase 5
+    /// will replace that path with a Weak<Db> bridge.
+    pub emit_freepbas: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -261,15 +271,40 @@ fn lineage_gc_cycle(page_store: &Arc<PageStore>, ctx: &LineageGcCtx) -> Result<u
     Ok(advanced)
 }
 
-fn try_advance_head_one(
+/// Output of [`gc_plan_head_advance`]. Carries everything
+/// [`gc_execute_head_advance`] needs to actually advance the chain,
+/// plus the list of PBAs that the (Phase 4 Step 4) FreePbas-emitting
+/// driver wants to surface to onyx before the chain is truncated.
+///
+/// `dead_pbas` is collected in segment order from the head segment's
+/// records, with no dedup. Phase 4 currently retires whole segments
+/// at a time, so duplicates within a single segment are not expected;
+/// downstream `apply_free_pbas` is set-typed regardless.
+pub(super) struct HeadAdvancePlan {
+    pub old_head: PageId,
+    pub head_page_count: u32,
+    pub tail: PageId,
+    pub dead_pbas: Vec<Pba>,
+}
+
+/// Plan phase of one volume's Lineage GC step. Reads the head segment,
+/// captures the snapshot / descendant pin set, and verifies that every
+/// record's refcount has already reached 0. Returns `Some(plan)` iff
+/// the head can be advanced; `None` means "skip this volume this
+/// cycle" (head empty, snap/descendant pin, or any record still
+/// rc>0). Does **not** mutate state and does **not** take
+/// `apply_gate`; safe to call from any context including the
+/// flag-ON FreePbas driver, which needs to commit a WAL record
+/// between plan and execute.
+pub(super) fn gc_plan_head_advance(
     page_store: &Arc<PageStore>,
     ctx: &LineageGcCtx,
     vol: &Volume,
     vol_ord: VolumeOrdinal,
-) -> Result<bool> {
+) -> Result<Option<HeadAdvancePlan>> {
     let head = vol.dead_list_head_pid.load(Ordering::Acquire);
     if head == NULL_PAGE {
-        return Ok(false);
+        return Ok(None);
     }
 
     // 1. Read the head segment's pages.
@@ -293,62 +328,138 @@ fn try_advance_head_one(
     // ran" — no side effect.
     ctx.faults.inject(FaultPoint::LineageGcMidSegmentRead)?;
 
-    // 2. Snapshot the active snapshot LSNs for this volume. New
+    // 2. Snapshot the active snapshot LSNs for this volume AND the
+    // `branched_at_lsn`s of every still-attached descendant. New
     // snapshots that arrive after this read have `created_lsn >
     // current_lsn > death_lsn` for every record here, so they
     // can't pin anything we're about to decide on; missing them is
-    // safe. `drop_snapshot` runs under `drop_gate.write()` and is
-    // serialized with `manifest_state.lock()` for commits, so the
-    // snapshot list is stable during this critical section.
-    let snap_lsns: Vec<Lsn> = {
+    // safe. `drop_snapshot` and `clone_volume` both run under
+    // `drop_gate.write()` and are serialized with
+    // `manifest_state.lock()` for commits, so both the snapshot list
+    // and the descendant set are stable during this critical
+    // section.
+    //
+    // Phase 4: a descendant whose `parent_vol_ord == Some(vol_ord)`
+    // has not yet had its background promotion walker complete; the
+    // global rc has therefore not yet been bumped for the parent's
+    // shared PBAs. The descendant still observes the parent's L2P
+    // state at the moment of clone (`branched_at_lsn`), so any
+    // parent dead-list record whose `[birth, death)` interval
+    // contains that LSN must stay pinned until the descendant
+    // either (a) finishes its promotion walker — which clears
+    // `parent_vol_ord` — or (b) is itself dropped.
+    let (snap_lsns, descendant_branch_lsns): (Vec<Lsn>, Vec<Lsn>) = {
         let mst = ctx.manifest_state.lock();
-        mst.manifest
+        let snap_lsns = mst
+            .manifest
             .snapshots
             .iter()
             .filter(|s| s.vol_ord == vol_ord)
             .map(|s| s.created_lsn)
-            .collect()
+            .collect::<Vec<_>>();
+        let descendant_branch_lsns = mst
+            .manifest
+            .volumes
+            .iter()
+            .filter(|e| e.parent_vol_ord == Some(vol_ord))
+            .map(|e| e.branched_at_lsn)
+            .collect::<Vec<_>>();
+        (snap_lsns, descendant_branch_lsns)
     };
 
     // 3. Check every record: must be unpinned by any active
-    // snapshot AND the hot path must have already brought the rc
-    // to 0. If any record fails either check, leave the segment
-    // alone — it'll be re-evaluated on the next cycle (e.g. after
-    // a drop_snapshot or further hot-path decrefs).
+    // snapshot, unpinned by any descendant's branch point, AND
+    // the hot path must have already brought the rc to 0. If any
+    // record fails any check, leave the segment alone — it'll be
+    // re-evaluated on the next cycle (e.g. after a drop_snapshot,
+    // a PromotionComplete, or further hot-path decrefs).
     let n_shards = ctx.refcount_shards_rc.len();
     debug_assert!(n_shards > 0, "lineage GC: refcount_shards_rc must be non-empty");
+    let mut dead_pbas: Vec<Pba> = Vec::with_capacity(records.len());
     for rec in &records {
         if snap_pinned(&snap_lsns, rec.birth_lsn, rec.death_lsn) {
-            return Ok(false);
+            return Ok(None);
+        }
+        if snap_pinned(&descendant_branch_lsns, rec.birth_lsn, rec.death_lsn) {
+            return Ok(None);
         }
         let sid = (xxhash_rust::xxh3::xxh3_64(&rec.pba.to_be_bytes()) as usize) % n_shards;
         let rc = ctx.refcount_shards_rc[sid].get(rec.pba)?;
         if rc > 0 {
-            return Ok(false);
+            return Ok(None);
         }
+        dead_pbas.push(rec.pba);
     }
 
-    // 4. Locate the segment "newer than head" by walking the chain
-    // from tail. Under apply_gate.write (acquired below) flush
-    // cannot extend the chain mid-walk, so the walk's view is
-    // consistent with the manifest we'll mutate.
+    // 4. Locate the tail anchor up front so the execute phase can
+    // walk the chain under the gate. tail being NULL with head set
+    // is a Phase 2 invariant violation — bail rather than execute
+    // a corrupt manifest.
     let tail = vol.dead_list_tail_pid.load(Ordering::Acquire);
     if tail == NULL_PAGE {
-        // Head set but tail clear is a Phase 2 invariant violation;
-        // log and bail rather than write a corrupt manifest.
         return Err(MetaDbError::Corruption(format!(
             "lineage GC: vol_ord {vol_ord} has head_pid={head} but tail_pid=NULL_PAGE"
         )));
     }
+
+    Ok(Some(HeadAdvancePlan {
+        old_head: head,
+        head_page_count: seg_page_count as u32,
+        tail,
+        dead_pbas,
+    }))
+}
+
+/// Execute phase of one volume's Lineage GC step. Takes
+/// `apply_gate.write()`, re-reads the head atomic, walks the chain to
+/// find the segment "newer than head", commits the manifest, promotes
+/// the new head/tail atomics, and frees the old head segment's pages.
+///
+/// The plan-then-execute split exists so the (Phase 4 Step 4)
+/// FreePbas-emitting driver can `commit_ops(WalOp::FreePbas { … })`
+/// between the two phases without deadlocking against `apply_gate`
+/// — `commit_ops` takes `apply_gate.read()` internally. Phase 4
+/// keeps the hot path maintaining rc, so the FreePbas applied
+/// between plan and execute observes rc=0 for every PBA we
+/// surfaced (the plan's rc==0 gate) and takes the exclusive branch.
+/// A crash between FreePbas commit and execute is safe: the chain
+/// is still intact, next GC cycle re-runs both phases and
+/// `apply_free_pbas` re-surfaces the same PBAs (onyx retire is a
+/// set). A crash inside execute (after manifest commit, before
+/// page_store free) leaks segment pages to recovery's free-list
+/// scan, same as Phase 3.
+pub(super) fn gc_execute_head_advance(
+    page_store: &Arc<PageStore>,
+    ctx: &LineageGcCtx,
+    vol: &Volume,
+    vol_ord: VolumeOrdinal,
+    plan: &HeadAdvancePlan,
+) -> Result<()> {
     advance_head_pid_durable(
         page_store,
         ctx,
         vol,
         vol_ord,
-        head,
-        seg_page_count as u32,
-        tail,
-    )?;
+        plan.old_head,
+        plan.head_page_count,
+        plan.tail,
+    )
+}
+
+fn try_advance_head_one(
+    page_store: &Arc<PageStore>,
+    ctx: &LineageGcCtx,
+    vol: &Volume,
+    vol_ord: VolumeOrdinal,
+) -> Result<bool> {
+    let Some(plan) = gc_plan_head_advance(page_store, ctx, vol, vol_ord)? else {
+        return Ok(false);
+    };
+    // Phase 3 worker path: no FreePbas emission, chain truncation
+    // only. Phase 4 Step 4's FreePbas-emitting driver lives in
+    // `Db::run_lineage_gc_cycle_inner` because `commit_ops` requires
+    // `&Db`, which a background worker doesn't hold (cycle hygiene).
+    gc_execute_head_advance(page_store, ctx, vol, vol_ord, &plan)?;
     Ok(true)
 }
 

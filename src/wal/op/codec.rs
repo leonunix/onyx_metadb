@@ -194,6 +194,33 @@ impl WalOp {
                     out.extend_from_slice(&pba.to_be_bytes());
                 }
             }
+            WalOp::PromotionChunk {
+                vol_ord,
+                pba_increfs,
+                next_cursor,
+            } => {
+                out.push(TAG_PROMOTION_CHUNK);
+                out.extend_from_slice(&vol_ord.to_be_bytes());
+                let count: u32 = pba_increfs
+                    .len()
+                    .try_into()
+                    .expect("PromotionChunk pba count fits in u32");
+                out.extend_from_slice(&count.to_be_bytes());
+                for pba in pba_increfs.iter() {
+                    out.extend_from_slice(&pba.to_be_bytes());
+                }
+                match next_cursor {
+                    None => out.push(PROMOTION_CHUNK_CURSOR_NONE),
+                    Some(lba) => {
+                        out.push(PROMOTION_CHUNK_CURSOR_SOME);
+                        out.extend_from_slice(&lba.to_be_bytes());
+                    }
+                }
+            }
+            WalOp::PromotionComplete { vol_ord } => {
+                out.push(TAG_PROMOTION_COMPLETE);
+                out.extend_from_slice(&vol_ord.to_be_bytes());
+            }
         }
     }
 
@@ -229,6 +256,15 @@ impl WalOp {
                 src_shard_roots, ..
             } => 1 + 2 + 2 + 8 + 4 + src_shard_roots.len() * 8,
             WalOp::FreePbas { pbas, .. } => 1 + 2 + 4 + pbas.len() * 8,
+            WalOp::PromotionChunk {
+                pba_increfs,
+                next_cursor,
+                ..
+            } => {
+                let base = 1 + 2 + 4 + pba_increfs.len() * 8 + 1;
+                base + if next_cursor.is_some() { 8 } else { 0 }
+            }
+            WalOp::PromotionComplete { .. } => 1 + 2,
         }
     }
 }
@@ -648,6 +684,62 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                 },
                 &payload[cursor..],
             ))
+        }
+        TAG_PROMOTION_CHUNK => {
+            require_len(payload, 6, "PROMOTION_CHUNK header")?;
+            let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
+            let count = u32::from_be_bytes(payload[2..6].try_into().unwrap()) as usize;
+            if count > MAX_PROMOTION_CHUNK_PBAS {
+                return Err(MetaDbError::Corruption(format!(
+                    "PROMOTION_CHUNK count {count} exceeds MAX_PROMOTION_CHUNK_PBAS {}",
+                    MAX_PROMOTION_CHUNK_PBAS,
+                )));
+            }
+            let pbas_bytes = count
+                .checked_mul(8)
+                .ok_or_else(|| MetaDbError::Corruption("PROMOTION_CHUNK count overflow".into()))?;
+            require_len(
+                &payload[6..],
+                pbas_bytes + 1,
+                "PROMOTION_CHUNK pba list + cursor tag",
+            )?;
+            let mut pbas = Vec::with_capacity(count);
+            let mut cursor = 6usize;
+            for _ in 0..count {
+                let pba = u64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap());
+                pbas.push(pba);
+                cursor += 8;
+            }
+            let cursor_tag = payload[cursor];
+            cursor += 1;
+            let next_cursor = match cursor_tag {
+                PROMOTION_CHUNK_CURSOR_NONE => None,
+                PROMOTION_CHUNK_CURSOR_SOME => {
+                    require_len(&payload[cursor..], 8, "PROMOTION_CHUNK cursor payload")?;
+                    let lba = u64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap());
+                    cursor += 8;
+                    Some(lba)
+                }
+                other => {
+                    return Err(MetaDbError::Corruption(format!(
+                        "PROMOTION_CHUNK: unknown cursor tag 0x{other:02x} \
+                         (expected 0x{PROMOTION_CHUNK_CURSOR_NONE:02x} or 0x{PROMOTION_CHUNK_CURSOR_SOME:02x})"
+                    )));
+                }
+            };
+            Ok((
+                WalOp::PromotionChunk {
+                    vol_ord,
+                    pba_increfs: pbas.into_boxed_slice(),
+                    next_cursor,
+                },
+                &payload[cursor..],
+            ))
+        }
+        TAG_PROMOTION_COMPLETE => {
+            require_len(payload, 2, "PROMOTION_COMPLETE")?;
+            let vol_ord = u16::from_be_bytes(payload[..2].try_into().unwrap());
+            Ok((WalOp::PromotionComplete { vol_ord }, &payload[2..]))
         }
         other => Err(MetaDbError::Corruption(format!(
             "unknown WAL op tag 0x{other:02x}"

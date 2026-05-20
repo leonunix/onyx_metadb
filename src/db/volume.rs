@@ -62,6 +62,9 @@ impl Db {
                 flags: 0,
                 dead_list_head_pid: crate::types::NULL_PAGE,
                 dead_list_tail_pid: crate::types::NULL_PAGE,
+                parent_vol_ord: None,
+                branched_at_lsn: 0,
+                promotion_cursor: None,
             });
             probe.check_encodable()?;
             (ord, shard_count)
@@ -119,6 +122,13 @@ impl Db {
                 flags: 0,
                 dead_list_head_pid: crate::types::NULL_PAGE,
                 dead_list_tail_pid: crate::types::NULL_PAGE,
+                // Top-level volume: no parent lineage and no in-flight
+                // promotion walker. `clone_volume` is the only path that
+                // sets `parent_vol_ord` / `branched_at_lsn` / arms the
+                // walker.
+                parent_vol_ord: None,
+                branched_at_lsn: 0,
+                promotion_cursor: None,
             });
             mstate.manifest.next_volume_ord = ord
                 .checked_add(1)
@@ -175,6 +185,31 @@ impl Db {
             {
                 return Err(MetaDbError::InvalidArgument(format!(
                     "cannot drop volume {vol_ord} with live snapshots"
+                )));
+            }
+            // [[no-refcount-hot-path-design]] Phase 4 Step 6: descendant
+            // clones whose `parent_vol_ord == vol_ord` rely on the
+            // parent's COW-shared L2P pages until their promotion walker
+            // finishes. Dropping the parent now would free those pages
+            // out from under live descendants. Cross-volume snap_pin
+            // (Step 2) keeps the parent's PBA-level data observable,
+            // but the L2P page tree itself is per-volume — once we
+            // collect-and-free the parent's pages there's nothing for
+            // the descendant to COW from. Reject and let the caller
+            // either promote the descendants to independence first or
+            // drop them. `parent_vol_ord` is cleared by
+            // `WalOp::PromotionComplete`, so this naturally accepts
+            // post-promotion descendants.
+            if let Some(child) = mstate
+                .manifest
+                .volumes
+                .iter()
+                .find(|v| v.parent_vol_ord == Some(vol_ord))
+            {
+                return Err(MetaDbError::InvalidArgument(format!(
+                    "cannot drop volume {vol_ord} with descendant clone {} pending promotion \
+                     (parent_vol_ord still set)",
+                    child.ord
                 )));
             }
         }
@@ -363,7 +398,7 @@ impl Db {
         // Resolve the snapshot entry + allocate the new ord under the
         // manifest mutex so two concurrent clones can't hand out the
         // same ordinal.
-        let (src_ord, src_shard_roots, new_ord) = {
+        let (src_ord, src_shard_roots, new_ord, branched_at_lsn) = {
             let mstate = self.manifest_state.lock();
             let entry = mstate
                 .manifest
@@ -400,9 +435,17 @@ impl Db {
                 flags: 0,
                 dead_list_head_pid: crate::types::NULL_PAGE,
                 dead_list_tail_pid: crate::types::NULL_PAGE,
+                parent_vol_ord: Some(entry.vol_ord),
+                branched_at_lsn: entry.created_lsn,
+                promotion_cursor: None,
             });
             probe.check_encodable()?;
-            (entry.vol_ord, entry.l2p_shard_roots.to_vec(), new_ord)
+            (
+                entry.vol_ord,
+                entry.l2p_shard_roots.to_vec(),
+                new_ord,
+                entry.created_lsn,
+            )
         };
 
         let op = WalOp::CloneVolume {
@@ -467,7 +510,26 @@ impl Db {
                     "clone_volume: ord {new_ord} already present"
                 )));
             }
-            volumes_map.insert(new_ord, Arc::new(Volume::new(new_ord, shards, lsn)));
+            // Use `Volume::with_lineage` so the in-memory volume carries
+            // `parent_vol_ord` / `branched_at_lsn` straight away. The
+            // next `flush` reads these back through
+            // `refresh_manifest_entries`; if we left them at the
+            // `Volume::new` defaults they would overwrite the manifest
+            // commit's correctly-set lineage trio on the very next
+            // checkpoint.
+            volumes_map.insert(
+                new_ord,
+                Arc::new(Volume::with_lineage(
+                    new_ord,
+                    shards,
+                    lsn,
+                    crate::types::NULL_PAGE,
+                    crate::types::NULL_PAGE,
+                    Some(src_ord),
+                    branched_at_lsn,
+                    None,
+                )),
+            );
         }
 
         {
@@ -490,6 +552,15 @@ impl Db {
                 // parent's).
                 dead_list_head_pid: crate::types::NULL_PAGE,
                 dead_list_tail_pid: crate::types::NULL_PAGE,
+                // Phase 4 lineage tracking. `parent_vol_ord` + `branched_at_lsn`
+                // mark this volume as a clone whose Lineage GC must consult the
+                // parent (cross-volume snap_pin: Step 2). `promotion_cursor`
+                // stays `None` until Step 5 arms the background walker that
+                // increfs the global rc for each shared PBA, which is what
+                // ultimately lets the parent be dropped independently.
+                parent_vol_ord: Some(src_ord),
+                branched_at_lsn,
+                promotion_cursor: None,
             });
             mstate.manifest.next_volume_ord = new_ord
                 .checked_add(1)

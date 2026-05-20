@@ -308,6 +308,15 @@ pub struct Config {
     /// via a condvar, so under load the worker stays hot and only
     /// hits this on truly idle systems.
     pub async_reclaim_idle_interval_ms: u64,
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 4: when true, the
+    /// Lineage GC pass emits a [`crate::wal::WalOp::FreePbas`] WAL
+    /// record for every dead-list record it retires (decref each
+    /// shared PBA via the global rc, surface exclusive PBAs
+    /// directly) before truncating the chain. When false (the
+    /// default), GC behaves exactly as in Phase 3 — chain
+    /// truncation only, no PBA retire surface. Phase 5 will flip
+    /// the default ON once the hot path stops maintaining rc.
+    pub lineage_gc_emit_freepbas: bool,
 }
 
 impl Config {
@@ -374,6 +383,11 @@ impl Config {
             // last flush even if `notify()` was missed; long
             // enough not to busy-loop on otherwise-idle pages.
             async_reclaim_idle_interval_ms: 50,
+            // Phase 4 Step 4 keeps the FreePbas emission default-OFF
+            // so existing Phase 3 behavior (chain truncation only)
+            // is preserved bit-for-bit until Phase 5 wires the hot
+            // path to stop maintaining rc.
+            lineage_gc_emit_freepbas: false,
             rebuild_free_list_on_open: true,
             reclaim_orphans_on_open: true,
             // 1 M buckets × 4 entries = 4 M cuckoo capacity at load

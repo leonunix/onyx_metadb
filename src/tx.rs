@@ -120,19 +120,42 @@ pub enum ApplyOutcome {
         prevs: Box<[Option<L2pValue>]>,
         freed_pbas: Vec<Pba>,
     },
-    /// Outcome of [`WalOp::FreePbas`] — Phase 3 (no-refcount-hot-path)
-    /// plumbing for the Lineage GC consumer. `freed_pbas` is the subset
-    /// of the op's `pbas` whose refcount transitioned from `>0` to `0`
-    /// during this apply. Onyx-side cleanup coalesces sorted PBAs into
-    /// `retire_one` / `retire_extent` calls, mirroring the path that
-    /// today serves `L2pRemap.freed_pba` / `RangeDelete.freed_pbas`.
+    /// Outcome of [`WalOp::FreePbas`] — [[no-refcount-hot-path-design]]
+    /// Phase 4 Step 3 retire-surface for the Lineage GC consumer.
+    /// `freed_pbas` is the union of:
     ///
-    /// Empty `freed_pbas` is normal in Phase 3: the hot path is still
-    /// authoritative for refcount writes, so most GC-emitted `FreePbas`
-    /// records find the PBA already at refcount 0 (already freed) and
-    /// return no work. Phase 5 will pull hot-path RC decref out and this
-    /// list becomes the only retire source.
+    /// - **Shared PBAs** whose rc transitioned from `>0` to `0` during
+    ///   this apply (the dedup-retire path: onyx-side cleanup also
+    ///   deletes the dedup_index entry).
+    /// - **Exclusive PBAs** that arrived with rc=0 and were surfaced
+    ///   directly — no rc mutation, no dedup_index delete required.
+    ///
+    /// Onyx-side cleanup coalesces sorted PBAs into `retire_one` /
+    /// `retire_extent` calls, mirroring the path that today serves
+    /// `L2pRemap.freed_pba` / `RangeDelete.freed_pbas`. Duplicate
+    /// surfaces (across replays or across cycles) are harmless because
+    /// retire is a set operation.
     FreePbas { freed_pbas: Box<[Pba]> },
+    /// Outcome of [`WalOp::PromotionChunk`] —
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 background
+    /// promotion walker progress record. The walker incref'd
+    /// `increfs_applied` PBAs against the global refcount table and
+    /// advanced the volume's `promotion_cursor` to `cursor_advanced_to`.
+    ///
+    /// `cursor_advanced_to == None` means "the walker finished its last
+    /// chunk for this volume" (the next op will be `PromotionComplete`);
+    /// `Some(lba)` is the next LBA the walker should resume at on the
+    /// following cycle / after crash.
+    PromotionChunk {
+        increfs_applied: usize,
+        cursor_advanced_to: Option<crate::types::Lba>,
+    },
+    /// Outcome of [`WalOp::PromotionComplete`] —
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 walker finish
+    /// record. Apply cleared the volume's `parent_vol_ord` and
+    /// `promotion_cursor`. No data is carried; the outcome slot exists
+    /// only to preserve the `outcomes.len() == ops.len()` contract.
+    PromotionComplete,
 }
 
 /// A batch of ops to be committed atomically.
@@ -313,18 +336,58 @@ impl<'db> Transaction<'db> {
         self
     }
 
-    /// Phase 3 (no-refcount-hot-path) Lineage GC emitter. Buffers a
-    /// [`WalOp::FreePbas`] that asks apply to decref each pba by 1 and
-    /// surface those that hit refcount 0 in
-    /// [`ApplyOutcome::FreePbas.freed_pbas`]. Apply is idempotent
-    /// (rc stage clamps at 0), so replaying the same op never
-    /// underflows.
+    /// [[no-refcount-hot-path-design]] Lineage GC emitter. Buffers a
+    /// [`WalOp::FreePbas`] that asks apply to classify each pba as
+    /// shared (rc>0, decref by 1, surface if it reaches 0) or
+    /// exclusive (rc=0, surface without touching rc) and report the
+    /// retire set in [`ApplyOutcome::FreePbas.freed_pbas`]. Apply is
+    /// idempotent: re-running the same op surfaces the same PBAs (or
+    /// a superset thereof) and onyx-side retire dedups via set
+    /// semantics.
     ///
     /// `pbas` may be empty — the op then commits as a no-op but the
     /// outcome slot is still present (`ApplyOutcome::FreePbas { freed_pbas: [] }`),
     /// preserving the index correspondence callers rely on.
     pub fn free_pbas(&mut self, vol_ord: VolumeOrdinal, pbas: Box<[Pba]>) -> &mut Self {
         self.ops.push(WalOp::FreePbas { vol_ord, pbas });
+        self
+    }
+
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 background
+    /// promotion walker emitter. Buffers a [`WalOp::PromotionChunk`]
+    /// that records one chunk of incref work against the global
+    /// refcount table and advances the volume's `promotion_cursor` to
+    /// `next_cursor`.
+    ///
+    /// `next_cursor = Some(lba)` means "resume from `lba` on the next
+    /// chunk"; `None` means "this was the walker's last chunk — the
+    /// follow-up [`WalOp::PromotionComplete`] will clear the lineage
+    /// edge".
+    ///
+    /// `pba_increfs` may be empty — the chunk then carries only the
+    /// cursor advance (a sparse leaf scan that yielded no shared
+    /// extents). The outcome slot is still present.
+    pub fn promotion_chunk(
+        &mut self,
+        vol_ord: VolumeOrdinal,
+        pba_increfs: Box<[Pba]>,
+        next_cursor: Option<Lba>,
+    ) -> &mut Self {
+        self.ops.push(WalOp::PromotionChunk {
+            vol_ord,
+            pba_increfs,
+            next_cursor,
+        });
+        self
+    }
+
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 walker
+    /// finish emitter. Buffers a [`WalOp::PromotionComplete`] that
+    /// clears the clone's `parent_vol_ord` and `promotion_cursor` —
+    /// after this record the parent's Lineage GC stops treating the
+    /// clone's `branched_at_lsn` as a pin point.
+    pub fn promotion_complete(&mut self, vol_ord: VolumeOrdinal) -> &mut Self {
+        self.ops.push(WalOp::PromotionComplete { vol_ord });
         self
     }
 

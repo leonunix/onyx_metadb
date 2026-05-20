@@ -105,6 +105,9 @@ pub(super) fn refresh_manifest_entries(
             dead_list_tail_pid: vol
                 .dead_list_tail_pid
                 .load(std::sync::atomic::Ordering::Acquire),
+            parent_vol_ord: *vol.parent_vol_ord.read(),
+            branched_at_lsn: vol.branched_at_lsn,
+            promotion_cursor: *vol.promotion_cursor.read(),
         });
     }
     manifest.volumes = new_entries;

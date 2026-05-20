@@ -54,6 +54,8 @@
 //! | 41  | `DROP_VOLUME`       | ord (2 B BE) + count (4 B BE) + pid×count                                           |   6+8n   |
 //! | 42  | `CLONE_VOLUME`      | src_ord (2 B BE) + new_ord (2 B BE) + snap_id (8 B BE) + shard_count (4 B BE) + pid×shard_count | 16+8n |
 //! | 43  | `FREE_PBAS`         | vol_ord (2 B BE) + count (4 B BE) + pba×count                                       |   6+8n   |
+//! | 44  | `PROMOTION_CHUNK`   | vol_ord (2 B BE) + count (4 B BE) + pba×count + cursor_tag (1 B) + [cursor (8 B BE)] | 7/15+8n |
+//! | 45  | `PROMOTION_COMPLETE`| vol_ord (2 B BE)                                                                    |     2    |
 //!
 //! `L2P_REMAP` guard: tag `0x00` = no guard (payload ends); tag `0x01`
 //! = guarded, followed by `pba (8 B BE) + min_rc (4 B BE)` — 12 more
@@ -118,7 +120,13 @@ use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
 /// The current binary emits this op only as a forward-looking smoke test;
 /// production GC paths in Phase 3 are gated default-off behind a config
 /// flag. Apply is idempotent (decref-if-positive + free-on-zero).
-pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB5;
+/// v6 (0xB6): added `PromotionChunk` (tag 0x44) + `PromotionComplete`
+/// (tag 0x45) — Phase 4 Step 5 background clone-promotion walker. The
+/// walker emits per-chunk incref batches for the clone's shared lineage
+/// while advancing a per-volume cursor; when the cursor reaches the end
+/// it emits `PromotionComplete` to clear `parent_vol_ord` /
+/// `promotion_cursor` so the parent's Lineage GC can resume.
+pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB6;
 
 pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;
@@ -165,6 +173,17 @@ pub const TAG_CREATE_VOLUME: u8 = 0x40;
 pub const TAG_DROP_VOLUME: u8 = 0x41;
 pub const TAG_CLONE_VOLUME: u8 = 0x42;
 pub const TAG_FREE_PBAS: u8 = 0x43;
+pub const TAG_PROMOTION_CHUNK: u8 = 0x44;
+pub const TAG_PROMOTION_COMPLETE: u8 = 0x45;
+
+/// Cursor discriminator on [`WalOp::PromotionChunk`]: payload ends after
+/// the PBA list; the walker has reached the end of the clone's L2P and
+/// the apply path will clear `promotion_cursor` to `None`.
+pub const PROMOTION_CHUNK_CURSOR_NONE: u8 = 0x00;
+/// Cursor discriminator on [`WalOp::PromotionChunk`]: an 8-byte
+/// big-endian LBA follows, recording the next LBA the walker intends
+/// to visit on its subsequent chunk.
+pub const PROMOTION_CHUNK_CURSOR_SOME: u8 = 0x01;
 
 /// Maximum PBAs in a single [`WalOp::FreePbas`] record. The Lineage GC
 /// worker batches at most one dead-list segment's worth of records per
@@ -174,6 +193,16 @@ pub const TAG_FREE_PBAS: u8 = 0x43;
 /// (`6 + 8 * 65536 ≈ 512 KiB`). Decoders reject larger counts to bound
 /// allocation under a corrupt length prefix.
 pub const MAX_FREE_PBAS_PER_OP: usize = 65536;
+
+/// Maximum PBAs per [`WalOp::PromotionChunk`]. The clone-promotion walker
+/// is paced one chunk per `commit_ops` call; large chunks let the walker
+/// amortize WAL framing and apply-gate cost, but a too-large chunk both
+/// inflates worst-case body bytes (`15 + 8 * 65536 ≈ 512 KiB` at the cap)
+/// and lengthens the time an apply holds the global apply gate. 65536
+/// matches `MAX_FREE_PBAS_PER_OP` so both lineage-traffic ops share the
+/// same backpressure bound; the walker driver clamps its chunk size well
+/// below this in production.
+pub const MAX_PROMOTION_CHUNK_PBAS: usize = 65536;
 
 /// One mutation op as stored in a WAL record body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,6 +393,41 @@ pub enum WalOp {
         vol_ord: VolumeOrdinal,
         pbas: Box<[Pba]>,
     },
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 background clone-
+    /// promotion walker emission. One chunk's worth of "this clone now
+    /// owns a lineage on these PBAs" work:
+    ///
+    /// * `pba_increfs` — incref every PBA by 1. Apply is **non-idempotent**
+    ///   in isolation (incref twice = double the lineage count), so
+    ///   replay safety rides on `promotion_cursor`'s advance: a chunk
+    ///   that already landed in a prior apply is detected by the cursor
+    ///   already being at or beyond `next_cursor` and the apply skips
+    ///   the incref pass (see [`super::super::db::apply::apply_promotion_chunk`]).
+    /// * `next_cursor = Some(lba)` — bump `promotion_cursor` to `lba` so
+    ///   the walker resumes from there after a crash. `None` means the
+    ///   walker has reached the end of the clone's L2P with this chunk;
+    ///   apply clears `promotion_cursor` and a follow-up
+    ///   [`PromotionComplete`](Self::PromotionComplete) is expected to
+    ///   release the cross-volume snap_pin on the parent.
+    ///
+    /// Decision A from the plan: the walker handles **only** rc
+    /// bookkeeping. Upgrading exclusive → shared dedup_index entries is
+    /// deferred to dedup-on-write so the walker does not need to read
+    /// LV3 / re-hash content.
+    PromotionChunk {
+        vol_ord: VolumeOrdinal,
+        pba_increfs: Box<[Pba]>,
+        next_cursor: Option<Lba>,
+    },
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 5. Emitted by the
+    /// promotion walker after its final
+    /// [`PromotionChunk`](Self::PromotionChunk) lands, this clears the
+    /// clone's `parent_vol_ord` and `promotion_cursor` so the parent
+    /// volume's Lineage GC stops treating the clone as a pin point. Apply
+    /// is idempotent: clearing two already-`None` fields is a no-op,
+    /// matching the `WalOp::DropSnapshot` / `WalOp::DropVolume`
+    /// replay-after-crash pattern.
+    PromotionComplete { vol_ord: VolumeOrdinal },
 }
 
 mod codec;

@@ -281,6 +281,61 @@ fn run_l2p_checkpoint_install_step(
 }
 
 impl Db {
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 7. Subscribe to
+    /// `WalOp::FreePbas` apply outcomes produced by metadb's internal
+    /// lineage-GC commit path. The sink is invoked exactly once per
+    /// successful internal `commit_ops(&[WalOp::FreePbas {..}])` with
+    /// the volume ordinal of the GC cycle and the non-empty
+    /// `ApplyOutcome::FreePbas.freed_pbas` vector (PBAs whose rc
+    /// transitioned to 0 plus exclusive PBAs that arrived at rc=0).
+    ///
+    /// Onyx registers a sink at startup so the engine-side allocator
+    /// retire + dedup candidate-cache invalidation can reclaim PBAs
+    /// surfaced by the metadb-internal GC cycle. The sink runs
+    /// **synchronously** on the GC driver thread and must not call
+    /// back into metadb's commit path (re-entrance would deadlock the
+    /// apply gate). For long-running work, push onto a channel and
+    /// drain elsewhere.
+    ///
+    /// Replacing an existing sink is allowed (the most recent caller
+    /// wins). Pass an `Arc` so the same closure can be cloned and
+    /// installed back after a teardown without re-allocating.
+    pub fn set_freed_pbas_sink(&self, sink: crate::FreedPbasSink) {
+        *self.freed_pbas_sink.lock() = Some(sink);
+    }
+
+    /// Drop any subscribed sink. Subsequent FreePbas commits surface
+    /// no callback. Used by onyx teardown so the channel sender does
+    /// not outlive the receiver during shutdown.
+    pub fn clear_freed_pbas_sink(&self) {
+        *self.freed_pbas_sink.lock() = None;
+    }
+
+    /// Internal helper: pluck `ApplyOutcome::FreePbas` entries out of a
+    /// commit-ops result and forward their `freed_pbas` to the
+    /// registered sink (if any). Non-`FreePbas` outcomes and
+    /// `freed_pbas.is_empty()` cases are skipped. The sink call
+    /// happens with the sink mutex released so a sink can safely
+    /// re-enter unrelated metadb APIs (it still must not re-enter
+    /// commit_ops; see [`Db::set_freed_pbas_sink`]).
+    pub(crate) fn dispatch_freed_pbas_outcomes(
+        &self,
+        vol_ord: crate::types::VolumeOrdinal,
+        outcomes: Vec<crate::tx::ApplyOutcome>,
+    ) {
+        let sink = match self.freed_pbas_sink.lock().clone() {
+            Some(s) => s,
+            None => return,
+        };
+        for outcome in outcomes {
+            if let crate::tx::ApplyOutcome::FreePbas { freed_pbas } = outcome {
+                if !freed_pbas.is_empty() {
+                    sink(vol_ord, freed_pbas.into_vec());
+                }
+            }
+        }
+    }
+
     /// Create a fresh database in `root_dir` using the default config.
     pub fn create(root_dir: &Path) -> Result<Self> {
         Self::create_with_config(Config::new(root_dir))
@@ -369,6 +424,9 @@ impl Db {
             flags: 0,
             dead_list_head_pid: crate::types::NULL_PAGE,
             dead_list_tail_pid: crate::types::NULL_PAGE,
+            parent_vol_ord: None,
+            branched_at_lsn: 0,
+            promotion_cursor: None,
         }];
         manifest.next_volume_ord = BOOTSTRAP_VOLUME_ORD + 1;
         manifest_store.commit(&manifest)?;
@@ -455,6 +513,8 @@ impl Db {
                 soft_entries: cfg.l2p_buffer_soft_entries,
                 max_interval_ms: cfg.l2p_buffer_max_interval_ms,
             },
+            lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
+            freed_pbas_sink: Mutex::new(None),
         };
         // Spawn refcount drainers (priority 3) — fresh DB has no
         // replay to worry about, so we can spawn unconditionally
@@ -590,12 +650,15 @@ impl Db {
             )?;
             volumes.insert(
                 entry.ord,
-                Arc::new(Volume::with_dead_list_anchor(
+                Arc::new(Volume::with_lineage(
                     entry.ord,
                     shards,
                     entry.created_lsn,
                     entry.dead_list_head_pid,
                     entry.dead_list_tail_pid,
+                    entry.parent_vol_ord,
+                    entry.branched_at_lsn,
+                    entry.promotion_cursor,
                 )),
             );
         }
@@ -687,6 +750,9 @@ impl Db {
                                     flags: 0,
                                     dead_list_head_pid: crate::types::NULL_PAGE,
                                     dead_list_tail_pid: crate::types::NULL_PAGE,
+                                    parent_vol_ord: None,
+                                    branched_at_lsn: 0,
+                                    promotion_cursor: None,
                                 });
                                 mutated_volumes = true;
                             }
@@ -703,9 +769,9 @@ impl Db {
                             }
                         }
                         WalOp::CloneVolume {
-                            src_ord: _,
+                            src_ord,
                             new_ord,
-                            src_snap_id: _,
+                            src_snap_id,
                             src_shard_roots,
                         } => {
                             if !volumes.contains_key(new_ord) {
@@ -744,8 +810,42 @@ impl Db {
                                     cfg.l2p_buffer_enabled,
                                 )?;
                                 let shard_count = shards.len() as u32;
-                                volumes
-                                    .insert(*new_ord, Arc::new(Volume::new(*new_ord, shards, lsn)));
+                                // Phase 4: recover the snapshot's
+                                // `created_lsn` so the clone's
+                                // `branched_at_lsn` round-trips through
+                                // replay the same way as the live
+                                // `clone_volume` path. `TakeSnapshot` is
+                                // serialized before its `CloneVolume`
+                                // in the WAL, so the snapshot is
+                                // already in `manifest.snapshots`
+                                // here unless the source was a
+                                // previously-checkpointed snapshot
+                                // that survived in the manifest from
+                                // the prior incarnation.
+                                let branched_at_lsn = manifest
+                                    .snapshots
+                                    .iter()
+                                    .find(|s| s.id == *src_snap_id)
+                                    .map(|s| s.created_lsn)
+                                    .ok_or_else(|| {
+                                        MetaDbError::Corruption(format!(
+                                            "CloneVolume replay: snapshot {src_snap_id} \
+                                             missing from manifest at lsn {lsn}"
+                                        ))
+                                    })?;
+                                volumes.insert(
+                                    *new_ord,
+                                    Arc::new(Volume::with_lineage(
+                                        *new_ord,
+                                        shards,
+                                        lsn,
+                                        crate::types::NULL_PAGE,
+                                        crate::types::NULL_PAGE,
+                                        Some(*src_ord),
+                                        branched_at_lsn,
+                                        None,
+                                    )),
+                                );
                                 let durable_seqs =
                                     vec![lsn; shard_count as usize].into_boxed_slice();
                                 manifest.volumes.push(VolumeEntry {
@@ -757,6 +857,9 @@ impl Db {
                                     flags: 0,
                                     dead_list_head_pid: crate::types::NULL_PAGE,
                                     dead_list_tail_pid: crate::types::NULL_PAGE,
+                                    parent_vol_ord: Some(*src_ord),
+                                    branched_at_lsn,
+                                    promotion_cursor: None,
                                 });
                                 mutated_volumes = true;
                             }
@@ -991,6 +1094,8 @@ impl Db {
                 soft_entries: cfg.l2p_buffer_soft_entries,
                 max_interval_ms: cfg.l2p_buffer_max_interval_ms,
             },
+            lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
+            freed_pbas_sink: Mutex::new(None),
         };
         db.recompute_all_snap_infos();
         // Spawn refcount drainers AFTER WAL replay finished above so
@@ -1056,6 +1161,7 @@ impl Db {
                 .map(|shard| shard.rc.clone())
                 .collect(),
             faults: self.faults.clone(),
+            emit_freepbas: self.lineage_gc_emit_freepbas,
         };
         let worker = super::async_reclaim::AsyncReclaim::start_with_lineage_gc(
             self.page_store.clone(),
@@ -2667,6 +2773,9 @@ fn refresh_manifest_from_checkpoints(
             flags: volume.flags.load(std::sync::atomic::Ordering::Relaxed),
             dead_list_head_pid,
             dead_list_tail_pid,
+            parent_vol_ord: *volume.parent_vol_ord.read(),
+            branched_at_lsn: volume.branched_at_lsn,
+            promotion_cursor: *volume.promotion_cursor.read(),
         });
     }
     manifest.volumes = new_entries;

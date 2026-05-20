@@ -240,7 +240,30 @@ pub struct Db {
     /// Compactor params captured at Db construction so the worker
     /// can be (re)started without re-reading the full Config.
     l2p_compactor_params: l2p_compactor::L2pCompactorParams,
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 4. Cached copy
+    /// of `Config::lineage_gc_emit_freepbas` so the GC driver
+    /// (`run_lineage_gc_cycle_inner`) and the async-reclaim worker
+    /// pick up the same value without re-reading the full config.
+    lineage_gc_emit_freepbas: bool,
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 7. Optional sink
+    /// invoked when a `WalOp::FreePbas` apply produces a non-empty
+    /// `ApplyOutcome::FreePbas.freed_pbas`. Onyx registers a sink at
+    /// startup so the engine-side cleanup (`SpaceAllocator::retire_*`
+    /// + dedup candidate cache invalidation) can drain reclamation
+    /// signals out of metadb's internal lineage-GC commit path.
+    /// Internal `commit_ops` calls (e.g. `run_lineage_gc_cycle_inner`)
+    /// invoke the sink synchronously after a successful commit; the
+    /// sink must not call back into metadb's commit path. None when
+    /// no consumer has subscribed (the default — keeps Phase 4 tests
+    /// that drive the GC directly free of side effects).
+    freed_pbas_sink: Mutex<Option<FreedPbasSink>>,
 }
+
+/// Synchronous callback invoked with the freed-PBA set produced by a
+/// `WalOp::FreePbas` apply. Used by onyx to receive lineage-GC retire
+/// signals; see [`Db::set_freed_pbas_sink`]. The vector is owned and
+/// can be drained by the sink without copy.
+pub type FreedPbasSink = Arc<dyn Fn(VolumeOrdinal, Vec<Pba>) + Send + Sync>;
 
 struct ManifestState {
     store: ManifestStore,
@@ -845,6 +868,21 @@ struct Volume {
     /// Loaded from `VolumeEntry.dead_list_tail_pid` on `Db::open`, advanced
     /// on every checkpoint flush that writes a new segment.
     dead_list_tail_pid: AtomicU64,
+    /// Phase 4 lineage tracking — mirrors
+    /// [`VolumeEntry::parent_vol_ord`]. `INVALID_VOLUME` encodes
+    /// `Option::None`. Loaded on `Db::open`; mutated only by clone /
+    /// promotion-complete paths under `apply_gate.write()` (single
+    /// writer, so a relaxed atomic is sufficient).
+    parent_vol_ord: parking_lot::RwLock<Option<VolumeOrdinal>>,
+    /// Snapshot's `created_lsn` at the moment this volume was cloned.
+    /// `0` if no parent. Lineage GC uses this to decide whether parent
+    /// PBAs in `[birth, death)` are still observable from descendants.
+    branched_at_lsn: Lsn,
+    /// Background promotion walker progress. `Some(lba)` while the
+    /// walker still has work to do; `None` when idle. Mutated only by
+    /// the walker thread under `apply_gate.read()` and cleared by the
+    /// `PromotionComplete` apply path; readers see relaxed snapshots.
+    promotion_cursor: parking_lot::RwLock<Option<crate::types::Lba>>,
 }
 
 impl Volume {
@@ -857,6 +895,9 @@ impl Volume {
             dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             dead_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
             dead_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            parent_vol_ord: parking_lot::RwLock::new(None),
+            branched_at_lsn: 0,
+            promotion_cursor: parking_lot::RwLock::new(None),
         }
     }
 
@@ -875,6 +916,40 @@ impl Volume {
             dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             dead_list_head_pid: AtomicU64::new(head_pid),
             dead_list_tail_pid: AtomicU64::new(tail_pid),
+            parent_vol_ord: parking_lot::RwLock::new(None),
+            branched_at_lsn: 0,
+            promotion_cursor: parking_lot::RwLock::new(None),
+        }
+    }
+
+    /// Variant of [`with_dead_list_anchor`] that also carries Phase 4
+    /// lineage fields. Used by `Db::open` to seed clones from the
+    /// persisted `VolumeEntry` and by `Db::clone_volume` to mark a
+    /// freshly-minted clone before its background promotion walker
+    /// starts. `branched_at_lsn` is immutable for the volume's lifetime
+    /// (it pins the slice of parent history the clone shares); the
+    /// other two move only on explicit lineage events.
+    fn with_lineage(
+        ord: VolumeOrdinal,
+        shards: Vec<L2pShard>,
+        created_lsn: Lsn,
+        head_pid: crate::types::PageId,
+        tail_pid: crate::types::PageId,
+        parent_vol_ord: Option<VolumeOrdinal>,
+        branched_at_lsn: Lsn,
+        promotion_cursor: Option<crate::types::Lba>,
+    ) -> Self {
+        Self {
+            ord,
+            shards,
+            created_lsn,
+            flags: AtomicU8::new(0),
+            dead_list: Arc::new(crate::deadlist::DeadListState::new()),
+            dead_list_head_pid: AtomicU64::new(head_pid),
+            dead_list_tail_pid: AtomicU64::new(tail_pid),
+            parent_vol_ord: parking_lot::RwLock::new(parent_vol_ord),
+            branched_at_lsn,
+            promotion_cursor: parking_lot::RwLock::new(promotion_cursor),
         }
     }
 }
@@ -999,6 +1074,7 @@ mod l2p;
 mod l2p_buffer;
 mod l2p_compactor;
 mod lifecycle;
+mod promotion;
 mod snapshot;
 mod streaming_flush;
 mod volume;
@@ -1084,12 +1160,60 @@ impl Db {
         self.page_store.read_page(pid)
     }
 
-    /// Test helper: synchronously drive one Phase 3 Lineage GC cycle
-    /// (same logic the `metadb-async-reclaim` worker runs in the
-    /// background) and return the number of volumes whose `head_pid`
-    /// advanced. Used by `db::tests::lineage_gc` to assert chain
-    /// truncation without racing the background worker.
+    pub(crate) fn test_clear_parent_vol_ord(&self, vol_ord: VolumeOrdinal) {
+        if let Some(vol) = self.volumes.read().get(&vol_ord) {
+            *vol.parent_vol_ord.write() = None;
+            *vol.promotion_cursor.write() = None;
+        }
+        let mut mst = self.manifest_state.lock();
+        if let Some(entry) = mst.manifest.volumes.iter_mut().find(|e| e.ord == vol_ord) {
+            entry.parent_vol_ord = None;
+            entry.promotion_cursor = None;
+        }
+    }
+
+    /// Test helper: drive one step of the
+    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 promotion walker
+    /// for `vol_ord`. Returns the step outcome so tests can assert
+    /// whether a chunk was committed, completion has been reached, or
+    /// the volume isn't a clone.
+    ///
+    /// The production walker would call [`Db::run_promotion_chunk`] in
+    /// a loop until [`promotion::PromotionStep::Completed`]; tests
+    /// invoke it step-by-step so they can assert intermediate cursor /
+    /// rc state.
+    #[cfg(test)]
+    pub(crate) fn test_run_promotion_chunk(
+        &self,
+        vol_ord: VolumeOrdinal,
+    ) -> Result<promotion::PromotionStep> {
+        self.run_promotion_chunk(vol_ord)
+    }
+
+    /// Test helper: synchronously drive one Lineage GC cycle and
+    /// return the number of volumes whose `head_pid` advanced. Used by
+    /// `db::tests::lineage_gc` to assert chain truncation without
+    /// racing the background worker.
+    ///
+    /// When [`Config::lineage_gc_emit_freepbas`] is `false` (default),
+    /// behaves exactly like the Phase 3 worker: per-volume
+    /// plan + execute, no WAL side effects.
+    ///
+    /// When the flag is `true` ([[no-refcount-hot-path-design]] Phase 4
+    /// Step 4 / Phase 5 default), each volume's plan + execute is
+    /// interleaved with a `WalOp::FreePbas` commit carrying the
+    /// segment's dead-record PBAs. Phase 4 hot path still maintains
+    /// rc, so `apply_free_pbas` sees rc=0 for every PBA we surface
+    /// (the plan's rc==0 gate guarantees this) and takes the
+    /// exclusive branch. The background-worker path
+    /// (`async_reclaim::lineage_gc_cycle`) keeps Phase 3 behavior
+    /// regardless of this flag because it has no access to
+    /// `commit_ops`; Phase 5 will wire a `Weak<Db>` bridge.
     pub(crate) fn test_run_lineage_gc_cycle(&self) -> Result<usize> {
+        self.run_lineage_gc_cycle_inner()
+    }
+
+    fn run_lineage_gc_cycle_inner(&self) -> Result<usize> {
         let ctx = async_reclaim::LineageGcCtx {
             volumes: self.volumes.clone(),
             manifest_state: self.manifest_state.clone(),
@@ -1100,8 +1224,72 @@ impl Db {
                 .map(|shard| shard.rc.clone())
                 .collect(),
             faults: self.faults.clone(),
+            emit_freepbas: self.lineage_gc_emit_freepbas,
         };
-        async_reclaim::test_run_lineage_gc_cycle(&self.page_store, &ctx)
+        if !self.lineage_gc_emit_freepbas {
+            // Flag OFF: chain truncation only, identical to Phase 3 /
+            // background-worker behavior.
+            return async_reclaim::test_run_lineage_gc_cycle(&self.page_store, &ctx);
+        }
+
+        // Flag ON: per-volume plan → FreePbas commit → execute. We
+        // can't fold FreePbas into a single WAL record across
+        // volumes because `WalOp::FreePbas { vol_ord, … }` is
+        // per-volume; multi-vol cycles emit one record per advancing
+        // volume, identical to how Phase 5 will work.
+        let vol_handles: Vec<(crate::types::VolumeOrdinal, Arc<Volume>)> = {
+            let guard = self.volumes.read();
+            guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+        let mut advanced = 0;
+        for (vol_ord, vol) in vol_handles {
+            let plan = match async_reclaim::gc_plan_head_advance(
+                &self.page_store,
+                &ctx,
+                &vol,
+                vol_ord,
+            ) {
+                Ok(Some(p)) => p,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        vol_ord = vol_ord,
+                        error = %err,
+                        "lineage GC: plan failed (flag ON)"
+                    );
+                    continue;
+                }
+            };
+            if !plan.dead_pbas.is_empty() {
+                // Order matters: FreePbas must commit BEFORE chain
+                // truncation. If we truncate first and then crash
+                // before FreePbas, the retire signal is lost (the
+                // dead-list records are gone, onyx has no way to
+                // know the PBAs are reclaimable). Committing first
+                // means a crash before truncate is recoverable:
+                // next GC cycle re-runs the plan against the still-
+                // intact chain and re-emits FreePbas; apply
+                // `apply_free_pbas` re-surfaces the same PBAs (rc
+                // already 0 → exclusive branch) and onyx retire
+                // dedups via set semantics.
+                let pbas = plan.dead_pbas.clone().into_boxed_slice();
+                let (_lsn, outcomes) =
+                    self.commit_ops(&[WalOp::FreePbas { vol_ord, pbas }])?;
+                self.dispatch_freed_pbas_outcomes(vol_ord, outcomes);
+            }
+            if let Err(err) =
+                async_reclaim::gc_execute_head_advance(&self.page_store, &ctx, &vol, vol_ord, &plan)
+            {
+                tracing::warn!(
+                    vol_ord = vol_ord,
+                    error = %err,
+                    "lineage GC: execute failed after FreePbas commit (flag ON)"
+                );
+                continue;
+            }
+            advanced += 1;
+        }
+        Ok(advanced)
     }
 }
 

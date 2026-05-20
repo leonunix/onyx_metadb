@@ -1,7 +1,14 @@
 use super::*;
+use crate::types::{INVALID_VOLUME, Lba};
 
 /// Flag bits on a [`VolumeEntry`].
 pub const VOLUME_FLAG_DROP_PENDING: u8 = 0x01;
+
+/// Sentinel for `VolumeEntry::promotion_cursor` meaning "no promotion
+/// walker active for this volume" — used both for top-level volumes that
+/// have no parent to promote from and for clones whose background
+/// promotion walker has run to completion.
+pub const PROMOTION_CURSOR_NONE: Lba = u64::MAX;
 
 /// One entry in the v6 manifest `volumes` table.
 ///
@@ -33,19 +40,44 @@ pub struct VolumeEntry {
     /// Newest dead-list segment page (apply-time append anchor for the next
     /// checkpoint flush). `NULL_PAGE` while the chain is empty.
     pub dead_list_tail_pid: PageId,
+    /// Phase 4 lineage tracking. The clone's parent volume while a
+    /// background promotion walker still owes work; `None` for top-level
+    /// volumes and for clones whose promotion has completed. Cross-volume
+    /// snap_pin in Lineage GC consults this back-pointer to keep the
+    /// parent's PBAs alive until the walker has incref'd them into the
+    /// clone's lineage.
+    pub parent_vol_ord: Option<VolumeOrdinal>,
+    /// LSN at the parent snapshot's `created_lsn` when this volume was
+    /// branched off. Together with `parent_vol_ord` this fixes the slice
+    /// of the parent's history that the clone shares; `0` when there is
+    /// no parent.
+    pub branched_at_lsn: Lsn,
+    /// Background promotion walker progress. `Some(lba)` while the
+    /// walker is mid-flight (records the next LBA in the clone's L2P
+    /// it intends to visit); `None` when no walker is active for this
+    /// volume — both for fresh top-level volumes and for clones whose
+    /// promotion has reached the end of the keyspace.
+    pub promotion_cursor: Option<Lba>,
 }
 
 /// Size of a [`VolumeEntry`]'s fixed header when encoded inline. The
 /// variable `l2p_shard_roots` tail follows immediately.
 ///
 /// v13 grew the fixed header by 16 B (dead-list head/tail page ids).
+/// v14 grew it by another 20 B for Phase 4 lineage tracking:
+/// `parent_vol_ord` (2) + alignment pad (2) + `branched_at_lsn` (8) +
+/// `promotion_cursor` (8).
 pub const VOLUME_ENTRY_FIXED_SIZE: usize = 2 /* ord */
     + 4 /* shard_count */
     + 8 /* created_lsn */
     + 1 /* flags */
     + 1 /* reserved / alignment */
     + 8 /* dead_list_head_pid */
-    + 8 /* dead_list_tail_pid */;
+    + 8 /* dead_list_tail_pid */
+    + 2 /* parent_vol_ord (u16, INVALID_VOLUME = None) */
+    + 2 /* reserved / alignment */
+    + 8 /* branched_at_lsn */
+    + 8 /* promotion_cursor (Lba, PROMOTION_CURSOR_NONE = None) */;
 
 /// Inline-encoded byte length of a volume entry with the given shard count.
 ///
@@ -96,6 +128,16 @@ pub fn encode_volume_entry_inline(
     buf[*off + 15] = 0; // reserved
     buf[*off + 16..*off + 24].copy_from_slice(&entry.dead_list_head_pid.to_le_bytes());
     buf[*off + 24..*off + 32].copy_from_slice(&entry.dead_list_tail_pid.to_le_bytes());
+    // v14: lineage tracking fields. `Option::None` is encoded with the
+    // designated sentinels (`INVALID_VOLUME` / `PROMOTION_CURSOR_NONE`)
+    // so the wire format stays Plain Old Data and the decoder can
+    // remain branch-free.
+    let parent_raw = entry.parent_vol_ord.unwrap_or(INVALID_VOLUME);
+    buf[*off + 32..*off + 34].copy_from_slice(&parent_raw.to_le_bytes());
+    buf[*off + 34..*off + 36].copy_from_slice(&0u16.to_le_bytes()); // reserved
+    buf[*off + 36..*off + 44].copy_from_slice(&entry.branched_at_lsn.to_le_bytes());
+    let cursor_raw = entry.promotion_cursor.unwrap_or(PROMOTION_CURSOR_NONE);
+    buf[*off + 44..*off + 52].copy_from_slice(&cursor_raw.to_le_bytes());
     *off += VOLUME_ENTRY_FIXED_SIZE;
     for root in entry.l2p_shard_roots.iter().copied() {
         buf[*off..*off + 8].copy_from_slice(&root.to_le_bytes());
@@ -132,6 +174,23 @@ pub fn decode_volume_entry_inline(
     // buf[*off + 15] reserved
     let dead_list_head_pid = u64::from_le_bytes(buf[*off + 16..*off + 24].try_into().unwrap());
     let dead_list_tail_pid = u64::from_le_bytes(buf[*off + 24..*off + 32].try_into().unwrap());
+    // v14 lineage tracking. Top-level (v13) databases are flag-day
+    // rejected at manifest open, so decode always reads all four
+    // trailing fields and converts sentinel values back to `Option::None`.
+    let parent_raw = u16::from_le_bytes(buf[*off + 32..*off + 34].try_into().unwrap());
+    let parent_vol_ord = if parent_raw == INVALID_VOLUME {
+        None
+    } else {
+        Some(parent_raw)
+    };
+    // buf[*off + 34..*off + 36] reserved
+    let branched_at_lsn = u64::from_le_bytes(buf[*off + 36..*off + 44].try_into().unwrap());
+    let cursor_raw = u64::from_le_bytes(buf[*off + 44..*off + 52].try_into().unwrap());
+    let promotion_cursor = if cursor_raw == PROMOTION_CURSOR_NONE {
+        None
+    } else {
+        Some(cursor_raw)
+    };
     *off += VOLUME_ENTRY_FIXED_SIZE;
     let needed_roots = shard_count as usize * size_of::<PageId>();
     if buf.len() < *off + needed_roots {
@@ -175,5 +234,8 @@ pub fn decode_volume_entry_inline(
         flags,
         dead_list_head_pid,
         dead_list_tail_pid,
+        parent_vol_ord,
+        branched_at_lsn,
+        promotion_cursor,
     })
 }

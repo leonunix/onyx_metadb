@@ -444,4 +444,74 @@ fn clone_of_empty_volume_is_empty_and_writable() {
     assert_eq!(db.get(clone, 1).unwrap(), Some(v(7)));
 }
 
+// -------- phase 4 step 1: lineage tracking on VolumeEntry --------
+
+// Fresh top-level volumes (bootstrap + `create_volume`) must record
+// `parent_vol_ord = None` / `branched_at_lsn = 0` / `promotion_cursor = None`.
+// That keeps the v14 schema honest: only `clone_volume` is allowed to
+// arm the lineage fields, so downstream Lineage GC / cross-volume
+// snap_pin doesn't pick up stray parent edges.
+#[test]
+fn phase4_top_level_volume_has_no_lineage() {
+    let (_d, db) = mk_db();
+    let ord = db.create_volume().unwrap();
+    let m = db.manifest();
+    for e in &m.volumes {
+        assert_eq!(e.parent_vol_ord, None, "ord={}", e.ord);
+        assert_eq!(e.branched_at_lsn, 0, "ord={}", e.ord);
+        assert_eq!(e.promotion_cursor, None, "ord={}", e.ord);
+    }
+    let _ = ord;
+}
+
+// A fast clone (`clone_volume`) must record `parent_vol_ord = Some(src)`
+// and `branched_at_lsn = snapshot.created_lsn`. `promotion_cursor` stays
+// `None` in Step 1 — Step 5's background walker is what arms it.
+// Round-trips through flush + reopen.
+#[test]
+fn phase4_clone_records_parent_and_branched_lsn() {
+    let dir = TempDir::new().unwrap();
+    let (src, clone, expected_branched_at) = {
+        let db = Db::create(dir.path()).unwrap();
+        let src = db.create_volume().unwrap();
+        // Drive a write so the snapshot's `created_lsn` is non-zero
+        // and distinguishable from the source volume's `created_lsn`.
+        db.insert(src, 0, v(1)).unwrap();
+        let snap = db.take_snapshot(src).unwrap();
+        let snap_lsn = db
+            .manifest()
+            .snapshots
+            .iter()
+            .find(|s| s.id == snap)
+            .map(|s| s.created_lsn)
+            .unwrap();
+        assert!(snap_lsn > 0, "snapshot's created_lsn should be non-zero");
+        let clone = db.clone_volume(snap).unwrap();
+
+        // Live view: source has no parent; clone points at source +
+        // snapshot LSN; cursor still idle.
+        let m = db.manifest();
+        let src_entry = m.volumes.iter().find(|v| v.ord == src).unwrap();
+        assert_eq!(src_entry.parent_vol_ord, None);
+        assert_eq!(src_entry.branched_at_lsn, 0);
+        let clone_entry = m.volumes.iter().find(|v| v.ord == clone).unwrap();
+        assert_eq!(clone_entry.parent_vol_ord, Some(src));
+        assert_eq!(clone_entry.branched_at_lsn, snap_lsn);
+        assert_eq!(clone_entry.promotion_cursor, None);
+
+        // Persist the manifest so the reopen check below is meaningful.
+        db.flush().unwrap();
+        (src, clone, snap_lsn)
+    };
+
+    // Reopen — lineage fields survive both the manifest round-trip and
+    // the Volume reconstruction that seeds them back from `VolumeEntry`.
+    let db = Db::open(dir.path()).unwrap();
+    let m = db.manifest();
+    let clone_entry = m.volumes.iter().find(|v| v.ord == clone).unwrap();
+    assert_eq!(clone_entry.parent_vol_ord, Some(src));
+    assert_eq!(clone_entry.branched_at_lsn, expected_branched_at);
+    assert_eq!(clone_entry.promotion_cursor, None);
+}
+
 // -------- phase 7 commit 11: streaming iterators --------
