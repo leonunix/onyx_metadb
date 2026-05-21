@@ -13,8 +13,12 @@ fn l2p(n: u8) -> L2pValue {
 }
 
 fn dval(n: u8) -> DedupValue {
+    // Encode `n` as a big-endian u64 in the leading 8 bytes so
+    // `head_pba()` returns a small refcount-array-safe value.
+    // Phase 5 routes `DedupPut` through `rc.stage(head_pba, +1)`;
+    // byte-0 encoding would decode as ~7e16 and OOM the rc array.
     let mut x = [0u8; 28];
-    x[0] = n;
+    x[..8].copy_from_slice(&(n as u64).to_be_bytes());
     DedupValue(x)
 }
 
@@ -54,11 +58,14 @@ fn crash_after_wal_before_apply_recovers_committed_tx() {
         let path = dir.path().to_path_buf();
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            // Seed rc(42) before installing the fault so the post-WAL
+            // crash exercises the L2P + dedup path alongside an
+            // already-persistent shared PBA.
+            db.incref_pba(42, 2).unwrap();
             faults.install(FaultPoint::CommitPostWalBeforeApply, 1, FaultAction::Panic);
             let mut tx = db.begin();
             tx.insert(0, 1, l2p(9));
             tx.put_dedup(h(7), dval(7));
-            tx.incref_pba(42, 2);
             let _ = tx.commit();
         }
     }));
@@ -78,7 +85,11 @@ fn crash_after_apply_before_lsn_bump_does_not_double_apply_on_reopen() {
         let path = dir.path().to_path_buf();
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
-            db.incref_pba(100, 5).unwrap();
+            // Phase 5: standalone Incref WAL ops are gone, so the
+            // double-apply check uses the test-only seed (which
+            // commits via PromotionChunk) for the second rc bump too.
+            // Crash window now covers L2P + dedup apply only.
+            db.incref_pba(100, 7).unwrap();
             faults.install(
                 FaultPoint::CommitPostApplyBeforeLsnBump,
                 1,
@@ -87,7 +98,6 @@ fn crash_after_apply_before_lsn_bump_does_not_double_apply_on_reopen() {
             let mut tx = db.begin();
             tx.insert(0, 1, l2p(1));
             tx.put_dedup(h(99), dval(9));
-            tx.incref_pba(100, 2);
             let _ = tx.commit();
         }
     }));
@@ -152,6 +162,9 @@ fn flush_before_manifest_fault_does_not_checkpoint_refcount_in_place() {
         let mut tx = db.begin();
         tx.l2p_remap(0, 0, remap_val(195, 1), None);
         tx.commit().unwrap();
+        // Phase 5: LANED L2pRemap doesn't bump rc; seed explicitly via
+        // PromotionChunk so range_delete's decref has a non-zero base.
+        db.incref_pba(195, 1).unwrap();
         db.flush().unwrap();
 
         db.range_delete(0, 0, 1).unwrap();
@@ -479,10 +492,19 @@ fn crash_after_wal_before_apply_replays_l2p_remap() {
 }
 
 /// Crash between apply and last_applied_lsn bump. On replay metadb
-/// must not double-apply the refcount decref/incref embedded in the
-/// L2pRemap. The `page.generation >= lsn` guard on L2P pages plus the
-/// checkpoint-lsn ordering rule in `commit_ops` is what keeps the
-/// refcount side consistent.
+/// must restore L2P state idempotently: the post-crash remap that
+/// applied-but-didn't-bump-lsn is re-applied via the legacy SERIAL
+/// path (single-op WAL records bypass the bucket threshold), and the
+/// final L2P mapping matches the live post-apply state byte-for-byte.
+///
+/// Phase 5 note: hot-path LANED L2pRemap is rc-neutral, but the
+/// legacy SERIAL apply path (`apply_l2p_remap` in apply.rs) is the
+/// one replay uses for single-op records, and it still drives the
+/// incref(new) / decref(old) decision. The rc assertions below
+/// reflect that SERIAL replay behavior — rc converges to the
+/// "as-if-everything-went-through-SERIAL" totals. The sibling test
+/// `crash_after_wal_before_apply_replays_l2p_remap` documents the
+/// same pattern at lba=11.
 #[test]
 fn crash_after_apply_before_lsn_bump_l2p_remap_idempotent() {
     let dir = TempDir::new().unwrap();
@@ -492,17 +514,16 @@ fn crash_after_apply_before_lsn_bump_l2p_remap_idempotent() {
         let path = dir.path().to_path_buf();
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
-            // Pre-seed rc(100)=2 via two independent remaps so the
-            // post-crash remap decrefs without reaching zero — this
-            // is the "decref not to zero" path where a double-apply
-            // would silently under-count.
+            // Seed two L2P mappings so the post-crash remap has a
+            // prev value to overwrite. Live LANED apply leaves rc
+            // untouched; rc only moves via the legacy SERIAL replay
+            // path after reopen.
             let mut tx = db.begin();
             tx.l2p_remap(0, 10, remap_val(100, 1), None);
             tx.commit().unwrap();
             let mut tx = db.begin();
             tx.l2p_remap(0, 11, remap_val(100, 2), None);
             tx.commit().unwrap();
-            assert_eq!(db.get_refcount(100).unwrap(), 2);
 
             faults.install(
                 FaultPoint::CommitPostApplyBeforeLsnBump,
@@ -516,13 +537,15 @@ fn crash_after_apply_before_lsn_bump_l2p_remap_idempotent() {
     }));
 
     let db = Db::open(dir.path()).unwrap();
+    // L2P state: lba=10 settled on pba=200 (the post-fault remap was
+    // applied before the crash, then replayed idempotently). lba=11
+    // still maps to its original pba=100.
     assert_eq!(db.get(0, 10).unwrap(), Some(remap_val(200, 1)));
     assert_eq!(db.get(0, 11).unwrap(), Some(remap_val(100, 2)));
-    assert_eq!(
-        db.get_refcount(100).unwrap(),
-        1,
-        "replay must not double-decref; rc should be 1 after one decref",
-    );
+    // Phase 5 SERIAL replay rc accounting: tx1 incref(100), tx2
+    // incref(100), tx3 (lba=10 → pba=200) decref(100) + incref(200).
+    // Net: rc(100)=1, rc(200)=1.
+    assert_eq!(db.get_refcount(100).unwrap(), 1);
     assert_eq!(db.get_refcount(200).unwrap(), 1);
 }
 
@@ -650,12 +673,19 @@ fn drop_snapshot_crash_after_wal_before_apply_replays_pba_decrefs() {
         let path = dir.path().to_path_buf();
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
-            // Seed rc(100)=1 via l2p_remap.
+            // Seed L2P + rc(100)=1. Phase 5 LANED L2pRemap on a
+            // non-snapshot volume does not touch rc, so we drive
+            // rc(100) explicitly via PromotionChunk. After the
+            // snapshot is taken, subsequent L2pRemaps on the volume
+            // route to the SERIAL/LEGACY path and still produce the
+            // expected snap-pinned rc semantics.
             let mut tx = db.begin();
             tx.l2p_remap(0, 10, remap_val(100, 1), None);
             tx.commit().unwrap();
+            db.incref_pba(100, 1).unwrap();
             let snap = db.take_snapshot(0).unwrap();
-            // Leaf-shared remap → decref(100) suppressed; rc(100) still 1.
+            // Leaf-shared remap → decref(100) suppressed by snap_pins_old;
+            // SERIAL apply increfs rc(200). rc(100) still 1.
             let mut tx = db.begin();
             tx.l2p_remap(0, 10, remap_val(200, 1), None);
             tx.commit().unwrap();
@@ -702,13 +732,16 @@ fn drop_snapshot_crash_after_apply_before_lsn_bump_does_not_double_decref() {
         let path = dir.path().to_path_buf();
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
-            // Seed rc(100)=2 via two independent l2p_remaps.
+            // Seed L2P + rc(100)=2. Phase 5 LANED L2pRemap on a
+            // non-snapshot volume does not touch rc, so we drive
+            // rc(100) explicitly via PromotionChunk.
             let mut tx = db.begin();
             tx.l2p_remap(0, 10, remap_val(100, 1), None);
             tx.commit().unwrap();
             let mut tx = db.begin();
             tx.l2p_remap(0, 11, remap_val(100, 2), None);
             tx.commit().unwrap();
+            db.incref_pba(100, 2).unwrap();
             assert_eq!(db.get_refcount(100).unwrap(), 2);
 
             let snap = db.take_snapshot(0).unwrap();
@@ -773,6 +806,16 @@ fn drop_snapshot_crash_mid_page_cascade_recovers_consistent_refcounts() {
                 let mut tx = db.begin();
                 tx.l2p_remap(0, i * 4, remap_val(100 + i, 0), None);
                 tx.commit().unwrap();
+            }
+            // Phase 5: LANED L2pRemap on a non-snapshot volume does
+            // not touch rc, so the per-pba rc baseline must be
+            // driven independently via PromotionChunk before the
+            // snapshot. Without this, drop_snapshot's pba_decrefs
+            // filter (`taken < rc`) would compute an empty list and
+            // the page cascade fault would not have anything to
+            // exercise.
+            for i in 0u64..256 {
+                db.incref_pba(100 + i, 1).unwrap();
             }
             db.flush().unwrap();
             let snap = db.take_snapshot(0).unwrap();

@@ -131,8 +131,6 @@ struct OpCounts {
     l2p_remap_range: u64,
     dedup_put: u64,
     dedup_delete: u64,
-    incref: u64,
-    decref: u64,
     drop_snapshot: u64,
     create_volume: u64,
     drop_volume: u64,
@@ -154,8 +152,6 @@ impl OpCounts {
             WalOp::DedupDelete { .. }
             | WalOp::DedupCompareDelete { .. }
             | WalOp::DedupComparePut { .. } => self.dedup_delete += 1,
-            WalOp::Incref { .. } => self.incref += 1,
-            WalOp::Decref { .. } => self.decref += 1,
             WalOp::DropSnapshot { .. } => self.drop_snapshot += 1,
             WalOp::CreateVolume { .. } => self.create_volume += 1,
             WalOp::DropVolume { .. } => self.drop_volume += 1,
@@ -333,20 +329,35 @@ fn fmt_op(op: &WalOp) -> String {
             "L2pRemapRange vol={vol_ord} start_lba={start_lba} count={}",
             values.len(),
         ),
-        WalOp::DedupPut { hash, value } => {
-            format!("DedupPut hash={} value={}", hex(hash), hex(value.0))
+        WalOp::DedupPut {
+            hash,
+            value,
+            old_pba,
+        } => {
+            format!(
+                "DedupPut hash={} value={} old_pba={}",
+                hex(hash),
+                hex(value.0),
+                fmt_old_pba(*old_pba),
+            )
         }
         WalOp::DedupPutGuarded {
             hash,
             value,
             pba_guard,
             min_rc,
+            old_pba,
         } => format!(
-            "DedupPutGuarded hash={} value={} pba_guard={pba_guard} min_rc={min_rc}",
+            "DedupPutGuarded hash={} value={} pba_guard={pba_guard} min_rc={min_rc} old_pba={}",
             hex(hash),
-            hex(value.0)
+            hex(value.0),
+            fmt_old_pba(*old_pba),
         ),
-        WalOp::DedupDelete { hash } => format!("DedupDelete hash={}", hex(hash)),
+        WalOp::DedupDelete { hash, old_pba } => format!(
+            "DedupDelete hash={} old_pba={}",
+            hex(hash),
+            fmt_old_pba(*old_pba),
+        ),
         WalOp::DedupCompareDelete { hash, old_value } => format!(
             "DedupCompareDelete hash={} old_value={}",
             hex(hash),
@@ -362,8 +373,6 @@ fn fmt_op(op: &WalOp) -> String {
             hex(old_value.0),
             hex(new_value.0)
         ),
-        WalOp::Incref { pba, delta } => format!("Incref pba={pba} delta={delta}"),
-        WalOp::Decref { pba, delta } => format!("Decref pba={pba} delta={delta}"),
         WalOp::DropSnapshot {
             id,
             pages,
@@ -460,24 +469,33 @@ fn op_json(op: &WalOp) -> String {
             "{{\"op\":\"L2pRemapRange\",\"vol_ord\":{vol_ord},\"start_lba\":{start_lba},\"count\":{}}}",
             values.len(),
         ),
-        WalOp::DedupPut { hash, value } => format!(
-            "{{\"op\":\"DedupPut\",\"hash\":\"{}\",\"value\":\"{}\"}}",
+        WalOp::DedupPut {
+            hash,
+            value,
+            old_pba,
+        } => format!(
+            "{{\"op\":\"DedupPut\",\"hash\":\"{}\",\"value\":\"{}\",\"old_pba\":{}}}",
             hex(hash),
             hex(value.0),
+            json_old_pba(*old_pba),
         ),
         WalOp::DedupPutGuarded {
             hash,
             value,
             pba_guard,
             min_rc,
+            old_pba,
         } => format!(
-            "{{\"op\":\"DedupPutGuarded\",\"hash\":\"{}\",\"value\":\"{}\",\"pba_guard\":{pba_guard},\"min_rc\":{min_rc}}}",
+            "{{\"op\":\"DedupPutGuarded\",\"hash\":\"{}\",\"value\":\"{}\",\"pba_guard\":{pba_guard},\"min_rc\":{min_rc},\"old_pba\":{}}}",
             hex(hash),
             hex(value.0),
+            json_old_pba(*old_pba),
         ),
-        WalOp::DedupDelete { hash } => {
-            format!("{{\"op\":\"DedupDelete\",\"hash\":\"{}\"}}", hex(hash))
-        }
+        WalOp::DedupDelete { hash, old_pba } => format!(
+            "{{\"op\":\"DedupDelete\",\"hash\":\"{}\",\"old_pba\":{}}}",
+            hex(hash),
+            json_old_pba(*old_pba),
+        ),
         WalOp::DedupCompareDelete { hash, old_value } => format!(
             "{{\"op\":\"DedupCompareDelete\",\"hash\":\"{}\",\"old_value\":\"{}\"}}",
             hex(hash),
@@ -493,12 +511,6 @@ fn op_json(op: &WalOp) -> String {
             hex(old_value.0),
             hex(new_value.0)
         ),
-        WalOp::Incref { pba, delta } => {
-            format!("{{\"op\":\"Incref\",\"pba\":{pba},\"delta\":{delta}}}")
-        }
-        WalOp::Decref { pba, delta } => {
-            format!("{{\"op\":\"Decref\",\"pba\":{pba},\"delta\":{delta}}}")
-        }
         WalOp::DropSnapshot {
             id,
             pages,
@@ -565,8 +577,6 @@ fn op_tag_list(ops: &[WalOp]) -> String {
             WalOp::DedupDelete { .. } => "DedupDelete",
             WalOp::DedupCompareDelete { .. } => "DedupCompareDelete",
             WalOp::DedupComparePut { .. } => "DedupComparePut",
-            WalOp::Incref { .. } => "Incref",
-            WalOp::Decref { .. } => "Decref",
             WalOp::DropSnapshot { .. } => "DropSnapshot",
             WalOp::CreateVolume { .. } => "CreateVolume",
             WalOp::DropVolume { .. } => "DropVolume",
@@ -621,8 +631,6 @@ fn print_op_counts_human(c: &OpCounts) {
     eprintln!("  L2pDelete:          {}", c.l2p_delete);
     eprintln!("  DedupPut:           {}", c.dedup_put);
     eprintln!("  DedupDelete:        {}", c.dedup_delete);
-    eprintln!("  Incref:             {}", c.incref);
-    eprintln!("  Decref:             {}", c.decref);
     eprintln!("  DropSnapshot:       {}", c.drop_snapshot);
 }
 
@@ -656,13 +664,11 @@ fn print_summary_json(_cfg: &Config, s: &Summary) {
 
 fn op_counts_json(c: &OpCounts) -> String {
     format!(
-        "{{\"L2pPut\":{},\"L2pDelete\":{},\"DedupPut\":{},\"DedupDelete\":{},\"Incref\":{},\"Decref\":{},\"DropSnapshot\":{}}}",
+        "{{\"L2pPut\":{},\"L2pDelete\":{},\"DedupPut\":{},\"DedupDelete\":{},\"DropSnapshot\":{}}}",
         c.l2p_put,
         c.l2p_delete,
         c.dedup_put,
         c.dedup_delete,
-        c.incref,
-        c.decref,
         c.drop_snapshot,
     )
 }
@@ -687,6 +693,20 @@ fn hex<T: AsRef<[u8]>>(bytes: T) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+fn fmt_old_pba(old_pba: Option<onyx_metadb::types::Pba>) -> String {
+    match old_pba {
+        Some(pba) => format!("Some({pba})"),
+        None => "None".to_string(),
+    }
+}
+
+fn json_old_pba(old_pba: Option<onyx_metadb::types::Pba>) -> String {
+    match old_pba {
+        Some(pba) => pba.to_string(),
+        None => "null".to_string(),
+    }
 }
 
 fn escape_json(input: &str) -> String {

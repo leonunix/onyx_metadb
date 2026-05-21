@@ -121,87 +121,6 @@ fn merge_l2p_outcome(
     }
 }
 
-fn push_l2p_remap_rc_actions(
-    rc_actions: &mut Vec<RcApplyAction>,
-    op_idx: usize,
-    lba: u64,
-    prev: Option<L2pValue>,
-    new_value: L2pValue,
-    lsn: Lsn,
-    range_op: bool,
-) {
-    let value_changed = prev != Some(new_value);
-    if !value_changed {
-        return;
-    }
-    let new_pba = new_value.head_pba();
-    let new_is_zero = new_value.0[27] & 0x02 != 0;
-    match prev {
-        Some(old_value) => {
-            let old_pba = old_value.head_pba();
-            let old_is_zero = old_value.0[27] & 0x02 != 0;
-            let push_decref = !old_is_zero && (old_pba != new_pba || new_is_zero);
-            let push_incref = !new_is_zero && (old_pba != new_pba || old_is_zero);
-            tracing::trace!(
-                target: "onyx_metadb::db::commit::rc_action",
-                op_idx,
-                lba,
-                old_pba,
-                new_pba,
-                old_is_zero,
-                new_is_zero,
-                push_decref,
-                push_incref,
-                lsn,
-                "apply_l2p_bucket: l2p_remap rc_actions (Some prev)"
-            );
-            if push_decref {
-                rc_actions.push(RcApplyAction {
-                    op_idx,
-                    pba: old_pba,
-                    delta: -1,
-                    standalone_refcount: false,
-                    remap_freed_candidate: true,
-                    range_op,
-                });
-            }
-            if push_incref {
-                rc_actions.push(RcApplyAction {
-                    op_idx,
-                    pba: new_pba,
-                    delta: 1,
-                    standalone_refcount: false,
-                    remap_freed_candidate: false,
-                    range_op,
-                });
-            }
-        }
-        None => {
-            if !new_is_zero {
-                tracing::trace!(
-                    target: "onyx_metadb::db::commit::rc_action",
-                    op_idx,
-                    lba,
-                    new_pba,
-                    new_is_zero,
-                    push_decref = false,
-                    push_incref = true,
-                    lsn,
-                    "apply_l2p_bucket: l2p_remap rc_actions (None prev)"
-                );
-                rc_actions.push(RcApplyAction {
-                    op_idx,
-                    pba: new_pba,
-                    delta: 1,
-                    standalone_refcount: false,
-                    remap_freed_candidate: false,
-                    range_op,
-                });
-            }
-        }
-    }
-}
-
 struct LaneDispatchPlan {
     l2p_sorted: Vec<((VolumeOrdinal, usize), Vec<L2pBucketEntry>)>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
@@ -333,10 +252,9 @@ fn wal_lane_key(op: &WalOp) -> u64 {
         }
         WalOp::DedupPut { hash, .. }
         | WalOp::DedupPutGuarded { hash, .. }
-        | WalOp::DedupDelete { hash }
+        | WalOp::DedupDelete { hash, .. }
         | WalOp::DedupCompareDelete { hash, .. }
         | WalOp::DedupComparePut { hash, .. } => xxh3_64(hash),
-        WalOp::Incref { pba, .. } | WalOp::Decref { pba, .. } => xxh3_64(&pba.to_be_bytes()),
         WalOp::DropSnapshot { id, .. } => xxh3_64(&id.to_be_bytes()),
         WalOp::CreateVolume { ord, .. } | WalOp::DropVolume { ord, .. } => {
             xxh3_64(&ord.to_be_bytes())
@@ -1226,22 +1144,6 @@ impl Db {
                     }
                     remap_may_defer_refcount = true;
                 }
-                WalOp::Incref { pba, .. } | WalOp::Decref { pba, .. } => {
-                    let sid = shard_for_key(&self.refcount_shards, *pba);
-                    let delta = match op {
-                        WalOp::Incref { delta, .. } => i64::from(*delta),
-                        WalOp::Decref { delta, .. } => -i64::from(*delta),
-                        _ => unreachable!(),
-                    };
-                    rc_buckets[sid].push(RcApplyAction {
-                        op_idx: idx,
-                        pba: *pba,
-                        delta,
-                        standalone_refcount: true,
-                        remap_freed_candidate: false,
-                        range_op: false,
-                    });
-                }
                 WalOp::DedupPut { hash, .. }
                 | WalOp::DedupPutGuarded { hash, .. }
                 | WalOp::DedupDelete { hash, .. }
@@ -1526,23 +1428,13 @@ impl Db {
                 }
                 let prev_values =
                     tree.insert_leaf_run_at_lsn_deferred_finish(&entries, lsn)?;
-                for ((batch_i, (lba, new_value)), prev) in accepted_batch_idx
+                for ((batch_i, (_lba, _new_value)), prev) in accepted_batch_idx
                     .into_iter()
                     .zip(entries.into_iter())
                     .zip(prev_values.into_iter())
                 {
                     let b = &batch_lbas[batch_i];
-                    let is_range = b.range_offset.is_some();
                     super::apply::record_dead(&volume, prev, lsn);
-                    push_l2p_remap_rc_actions(
-                        &mut rc_actions,
-                        b.op_idx,
-                        lba,
-                        prev,
-                        new_value,
-                        lsn,
-                        is_range,
-                    );
                     match b.range_offset {
                         Some(off) => {
                             l2p_remap_range_lba_count += 1;
@@ -1655,15 +1547,6 @@ impl Db {
                         }
                         let prev = tree.insert_at_lsn_deferred_finish(*lba, *new_value, lsn)?;
                         super::apply::record_dead(&volume, prev, lsn);
-                        push_l2p_remap_rc_actions(
-                            &mut rc_actions,
-                            idx,
-                            *lba,
-                            prev,
-                            *new_value,
-                            lsn,
-                            false,
-                        );
                         l2p_remap_count += 1;
                         ApplyOutcome::L2pRemap {
                             applied: true,
@@ -1832,15 +1715,6 @@ impl Db {
                         }
                         shard.l2p_buffer.insert(lba, new_value, lsn);
                         super::apply::record_dead(&volume, cur, lsn);
-                        push_l2p_remap_rc_actions(
-                            &mut rc_actions,
-                            *op_idx,
-                            lba,
-                            cur,
-                            new_value,
-                            lsn,
-                            true,
-                        );
                         l2p_remap_range_lba_count += 1;
                         applied_bits[off as usize] = true;
                         prevs_box[off as usize] = cur;
@@ -1933,15 +1807,6 @@ impl Db {
                         }
                         shard.l2p_buffer.insert(*lba, *new_value, lsn);
                         super::apply::record_dead(&volume, cur, lsn);
-                        push_l2p_remap_rc_actions(
-                            &mut rc_actions,
-                            idx,
-                            *lba,
-                            cur,
-                            *new_value,
-                            lsn,
-                            false,
-                        );
                         l2p_remap_count += 1;
                         ApplyOutcome::L2pRemap {
                             applied: true,
@@ -2139,8 +2004,51 @@ impl Db {
     ) -> Result<Vec<(usize, ApplyOutcome)>> {
         let batch_started = std::time::Instant::now();
         let mut outcomes = Vec::with_capacity(indices.len());
-        let mut pending_puts: Vec<(Hash8, DedupValue, usize)> = Vec::new();
-        let flush_pending_puts = |pending_puts: &mut Vec<(Hash8, DedupValue, usize)>,
+        let mut pending_puts: Vec<(Hash8, DedupValue, Option<Pba>, usize)> = Vec::new();
+        // Phase 5: dedup-table mutations drive the global PBA refcount
+        // (shared-page bookkeeping). The hot path no longer stages rc
+        // deltas on L2P remaps, so any rc movement for a shared pba has
+        // to ride along with the DedupPut/Delete/Compare* that gained
+        // or lost the reference. Helpers below stay close to
+        // `apply_dedup_put_with_rc` / `apply_dedup_delete_with_rc` in
+        // `apply.rs` and use the same routing math (xxh3 mod shards)
+        // because this lane bucket holds `Arc<RcShard>` directly, not
+        // the outer `Shard` wrapper that `shard_for_key` expects.
+        let rc_shard_for = |pba: Pba| -> usize {
+            (xxh3_64(&pba.to_be_bytes()) as usize) % refcount_shards.len()
+        };
+        let stage_rc = |pba: Pba, delta: i64| -> Result<()> {
+            let sid = rc_shard_for(pba);
+            refcount_shards[sid].stage(pba, delta, lsn)?;
+            Ok(())
+        };
+        // Phase 5 stale-entry tolerance: a dedup_index row can point to
+        // a PBA whose rc has been driven to 0 by lineage GC without
+        // cleanup removing the row. The matching put/delete must then
+        // skip the decref instead of underflowing the rc table — see
+        // `apply_dedup_put_with_rc` for the full rationale. We pre-read
+        // the current rc once per stale candidate; within this lane the
+        // LSN-ordered apply gate prevents concurrent rc mutation on the
+        // same pba, so the floor check is sound.
+        let stage_rc_decref_if_live = |pba: Pba| -> Result<()> {
+            let sid = rc_shard_for(pba);
+            if refcount_shards[sid].get(pba)? > 0 {
+                refcount_shards[sid].stage(pba, -1, lsn)?;
+            }
+            Ok(())
+        };
+        // [[no-refcount-hot-path-design]] Phase 5 (WAL schema 0xB8):
+        // every dedup put / delete carries an embedded `old_pba`
+        // captured at `Transaction::commit` time. The live apply path
+        // here uses it directly so that replay and live apply produce
+        // the same rc deltas — apply is deterministic from the WAL
+        // alone, which is required because the on-disk dedup_index
+        // data pages are written eagerly per op (only the meta page
+        // is checkpoint-gated). Reading dedup_index here would also
+        // work for the live path, but using the embedded value keeps
+        // the live and replay paths bit-identical and saves a
+        // cuckoo lookup per op.
+        let flush_pending_puts = |pending_puts: &mut Vec<(Hash8, DedupValue, Option<Pba>, usize)>,
                                   outcomes: &mut Vec<(usize, ApplyOutcome)>|
          -> Result<()> {
             if pending_puts.is_empty() {
@@ -2148,14 +2056,21 @@ impl Db {
             }
             let entries: Vec<(Hash8, DedupValue)> = pending_puts
                 .iter()
-                .map(|(hash, value, _)| (*hash, *value))
+                .map(|(hash, value, _, _)| (*hash, *value))
                 .collect();
             let mut put_timings = DedupPutStageTimings::default();
             let started = std::time::Instant::now();
             dedup_index.put_many_with_metrics(&entries, lsn, &mut put_timings)?;
             metrics.record_dedup_forward_put_batch(pending_puts.len() as u64, started.elapsed());
             metrics.record_dedup_put_stages(put_timings);
-            for (_, _, idx) in pending_puts.drain(..) {
+            for (_, value, old_pba, idx) in pending_puts.drain(..) {
+                let new_pba = value.head_pba();
+                if old_pba != Some(new_pba) {
+                    if let Some(op) = old_pba {
+                        stage_rc_decref_if_live(op)?;
+                    }
+                    stage_rc(new_pba, 1)?;
+                }
                 outcomes.push((idx, ApplyOutcome::Dedup));
             }
             Ok(())
@@ -2163,19 +2078,24 @@ impl Db {
 
         for idx in indices {
             match &ops[idx] {
-                WalOp::DedupPut { hash, value } => {
-                    pending_puts.push((*hash, *value, idx));
+                WalOp::DedupPut {
+                    hash,
+                    value,
+                    old_pba,
+                } => {
+                    pending_puts.push((*hash, *value, *old_pba, idx));
                 }
                 WalOp::DedupPutGuarded {
                     hash,
                     value,
                     pba_guard,
                     min_rc,
+                    old_pba,
                 } => {
                     flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     let guard_started = std::time::Instant::now();
                     let rc = refcount_shards
-                        .get((xxh3_64(&pba_guard.to_be_bytes()) as usize) % refcount_shards.len())
+                        .get(rc_shard_for(*pba_guard))
                         .ok_or_else(|| MetaDbError::Corruption("missing refcount shard".into()))?
                         .get(*pba_guard)?;
                     metrics.record_dedup_guard(guard_started.elapsed());
@@ -2185,23 +2105,35 @@ impl Db {
                         dedup_index.put_with_metrics(*hash, *value, lsn, &mut put_timings)?;
                         metrics.record_dedup_forward_put(started.elapsed());
                         metrics.record_dedup_put_stages(put_timings);
+                        let new_pba = value.head_pba();
+                        if *old_pba != Some(new_pba) {
+                            if let Some(op) = *old_pba {
+                                stage_rc_decref_if_live(op)?;
+                            }
+                            stage_rc(new_pba, 1)?;
+                        }
                     }
                     outcomes.push((idx, ApplyOutcome::Dedup));
                 }
-                WalOp::DedupDelete { hash } => {
+                WalOp::DedupDelete { hash, old_pba } => {
                     flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     let started = std::time::Instant::now();
                     dedup_index.delete(hash, lsn)?;
                     metrics.record_dedup_forward_delete(started.elapsed());
+                    if let Some(op) = *old_pba {
+                        stage_rc_decref_if_live(op)?;
+                    }
                     outcomes.push((idx, ApplyOutcome::Dedup));
                 }
                 WalOp::DedupCompareDelete { hash, old_value } => {
                     flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     let started = std::time::Instant::now();
-                    let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
+                    let cur = dedup_index.get(hash)?;
+                    let applied = cur.as_ref() == Some(old_value);
                     if applied {
                         dedup_index.delete(hash, lsn)?;
                         metrics.record_dedup_forward_delete(started.elapsed());
+                        stage_rc_decref_if_live(old_value.head_pba())?;
                     }
                     outcomes.push((idx, ApplyOutcome::DedupCompare { applied }));
                 }
@@ -2212,12 +2144,19 @@ impl Db {
                 } => {
                     flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     let started = std::time::Instant::now();
-                    let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
+                    let cur = dedup_index.get(hash)?;
+                    let applied = cur.as_ref() == Some(old_value);
                     if applied {
                         let mut put_timings = DedupPutStageTimings::default();
                         dedup_index.put_with_metrics(*hash, *new_value, lsn, &mut put_timings)?;
                         metrics.record_dedup_forward_put(started.elapsed());
                         metrics.record_dedup_put_stages(put_timings);
+                        let old_pba = old_value.head_pba();
+                        let new_pba = new_value.head_pba();
+                        if old_pba != new_pba {
+                            stage_rc_decref_if_live(old_pba)?;
+                            stage_rc(new_pba, 1)?;
+                        }
                     }
                     outcomes.push((idx, ApplyOutcome::DedupCompare { applied }));
                 }
@@ -2560,22 +2499,6 @@ impl Db {
                             });
                     }
                 }
-                WalOp::Incref { pba, .. } | WalOp::Decref { pba, .. } => {
-                    let sid = shard_for_key(refcount_shards, *pba);
-                    let delta = match op {
-                        WalOp::Incref { delta, .. } => i64::from(*delta),
-                        WalOp::Decref { delta, .. } => -i64::from(*delta),
-                        _ => unreachable!(),
-                    };
-                    rc_buckets[sid].push(RcApplyAction {
-                        op_idx: idx,
-                        pba: *pba,
-                        delta,
-                        standalone_refcount: true,
-                        remap_freed_candidate: false,
-                        range_op: false,
-                    });
-                }
                 WalOp::DedupPut { .. }
                 | WalOp::DedupPutGuarded { .. }
                 | WalOp::DedupDelete { .. }
@@ -2797,22 +2720,6 @@ impl Db {
                             });
                     }
                 }
-                WalOp::Incref { pba, .. } | WalOp::Decref { pba, .. } => {
-                    let sid = shard_for_key(refcount_shards, *pba);
-                    let delta = match op {
-                        WalOp::Incref { delta, .. } => i64::from(*delta),
-                        WalOp::Decref { delta, .. } => -i64::from(*delta),
-                        _ => unreachable!(),
-                    };
-                    rc_buckets[sid].push(RcApplyAction {
-                        op_idx: idx,
-                        pba: *pba,
-                        delta,
-                        standalone_refcount: true,
-                        remap_freed_candidate: false,
-                        range_op: false,
-                    });
-                }
                 WalOp::DedupPut { .. }
                 | WalOp::DedupPutGuarded { .. }
                 | WalOp::DedupDelete { .. }
@@ -2965,7 +2872,6 @@ fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Du
         WalOp::L2pRemapRange { values, .. } => {
             metrics.record_apply_l2p_remap_range(values.len() as u64, elapsed)
         }
-        WalOp::Incref { .. } | WalOp::Decref { .. } => metrics.record_apply_refcount(elapsed),
         WalOp::DedupPut { .. }
         | WalOp::DedupPutGuarded { .. }
         | WalOp::DedupDelete { .. }

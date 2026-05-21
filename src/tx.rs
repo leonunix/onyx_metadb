@@ -25,6 +25,8 @@
 //!
 //! [`WalOp`]: crate::wal::WalOp
 
+use std::collections::HashMap;
+
 use crate::dedup_types::{DedupValue, Hash8};
 use crate::error::Result;
 use crate::paged::L2pValue;
@@ -33,7 +35,7 @@ use crate::wal::WalOp;
 
 /// Per-op outcome returned from the apply phase. Auto-commit wrappers
 /// around `Transaction` use these to surface pre-images through the
-/// existing `Db::insert` / `Db::incref_pba` / … signatures.
+/// existing `Db::insert` / `Db::delete` / … signatures.
 ///
 /// Phase A reserves variants for the onyx-adapter ops that land in
 /// sessions S2–S4 of [`docs/ONYX_INTEGRATION_PLAN.md`]:
@@ -48,7 +50,12 @@ use crate::wal::WalOp;
 pub enum ApplyOutcome {
     /// L2P put/delete; returns the previous value, if any.
     L2pPrev(Option<L2pValue>),
-    /// Refcount incref/decref; returns the new refcount value.
+    /// [[no-refcount-hot-path-design]] Phase 5: standalone refcount
+    /// ops were retired (WAL schema 0xB7), and the hot path no longer
+    /// emits implicit refcount deltas from L2P remaps. This variant
+    /// stays only because the dispatch plumbing still threads a
+    /// per-shard rc lane that produces zero outcomes. Future cleanup
+    /// can remove both the lane and this variant together.
     RefcountNew(u32),
     /// Dedup put/delete; no pre-image surfaced (LSM reads are not
     /// constant-time, and callers don't need the old value).
@@ -220,9 +227,8 @@ impl<'db> Transaction<'db> {
     /// and `ApplyOutcome::L2pRemap { applied: false, .. }` is
     /// reported. `None` applies unconditionally.
     ///
-    /// `insert` / `delete` / `incref_pba` / `decref_pba` stay for
-    /// diagnostic / non-refcount paths; the remap primitive is the
-    /// canonical onyx write op.
+    /// `insert` / `delete` stay for non-refcount L2P paths; the remap
+    /// primitive is the canonical onyx write op.
     pub fn l2p_remap(
         &mut self,
         vol_ord: VolumeOrdinal,
@@ -272,9 +278,16 @@ impl<'db> Transaction<'db> {
         self
     }
 
-    /// Buffer a dedup put.
+    /// Buffer a dedup put. The `old_pba` slot is left as `None`
+    /// here and resolved against the current dedup_index just before
+    /// the WAL is encoded (see [`resolve_dedup_old_pbas`]); callers
+    /// don't need to know the prior `head_pba()`.
     pub fn put_dedup(&mut self, hash: Hash8, value: DedupValue) -> &mut Self {
-        self.ops.push(WalOp::DedupPut { hash, value });
+        self.ops.push(WalOp::DedupPut {
+            hash,
+            value,
+            old_pba: None,
+        });
         self
     }
 
@@ -291,13 +304,17 @@ impl<'db> Transaction<'db> {
             value,
             pba_guard,
             min_rc,
+            old_pba: None,
         });
         self
     }
 
     /// Buffer a dedup tombstone.
     pub fn delete_dedup(&mut self, hash: Hash8) -> &mut Self {
-        self.ops.push(WalOp::DedupDelete { hash });
+        self.ops.push(WalOp::DedupDelete {
+            hash,
+            old_pba: None,
+        });
         self
     }
 
@@ -321,18 +338,6 @@ impl<'db> Transaction<'db> {
             old_value,
             new_value,
         });
-        self
-    }
-
-    /// Buffer a refcount increment. `delta == 0` is allowed.
-    pub fn incref_pba(&mut self, pba: Pba, delta: u32) -> &mut Self {
-        self.ops.push(WalOp::Incref { pba, delta });
-        self
-    }
-
-    /// Buffer a refcount decrement.
-    pub fn decref_pba(&mut self, pba: Pba, delta: u32) -> &mut Self {
-        self.ops.push(WalOp::Decref { pba, delta });
         self
     }
 
@@ -395,7 +400,8 @@ impl<'db> Transaction<'db> {
     /// record. Nothing is written if the transaction is empty; we
     /// return the last applied LSN instead, so read-your-writes still
     /// works when a caller races a commit against an empty commit.
-    pub fn commit(self) -> Result<Lsn> {
+    pub fn commit(mut self) -> Result<Lsn> {
+        self.resolve_dedup_old_pbas()?;
         self.db.commit_ops(&self.ops).map(|(lsn, _)| lsn)
     }
 
@@ -411,7 +417,8 @@ impl<'db> Transaction<'db> {
     /// to route e.g. `ApplyOutcome::L2pRemap.freed_pba` back to the
     /// `WalOp::L2pRemap` that produced it. `apply_op_bare` must return
     /// `Ok(_)` for every op; a `debug_assert!` would fire otherwise.
-    pub fn commit_with_outcomes(self) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+    pub fn commit_with_outcomes(mut self) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+        self.resolve_dedup_old_pbas()?;
         self.db.commit_ops(&self.ops)
     }
 
@@ -421,7 +428,118 @@ impl<'db> Transaction<'db> {
     /// metadb checkpoint persists the returned LSN. This is intended for
     /// Onyx LV2-backed flush commits, not lifecycle or standalone metadata
     /// operations.
-    pub fn commit_unlogged_with_outcomes(self) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+    pub fn commit_unlogged_with_outcomes(mut self) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+        self.resolve_dedup_old_pbas()?;
         self.db.commit_ops_unlogged(&self.ops)
+    }
+
+    /// Fill in the embedded `old_pba` on every `DedupPut` /
+    /// `DedupPutGuarded` / `DedupDelete` op the caller buffered with
+    /// `None`. Reads the on-disk dedup_index once per unique hash and
+    /// honours intra-batch chains: a second op against the same hash
+    /// in the same transaction sees the first op's `value.head_pba()`
+    /// as its `old_pba`, matching what the live apply path computes
+    /// from a serialized read view.
+    ///
+    /// [[no-refcount-hot-path-design]] Phase 5 needs apply to be
+    /// deterministic from the WAL alone — the on-disk dedup_index
+    /// data pages are written eagerly per op (only the meta page is
+    /// checkpoint-gated), so replaying `apply_op_bare` against the
+    /// post-crash dedup_index state previously observed a hash → value
+    /// mapping that already reflected ops above `checkpoint_lsn` and
+    /// computed the wrong rc deltas.
+    ///
+    /// Concurrent-commit note: in metadb today different writer threads
+    /// can race two `tx.commit()`s targeting the same hash. The reads
+    /// here are not serialized against another transaction's apply, so
+    /// two concurrent puts on the same hash may both capture the same
+    /// `old_pba`. The onyx writer is per-volume serialized and the
+    /// hash key space is high-entropy, so this collides only on the
+    /// pathological "two volumes write the same 4 KiB content at the
+    /// same instant" case; if that becomes a hotspot the fix is a
+    /// per-hash-shard serialization gate around the read + WAL submit.
+    fn resolve_dedup_old_pbas(&mut self) -> Result<()> {
+        let needs_resolution = self.ops.iter().any(|op| {
+            matches!(
+                op,
+                WalOp::DedupPut { old_pba: None, .. }
+                    | WalOp::DedupPutGuarded { old_pba: None, .. }
+                    | WalOp::DedupDelete { old_pba: None, .. }
+            )
+        });
+        if !needs_resolution {
+            return Ok(());
+        }
+        let mut in_batch: HashMap<Hash8, Option<Pba>> = HashMap::new();
+        for op in self.ops.iter_mut() {
+            match op {
+                WalOp::DedupPut {
+                    hash,
+                    value,
+                    old_pba,
+                } => {
+                    if old_pba.is_none() {
+                        let resolved = match in_batch.get(hash) {
+                            Some(v) => *v,
+                            None => self.db.dedup_lookup_head_pba(hash)?,
+                        };
+                        *old_pba = resolved;
+                    }
+                    in_batch.insert(*hash, Some(value.head_pba()));
+                }
+                WalOp::DedupPutGuarded {
+                    hash,
+                    value,
+                    old_pba,
+                    ..
+                } => {
+                    if old_pba.is_none() {
+                        let resolved = match in_batch.get(hash) {
+                            Some(v) => *v,
+                            None => self.db.dedup_lookup_head_pba(hash)?,
+                        };
+                        *old_pba = resolved;
+                    }
+                    // Guarded puts may be skipped by apply; only update
+                    // the intra-batch view once we know they applied.
+                    // The conservative choice is to assume they did
+                    // apply — a follow-up op against the same hash
+                    // typically expects to see the guarded put's
+                    // value. If the guard rejects, the apply-time
+                    // refcount short-circuits and the leftover stale
+                    // `old_pba` on the follow-up op is harmless: that
+                    // follow-up's own guard / unguarded path will
+                    // produce the right rc deltas based on its
+                    // captured value.
+                    in_batch.insert(*hash, Some(value.head_pba()));
+                }
+                WalOp::DedupDelete { hash, old_pba } => {
+                    if old_pba.is_none() {
+                        let resolved = match in_batch.get(hash) {
+                            Some(v) => *v,
+                            None => self.db.dedup_lookup_head_pba(hash)?,
+                        };
+                        *old_pba = resolved;
+                    }
+                    in_batch.insert(*hash, None);
+                }
+                WalOp::DedupComparePut {
+                    hash, new_value, ..
+                } => {
+                    // Compare ops don't carry a separate `old_pba`
+                    // slot — they already embed `old_value` and the
+                    // apply path uses `old_value.head_pba()` directly
+                    // when the compare succeeds. We still update the
+                    // intra-batch view so a follow-up put/delete sees
+                    // the right "prior" hash value.
+                    in_batch.insert(*hash, Some(new_value.head_pba()));
+                }
+                WalOp::DedupCompareDelete { hash, .. } => {
+                    in_batch.insert(*hash, None);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }

@@ -1,16 +1,12 @@
 fn generate_worker_op(tid: usize, rng: &mut ChaCha8Rng, model: &Model) -> WorkerOp {
     let slot = rng.gen_range(0..KEY_SLOTS_PER_THREAD);
-    let pba = refcount_pba(tid, slot);
     let live = model.live_volumes();
     let vol_ord = live[rng.gen_range(0..live.len())];
     let kind = match rng.gen_range(0..100) {
-        0..=29 => WorkerOpKind::Insert(rng.r#gen()),
-        30..=39 => WorkerOpKind::Delete,
-        40..=59 => WorkerOpKind::PutDedup(rng.r#gen()),
-        60..=69 => WorkerOpKind::DeleteDedup,
-        70..=84 => WorkerOpKind::Incref,
-        85..=94 if model.refcount.get(&pba).copied().unwrap_or(0) > 0 => WorkerOpKind::Decref,
-        85..=94 => WorkerOpKind::Get,
+        0..=39 => WorkerOpKind::Insert(rng.r#gen()),
+        40..=49 => WorkerOpKind::Delete,
+        50..=79 => WorkerOpKind::PutDedup(rng.r#gen()),
+        80..=89 => WorkerOpKind::DeleteDedup,
         _ => WorkerOpKind::Get,
     };
     WorkerOp {
@@ -80,24 +76,6 @@ fn apply_worker_op(model: &mut Model, op: &WorkerOp) -> Result<(), String> {
         }
         WorkerOpKind::DeleteDedup => {
             model.dedup.remove(&dedup_hash(op.tid, op.slot));
-        }
-        WorkerOpKind::Incref => {
-            *model
-                .refcount
-                .entry(refcount_pba(op.tid, op.slot))
-                .or_insert(0) += 1;
-        }
-        WorkerOpKind::Decref => {
-            let pba = refcount_pba(op.tid, op.slot);
-            if let Some(value) = model.refcount.get_mut(&pba) {
-                if *value == 0 {
-                    return Err(format!("model underflow on pba {pba}"));
-                }
-                *value -= 1;
-                if *value == 0 {
-                    model.refcount.remove(&pba);
-                }
-            }
         }
         WorkerOpKind::Get => {}
         WorkerOpKind::OnyxRemap { .. }

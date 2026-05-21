@@ -43,8 +43,6 @@ where
         "delete" => WorkerOpKind::Delete,
         "put_dedup" => WorkerOpKind::PutDedup(arg as u8),
         "delete_dedup" => WorkerOpKind::DeleteDedup,
-        "incref" => WorkerOpKind::Incref,
-        "decref" => WorkerOpKind::Decref,
         "get" => WorkerOpKind::Get,
         "onyx_remap" => WorkerOpKind::OnyxRemap {
             pba: arg,
@@ -73,8 +71,6 @@ fn worker_kind_name(kind: &WorkerOpKind) -> &'static str {
         WorkerOpKind::Delete => "delete",
         WorkerOpKind::PutDedup(_) => "put_dedup",
         WorkerOpKind::DeleteDedup => "delete_dedup",
-        WorkerOpKind::Incref => "incref",
-        WorkerOpKind::Decref => "decref",
         WorkerOpKind::Get => "get",
         WorkerOpKind::OnyxRemap { .. } => "onyx_remap",
         WorkerOpKind::OnyxRangeDelete { .. } => "onyx_range_delete",

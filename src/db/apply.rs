@@ -111,8 +111,34 @@ pub(super) fn apply_op_bare(
             };
             Ok(ApplyOutcome::L2pPrev(prev))
         }
-        WalOp::DedupPut { hash, value } => {
-            dedup_index.put(*hash, *value, lsn)?;
+        // [[no-refcount-hot-path-design]] Phase 5: `DedupPut` is now the
+        // only event that bumps global rc — the hot-path L2P apply arms
+        // were stripped of inline incref/decref. The contract is:
+        //   - inserting a fresh `(hash → pba)` entry         → incref(pba) by 1
+        //   - replacing an existing entry at the same hash  → decref(old.pba), incref(new.pba)
+        //     (no-op when old.pba == new.pba)
+        //   - removing an entry                              → decref(pba)
+        // Together with `apply_promotion_chunk` (clone walker) and
+        // `apply_free_pbas` (lineage GC), this keeps `rc[pba] > 0` as
+        // the "shared via dedup_index" signal that `apply_free_pbas`
+        // relies on. Replay safety: dedup_index operations are
+        // idempotent at the LSN-cutoff level (the WAL replay only
+        // re-applies records strictly above `checkpoint_lsn`), so the
+        // non-idempotent `rc.stage(±1)` here is safe under the same
+        // invariant.
+        WalOp::DedupPut {
+            hash,
+            value,
+            old_pba,
+        } => {
+            apply_dedup_put_with_rc(
+                dedup_index,
+                refcount_shards,
+                lsn,
+                *hash,
+                *value,
+                *old_pba,
+            )?;
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupPutGuarded {
@@ -120,21 +146,40 @@ pub(super) fn apply_op_bare(
             value,
             pba_guard,
             min_rc,
+            old_pba,
         } => {
             let sid = shard_for_key(refcount_shards, *pba_guard);
             if refcount_shards[sid].rc.get(*pba_guard)? >= *min_rc {
-                dedup_index.put(*hash, *value, lsn)?;
+                apply_dedup_put_with_rc(
+                    dedup_index,
+                    refcount_shards,
+                    lsn,
+                    *hash,
+                    *value,
+                    *old_pba,
+                )?;
             }
             Ok(ApplyOutcome::Dedup)
         }
-        WalOp::DedupDelete { hash } => {
-            dedup_index.delete(hash, lsn)?;
+        WalOp::DedupDelete { hash, old_pba } => {
+            apply_dedup_delete_with_rc(dedup_index, refcount_shards, lsn, hash, *old_pba)?;
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupCompareDelete { hash, old_value } => {
-            let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
+            let cur = dedup_index.get(hash)?;
+            let applied = cur.as_ref() == Some(old_value);
             if applied {
-                dedup_index.delete(hash, lsn)?;
+                // The compare ensured the on-disk entry equals
+                // `old_value`, so its head_pba is the right pba to
+                // decref. Compare ops don't carry a separate
+                // `old_pba` slot (the value is sufficient).
+                apply_dedup_delete_with_rc(
+                    dedup_index,
+                    refcount_shards,
+                    lsn,
+                    hash,
+                    Some(old_value.head_pba()),
+                )?;
             }
             Ok(ApplyOutcome::DedupCompare { applied })
         }
@@ -143,25 +188,19 @@ pub(super) fn apply_op_bare(
             old_value,
             new_value,
         } => {
-            let applied = dedup_index.get(hash)?.as_ref() == Some(old_value);
+            let cur = dedup_index.get(hash)?;
+            let applied = cur.as_ref() == Some(old_value);
             if applied {
-                dedup_index.put(*hash, *new_value, lsn)?;
+                apply_dedup_put_with_rc(
+                    dedup_index,
+                    refcount_shards,
+                    lsn,
+                    *hash,
+                    *new_value,
+                    Some(old_value.head_pba()),
+                )?;
             }
             Ok(ApplyOutcome::DedupCompare { applied })
-        }
-        WalOp::Incref { pba, delta } => {
-            let sid = shard_for_key(refcount_shards, *pba);
-            let (_, new) = refcount_shards[sid]
-                .rc
-                .stage(*pba, i64::from(*delta), lsn)?;
-            Ok(ApplyOutcome::RefcountNew(new))
-        }
-        WalOp::Decref { pba, delta } => {
-            let sid = shard_for_key(refcount_shards, *pba);
-            let (_, new) = refcount_shards[sid]
-                .rc
-                .stage(*pba, -i64::from(*delta), lsn)?;
-            Ok(ApplyOutcome::RefcountNew(new))
         }
         WalOp::L2pRemap {
             vol_ord,
@@ -323,6 +362,89 @@ pub(super) fn apply_promotion_complete(
     Ok(ApplyOutcome::PromotionComplete)
 }
 
+/// [[no-refcount-hot-path-design]] Phase 5 helper: put a `(hash, value)`
+/// into the dedup_index and reconcile the global refcount of the head
+/// PBA. `DedupPut` is one of the three remaining rc-mutating events
+/// (the others are `PromotionChunk` and `FreePbas`), so this helper is
+/// the single place where the "DedupPut bumps rc" contract lives.
+///
+/// Behavior given the WAL-embedded `old_pba`:
+///
+/// | `old_pba` | Same as `new_pba`? | rc work |
+/// |-----------|--------------------|---------|
+/// | `None`    | —                  | incref(new) |
+/// | `Some(p)` | yes                | none (idempotent re-put) |
+/// | `Some(p)` | no                 | decref(p) + incref(new) |
+///
+/// `old_pba` is captured at `Transaction::commit` time and embedded in
+/// the `WalOp::DedupPut` record (WAL schema 0xB8), so the apply path is
+/// deterministic from the WAL alone — no dedup_index read here. That
+/// matters for replay: dedup_index data pages are written eagerly per
+/// op (only the meta page is checkpoint-gated; see
+/// `lifecycle.rs::open_with_config_and_faults`), so reading the on-disk
+/// dedup_index during replay would observe a state already reflecting
+/// ops above `checkpoint_lsn` and stage the wrong rc deltas.
+pub(super) fn apply_dedup_put_with_rc(
+    dedup_index: &crate::dedup::DedupIndex,
+    refcount_shards: &[Shard],
+    lsn: Lsn,
+    hash: Hash8,
+    value: DedupValue,
+    old_pba: Option<Pba>,
+) -> Result<()> {
+    let new_pba = value.head_pba();
+    // Stage rc deltas BEFORE the dedup_index put so a stale-entry skip
+    // (see below) doesn't leave the index ahead of the rc table on
+    // error. Within a single apply LSN every op is serialized for the
+    // hash's shard, so the `get(old_pba)` floor check below cannot race
+    // with a concurrent rc mutation.
+    if old_pba != Some(new_pba) {
+        if let Some(op) = old_pba {
+            let sid = shard_for_key(refcount_shards, op);
+            // Phase 5: dedup_index entries can become stale when
+            // lineage GC's `FreePbas` decrefs a PBA without first
+            // invoking onyx-side `delete_dedup_index_if_matches`
+            // cleanup (the cleanup path is best-effort). A subsequent
+            // `DedupPut` on the stale hash should not double-decref
+            // — the entry never represented a live shared reference
+            // by the time we got here.
+            if refcount_shards[sid].rc.get(op)? > 0 {
+                refcount_shards[sid].rc.stage(op, -1, lsn)?;
+            }
+        }
+        let sid = shard_for_key(refcount_shards, new_pba);
+        refcount_shards[sid].rc.stage(new_pba, 1, lsn)?;
+    }
+    dedup_index.put(hash, value, lsn)?;
+    Ok(())
+}
+
+/// [[no-refcount-hot-path-design]] Phase 5 helper: drop a hash from the
+/// dedup_index and decref the head PBA's global refcount. Pair with
+/// [`apply_dedup_put_with_rc`]. `old_pba` is the captured `head_pba()`
+/// from the WAL record; `None` means there was no prior entry, in
+/// which case the delete is a no-op on the rc side.
+pub(super) fn apply_dedup_delete_with_rc(
+    dedup_index: &crate::dedup::DedupIndex,
+    refcount_shards: &[Shard],
+    lsn: Lsn,
+    hash: &Hash8,
+    old_pba: Option<Pba>,
+) -> Result<()> {
+    if let Some(pba) = old_pba {
+        let sid = shard_for_key(refcount_shards, pba);
+        // See `apply_dedup_put_with_rc` for the stale-entry contract:
+        // a dedup_index row pointing to a PBA whose rc has been driven
+        // to 0 by lineage GC is stale, and removing it must not
+        // underflow the rc table.
+        if refcount_shards[sid].rc.get(pba)? > 0 {
+            refcount_shards[sid].rc.stage(pba, -1, lsn)?;
+        }
+    }
+    dedup_index.delete(hash, lsn)?;
+    Ok(())
+}
+
 /// Apply a batched `WalOp::FreePbas` with exclusive/shared split
 /// ([[no-refcount-hot-path-design]] Phase 4 Step 3).
 ///
@@ -452,36 +574,24 @@ pub(super) fn record_dead(volume: &Volume, prev: Option<L2pValue>, death_lsn: Ls
     }
 }
 
-/// Apply one [`WalOp::L2pRemap`]. Fuses L2P put + refcount decref(old)
-/// + refcount incref(new) + (optionally) a liveness guard read into one
-/// atomic step — the onyx adapter hot path.
+/// Apply one [`WalOp::L2pRemap`]. Mutates the L2P shard
+/// (buffer or tree, depending on the B2 toggle) and emits the dead-list
+/// record for the previous mapping. Phase 5 rule: hot-path L2P remaps
+/// are **rc-neutral**. The only events that bump global refcounts are
+/// `PromotionChunk` (clone walker), `FreePbas` (Lineage GC), and the
+/// `DedupPut`/`DedupDelete`/`Dedup{Compare,}{Put,Delete}` family — all
+/// dispatched via [`apply_dedup_put_with_rc`] / [`apply_dedup_delete_with_rc`]
+/// / [`apply_promotion_chunk`] / [`apply_free_pbas`]. See the
+/// [[no-refcount-hot-path-design]] note in `apply_op_bare`.
 ///
-/// Decision table (post birth/death LSN + precise snap-pin check):
+/// `snap_infos` is currently unused: Phase 5's pinning is enforced via
+/// `birth_lsn` (lineage GC consumer side) rather than the per-remap
+/// snap-pin walk that the pre-Phase-5 hot path performed. Kept on the
+/// signature so callers (`apply_op_bare`, replay) don't churn; remove
+/// once all entry points migrate.
 ///
-/// | prev        | new vs old | snap pins (V,lba,old)? | decref(old) | incref(new) |
-/// |-------------|------------|------------------------|-------------|-------------|
-/// | `None`      | —          | —                      | no          | **yes**     |
-/// | `Some(old)` | same       | —                      | no          | no          |
-/// | `Some(old)` | different  | no                     | **yes**     | **yes**     |
-/// | `Some(old)` | different  | yes (suppress)         | no          | **yes**     |
-///
-/// "Snap pins (V, lba, old)" = some live snap of V has lba mapped to
-/// old_pba in its L2P. Decided in two stages:
-///   1. Fast filter: `old_pba.birth_lsn > min(snap.created_lsn)` →
-///      content is younger than every snap → no snap can pin it → no.
-///   2. Otherwise read each snap's L2P at lba (cached after first
-///      access) → match against old_pba.
-///
-/// Replaces the legacy `leaf_was_shared` proxy, which only fired on
-/// the *first* COW of a snapshot-shared leaf and missed subsequent
-/// overwrites in the same (now-private) leaf — see
-/// [`docs/ONYX_INTEGRATION_SPEC.md`](../../docs/ONYX_INTEGRATION_SPEC.md)
-/// §4.4.
-///
-/// Locking: the L2P shard mutex stays held across snap reads + refcount
-/// RMWs so the suppress decision and the incref/decref land atomically
-/// against any concurrent op on the same (vol, lba). Snap reads use
-/// the same `PagedL2p` instance (different root) so no extra locks.
+/// `guard` still applies — onyx-side dedup-hit promote relies on a
+/// liveness floor read of a target PBA's rc to gate the remap.
 pub(super) fn apply_l2p_remap(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
@@ -490,29 +600,21 @@ pub(super) fn apply_l2p_remap(
     lba: Lba,
     new_value: L2pValue,
     guard: Option<(Pba, u32)>,
-    snap_infos: &[SnapInfo],
+    _snap_infos: &[SnapInfo],
 ) -> Result<ApplyOutcome> {
     let volume = volumes.get(&vol_ord).ok_or_else(|| {
         MetaDbError::Corruption(format!("L2pRemap for unknown volume ord {vol_ord}"))
     })?;
     let l2p_sid = shard_for_key_l2p(&volume.shards, lba);
-    let new_pba = new_value.head_pba();
-    let new_is_zero = new_value.0[27] & 0x02 != 0;
     let use_buffer = volume.shards[l2p_sid].use_buffer;
 
-    // Guard check is done after the L2P shard mutex is taken but
-    // before any mutation, so the "guard passed" decision and the
-    // subsequent put/incref/decref sit inside the same critical
-    // section (SPEC §4.3). The guard reads the target-pba's refcount
-    // shard; that shard may differ from `new_pba` / `old_pba`'s
-    // shards — we acquire all needed refcount shards up front in
-    // sorted order to avoid cross-shard deadlock.
-    //
-    // In the B2 buffer path the tree write lock STILL protects against
-    // concurrent compactor cycles on this shard. Per-shard apply
-    // serialisation comes from the apply lane (one worker per shard),
-    // not from this lock. The lock prevents commits from racing the
-    // compactor's `tree.write()` mid-cycle.
+    // The L2P shard write lock (or, on the B2 path, its serialising
+    // role against compactor cycles) brackets the guard read + L2P
+    // write so the "guard passed" decision and the put land atomically
+    // against concurrent ops on this (vol, lba). Per-shard apply
+    // serialisation comes from the apply lane (one worker per shard);
+    // this lock prevents commits from racing the compactor's
+    // `tree.write()` mid-cycle.
     let mut tree = volume.shards[l2p_sid].tree.write();
 
     if let Some((gp, min_rc)) = guard {
@@ -558,68 +660,7 @@ pub(super) fn apply_l2p_remap(
         tree.insert_at_lsn(lba, new_value, lsn)?
     };
     record_dead(volume, prev, lsn);
-    let old_pba = prev.map(|p| p.head_pba());
 
-    // Snapshot-pin check: does any live snap of `vol_ord` map `lba`
-    // to the FULL `L2pValue` we're about to lose / gain? Audit
-    // semantics count distinct `(V, lba, value_28B)` tuples — so two
-    // values that share head_pba but differ on later bytes (e.g.
-    // `salt`) are independently counted, and a snap pinning
-    // `(V, lba, old_value)` blocks decref of `head_pba(old_value)`
-    // only when the FULL value matches.
-    //
-    // Two-stage detection:
-    //   1. Per-snap fast filter: skip any snap whose `created_lsn` is
-    //      earlier than `target.head_pba`'s `birth_lsn` — that snap was
-    //      taken before the content existed and cannot reference it.
-    //      Saves 1 paged-tree walk per skippable snap.
-    //   2. For surviving candidates, walk `L2P[V][lba]` from each
-    //      snap's root (single paged-tree get, hot pages cached) and
-    //      compare full value.
-    // Reads use the same shard's `tree` instance via `get_at(snap_root,
-    // lba)` so no extra locking is needed.
-    let snap_sid = shard_for_key_l2p(&volume.shards, lba);
-    let any_snap_pins =
-        |target: L2pValue, target_birth: Option<Lsn>, tree: &mut PagedL2p| -> Result<bool> {
-            for s in snap_infos {
-                if let Some(b) = target_birth {
-                    if b > s.created_lsn {
-                        // pba content was born after this snap — snap
-                        // can't reference it via any lba.
-                        continue;
-                    }
-                }
-                let snap_root = s.l2p_shard_roots[snap_sid];
-                if let Some(snap_val) = tree.get_at(snap_root, lba)? {
-                    if snap_val == target {
-                        return Ok(true);
-                    }
-                }
-            }
-            Ok(false)
-        };
-
-    let snap_pins_old = if snap_infos.is_empty() {
-        false
-    } else {
-        match prev {
-            Some(old_value) => {
-                let birth = lookup_birth_lsn(refcount_shards, old_value.head_pba())?;
-                any_snap_pins(old_value, birth, &mut tree)?
-            }
-            None => false,
-        }
-    };
-    let snap_pins_new = if new_is_zero || snap_infos.is_empty() {
-        false
-    } else {
-        let birth = lookup_birth_lsn(refcount_shards, new_pba)?;
-        any_snap_pins(new_value, birth, &mut tree)?
-    };
-
-    // Publish here — snap_pins above needed `&mut tree`; below this
-    // line the function only touches refcount shards.
-    //
     // B2 path: the compactor will publish on its next cycle, so commit
     // here only needs to make the buffer entry observable, which
     // `buffer.insert` did atomically above.
@@ -627,48 +668,10 @@ pub(super) fn apply_l2p_remap(
         publish_l2p_read_view(&volume.shards[l2p_sid], &tree);
     }
 
-    // Decision: rc[head_pba] changes only when the tuple is gained /
-    // lost from the union of (live ∪ all snaps). `prev != Some(new)`
-    // captures "live's mapping at this lba changes value byte-for-byte".
-    let value_changed = prev != Some(new_value);
-    let live_loses_old = prev.is_some() && value_changed;
-    let live_gains_new = value_changed;
-    let old_is_zero = prev.is_some_and(|old_value| old_value.0[27] & 0x02 != 0);
-    let do_decref = live_loses_old && !old_is_zero && !snap_pins_old;
-    let do_incref = live_gains_new && !new_is_zero && !snap_pins_new;
-
-    // Collapse per-pba net delta before taking shard locks. Same-head-pba
-    // overwrites can legitimately add and remove one logical version in the
-    // same op; applying the decref and incref independently would transiently
-    // hit rc=0 and incorrectly surface `freed_pba` even though the net effect
-    // is zero.
-    let mut net_delta: HashMap<Pba, i32> = HashMap::new();
-    if do_decref {
-        let pba = old_pba.expect("do_decref implies prev.is_some()");
-        *net_delta.entry(pba).or_insert(0) -= 1;
-    }
-    if do_incref {
-        *net_delta.entry(new_pba).or_insert(0) += 1;
-    }
-    let mut touched: Vec<(usize, Pba, i32)> = net_delta
-        .into_iter()
-        .filter(|(_, delta)| *delta != 0)
-        .map(|(pba, delta)| (shard_for_key(refcount_shards, pba), pba, delta))
-        .collect();
-    touched.sort_by_key(|(sid, _, _)| *sid);
-
-    let mut freed_pba: Option<Pba> = None;
-    for (sid, pba, delta) in touched {
-        let (pre, new) = refcount_shards[sid].rc.stage(pba, i64::from(delta), lsn)?;
-        if new == 0 && pre > 0 {
-            freed_pba = Some(pba);
-        }
-    }
-
     Ok(ApplyOutcome::L2pRemap {
         applied: true,
         prev,
-        freed_pba,
+        freed_pba: None,
     })
 }
 
@@ -702,8 +705,9 @@ pub(super) fn apply_l2p_remap_range(
     vol_ord: VolumeOrdinal,
     start_lba: Lba,
     values: &[L2pValue],
-    snap_infos: &[SnapInfo],
+    _snap_infos: &[SnapInfo],
 ) -> Result<ApplyOutcome> {
+    let _ = refcount_shards;
     let volume = volumes.get(&vol_ord).ok_or_else(|| {
         MetaDbError::Corruption(format!("L2pRemapRange for unknown volume ord {vol_ord}"))
     })?;
@@ -723,12 +727,6 @@ pub(super) fn apply_l2p_remap_range(
     let mut prevs: Vec<Option<L2pValue>> = vec![None; n];
     let mut applied: Vec<bool> = vec![false; n];
 
-    // Net per-PBA delta across the whole range. Same collapse logic as
-    // apply_l2p_remap, just summed over N LBAs: identical PBA on both
-    // sides of an overwrite (same head_pba but different other bytes
-    // → seq trailer differs) won't transiently hit rc=0 mid-range.
-    let mut net_delta: HashMap<Pba, i32> = HashMap::new();
-
     for (l2p_sid, indices) in shard_buckets.iter().enumerate() {
         if indices.is_empty() {
             continue;
@@ -739,8 +737,6 @@ pub(super) fn apply_l2p_remap_range(
         for &i in indices {
             let lba = start_lba + i as u64;
             let new_value = values[i];
-            let new_pba = new_value.head_pba();
-            let new_is_zero = new_value.0[27] & 0x02 != 0;
 
             // Buffer-first lookup matching apply_l2p_remap's path.
             let cur = if use_buffer {
@@ -773,66 +769,6 @@ pub(super) fn apply_l2p_remap_range(
             record_dead(volume, prev, lsn);
             prevs[i] = prev;
             applied[i] = true;
-            let old_pba = prev.map(|p| p.head_pba());
-
-            // Snap-pin check: per-LBA, same shape as apply_l2p_remap.
-            // The closure captures snap_infos + l2p_sid (which doubles
-            // as snap_sid because shard_for_key_l2p is volume-agnostic).
-            let snap_sid = l2p_sid;
-            let any_snap_pins = |target: L2pValue,
-                                 target_birth: Option<Lsn>,
-                                 tree: &mut PagedL2p|
-             -> Result<bool> {
-                for s in snap_infos {
-                    if let Some(b) = target_birth {
-                        if b > s.created_lsn {
-                            continue;
-                        }
-                    }
-                    let snap_root = s.l2p_shard_roots[snap_sid];
-                    if let Some(snap_val) = tree.get_at(snap_root, lba)? {
-                        if snap_val == target {
-                            return Ok(true);
-                        }
-                    }
-                }
-                Ok(false)
-            };
-
-            let snap_pins_old = if snap_infos.is_empty() {
-                false
-            } else {
-                match prev {
-                    Some(old_value) => {
-                        let birth =
-                            lookup_birth_lsn(refcount_shards, old_value.head_pba())?;
-                        any_snap_pins(old_value, birth, &mut tree)?
-                    }
-                    None => false,
-                }
-            };
-            let snap_pins_new = if new_is_zero || snap_infos.is_empty() {
-                false
-            } else {
-                let birth = lookup_birth_lsn(refcount_shards, new_pba)?;
-                any_snap_pins(new_value, birth, &mut tree)?
-            };
-
-            let value_changed = prev != Some(new_value);
-            let live_loses_old = prev.is_some() && value_changed;
-            let live_gains_new = value_changed;
-            let old_is_zero =
-                prev.is_some_and(|old_value| old_value.0[27] & 0x02 != 0);
-            let do_decref = live_loses_old && !old_is_zero && !snap_pins_old;
-            let do_incref = live_gains_new && !new_is_zero && !snap_pins_new;
-
-            if do_decref {
-                let pba = old_pba.expect("do_decref implies prev.is_some()");
-                *net_delta.entry(pba).or_insert(0) -= 1;
-            }
-            if do_incref {
-                *net_delta.entry(new_pba).or_insert(0) += 1;
-            }
         }
 
         // Publish once per shard, after all LBAs in this bucket mutated.
@@ -841,28 +777,13 @@ pub(super) fn apply_l2p_remap_range(
         }
     }
 
-    // Apply refcount deltas in shard-sorted order to avoid cross-shard
-    // deadlock with other paths that follow the same convention.
-    let mut touched: Vec<(usize, Pba, i32)> = net_delta
-        .into_iter()
-        .filter(|(_, delta)| *delta != 0)
-        .map(|(pba, delta)| (shard_for_key(refcount_shards, pba), pba, delta))
-        .collect();
-    touched.sort_by_key(|(sid, _, _)| *sid);
-
-    let mut freed_pbas: Vec<Pba> = Vec::new();
-    for (sid, pba, delta) in touched {
-        let (pre, new) =
-            refcount_shards[sid].rc.stage(pba, i64::from(delta), lsn)?;
-        if new == 0 && pre > 0 {
-            freed_pbas.push(pba);
-        }
-    }
-
+    // Phase 5: hot-path L2P remaps are rc-neutral (see `apply_l2p_remap`
+    // for the rationale). `freed_pbas` is surfaced by `apply_free_pbas`
+    // / lineage GC; this outcome always returns an empty vec.
     Ok(ApplyOutcome::L2pRemapRange {
         applied: applied.into_boxed_slice(),
         prevs: prevs.into_boxed_slice(),
-        freed_pbas,
+        freed_pbas: Vec::new(),
     })
 }
 

@@ -319,12 +319,6 @@ fn execute_worker_op(
         WorkerOpKind::DeleteDedup => {
             db.delete_dedup(dedup_hash(op.tid, op.slot))?;
         }
-        WorkerOpKind::Incref => {
-            db.incref_pba(refcount_pba(op.tid, op.slot), 1)?;
-        }
-        WorkerOpKind::Decref => {
-            let _ = db.decref_pba(refcount_pba(op.tid, op.slot), 1);
-        }
         WorkerOpKind::Get => {
             let _ = db.get(op.vol_ord, l2p_key(op.tid, op.slot))?;
             let _ = db.get_dedup(&dedup_hash(op.tid, op.slot))?;

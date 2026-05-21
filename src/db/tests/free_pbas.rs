@@ -60,13 +60,11 @@ fn free_pbas_unknown_pba_surfaces_as_exclusive() {
 
 #[test]
 fn free_pbas_shared_decrefs_global_rc() {
-    // Shared PBA (rc>0 from a dedup-like Incref): FreePbas takes the
+    // Shared PBA (rc>0 from clone promotion): FreePbas takes the
     // shared branch, decref by 1, rc→0 surfaces it. This is the
     // Phase-5 dedup-retire path exercised through the apply API.
     let (_d, db) = mk_db();
-    let mut tx = db.begin();
-    tx.incref_pba(42, 1);
-    tx.commit().unwrap();
+    db.incref_pba(42, 1).unwrap();
     assert_eq!(db.get_refcount(42).unwrap(), 1);
 
     let mut tx = db.begin();
@@ -96,13 +94,11 @@ fn free_pbas_exclusive_bypasses_rc() {
 
 #[test]
 fn free_pbas_leaves_positive_rc_alone() {
-    // Phase 3's hot path still maintains refcount, so packed slots
-    // see rc > 1. A GC-emitted FreePbas for one of these decrements
-    // by 1 and surfaces nothing (rc stays > 0).
+    // Shared PBAs (lineage rc > 1) lose one ref per FreePbas. A
+    // GC-emitted FreePbas for one of these decrements by 1 and
+    // surfaces nothing (rc stays > 0).
     let (_d, db) = mk_db();
-    let mut tx = db.begin();
-    tx.incref_pba(7, 3); // three "owners"
-    tx.commit().unwrap();
+    db.incref_pba(7, 3).unwrap(); // three "owners"
     assert_eq!(db.get_refcount(7).unwrap(), 3);
 
     let mut tx = db.begin();
@@ -120,9 +116,7 @@ fn free_pbas_is_idempotent_on_already_zero() {
     // again via the exclusive branch. Onyx-side retire dedups via
     // set semantics so duplicate surfaces are harmless.
     let (_d, db) = mk_db();
-    let mut tx = db.begin();
-    tx.incref_pba(11, 1);
-    tx.commit().unwrap();
+    db.incref_pba(11, 1).unwrap();
 
     let mut tx1 = db.begin();
     tx1.free_pbas(0, vec![11u64].into_boxed_slice());
@@ -145,10 +139,8 @@ fn free_pbas_batched_mixed_outcomes() {
     // pba 100: rc=1 (shared, decref to 0, surfaces)
     // pba 200: rc=2 (shared, decref to 1, NOT surfaced)
     // pba 300: rc=0 (exclusive, surfaces directly without touching rc)
-    let mut tx = db.begin();
-    tx.incref_pba(100, 1);
-    tx.incref_pba(200, 2);
-    tx.commit().unwrap();
+    db.incref_pba(100, 1).unwrap();
+    db.incref_pba(200, 2).unwrap();
 
     let mut tx = db.begin();
     tx.free_pbas(0, vec![100u64, 200, 300].into_boxed_slice());

@@ -469,9 +469,12 @@ fn b2_buffer_drop_snapshot_with_buffer_overwrites() {
 #[test]
 fn b2_buffer_range_delete_drains_buffer() {
     // `range_delete` calls `force_compact_l2p_buffers` so the scan
-    // sees buffer-only entries that haven't compacted yet. Use the
-    // L2pRemap path so RC bookkeeping matches what `range_delete`
-    // expects when it decref's captured values.
+    // sees buffer-only entries that haven't compacted yet.
+    //
+    // Phase 5: hot-path `L2pRemap` no longer maintains global rc,
+    // but `apply_l2p_range_delete` still decrefs. Seed rc explicitly
+    // so range_delete has something to decref from without
+    // underflowing.
     fn remap_val(pba: Pba, tag: u8) -> L2pValue {
         let mut v = [0u8; crate::paged::format::LEAF_VALUE_SIZE];
         v[..8].copy_from_slice(&pba.to_be_bytes());
@@ -483,6 +486,7 @@ fn b2_buffer_range_delete_drains_buffer() {
         let mut tx = db.begin();
         tx.l2p_remap(0, i, remap_val(100 + i, i as u8), None);
         tx.commit_with_outcomes().unwrap();
+        db.incref_pba(100 + i, 1).unwrap();
     }
     // No flush — many writes likely still live in the buffer.
     db.range_delete(0, 10, 40).unwrap();

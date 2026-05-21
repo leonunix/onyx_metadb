@@ -36,8 +36,6 @@ enum WorkerOpKind {
     Delete,
     PutDedup(u8),
     DeleteDedup,
-    Incref,
-    Decref,
     Get,
     OnyxRemap { pba: Pba, salt: u64, guard: u8 },
     OnyxRangeDelete { len: u64 },

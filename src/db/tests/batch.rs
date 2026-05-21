@@ -30,7 +30,8 @@ fn multi_get_matches_single_gets_across_shards() {
 fn multi_get_refcount_matches_single_gets_across_shards() {
     let (_d, db) = mk_db_with_shards(4);
     for pba in 0u64..100 {
-        db.incref_pba(pba, (pba as u32 % 5) + 1).unwrap();
+        let delta = (pba as u32 % 5) + 1;
+        db.incref_pba(pba, delta).unwrap();
     }
     let pbas: Vec<Pba> = vec![99, 0, 50, 9999, 42, 50, 1, 2, 9999];
     let got = db.multi_get_refcount(&pbas).unwrap();
@@ -105,7 +106,8 @@ fn multi_dedup_entries_are_live_matches_forward_and_refcount() {
 /// Bucketed apply must produce the same per-op outcomes and the
 /// same final state as the serial path, regardless of shard
 /// routing. Batch is sized above BUCKET_THRESHOLD so the bucket
-/// branch is exercised.
+/// branch is exercised. Phase 5 retired the standalone Incref /
+/// Decref WAL ops, so the mixed batch here covers L2P + dedup only.
 #[test]
 fn bucketed_apply_matches_serial_for_mixed_batch() {
     let (_d, db) = mk_db_with_shards(4);
@@ -114,33 +116,19 @@ fn bucketed_apply_matches_serial_for_mixed_batch() {
     for i in 0..16u64 {
         tx.insert(BOOTSTRAP_VOLUME_ORD, i * 37, v((i & 0xff) as u8));
     }
-    // 12 refcount ops; Incref first so Decref has something to
-    // subtract from on the same pba.
-    for pba in 0..12u64 {
-        tx.incref_pba(pba, 3);
-    }
-    for pba in 0..6u64 {
-        tx.decref_pba(pba, 1);
-    }
     // 4 dedup ops.
     for i in 0..4u64 {
         tx.put_dedup(hash_bytes(0xAAAA, i), dedup_val(i as u8));
     }
     let (_lsn, outcomes) = tx.commit_with_outcomes().unwrap();
-    // 16 L2P + 12 Incref + 6 Decref + 4 Dedup
-    assert_eq!(outcomes.len(), 16 + 18 + 4);
+    // 16 L2P + 4 Dedup
+    assert_eq!(outcomes.len(), 16 + 4);
     // Verify a representative subset of the resulting state.
     for i in 0..16u64 {
         assert_eq!(
             db.get(BOOTSTRAP_VOLUME_ORD, i * 37).unwrap(),
             Some(v((i & 0xff) as u8)),
         );
-    }
-    for pba in 0..6u64 {
-        assert_eq!(db.get_refcount(pba).unwrap(), 2); // 3 - 1
-    }
-    for pba in 6..12u64 {
-        assert_eq!(db.get_refcount(pba).unwrap(), 3);
     }
 }
 
@@ -168,22 +156,10 @@ fn bucketed_apply_preserves_intra_bucket_order() {
     );
 }
 
-/// Same-pba incref/decref in the same batch must apply in caller
-/// order. A decref before its paired incref would underflow.
-#[test]
-fn bucketed_apply_preserves_intra_bucket_rc_order() {
-    let (_d, db) = mk_db_with_shards(2);
-    let mut tx = db.begin();
-    // Pad so batch >= threshold.
-    for pba in 0..10u64 {
-        tx.incref_pba(pba + 100, 1);
-    }
-    // Incref then Decref same pba — ordering must be preserved.
-    tx.incref_pba(77, 5);
-    tx.decref_pba(77, 2);
-    tx.commit().unwrap();
-    assert_eq!(db.get_refcount(77).unwrap(), 3);
-}
+// Phase 5 retired the standalone Incref / Decref WAL ops, so the
+// "intra-bucket rc order" test no longer has a code path to exercise
+// — refcount mutations now arrive only via PromotionChunk / FreePbas /
+// volume-lifecycle ops, and each of those orders its own work.
 
 /// Small batches also use the lane path now; this is a behavioural
 /// smoke check that the low-overhead path still applies correctly.
@@ -233,13 +209,17 @@ fn rv(pba: Pba, tag: u8) -> L2pValue {
 
 #[test]
 fn bucketed_apply_large_remap_batch_updates_refcounts_and_freed_outcome() {
+    // Phase 5: L2pRemap no longer touches global rc; freed_pba is
+    // always None. The L2P state still progresses through the bucketed
+    // apply correctly — that is the load-bearing invariant for batch
+    // dispatch.
     let (_d, db) = mk_db_with_shards(8);
     for i in 0..16u64 {
         let mut tx = db.begin();
         tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, i * 37, rv(100, i as u8), None);
         tx.commit().unwrap();
     }
-    assert_eq!(db.get_refcount(100).unwrap(), 16);
+    assert_eq!(db.get_refcount(100).unwrap(), 0);
 
     let mut tx = db.begin();
     for i in 0..16u64 {
@@ -248,29 +228,32 @@ fn bucketed_apply_large_remap_batch_updates_refcounts_and_freed_outcome() {
     let (_, outcomes) = tx.commit_with_outcomes().unwrap();
     assert_eq!(outcomes.len(), 16);
 
-    let mut freed = Vec::new();
     for outcome in outcomes {
         match outcome {
             ApplyOutcome::L2pRemap {
                 applied, freed_pba, ..
             } => {
                 assert!(applied);
-                if let Some(pba) = freed_pba {
-                    freed.push(pba);
-                }
+                assert_eq!(freed_pba, None, "Phase 5: L2pRemap never surfaces freed_pba");
             }
             other => panic!("expected L2pRemap outcome, got {other:?}"),
         }
     }
-    assert_eq!(freed, vec![100]);
     assert_eq!(db.get_refcount(100).unwrap(), 0);
     for i in 0..16u64 {
-        assert_eq!(db.get_refcount(1_000 + i).unwrap(), 1);
+        assert_eq!(db.get_refcount(1_000 + i).unwrap(), 0);
+        // L2P state must reflect the overwrite.
+        assert_eq!(
+            db.get(BOOTSTRAP_VOLUME_ORD, i * 37).unwrap(),
+            Some(rv(1_000 + i, i as u8))
+        );
     }
 }
 
 #[test]
 fn bucketed_apply_remap_preserves_same_lba_order() {
+    // Phase 5: rc unchanged; the test verifies last-write-wins L2P
+    // ordering inside the bucketed apply.
     let (_d, db) = mk_db_with_shards(4);
     let mut tx = db.begin();
     for i in 0..8u64 {
@@ -284,11 +267,12 @@ fn bucketed_apply_remap_preserves_same_lba_order() {
     assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 7).unwrap(), Some(rv(30, 1)));
     assert_eq!(db.get_refcount(10).unwrap(), 0);
     assert_eq!(db.get_refcount(20).unwrap(), 0);
-    assert_eq!(db.get_refcount(30).unwrap(), 1);
+    assert_eq!(db.get_refcount(30).unwrap(), 0);
 }
 
 #[test]
 fn bucketed_apply_remap_preserves_same_lba_order_when_leaf_grouped() {
+    // Phase 5: rc unchanged across bucket apply.
     let (_d, db) = mk_db_with_shards(1);
     let mut tx = db.begin();
     for i in 0..8u64 {
@@ -309,11 +293,13 @@ fn bucketed_apply_remap_preserves_same_lba_order_when_leaf_grouped() {
     assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 514).unwrap(), Some(rv(12, 1)));
     assert_eq!(db.get_refcount(10).unwrap(), 0);
     assert_eq!(db.get_refcount(20).unwrap(), 0);
-    assert_eq!(db.get_refcount(30).unwrap(), 1);
+    assert_eq!(db.get_refcount(30).unwrap(), 0);
 }
 
 #[test]
 fn bucketed_apply_remap_batch_handles_shared_new_pba() {
+    // Phase 5: rc unchanged; the test verifies all 32 LBAs land on the
+    // shared PBA after the bucketed apply.
     let (_d, db) = mk_db_with_shards(8);
     let mut tx = db.begin();
     for i in 0..32u64 {
@@ -321,7 +307,7 @@ fn bucketed_apply_remap_batch_handles_shared_new_pba() {
     }
     tx.commit().unwrap();
 
-    assert_eq!(db.get_refcount(777).unwrap(), 32);
+    assert_eq!(db.get_refcount(777).unwrap(), 0);
     for i in 0..32u64 {
         assert_eq!(
             db.get(BOOTSTRAP_VOLUME_ORD, i * 101).unwrap(),

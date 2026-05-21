@@ -249,12 +249,20 @@ fn drainer_enabled_same_lsn_multi_slot_same_page_no_loss() {
 
     // Pump transactions: each tx increfs all 7 pbas. Repeat 200 times.
     // With drainer interval=5ms and threshold=4, the drainer will
-    // fire mid-stream — exactly the timing the bug needs.
+    // fire mid-stream — exactly the timing the bug needs. Phase 5
+    // routes increfs through `PromotionChunk` (one chunk = one rc
+    // bucket with N stages back-to-back, identical shape to the
+    // pre-Phase-5 multi-Incref tx the bug needed).
     for _ in 0..200 {
         let mut tx = db.begin();
-        for pba in &pbas {
-            tx.incref_pba(onyx_metadb::Pba::from(*pba), 1);
-        }
+        tx.promotion_chunk(
+            0,
+            pbas.iter()
+                .map(|pba| onyx_metadb::Pba::from(*pba))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            None,
+        );
         tx.commit().unwrap();
     }
 

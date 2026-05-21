@@ -33,22 +33,18 @@
 //!
 //! Tag table:
 //!
-//! | tag | mnemonic            | payload                                                                             |   size   |
-//! |-----|---------------------|-------------------------------------------------------------------------------------|----------|
-//! | 01  | `L2P_PUT`           | vol_ord (2 B BE) + lba (8 B BE) + value (36 B)                                      |    47    |
-//! | 02  | `L2P_DELETE`        | vol_ord (2 B BE) + lba (8 B BE)                                                     |    10    |
-//! | 03  | `L2P_REMAP`         | vol_ord (2 B BE) + lba (8 B BE) + new_value (36 B) + guard_tag (1 B) + [guard]      | 48 / 60  |
-//! | 04  | `L2P_RANGE_DELETE`  | vol_ord (2 B BE) + start (8 B BE) + end (8 B BE) + count (4 B BE) + (lba,value)×count | 22+44n |
-//! | 05  | `L2P_REMAP_RANGE`   | vol_ord (2 B BE) + start_lba (8 B BE) + count (4 B BE) + value×count (36 B each)    | 15+36n   |
-//! | 10  | `DEDUP_PUT`         | hash (32 B) + value (28 B)                                                          |    60    |
-//! | 11  | `DEDUP_DEL`         | hash (32 B)                                                                         |    32    |
-//! | 12  | `DEDUP_REVERSE_PUT` | pba (8 B BE) + hash (32 B)                                                          |    40    |
-//! | 13  | `DEDUP_REVERSE_DEL` | pba (8 B BE) + hash (32 B)                                                          |    40    |
-//! | 14  | `DEDUP_PUT_GUARDED` | hash (32 B) + value (28 B) + pba_guard (8 B BE) + min_rc (4 B BE)                  |    72    |
-//! | 15  | `DEDUP_COMPARE_DELETE` | hash (32 B) + old_value (28 B)                                                   |    60    |
-//! | 16  | `DEDUP_COMPARE_PUT` | hash (32 B) + old_value (28 B) + new_value (28 B)                                  |    88    |
-//! | 20  | `INCREF`            | pba (8 B BE) + delta (4 B BE)                                                       |    12    |
-//! | 21  | `DECREF`            | pba (8 B BE) + delta (4 B BE)                                                       |    12    |
+//! | tag | mnemonic            | payload                                                                                          |    size    |
+//! |-----|---------------------|--------------------------------------------------------------------------------------------------|------------|
+//! | 01  | `L2P_PUT`           | vol_ord (2 B BE) + lba (8 B BE) + value (36 B)                                                   |    47      |
+//! | 02  | `L2P_DELETE`        | vol_ord (2 B BE) + lba (8 B BE)                                                                  |    10      |
+//! | 03  | `L2P_REMAP`         | vol_ord (2 B BE) + lba (8 B BE) + new_value (36 B) + guard_tag (1 B) + [guard]                   |  48 / 60   |
+//! | 04  | `L2P_RANGE_DELETE`  | vol_ord (2 B BE) + start (8 B BE) + end (8 B BE) + count (4 B BE) + (lba,value)×count            |  22+44n    |
+//! | 05  | `L2P_REMAP_RANGE`   | vol_ord (2 B BE) + start_lba (8 B BE) + count (4 B BE) + value×count (36 B each)                 |  15+36n    |
+//! | 10  | `DEDUP_PUT`         | hash (8 B) + value (28 B) + old_pba_tag (1 B) + [old_pba (8 B BE)]                               |  38 / 46   |
+//! | 11  | `DEDUP_DEL`         | hash (8 B) + old_pba_tag (1 B) + [old_pba (8 B BE)]                                              |  10 / 18   |
+//! | 14  | `DEDUP_PUT_GUARDED` | hash (8 B) + value (28 B) + pba_guard (8 B BE) + min_rc (4 B BE) + old_pba_tag (1 B) + [old_pba] |  50 / 58   |
+//! | 15  | `DEDUP_COMPARE_DELETE` | hash (8 B) + old_value (28 B)                                                                 |    37      |
+//! | 16  | `DEDUP_COMPARE_PUT` | hash (8 B) + old_value (28 B) + new_value (28 B)                                                 |    65      |
 //! | 30  | `DROP_SNAPSHOT`     | id (8 B BE) + page_count (4 B BE) + pid×page_count + decref_count (4 B BE) + pba×decref_count | 16+8(n+m) |
 //! | 40  | `CREATE_VOLUME`     | ord (2 B BE) + shard_count (4 B BE)                                                 |     6    |
 //! | 41  | `DROP_VOLUME`       | ord (2 B BE) + count (4 B BE) + pid×count                                           |   6+8n   |
@@ -126,7 +122,25 @@ use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
 /// while advancing a per-volume cursor; when the cursor reaches the end
 /// it emits `PromotionComplete` to clear `parent_vol_ord` /
 /// `promotion_cursor` so the parent's Lineage GC can resume.
-pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB6;
+/// v7 (0xB7): [[no-refcount-hot-path-design]] Phase 5 retired the
+/// standalone `Incref` / `Decref` ops (tags 0x20 / 0x21) along with the
+/// `Db::incref_pba` / `Db::decref_pba` API. Global PBA refcount is now
+/// only mutated by `FreePbas` (Lineage GC), `PromotionChunk` (clone
+/// promotion walker), and the volume-lifecycle ops — never per-write.
+/// Tags 0x20 / 0x21 are reserved and must not be reused.
+/// v8 (0xB8): [[no-refcount-hot-path-design]] Phase 5 follow-up.
+/// `DedupPut` / `DedupPutGuarded` / `DedupDelete` now carry an embedded
+/// `old_pba: Option<Pba>` captured at `Transaction::commit` time. Apply
+/// uses this value verbatim to compute the rc decref/incref pair instead
+/// of re-reading the on-disk dedup_index. The on-disk dedup_index data
+/// pages are written eagerly per op (only the meta page is checkpoint-
+/// gated; see `lifecycle.rs::open_with_config_and_faults`), so WAL
+/// replay's `apply_op_bare` previously observed a state that already
+/// reflected post-checkpoint ops and computed the wrong rc deltas. The
+/// embedded value breaks that asymmetric-persistence trap. Encoding adds
+/// a 1-byte discriminator (`OLD_PBA_NONE` / `OLD_PBA_SOME`) followed by
+/// 8 bytes when present.
+pub const WAL_BODY_SCHEMA_VERSION: u8 = 0xB8;
 
 pub const TAG_L2P_PUT: u8 = 0x01;
 pub const TAG_L2P_DELETE: u8 = 0x02;
@@ -157,6 +171,17 @@ pub const L2P_REMAP_GUARD_NONE: u8 = 0x00;
 /// onyx's dedup hit path so a dedup target that was already freed
 /// between plan and apply cannot be re-linked.
 pub const L2P_REMAP_GUARD_SOME: u8 = 0x01;
+
+/// `DedupPut` / `DedupPutGuarded` / `DedupDelete` `old_pba`
+/// discriminator: no prior entry. Apply stages incref(new_pba) only
+/// (DedupPut/Guarded) or skips rc work entirely (DedupDelete).
+pub const OLD_PBA_NONE: u8 = 0x00;
+/// `DedupPut` / `DedupPutGuarded` / `DedupDelete` `old_pba`
+/// discriminator: prior entry existed; 8 bytes BE follow with the
+/// previous `value.head_pba()` captured at `Transaction::commit` time.
+/// Apply uses this PBA for the decref side of the rc work without
+/// re-reading the on-disk dedup_index.
+pub const OLD_PBA_SOME: u8 = 0x01;
 pub const TAG_DEDUP_PUT: u8 = 0x10;
 pub const TAG_DEDUP_DELETE: u8 = 0x11;
 // Tags 0x12 / 0x13 were `DEDUP_REVERSE_PUT` / `DEDUP_REVERSE_DELETE` and
@@ -166,8 +191,10 @@ pub const TAG_DEDUP_DELETE: u8 = 0x11;
 pub const TAG_DEDUP_PUT_GUARDED: u8 = 0x14;
 pub const TAG_DEDUP_COMPARE_DELETE: u8 = 0x15;
 pub const TAG_DEDUP_COMPARE_PUT: u8 = 0x16;
-pub const TAG_INCREF: u8 = 0x20;
-pub const TAG_DECREF: u8 = 0x21;
+// Tags 0x20 / 0x21 were `INCREF` / `DECREF` and retired in schema 0xB7
+// ([[no-refcount-hot-path-design]] Phase 5). Do not reuse — a 0xB6
+// segment that survives past the `WAL_BODY_SCHEMA_VERSION` reject would
+// otherwise decode as a different op.
 pub const TAG_DROP_SNAPSHOT: u8 = 0x30;
 pub const TAG_CREATE_VOLUME: u8 = 0x40;
 pub const TAG_DROP_VOLUME: u8 = 0x41;
@@ -284,18 +311,37 @@ pub enum WalOp {
         start_lba: Lba,
         values: Box<[L2pValue]>,
     },
+    /// Insert or overwrite `hash → value` in the dedup_index.
+    /// `old_pba = Some(p)` means the dedup_index entry for `hash`
+    /// before this op pointed at PBA `p` (whose
+    /// `value.head_pba() != new_value.head_pba()` resolution is the
+    /// caller's job — when they match the rc work collapses to a
+    /// no-op, otherwise apply stages `decref(old_pba) + incref(new)`).
+    /// `old_pba = None` means there was no prior entry; apply stages
+    /// `incref(new)` only. Captured at `Transaction::commit` so apply
+    /// is deterministic from the WAL alone — required for replay
+    /// correctness given dedup_index data pages are written eagerly
+    /// per op.
     DedupPut {
         hash: Hash8,
         value: DedupValue,
+        old_pba: Option<Pba>,
     },
     DedupPutGuarded {
         hash: Hash8,
         value: DedupValue,
         pba_guard: Pba,
         min_rc: u32,
+        old_pba: Option<Pba>,
     },
+    /// Tombstone `hash`. `old_pba = Some(p)` means the dedup_index
+    /// entry for `hash` before this op pointed at PBA `p`; apply
+    /// stages `decref(p)`. `old_pba = None` is a no-op delete (no
+    /// prior entry — happens when an upstream layer issued a defensive
+    /// `delete_dedup` on a hash that was never put).
     DedupDelete {
         hash: Hash8,
+        old_pba: Option<Pba>,
     },
     /// Tombstone `hash` only if the current forward index value is
     /// exactly `old_value`.
@@ -309,14 +355,6 @@ pub enum WalOp {
         hash: Hash8,
         old_value: DedupValue,
         new_value: DedupValue,
-    },
-    Incref {
-        pba: Pba,
-        delta: u32,
-    },
-    Decref {
-        pba: Pba,
-        delta: u32,
     },
     /// Drop snapshot `id` by decrementing the header refcount of every
     /// page reachable from the snapshot's shard roots (plus the

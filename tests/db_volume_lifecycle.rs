@@ -152,8 +152,11 @@ fn create_with_dedup_shards_n4_round_trips_through_reopen() {
         for byte0 in [0u8, 64, 128, 192] {
             let mut hash = [0u8; 8];
             hash[0] = byte0;
+            // `head_pba()` decodes the leading 8 bytes big-endian and
+            // Phase 5 stages an `rc.stage(+1)` against it; encode a
+            // small PBA so the refcount array doesn't OOM.
             let mut value = [0u8; 28];
-            value[0] = byte0;
+            value[..8].copy_from_slice(&(byte0 as u64).to_be_bytes());
             db.put_dedup(hash, onyx_metadb::DedupValue(value)).unwrap();
         }
         db.flush().unwrap();

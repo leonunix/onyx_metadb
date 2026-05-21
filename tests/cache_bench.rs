@@ -44,8 +44,12 @@ fn h(n: u64) -> Hash8 {
 }
 
 fn dv(n: u64) -> DedupValue {
+    // Big-endian leading 8 bytes so `head_pba()` decodes to `n`
+    // (Phase 5 routes `DedupPut` through `rc.stage(head_pba, +1)`,
+    // and an LE-encoded value would decode to a 56-bit shifted PBA
+    // that OOMs the refcount array).
     let mut x = [0u8; 28];
-    x[..8].copy_from_slice(&n.to_le_bytes());
+    x[..8].copy_from_slice(&n.to_be_bytes());
     DedupValue(x)
 }
 

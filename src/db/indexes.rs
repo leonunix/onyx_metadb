@@ -35,30 +35,59 @@ impl Db {
         Ok(out)
     }
 
-    /// Increment `pba`'s refcount by `delta`. Returns the new value.
-    /// `delta == 0` is a no-op that still performs a lookup.
+    /// Test-only helper to seed PBA refcount state ahead of FreePbas /
+    /// PromotionChunk apply scenarios. Phase 5 removed the per-write
+    /// refcount path, so production code no longer needs an incref WAL
+    /// op; the rc shard is still backed by the same paged-array. Tests
+    /// drive `PromotionChunk` (the only remaining `rc.stage(+)` caller)
+    /// so the seed lives on the same WAL replay path as production rc
+    /// writes.
+    ///
+    /// `#[doc(hidden)]` and `pub` — not `cfg(test)` — so integration
+    /// tests in `tests/` can call it. Production code must not.
+    #[doc(hidden)]
     pub fn incref_pba(&self, pba: Pba, delta: u32) -> Result<u32> {
-        let mut tx = self.begin();
-        tx.incref_pba(pba, delta);
-        let (_, outcomes) = tx.commit_with_outcomes()?;
-        match outcomes.into_iter().next().unwrap() {
-            ApplyOutcome::RefcountNew(v) => Ok(v),
-            _ => unreachable!("incref produces RefcountNew"),
+        if delta == 0 {
+            return self.get_refcount(pba);
         }
+        const BOOTSTRAP_VOL_ORD: crate::types::VolumeOrdinal = 0;
+        // Pack `delta` copies of `pba` into PromotionChunks so one rc
+        // bucket sees back-to-back stages — matches the pre-Phase-5
+        // `tx.incref_pba(pba, delta)` shape. Each chunk is capped by
+        // `MAX_PROMOTION_CHUNK_PBAS`; large deltas split across chunks.
+        let mut remaining = delta as usize;
+        while remaining > 0 {
+            let take = remaining.min(crate::wal::op::MAX_PROMOTION_CHUNK_PBAS);
+            let mut pba_increfs = Vec::with_capacity(take);
+            for _ in 0..take {
+                pba_increfs.push(pba);
+            }
+            let mut tx = self.begin();
+            tx.promotion_chunk(BOOTSTRAP_VOL_ORD, pba_increfs.into_boxed_slice(), None);
+            tx.commit()?;
+            remaining -= take;
+        }
+        self.get_refcount(pba)
     }
 
-    /// Decrement `pba`'s refcount by `delta`. Returns the new value.
-    /// Decrementing below zero is an error. When the new value hits
-    /// zero the row is removed entirely, so the caller is responsible
-    /// for cleaning up the corresponding dedup entry.
+    /// Test-only inverse of [`Self::incref_pba`]. Drives the rc down via
+    /// `FreePbas` shared-branch semantics: each FreePbas op decrefs the
+    /// PBA by 1 (rc>0) or surfaces it as exclusive (rc==0). The caller
+    /// is responsible for the post-condition; with FreePbas the rc may
+    /// reach 0 before `delta` is exhausted (further ops are no-ops on
+    /// the rc side but still surface the PBA).
+    #[doc(hidden)]
     pub fn decref_pba(&self, pba: Pba, delta: u32) -> Result<u32> {
-        let mut tx = self.begin();
-        tx.decref_pba(pba, delta);
-        let (_, outcomes) = tx.commit_with_outcomes()?;
-        match outcomes.into_iter().next().unwrap() {
-            ApplyOutcome::RefcountNew(v) => Ok(v),
-            _ => unreachable!("decref produces RefcountNew"),
+        if delta == 0 {
+            return self.get_refcount(pba);
         }
+        const BOOTSTRAP_VOL_ORD: crate::types::VolumeOrdinal = 0;
+        for _ in 0..delta {
+            let mut tx = self.begin();
+            tx.free_pbas(BOOTSTRAP_VOL_ORD, vec![pba].into_boxed_slice());
+            tx.commit()?;
+        }
+        self.get_refcount(pba)
     }
 
     /// Record a `hash → value` entry in the dedup index (WAL-logged).
@@ -107,6 +136,16 @@ impl Db {
     /// Point-lookup `hash` in the dedup index.
     pub fn get_dedup(&self, hash: &Hash8) -> Result<Option<DedupValue>> {
         self.dedup_index.get(hash)
+    }
+
+    /// [[no-refcount-hot-path-design]] Phase 5 helper: read the current
+    /// `head_pba()` for `hash` from the dedup_index, used by
+    /// `Transaction::resolve_dedup_old_pbas` to embed the prior PBA in
+    /// `DedupPut` / `DedupPutGuarded` / `DedupDelete` WAL records so
+    /// apply is deterministic from the WAL alone and replay doesn't
+    /// observe the asymmetric on-disk dedup_index state.
+    pub(crate) fn dedup_lookup_head_pba(&self, hash: &Hash8) -> Result<Option<Pba>> {
+        Ok(self.dedup_index.get(hash)?.map(|v| v.head_pba()))
     }
 
     /// Batched dedup index lookup. Shares one LSM reader-drain and one

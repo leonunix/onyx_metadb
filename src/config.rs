@@ -383,11 +383,12 @@ impl Config {
             // last flush even if `notify()` was missed; long
             // enough not to busy-loop on otherwise-idle pages.
             async_reclaim_idle_interval_ms: 50,
-            // Phase 4 Step 4 keeps the FreePbas emission default-OFF
-            // so existing Phase 3 behavior (chain truncation only)
-            // is preserved bit-for-bit until Phase 5 wires the hot
-            // path to stop maintaining rc.
-            lineage_gc_emit_freepbas: false,
+            // [[no-refcount-hot-path-design]] Phase 5: hot-path RC
+            // writes are gone — Lineage GC is the sole producer of
+            // PBA-free decisions, so FreePbas emission must be on by
+            // default. The Phase 3/4 default-off mode is preserved
+            // only for offline tooling that explicitly opts out.
+            lineage_gc_emit_freepbas: true,
             rebuild_free_list_on_open: true,
             reclaim_orphans_on_open: true,
             // 1 M buckets × 4 entries = 4 M cuckoo capacity at load

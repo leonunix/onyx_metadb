@@ -34,8 +34,12 @@ fn l2p(n: u8) -> L2pValue {
 }
 
 fn dval(n: u8) -> DedupValue {
+    // Encode `n` as a big-endian u64 in the leading 8 bytes so
+    // `head_pba()` returns a small refcount-array-safe value.
+    // Phase 5 routes `DedupPut` through `rc.stage(head_pba, +1)`;
+    // byte-0 encoding would decode as ~7e16 and OOM the rc array.
     let mut x = [0u8; 28];
-    x[0] = n;
+    x[..8].copy_from_slice(&(n as u64).to_be_bytes());
     DedupValue(x)
 }
 
@@ -84,10 +88,39 @@ fn apply_to_reference(
             current_l2p.remove(&k);
         }
         Op::PutDedup(hk, hv) => {
-            current_dedup.insert(h(hk), dval(hv));
+            // Phase 5: DedupPut bumps rc[head_pba(new)] and
+            // decrements rc[head_pba(prev)] if prev existed with a
+            // different head_pba. Mirror that here.
+            let new_value = dval(hv);
+            let new_pba = new_value.head_pba();
+            let prev = current_dedup.insert(h(hk), new_value);
+            let prev_pba = prev.map(|v| v.head_pba());
+            if prev_pba != Some(new_pba) {
+                if let Some(op_pba) = prev_pba {
+                    let cur = current_refcount.get(&op_pba).copied().unwrap_or(0);
+                    let next = cur.saturating_sub(1);
+                    if next == 0 {
+                        current_refcount.remove(&op_pba);
+                    } else {
+                        current_refcount.insert(op_pba, next);
+                    }
+                }
+                let cur = current_refcount.get(&new_pba).copied().unwrap_or(0);
+                current_refcount.insert(new_pba, cur.saturating_add(1));
+            }
         }
         Op::DeleteDedup(hk) => {
-            current_dedup.remove(&h(hk));
+            if let Some(prev) = current_dedup.remove(&h(hk)) {
+                // Phase 5: DedupDelete decrements rc[head_pba(prev)].
+                let pba = prev.head_pba();
+                let cur = current_refcount.get(&pba).copied().unwrap_or(0);
+                let next = cur.saturating_sub(1);
+                if next == 0 {
+                    current_refcount.remove(&pba);
+                } else {
+                    current_refcount.insert(pba, next);
+                }
+            }
         }
         Op::Incref(pba, delta) => {
             let cur = current_refcount.get(&pba).copied().unwrap_or(0);
@@ -318,9 +351,11 @@ fn failed_commit_does_not_apply_to_memory_state() {
 
     faults.install(FaultPoint::WalFsyncBefore, 1, FaultAction::Error);
 
+    // Phase 5: the tx only carries L2P + dedup since standalone
+    // refcount WAL ops were retired. The crash check is unchanged in
+    // spirit: the failed fsync must leave every shard untouched.
     let mut tx = db.begin();
     tx.insert(0, 1, l2p(99));
-    tx.incref_pba(10, 1);
     tx.put_dedup(h(100), dval(99));
     assert!(tx.commit().is_err());
 
@@ -339,3 +374,4 @@ fn failed_commit_does_not_apply_to_memory_state() {
 // disabled under some feature flag.
 #[allow(dead_code)]
 fn _anchor_arc(_a: Arc<FaultController>) {}
+

@@ -248,26 +248,17 @@ fn incref_and_decref_roundtrip() {
     assert_eq!(db.get_refcount(42).unwrap(), 0);
 }
 
-#[test]
-fn decref_underflow_errors() {
-    let (_d, db) = mk_db();
-    db.incref_pba(1, 2).unwrap();
-    assert!(matches!(
-        db.decref_pba(1, 3).unwrap_err(),
-        MetaDbError::InvalidArgument(_)
-    ));
-}
-
-#[test]
-fn incref_overflow_errors() {
-    let (_d, db) = mk_db();
-    db.incref_pba(1, u32::MAX - 1).unwrap();
-    assert_eq!(db.incref_pba(1, 1).unwrap(), u32::MAX);
-    assert!(matches!(
-        db.incref_pba(1, 1).unwrap_err(),
-        MetaDbError::InvalidArgument(_)
-    ));
-}
+// Phase 5: `decref_underflow_errors` removed — `Db::decref_pba` now
+// drives `WalOp::FreePbas` which never underflows (rc>0 → decref by 1;
+// rc==0 → exclusive surface, no error). The underlying refcount
+// overflow/underflow guard is covered by the rc shard's own unit tests
+// in `src/refcount/`.
+//
+// `incref_overflow_errors` removed — `Db::incref_pba` now drives
+// `WalOp::PromotionChunk` so driving u32::MAX worth of staged ops
+// requires hundreds of WAL records and would take minutes. The
+// overflow guard sits in `RcShard::stage` / `apply_delta_pure` and is
+// covered by `refcount::apply_delta_tests::overflow_errors`.
 
 #[test]
 fn refcount_survives_flush_and_reopen() {
@@ -466,19 +457,16 @@ fn multi_op_tx_commits_atomically_and_all_ops_visible() {
     let mut tx = db.begin();
     tx.insert(0, 1, v(1));
     tx.insert(0, 2, v(2));
-    tx.incref_pba(10, 3);
     tx.put_dedup(h(1), dv(9));
     let lsn = tx.commit().unwrap();
     assert!(lsn >= 1);
-    // The hot-path commit emits `DedupPut` alongside L2P + refcount
-    // ops, which routes the dedup apply through the async lane (the
-    // production semantic is eventual-consistency for the dedup
-    // hint table). Drain so the read-after-write assertion below
-    // observes the put.
+    // The hot-path commit emits `DedupPut` alongside L2P ops, which
+    // routes the dedup apply through the async lane (production
+    // semantic is eventual-consistency for the dedup hint table).
+    // Drain so the read-after-write assertion below observes the put.
     db.wait_apply_idle();
     assert_eq!(db.get(0, 1).unwrap(), Some(v(1)));
     assert_eq!(db.get(0, 2).unwrap(), Some(v(2)));
-    assert_eq!(db.get_refcount(10).unwrap(), 3);
     assert_eq!(db.get_dedup(&h(1)).unwrap(), Some(dv(9)));
 }
 
@@ -490,14 +478,12 @@ fn multi_op_tx_survives_reopen_all_or_nothing() {
         let mut tx = db.begin();
         tx.insert(0, 1, v(1));
         tx.insert(0, 2, v(2));
-        tx.incref_pba(10, 3);
         tx.put_dedup(h(1), dv(9));
         tx.commit().unwrap();
     }
     let db = Db::open(dir.path()).unwrap();
     assert_eq!(db.get(0, 1).unwrap(), Some(v(1)));
     assert_eq!(db.get(0, 2).unwrap(), Some(v(2)));
-    assert_eq!(db.get_refcount(10).unwrap(), 3);
     assert_eq!(db.get_dedup(&h(1)).unwrap(), Some(dv(9)));
 }
 
@@ -535,9 +521,8 @@ fn unlogged_commit_survives_reopen_after_flush() {
         let db = Db::create_with_config(cfg).unwrap();
         let mut tx = db.begin();
         tx.insert(0, 7, v(7));
-        tx.incref_pba(700, 1);
         let (lsn, outcomes) = tx.commit_unlogged_with_outcomes().unwrap();
-        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes.len(), 1);
         assert_eq!(db.last_applied_lsn(), lsn);
         db.flush().unwrap();
         assert_eq!(db.manifest().checkpoint_lsn, lsn);
@@ -548,7 +533,6 @@ fn unlogged_commit_survives_reopen_after_flush() {
     let db = Db::open_with_config(cfg).unwrap();
     assert_eq!(db.last_applied_lsn(), applied);
     assert_eq!(db.get(0, 7).unwrap(), Some(v(7)));
-    assert_eq!(db.get_refcount(700).unwrap(), 1);
 }
 
 #[test]
@@ -581,23 +565,24 @@ fn reopen_replay_advances_last_applied() {
 fn apply_lane_h2_metrics_record_wakeups_and_bursts() {
     // Smoke test for the H2 apply-lane wakeup / burst counters added on
     // 2026-05-10. After at least one commit, the L2P lane must have been
-    // woken at least once (the worker starts idle) and refcount taps must
-    // have recorded both an idle wait and a wakeup. After draining and
-    // committing one more op, the next wait must close the burst that
-    // covered the earlier ops.
+    // woken at least once (the worker starts idle).
+    //
+    // Phase 5: refcount lane no longer wakes from L2pRemap commits
+    // (hot-path RC was removed). `Db::incref_pba` drives
+    // `WalOp::PromotionChunk` through `apply_op_bare`, not through the
+    // per-shard rc apply lane; the RC lane wakeup assertion has been
+    // dropped. The L2P lane assertions still hold.
     let (_d, db) = mk_db();
     for i in 0u64..16 {
         db.insert(0, i, v(i as u8)).unwrap();
-        db.incref_pba(1_000 + i, 1).unwrap();
     }
     // Wait a beat so the per-shard lane workers go back to idle on the
     // cvar. Without this, the burst we just produced hasn't been closed
     // by a wait and `burst_total` may still be zero.
     std::thread::sleep(std::time::Duration::from_millis(50));
-    // One more op per kind forces a wakeup-then-pop, which records the
-    // burst that closed when the lane parked above.
+    // One more op forces a wakeup-then-pop, which records the burst
+    // that closed when the lane parked above.
     db.insert(0, 1_000, v(0)).unwrap();
-    db.incref_pba(2_000, 1).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let m = db.metrics_snapshot();
@@ -605,11 +590,6 @@ fn apply_lane_h2_metrics_record_wakeups_and_bursts() {
         m.l2p_apply_lane_wakeups > 0,
         "L2P lane should wake from cvar at least once: {}",
         m.l2p_apply_lane_wakeups,
-    );
-    assert!(
-        m.rc_apply_lane_wakeups > 0,
-        "RC lane should wake from cvar at least once: {}",
-        m.rc_apply_lane_wakeups,
     );
     assert!(
         m.l2p_apply_lane_burst_total > 0,

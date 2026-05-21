@@ -133,8 +133,13 @@ pub(super) fn h(n: u64) -> Hash8 {
 }
 
 pub(super) fn dv(n: u8) -> DedupValue {
+    // Encode `n` as a big-endian u64 in the leading 8 bytes so
+    // `head_pba()` decodes to a small integer rather than a 56-bit
+    // shifted value. Phase 5 routes `DedupPut` through rc.stage on
+    // `head_pba`, and pathological PBAs (e.g. 7e16) would otherwise
+    // OOM the refcount array.
     let mut x = [0u8; 28];
-    x[0] = n;
+    x[..8].copy_from_slice(&(n as u64).to_be_bytes());
     DedupValue(x)
 }
 
@@ -154,8 +159,10 @@ pub(super) fn hash_bytes(high: u64, low: u64) -> Hash8 {
 }
 
 pub(super) fn dedup_val(n: u8) -> DedupValue {
+    // Same encoding as `dv` — leading big-endian u64 so `head_pba()`
+    // returns a small, refcount-array-safe value.
     let mut v = [0u8; 28];
-    v[0] = n;
+    v[..8].copy_from_slice(&(n as u64).to_be_bytes());
     DedupValue(v)
 }
 

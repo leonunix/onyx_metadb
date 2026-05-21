@@ -508,7 +508,6 @@ fn run_meta_tx(cfg: &BenchConfig, db: Arc<Db>) -> Result<BenchReport, String> {
                 let mut tx = db.begin();
 
                 if let Some(old) = slots[slot_idx].take() {
-                    tx.decref_pba(old.pba, 1);
                     let old_entry = &mut dedup_entries[old.dedup_idx];
                     old_entry.live_refs -= 1;
                     if old_entry.live_refs == 0 {
@@ -528,7 +527,6 @@ fn run_meta_tx(cfg: &BenchConfig, db: Arc<Db>) -> Result<BenchReport, String> {
                     let entry = &mut dedup_entries[idx];
                     entry.live_refs += 1;
                     tx.insert(0, lba, l2p_value_from_pba(entry.pba));
-                    tx.incref_pba(entry.pba, 1);
                     Mapping {
                         pba: entry.pba,
                         dedup_idx: idx,
@@ -539,7 +537,6 @@ fn run_meta_tx(cfg: &BenchConfig, db: Arc<Db>) -> Result<BenchReport, String> {
                     let hash = hash_from_parts(tid as u64, next_hash_seq);
                     next_hash_seq += 1;
                     tx.insert(0, lba, l2p_value_from_pba(pba));
-                    tx.incref_pba(pba, 1);
                     tx.put_dedup(hash, dedup_value_from_pba(pba));
                     dedup_entries.push(DedupEntry {
                         pba,

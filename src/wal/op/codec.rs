@@ -76,26 +76,34 @@ impl WalOp {
                     out.extend_from_slice(&value.0);
                 }
             }
-            WalOp::DedupPut { hash, value } => {
+            WalOp::DedupPut {
+                hash,
+                value,
+                old_pba,
+            } => {
                 out.push(TAG_DEDUP_PUT);
                 out.extend_from_slice(hash);
                 out.extend_from_slice(&value.0);
+                encode_old_pba(out, *old_pba);
             }
             WalOp::DedupPutGuarded {
                 hash,
                 value,
                 pba_guard,
                 min_rc,
+                old_pba,
             } => {
                 out.push(TAG_DEDUP_PUT_GUARDED);
                 out.extend_from_slice(hash);
                 out.extend_from_slice(&value.0);
                 out.extend_from_slice(&pba_guard.to_be_bytes());
                 out.extend_from_slice(&min_rc.to_be_bytes());
+                encode_old_pba(out, *old_pba);
             }
-            WalOp::DedupDelete { hash } => {
+            WalOp::DedupDelete { hash, old_pba } => {
                 out.push(TAG_DEDUP_DELETE);
                 out.extend_from_slice(hash);
+                encode_old_pba(out, *old_pba);
             }
             WalOp::DedupCompareDelete { hash, old_value } => {
                 out.push(TAG_DEDUP_COMPARE_DELETE);
@@ -111,16 +119,6 @@ impl WalOp {
                 out.extend_from_slice(hash);
                 out.extend_from_slice(&old_value.0);
                 out.extend_from_slice(&new_value.0);
-            }
-            WalOp::Incref { pba, delta } => {
-                out.push(TAG_INCREF);
-                out.extend_from_slice(&pba.to_be_bytes());
-                out.extend_from_slice(&delta.to_be_bytes());
-            }
-            WalOp::Decref { pba, delta } => {
-                out.push(TAG_DECREF);
-                out.extend_from_slice(&pba.to_be_bytes());
-                out.extend_from_slice(&delta.to_be_bytes());
             }
             WalOp::DropSnapshot {
                 id,
@@ -241,12 +239,13 @@ impl WalOp {
                 1 + 2 + 8 + 8 + 4 + captured.len() * (8 + L2P_VALUE_BYTES)
             }
             WalOp::L2pRemapRange { values, .. } => 1 + 2 + 8 + 4 + values.len() * L2P_VALUE_BYTES,
-            WalOp::DedupPut { .. } => 1 + 8 + 28,
-            WalOp::DedupPutGuarded { .. } => 1 + 8 + 28 + 8 + 4,
-            WalOp::DedupDelete { .. } => 1 + 8,
+            WalOp::DedupPut { old_pba, .. } => 1 + 8 + 28 + old_pba_encoded_len(*old_pba),
+            WalOp::DedupPutGuarded { old_pba, .. } => {
+                1 + 8 + 28 + 8 + 4 + old_pba_encoded_len(*old_pba)
+            }
+            WalOp::DedupDelete { old_pba, .. } => 1 + 8 + old_pba_encoded_len(*old_pba),
             WalOp::DedupCompareDelete { .. } => 1 + 8 + 28,
             WalOp::DedupComparePut { .. } => 1 + 8 + 28 + 28,
-            WalOp::Incref { .. } | WalOp::Decref { .. } => 1 + 8 + 4,
             WalOp::DropSnapshot {
                 pages, pba_decrefs, ..
             } => 1 + 8 + 4 + pages.len() * 8 + 4 + pba_decrefs.len() * 8,
@@ -309,9 +308,9 @@ pub fn try_encode_body(ops: &[WalOp]) -> Result<Vec<u8>> {
 /// [`MetaDbError::Corruption`] on missing/mismatched schema version,
 /// any short read, or any unknown tag.
 ///
-/// A pre-v1 body starts with an op tag (`≤ 0x42`) rather than
-/// `WAL_BODY_SCHEMA_VERSION` (currently 0xB3), so recovery from an old
-/// segment hits the version-reject branch before it interprets any payload.
+/// A pre-v1 body starts with an op tag (`≤ 0x45`) rather than
+/// `WAL_BODY_SCHEMA_VERSION`, so recovery from an old segment hits the
+/// version-reject branch before it interprets any payload.
 pub fn decode_body(body: &[u8]) -> Result<Vec<WalOp>> {
     let first = *body.first().ok_or_else(|| {
         MetaDbError::Corruption(format!(
@@ -485,12 +484,14 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             hash.copy_from_slice(&payload[..8]);
             let mut v = [0u8; 28];
             v.copy_from_slice(&payload[8..36]);
+            let (old_pba, rest) = decode_old_pba(&payload[36..], "DEDUP_PUT")?;
             Ok((
                 WalOp::DedupPut {
                     hash,
                     value: DedupValue(v),
+                    old_pba,
                 },
-                &payload[36..],
+                rest,
             ))
         }
         TAG_DEDUP_PUT_GUARDED => {
@@ -501,21 +502,24 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
             v.copy_from_slice(&payload[8..36]);
             let pba_guard = u64::from_be_bytes(payload[36..44].try_into().unwrap());
             let min_rc = u32::from_be_bytes(payload[44..48].try_into().unwrap());
+            let (old_pba, rest) = decode_old_pba(&payload[48..], "DEDUP_PUT_GUARDED")?;
             Ok((
                 WalOp::DedupPutGuarded {
                     hash,
                     value: DedupValue(v),
                     pba_guard,
                     min_rc,
+                    old_pba,
                 },
-                &payload[48..],
+                rest,
             ))
         }
         TAG_DEDUP_DELETE => {
             require_len(payload, 8, "DEDUP_DELETE")?;
             let mut hash = [0u8; 8];
             hash.copy_from_slice(&payload[..8]);
-            Ok((WalOp::DedupDelete { hash }, &payload[8..]))
+            let (old_pba, rest) = decode_old_pba(&payload[8..], "DEDUP_DELETE")?;
+            Ok((WalOp::DedupDelete { hash, old_pba }, rest))
         }
         TAG_DEDUP_COMPARE_DELETE => {
             require_len(payload, 36, "DEDUP_COMPARE_DELETE")?;
@@ -547,17 +551,6 @@ fn decode_one(body: &[u8]) -> Result<(WalOp, &[u8])> {
                 },
                 &payload[64..],
             ))
-        }
-        TAG_INCREF | TAG_DECREF => {
-            require_len(payload, 12, "INCREF/DECREF")?;
-            let pba = u64::from_be_bytes(payload[..8].try_into().unwrap());
-            let delta = u32::from_be_bytes(payload[8..12].try_into().unwrap());
-            let op = if tag == TAG_INCREF {
-                WalOp::Incref { pba, delta }
-            } else {
-                WalOp::Decref { pba, delta }
-            };
-            Ok((op, &payload[12..]))
         }
         TAG_DROP_SNAPSHOT => {
             require_len(payload, 12, "DROP_SNAPSHOT header")?;
@@ -760,4 +753,39 @@ fn require_len(buf: &[u8], need: usize, what: &str) -> Result<()> {
 
 fn short_read() -> MetaDbError {
     MetaDbError::Corruption("WAL op body truncated (expected tag)".into())
+}
+
+fn encode_old_pba(out: &mut Vec<u8>, old_pba: Option<Pba>) {
+    match old_pba {
+        None => out.push(OLD_PBA_NONE),
+        Some(pba) => {
+            out.push(OLD_PBA_SOME);
+            out.extend_from_slice(&pba.to_be_bytes());
+        }
+    }
+}
+
+fn old_pba_encoded_len(old_pba: Option<Pba>) -> usize {
+    if old_pba.is_some() {
+        1 + 8
+    } else {
+        1
+    }
+}
+
+fn decode_old_pba<'a>(payload: &'a [u8], what: &str) -> Result<(Option<Pba>, &'a [u8])> {
+    require_len(payload, 1, what)?;
+    let tag = payload[0];
+    match tag {
+        OLD_PBA_NONE => Ok((None, &payload[1..])),
+        OLD_PBA_SOME => {
+            require_len(&payload[1..], 8, what)?;
+            let pba = u64::from_be_bytes(payload[1..9].try_into().unwrap());
+            Ok((Some(pba), &payload[9..]))
+        }
+        other => Err(MetaDbError::Corruption(format!(
+            "{what}: unknown old_pba tag 0x{other:02x} \
+             (expected 0x{OLD_PBA_NONE:02x} or 0x{OLD_PBA_SOME:02x})"
+        ))),
+    }
 }

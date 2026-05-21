@@ -44,10 +44,12 @@ fn multi_op_round_trip_preserves_order() {
         WalOp::DedupPut {
             hash: h(2),
             value: dv(3),
+            old_pba: None,
         },
-        WalOp::Incref { pba: 4, delta: 5 },
-        WalOp::DedupDelete { hash: h(6) },
-        WalOp::Decref { pba: 7, delta: 1 },
+        WalOp::DedupDelete {
+            hash: h(6),
+            old_pba: Some(42),
+        },
         WalOp::L2pDelete { vol_ord: 7, lba: 8 },
     ];
     let body = encode_body(&ops);
@@ -62,10 +64,68 @@ fn dedup_put_guarded_round_trip() {
         value: dv(0xB2),
         pba_guard: 0x0123_4567_89AB_CDEF,
         min_rc: 7,
+        old_pba: Some(0xFEED_F00D),
     }];
     let body = encode_body(&ops);
-    assert_eq!(body.len(), 1 + 1 + 8 + 28 + 8 + 4);
+    // tag(1) + hash(8) + value(28) + pba_guard(8) + min_rc(4) + old_pba_tag(1) + old_pba(8)
+    assert_eq!(body.len(), 1 + 1 + 8 + 28 + 8 + 4 + 1 + 8);
     assert_eq!(decode_body(&body).unwrap(), ops);
+}
+
+#[test]
+fn dedup_put_old_pba_some_and_none_round_trip() {
+    let ops = vec![
+        WalOp::DedupPut {
+            hash: h(1),
+            value: dv(2),
+            old_pba: None,
+        },
+        WalOp::DedupPut {
+            hash: h(3),
+            value: dv(4),
+            old_pba: Some(0x0011_2233_4455_6677),
+        },
+        WalOp::DedupDelete {
+            hash: h(5),
+            old_pba: None,
+        },
+        WalOp::DedupDelete {
+            hash: h(6),
+            old_pba: Some(0xFFFF_FFFF_FFFF_FFFF),
+        },
+    ];
+    let body = encode_body(&ops);
+    assert_eq!(decode_body(&body).unwrap(), ops);
+}
+
+#[test]
+fn dedup_put_unknown_old_pba_tag_is_corruption() {
+    // Encode a valid DedupPut header, then poison the trailing
+    // old_pba discriminator.
+    let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_DEDUP_PUT];
+    body.extend_from_slice(&h(1)); // hash
+    body.extend_from_slice(&dv(2).0); // value
+    body.push(0x7F); // bogus old_pba discriminator
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(msg.contains("DEDUP_PUT") && msg.contains("old_pba"), "{msg}")
+        }
+        e => panic!("{e}"),
+    }
+}
+
+#[test]
+fn dedup_put_old_pba_some_truncated_is_corruption() {
+    // tag=SOME but missing the 8-byte pba payload.
+    let mut body = vec![WAL_BODY_SCHEMA_VERSION, TAG_DEDUP_PUT];
+    body.extend_from_slice(&h(1));
+    body.extend_from_slice(&dv(2).0);
+    body.push(OLD_PBA_SOME);
+    body.extend_from_slice(&[0u8, 0, 0]); // only 3 of 8 bytes
+    match decode_body(&body).unwrap_err() {
+        MetaDbError::Corruption(msg) => assert!(msg.contains("DEDUP_PUT"), "{msg}"),
+        e => panic!("{e}"),
+    }
 }
 
 #[test]
@@ -289,7 +349,6 @@ fn drop_snapshot_survives_interleaving() {
             pages: vec![10, 11, 12],
             pba_decrefs: vec![50, 51],
         },
-        WalOp::Incref { pba: 20, delta: 1 },
     ];
     let body = encode_body(&ops);
     let decoded = decode_body(&body).unwrap();
@@ -364,8 +423,12 @@ fn encoded_len_matches_encode_output() {
         WalOp::DedupPut {
             hash: h(2),
             value: dv(3),
+            old_pba: Some(7),
         },
-        WalOp::Incref { pba: 4, delta: 5 },
+        WalOp::DedupDelete {
+            hash: h(4),
+            old_pba: None,
+        },
     ];
     let expected: usize = 1 + ops.iter().map(|op| op.encoded_len()).sum::<usize>();
     assert_eq!(encode_body(&ops).len(), expected);
@@ -443,7 +506,6 @@ fn volume_ops_interleave_with_legacy_ops() {
             lba: 100,
             value: v(7),
         },
-        WalOp::Incref { pba: 50, delta: 2 },
         WalOp::DropVolume {
             ord: 99,
             pages: vec![200, 201],
@@ -454,7 +516,10 @@ fn volume_ops_interleave_with_legacy_ops() {
             src_snap_id: 77,
             src_shard_roots: vec![10, 11],
         },
-        WalOp::DedupDelete { hash: h(9) },
+        WalOp::DedupDelete {
+            hash: h(9),
+            old_pba: None,
+        },
     ];
     let body = encode_body(&ops);
     assert_eq!(decode_body(&body).unwrap(), ops);
@@ -545,14 +610,16 @@ fn l2p_remap_interleaves_with_other_ops() {
             new_value: v(1),
             guard: None,
         },
-        WalOp::Incref { pba: 99, delta: 3 },
         WalOp::L2pRemap {
             vol_ord: 2,
             lba: 2,
             new_value: v(2),
             guard: Some((42, u32::MAX)),
         },
-        WalOp::DedupDelete { hash: h(3) },
+        WalOp::DedupDelete {
+            hash: h(3),
+            old_pba: None,
+        },
         WalOp::L2pDelete { vol_ord: 1, lba: 1 },
     ];
     let body = encode_body(&ops);
@@ -688,7 +755,6 @@ fn l2p_range_delete_interleaves_with_other_ops() {
             end: 10,
             captured: vec![(0, val(100)), (5, val(200))],
         },
-        WalOp::Incref { pba: 300, delta: 4 },
         WalOp::L2pRangeDelete {
             vol_ord: 2,
             start: u64::MAX - 10,

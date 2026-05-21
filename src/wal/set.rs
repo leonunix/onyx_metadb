@@ -283,14 +283,17 @@ mod tests {
             WalOp::DedupPut {
                 hash: hash(1),
                 value: value(1),
+                old_pba: None,
             },
             WalOp::DedupPut {
                 hash: hash(2),
                 value: value(2),
+                old_pba: None,
             },
             WalOp::DedupPut {
                 hash: hash(3),
                 value: value(3),
+                old_pba: None,
             },
         ];
 
