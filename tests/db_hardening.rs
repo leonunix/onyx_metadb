@@ -453,10 +453,10 @@ fn remap_val(pba: u64, tag: u8) -> L2pValue {
 }
 
 /// Crash right after the WAL record landed but before apply ran.
-/// Recovery must replay the `L2pRemap` so both the L2P mapping and
-/// the refcount side-effects end up on disk. Regression test for the
-/// SPEC §4.3 guard-atomicity invariant: no half-applied state is
-/// allowed.
+/// Recovery must replay the `L2pRemap` so the L2P mapping ends up on
+/// disk. Phase 5: L2pRemap is rc-neutral, so the only rc movement
+/// here comes from the test-only `incref_pba` seed (which commits as
+/// `WalOp::PromotionChunk` and is replayable like any other op).
 #[test]
 fn crash_after_wal_before_apply_replays_l2p_remap() {
     let dir = TempDir::new().unwrap();
@@ -466,10 +466,15 @@ fn crash_after_wal_before_apply_replays_l2p_remap() {
         let path = dir.path().to_path_buf();
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
-            // Seed rc(100)=1 so guard tests observe a live target.
+            // Phase 5: L2pRemap is rc-neutral, so the guarded op
+            // below would never see rc(100) > 0 from the seed remap
+            // alone. Drive rc(100)=1 explicitly via PromotionChunk so
+            // the post-fault remap's `Some((100, 1))` guard passes
+            // both live and on replay.
             let mut tx = db.begin();
             tx.l2p_remap(0, 10, remap_val(100, 1), None);
             tx.commit().unwrap();
+            db.incref_pba(100, 1).unwrap();
             faults.install(FaultPoint::CommitPostWalBeforeApply, 1, FaultAction::Panic);
             let mut tx = db.begin();
             tx.l2p_remap(0, 11, remap_val(100, 2), Some((100, 1)));
@@ -486,25 +491,21 @@ fn crash_after_wal_before_apply_replays_l2p_remap() {
     );
     assert_eq!(
         db.get_refcount(100).unwrap(),
-        2,
-        "refcount incref from replayed L2pRemap applied exactly once",
+        1,
+        "Phase 5: only the PromotionChunk seed moves rc; remap is rc-neutral",
     );
 }
 
 /// Crash between apply and last_applied_lsn bump. On replay metadb
 /// must restore L2P state idempotently: the post-crash remap that
-/// applied-but-didn't-bump-lsn is re-applied via the legacy SERIAL
-/// path (single-op WAL records bypass the bucket threshold), and the
-/// final L2P mapping matches the live post-apply state byte-for-byte.
+/// applied-but-didn't-bump-lsn is re-applied via the same
+/// `apply_l2p_remap` path (single-op WAL records still take the
+/// SERIAL apply branch), and the final L2P mapping matches the live
+/// post-apply state byte-for-byte.
 ///
-/// Phase 5 note: hot-path LANED L2pRemap is rc-neutral, but the
-/// legacy SERIAL apply path (`apply_l2p_remap` in apply.rs) is the
-/// one replay uses for single-op records, and it still drives the
-/// incref(new) / decref(old) decision. The rc assertions below
-/// reflect that SERIAL replay behavior — rc converges to the
-/// "as-if-everything-went-through-SERIAL" totals. The sibling test
-/// `crash_after_wal_before_apply_replays_l2p_remap` documents the
-/// same pattern at lba=11.
+/// Phase 5: `apply_l2p_remap` is rc-neutral on both the LANED and
+/// SERIAL paths, so rc stays at 0 for every pba touched — the
+/// load-bearing assertions are on the L2P state.
 #[test]
 fn crash_after_apply_before_lsn_bump_l2p_remap_idempotent() {
     let dir = TempDir::new().unwrap();
@@ -515,9 +516,8 @@ fn crash_after_apply_before_lsn_bump_l2p_remap_idempotent() {
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
             // Seed two L2P mappings so the post-crash remap has a
-            // prev value to overwrite. Live LANED apply leaves rc
-            // untouched; rc only moves via the legacy SERIAL replay
-            // path after reopen.
+            // prev value to overwrite. All three commits are
+            // rc-neutral under Phase 5.
             let mut tx = db.begin();
             tx.l2p_remap(0, 10, remap_val(100, 1), None);
             tx.commit().unwrap();
@@ -542,17 +542,21 @@ fn crash_after_apply_before_lsn_bump_l2p_remap_idempotent() {
     // still maps to its original pba=100.
     assert_eq!(db.get(0, 10).unwrap(), Some(remap_val(200, 1)));
     assert_eq!(db.get(0, 11).unwrap(), Some(remap_val(100, 2)));
-    // Phase 5 SERIAL replay rc accounting: tx1 incref(100), tx2
-    // incref(100), tx3 (lba=10 → pba=200) decref(100) + incref(200).
-    // Net: rc(100)=1, rc(200)=1.
-    assert_eq!(db.get_refcount(100).unwrap(), 1);
-    assert_eq!(db.get_refcount(200).unwrap(), 1);
+    // Phase 5: every L2pRemap apply is rc-neutral; no rc-mutating op
+    // ran in this scenario.
+    assert_eq!(db.get_refcount(100).unwrap(), 0);
+    assert_eq!(db.get_refcount(200).unwrap(), 0);
 }
 
 /// L2pRangeDelete crashes right after WAL submit. Recovery must
 /// replay the captured list and end up at the same final state:
 /// every lba in the captured range gone, and every refcount on a
 /// non-shared leaf decremented exactly once.
+///
+/// Phase 5: L2pRemap is rc-neutral, so the seed mappings don't drive
+/// rc on their own. `apply_l2p_range_delete` still decrefs each
+/// captured PBA (no Phase 5 change to that op), so we seed rc
+/// explicitly via PromotionChunk to avoid underflow on apply.
 #[test]
 fn crash_after_wal_before_apply_replays_l2p_range_delete() {
     let dir = TempDir::new().unwrap();
@@ -562,11 +566,14 @@ fn crash_after_wal_before_apply_replays_l2p_range_delete() {
         let path = dir.path().to_path_buf();
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
-            // Seed 4 lbas at distinct pbas.
+            // Seed 4 lbas at distinct pbas, and drive rc(100..104)=1
+            // explicitly via PromotionChunk so range_delete has
+            // something to decref without underflow.
             for i in 0..4u64 {
                 let mut tx = db.begin();
                 tx.l2p_remap(0, 10 + i, remap_val(100 + i, 0), None);
                 tx.commit().unwrap();
+                db.incref_pba(100 + i, 1).unwrap();
             }
             faults.install(FaultPoint::CommitPostWalBeforeApply, 1, FaultAction::Panic);
             let _ = db.range_delete(0, 10, 14);
@@ -584,6 +591,10 @@ fn crash_after_wal_before_apply_replays_l2p_range_delete() {
 /// not re-decref pbas that were already decremented to zero — the
 /// checkpoint_lsn ordering rule guards this path identically to the
 /// L2pRemap case.
+///
+/// Phase 5: L2pRemap is rc-neutral, but `apply_l2p_range_delete`
+/// still drives `rc.stage(pba, -1)`, so seed rc explicitly to avoid
+/// underflow.
 #[test]
 fn crash_after_apply_before_lsn_bump_l2p_range_delete_idempotent() {
     let dir = TempDir::new().unwrap();
@@ -593,13 +604,14 @@ fn crash_after_apply_before_lsn_bump_l2p_range_delete_idempotent() {
         let path = dir.path().to_path_buf();
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
-            // Seed lbas 0..6 with pbas 100..106. Split the range
-            // delete over two lbas only so replay has a non-trivial
-            // decref set to re-evaluate.
+            // Seed lbas 0..6 with pbas 100..106, and drive each
+            // rc(100+i)=1 via PromotionChunk so the range delete can
+            // decref without underflow.
             for i in 0..6u64 {
                 let mut tx = db.begin();
                 tx.l2p_remap(0, i, remap_val(100 + i, 0), None);
                 tx.commit().unwrap();
+                db.incref_pba(100 + i, 1).unwrap();
             }
             faults.install(
                 FaultPoint::CommitPostApplyBeforeLsnBump,
@@ -673,24 +685,24 @@ fn drop_snapshot_crash_after_wal_before_apply_replays_pba_decrefs() {
         let path = dir.path().to_path_buf();
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
-            // Seed L2P + rc(100)=1. Phase 5 LANED L2pRemap on a
-            // non-snapshot volume does not touch rc, so we drive
-            // rc(100) explicitly via PromotionChunk. After the
-            // snapshot is taken, subsequent L2pRemaps on the volume
-            // route to the SERIAL/LEGACY path and still produce the
-            // expected snap-pinned rc semantics.
+            // Seed L2P + rc(100)=1. Phase 5 L2pRemap is rc-neutral
+            // on both LANED and SERIAL paths, so the snap-on-vol
+            // remap below does not bump rc(200) either; the only
+            // rc-mutating event in this scenario is the eventual
+            // `drop_snapshot` pba_decrefs apply.
             let mut tx = db.begin();
             tx.l2p_remap(0, 10, remap_val(100, 1), None);
             tx.commit().unwrap();
             db.incref_pba(100, 1).unwrap();
             let snap = db.take_snapshot(0).unwrap();
-            // Leaf-shared remap → decref(100) suppressed by snap_pins_old;
-            // SERIAL apply increfs rc(200). rc(100) still 1.
+            // Snap-on-vol remap: rc-neutral. rc(100) stays 1
+            // (snap-pin / dead-list path enforces eventual cleanup
+            // when the snap is dropped); rc(200) stays 0.
             let mut tx = db.begin();
             tx.l2p_remap(0, 10, remap_val(200, 1), None);
             tx.commit().unwrap();
             assert_eq!(db.get_refcount(100).unwrap(), 1);
-            assert_eq!(db.get_refcount(200).unwrap(), 1);
+            assert_eq!(db.get_refcount(200).unwrap(), 0);
             faults.install(FaultPoint::CommitPostWalBeforeApply, 1, FaultAction::Panic);
             let _ = db.drop_snapshot(snap);
             panic!("drop_snapshot returned but fault should have panicked");
@@ -704,7 +716,7 @@ fn drop_snapshot_crash_after_wal_before_apply_replays_pba_decrefs() {
         0,
         "replay ran pba_decrefs[100] to zero",
     );
-    assert_eq!(db.get_refcount(200).unwrap(), 1);
+    assert_eq!(db.get_refcount(200).unwrap(), 0);
     assert_eq!(db.get(0, 10).unwrap(), Some(remap_val(200, 1)));
     assert!(
         db.snapshots().is_empty(),
@@ -732,9 +744,9 @@ fn drop_snapshot_crash_after_apply_before_lsn_bump_does_not_double_decref() {
         let path = dir.path().to_path_buf();
         move || {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
-            // Seed L2P + rc(100)=2. Phase 5 LANED L2pRemap on a
-            // non-snapshot volume does not touch rc, so we drive
-            // rc(100) explicitly via PromotionChunk.
+            // Seed L2P + rc(100)=2. Phase 5 L2pRemap is rc-neutral,
+            // so the seed rc must be driven explicitly via
+            // PromotionChunk.
             let mut tx = db.begin();
             tx.l2p_remap(0, 10, remap_val(100, 1), None);
             tx.commit().unwrap();
@@ -745,8 +757,9 @@ fn drop_snapshot_crash_after_apply_before_lsn_bump_does_not_double_decref() {
             assert_eq!(db.get_refcount(100).unwrap(), 2);
 
             let snap = db.take_snapshot(0).unwrap();
-            // After snapshot, remap just lba=10 to a new pba — leaf
-            // shared → decref(100) is suppressed. rc(100) stays at 2.
+            // After snapshot, remap just lba=10 to a new pba. Phase
+            // 5: L2pRemap is rc-neutral on all paths, so rc(100)
+            // stays at 2 and rc(200) stays at 0.
             let mut tx = db.begin();
             tx.l2p_remap(0, 10, remap_val(200, 1), None);
             tx.commit().unwrap();
@@ -770,7 +783,7 @@ fn drop_snapshot_crash_after_apply_before_lsn_bump_does_not_double_decref() {
         1,
         "replay must not double-decref; rc stays at 1",
     );
-    assert_eq!(db.get_refcount(200).unwrap(), 1);
+    assert_eq!(db.get_refcount(200).unwrap(), 0);
     drop(db);
     let report = verify_path(dir.path(), VerifyOptions::default()).unwrap();
     assert!(

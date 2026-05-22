@@ -68,12 +68,12 @@ fn l2p_remap_same_pba_in_place_overwrite_net_zero() {
 
 #[test]
 fn l2p_remap_same_pba_leaf_shared_increfs_new() {
-    // Phase 5 nuance: with a live snapshot on the volume,
-    // `batch_uses_serial_apply` routes the commit through the legacy
-    // `apply_l2p_remap` (which still maintains rc) so onyx-side
-    // snap_pin walk stays correct. The hot-path-rc bypass only kicks
-    // in for snapshot-free volumes. Pre-write rc(100)=0; the
-    // shared-leaf rc bump puts the new mapping at rc=1 (snap pins old).
+    // Phase 5: L2pRemap is uniformly rc-neutral across both the hot
+    // (lane) path and the serial path that snapshot-on-volume routes
+    // through. The serial path still exists for the dead-list /
+    // snap-pin recording inside `record_dead`, but the rc table is
+    // untouched. Snap-on-vol rc bookkeeping (when needed) lives on
+    // `drop_snapshot`'s `pba_decrefs` plan.
     let (_d, db) = mk_db();
     remap(&db, 10, remap_val(100, 1), None);
     db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
@@ -83,9 +83,8 @@ fn l2p_remap_same_pba_leaf_shared_increfs_new() {
     assert_eq!(freed, None);
     assert_eq!(
         db.get_refcount(100).unwrap(),
-        1,
-        "snapshot-on-volume path uses legacy apply_l2p_remap; \
-         snap pins old → only incref new, rc=1"
+        0,
+        "Phase 5: L2pRemap is rc-neutral on both hot-path and serial path",
     );
 }
 
@@ -107,11 +106,12 @@ fn l2p_remap_different_pba_exclusive_decrefs_old_increfs_new() {
 
 #[test]
 fn l2p_remap_different_pba_leaf_shared_suppresses_decref() {
-    // Phase 5 nuance: with a live snapshot on the volume the commit
-    // path still goes through legacy `apply_l2p_remap` (snap-pin walk
-    // is only there). pre-rc(100)=0; snap pins old → decref suppressed;
-    // incref new pba=200 succeeds → rc(200)=1. The hot-path-rc bypass
-    // applies only to snapshot-free volumes.
+    // Phase 5: L2pRemap is rc-neutral regardless of routing. Snapshot
+    // pinning of the old PBA is enforced by `record_dead` populating
+    // the volume's dead-list with the prev `(pba, birth_lsn, death_lsn)`;
+    // Lineage GC consumes the dead-list and emits `FreePbas` only when
+    // both snap-pin and descendant-pin clear. The freed_pba slot on
+    // L2pRemap is always None on the Phase 5 hot path.
     let (_d, db) = mk_db();
     remap(&db, 10, remap_val(100, 1), None);
     db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
@@ -119,8 +119,8 @@ fn l2p_remap_different_pba_leaf_shared_suppresses_decref() {
     let (prev, freed) = assert_remap_applied(outcome);
     assert_eq!(prev, Some(remap_val(100, 1)));
     assert_eq!(freed, None);
-    assert_eq!(db.get_refcount(100).unwrap(), 0, "started at 0; decref suppressed by snap");
-    assert_eq!(db.get_refcount(200).unwrap(), 1, "snapshot path uses legacy apply, increfs new pba");
+    assert_eq!(db.get_refcount(100).unwrap(), 0, "Phase 5: rc-neutral apply");
+    assert_eq!(db.get_refcount(200).unwrap(), 0, "Phase 5: rc-neutral apply");
 }
 
 #[test]
@@ -228,11 +228,10 @@ fn l2p_remap_packed_slot_multi_lba_refcount_aggregates_correctly() {
 
 #[test]
 fn l2p_remap_survives_restart_via_wal_replay() {
-    // Phase 5: WAL replay still rebuilds L2P mapping. The legacy
-    // `apply_l2p_remap` (apply_op_bare path) still runs rc on replay,
-    // so after reopen rc(100)=1 even though the live hot-path commit
-    // left it at 0. This asymmetry is acceptable — production code
-    // doesn't observe live-then-replay rc in the same process.
+    // Phase 5: WAL replay reuses `apply_op_bare` → `apply_l2p_remap`,
+    // which is rc-neutral. Replay restores the L2P mapping; rc stays
+    // at 0 because no rc-mutating op (DedupPut / PromotionChunk /
+    // FreePbas) ran.
     let dir = TempDir::new().unwrap();
     {
         let db = Db::create(dir.path()).unwrap();
@@ -246,7 +245,7 @@ fn l2p_remap_survives_restart_via_wal_replay() {
         db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(),
         Some(remap_val(100, 7))
     );
-    assert_eq!(db.get_refcount(100).unwrap(), 1);
+    assert_eq!(db.get_refcount(100).unwrap(), 0);
 }
 
 #[test]
@@ -334,11 +333,9 @@ fn l2p_remap_guard_reject_does_not_replay_after_later_refcount_growth() {
 
 #[test]
 fn l2p_remap_freed_pba_round_trips_through_replay() {
-    // Phase 5: hot-path L2pRemap doesn't move rc; the legacy
-    // `apply_l2p_remap` on the WAL-replay path still does. So after
-    // reopen we see rc(100)=0 (decref→0) and rc(200)=1 (incref). The
-    // load-bearing invariant is that the L2P mapping at lba=10 is the
-    // post-overwrite value.
+    // Phase 5: L2pRemap is rc-neutral on both the live hot path and
+    // WAL replay. The load-bearing invariant is that the L2P mapping
+    // at lba=10 is the post-overwrite value after replay.
     let dir = TempDir::new().unwrap();
     {
         let db = Db::create(dir.path()).unwrap();
@@ -349,7 +346,7 @@ fn l2p_remap_freed_pba_round_trips_through_replay() {
     }
     let db = Db::open(dir.path()).unwrap();
     assert_eq!(db.get_refcount(100).unwrap(), 0);
-    assert_eq!(db.get_refcount(200).unwrap(), 1);
+    assert_eq!(db.get_refcount(200).unwrap(), 0);
     assert_eq!(
         db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(),
         Some(remap_val(200, 1))
@@ -657,23 +654,19 @@ fn range_delete_dedup_with_snapshot_suppresses_all() {
 
 #[test]
 fn l2p_remap_leaf_shared_plus_drop_snapshot_ends_at_correct_refcount() {
-    // Phase 5 nuance: snapshot-on-volume path uses legacy apply
-    // (see batch_uses_serial_apply). rc(100) starts at 0 (first
-    // write didn't go through legacy because no snapshot was live);
-    // post-snapshot remap goes through legacy → snap pins old (100)
-    // → decref suppressed; incref new (200) → rc(200)=1. After
-    // drop_snapshot, pba_decrefs covers (100, prev_value) → rc(100)
-    // stays at 0 (filtered, was already 0) and report.freed_pbas
-    // does not surface 100. rc(200) stays at 1.
+    // Phase 5: L2pRemap is rc-neutral on all paths. `drop_snapshot`
+    // still walks the snapshot's L2P to plan `pba_decrefs`, but the
+    // `rc > pending` filter drops every entry because no rc bump ever
+    // happened. So `freed_pbas` is empty and both rcs stay at 0.
     let (_d, db) = mk_db();
     remap(&db, 10, remap_val(100, 1), None);
     let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
     remap(&db, 10, remap_val(200, 1), None);
     assert_eq!(db.get_refcount(100).unwrap(), 0);
-    assert_eq!(db.get_refcount(200).unwrap(), 1);
+    assert_eq!(db.get_refcount(200).unwrap(), 0);
     let report = db.drop_snapshot(snap).unwrap().unwrap();
     assert_eq!(db.get_refcount(100).unwrap(), 0);
-    assert_eq!(db.get_refcount(200).unwrap(), 1);
+    assert_eq!(db.get_refcount(200).unwrap(), 0);
     assert!(
         report.freed_pbas.is_empty(),
         "rc(100) was 0 → pba_decrefs filter drops it → not in freed",
@@ -739,11 +732,12 @@ fn drop_snapshot_freed_pbas_covers_dedup_multi_lba_share() {
         freed.contains(&777),
         "pba 777 should be in freed_pbas (hit zero)",
     );
-    // Snapshot-on-volume path uses legacy apply; new pbas get
-    // increfd to 1 (incref new, decref-old suppressed by snap pin).
+    // Phase 5: L2pRemap is rc-neutral on all paths, so the new PBAs
+    // stay at rc=0 and are not in `freed_pbas` (they were never live
+    // in the snapshot's L2P at plan time).
     for lba in 10u64..14 {
         let pba = 888 + lba;
-        assert_eq!(db.get_refcount(pba).unwrap(), 1);
+        assert_eq!(db.get_refcount(pba).unwrap(), 0);
         assert!(!freed.contains(&pba));
     }
 }
@@ -891,12 +885,9 @@ fn l2p_remap_range_crosses_l2p_shard_boundary() {
 
 #[test]
 fn l2p_remap_range_snapshot_pin_suppresses_decref_per_lba() {
-    // Phase 5 nuance: snapshot-on-volume routes commits through legacy
-    // `apply_l2p_remap_range` which still maintains rc. Pre-snapshot
-    // first range write went through the hot-path lane (rc unchanged,
-    // rc(700..704)=0). Post-snapshot range write hits legacy:
-    //   - snap pins old (rc(700..704)) → decref suppressed
-    //   - incref new 900 four times → rc(900)=4
+    // Phase 5: L2pRemapRange is rc-neutral on all paths. Pre- and
+    // post-snapshot range writes leave global rc at 0 for every PBA;
+    // freed_pbas surfaces nothing.
     let (_d, db) = mk_db();
     let seed: Vec<_> = (0..4u8).map(|i| remap_val(700 + i as u64, 1)).collect();
     let _ = remap_range(&db, 10, seed.clone());
@@ -910,14 +901,15 @@ fn l2p_remap_range_snapshot_pin_suppresses_decref_per_lba() {
     for i in 0..4u8 {
         assert_eq!(db.get_refcount(700 + i as u64).unwrap(), 0);
     }
-    assert_eq!(db.get_refcount(900).unwrap(), 4);
+    assert_eq!(db.get_refcount(900).unwrap(), 0);
     // drop_snapshot walks pba_decrefs; rc(700..704)=0 so filter drops
-    // them. rc(900) stays at 4. No assertion needed on freed_pbas.
+    // them. rc(900) was never bumped (rc-neutral apply). freed_pbas
+    // empty.
     db.drop_snapshot(snap).unwrap();
     for i in 0..4u8 {
         assert_eq!(db.get_refcount(700 + i as u64).unwrap(), 0);
     }
-    assert_eq!(db.get_refcount(900).unwrap(), 4);
+    assert_eq!(db.get_refcount(900).unwrap(), 0);
 }
 
 #[test]

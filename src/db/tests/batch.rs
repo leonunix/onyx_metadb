@@ -65,6 +65,11 @@ fn multi_get_dedup_hits_memtable_and_sst() {
 
 #[test]
 fn multi_dedup_entries_are_live_matches_forward_and_refcount() {
+    // Phase 5: `put_dedup` issues `WalOp::DedupPut`, whose apply
+    // increfs the head PBA's rc by 1. The "zero_rc" arm therefore
+    // has to drive the rc back down explicitly via FreePbas (the
+    // `decref_pba` test helper) to model a forward entry whose
+    // underlying PBA has been retired.
     let (_d, db) = mk_db_with_shards(4);
     let live = h(1);
     let zero_rc = h(2);
@@ -84,6 +89,9 @@ fn multi_dedup_entries_are_live_matches_forward_and_refcount() {
     db.incref_pba(old_value.head_pba(), 1).unwrap();
     db.incref_pba(new_value.head_pba(), 1).unwrap();
     db.incref_pba(missing_value.head_pba(), 1).unwrap();
+    // Drive rc(zero_value.head_pba()) back to 0 to model a stale
+    // forward entry whose PBA has been retired.
+    db.decref_pba(zero_value.head_pba(), 1).unwrap();
 
     let got = db
         .multi_dedup_entries_are_live(&[

@@ -884,6 +884,18 @@ pub(super) fn apply_l2p_range_delete(
         for &idx in indices {
             let (_, value) = captured[idx];
             let pba = value.head_pba();
+            // Phase 5: hot-path L2pRemap is rc-neutral, so a captured
+            // PBA may have `rc == 0` (fresh exclusive write that never
+            // entered dedup_index nor was promoted). Decref'ing such a
+            // PBA would underflow. The stale-entry skip mirrors the
+            // pattern in `apply_dedup_put_with_rc`: only mutate rc when
+            // it represents a live "shared via dedup_index /
+            // PromotionChunk" reference. Same on replay — `rc.get`
+            // observes the in-progress apply lane's state for this
+            // LSN.
+            if shard.rc.get(pba)? == 0 {
+                continue;
+            }
             let (pre, new) = shard.rc.stage(pba, -1, lsn)?;
             if new == 0 && pre > 0 {
                 freed_pbas.push(pba);
