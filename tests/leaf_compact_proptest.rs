@@ -200,19 +200,25 @@ proptest! {
     }
 }
 
-// ---------- regression test: 110 unique units, one per slot (v4 cap) -----
+// ---------- regression test: every slot a unique unit (v5 cap=128) -----
 //
 // Pre-v3 layout (compact v2) capped the unit dict at 100 entries; a
 // leaf with 128 distinct L2pValues — one per slot — used to fail at
 // the 101st insert. v3 raised the cap to 128 by dropping on-disk
 // `unit_lba_count` and shrinking per-slot seq from u64 to u32 delta.
 //
-// v4 (Phase 1 of [[no-refcount-hot-path-design]]) adds a per-leaf
+// v4 (Phase 1 of [[no-refcount-hot-path-design]]) added a per-leaf
 // 8 B `base_birth_lsn` and a per-unit 4 B `birth_delta`, tightening
-// `MAX_UNITS_PER_LEAF` back to 110. This test still pins down "the
-// pathological 1-LBA-per-unit run fills the dict to its declared
-// cap"; once a continuation-page overflow mechanism lands we'll be
-// able to raise it back to LEAF_ENTRY_COUNT.
+// `MAX_UNITS_PER_LEAF` back to 110 — which surfaced as
+// `compact_in_place did not free enough room for one unit` corruption
+// under randwrite/seqwrite on nvme-box.
+//
+// v5 restores the cap to 128 = LEAF_ENTRY_COUNT by encoding
+// `base_pba` as a leaf-local u32 delta against a new header
+// `base_pba` field (net: header +8 B, unit -4 B). This test pins
+// down "the pathological 1-LBA-per-unit run fills the dict to the
+// LEAF_ENTRY_COUNT cap" so any future schema change that re-shrinks
+// the cap will fail loudly here.
 #[test]
 fn one_unique_unit_per_slot_round_trips() {
     use onyx_metadb::paged::leaf_compact::MAX_UNITS_PER_LEAF;

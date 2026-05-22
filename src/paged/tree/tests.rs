@@ -10,14 +10,15 @@ fn mk_store() -> (TempDir, Arc<PageStore>) {
 
 fn v(n: u8) -> L2pValue {
     let mut x = [n; crate::paged::format::LEAF_VALUE_SIZE];
-    // Onyx invariant for v4 compact encoding: unit_original_size must
+    // Onyx invariant for v4+ compact encoding: unit_original_size must
     // equal unit_lba_count * 4096 so the encoder can drop lba_count
     // and recover it from original_size on read. Set 1 LBA × 4096.
     x[13..17].copy_from_slice(&4096u32.to_be_bytes());
     x[17..19].copy_from_slice(&1u16.to_be_bytes());
-    // seq / birth_lsn trailers: small monotonic u64 so the per-leaf
-    // u32 seq_delta / birth_delta encodings don't overflow when
-    // distinct `n` values land in the same leaf.
+    // pba / seq / birth_lsn trailers: small monotonic u64 so the
+    // per-leaf u32 pba_delta (v5) / seq_delta / birth_delta encodings
+    // don't overflow when distinct `n` values land in the same leaf.
+    x[0..8].copy_from_slice(&(n as u64).to_be_bytes());
     x[28..36].copy_from_slice(&(n as u64).to_be_bytes());
     x[36..44].copy_from_slice(&(n as u64).to_be_bytes());
     L2pValue(x)

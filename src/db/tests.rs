@@ -3,7 +3,12 @@ use tempfile::TempDir;
 
 pub(super) fn v(n: u8) -> L2pValue {
     let mut x = [0u8; crate::paged::format::LEAF_VALUE_SIZE];
-    x[0] = n;
+    // Put `n` in the LOW byte of the BE u64 PBA (not the high byte —
+    // that produced n × 2^56 spreads across distinct v() calls, which
+    // is fine for v3/v4's inline u64 base_pba but trips v5's u32
+    // pba_delta `compact_in_place did not free enough room` rebase
+    // fallback when two values from this helper share a leaf).
+    x[7] = n;
     // Pin the birth_lsn trailer to a small non-zero u64 so the apply
     // path's birth_lsn stamping (replaces 0 sentinel with apply lsn)
     // doesn't perturb the value bytes underneath round-trip assertions

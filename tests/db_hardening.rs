@@ -7,7 +7,9 @@ use tempfile::TempDir;
 
 fn l2p(n: u8) -> L2pValue {
     let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
-    x[0] = n;
+    // v5: store n in the LOW byte of the big-endian u64 base_pba so
+    // distinct l2p(n) values stay within u32 of each other.
+    x[7] = n;
     x[onyx_metadb::paged::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(x)
 }
@@ -812,9 +814,9 @@ fn drop_snapshot_crash_mid_page_cascade_recovers_consistent_refcounts() {
             let db = Db::create_with_faults(&path, faults.clone()).unwrap();
             // Enough writes to guarantee multi-page L2P trees so the
             // drop_snapshot page cascade is non-trivial. Use LBA = i*4
-            // to spread 256 unique PBAs across multiple leaves and stay
-            // under the v4 MAX_UNITS_PER_LEAF=110 cap (32 unique units
-            // per leaf at this stride).
+            // to spread 256 unique PBAs across multiple leaves (32
+            // unique units per leaf at this stride, well under the
+            // v5 MAX_UNITS_PER_LEAF=128 cap).
             for i in 0u64..256 {
                 let mut tx = db.begin();
                 tx.l2p_remap(0, i * 4, remap_val(100 + i, 0), None);

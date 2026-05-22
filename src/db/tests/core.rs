@@ -383,9 +383,10 @@ fn b2_buffer_take_snapshot_force_compacts_target() {
     // committed LSN.
     //
     // NB: capped at 100 LBAs (rather than 200) so leaf 0 never holds
-    // more than MAX_UNITS_PER_LEAF=110 unique units — see
-    // `leaf_compact::MAX_UNITS_PER_LEAF` docs for the v4 cap and the
-    // pathological 1-LBA-per-unit fallback story.
+    // more than MAX_UNITS_PER_LEAF=128 unique units — see
+    // `leaf_compact::MAX_UNITS_PER_LEAF` docs for the v5 cap (restored
+    // to LEAF_ENTRY_COUNT via the base_pba delta after v4 had to
+    // tighten to 110 for the birth_delta).
     let (_d, db) = mk_db_with_buffer();
     for i in 0u64..100 {
         db.insert(0, i, v(i as u8)).unwrap();

@@ -1013,9 +1013,11 @@ mod tests {
     fn v(byte: u8) -> L2pValue {
         // v3 compact encoder requires unit_original_size = lba_count * 4096
         // so it can drop on-disk lba_count and recover it on decode.
-        // The per-LBA seq trailer must fit a u32 delta off the leaf's
-        // base_seq, so use `byte` as a small u64.
+        // The per-LBA seq trailer, the per-PBA birth_lsn (v4), and the
+        // per-PBA base_pba (v5) must fit a u32 delta off the leaf's
+        // bases, so use `byte` as a small u64 for each.
         let mut x = [byte; crate::paged::format::LEAF_VALUE_SIZE];
+        x[0..8].copy_from_slice(&(byte as u64).to_be_bytes());
         x[13..17].copy_from_slice(&4096u32.to_be_bytes());
         x[17..19].copy_from_slice(&1u16.to_be_bytes());
         x[28..36].copy_from_slice(&(byte as u64).to_be_bytes());

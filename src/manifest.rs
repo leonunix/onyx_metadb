@@ -60,6 +60,14 @@ use crate::types::{
 /// walker that lazily turns Clone-Eager L2P shares into independent
 /// lineages by incref'ing the global rc per shared PBA. Old v13
 /// manifests are hard-rejected on open — no on-disk migration.
+///
+/// (Compact leaf format independently bumped from v4 → v5: per-leaf
+/// `base_pba` (8 B) added to the leaf header and per-unit `base_pba`
+/// (8 B) shrunk to a u32 `pba_delta` (4 B) against it, restoring
+/// `MAX_UNITS_PER_LEAF` from v4's 110 back to the v3 value of 128 =
+/// LEAF_ENTRY_COUNT. Leaf version is checked per page in
+/// `paged::leaf_compact`; manifest body version stays at 14 because
+/// no manifest field changes.)
 pub const MANIFEST_BODY_VERSION: u32 = 14;
 
 // v8 body layout. Fixed header is the same shape as v7 except:

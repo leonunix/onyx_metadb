@@ -39,9 +39,11 @@ fn l2p_put_emits_on_overwrite_only() {
     db.insert(0, 1, v(0xBB)).unwrap();
     let records = drain_dead_list(&db, 0);
     assert_eq!(records.len(), 1);
-    // `v(0xAA)` stamps byte 0 to 0xAA; `head_pba` reads bytes [0..8] as
-    // big-endian u64, so the recovered PBA is 0xAA shifted into the high byte.
-    assert_eq!(records[0].pba, 0xAAu64 << 56);
+    // `v(0xAA)` stamps byte 7 (LOW byte of the big-endian u64
+    // base_pba) to 0xAA, so the recovered PBA is 0xAA. (Old v() put
+    // it in byte 0 = high byte = 0xAA << 56, but that produced
+    // u64-wide spreads incompatible with v5's u32 pba_delta encoding.)
+    assert_eq!(records[0].pba, 0xAAu64);
     assert_ne!(records[0].birth_lsn, 0);
     assert!(records[0].death_lsn > records[0].birth_lsn);
 }

@@ -147,16 +147,18 @@ const _: () = {
     assert!(PAGE_PAYLOAD_SIZE == 4032);
     assert!(LEAF_ENTRY_COUNT == 128);
     assert!(LEAF_BITMAP_BYTES == 16);
-    // Compact format invariants (v4). Header is 34 B (bitmap 16 +
-    // unit_count 1 + version 1 + base_seq 8 + base_birth_lsn 8).
-    // Per-slot record stays 7 B (unit_idx + offset_in_unit + u32
-    // seq_delta). Unit-dict entry grew from 24 → 28 B with the 4 B
-    // per-unit `birth_delta`. To keep the worst-case under the
-    // 4032 B payload cap the per-leaf unit cap drops to 110 (worst
-    // case 34 + 896 + 3080 = 4010 B, 22 B headroom).
-    assert!(leaf_compact::COMPACT_HEADER_BYTES == 34);
-    assert!(leaf_compact::COMPACT_UNIT_DICT_OFFSET == 930);
-    assert!(leaf_compact::MAX_UNITS_PER_LEAF == 110);
+    // Compact format invariants (v5). Header is 42 B (bitmap 16 +
+    // unit_count 1 + version 1 + base_seq 8 + base_birth_lsn 8 +
+    // base_pba 8). Per-slot record stays 7 B (unit_idx +
+    // offset_in_unit + u32 seq_delta). Unit-dict entry shrank from
+    // 28 → 24 B by moving `base_pba` to a leaf-local u32 delta
+    // against the new header `base_pba`. This restores the v3
+    // worst-case cap MAX_UNITS_PER_LEAF = 128 = LEAF_ENTRY_COUNT
+    // (worst case 42 + 896 + 3072 = 4010 B, 22 B headroom — same
+    // headroom v4 had at N = 110).
+    assert!(leaf_compact::COMPACT_HEADER_BYTES == 42);
+    assert!(leaf_compact::COMPACT_UNIT_DICT_OFFSET == 938);
+    assert!(leaf_compact::MAX_UNITS_PER_LEAF == 128);
     assert!(leaf_compact::compact_size(leaf_compact::MAX_UNITS_PER_LEAF) <= PAGE_PAYLOAD_SIZE);
     assert!(INDEX_FANOUT == 256);
     assert!(INDEX_FANOUT * INDEX_CHILD_SIZE <= PAGE_PAYLOAD_SIZE);
@@ -348,9 +350,11 @@ pub fn leaf_entry_count(page: &Page) -> u16 {
 ///
 /// If the unit dict is full when a new unit would be appended, this
 /// function runs `compact_in_place` to drop dead unit entries and
-/// retries. In v2 the payload-bound cap is `MAX_UNITS_PER_LEAF = 100`;
-/// `compact_in_place` after a typical clear cycle frees enough room for
-/// one more unit. A retry that still fails surfaces as `Corruption`.
+/// retries. In v5 the payload-bound cap is `MAX_UNITS_PER_LEAF = 128`
+/// (= LEAF_ENTRY_COUNT, restored after Phase 1 v4 tightened it to 110
+/// to make room for `birth_delta`); `compact_in_place` after a typical
+/// clear cycle frees enough room for one more unit. A retry that still
+/// fails surfaces as `Corruption`.
 pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pValue>> {
     debug_assert!(i < LEAF_ENTRY_COUNT);
     let payload_head = |page: &Page| -> Vec<u8> { page.payload()[..32].to_vec() };
@@ -416,16 +420,20 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pVal
                 leaf_compact::payload_bit_clear(page.payload_mut(), i);
                 leaf_compact::zero_entry(page.payload_mut(), i);
             }
-            // Three ways `find_or_append_unit` returns None:
+            // Four ways `find_or_append_unit` returns None:
             //   - dict is full (reclaim dead units via compact)
             //   - target.birth_lsn would underflow / overflow the leaf
             //     base_birth_lsn (rebase by folding in target.birth_lsn)
-            // Pass both `incoming_seq=0` and the unit's birth so the
-            // compact pass covers either reason in one shot.
+            //   - target.base_pba would underflow / overflow the leaf
+            //     base_pba (rebase by folding in target.base_pba, v5)
+            // Pass `incoming_seq=0`, the unit's birth, and the unit's
+            // base_pba so the compact pass covers all reasons in one
+            // shot.
             leaf_compact::compact_in_place_full(
                 page.payload_mut(),
                 0,
                 unit.birth_lsn,
+                Some(unit.base_pba),
             )?;
             let result = leaf_compact::find_or_append_unit(page.payload_mut(), &unit);
             // Restore the bit so the rest of leaf_set sees the same
@@ -456,18 +464,20 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pVal
             // base_seq (caller wrote with a smaller LSN than already on
             // disk) or above base_seq + u32::MAX (leaf has been alive
             // long enough to span 4G LSNs). compact_in_place_full
-            // rebases base_seq to min(live seq, incoming seq) and
-            // base_birth_lsn to min(live birth, incoming birth);
-            // afterwards the new seq fits as long as the live-seq
-            // spread itself stays under u32::MAX. If it doesn't,
-            // surface Corruption — that means a single leaf's writes
-            // legitimately span >4G LSNs, which shouldn't happen in
-            // onyx workloads but is worth flagging loudly so we don't
-            // silently drop a write.
+            // rebases base_seq to min(live seq, incoming seq),
+            // base_birth_lsn to min(live birth, incoming birth), and
+            // base_pba to min(live pba, incoming pba); afterwards the
+            // new seq fits as long as the live-seq spread itself stays
+            // under u32::MAX. If it doesn't, surface Corruption —
+            // that means a single leaf's writes legitimately span
+            // >4G LSNs, which shouldn't happen in onyx workloads but
+            // is worth flagging loudly so we don't silently drop a
+            // write.
             leaf_compact::compact_in_place_full(
                 page.payload_mut(),
                 entry.seq,
                 unit.birth_lsn,
+                Some(unit.base_pba),
             )?;
             // The unit dict was rewritten by compact_in_place; the unit
             // we just appended (or matched) may have a new index, so
@@ -645,13 +655,15 @@ mod tests {
     /// Build an L2pValue with `byte` repeated across non-derived
     /// fields. The v4 compact encoder drops `unit_lba_count` and
     /// reconstructs it from `unit_original_size / 4096`, so the input
-    /// must satisfy that invariant. The per-LBA seq trailer and the
-    /// per-PBA `birth_lsn` are set to `byte` as a small monotonic u64
-    /// (rather than `byte` repeated 8 times) so the per-leaf u32
-    /// `seq_delta` / `birth_delta` encodings don't overflow when two
-    /// different `byte` values land in the same leaf.
+    /// must satisfy that invariant. The per-LBA seq trailer, the
+    /// per-PBA `birth_lsn`, and the per-PBA `base_pba` (v5 NEW) are
+    /// set to `byte` as a small monotonic u64 (rather than `byte`
+    /// repeated 8 times) so the per-leaf u32 `seq_delta`,
+    /// `birth_delta`, and `pba_delta` encodings don't overflow when
+    /// two different `byte` values land in the same leaf.
     fn v(byte: u8) -> L2pValue {
         let mut x = [byte; LEAF_VALUE_SIZE];
+        x[0..8].copy_from_slice(&(byte as u64).to_be_bytes());
         x[13..17].copy_from_slice(&4096u32.to_be_bytes());
         x[17..19].copy_from_slice(&1u16.to_be_bytes());
         x[28..36].copy_from_slice(&(byte as u64).to_be_bytes());
@@ -717,7 +729,12 @@ mod tests {
         for i in 0..LEAF_ENTRY_COUNT {
             if i % 7 == 0 {
                 assert!(leaf_bit_set(&p, i), "slot {i} should be set");
-                assert_eq!(leaf_value_at(&p, i).unwrap().unwrap().0[0], i as u8);
+                // v() now stores `byte` at offset 8 (compression
+                // field) instead of offset 0, because offset 0..8 is
+                // now the big-endian u64 base_pba and we encode `byte
+                // as u64` there to keep the v5 pba_delta encoding from
+                // overflowing under cross-leaf spread.
+                assert_eq!(leaf_value_at(&p, i).unwrap().unwrap().0[8], i as u8);
             } else {
                 assert!(!leaf_bit_set(&p, i), "slot {i} should be clear");
                 assert_eq!(leaf_value_at(&p, i).unwrap(), None);

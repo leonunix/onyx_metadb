@@ -28,7 +28,9 @@ type DedupRef = BTreeMap<Hash8, DedupValue>;
 
 fn l2p(n: u8) -> L2pValue {
     let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
-    x[0] = n;
+    // v5: store n in the LOW byte of the big-endian u64 base_pba so
+    // distinct l2p(n) values stay within u32 of each other.
+    x[7] = n;
     x[onyx_metadb::paged::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(x)
 }

@@ -1,5 +1,6 @@
-//! Onyx-aware compact leaf encoding (v4 — adds per-unit `birth_lsn`
-//! delta against a leaf-local `base_birth_lsn`).
+//! Onyx-aware compact leaf encoding (v5 — adds per-unit `base_pba`
+//! delta against a leaf-local `base_pba`, restoring the v3 worst-case
+//! `MAX_UNITS_PER_LEAF = 128` after Phase 1 v4 tightened it to 110).
 //!
 //! The legacy dense leaf format stored 128 × 28 B `BlockmapValue` records
 //! back-to-back. Onyx's packer puts consecutive LBAs into the same
@@ -13,7 +14,7 @@
 //!   pba, compression, unit_compressed_size, unit_original_size,
 //!   slot_offset, crc32, flags
 //!
-//! `unit_lba_count` is **not stored on disk** in v3; it is reconstructed
+//! `unit_lba_count` is **not stored on disk** in v3+; it is reconstructed
 //! on read as `unit_original_size / BLOCK_SIZE_4K`. Onyx's writer always
 //! sets `unit_original_size = lba_count * 4096`, so the round trip is
 //! exact.
@@ -26,13 +27,19 @@
 //!                    "no guard" seq=0 case, preserving the
 //!                    `seq_guard` CAS semantics introduced in 0xB2 WAL.)
 //!
-//! Per-unit varying field (v4):
-//!   birth_delta     (u32 BE; the full per-PBA `birth_lsn` is
-//!                    `base_birth_lsn + birth_delta`, where
-//!                    `base_birth_lsn` lives in the leaf header.
-//!                    Sentinel `u32::MAX` encodes the "no birth recorded"
-//!                    case (full_birth_lsn = 0). Powers Phase 2's
-//!                    per-volume dead-list emission — see
+//! Per-unit varying fields:
+//!   pba_delta       (u32 BE; v5 NEW. The full per-unit `base_pba` is
+//!                    `header.base_pba + pba_delta`. Sentinel `u32::MAX`
+//!                    encodes the "not yet placed against a base"
+//!                    transient state used by `write_to`; live on-disk
+//!                    units always carry a real delta. Saves 4 B / unit
+//!                    vs the v4 inline u64, which is what buys back the
+//!                    v3 128-unit cap after birth_delta was added.)
+//!   birth_delta     (u32 BE; v4. The full per-PBA `birth_lsn` is
+//!                    `header.base_birth_lsn + birth_delta`. Sentinel
+//!                    `u32::MAX` encodes the "no birth recorded" case
+//!                    (full_birth_lsn = 0). Powers Phase 2's per-volume
+//!                    dead-list emission — see
 //!                    [[no-refcount-hot-path-design]] memory.)
 //!
 //! # On-disk layout (within the 4032 B leaf payload)
@@ -44,25 +51,27 @@
 //!   [18.. 26]  base_seq        u64 BE  (leaf-local seq base, set on
 //!                                       first non-sentinel insert)
 //!   [26.. 34]  base_birth_lsn  u64 BE  (leaf-local birth_lsn base, set on
-//!                                       first non-sentinel insert, v4 NEW)
-//!   [34..930]  entries         128 × 7 B (slot-indexed dense array)
-//!     entry @ slot s lives at offset 34 + s*7
+//!                                       first non-sentinel insert, v4)
+//!   [34.. 42]  base_pba        u64 BE  (leaf-local pba base, set on
+//!                                       first unit insert, v5 NEW)
+//!   [42..938]  entries         128 × 7 B (slot-indexed dense array)
+//!     entry @ slot s lives at offset 42 + s*7
 //!       [0..1]  unit_idx       u8 (index into unit dict)
 //!       [1..3]  offset_in_unit u16 BE
 //!       [3..7]  seq_delta      u32 BE
 //!                — `u32::MAX` ⇒ full_seq = 0 ("no guard")
 //!                — otherwise   ⇒ full_seq = base_seq + seq_delta
 //!     Unset slots are zero (caller checks bitmap before reading).
-//!   [930..930+28*N]  unit dict (N = unit_count entries × 28 B)
+//!   [938..938+24*N]  unit dict (N = unit_count entries × 24 B)
 //!     per unit:
-//!       [ 0.. 8]  base_pba           u64 BE
-//!       [ 8..12]  unit_compressed_sz u32 BE
-//!       [12..16]  unit_original_sz   u32 BE
-//!       [16..18]  slot_offset        u16 BE
-//!       [18..22]  crc32              u32 BE
-//!       [22..23]  compression        u8
-//!       [23..24]  flags              u8
-//!       [24..28]  birth_delta        u32 BE (v4 NEW; see above)
+//!       [ 0.. 4]  pba_delta          u32 BE (v5 NEW; was 8 B inline base_pba)
+//!       [ 4.. 8]  unit_compressed_sz u32 BE
+//!       [ 8..12]  unit_original_sz   u32 BE
+//!       [12..14]  slot_offset        u16 BE
+//!       [14..18]  crc32              u32 BE
+//!       [18..19]  compression        u8
+//!       [19..20]  flags              u8
+//!       [20..24]  birth_delta        u32 BE (v4; see above)
 //! ```
 //!
 //! # Why slot-indexed (vs popcount-indexed) entries
@@ -76,24 +85,23 @@
 //! writes; packer fills units), so the overhead only appears for
 //! transient sparse states after random deletes.
 //!
-//! # Worst-case sizes for a 128-entry leaf (v4, 28 B/unit)
+//! # Worst-case sizes for a 128-entry leaf (v5, 24 B/unit, 42 B header)
 //!
-//! - empty leaf:    34 +    0 +  896 =  930 B
-//! - 1 unit:        34 +   28 +  896 =  958 B
-//! - 8 units:       34 +  224 +  896 = 1154 B
-//! - 32 units:      34 +  896 +  896 = 1826 B
-//! - 64 units:      34 + 1792 +  896 = 2722 B
-//! - 100 units:     34 + 2800 +  896 = 3730 B
-//! - 110 units:     34 + 3080 +  896 = 4010 B  (≤ 4032 — payload cap; 22 B headroom)
-//! - 128 units:     34 + 3584 +  896 = 4514 B  (BUSTS — capped at 110)
+//! - empty leaf:    42 +    0 +  896 =  938 B
+//! - 1 unit:        42 +   24 +  896 =  962 B
+//! - 8 units:       42 +  192 +  896 = 1130 B
+//! - 32 units:      42 +  768 +  896 = 1706 B
+//! - 64 units:      42 + 1536 +  896 = 2474 B
+//! - 100 units:     42 + 2400 +  896 = 3338 B
+//! - 128 units:     42 + 3072 +  896 = 4010 B  (≤ 4032 — payload cap; 22 B headroom)
 //!
-//! `MAX_UNITS_PER_LEAF = 110` (down from v3's 128). Onyx's typical
-//! packer-driven workload keeps distinct units per leaf well below this
-//! cap. The pathological "every slot a unique unit" case (synthetic
-//! `--refill_buffers` 1-LBA-per-unit) will fail `leaf_set` with the
-//! v2-era `compact_in_place did not free enough room for one unit`
-//! `Corruption` once it tries to insert unit #111; a continuation-page
-//! overflow mechanism is the planned mitigation if soak ever hits it.
+//! `MAX_UNITS_PER_LEAF = 128 = LEAF_ENTRY_COUNT`. The pathological
+//! "every slot a unique unit" case fits exactly (same headroom v3 had
+//! pre-Phase-1). Workloads that legitimately span > 4 G PBA blocks
+//! within a single 128-LBA leaf range will trip the v5 rebase fallback
+//! in `compact_in_place_full` (mirrors birth_delta's > 4 G LSN edge);
+//! the continuation-page overflow mechanism remains the long-term
+//! mitigation for that case.
 
 use crate::error::{MetaDbError, Result};
 use crate::paged::format::{LEAF_BITMAP_BYTES, LEAF_ENTRY_COUNT, LEAF_VALUE_SIZE};
@@ -106,7 +114,8 @@ use crate::paged::format::{LEAF_BITMAP_BYTES, LEAF_ENTRY_COUNT, LEAF_VALUE_SIZE}
 /// v2: per-slot u64 seq (36 B values, 11 B per-slot record, 100 unit cap).
 /// v3: per-leaf base_seq + u32 delta, drop on-disk lba_count, 128 unit cap.
 /// v4: per-leaf base_birth_lsn + per-unit u32 birth_delta (28 B unit), 110 unit cap.
-pub const COMPACT_VERSION: u8 = 4;
+/// v5: per-leaf base_pba + per-unit u32 pba_delta (24 B unit), 128 unit cap.
+pub const COMPACT_VERSION: u8 = 5;
 
 /// Sentinel `seq_delta` value encoding "no seq guard" (full_seq=0).
 pub const SEQ_DELTA_NO_GUARD: u32 = u32::MAX;
@@ -116,6 +125,14 @@ pub const SEQ_DELTA_NO_GUARD: u32 = u32::MAX;
 /// that don't carry a birth_lsn. Mirrors `SEQ_DELTA_NO_GUARD`'s shape.
 pub const BIRTH_DELTA_NO_RECORD: u32 = u32::MAX;
 
+/// Sentinel `pba_delta` value for the transient "unit not yet placed
+/// against a leaf base" state used by `UnitMeta::write_to` when it
+/// runs without a base (e.g. during a `compact_in_place` rebase pass
+/// before the new base is committed to the header). Live on-disk
+/// units always carry a real delta. Mirrors `BIRTH_DELTA_NO_RECORD`'s
+/// shape so the encode/decode patterns stay uniform.
+pub const PBA_DELTA_NO_RECORD: u32 = u32::MAX;
+
 /// Onyx 4 KiB block size used to recover `unit_lba_count` from
 /// `unit_original_size`. Must match
 /// `onyx_storage::types::BLOCK_SIZE`.
@@ -123,14 +140,17 @@ pub const BLOCK_SIZE_4K: u32 = 4096;
 
 /// Fixed-size fields at the head of a compact payload. Always present,
 /// even for an empty leaf.
-/// Layout: `[bitmap 16 | unit_count 1 | version 1 | base_seq 8 | base_birth_lsn 8]`.
-pub const COMPACT_HEADER_BYTES: usize = LEAF_BITMAP_BYTES + 1 + 1 + 8 + 8; // 34
+/// Layout (v5): `[bitmap 16 | unit_count 1 | version 1 | base_seq 8 | base_birth_lsn 8 | base_pba 8]`.
+pub const COMPACT_HEADER_BYTES: usize = LEAF_BITMAP_BYTES + 1 + 1 + 8 + 8 + 8; // 42
 
 /// Byte offset of the leaf-local `base_seq` field within the header.
 pub const COMPACT_BASE_SEQ_OFFSET: usize = LEAF_BITMAP_BYTES + 2;
 
 /// Byte offset of the leaf-local `base_birth_lsn` field within the header.
 pub const COMPACT_BASE_BIRTH_OFFSET: usize = COMPACT_BASE_SEQ_OFFSET + 8;
+
+/// Byte offset of the leaf-local `base_pba` field within the header (v5).
+pub const COMPACT_BASE_PBA_OFFSET: usize = COMPACT_BASE_BIRTH_OFFSET + 8;
 
 /// Size of one per-entry slot-indexed record on disk.
 /// Layout: `[unit_idx:u8 | offset_in_unit:u16 BE | seq_delta:u32 BE]`.
@@ -146,11 +166,12 @@ pub const COMPACT_ENTRIES_OFFSET: usize = COMPACT_HEADER_BYTES;
 /// Byte offset at which the unit dictionary begins.
 pub const COMPACT_UNIT_DICT_OFFSET: usize = COMPACT_ENTRIES_OFFSET + COMPACT_ENTRIES_REGION_BYTES;
 
-/// Size of one unit-dict entry on disk.
+/// Size of one unit-dict entry on disk (v5).
 /// Layout:
-///   `[base_pba 8 | comp_sz 4 | orig_sz 4 | slot_off 2 | crc32 4 | comp 1 | flags 1 | birth_delta 4]`.
-/// (`unit_lba_count` is derived from `unit_original_size` on decode.)
-pub const COMPACT_UNIT_BYTES: usize = 28;
+///   `[pba_delta 4 | comp_sz 4 | orig_sz 4 | slot_off 2 | crc32 4 | comp 1 | flags 1 | birth_delta 4]`.
+/// (`unit_lba_count` is derived from `unit_original_size` on decode.
+/// `base_pba = header.base_pba + pba_delta` is the full per-unit PBA.)
+pub const COMPACT_UNIT_BYTES: usize = 24;
 
 /// Footprint of the legacy dense format (16 B bitmap + 128 × 44 B
 /// values). Kept as a reference baseline for benches and CR reporting;
@@ -159,17 +180,17 @@ pub const COMPACT_UNIT_BYTES: usize = 28;
 pub const DENSE_FOOTPRINT_BYTES: usize = LEAF_BITMAP_BYTES + LEAF_ENTRY_COUNT * LEAF_VALUE_SIZE;
 
 /// Maximum number of distinct units a single leaf can reference. With
-/// v4 schema (header grew 8 B for base_birth_lsn, unit dict grew 4 B
-/// for per-unit birth_delta) the worst-case footprint is
-/// `34 + 896 + N×28` which fits 4032 B only up to **N = 110**
-/// (`34 + 896 + 110×28 = 4010 B`, 22 B headroom). Down from v3's 128.
-/// Onyx's packer-driven steady-state stays far below this cap;
-/// pathologically fragmented synthetic workloads
-/// (`--refill_buffers` / 1-LBA-per-unit) may trip
-/// `compact_in_place did not free enough room for one unit` once they
-/// try to write the 111th unit — a continuation-page mechanism is the
-/// planned mitigation if soak ever hits it.
-pub const MAX_UNITS_PER_LEAF: usize = 110;
+/// v5 schema (header grew another 8 B for base_pba, unit dict shrank
+/// 4 B because `base_pba` is now a u32 delta against the header base)
+/// the worst-case footprint is `42 + 896 + N×24` which fits 4032 B up
+/// to **N = 128 = LEAF_ENTRY_COUNT** (`42 + 896 + 128×24 = 4010 B`,
+/// 22 B headroom — same headroom v4 had at N = 110). The pathological
+/// "every slot a unique unit" case (synthetic `--refill_buffers` /
+/// 1-LBA-per-unit) now fits exactly. Workloads that legitimately span
+/// > 4 G PBA blocks within a single leaf trip the rebase fallback in
+/// `compact_in_place_full` and surface Corruption (mirrors
+/// birth_delta's > 4 G LSN edge case).
+pub const MAX_UNITS_PER_LEAF: usize = 128;
 
 /// Byte offset (within the leaf payload) of unit `i` in the dictionary.
 #[inline]
@@ -250,7 +271,7 @@ impl UnitMeta {
             (unit.flags & 0x02) != 0
                 || u16::from_be_bytes(v[17..19].try_into().unwrap()) as u32 * BLOCK_SIZE_4K
                     == unit.unit_original_size,
-            "v4 compact encoding requires unit_original_size == lba_count * 4096 (unless FLAG_ZERO)"
+            "v5 compact encoding requires unit_original_size == lba_count * 4096 (unless FLAG_ZERO)"
         );
         let entry = EntryDelta {
             offset_in_unit: u16::from_be_bytes(v[19..21].try_into().unwrap()),
@@ -259,26 +280,63 @@ impl UnitMeta {
         (unit, entry)
     }
 
-    /// Encode unit fields. The 4 B `birth_delta` tail is filled by
-    /// [`write_unit_with_base`] which knows the leaf-local
-    /// `base_birth_lsn`; pure `write_to` writes the sentinel
-    /// "no record" so it's safe to call standalone (e.g. in the
-    /// `compact_in_place` rebase loop before the base is updated).
+    /// Encode unit fields (v5). The 4 B `pba_delta` head and 4 B
+    /// `birth_delta` tail are filled by [`try_write_pba_delta`] /
+    /// [`try_write_birth_delta`] which know the leaf-local bases; pure
+    /// `write_to` writes both sentinels ("not yet placed against a
+    /// base") so it's safe to call standalone (e.g. in the
+    /// `compact_in_place` rebase loop before the new bases are
+    /// updated).
     #[inline]
     fn write_to(&self, out: &mut [u8; COMPACT_UNIT_BYTES]) {
-        out[0..8].copy_from_slice(&self.base_pba.to_be_bytes());
-        out[8..12].copy_from_slice(&self.unit_compressed_size.to_be_bytes());
-        out[12..16].copy_from_slice(&self.unit_original_size.to_be_bytes());
-        out[16..18].copy_from_slice(&self.slot_offset.to_be_bytes());
-        out[18..22].copy_from_slice(&self.crc32.to_be_bytes());
-        out[22] = self.compression;
-        out[23] = self.flags;
-        out[24..28].copy_from_slice(&BIRTH_DELTA_NO_RECORD.to_be_bytes());
+        out[0..4].copy_from_slice(&PBA_DELTA_NO_RECORD.to_be_bytes());
+        out[4..8].copy_from_slice(&self.unit_compressed_size.to_be_bytes());
+        out[8..12].copy_from_slice(&self.unit_original_size.to_be_bytes());
+        out[12..14].copy_from_slice(&self.slot_offset.to_be_bytes());
+        out[14..18].copy_from_slice(&self.crc32.to_be_bytes());
+        out[18] = self.compression;
+        out[19] = self.flags;
+        out[20..24].copy_from_slice(&BIRTH_DELTA_NO_RECORD.to_be_bytes());
+    }
+
+    /// Encode the per-unit `pba_delta` against `base_pba` (v5). Returns
+    /// `NeedsRebase` if the delta would overflow `u32::MAX` (or if
+    /// `base_pba < header.base_pba`); callers must run
+    /// [`compact_in_place_with_incoming_pba`] and retry. Mirrors
+    /// [`try_write_birth_delta`] but signals "first unit, adopt
+    /// incoming as the base" via the explicit `has_base` flag — unlike
+    /// `birth_lsn`, PBA = 0 is a valid allocator output and cannot
+    /// double as a sentinel.
+    #[inline]
+    fn try_write_pba_delta(
+        &self,
+        base_pba: u64,
+        has_base: bool,
+        out: &mut [u8; COMPACT_UNIT_BYTES],
+    ) -> WritePbaOutcome {
+        let (delta, outcome) = if !has_base {
+            (
+                0u32,
+                WritePbaOutcome::AdoptedBase {
+                    new_base: self.base_pba,
+                },
+            )
+        } else if self.base_pba < base_pba {
+            return WritePbaOutcome::NeedsRebase;
+        } else {
+            let diff = self.base_pba - base_pba;
+            if diff >= PBA_DELTA_NO_RECORD as u64 {
+                return WritePbaOutcome::NeedsRebase;
+            }
+            (diff as u32, WritePbaOutcome::Written)
+        };
+        out[0..4].copy_from_slice(&delta.to_be_bytes());
+        outcome
     }
 
     /// Encode the per-unit `birth_delta` against `base_birth_lsn`.
-    /// Returns `false` if the delta would overflow `u32::MAX` (or if
-    /// `birth_lsn < base_birth_lsn`); callers must
+    /// Returns `NeedsRebase` if the delta would overflow `u32::MAX`
+    /// (or if `birth_lsn < base_birth_lsn`); callers must
     /// [`compact_in_place_with_incoming_birth`] and retry.
     #[inline]
     fn try_write_birth_delta(
@@ -304,29 +362,44 @@ impl UnitMeta {
             }
             (diff as u32, WriteBirthOutcome::Written)
         };
-        out[24..28].copy_from_slice(&delta.to_be_bytes());
+        out[20..24].copy_from_slice(&delta.to_be_bytes());
         outcome
     }
 
-    /// Decode the 28 B unit dict entry, reconstructing the full
-    /// `birth_lsn` from `base_birth_lsn` + `birth_delta`.
+    /// Decode the 24 B unit dict entry (v5), reconstructing the full
+    /// `base_pba` from `header.base_pba` + `pba_delta` and the full
+    /// `birth_lsn` from `header.base_birth_lsn` + `birth_delta`.
     #[inline]
-    fn read_from(buf: &[u8], base_birth_lsn: u64) -> Self {
+    fn read_from(buf: &[u8], base_birth_lsn: u64, base_pba: u64) -> Self {
         debug_assert!(buf.len() >= COMPACT_UNIT_BYTES);
-        let birth_delta = u32::from_be_bytes(buf[24..28].try_into().unwrap());
+        let pba_delta = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        // PBA_DELTA_NO_RECORD is a transient sentinel only ever set by
+        // `write_to` while a unit is staged before
+        // `try_write_pba_delta` commits the real delta. On a live page
+        // it shouldn't appear; if it does (stale page after a crashed
+        // rebase, fault injection) decode it as `base_pba` (delta 0)
+        // so the value still round-trips through tests. The
+        // `payload_decode_at_checked` path independently verifies the
+        // unit_count / bitmap invariants.
+        let resolved_pba = if pba_delta == PBA_DELTA_NO_RECORD {
+            base_pba
+        } else {
+            base_pba.wrapping_add(pba_delta as u64)
+        };
+        let birth_delta = u32::from_be_bytes(buf[20..24].try_into().unwrap());
         let birth_lsn = if birth_delta == BIRTH_DELTA_NO_RECORD {
             0
         } else {
             base_birth_lsn.wrapping_add(birth_delta as u64)
         };
         UnitMeta {
-            base_pba: u64::from_be_bytes(buf[0..8].try_into().unwrap()),
-            unit_compressed_size: u32::from_be_bytes(buf[8..12].try_into().unwrap()),
-            unit_original_size: u32::from_be_bytes(buf[12..16].try_into().unwrap()),
-            slot_offset: u16::from_be_bytes(buf[16..18].try_into().unwrap()),
-            crc32: u32::from_be_bytes(buf[18..22].try_into().unwrap()),
-            compression: buf[22],
-            flags: buf[23],
+            base_pba: resolved_pba,
+            unit_compressed_size: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
+            unit_original_size: u32::from_be_bytes(buf[8..12].try_into().unwrap()),
+            slot_offset: u16::from_be_bytes(buf[12..14].try_into().unwrap()),
+            crc32: u32::from_be_bytes(buf[14..18].try_into().unwrap()),
+            compression: buf[18],
+            flags: buf[19],
             birth_lsn,
         }
     }
@@ -387,6 +460,21 @@ pub(crate) enum WriteBirthOutcome {
     AdoptedBase { new_base: u64 },
     /// Delta would overflow `u32::MAX` (or `birth_lsn < base_birth_lsn`).
     /// Caller must run [`compact_in_place_with_incoming_birth`] and
+    /// retry.
+    NeedsRebase,
+}
+
+/// Outcome of a unit-dict `pba_delta` encode attempt (v5). Mirrors
+/// [`WriteBirthOutcome`] but for the per-unit `base_pba` field.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WritePbaOutcome {
+    /// Delta written successfully under the existing header `base_pba`.
+    Written,
+    /// Header `base_pba` was 0; this unit's `base_pba` became the new
+    /// base. Caller must persist `new_base` to the leaf header.
+    AdoptedBase { new_base: u64 },
+    /// Delta would overflow `u32::MAX` (or `base_pba < header.base_pba`).
+    /// Caller must run [`compact_in_place_with_incoming_pba`] and
     /// retry.
     NeedsRebase,
 }
@@ -546,49 +634,147 @@ pub(crate) fn write_base_birth(payload: &mut [u8], base_birth_lsn: u64) {
         .copy_from_slice(&base_birth_lsn.to_be_bytes());
 }
 
-/// Read the unit-dict entry at `idx`. Caller must ensure
+/// Read the leaf-local `base_pba` from the header (v5). Zero means
+/// "no unit has been written yet"; the first unit insert adopts its
+/// PBA as the new base.
+#[inline]
+pub(crate) fn read_base_pba(payload: &[u8]) -> u64 {
+    u64::from_be_bytes(
+        payload[COMPACT_BASE_PBA_OFFSET..COMPACT_BASE_PBA_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    )
+}
+
+/// Write the leaf-local `base_pba` into the header (v5). Callers
+/// update this when a unit adopts a new base or
+/// [`compact_in_place_with_incoming_pba`] rebases.
+#[inline]
+pub(crate) fn write_base_pba(payload: &mut [u8], base_pba: u64) {
+    payload[COMPACT_BASE_PBA_OFFSET..COMPACT_BASE_PBA_OFFSET + 8]
+        .copy_from_slice(&base_pba.to_be_bytes());
+}
+
+/// Read the unit-dict entry at `idx` (v5). Caller must ensure
 /// `idx < read_unit_count(payload)`. The `birth_lsn` field is
-/// reconstructed from the leaf's `base_birth_lsn` + `birth_delta`.
+/// reconstructed from the leaf's `base_birth_lsn` + `birth_delta`;
+/// the `base_pba` is reconstructed from the leaf's `base_pba` +
+/// `pba_delta`.
 #[inline]
 pub(crate) fn read_unit(payload: &[u8], idx: usize) -> UnitMeta {
     let off = unit_offset(idx);
     let base_birth_lsn = read_base_birth(payload);
-    UnitMeta::read_from(&payload[off..off + COMPACT_UNIT_BYTES], base_birth_lsn)
+    let base_pba = read_base_pba(payload);
+    UnitMeta::read_from(
+        &payload[off..off + COMPACT_UNIT_BYTES],
+        base_birth_lsn,
+        base_pba,
+    )
 }
 
-/// Write the unit-dict entry at `idx`. Encodes `birth_delta` against
-/// the current `base_birth_lsn`; the caller is responsible for
-/// adopting / rebasing if the outcome is `NeedsRebase`. Most callers
-/// should use [`write_unit_or_rebase`] which handles the base
+/// Outcome of `try_write_unit` (v5). Tracks which of the two delta
+/// encodings (`pba_delta` or `birth_delta`) decided the operation's
+/// fate. Callers driving the rebase loop in `find_or_append_unit`
+/// dispatch the corresponding `compact_in_place_with_incoming_*` /
+/// `compact_in_place_full` variant based on this discriminant.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WriteUnitOutcome {
+    /// Both deltas fit; the unit is fully written.
+    Written,
+    /// Header bases were updated as a side effect (one or both of
+    /// `base_pba` / `base_birth_lsn` adopted the new unit's values).
+    /// Caller has nothing more to do; the unit is fully written.
+    AdoptedBases,
+    /// `pba_delta` overflowed (or `base_pba < header.base_pba`). Caller
+    /// must run [`compact_in_place_with_incoming_pba`] / pass the
+    /// incoming pba through [`compact_in_place_full`] and retry.
+    NeedsPbaRebase,
+    /// `birth_delta` overflowed (or `birth_lsn < header.base_birth_lsn`).
+    /// Caller must run [`compact_in_place_with_incoming_birth`] / pass
+    /// the incoming birth through [`compact_in_place_full`] and retry.
+    NeedsBirthRebase,
+}
+
+/// Write the unit-dict entry at `idx` (v5). Encodes `pba_delta`
+/// against the current `base_pba` and `birth_delta` against the
+/// current `base_birth_lsn`; the caller is responsible for adopting /
+/// rebasing if the outcome is `NeedsPbaRebase` or `NeedsBirthRebase`.
+/// Most callers should use [`write_unit`] which handles the base
 /// adoption automatically.
+///
+/// On `NeedsPbaRebase` the unit's static bytes (compressed_size,
+/// original_size, etc.) are written to disk with `PBA_DELTA_NO_RECORD`
+/// as the sentinel head; on `NeedsBirthRebase` everything except
+/// birth_delta is committed and the tail carries
+/// `BIRTH_DELTA_NO_RECORD`. Callers that get a rebase outcome must
+/// either retry-write after rebasing or treat the slot as transient.
 #[inline]
 pub(crate) fn try_write_unit(
     payload: &mut [u8],
     idx: usize,
     u: &UnitMeta,
-) -> WriteBirthOutcome {
+) -> WriteUnitOutcome {
     let off = unit_offset(idx);
     let base_birth_lsn = read_base_birth(payload);
+    let base_pba = read_base_pba(payload);
+    // `has_base` distinguishes "header.base_pba is meaningful" from
+    // "leaf is empty / first unit will adopt". We use unit_count > 0
+    // as the signal since PBA = 0 is a valid allocator output and
+    // can't double as an in-band sentinel.
+    let has_base = read_unit_count(payload) > 0;
     let dst: &mut [u8; COMPACT_UNIT_BYTES] = (&mut payload[off..off + COMPACT_UNIT_BYTES])
         .try_into()
         .unwrap();
     u.write_to(dst);
-    u.try_write_birth_delta(base_birth_lsn, dst)
+    let pba_outcome = u.try_write_pba_delta(base_pba, has_base, dst);
+    let birth_outcome = u.try_write_birth_delta(base_birth_lsn, dst);
+
+    let pba_adopt = match pba_outcome {
+        WritePbaOutcome::NeedsRebase => return WriteUnitOutcome::NeedsPbaRebase,
+        WritePbaOutcome::AdoptedBase { new_base } => Some(new_base),
+        WritePbaOutcome::Written => None,
+    };
+    let birth_adopt = match birth_outcome {
+        WriteBirthOutcome::NeedsRebase => return WriteUnitOutcome::NeedsBirthRebase,
+        WriteBirthOutcome::AdoptedBase { new_base } => Some(new_base),
+        WriteBirthOutcome::Written => None,
+    };
+
+    let mut adopted = false;
+    if let Some(b) = pba_adopt {
+        write_base_pba(payload, b);
+        adopted = true;
+    }
+    if let Some(b) = birth_adopt {
+        write_base_birth(payload, b);
+        adopted = true;
+    }
+    if adopted {
+        WriteUnitOutcome::AdoptedBases
+    } else {
+        WriteUnitOutcome::Written
+    }
 }
 
-/// Write a unit, transparently adopting `birth_lsn` as the new
-/// `base_birth_lsn` if the header's base was zero. Panics if a rebase
-/// is required (caller should run
-/// [`compact_in_place_with_incoming_birth`] first when this can
-/// happen).
+/// Write a unit, transparently adopting bases if the header's
+/// `base_pba` / `base_birth_lsn` were zero. Panics if a rebase is
+/// required (caller should run
+/// [`compact_in_place_with_incoming_birth`] /
+/// [`compact_in_place_with_incoming_pba`] first when this can happen).
 #[inline]
 pub(crate) fn write_unit(payload: &mut [u8], idx: usize, u: &UnitMeta) {
     match try_write_unit(payload, idx, u) {
-        WriteBirthOutcome::Written => {}
-        WriteBirthOutcome::AdoptedBase { new_base } => {
-            write_base_birth(payload, new_base);
+        WriteUnitOutcome::Written | WriteUnitOutcome::AdoptedBases => {}
+        WriteUnitOutcome::NeedsPbaRebase => {
+            panic!(
+                "compact leaf write_unit idx={idx} base_pba={} requires rebase \
+                 (header.base_pba={}); caller must use try_write_unit + \
+                 compact_in_place_with_incoming_pba loop instead",
+                u.base_pba,
+                read_base_pba(payload)
+            );
         }
-        WriteBirthOutcome::NeedsRebase => {
+        WriteUnitOutcome::NeedsBirthRebase => {
             panic!(
                 "compact leaf write_unit idx={idx} birth_lsn={} requires rebase \
                  (base_birth_lsn={}); caller must use try_write_unit + \
@@ -691,7 +877,7 @@ pub(crate) fn decompose_value(v: &[u8; LEAF_VALUE_SIZE]) -> (UnitMeta, EntryDelt
 /// which case the caller must run `compact_in_place` and retry).
 ///
 /// "Find" walks the dict linearly. With 1..32 typical units this beats
-/// a HashMap; with the v3 worst case of 128 units it's still ~3.1 KiB
+/// a HashMap; with the worst case of 128 units it's still ~3 KiB
 /// of sequential reads, well within an L1 line.
 pub(crate) fn find_or_append_unit(payload: &mut [u8], target: &UnitMeta) -> Option<u8> {
     let count = read_unit_count(payload) as usize;
@@ -713,12 +899,17 @@ pub(crate) fn find_or_append_unit(payload: &mut [u8], target: &UnitMeta) -> Opti
     if count >= MAX_UNITS_PER_LEAF {
         return None;
     }
-    // Probe the birth_delta encoding first; if a rebase is needed
-    // signal back as `None` so the caller can run
-    // `compact_in_place_with_incoming_birth(target.birth_lsn)` and
-    // retry. Otherwise commit the write and bump unit_count.
+    // Probe both delta encodings before mutating the dict; if either
+    // would need a rebase, return `None` so the caller can run
+    // `compact_in_place_full(payload, 0, target.birth_lsn,
+    // target.base_pba)` (which folds both incoming bases into one
+    // pass) and retry. Otherwise commit the write and bump unit_count.
     let base_birth = read_base_birth(payload);
     if needs_birth_rebase(base_birth, target.birth_lsn) {
+        return None;
+    }
+    let base_pba = read_base_pba(payload);
+    if needs_pba_rebase(base_pba, count > 0, target.base_pba) {
         return None;
     }
     write_unit(payload, count, target);
@@ -745,6 +936,26 @@ pub(crate) fn needs_birth_rebase(base_birth_lsn: u64, incoming_birth: u64) -> bo
     diff >= BIRTH_DELTA_NO_RECORD as u64
 }
 
+/// True iff encoding `incoming_pba` against `base_pba` would overflow
+/// `u32::MAX` or underflow (incoming below base). Used by
+/// `find_or_append_unit` to decide whether to bail out for a rebase
+/// before mutating the dict. Mirrors [`needs_birth_rebase`] but takes
+/// an explicit `has_base` flag instead of treating `base_pba == 0` as
+/// "no base set" — PBA = 0 is a valid allocator output and cannot
+/// double as a sentinel. Callers should pass `has_base = unit_count
+/// > 0`.
+#[inline]
+pub(crate) fn needs_pba_rebase(base_pba: u64, has_base: bool, incoming_pba: u64) -> bool {
+    if !has_base {
+        return false;
+    }
+    if incoming_pba < base_pba {
+        return true;
+    }
+    let diff = incoming_pba - base_pba;
+    diff >= PBA_DELTA_NO_RECORD as u64
+}
+
 /// Maximum unit-dict capacity given the payload size. With v4's 4032 B
 /// payload that's `(4032 - 930) / 28 = 110`, matching the
 /// `MAX_UNITS_PER_LEAF = 110` cap exactly.
@@ -759,61 +970,78 @@ pub const fn max_units_per_payload(payload_len: usize) -> usize {
 
 /// Rebuild the unit dictionary in place, dropping unreferenced units
 /// and renumbering `unit_idx` references in the entries region. Also
-/// rebases `base_seq` to `min(live full_seq)` and `base_birth_lsn` to
-/// `min(live unit birth_lsn)` so subsequent inserts have the maximum
-/// possible delta headroom.
+/// rebases `base_seq` to `min(live full_seq)`, `base_birth_lsn` to
+/// `min(live unit birth_lsn)`, and `base_pba` to `min(live unit
+/// base_pba)` so subsequent inserts have the maximum possible delta
+/// headroom.
 ///
 /// See [`compact_in_place_with_incoming`] /
 /// [`compact_in_place_with_incoming_birth`] /
-/// [`compact_in_place_full`] for variants that also account for a
-/// not-yet-written entry's or unit's seq/birth during rebase.
+/// [`compact_in_place_with_incoming_pba`] / [`compact_in_place_full`]
+/// for variants that also account for a not-yet-written entry's or
+/// unit's seq/birth/pba during rebase.
 pub(crate) fn compact_in_place(payload: &mut [u8]) -> Result<()> {
-    compact_in_place_full(payload, 0, 0)
+    compact_in_place_full(payload, 0, 0, None)
 }
 
 /// Like [`compact_in_place`] but also folds `incoming_seq` (the seq
 /// of an entry about to be written by the caller) into the
 /// `new_base_seq = min(...)` computation. Equivalent to
-/// `compact_in_place_full(payload, incoming_seq, 0)`.
+/// `compact_in_place_full(payload, incoming_seq, 0, None)`.
 pub(crate) fn compact_in_place_with_incoming(
     payload: &mut [u8],
     incoming_seq: u64,
 ) -> Result<()> {
-    compact_in_place_full(payload, incoming_seq, 0)
+    compact_in_place_full(payload, incoming_seq, 0, None)
 }
 
 /// Like [`compact_in_place`] but also folds `incoming_birth` (the
 /// birth_lsn of a unit about to be appended by the caller) into the
 /// `new_base_birth_lsn = min(...)` computation. Equivalent to
-/// `compact_in_place_full(payload, 0, incoming_birth)`.
+/// `compact_in_place_full(payload, 0, incoming_birth, None)`.
 pub(crate) fn compact_in_place_with_incoming_birth(
     payload: &mut [u8],
     incoming_birth: u64,
 ) -> Result<()> {
-    compact_in_place_full(payload, 0, incoming_birth)
+    compact_in_place_full(payload, 0, incoming_birth, None)
+}
+
+/// Like [`compact_in_place`] but also folds `incoming_pba` (the
+/// `base_pba` of a unit about to be appended by the caller) into the
+/// `new_base_pba = min(...)` computation. Equivalent to
+/// `compact_in_place_full(payload, 0, 0, Some(incoming_pba))`.
+pub(crate) fn compact_in_place_with_incoming_pba(
+    payload: &mut [u8],
+    incoming_pba: u64,
+) -> Result<()> {
+    compact_in_place_full(payload, 0, 0, Some(incoming_pba))
 }
 
 /// Algorithm:
 /// 1. Compute `new_base_seq = min(live full_seq among non-sentinel
-///    entries, incoming_seq if non-zero)` and `new_base_birth_lsn =
+///    entries, incoming_seq if non-zero)`, `new_base_birth_lsn =
 ///    min(live unit birth_lsn among non-sentinel units, incoming_birth
-///    if non-zero)`. If no candidate values exist, the corresponding
-///    base resets to 0.
+///    if non-zero)`, and `new_base_pba = min(live unit base_pba,
+///    incoming_pba if non-zero)`. If no candidate values exist, the
+///    corresponding base resets to 0.
 /// 2. Scan all 128 entry slots. For each set slot, read its old
 ///    `unit_idx` and full seq. Build `old → new` index translation,
 ///    allocating a new index the first time we see each old index.
-///    Capture each live unit's full birth_lsn from the OLD base.
+///    Capture each live unit's full birth_lsn and base_pba from the
+///    OLD bases.
 /// 3. Re-emit live units to a scratch Vec (preserving discovery order),
-///    each with its full (already-decoded) `birth_lsn`.
-/// 4. Write the new `base_seq` and `base_birth_lsn` into the header.
+///    each with its full (already-decoded) `birth_lsn` and `base_pba`.
+/// 4. Write the new `base_seq`, `base_birth_lsn`, and `base_pba` into
+///    the header.
 /// 5. Re-emit live entries under the new base_seq.
-/// 6. Re-emit live units under the new base_birth_lsn.
+/// 6. Re-emit live units under the new bases.
 /// 7. Zero out the tail bytes between the new and old `unit_count`.
 /// 8. Write `new_unit_count`.
 pub(crate) fn compact_in_place_full(
     payload: &mut [u8],
     incoming_seq: u64,
     incoming_birth: u64,
+    incoming_pba: Option<u64>,
 ) -> Result<()> {
     let old_count = read_unit_count(payload) as usize;
     let cap = max_units_per_payload(payload.len()).min(MAX_UNITS_PER_LEAF);
@@ -824,10 +1052,11 @@ pub(crate) fn compact_in_place_full(
     }
     if old_count == 0 {
         // No units yet — but bases may still be nonzero from a prior
-        // population that's been entirely cleared. Reset both so the
-        // next insert can adopt cleanly.
+        // population that's been entirely cleared. Reset all three so
+        // the next insert can adopt cleanly.
         write_base_seq(payload, 0);
         write_base_birth(payload, 0);
+        write_base_pba(payload, 0);
         return Ok(());
     }
 
@@ -859,14 +1088,19 @@ pub(crate) fn compact_in_place_full(
     }
 
     // Pass 2: discovery-ordered remap from old unit_idx → new unit_idx.
-    // Captures each live unit with its full birth_lsn under the
-    // CURRENT base_birth_lsn — must be read before rewriting it.
+    // Captures each live unit with its full birth_lsn / base_pba under
+    // the CURRENT header bases — must be read before rewriting them.
     let mut remap: [Option<u8>; 256] = [None; 256];
     let mut live_units: Vec<UnitMeta> = Vec::with_capacity(old_count);
     let mut new_base_birth: Option<u64> = None;
     if incoming_birth != 0 {
         new_base_birth = Some(incoming_birth);
     }
+    // PBA fold: unlike birth/seq, 0 IS a valid PBA, so we fold every
+    // live unit's `base_pba` into the min unconditionally. `Option`
+    // discriminates "no candidate" (no live units AND no incoming)
+    // from "min is 0".
+    let mut new_base_pba: Option<u64> = incoming_pba;
     let live_clone = live.clone();
     for (_, old_idx, _) in &live_clone {
         if remap[*old_idx].is_some() {
@@ -879,6 +1113,10 @@ pub(crate) fn compact_in_place_full(
                 None => unit.birth_lsn,
             });
         }
+        new_base_pba = Some(match new_base_pba {
+            Some(b) => b.min(unit.base_pba),
+            None => unit.base_pba,
+        });
         let new_idx = live_units.len() as u8;
         remap[*old_idx] = Some(new_idx);
         live_units.push(unit);
@@ -889,8 +1127,10 @@ pub(crate) fn compact_in_place_full(
     // header.
     let resolved_base_seq = new_base_seq.unwrap_or(0);
     let resolved_base_birth = new_base_birth.unwrap_or(0);
+    let resolved_base_pba = new_base_pba.unwrap_or(0);
     write_base_seq(payload, resolved_base_seq);
     write_base_birth(payload, resolved_base_birth);
+    write_base_pba(payload, resolved_base_pba);
 
     // Pass 3: re-emit live entries under the new base_seq.
     for (slot, old_idx, entry) in &live {
@@ -910,15 +1150,19 @@ pub(crate) fn compact_in_place_full(
         }
     }
 
-    // Pass 4: re-emit dict tightly, encoding each unit's birth_delta
-    // against the new base_birth_lsn.
+    // Pass 4: re-emit dict tightly, encoding each unit's pba_delta /
+    // birth_delta against the new bases.
     for (i, u) in live_units.iter().enumerate() {
         match try_write_unit(payload, i, u) {
-            WriteBirthOutcome::Written => {}
-            WriteBirthOutcome::AdoptedBase { new_base } => {
-                write_base_birth(payload, new_base);
+            WriteUnitOutcome::Written | WriteUnitOutcome::AdoptedBases => {}
+            WriteUnitOutcome::NeedsPbaRebase => {
+                return Err(MetaDbError::Corruption(format!(
+                    "compact leaf pba_delta would overflow u32 even after rebase: \
+                     unit_idx={i} base_pba={} base={}",
+                    u.base_pba, resolved_base_pba
+                )));
             }
-            WriteBirthOutcome::NeedsRebase => {
+            WriteUnitOutcome::NeedsBirthRebase => {
                 return Err(MetaDbError::Corruption(format!(
                     "compact leaf birth_delta would overflow u32 even after rebase: \
                      unit_idx={i} birth_lsn={} base={}",
@@ -1002,7 +1246,7 @@ pub(crate) fn payload_decode_at_checked(
 /// `bitmap` is the 16 B presence bitmap; `values` is the 128 × 44 B
 /// value array (unset slots may be anything — they're skipped via the
 /// bitmap). The output is always strictly smaller than the 4032 B leaf
-/// payload for valid populations (≤ 110 distinct units), so encode
+/// payload for valid populations (≤ 128 distinct units), so encode
 /// never fails on size grounds and returns a `Vec<u8>` directly.
 pub fn encode(
     bitmap: &[u8; LEAF_BITMAP_BYTES],
@@ -1012,20 +1256,22 @@ pub fn encode(
     // 1..8 distinct units, `units.iter().position()` outperforms a
     // HashMap. We bound the dict to MAX_UNITS_PER_LEAF.
     let mut units: Vec<UnitMeta> = Vec::with_capacity(8);
-    // Pre-size the output buffer to the v4 worst case (MAX_UNITS_PER_LEAF
+    // Pre-size the output buffer to the v5 worst case (MAX_UNITS_PER_LEAF
     // distinct units = 4010 B). We'll truncate to the actual dict size.
     let mut out = vec![0u8; compact_size(MAX_UNITS_PER_LEAF)];
     out[..LEAF_BITMAP_BYTES].copy_from_slice(bitmap);
     out[LEAF_BITMAP_BYTES + 1] = COMPACT_VERSION;
 
     // Pass 1: decompose every set slot, compute base_seq = min(live
-    // non-sentinel seqs) and base_birth_lsn = min(live unit
-    // birth_lsns) so encode produces the same byte pattern as a leaf
-    // populated via the page-level primitives + final compact_in_place.
+    // non-sentinel seqs), base_birth_lsn = min(live unit birth_lsns),
+    // and base_pba = min(live unit base_pba) so encode produces the
+    // same byte pattern as a leaf populated via the page-level
+    // primitives + final compact_in_place.
     let mut entries: Vec<(usize, EntryDelta, usize /*unit_idx*/)> =
         Vec::with_capacity(LEAF_ENTRY_COUNT);
     let mut base_seq: Option<u64> = None;
     let mut base_birth: Option<u64> = None;
+    let mut base_pba: Option<u64> = None;
     for slot in 0..LEAF_ENTRY_COUNT {
         if (bitmap[slot / 8] >> (slot % 8)) & 1 == 0 {
             continue;
@@ -1041,6 +1287,13 @@ pub fn encode(
                         None => unit.birth_lsn,
                     });
                 }
+                // PBA fold: 0 is a valid PBA, so fold every unit
+                // unconditionally — `Option` discriminates "no live
+                // units yet" from "min is 0".
+                base_pba = Some(match base_pba {
+                    Some(b) => b.min(unit.base_pba),
+                    None => unit.base_pba,
+                });
                 units.push(unit);
                 units.len() - 1
             }
@@ -1055,10 +1308,13 @@ pub fn encode(
     }
     let resolved_base_seq = base_seq.unwrap_or(0);
     let resolved_base_birth = base_birth.unwrap_or(0);
+    let resolved_base_pba = base_pba.unwrap_or(0);
     out[COMPACT_BASE_SEQ_OFFSET..COMPACT_BASE_SEQ_OFFSET + 8]
         .copy_from_slice(&resolved_base_seq.to_be_bytes());
     out[COMPACT_BASE_BIRTH_OFFSET..COMPACT_BASE_BIRTH_OFFSET + 8]
         .copy_from_slice(&resolved_base_birth.to_be_bytes());
+    out[COMPACT_BASE_PBA_OFFSET..COMPACT_BASE_PBA_OFFSET + 8]
+        .copy_from_slice(&resolved_base_pba.to_be_bytes());
 
     for (slot, entry, unit_idx) in &entries {
         let off = entry_offset(*slot);
@@ -1074,15 +1330,27 @@ pub fn encode(
     }
 
     out[LEAF_BITMAP_BYTES] = units.len() as u8;
+    let has_pba_base = !units.is_empty();
     for (i, u) in units.iter().enumerate() {
         let off = unit_offset(i);
         let dst: &mut [u8; COMPACT_UNIT_BYTES] = (&mut out[off..off + COMPACT_UNIT_BYTES])
             .try_into()
             .unwrap();
         u.write_to(dst);
-        let outcome = u.try_write_birth_delta(resolved_base_birth, dst);
+        // `has_pba_base` is true once any unit exists; resolved_base_pba
+        // was just written to the header above. The first unit (i = 0)
+        // sees has_base = true here because we already committed the
+        // count + base, mirroring the post-compact state in
+        // `compact_in_place_full`.
+        let pba_outcome = u.try_write_pba_delta(resolved_base_pba, has_pba_base, dst);
         debug_assert!(
-            !matches!(outcome, WriteBirthOutcome::NeedsRebase),
+            !matches!(pba_outcome, WritePbaOutcome::NeedsRebase),
+            "encode: pba_delta overflow at unit_idx {i} base_pba={} base={resolved_base_pba}",
+            u.base_pba
+        );
+        let birth_outcome = u.try_write_birth_delta(resolved_base_birth, dst);
+        debug_assert!(
+            !matches!(birth_outcome, WriteBirthOutcome::NeedsRebase),
             "encode: birth_delta overflow at unit_idx {i} birth_lsn={} base={resolved_base_birth}",
             u.birth_lsn
         );
@@ -1145,6 +1413,11 @@ pub fn decode_at(encoded: &[u8], slot: usize) -> Option<[u8; LEAF_VALUE_SIZE]> {
             .try_into()
             .unwrap(),
     );
+    let base_pba = u64::from_be_bytes(
+        encoded[COMPACT_BASE_PBA_OFFSET..COMPACT_BASE_PBA_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
     let entry_off = entry_offset(slot);
     let (unit_idx, entry) =
         EntryDelta::read_from(&encoded[entry_off..entry_off + COMPACT_ENTRY_BYTES], base_seq);
@@ -1158,6 +1431,7 @@ pub fn decode_at(encoded: &[u8], slot: usize) -> Option<[u8; LEAF_VALUE_SIZE]> {
     let unit = UnitMeta::read_from(
         &encoded[unit_off..unit_off + COMPACT_UNIT_BYTES],
         base_birth,
+        base_pba,
     );
     Some(compose(&unit, &entry))
 }
@@ -1187,6 +1461,11 @@ pub fn decode_all(encoded: &[u8]) -> [Option<[u8; LEAF_VALUE_SIZE]>; LEAF_ENTRY_
             .try_into()
             .unwrap(),
     );
+    let base_pba = u64::from_be_bytes(
+        encoded[COMPACT_BASE_PBA_OFFSET..COMPACT_BASE_PBA_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
 
     let mut units: Vec<UnitMeta> = Vec::with_capacity(unit_count);
     for i in 0..unit_count {
@@ -1197,6 +1476,7 @@ pub fn decode_all(encoded: &[u8]) -> [Option<[u8; LEAF_VALUE_SIZE]>; LEAF_ENTRY_
         units.push(UnitMeta::read_from(
             &encoded[off..off + COMPACT_UNIT_BYTES],
             base_birth,
+            base_pba,
         ));
     }
 
@@ -1270,8 +1550,8 @@ mod tests {
     fn empty_leaf_round_trips() {
         let (bm, vals) = empty_leaf_input();
         let enc = encode(&bm, &vals);
-        // 34 header + 896 entries (zero) + 0 unit dict = 930.
-        assert_eq!(enc.len(), 930);
+        // 42 header + 896 entries (zero) + 0 unit dict = 938 (v5).
+        assert_eq!(enc.len(), 938);
         for s in 0..LEAF_ENTRY_COUNT {
             assert_eq!(decode_at(&enc, s), None);
         }
@@ -1296,10 +1576,11 @@ mod tests {
             set(&mut bm, &mut vals, i, v);
         }
         let enc = encode(&bm, &vals);
-        // 34 + 896 + 28 = 958 (v4: header +8 for base_birth_lsn, unit +4 for birth_delta)
-        assert_eq!(enc.len(), 958);
+        // 42 + 896 + 24 = 962 (v5: header +8 for base_pba, unit -4 because
+        // base_pba is now a u32 delta against the leaf base).
+        assert_eq!(enc.len(), 962);
         let cr = DENSE_FOOTPRINT_BYTES as f64 / enc.len() as f64;
-        // 1 unit / 128 slots: dense=16+128*44=5648, compact=958 → ~5.9x.
+        // 1 unit / 128 slots: dense=16+128*44=5648, compact=962 → ~5.87x.
         assert!(cr > 4.0, "CR too low: {cr}");
 
         for i in 0..LEAF_ENTRY_COUNT {
@@ -1328,10 +1609,10 @@ mod tests {
             set(&mut bm, &mut vals, i, v);
         }
         let enc = encode(&bm, &vals);
-        // 34 + 896 + 8*28 = 1154 (v4 layout)
-        assert_eq!(enc.len(), 1154);
+        // 42 + 896 + 8*24 = 1130 (v5 layout)
+        assert_eq!(enc.len(), 1130);
         let cr = DENSE_FOOTPRINT_BYTES as f64 / enc.len() as f64;
-        // 8 units / 128 slots: dense=5648, compact=1154 → ~4.9x.
+        // 8 units / 128 slots: dense=5648, compact=1130 → ~5.0x.
         assert!(cr >= 3.5, "8-unit CR {cr} below 3.5x");
 
         let all = decode_all(&enc);
@@ -1372,14 +1653,16 @@ mod tests {
 
     #[test]
     fn pathological_distinct_units_fits_payload() {
-        // v4 caps at MAX_UNITS_PER_LEAF = 110 (down from v3's 128).
-        // The payload-bound cap is (4032 - 930) / 28 = 110 — exactly
-        // what we set. 110 distinct units => 34 + 896 + 28*110 =
-        // 4010 B, leaving 22 B headroom in the 4032 B payload.
-        // Synthetic 1-LBA-per-unit workloads that need >110 unique
-        // units per leaf will fall back to `Corruption` in `leaf_set`
-        // until a continuation-page mechanism is wired up — see the
-        // module-level comment.
+        // v5 restores MAX_UNITS_PER_LEAF = 128 = LEAF_ENTRY_COUNT
+        // (after v4's 110 cap, tightened to make room for birth_delta).
+        // The payload-bound cap is (4032 - 938) / 24 = 128 — exactly
+        // what we set. 128 distinct units => 42 + 896 + 24*128 =
+        // 4010 B, leaving 22 B headroom in the 4032 B payload —
+        // identical to v4's headroom at its old N = 110. Synthetic
+        // 1-LBA-per-unit workloads now fit exactly. Workloads that
+        // legitimately span >4 G PBA blocks within one 128-LBA leaf
+        // range will trip the rebase fallback in compact_in_place;
+        // see the module-level comment.
         let (mut bm, mut vals) = empty_leaf_input();
         for i in 0..MAX_UNITS_PER_LEAF {
             let v = bv(0x3000 + i as u64, 1, 500, 4096, 1, 0, i as u32, 0, 0);
@@ -1604,8 +1887,8 @@ mod tests {
         let cap = max_units_per_payload(p.len()).min(MAX_UNITS_PER_LEAF);
 
         // Fill: each leaf slot 0..min(cap,128) gets its own unit. With
-        // v3's 7 B per-slot record + 24 B unit + 26 B header the
-        // payload-bound cap is 129, capped at MAX_UNITS_PER_LEAF=128
+        // v5's 7 B per-slot record + 24 B unit + 42 B header the
+        // payload-bound cap is 128, equal to MAX_UNITS_PER_LEAF=128
         // = LEAF_ENTRY_COUNT, so we fill every slot for full coverage.
         let live_slots: Vec<usize> = (0..cap.min(LEAF_ENTRY_COUNT)).collect();
         for &slot in &live_slots {
@@ -1721,25 +2004,28 @@ mod tests {
 
     #[test]
     fn fixed_offsets_compile_time_invariants() {
-        // Sanity for v4 layout constants. Header: 16 B bitmap + 1 B
+        // Sanity for v5 layout constants. Header: 16 B bitmap + 1 B
         // unit_count + 1 B version + 8 B base_seq + 8 B base_birth_lsn
-        // = 34 B. Per-slot record: 7 B (unit_idx + offset + u32
-        // seq_delta). Unit-dict entry: 28 B (24 B from v3 + 4 B per-
-        // unit birth_delta). MAX_UNITS_PER_LEAF tightens to 110 so the
-        // pathological 110-distinct-unit case fits the 4032 B payload
-        // with 22 B headroom.
-        assert_eq!(COMPACT_HEADER_BYTES, 34);
+        // + 8 B base_pba = 42 B. Per-slot record: 7 B (unit_idx +
+        // offset + u32 seq_delta). Unit-dict entry: 24 B (28 B from
+        // v4 - 4 B because base_pba is now a u32 delta against the
+        // leaf base instead of an inline u64). MAX_UNITS_PER_LEAF
+        // restores to 128 = LEAF_ENTRY_COUNT so the pathological
+        // 128-distinct-unit case fits the 4032 B payload with 22 B
+        // headroom (same headroom v4 had at its old N = 110).
+        assert_eq!(COMPACT_HEADER_BYTES, 42);
         assert_eq!(COMPACT_BASE_SEQ_OFFSET, 18);
         assert_eq!(COMPACT_BASE_BIRTH_OFFSET, 26);
-        assert_eq!(COMPACT_ENTRIES_OFFSET, 34);
-        assert_eq!(COMPACT_UNIT_DICT_OFFSET, 930);
+        assert_eq!(COMPACT_BASE_PBA_OFFSET, 34);
+        assert_eq!(COMPACT_ENTRIES_OFFSET, 42);
+        assert_eq!(COMPACT_UNIT_DICT_OFFSET, 938);
         assert_eq!(COMPACT_ENTRY_BYTES, 7);
-        assert_eq!(COMPACT_UNIT_BYTES, 28);
-        assert_eq!(MAX_UNITS_PER_LEAF, 110);
-        assert_eq!(max_units_per_payload(crate::page::PAGE_PAYLOAD_SIZE), 110);
-        assert_eq!(compact_size(0), 930);
-        assert_eq!(compact_size(1), 958);
-        assert_eq!(compact_size(8), 1154);
+        assert_eq!(COMPACT_UNIT_BYTES, 24);
+        assert_eq!(MAX_UNITS_PER_LEAF, 128);
+        assert_eq!(max_units_per_payload(crate::page::PAGE_PAYLOAD_SIZE), 128);
+        assert_eq!(compact_size(0), 938);
+        assert_eq!(compact_size(1), 962);
+        assert_eq!(compact_size(8), 1130);
         assert_eq!(compact_size(MAX_UNITS_PER_LEAF), 4010);
         assert!(compact_size(MAX_UNITS_PER_LEAF) <= crate::page::PAGE_PAYLOAD_SIZE);
     }
