@@ -67,11 +67,7 @@ struct RcBucketApplyResult {
 /// per-LBA `applied` bits are OR-ed, `prevs` slots are filled in where
 /// previously `None`, and `freed_pbas` are concatenated. All other
 /// outcomes are 1-shard-per-op and simply overwrite.
-fn merge_l2p_outcome(
-    outcomes: &mut [Option<ApplyOutcome>],
-    idx: usize,
-    incoming: ApplyOutcome,
-) {
+fn merge_l2p_outcome(outcomes: &mut [Option<ApplyOutcome>], idx: usize, incoming: ApplyOutcome) {
     match incoming {
         ApplyOutcome::L2pRemapRange {
             applied: in_applied,
@@ -110,9 +106,7 @@ fn merge_l2p_outcome(
                 });
             }
             Some(other) => {
-                panic!(
-                    "L2pRemapRange partial at idx={idx} but existing outcome is {other:?}"
-                );
+                panic!("L2pRemapRange partial at idx={idx} but existing outcome is {other:?}");
             }
         },
         other => {
@@ -270,8 +264,9 @@ fn wal_lane_key(op: &WalOp) -> u64 {
         // refcount table + the in-memory manifest's lineage edges).
         // The lane key is used only to pick a WAL writer lane; we hash
         // by vol_ord so different volumes' walker commits can fan out.
-        WalOp::PromotionChunk { vol_ord, .. }
-        | WalOp::PromotionComplete { vol_ord } => xxh3_64(&vol_ord.to_be_bytes()),
+        WalOp::PromotionChunk { vol_ord, .. } | WalOp::PromotionComplete { vol_ord } => {
+            xxh3_64(&vol_ord.to_be_bytes())
+        }
     }
 }
 
@@ -841,16 +836,22 @@ impl Db {
                 ..
             } => {
                 let mut mstate = self.manifest_state.lock();
-                if let Some(entry) =
-                    mstate.manifest.volumes.iter_mut().find(|e| e.ord == *vol_ord)
+                if let Some(entry) = mstate
+                    .manifest
+                    .volumes
+                    .iter_mut()
+                    .find(|e| e.ord == *vol_ord)
                 {
                     entry.promotion_cursor = *next_cursor;
                 }
             }
             WalOp::PromotionComplete { vol_ord } => {
                 let mut mstate = self.manifest_state.lock();
-                if let Some(entry) =
-                    mstate.manifest.volumes.iter_mut().find(|e| e.ord == *vol_ord)
+                if let Some(entry) = mstate
+                    .manifest
+                    .volumes
+                    .iter_mut()
+                    .find(|e| e.ord == *vol_ord)
                 {
                     entry.parent_vol_ord = None;
                     entry.promotion_cursor = None;
@@ -946,8 +947,7 @@ impl Db {
         let mut remap_vols = HashSet::new();
         for op in ops {
             match op {
-                WalOp::L2pRemap { vol_ord, .. }
-                | WalOp::L2pRemapRange { vol_ord, .. } => {
+                WalOp::L2pRemap { vol_ord, .. } | WalOp::L2pRemapRange { vol_ord, .. } => {
                     remap_vols.insert(*vol_ord);
                 }
                 _ => {}
@@ -1134,13 +1134,12 @@ impl Db {
                         per_shard.entry(sid).or_default().push(off as u32);
                     }
                     for (sid, offsets) in per_shard {
-                        l2p_buckets
-                            .entry((*vol_ord, sid))
-                            .or_default()
-                            .push(L2pBucketEntry::RangeSlice {
+                        l2p_buckets.entry((*vol_ord, sid)).or_default().push(
+                            L2pBucketEntry::RangeSlice {
                                 op_idx: idx,
                                 lba_offsets: offsets.into_boxed_slice(),
-                            });
+                            },
+                        );
                     }
                     remap_may_defer_refcount = true;
                 }
@@ -1347,22 +1346,22 @@ impl Db {
                             nonbatch_positions.push(pos);
                         }
                     }
-                    L2pBucketEntry::RangeSlice { op_idx, lba_offsets } => {
+                    L2pBucketEntry::RangeSlice {
+                        op_idx,
+                        lba_offsets,
+                    } => {
                         let (start_lba, range_values) = match &ops[*op_idx] {
                             WalOp::L2pRemapRange {
                                 start_lba, values, ..
                             } => (*start_lba, values.as_ref()),
-                            other => unreachable!(
-                                "RangeSlice op_idx points to non-range op: {other:?}"
-                            ),
+                            other => {
+                                unreachable!("RangeSlice op_idx points to non-range op: {other:?}")
+                            }
                         };
                         let n = range_values.len();
-                        range_partials.entry(*op_idx).or_insert_with(|| {
-                            (
-                                vec![false; n].into_boxed_slice(),
-                                vec![None; n],
-                            )
-                        });
+                        range_partials
+                            .entry(*op_idx)
+                            .or_insert_with(|| (vec![false; n].into_boxed_slice(), vec![None; n]));
                         for &off in lba_offsets.iter() {
                             batch_lbas.push(BatchLba {
                                 op_idx: *op_idx,
@@ -1426,8 +1425,7 @@ impl Db {
                 if entries.is_empty() {
                     continue;
                 }
-                let prev_values =
-                    tree.insert_leaf_run_at_lsn_deferred_finish(&entries, lsn)?;
+                let prev_values = tree.insert_leaf_run_at_lsn_deferred_finish(&entries, lsn)?;
                 for ((batch_i, (_lba, _new_value)), prev) in accepted_batch_idx
                     .into_iter()
                     .zip(entries.into_iter())
@@ -1687,14 +1685,18 @@ impl Db {
         let ops_started = std::time::Instant::now();
         let ops_result = (|| -> Result<()> {
             for entry in &indices {
-                if let L2pBucketEntry::RangeSlice { op_idx, lba_offsets } = entry {
+                if let L2pBucketEntry::RangeSlice {
+                    op_idx,
+                    lba_offsets,
+                } = entry
+                {
                     let (range_start_lba, range_values) = match &ops[*op_idx] {
                         WalOp::L2pRemapRange {
                             start_lba, values, ..
                         } => (*start_lba, values.as_ref()),
-                        other => unreachable!(
-                            "RangeSlice op_idx points to non-range op: {other:?}"
-                        ),
+                        other => {
+                            unreachable!("RangeSlice op_idx points to non-range op: {other:?}")
+                        }
                     };
                     let n = range_values.len();
                     let mut applied_bits = vec![false; n].into_boxed_slice();
@@ -2014,9 +2016,8 @@ impl Db {
         // `apply.rs` and use the same routing math (xxh3 mod shards)
         // because this lane bucket holds `Arc<RcShard>` directly, not
         // the outer `Shard` wrapper that `shard_for_key` expects.
-        let rc_shard_for = |pba: Pba| -> usize {
-            (xxh3_64(&pba.to_be_bytes()) as usize) % refcount_shards.len()
-        };
+        let rc_shard_for =
+            |pba: Pba| -> usize { (xxh3_64(&pba.to_be_bytes()) as usize) % refcount_shards.len() };
         let stage_rc = |pba: Pba, delta: i64| -> Result<()> {
             let sid = rc_shard_for(pba);
             refcount_shards[sid].stage(pba, delta, lsn)?;
@@ -2048,33 +2049,35 @@ impl Db {
         // work for the live path, but using the embedded value keeps
         // the live and replay paths bit-identical and saves a
         // cuckoo lookup per op.
-        let flush_pending_puts = |pending_puts: &mut Vec<(Hash8, DedupValue, Option<Pba>, usize)>,
-                                  outcomes: &mut Vec<(usize, ApplyOutcome)>|
-         -> Result<()> {
-            if pending_puts.is_empty() {
-                return Ok(());
-            }
-            let entries: Vec<(Hash8, DedupValue)> = pending_puts
-                .iter()
-                .map(|(hash, value, _, _)| (*hash, *value))
-                .collect();
-            let mut put_timings = DedupPutStageTimings::default();
-            let started = std::time::Instant::now();
-            dedup_index.put_many_with_metrics(&entries, lsn, &mut put_timings)?;
-            metrics.record_dedup_forward_put_batch(pending_puts.len() as u64, started.elapsed());
-            metrics.record_dedup_put_stages(put_timings);
-            for (_, value, old_pba, idx) in pending_puts.drain(..) {
-                let new_pba = value.head_pba();
-                if old_pba != Some(new_pba) {
-                    if let Some(op) = old_pba {
-                        stage_rc_decref_if_live(op)?;
-                    }
-                    stage_rc(new_pba, 1)?;
+        let flush_pending_puts =
+            |pending_puts: &mut Vec<(Hash8, DedupValue, Option<Pba>, usize)>,
+             outcomes: &mut Vec<(usize, ApplyOutcome)>|
+             -> Result<()> {
+                if pending_puts.is_empty() {
+                    return Ok(());
                 }
-                outcomes.push((idx, ApplyOutcome::Dedup));
-            }
-            Ok(())
-        };
+                let entries: Vec<(Hash8, DedupValue)> = pending_puts
+                    .iter()
+                    .map(|(hash, value, _, _)| (*hash, *value))
+                    .collect();
+                let mut put_timings = DedupPutStageTimings::default();
+                let started = std::time::Instant::now();
+                dedup_index.put_many_with_metrics(&entries, lsn, &mut put_timings)?;
+                metrics
+                    .record_dedup_forward_put_batch(pending_puts.len() as u64, started.elapsed());
+                metrics.record_dedup_put_stages(put_timings);
+                for (_, value, old_pba, idx) in pending_puts.drain(..) {
+                    let new_pba = value.head_pba();
+                    if old_pba != Some(new_pba) {
+                        if let Some(op) = old_pba {
+                            stage_rc_decref_if_live(op)?;
+                        }
+                        stage_rc(new_pba, 1)?;
+                    }
+                    outcomes.push((idx, ApplyOutcome::Dedup));
+                }
+                Ok(())
+            };
 
         for idx in indices {
             match &ops[idx] {
@@ -2434,14 +2437,7 @@ impl Db {
             return Ok(outcomes);
         }
 
-        Self::apply_ops_grouped_to_lanes(
-            volumes,
-            refcount_shards,
-            dedup_index,
-            metrics,
-            lsn,
-            ops,
-        )
+        Self::apply_ops_grouped_to_lanes(volumes, refcount_shards, dedup_index, metrics, lsn, ops)
     }
 
     fn apply_ops_grouped_to_lanes(
@@ -2490,13 +2486,12 @@ impl Db {
                         per_shard.entry(sid).or_default().push(off as u32);
                     }
                     for (sid, offsets) in per_shard {
-                        l2p_buckets
-                            .entry((*vol_ord, sid))
-                            .or_default()
-                            .push(L2pBucketEntry::RangeSlice {
+                        l2p_buckets.entry((*vol_ord, sid)).or_default().push(
+                            L2pBucketEntry::RangeSlice {
                                 op_idx: idx,
                                 lba_offsets: offsets.into_boxed_slice(),
-                            });
+                            },
+                        );
                     }
                 }
                 WalOp::DedupPut { .. }
@@ -2514,9 +2509,7 @@ impl Db {
                 | WalOp::FreePbas { .. }
                 | WalOp::PromotionChunk { .. }
                 | WalOp::PromotionComplete { .. } => {
-                    unreachable!(
-                        "lifecycle op must not reach apply_ops_grouped_to_lanes"
-                    );
+                    unreachable!("lifecycle op must not reach apply_ops_grouped_to_lanes");
                 }
             }
         }
@@ -2711,13 +2704,12 @@ impl Db {
                         per_shard.entry(sid).or_default().push(off as u32);
                     }
                     for (sid, offsets) in per_shard {
-                        l2p_buckets
-                            .entry((*vol_ord, sid))
-                            .or_default()
-                            .push(L2pBucketEntry::RangeSlice {
+                        l2p_buckets.entry((*vol_ord, sid)).or_default().push(
+                            L2pBucketEntry::RangeSlice {
                                 op_idx: idx,
                                 lba_offsets: offsets.into_boxed_slice(),
-                            });
+                            },
+                        );
                     }
                 }
                 WalOp::DedupPut { .. }
@@ -2888,105 +2880,4 @@ fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Du
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn footprint(lanes: impl IntoIterator<Item = DispatchLaneKey>) -> DispatchFootprint {
-        DispatchFootprint {
-            global: false,
-            lanes: lanes.into_iter().collect(),
-        }
-    }
-
-    fn entry(footprint: DispatchFootprint, durable: bool) -> DispatchEntry {
-        DispatchEntry { footprint, durable }
-    }
-
-    #[test]
-    fn dispatch_scheduler_allows_disjoint_higher_lsn_to_bypass() {
-        let mut state = DispatchState::default();
-        state
-            .pending
-            .insert(10, entry(footprint([DispatchLaneKey::L2p(0, 0)]), false));
-        state
-            .pending
-            .insert(11, entry(footprint([DispatchLaneKey::L2p(0, 1)]), true));
-
-        assert!(
-            dispatch_ready(&state, 11),
-            "lower undurable work on another shard must not block dispatch"
-        );
-    }
-
-    #[test]
-    fn dispatch_scheduler_blocks_conflicting_higher_lsn() {
-        let mut state = DispatchState::default();
-        state
-            .pending
-            .insert(10, entry(footprint([DispatchLaneKey::Refcount(2)]), false));
-        state
-            .pending
-            .insert(11, entry(footprint([DispatchLaneKey::Refcount(2)]), true));
-
-        assert!(
-            !dispatch_ready(&state, 11),
-            "same lane must preserve WAL LSN dispatch order"
-        );
-        state.pending.remove(&10);
-        assert!(dispatch_ready(&state, 11));
-    }
-
-    #[test]
-    fn dispatch_scheduler_treats_global_as_conflicting_with_every_lane() {
-        let mut state = DispatchState::default();
-        state
-            .pending
-            .insert(10, entry(DispatchFootprint::global(), true));
-        state
-            .pending
-            .insert(11, entry(footprint([DispatchLaneKey::Dedup(0)]), true));
-
-        assert!(
-            !dispatch_ready(&state, 11),
-            "global serial work must retain the old FIFO barrier"
-        );
-    }
-
-    #[test]
-    fn small_remap_batches_use_lane_dispatch_not_global_serial() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db = Db::create(dir.path()).unwrap();
-        let mut raw = [0u8; crate::paged::format::LEAF_VALUE_SIZE];
-        raw[..8].copy_from_slice(&123_u64.to_be_bytes());
-
-        let ops = [WalOp::L2pRemap {
-            vol_ord: BOOTSTRAP_VOLUME_ORD,
-            lba: 7,
-            new_value: L2pValue(raw),
-            guard: None,
-        }];
-
-        assert!(
-            !db.batch_uses_serial_apply(&ops),
-            "tiny remap commits must keep precise L2P/refcount footprints so they do not block dedup dispatch globally"
-        );
-        let plan = db
-            .build_lane_dispatch_plan(&db.volumes.read().clone(), &ops)
-            .unwrap();
-        let footprint = DispatchFootprint::from_lane_plan(&plan);
-        assert!(!footprint.global);
-        assert!(
-            footprint
-                .lanes
-                .iter()
-                .any(|lane| matches!(lane, DispatchLaneKey::L2p(BOOTSTRAP_VOLUME_ORD, _)))
-        );
-        assert!(
-            !footprint
-                .lanes
-                .iter()
-                .any(|lane| matches!(lane, DispatchLaneKey::Dedup(_))),
-            "remap-only commits should not conflict with dedup shards"
-        );
-    }
-}
+mod tests;

@@ -1243,10 +1243,8 @@ impl Db {
                         super::apply::publish_l2p_read_view(shard, &tree);
                         drop(tree);
                         shard.l2p_buffer.finish_compaction(swap.max_lsn);
-                        self.metrics.record_l2p_buffer_compaction(
-                            swap.count,
-                            started.elapsed(),
-                        );
+                        self.metrics
+                            .record_l2p_buffer_compaction(swap.count, started.elapsed());
                     }
                     Err(err) => {
                         drop(tree);
@@ -1581,11 +1579,7 @@ impl Db {
     /// full-sample selection, preserving the pre-partial behaviour.
     /// `force_all = true` (forced flush / snapshot / shutdown drain)
     /// also returns a full selection regardless of budget.
-    fn select_shards_for_flush(
-        &self,
-        volumes: &[Arc<Volume>],
-        force_all: bool,
-    ) -> SelectedShards {
+    fn select_shards_for_flush(&self, volumes: &[Arc<Volume>], force_all: bool) -> SelectedShards {
         use std::sync::atomic::Ordering;
         let mut l2p: Vec<Vec<bool>> = volumes
             .iter()
@@ -1738,10 +1732,8 @@ impl Db {
         // Decide which shards this round samples. Forced flushes
         // (`flush()`, snapshot, shutdown) always select everything;
         // steady-state `try_flush()` honours the budget cap.
-        let selected = self.select_shards_for_flush(
-            &volumes,
-            matches!(kind, crate::metrics::FlushKind::Forced),
-        );
+        let selected = self
+            .select_shards_for_flush(&volumes, matches!(kind, crate::metrics::FlushKind::Forced));
         // Drain per-volume dead-list buffers while still holding
         // `apply_gate.write()` — late drainers would race new apply
         // ops pushing into the same buffer. The drained records are
@@ -1793,9 +1785,9 @@ impl Db {
                 Vec::with_capacity(volume.shards.len());
             for s_idx in 0..volume.shards.len() {
                 if selected.l2p[v_idx][s_idx] {
-                    let mut guard = guard_iter
-                        .next()
-                        .expect("lock_selected_l2p_shards_for must hand out one guard per selected shard");
+                    let mut guard = guard_iter.next().expect(
+                        "lock_selected_l2p_shards_for must hand out one guard per selected shard",
+                    );
                     per_volume.push(Some(guard.begin_checkpoint()));
                 } else {
                     per_volume.push(None);
@@ -1939,7 +1931,10 @@ impl Db {
                                     .record_flush_io(io_started.elapsed(), total_pages_written);
                                 self.metrics
                                     .record_flush_total(kind, flush_started.elapsed());
-                                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                                self.abort_rc_checkpoints_sparse(
+                                    refcount_checkpoints,
+                                    wal_checkpoint,
+                                );
                                 self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                                 return Err(err);
                             }
@@ -2050,11 +2045,7 @@ impl Db {
             }
         }
         if let Some(err) = dead_list_alloc_err {
-            self.rollback_dead_list_drain(
-                &mut drained_deadlists,
-                &dead_list_plans,
-                wal_checkpoint,
-            );
+            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics
@@ -2068,11 +2059,7 @@ impl Db {
         if let Err(err) = self.page_store.write_sealed_page_runs(sealed_pages) {
             self.metrics
                 .record_flush_io_page_write(page_write_started.elapsed());
-            self.rollback_dead_list_drain(
-                &mut drained_deadlists,
-                &dead_list_plans,
-                wal_checkpoint,
-            );
+            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics
@@ -2086,11 +2073,7 @@ impl Db {
         let sync_started = std::time::Instant::now();
         if let Err(err) = self.page_store.sync() {
             self.metrics.record_flush_io_sync(sync_started.elapsed());
-            self.rollback_dead_list_drain(
-                &mut drained_deadlists,
-                &dead_list_plans,
-                wal_checkpoint,
-            );
+            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.metrics
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics
@@ -2112,11 +2095,7 @@ impl Db {
             .faults
             .inject(FaultPoint::DeadListPostSegWriteBeforeManifest)
         {
-            self.rollback_dead_list_drain(
-                &mut drained_deadlists,
-                &dead_list_plans,
-                wal_checkpoint,
-            );
+            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
@@ -2180,11 +2159,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            self.rollback_dead_list_drain(
-                &mut drained_deadlists,
-                &dead_list_plans,
-                wal_checkpoint,
-            );
+            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
@@ -2201,11 +2176,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            self.rollback_dead_list_drain(
-                &mut drained_deadlists,
-                &dead_list_plans,
-                wal_checkpoint,
-            );
+            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
@@ -2223,11 +2194,8 @@ impl Db {
         // Full-sample / forced flushes have every selected[*] == true
         // and the result is simply `wal_checkpoint`, matching the
         // pre-partial behaviour.
-        let new_checkpoint_lsn = self.compute_min_last_flushed_lsn_after(
-            &volumes,
-            &selected,
-            wal_checkpoint,
-        );
+        let new_checkpoint_lsn =
+            self.compute_min_last_flushed_lsn_after(&volumes, &selected, wal_checkpoint);
         manifest_state.manifest.checkpoint_lsn = new_checkpoint_lsn;
         // Tier 2.B Stage 1: persist per-shard durable_seq alongside
         // the global checkpoint_lsn. Same inputs as the min()
@@ -2247,11 +2215,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            self.rollback_dead_list_drain(
-                &mut drained_deadlists,
-                &dead_list_plans,
-                wal_checkpoint,
-            );
+            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
@@ -2263,11 +2227,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            self.rollback_dead_list_drain(
-                &mut drained_deadlists,
-                &dead_list_plans,
-                wal_checkpoint,
-            );
+            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
@@ -2659,26 +2619,7 @@ impl Db {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn flush_reclaim_budget_scales_with_writes_and_backlog() {
-        assert_eq!(flush_reclaim_budget(0, 0), FLUSH_RECLAIM_MIN_BUDGET_PAGES);
-        assert_eq!(
-            flush_reclaim_budget(0, FLUSH_RECLAIM_MIN_BUDGET_PAGES),
-            FLUSH_RECLAIM_MIN_BUDGET_PAGES * 8
-        );
-        assert_eq!(
-            flush_reclaim_budget(8 * 1_048_576, 1),
-            FLUSH_RECLAIM_MAX_BUDGET_PAGES / 2
-        );
-        assert_eq!(
-            flush_reclaim_budget(FLUSH_RECLAIM_BACKLOG_HARD_CAP_PAGES, 1),
-            FLUSH_RECLAIM_MAX_BUDGET_PAGES
-        );
-    }
-}
+mod tests;
 
 fn refresh_manifest_from_checkpoints(
     manifest: &mut Manifest,
@@ -2752,18 +2693,17 @@ fn refresh_manifest_from_checkpoints(
             Some(seqs) if seqs.len() == volume.shards.len() => seqs.to_vec().into_boxed_slice(),
             _ => vec![0; volume.shards.len()].into_boxed_slice(),
         };
-        let (dead_list_head_pid, dead_list_tail_pid) =
-            match dead_list_overrides.get(&volume.ord) {
-                Some((h, t)) => (*h, *t),
-                None => (
-                    volume
-                        .dead_list_head_pid
-                        .load(std::sync::atomic::Ordering::Acquire),
-                    volume
-                        .dead_list_tail_pid
-                        .load(std::sync::atomic::Ordering::Acquire),
-                ),
-            };
+        let (dead_list_head_pid, dead_list_tail_pid) = match dead_list_overrides.get(&volume.ord) {
+            Some((h, t)) => (*h, *t),
+            None => (
+                volume
+                    .dead_list_head_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                volume
+                    .dead_list_tail_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
+        };
         new_entries.push(VolumeEntry {
             ord: volume.ord,
             shard_count: volume.shards.len() as u32,
@@ -2846,8 +2786,7 @@ fn refresh_manifest_durable_seq(
         }
     }
     if manifest.refcount_durable_seq.len() != refcount_shards.len() {
-        manifest.refcount_durable_seq =
-            vec![0; refcount_shards.len()].into_boxed_slice();
+        manifest.refcount_durable_seq = vec![0; refcount_shards.len()].into_boxed_slice();
     }
     for (s_idx, shard) in refcount_shards.iter().enumerate() {
         let lsn = if selected.rc[s_idx] {
