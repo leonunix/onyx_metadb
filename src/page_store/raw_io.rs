@@ -8,7 +8,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
 
 use crate::config::PAGE_SIZE;
 use crate::error::{MetaDbError, Result};

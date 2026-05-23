@@ -1,4 +1,4 @@
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 #[cfg(target_os = "linux")]
 use parking_lot::Mutex;
 use std::fs::File;
