@@ -17,13 +17,14 @@ impl Db {
         // (shared-page bookkeeping). The hot path no longer stages rc
         // deltas on L2P remaps, so any rc movement for a shared pba has
         // to ride along with the DedupPut/Delete/Compare* that gained
-        // or lost the reference. Helpers below stay close to
-        // `apply_dedup_put_with_rc` / `apply_dedup_delete_with_rc` in
-        // `apply.rs` and use the same routing math (xxh3 mod shards)
-        // because this lane bucket holds `Arc<RcShard>` directly, not
-        // the outer `Shard` wrapper that `shard_for_key` expects.
-        let rc_shard_for =
-            |pba: Pba| -> usize { (xxh3_64(&pba.to_be_bytes()) as usize) % refcount_shards.len() };
+        // or lost the reference. Helpers below use the shared
+        // `rc_shard_of_pba` routing helper so the planner
+        // (`build_lane_dispatch_plan`) and this apply lane agree on
+        // which rc shard a PBA lives in — divergence is a deadlock /
+        // underflow hazard.
+        let rc_shard_for = |pba: Pba| -> usize {
+            super::rc_shard_of_pba(pba, refcount_shards.len())
+        };
         let stage_rc = |pba: Pba, delta: i64| -> Result<()> {
             let sid = rc_shard_for(pba);
             refcount_shards[sid].stage(pba, delta, lsn)?;

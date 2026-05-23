@@ -5,6 +5,17 @@ mod l2p;
 mod refcount;
 mod replay;
 
+/// Hash a PBA to a refcount shard index. Mirrors the routing math used
+/// by `shard_for_key` in `apply.rs` and by the dedup apply lane's
+/// inlined `rc_shard_for` closure. The planner and the apply lanes
+/// MUST agree on this routing — divergence is a deadlock / underflow
+/// hazard (planner says shard X is in the footprint, apply touches
+/// shard Y → concurrent commit on Y races).
+#[inline]
+pub(super) fn rc_shard_of_pba(pba: Pba, num_shards: usize) -> usize {
+    (xxh3_64(&pba.to_be_bytes()) as usize) % num_shards
+}
+
 impl Db {
     pub(super) fn build_lane_dispatch_plan(
         &self,
@@ -19,7 +30,32 @@ impl Db {
         let dedup_shard_count_u32 = dedup_shard_count as u32;
         let mut dedup_buckets: Vec<Vec<usize>> =
             (0..dedup_shard_count).map(|_| Vec::new()).collect();
-        let mut remap_may_defer_refcount = false;
+        // Precise refcount footprint. The pre-Phase-5 planner used a
+        // blanket `rc_enqueued.fill(true)` on any remap because the
+        // hot-path L2pRemap drove rc deltas itself — that blanket made
+        // every commit's footprint claim all 16 refcount lanes,
+        // serializing every commit against every other commit on a
+        // single volume regardless of which L2P shard each touched.
+        //
+        // Phase 5 ([phase5-option-a-landed]) made L2pRemap/L2pRemapRange
+        // rc-neutral on the hot path — the rc-staging now rides
+        // exclusively on the dedup ops (DedupPut/Guarded/Delete/Compare*)
+        // via `lanes/dedup.rs::stage_rc{,_decref_if_live}`. So the
+        // planner can compute the precise rc-shard set by walking those
+        // ops and any guarded L2pRemap (which still READS rc[gp] inline
+        // in `apply_l2p_bucket`; cross-LSN consistency requires footprint
+        // claim).
+        //
+        // If a future op type adds rc-staging without updating this
+        // walk, the consequence is: the planner says shard X is NOT in
+        // the footprint, but the lane stages rc[Y] anyway. A concurrent
+        // commit also touching rc[Y] races → underflow on the
+        // non-atomic read-then-stage in `stage_rc_decref_if_live`.
+        let num_rc_shards = self.refcount_shards.len();
+        let mut rc_shards_touched: Vec<bool> = vec![false; num_rc_shards];
+        let mut mark_rc = |pba: Pba, rc_shards_touched: &mut Vec<bool>| {
+            rc_shards_touched[rc_shard_of_pba(pba, num_rc_shards)] = true;
+        };
 
         for (idx, op) in ops.iter().enumerate() {
             match op {
@@ -33,7 +69,12 @@ impl Db {
                         .or_default()
                         .push(L2pBucketEntry::Single(idx));
                 }
-                WalOp::L2pRemap { vol_ord, lba, .. } => {
+                WalOp::L2pRemap {
+                    vol_ord,
+                    lba,
+                    guard,
+                    ..
+                } => {
                     let volume = volumes.get(vol_ord).ok_or_else(|| {
                         MetaDbError::Corruption(format!(
                             "L2pRemap for unknown volume ord {vol_ord}"
@@ -44,7 +85,12 @@ impl Db {
                         .entry((*vol_ord, sid))
                         .or_default()
                         .push(L2pBucketEntry::Single(idx));
-                    remap_may_defer_refcount = true;
+                    // Guarded L2pRemap reads rc[guard.0] inline in
+                    // `apply_l2p_bucket` (lanes/l2p.rs:~280, ~540).
+                    // Unguarded remap is rc-neutral (Phase 5).
+                    if let Some((gp, _)) = guard {
+                        mark_rc(*gp, &mut rc_shards_touched);
+                    }
                 }
                 WalOp::L2pRemapRange {
                     vol_ord,
@@ -81,16 +127,76 @@ impl Db {
                             },
                         );
                     }
-                    remap_may_defer_refcount = true;
+                    // L2pRemapRange is always unguarded (tx.rs:250) and
+                    // rc-neutral (Phase 5). No rc shards added.
                 }
-                WalOp::DedupPut { hash, .. }
-                | WalOp::DedupPutGuarded { hash, .. }
-                | WalOp::DedupDelete { hash, .. }
-                | WalOp::DedupCompareDelete { hash, .. }
-                | WalOp::DedupComparePut { hash, .. } => {
+                WalOp::DedupPut {
+                    hash,
+                    value,
+                    old_pba,
+                } => {
                     let sid =
                         crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
                     dedup_buckets[sid].push(idx);
+                    // Apply stages: decref(old_pba) if Some + incref(new_pba)
+                    // (lanes/dedup.rs:75-84). Pessimistically claim both
+                    // even though the apply skips the decref/incref pair
+                    // when old_pba == new_pba — that runtime decision
+                    // must not change the dispatch footprint.
+                    mark_rc(value.head_pba(), &mut rc_shards_touched);
+                    if let Some(op) = old_pba {
+                        mark_rc(*op, &mut rc_shards_touched);
+                    }
+                }
+                WalOp::DedupPutGuarded {
+                    hash,
+                    value,
+                    pba_guard,
+                    old_pba,
+                    ..
+                } => {
+                    let sid =
+                        crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    dedup_buckets[sid].push(idx);
+                    // Apply reads rc[pba_guard] then conditionally stages
+                    // decref(old_pba) + incref(new_pba) (lanes/dedup.rs:97-123).
+                    mark_rc(*pba_guard, &mut rc_shards_touched);
+                    mark_rc(value.head_pba(), &mut rc_shards_touched);
+                    if let Some(op) = old_pba {
+                        mark_rc(*op, &mut rc_shards_touched);
+                    }
+                }
+                WalOp::DedupDelete { hash, old_pba } => {
+                    let sid =
+                        crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    dedup_buckets[sid].push(idx);
+                    // Apply stages decref(old_pba) if Some (lanes/dedup.rs:127-135).
+                    if let Some(op) = old_pba {
+                        mark_rc(*op, &mut rc_shards_touched);
+                    }
+                }
+                WalOp::DedupCompareDelete { hash, old_value } => {
+                    let sid =
+                        crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    dedup_buckets[sid].push(idx);
+                    // Apply stages decref(old_value.head_pba()) iff the
+                    // CAS observes old_value matches current
+                    // (lanes/dedup.rs:137-148). Pessimistic claim — the
+                    // CAS decision can't change the dispatch footprint.
+                    mark_rc(old_value.head_pba(), &mut rc_shards_touched);
+                }
+                WalOp::DedupComparePut {
+                    hash,
+                    old_value,
+                    new_value,
+                } => {
+                    let sid =
+                        crate::dedup_types::shard_for_hash(hash, dedup_shard_count_u32) as usize;
+                    dedup_buckets[sid].push(idx);
+                    // Apply stages decref(old)+incref(new) iff CAS hits
+                    // (lanes/dedup.rs:149-171). Pessimistic claim.
+                    mark_rc(old_value.head_pba(), &mut rc_shards_touched);
+                    mark_rc(new_value.head_pba(), &mut rc_shards_touched);
                 }
                 WalOp::DropSnapshot { .. }
                 | WalOp::CreateVolume { .. }
@@ -110,11 +216,15 @@ impl Db {
         let mut l2p_sorted: Vec<_> = l2p_buckets.into_iter().collect();
         l2p_sorted.sort_by_key(|((vol, sid), _)| (*vol, *sid));
 
-        let mut rc_enqueued: Vec<bool> =
-            rc_buckets.iter().map(|bucket| !bucket.is_empty()).collect();
-        if remap_may_defer_refcount {
-            rc_enqueued.fill(true);
-        }
+        // Preserve the existing `!rc_buckets[sid].is_empty()` clause so
+        // future ops that push directly into `rc_buckets` (replay path,
+        // future direct refcount ops) still register their lanes. The
+        // hot path uses `rc_shards_touched` exclusively.
+        let rc_enqueued: Vec<bool> = rc_buckets
+            .iter()
+            .enumerate()
+            .map(|(sid, bucket)| !bucket.is_empty() || rc_shards_touched[sid])
+            .collect();
 
         Ok(LaneDispatchPlan {
             l2p_sorted,
