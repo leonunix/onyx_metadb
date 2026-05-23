@@ -347,3 +347,218 @@ fn two_disjoint_l2p_remap_range_commits_do_not_conflict() {
         fp_b.lanes,
     );
 }
+
+// -------- ZFS-TXG-clone Phase 1: direct L2P apply fast path --------
+
+/// Build a Db with both `l2p_buffer_enabled` and
+/// `commit_direct_apply_enabled` on. The direct-apply path requires
+/// `use_buffer` per shard, which only happens when the embedder
+/// enables the buffer at create time. The buffer's compactor is
+/// configured with a tiny soft trigger so any state mutation is
+/// quickly folded into the tree, exercising the lookup-fallthrough
+/// (read_view) leg of `apply_l2p_bucket_buffer` as well as the
+/// buffer hit leg.
+fn mk_direct_apply_db() -> (tempfile::TempDir, Db) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.commit_direct_apply_enabled = true;
+    cfg.l2p_buffer_soft_entries = 4;
+    cfg.l2p_buffer_max_interval_ms = 50;
+    let db = Db::create_with_config(cfg).unwrap();
+    (dir, db)
+}
+
+/// Same harness but with `commit_direct_apply_enabled = false`. Used
+/// for the equivalence test that compares direct- vs lane-path
+/// outcomes byte-for-byte.
+fn mk_lane_only_db() -> (tempfile::TempDir, Db) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.commit_direct_apply_enabled = false;
+    cfg.l2p_buffer_soft_entries = 4;
+    cfg.l2p_buffer_max_interval_ms = 50;
+    let db = Db::create_with_config(cfg).unwrap();
+    (dir, db)
+}
+
+#[test]
+fn direct_apply_eligibility_l2p_only_with_buffer_passes() {
+    let (_d, db) = mk_direct_apply_db();
+    let volumes = db.volumes.read().clone();
+
+    let ops: Vec<WalOp> = (0..10u64)
+        .map(|i| WalOp::L2pRemap {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: i,
+            new_value: l2p_value_with_pba(100 + i),
+            guard: None,
+        })
+        .collect();
+
+    let plan = db.build_lane_dispatch_plan(&volumes, &ops).unwrap();
+    assert!(
+        Db::plan_is_l2p_direct_eligible(&plan, &volumes),
+        "L2P-only unguarded-remap plan must be direct-apply-eligible \
+         when use_buffer is set on every target shard"
+    );
+}
+
+#[test]
+fn direct_apply_eligibility_no_buffer_fails() {
+    // Default config has `l2p_buffer_enabled = false`, so use_buffer
+    // is false on every shard, and the direct path must refuse to
+    // carry the commit even though no rc / dedup work is present.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Db::create(dir.path()).unwrap();
+    let volumes = db.volumes.read().clone();
+
+    let ops = [WalOp::L2pPut {
+        vol_ord: BOOTSTRAP_VOLUME_ORD,
+        lba: 42,
+        value: l2p_value_with_pba(7),
+    }];
+    let plan = db.build_lane_dispatch_plan(&volumes, &ops).unwrap();
+    assert!(
+        !Db::plan_is_l2p_direct_eligible(&plan, &volumes),
+        "use_buffer=false on target shard must force the lane path"
+    );
+}
+
+#[test]
+fn direct_apply_eligibility_dedup_present_fails() {
+    let (_d, db) = mk_direct_apply_db();
+    let volumes = db.volumes.read().clone();
+
+    let ops = vec![
+        WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 1,
+            value: l2p_value_with_pba(11),
+        },
+        WalOp::DedupPut {
+            hash: hash_for(42),
+            value: dedup_value_with_pba(99),
+            old_pba: None,
+        },
+    ];
+    let plan = db.build_lane_dispatch_plan(&volumes, &ops).unwrap();
+    assert!(
+        !Db::plan_is_l2p_direct_eligible(&plan, &volumes),
+        "any dedup op in the batch must force the lane path"
+    );
+}
+
+#[test]
+fn direct_apply_eligibility_guarded_remap_fails() {
+    // A guarded L2pRemap claims the rc shard of its guard pba (lanes.rs:91),
+    // so `rc_enqueued` is non-empty. The direct path must defer to the
+    // lane path so the guard's rc.get() runs under the standard lane
+    // ordering rather than racing inline on the commit thread.
+    let (_d, db) = mk_direct_apply_db();
+    let volumes = db.volumes.read().clone();
+
+    let ops = [WalOp::L2pRemap {
+        vol_ord: BOOTSTRAP_VOLUME_ORD,
+        lba: 42,
+        new_value: l2p_value_with_pba(7777),
+        guard: Some((0xABCDE, 1)),
+    }];
+    let plan = db.build_lane_dispatch_plan(&volumes, &ops).unwrap();
+    assert!(
+        !Db::plan_is_l2p_direct_eligible(&plan, &volumes),
+        "guarded L2pRemap (rc-touching) must force the lane path"
+    );
+}
+
+#[test]
+fn direct_apply_path_increments_counter_and_serves_reads() {
+    let (_d, db) = mk_direct_apply_db();
+
+    let baseline_count = db.metrics_snapshot().commit_direct_apply_count;
+
+    // Pure L2P-only commit; should take the direct path.
+    let mut tx = db.begin();
+    for i in 0u64..16 {
+        tx.insert(0, i, l2p_value_with_pba(100 + i));
+    }
+    tx.commit().unwrap();
+
+    let post_count = db.metrics_snapshot().commit_direct_apply_count;
+    assert!(
+        post_count > baseline_count,
+        "direct_apply counter must increment for an L2P-only commit \
+         (before={baseline_count}, after={post_count})"
+    );
+
+    // Reads must see the just-committed values via the buffer overlay.
+    for i in 0u64..16 {
+        let got = db.get(0, i).unwrap();
+        assert_eq!(
+            got,
+            Some(l2p_value_with_pba(100 + i)),
+            "direct-applied LBA {i} must be readable"
+        );
+    }
+}
+
+#[test]
+fn direct_apply_equivalent_to_lane_path() {
+    // Drive identical L2P-only workloads through both paths and
+    // assert the post-commit reads return identical values. This is
+    // the load-bearing safety check for Phase 1: the direct path is
+    // only safe if it produces byte-equivalent state.
+    let (_d1, db_direct) = mk_direct_apply_db();
+    let (_d2, db_lane) = mk_lane_only_db();
+
+    let lbas: Vec<u64> = (0..64u64).collect();
+    let values: Vec<L2pValue> = lbas.iter().map(|&i| l2p_value_with_pba(0xC0DE + i)).collect();
+
+    // First commit: L2pPut burst.
+    let mut tx_d = db_direct.begin();
+    let mut tx_l = db_lane.begin();
+    for (i, v) in lbas.iter().zip(values.iter()) {
+        tx_d.insert(0, *i, *v);
+        tx_l.insert(0, *i, *v);
+    }
+    tx_d.commit().unwrap();
+    tx_l.commit().unwrap();
+
+    // Second commit: overwrite half with L2pRemap (unguarded) to
+    // exercise the prev-lookup + remap branch on the direct path.
+    let new_values: Vec<L2pValue> = lbas
+        .iter()
+        .map(|&i| l2p_value_with_pba(0xBABE + i))
+        .collect();
+    let mut tx_d = db_direct.begin();
+    let mut tx_l = db_lane.begin();
+    for i in 0..32u64 {
+        tx_d.l2p_remap(0, i, new_values[i as usize], None);
+        tx_l.l2p_remap(0, i, new_values[i as usize], None);
+    }
+    tx_d.commit().unwrap();
+    tx_l.commit().unwrap();
+
+    // Snapshot final state.
+    for i in lbas {
+        let got_d = db_direct.get(0, i).unwrap();
+        let got_l = db_lane.get(0, i).unwrap();
+        assert_eq!(
+            got_d, got_l,
+            "direct-apply and lane-apply diverged at lba {i}: direct={got_d:?} lane={got_l:?}"
+        );
+    }
+
+    let snap_d = db_direct.metrics_snapshot();
+    let snap_l = db_lane.metrics_snapshot();
+    assert!(
+        snap_d.commit_direct_apply_count > 0,
+        "direct db must have taken the direct path at least once"
+    );
+    assert_eq!(
+        snap_l.commit_direct_apply_count, 0,
+        "lane-only db must never take the direct path"
+    );
+}
+

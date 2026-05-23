@@ -64,6 +64,25 @@ pub struct Config {
     /// independent durable replay source until checkpoint. Default off.
     pub unlogged_commits_enabled: bool,
 
+    /// ZFS-TXG-clone Phase 1: when true (default), `commit_ops` detects
+    /// L2P-only commits (no rc / dedup buckets, all target L2P shards in
+    /// buffered mode) and applies their L2P buckets DIRECTLY on the caller
+    /// thread instead of enqueuing closures onto per-shard apply-lane
+    /// workers. Eliminates ~230 us of channel + queue-wait + worker
+    /// scheduling overhead per commit on the seqwrite hot path.
+    ///
+    /// Falls back to the lane path automatically when:
+    ///   * the commit touches any dedup bucket,
+    ///   * any L2P shard is not running in `use_buffer` mode, or
+    ///   * the commit is in the serial-apply branch (lifecycle ops,
+    ///     guarded remap on a snapshot-bearing volume).
+    ///
+    /// Behaviour is byte-equivalent to the lane path; this is purely a
+    /// concurrency / latency optimisation. See
+    /// `/root/.claude/plans/zfs-txg-clone.md` Phase 1. Set to false to
+    /// force the legacy lane path (e.g. for differential debugging).
+    pub commit_direct_apply_enabled: bool,
+
     /// Upper bound on a single group-commit batch, in bytes.
     pub group_commit_max_batch_bytes: usize,
 
@@ -338,6 +357,11 @@ impl Config {
             wal_segment_bytes: 64 * 1024 * 1024,
             wal_lanes: 1,
             unlogged_commits_enabled: false,
+            // ZFS-TXG-clone Phase 1 — default on. Direct L2P apply on
+            // caller thread for L2P-only commits. Safe fallback to lane
+            // path for any commit that doesn't match the eligibility
+            // check (see `commit_direct_apply_enabled` doc).
+            commit_direct_apply_enabled: true,
             group_commit_max_batch_bytes: 4 * 1024 * 1024,
             group_commit_timeout_us: 1,
             page_cache_bytes: 512 * 1024 * 1024,

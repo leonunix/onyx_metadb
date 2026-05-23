@@ -74,6 +74,20 @@ impl MetaMetrics {
         record_duration(&self.commit_apply_us, &self.commit_apply_max_us, elapsed);
     }
 
+    /// ZFS-TXG-clone Phase 1: tracks the L2P-only direct-apply fast
+    /// path. Wall time recorded is a subset of `commit_apply_us`
+    /// (this path replaces the lane-recv stretch). Counter increments
+    /// per commit taking the fast path.
+    pub(crate) fn record_commit_direct_apply(&self, elapsed: Duration) {
+        self.commit_direct_apply_count
+            .fetch_add(1, Ordering::Relaxed);
+        record_duration(
+            &self.commit_direct_apply_us,
+            &self.commit_direct_apply_max_us,
+            elapsed,
+        );
+    }
+
     pub(crate) fn record_commit_plan(&self, elapsed: Duration) {
         record_duration(&self.commit_plan_us, &self.commit_plan_max_us, elapsed);
     }

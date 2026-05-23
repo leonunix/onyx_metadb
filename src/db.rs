@@ -112,6 +112,10 @@ pub struct Db {
     /// uncheckpointed no-WAL LSN.
     unlogged_commit_gate: RwLock<()>,
     unlogged_commits_enabled: bool,
+    /// ZFS-TXG-clone Phase 1: when true, L2P-only commits skip the
+    /// apply-lane channel hop and apply directly on the caller
+    /// thread. See `Config::commit_direct_apply_enabled`.
+    commit_direct_apply_enabled: bool,
     /// Excludes apply phases from flush / snapshot. Commit takes
     /// `.read()` across the apply + bump; flush / take_snapshot /
     /// drop_snapshot take `.write()` so they observe a quiescent tree

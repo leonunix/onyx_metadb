@@ -61,6 +61,19 @@ pub struct MetaMetrics {
     commit_apply_us: AtomicU64,
     commit_apply_max_us: AtomicU64,
 
+    // ZFS-TXG-clone Phase 1 (direct L2P apply on commit thread):
+    // counts and timings for the L2P-only fast path that skips
+    // `enqueue_lane_plan` + `apply_ops_laned`. `commit_direct_apply_count`
+    // = number of commits that took the fast path;
+    // `commit_direct_apply_us` = cumulative wall time spent in
+    // `apply_l2p_direct` for those commits (subset of
+    // `commit_apply_us`). When this counter is rising and
+    // `commit_apply_l2p_wait_us` stays flat, the fast path is
+    // carrying the bulk of traffic.
+    commit_direct_apply_count: AtomicU64,
+    commit_direct_apply_us: AtomicU64,
+    commit_direct_apply_max_us: AtomicU64,
+
     // Per-phase split of `commit_apply_us`. `apply_ops_laned` runs
     // L2P → refcount → dedup as three sequential lane-barrier
     // phases; each blocks commit ack. Use these counters to

@@ -417,7 +417,12 @@ impl Db {
     /// takes ownership of the bucket's entries; each `RangeSlice`
     /// entry contributes a partial `ApplyOutcome::L2pRemapRange` to be
     /// merged in `apply_ops_laned`.
-    fn apply_l2p_bucket_buffer(
+    /// Visible to the rest of `db::commit` so the Phase 1 direct-apply
+    /// fast path in `commit.rs` can invoke it on the caller thread,
+    /// skipping the apply-lane channel hop. Buffer mode never produces
+    /// `rc_actions`, so the returned `L2pBucketApplyResult.rc_actions`
+    /// is always empty here.
+    pub(in crate::db::commit) fn apply_l2p_bucket_buffer(
         volume: Arc<Volume>,
         sid: usize,
         indices: Vec<L2pBucketEntry>,

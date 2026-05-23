@@ -634,6 +634,129 @@ impl Db {
         result
     }
 
+    /// ZFS-TXG-clone Phase 1 eligibility check.
+    ///
+    /// The L2P-direct fast path can carry a commit iff:
+    ///   * no dedup bucket carries work — dedup apply lives in its own
+    ///     per-shard lane and isn't re-implementable on the caller
+    ///     thread without serialising every dedup lane;
+    ///   * no rc shard is flagged in `rc_enqueued` — guarded
+    ///     `L2pRemap` (the only L2P op that touches rc at plan time)
+    ///     reads rc inline inside `apply_l2p_bucket_buffer`, but if rc
+    ///     work is pending in this batch we route through lanes for
+    ///     consistency with the existing `apply_ops_laned` ordering;
+    ///   * every target (vol, sid) L2P shard runs in `use_buffer`
+    ///     mode. Buffer mode emits zero `rc_actions`; tree mode does
+    ///     not and cannot be bypassed here.
+    ///
+    /// This is intentionally borrowing — the caller still owns
+    /// `plan` after the check and can route it to either path.
+    fn plan_is_l2p_direct_eligible(
+        plan: &LaneDispatchPlan,
+        volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+    ) -> bool {
+        if plan.dedup_buckets.iter().any(|bucket| !bucket.is_empty()) {
+            return false;
+        }
+        if plan.rc_enqueued.iter().any(|&enq| enq) {
+            return false;
+        }
+        for ((vol_ord, sid), _entries) in &plan.l2p_sorted {
+            let Some(volume) = volumes.get(vol_ord) else {
+                return false;
+            };
+            let Some(shard) = volume.shards.get(*sid) else {
+                return false;
+            };
+            if !shard.use_buffer {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// ZFS-TXG-clone Phase 1 direct apply.
+    ///
+    /// Mirrors what `enqueue_lane_plan` + the L2P recv loop of
+    /// `apply_ops_laned` would do, but runs every per-shard
+    /// `apply_l2p_bucket_buffer` invocation in series on the calling
+    /// commit thread. Each invocation is read-mostly on `read_view`
+    /// and writes only into `shard.l2p_buffer` (a `parking_lot::Mutex`
+    /// briefly held per LBA), so no shared apply-lane scheduler is
+    /// needed. Every shard is touched once; ordering across shards is
+    /// independent (different `(vol, sid)` keys disjoint).
+    ///
+    /// Eligibility guarantees:
+    ///   * `apply_l2p_bucket_buffer` returns empty `rc_actions` (its
+    ///     buffer-mode body never pushes any); we `debug_assert!` and
+    ///     return an error if not, since that would indicate a future
+    ///     change broke the contract.
+    ///   * Every op index in `ops` ends up populated in `outcomes`:
+    ///     `L2pPut`/`L2pDelete`/`L2pRemap` produce one outcome from
+    ///     one bucket; `L2pRemapRange` may span multiple buckets and
+    ///     gets merged via `merge_l2p_outcome`.
+    fn apply_l2p_direct(
+        &self,
+        volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+        lsn: Lsn,
+        plan: LaneDispatchPlan,
+        ops: &[WalOp],
+    ) -> Result<Vec<ApplyOutcome>> {
+        let mut outcome_slots: Vec<Option<ApplyOutcome>> =
+            (0..ops.len()).map(|_| None).collect();
+        // Snapshot rc shard handles once (cheap clones of Arcs).
+        // Only the guarded-`L2pRemap` path inside `apply_l2p_bucket_buffer`
+        // dereferences this; eligibility filters that case out, but
+        // the helper still takes the slice as a parameter.
+        let refcount_shards_snapshot: Vec<Arc<crate::refcount::RcShard>> =
+            self.refcount_shards.iter().map(|s| s.rc.clone()).collect();
+
+        for ((vol_ord, sid), entries) in plan.l2p_sorted {
+            let volume = volumes.get(&vol_ord).ok_or_else(|| {
+                MetaDbError::Corruption(format!(
+                    "apply_l2p_direct: missing volume ord {vol_ord} at apply time"
+                ))
+            })?;
+            let bucket_result = Self::apply_l2p_bucket_buffer(
+                volume.clone(),
+                sid,
+                entries,
+                lsn,
+                ops,
+                &refcount_shards_snapshot,
+                &self.metrics,
+            )?;
+            debug_assert!(
+                bucket_result.rc_actions.is_empty(),
+                "apply_l2p_bucket_buffer in direct apply produced non-empty rc_actions; \
+                 buffer mode is supposed to be rc-neutral"
+            );
+            if !bucket_result.rc_actions.is_empty() {
+                return Err(MetaDbError::Corruption(
+                    "direct apply received rc_actions from buffer-mode L2P bucket; \
+                     fallback to lane path required"
+                        .into(),
+                ));
+            }
+            for (idx, outcome) in bucket_result.outcomes {
+                merge_l2p_outcome(&mut outcome_slots, idx, outcome);
+            }
+        }
+
+        let outcomes: Vec<ApplyOutcome> = outcome_slots
+            .into_iter()
+            .enumerate()
+            .map(|(idx, slot)| {
+                slot.ok_or_else(|| {
+                    MetaDbError::Corruption(format!(
+                        "apply_l2p_direct: op index {idx} not covered by any L2P bucket"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(outcomes)
+    }
+
     fn finish_commit_apply(
         &self,
         lsn: Lsn,
@@ -650,31 +773,72 @@ impl Db {
 
         let apply_started = std::time::Instant::now();
         let outcomes = if let Some(plan) = ctx.plan {
-            let enqueue_started = std::time::Instant::now();
-            let queued_plan =
-                self.enqueue_lane_plan(&ctx.volumes, lsn, plan, Arc::new(ctx.ops.to_vec()));
-            ctx.timing.lane_enqueue = enqueue_started.elapsed();
-            match self.apply_ops_laned(lsn, ctx.ops.len(), queued_plan) {
-                Ok((outcomes, laned_timing)) => {
-                    ctx.timing.apply = apply_started.elapsed();
-                    ctx.timing.laned = laned_timing;
-                    self.metrics.record_commit_apply(ctx.timing.apply);
-                    self.metrics.record_commit_apply_laned(
-                        laned_timing.l2p_wait,
-                        laned_timing.rc_enqueue,
-                        laned_timing.rc_wait,
-                        laned_timing.dedup_enqueue,
-                        laned_timing.dedup_wait,
-                    );
-                    outcomes
+            // ZFS-TXG-clone Phase 1 fast path: when the plan is
+            // L2P-only (no dedup buckets, no rc-touched shards) and
+            // every target L2P shard is in buffered mode, run the L2P
+            // apply directly on this thread. This skips
+            // `enqueue_lane_plan` (channel sends) +
+            // `apply_ops_laned`'s lane recv loops, which together
+            // average ~230 us per commit on the seqwrite hot path.
+            //
+            // The plan is consumed by either branch; we move it
+            // accordingly. `plan_is_l2p_direct_eligible` is a
+            // borrowing check so we can still use `plan` afterwards.
+            if self.commit_direct_apply_enabled
+                && Self::plan_is_l2p_direct_eligible(&plan, &ctx.volumes)
+            {
+                match self.apply_l2p_direct(&ctx.volumes, lsn, plan, ctx.ops) {
+                    Ok(outcomes) => {
+                        ctx.timing.apply = apply_started.elapsed();
+                        self.metrics.record_commit_apply(ctx.timing.apply);
+                        self.metrics.record_commit_direct_apply(ctx.timing.apply);
+                        // Direct-apply bypasses `enqueue_lane_plan` and
+                        // `apply_ops_laned`, where the lane path retires
+                        // its dispatch reservation
+                        // (`complete_retained_dispatch`). Skipping that
+                        // call would leave our LSN forever in
+                        // `dispatch_state.pending`, blocking every
+                        // higher-LSN commit on
+                        // `mark_wal_durable_and_wait_for_dispatch`.
+                        self.complete_retained_dispatch(lsn);
+                        outcomes
+                    }
+                    Err(err) => {
+                        ctx.timing.apply = apply_started.elapsed();
+                        self.metrics.record_commit_apply(ctx.timing.apply);
+                        self.metrics
+                            .record_commit_error(ctx.commit_started.elapsed());
+                        self.poison_commit_waiters(&err);
+                        return Err(err);
+                    }
                 }
-                Err(err) => {
-                    ctx.timing.apply = apply_started.elapsed();
-                    self.metrics.record_commit_apply(ctx.timing.apply);
-                    self.metrics
-                        .record_commit_error(ctx.commit_started.elapsed());
-                    self.poison_commit_waiters(&err);
-                    return Err(err);
+            } else {
+                let enqueue_started = std::time::Instant::now();
+                let queued_plan =
+                    self.enqueue_lane_plan(&ctx.volumes, lsn, plan, Arc::new(ctx.ops.to_vec()));
+                ctx.timing.lane_enqueue = enqueue_started.elapsed();
+                match self.apply_ops_laned(lsn, ctx.ops.len(), queued_plan) {
+                    Ok((outcomes, laned_timing)) => {
+                        ctx.timing.apply = apply_started.elapsed();
+                        ctx.timing.laned = laned_timing;
+                        self.metrics.record_commit_apply(ctx.timing.apply);
+                        self.metrics.record_commit_apply_laned(
+                            laned_timing.l2p_wait,
+                            laned_timing.rc_enqueue,
+                            laned_timing.rc_wait,
+                            laned_timing.dedup_enqueue,
+                            laned_timing.dedup_wait,
+                        );
+                        outcomes
+                    }
+                    Err(err) => {
+                        ctx.timing.apply = apply_started.elapsed();
+                        self.metrics.record_commit_apply(ctx.timing.apply);
+                        self.metrics
+                            .record_commit_error(ctx.commit_started.elapsed());
+                        self.poison_commit_waiters(&err);
+                        return Err(err);
+                    }
                 }
             }
         } else {
