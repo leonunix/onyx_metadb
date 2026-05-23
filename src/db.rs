@@ -130,12 +130,38 @@ pub struct Db {
     /// trees / SSTs) and bumped on every commit. Paired with
     /// [`commit_cvar`](Self::commit_cvar) to form the apply-order queue.
     last_applied_lsn: Mutex<Lsn>,
-    /// Notified whenever `last_applied_lsn` advances. Commit threads
-    /// wait on this after WAL submit returns with their assigned LSN,
-    /// re-checking `*last_applied_lsn + 1 == lsn` on each wakeup. Every
-    /// LSN is unique, so at most one thread waits for any given
-    /// predecessor value.
+    /// Notified whenever `last_applied_lsn` advances. Lifecycle ops
+    /// and serial-apply commits wait on this in
+    /// `wait_for_global_apply_turn`. Laned commits no longer require
+    /// strict LSN-order apply (the lane dispatch already serializes
+    /// per-lane), so `finish_global_apply` does NOT wait on this — it
+    /// just inserts its LSN into `applied_set` and advances the
+    /// watermark via contiguous-prefix pop. The cvar is only notified
+    /// when the watermark actually advances, so out-of-order finishes
+    /// don't produce a broadcast storm.
     commit_cvar: Condvar,
+    /// Set of completed LSNs whose apply is done but that aren't yet
+    /// covered by the contiguous-prefix watermark in
+    /// `last_applied_lsn`. Used by `finish_global_apply` to bump the
+    /// watermark out of order: a commit completes, inserts its LSN
+    /// into the set, then pops contiguous prefixes off the head while
+    /// `last_applied_lsn + 1` is present.
+    ///
+    /// Mutex is held only briefly (insert + a tight prefix-pop loop)
+    /// so contention scales sub-linearly even at high concurrency.
+    /// Pre-redesign, every commit parked on `commit_cvar` waiting for
+    /// `last_applied_lsn + 1 == lsn` — at 128 in-flight commits this
+    /// formed a 128-deep cvar chain with one wake per LSN advance.
+    /// The set+watermark approach drops the chain entirely (laned
+    /// commits never park) without losing the manifest checkpoint
+    /// invariant (watermark is monotonic; manifest still stores it
+    /// as "all LSNs ≤ X are durable").
+    ///
+    /// Per-lane LSN order is still enforced by the dispatch_state
+    /// footprint protocol — out-of-order apply across LANES is
+    /// allowed only when lanes are disjoint, so the apply itself
+    /// preserves all required ordering.
+    applied_set: Mutex<BTreeSet<Lsn>>,
     /// LSNs of commits that currently hold `apply_gate.read()`.
     ///
     /// This lets a lower-LSN predecessor bypass a pending checkpoint

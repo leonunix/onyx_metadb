@@ -1048,21 +1048,55 @@ impl Db {
         Ok(())
     }
 
+    /// Mark `lsn` as applied (lane work + apply_gate already done) and
+    /// advance the watermark `last_applied_lsn` if `lsn` extends the
+    /// contiguous prefix of completed LSNs.
+    ///
+    /// Pre-redesign this was a strict-LSN-order chain: every commit
+    /// parked on `commit_cvar` waiting for `last_applied_lsn + 1 == lsn`,
+    /// then bumped + `notify_all`'d. With 128 concurrent in-flight
+    /// commits that produced 128 sequential cvar handoffs per LSN burst.
+    ///
+    /// The new design decouples apply order from LSN order at the
+    /// global level: per-lane order is still enforced by the dispatch
+    /// footprint protocol (`mark_wal_durable_and_wait_for_dispatch`
+    /// only releases a commit when all conflicting lower LSNs have
+    /// dispatched), so commits with disjoint footprints can apply in
+    /// any order. The watermark catches up via contiguous-prefix pop.
+    ///
+    /// `wait_for_global_apply_turn` is retained unchanged for lifecycle
+    /// ops and serial-apply commits that genuinely need to wait for
+    /// `last_applied_lsn >= lsn - 1`; this path still uses
+    /// `commit_cvar`. The notify here only fires when the watermark
+    /// actually advances, so out-of-order finishes don't broadcast.
     pub(super) fn finish_global_apply(&self, lsn: Lsn) -> Result<()> {
-        let mut applied = self.last_applied_lsn.lock();
-        while *applied + 1 < lsn {
-            if let Some(err) = self.commit_poison_error() {
-                return Err(err);
+        let advanced = {
+            let mut applied = self.last_applied_lsn.lock();
+            let mut set = self.applied_set.lock();
+            debug_assert!(
+                lsn > *applied,
+                "finish_global_apply called with LSN {lsn} <= already-applied watermark {}",
+                *applied
+            );
+            set.insert(lsn);
+            let before = *applied;
+            // Pop contiguous prefix off the head of the set. Each
+            // pop bumps the watermark by 1; the loop runs zero times
+            // if our LSN didn't complete the next contiguous slot,
+            // and runs N times if we filled a gap that retired N
+            // already-applied LSNs into the watermark.
+            while set.remove(&(*applied + 1)) {
+                *applied += 1;
             }
-            self.commit_cvar.wait(&mut applied);
+            *applied != before
+        };
+        // Only notify on actual watermark advances. Lifecycle ops and
+        // serial-apply commits waiting on `commit_cvar` care about the
+        // watermark; out-of-order laned finishes that don't move it
+        // don't need to wake anyone.
+        if advanced {
+            self.commit_cvar.notify_all();
         }
-        debug_assert_eq!(
-            *applied + 1,
-            lsn,
-            "global apply LSN advanced non-contiguously"
-        );
-        *applied = lsn;
-        self.commit_cvar.notify_all();
         Ok(())
     }
 }
