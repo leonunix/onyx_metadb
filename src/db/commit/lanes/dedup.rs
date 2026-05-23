@@ -1,0 +1,179 @@
+use super::*;
+use crate::metrics::DedupPutStageTimings;
+
+impl Db {
+    pub(in crate::db::commit) fn apply_dedup_indices_to(
+        dedup_index: &crate::dedup::DedupIndex,
+        refcount_shards: &[Arc<crate::refcount::RcShard>],
+        metrics: &MetaMetrics,
+        ops: &[WalOp],
+        indices: Vec<usize>,
+        lsn: Lsn,
+    ) -> Result<Vec<(usize, ApplyOutcome)>> {
+        let batch_started = std::time::Instant::now();
+        let mut outcomes = Vec::with_capacity(indices.len());
+        let mut pending_puts: Vec<(Hash8, DedupValue, Option<Pba>, usize)> = Vec::new();
+        // Phase 5: dedup-table mutations drive the global PBA refcount
+        // (shared-page bookkeeping). The hot path no longer stages rc
+        // deltas on L2P remaps, so any rc movement for a shared pba has
+        // to ride along with the DedupPut/Delete/Compare* that gained
+        // or lost the reference. Helpers below stay close to
+        // `apply_dedup_put_with_rc` / `apply_dedup_delete_with_rc` in
+        // `apply.rs` and use the same routing math (xxh3 mod shards)
+        // because this lane bucket holds `Arc<RcShard>` directly, not
+        // the outer `Shard` wrapper that `shard_for_key` expects.
+        let rc_shard_for =
+            |pba: Pba| -> usize { (xxh3_64(&pba.to_be_bytes()) as usize) % refcount_shards.len() };
+        let stage_rc = |pba: Pba, delta: i64| -> Result<()> {
+            let sid = rc_shard_for(pba);
+            refcount_shards[sid].stage(pba, delta, lsn)?;
+            Ok(())
+        };
+        // Phase 5 stale-entry tolerance: a dedup_index row can point to
+        // a PBA whose rc has been driven to 0 by lineage GC without
+        // cleanup removing the row. The matching put/delete must then
+        // skip the decref instead of underflowing the rc table — see
+        // `apply_dedup_put_with_rc` for the full rationale. We pre-read
+        // the current rc once per stale candidate; within this lane the
+        // LSN-ordered apply gate prevents concurrent rc mutation on the
+        // same pba, so the floor check is sound.
+        let stage_rc_decref_if_live = |pba: Pba| -> Result<()> {
+            let sid = rc_shard_for(pba);
+            if refcount_shards[sid].get(pba)? > 0 {
+                refcount_shards[sid].stage(pba, -1, lsn)?;
+            }
+            Ok(())
+        };
+        // [[no-refcount-hot-path-design]] Phase 5 (WAL schema 0xB8):
+        // every dedup put / delete carries an embedded `old_pba`
+        // captured at `Transaction::commit` time. The live apply path
+        // here uses it directly so that replay and live apply produce
+        // the same rc deltas — apply is deterministic from the WAL
+        // alone, which is required because the on-disk dedup_index
+        // data pages are written eagerly per op (only the meta page
+        // is checkpoint-gated). Reading dedup_index here would also
+        // work for the live path, but using the embedded value keeps
+        // the live and replay paths bit-identical and saves a
+        // cuckoo lookup per op.
+        let flush_pending_puts =
+            |pending_puts: &mut Vec<(Hash8, DedupValue, Option<Pba>, usize)>,
+             outcomes: &mut Vec<(usize, ApplyOutcome)>|
+             -> Result<()> {
+                if pending_puts.is_empty() {
+                    return Ok(());
+                }
+                let entries: Vec<(Hash8, DedupValue)> = pending_puts
+                    .iter()
+                    .map(|(hash, value, _, _)| (*hash, *value))
+                    .collect();
+                let mut put_timings = DedupPutStageTimings::default();
+                let started = std::time::Instant::now();
+                dedup_index.put_many_with_metrics(&entries, lsn, &mut put_timings)?;
+                metrics
+                    .record_dedup_forward_put_batch(pending_puts.len() as u64, started.elapsed());
+                metrics.record_dedup_put_stages(put_timings);
+                for (_, value, old_pba, idx) in pending_puts.drain(..) {
+                    let new_pba = value.head_pba();
+                    if old_pba != Some(new_pba) {
+                        if let Some(op) = old_pba {
+                            stage_rc_decref_if_live(op)?;
+                        }
+                        stage_rc(new_pba, 1)?;
+                    }
+                    outcomes.push((idx, ApplyOutcome::Dedup));
+                }
+                Ok(())
+            };
+
+        for idx in indices {
+            match &ops[idx] {
+                WalOp::DedupPut {
+                    hash,
+                    value,
+                    old_pba,
+                } => {
+                    pending_puts.push((*hash, *value, *old_pba, idx));
+                }
+                WalOp::DedupPutGuarded {
+                    hash,
+                    value,
+                    pba_guard,
+                    min_rc,
+                    old_pba,
+                } => {
+                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
+                    let guard_started = std::time::Instant::now();
+                    let rc = refcount_shards
+                        .get(rc_shard_for(*pba_guard))
+                        .ok_or_else(|| MetaDbError::Corruption("missing refcount shard".into()))?
+                        .get(*pba_guard)?;
+                    metrics.record_dedup_guard(guard_started.elapsed());
+                    if rc >= *min_rc {
+                        let mut put_timings = DedupPutStageTimings::default();
+                        let started = std::time::Instant::now();
+                        dedup_index.put_with_metrics(*hash, *value, lsn, &mut put_timings)?;
+                        metrics.record_dedup_forward_put(started.elapsed());
+                        metrics.record_dedup_put_stages(put_timings);
+                        let new_pba = value.head_pba();
+                        if *old_pba != Some(new_pba) {
+                            if let Some(op) = *old_pba {
+                                stage_rc_decref_if_live(op)?;
+                            }
+                            stage_rc(new_pba, 1)?;
+                        }
+                    }
+                    outcomes.push((idx, ApplyOutcome::Dedup));
+                }
+                WalOp::DedupDelete { hash, old_pba } => {
+                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
+                    let started = std::time::Instant::now();
+                    dedup_index.delete(hash, lsn)?;
+                    metrics.record_dedup_forward_delete(started.elapsed());
+                    if let Some(op) = *old_pba {
+                        stage_rc_decref_if_live(op)?;
+                    }
+                    outcomes.push((idx, ApplyOutcome::Dedup));
+                }
+                WalOp::DedupCompareDelete { hash, old_value } => {
+                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
+                    let started = std::time::Instant::now();
+                    let cur = dedup_index.get(hash)?;
+                    let applied = cur.as_ref() == Some(old_value);
+                    if applied {
+                        dedup_index.delete(hash, lsn)?;
+                        metrics.record_dedup_forward_delete(started.elapsed());
+                        stage_rc_decref_if_live(old_value.head_pba())?;
+                    }
+                    outcomes.push((idx, ApplyOutcome::DedupCompare { applied }));
+                }
+                WalOp::DedupComparePut {
+                    hash,
+                    old_value,
+                    new_value,
+                } => {
+                    flush_pending_puts(&mut pending_puts, &mut outcomes)?;
+                    let started = std::time::Instant::now();
+                    let cur = dedup_index.get(hash)?;
+                    let applied = cur.as_ref() == Some(old_value);
+                    if applied {
+                        let mut put_timings = DedupPutStageTimings::default();
+                        dedup_index.put_with_metrics(*hash, *new_value, lsn, &mut put_timings)?;
+                        metrics.record_dedup_forward_put(started.elapsed());
+                        metrics.record_dedup_put_stages(put_timings);
+                        let old_pba = old_value.head_pba();
+                        let new_pba = new_value.head_pba();
+                        if old_pba != new_pba {
+                            stage_rc_decref_if_live(old_pba)?;
+                            stage_rc(new_pba, 1)?;
+                        }
+                    }
+                    outcomes.push((idx, ApplyOutcome::DedupCompare { applied }));
+                }
+                other => unreachable!("dedup bucket holds only dedup ops; saw {other:?}"),
+            };
+        }
+        flush_pending_puts(&mut pending_puts, &mut outcomes)?;
+        metrics.record_apply_dedup_batch(outcomes.len() as u64, batch_started.elapsed());
+        Ok(outcomes)
+    }
+}
