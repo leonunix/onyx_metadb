@@ -674,6 +674,29 @@ impl Db {
         (xxh3_64(&pba.to_be_bytes()) as usize) % self.refcount_shards.len()
     }
 
+    /// Public L2P-shard routing for clients (onyx) that want to
+    /// pre-bucket commit batches per L2P shard before issuing the
+    /// metadb call. Mirrors `shard_for_key_l2p(&volume.shards, lba)`
+    /// from `apply.rs:332` but uses `refcount_shards.len()` as the
+    /// modulus — L2P shards and refcount shards both come from
+    /// `Config::shards_per_partition`, so their counts are equal for
+    /// every volume in this partition (the bootstrap volume and every
+    /// volume created via `CreateVolume`).
+    ///
+    /// The hash math (xxh3_64 of `lba >> LEAF_SHIFT`) MUST stay in
+    /// lockstep with `shard_for_key_l2p` and the dispatch planner —
+    /// divergence between client-side bucketing and apply-side routing
+    /// would cause sub-commits to claim L2P shards they don't actually
+    /// touch (and miss the ones they do), breaking the dispatch
+    /// footprint invariant. Tested by
+    /// `l2p_shard_for_matches_shard_for_key_l2p` in
+    /// `commit/tests.rs`.
+    pub fn l2p_shard_for(&self, lba: Lba) -> usize {
+        debug_assert!(!self.refcount_shards.is_empty());
+        let leaf_idx = lba >> crate::paged::format::LEAF_SHIFT;
+        (xxh3_64(&leaf_idx.to_be_bytes()) as usize) % self.refcount_shards.len()
+    }
+
     pub(super) fn prepare_dedup_manifest_update(
         &self,
         manifest: &mut Manifest,

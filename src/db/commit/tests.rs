@@ -260,6 +260,29 @@ fn dedup_put_commit_has_precise_rc_footprint() {
 }
 
 #[test]
+fn l2p_shard_for_matches_shard_for_key_l2p() {
+    // The public `Db::l2p_shard_for` MUST agree with the internal
+    // `shard_for_key_l2p(&volume.shards, lba)` for every LBA. Onyx
+    // pre-shards passthrough commits per L2P shard based on the
+    // public API; if the two routing functions diverge, sub-commits
+    // would target shards they don't actually touch in apply, breaking
+    // the dispatch footprint invariant and creating phantom races.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Db::create(dir.path()).unwrap();
+    let volumes = db.volumes.read().clone();
+    let volume = volumes
+        .get(&BOOTSTRAP_VOLUME_ORD)
+        .expect("bootstrap volume present");
+    for lba in [0u64, 1, 127, 128, 255, 256, 1024, 1_000_000, u64::MAX / 2] {
+        assert_eq!(
+            db.l2p_shard_for(lba),
+            shard_for_key_l2p(&volume.shards, lba),
+            "l2p_shard_for / shard_for_key_l2p disagree at lba={lba}",
+        );
+    }
+}
+
+#[test]
 fn two_disjoint_l2p_remap_range_commits_do_not_conflict() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Db::create(dir.path()).unwrap();
