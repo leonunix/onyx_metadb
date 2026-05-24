@@ -433,6 +433,21 @@ impl<'db> Transaction<'db> {
         self.db.commit_ops_unlogged(&self.ops)
     }
 
+    /// ZFS-TXG-clone Phase 2: like
+    /// [`commit_with_outcomes`](Self::commit_with_outcomes) but returns
+    /// a [`crate::DeferredOutcomeHandle`] instead of the outcomes vec.
+    /// The handle delivers the same outcomes the sync path would have,
+    /// at the next L2P compactor pass when
+    /// `Config::commit_deferred_outcomes_enabled = true`. With the
+    /// flag off the handle is pre-populated and `recv()` returns
+    /// immediately. See `commit/outcomes.rs` for the delivery model.
+    pub fn commit_deferred_with_outcomes(
+        mut self,
+    ) -> Result<(Lsn, crate::DeferredOutcomeHandle)> {
+        self.resolve_dedup_old_pbas()?;
+        self.db.commit_ops_deferred(&self.ops)
+    }
+
     /// Fill in the embedded `old_pba` on every `DedupPut` /
     /// `DedupPutGuarded` / `DedupDelete` op the caller buffered with
     /// `None`. Reads the on-disk dedup_index once per unique hash and
