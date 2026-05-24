@@ -117,6 +117,19 @@ pub enum FaultPoint {
     /// or the worker was killed). No side effect — the GC pass
     /// hadn't yet mutated anything.
     LineageGcMidSegmentRead,
+    /// ZFS-TXG-clone Phase 2 fault: inside the L2P compactor's
+    /// step-7 drain of [`crate::db::commit::DeferredOutcomeAggregator`],
+    /// after the staged outcomes have been popped from the pending
+    /// map but **before** any `sender.send(...)` has fired.
+    /// `FaultAction::Panic` simulates a crash: every waiter parked
+    /// on `recv()` resolves with the channel-disconnected error
+    /// after the receiver side closes. On-disk state is unaffected
+    /// (the apply happened during commit, well before stage). The
+    /// drop_handle / poison_all path covers the next-Db-open case
+    /// without needing recovery here. `FaultAction::Error` is
+    /// treated as a Panic since `drain_up_to_lsn` returns `usize`
+    /// (no Result to propagate).
+    DeferredOutcomeDrainMidway,
 }
 
 impl FaultPoint {
@@ -142,6 +155,7 @@ impl FaultPoint {
             Self::LineageGcPostFreePbasBeforeManifest => "lineage_gc.post_free_pbas.before_manifest",
             Self::LineageGcPostHeadAdvanceBeforeFree => "lineage_gc.post_head_advance.before_free",
             Self::LineageGcMidSegmentRead => "lineage_gc.mid_segment_read",
+            Self::DeferredOutcomeDrainMidway => "deferred_outcomes.drain.midway",
         }
     }
 }

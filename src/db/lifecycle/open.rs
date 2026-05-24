@@ -138,7 +138,7 @@ impl Db {
             metrics.clone(),
         );
         let deferred_outcomes = Arc::new(
-            crate::db::commit::DeferredOutcomeAggregator::new(metrics.clone()),
+            crate::db::commit::DeferredOutcomeAggregator::new(metrics.clone(), faults.clone()),
         );
         let db = Self {
             page_store,
@@ -726,7 +726,7 @@ impl Db {
         );
 
         let deferred_outcomes = Arc::new(
-            crate::db::commit::DeferredOutcomeAggregator::new(metrics.clone()),
+            crate::db::commit::DeferredOutcomeAggregator::new(metrics.clone(), faults.clone()),
         );
         let db = Self {
             page_store,

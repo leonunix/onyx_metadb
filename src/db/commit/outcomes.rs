@@ -61,6 +61,7 @@ use parking_lot::Mutex;
 
 use crate::error::{MetaDbError, Result};
 use crate::metrics::MetaMetrics;
+use crate::testing::faults::{FaultController, FaultPoint};
 use crate::tx::ApplyOutcome;
 use crate::types::Lsn;
 
@@ -137,13 +138,15 @@ struct StagedOutcome {
 pub(crate) struct DeferredOutcomeAggregator {
     pending: Mutex<BTreeMap<Lsn, StagedOutcome>>,
     metrics: Arc<MetaMetrics>,
+    faults: Arc<FaultController>,
 }
 
 impl DeferredOutcomeAggregator {
-    pub(crate) fn new(metrics: Arc<MetaMetrics>) -> Self {
+    pub(crate) fn new(metrics: Arc<MetaMetrics>, faults: Arc<FaultController>) -> Self {
         Self {
             pending: Mutex::new(BTreeMap::new()),
             metrics,
+            faults,
         }
     }
 
@@ -198,6 +201,17 @@ impl DeferredOutcomeAggregator {
         self.metrics
             .record_deferred_outcomes_pending(depth_after);
         let released_count = released_senders.len();
+        // ZFS-TXG-clone Phase 2 fault: simulate a crash between the
+        // pending-map drain and outcome delivery. The senders we
+        // already popped get dropped on unwind, so every waiter
+        // resolves with the channel-disconnected error. Apply state
+        // on-disk is unaffected because `commit_ops_deferred`
+        // populated `outcomes` and stamped `last_applied_lsn` before
+        // staging. Action::Error is treated as Panic here because
+        // `drain_up_to_lsn` returns `usize`.
+        if let Err(err) = self.faults.inject(FaultPoint::DeferredOutcomeDrainMidway) {
+            panic!("metadb: {} (mid-drain fault)", err);
+        }
         for staged in released_senders {
             // Receiver may have been dropped; ignore the send error.
             let _ = staged.sender.send(Ok(staged.outcomes));
@@ -242,9 +256,13 @@ mod tests {
         Arc::new(MetaMetrics::default())
     }
 
+    fn fresh_agg() -> DeferredOutcomeAggregator {
+        DeferredOutcomeAggregator::new(metrics(), FaultController::disabled())
+    }
+
     #[test]
     fn stage_and_drain_releases_at_or_below_watermark() {
-        let agg = DeferredOutcomeAggregator::new(metrics());
+        let agg = fresh_agg();
         let h10 = agg.stage(10, vec![ApplyOutcome::L2pPrev(None)]);
         let h20 = agg.stage(20, vec![ApplyOutcome::L2pPrev(None)]);
         assert_eq!(h10.lsn(), 10);
@@ -266,7 +284,7 @@ mod tests {
 
     #[test]
     fn drain_below_watermark_holds_back_entry() {
-        let agg = DeferredOutcomeAggregator::new(metrics());
+        let agg = fresh_agg();
         let h = agg.stage(50, vec![ApplyOutcome::L2pPrev(None)]);
         let released = agg.drain_up_to_lsn(49);
         assert_eq!(released, 0);
@@ -278,7 +296,7 @@ mod tests {
 
     #[test]
     fn poison_all_unblocks_waiters() {
-        let agg = DeferredOutcomeAggregator::new(metrics());
+        let agg = fresh_agg();
         let handle = agg.stage(30, vec![ApplyOutcome::L2pPrev(None)]);
         agg.poison_all("test shutdown");
         let result = handle.recv();
@@ -288,7 +306,7 @@ mod tests {
 
     #[test]
     fn dropped_handle_does_not_block_drain() {
-        let agg = DeferredOutcomeAggregator::new(metrics());
+        let agg = fresh_agg();
         let handle = agg.stage(40, vec![ApplyOutcome::L2pPrev(None)]);
         drop(handle);
         // Drain still releases the entry; the send fails silently.
@@ -298,7 +316,7 @@ mod tests {
 
     #[test]
     fn try_recv_returns_handle_when_not_ready() {
-        let agg = DeferredOutcomeAggregator::new(metrics());
+        let agg = fresh_agg();
         let handle = agg.stage(50, vec![ApplyOutcome::L2pPrev(None)]);
         let handle = match handle.try_recv() {
             Err(handle) => handle,
