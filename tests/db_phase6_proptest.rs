@@ -183,6 +183,25 @@ fn tiny_cache_config(path: &Path) -> Config {
     cfg
 }
 
+/// ZFS-TXG-clone Phase 2 axis: opt the same `run_ops_with_config`
+/// body into the deferred-outcome plumbing. None of the
+/// `apply_to_db` helpers route through `commit_ops_deferred` today
+/// (Db::insert / Db::delete / Db::put_dedup / Db::incref_pba /
+/// Db::decref_pba all go through `commit_ops`), so this is a
+/// regression guard: any future change that lets the flag affect
+/// sync `commit_ops` will surface here.
+fn deferred_config(path: &Path) -> Config {
+    let mut cfg = Config::new(path);
+    cfg.commit_deferred_outcomes_enabled = true;
+    cfg
+}
+
+fn deferred_tiny_cache_config(path: &Path) -> Config {
+    let mut cfg = tiny_cache_config(path);
+    cfg.commit_deferred_outcomes_enabled = true;
+    cfg
+}
+
 fn run_ops_with_config(ops: &[Op], cfg: &Config) -> Result<(), TestCaseError> {
     let mut current_l2p: L2pRef = BTreeMap::new();
     let mut current_refcount: RefcountRef = BTreeMap::new();
@@ -300,6 +319,28 @@ proptest! {
     ) {
         let dir = TempDir::new().unwrap();
         run_ops_with_config(&ops, &tiny_cache_config(dir.path()))?;
+    }
+
+    /// ZFS-TXG-clone Phase 2 axis: same property, db opened with
+    /// `commit_deferred_outcomes_enabled = true`. See [`deferred_config`]
+    /// for why this is a regression guard rather than an exhaustive
+    /// equivalence sweep — `Db::insert` / `delete` / `put_dedup` /
+    /// `incref_pba` / `decref_pba` go through `commit_ops`, which is
+    /// flag-independent today.
+    #[test]
+    fn db_vs_reference_with_reopens_deferred(
+        ops in proptest::collection::vec(arb_op(), 30..80)
+    ) {
+        let dir = TempDir::new().unwrap();
+        run_ops_with_config(&ops, &deferred_config(dir.path()))?;
+    }
+
+    #[test]
+    fn db_vs_reference_with_reopens_tiny_cache_deferred(
+        ops in proptest::collection::vec(arb_op(), 30..80)
+    ) {
+        let dir = TempDir::new().unwrap();
+        run_ops_with_config(&ops, &deferred_tiny_cache_config(dir.path()))?;
     }
 }
 
