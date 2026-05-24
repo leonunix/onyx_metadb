@@ -435,14 +435,20 @@ impl Db {
         let shard = &volume.shards[sid];
         let mut outcomes = Vec::with_capacity(indices.len());
         let rc_actions = Vec::new();
-        // Snapshot the current published read view once. Lookups for `cur`
-        // fall through to this view on buffer miss. Compactor publishes a
-        // new view on each cycle; capturing once per-bucket is safe because
-        // any committed-but-uncompacted state we'd miss in this view still
-        // shows up in `shard.l2p_buffer.lookup`.
-        let read_view_prepare_started = std::time::Instant::now();
-        let read_view: Arc<crate::paged::ReadView> = shard.read_view.read().clone();
-        let read_view_prepare = read_view_prepare_started.elapsed();
+        // Per-LBA `cur` reads consult [`shard.l2p_buffer`] first and fall
+        // through to a freshly-loaded `shard.read_view` on Absent. Re-fetch
+        // per fallthrough — capturing the read view once at function entry
+        // is **not** race-free vs the background compactor: a compactor
+        // cycle that runs after the snapshot finishes `swap_for_compaction`
+        // → `publish_l2p_read_view` → `finish_compaction` between the
+        // bucket start and a later `buffer.lookup`, at which point the
+        // entry is gone from `draining` and the stale snapshot does not
+        // yet see it in the tree, yielding a spurious None `prev`.
+        // [[zfs-txg-clone-phase2-remaining]] #3a reproducer hits this
+        // deterministically with overlapping L2pRemapRange + an aggressive
+        // compactor.
+        let read_view_prepare = std::time::Duration::ZERO;
+        let load_view = || -> Arc<crate::paged::ReadView> { shard.read_view.read().clone() };
         let mut l2p_put_count = 0u64;
         let mut l2p_delete_count = 0u64;
         let mut l2p_remap_count = 0u64;
@@ -474,7 +480,7 @@ impl Db {
                         let cur = match shard.l2p_buffer.lookup(lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
-                            BufferLookup::Absent => read_view.get(lba)?,
+                            BufferLookup::Absent => load_view().get(lba)?,
                         };
                         if super::apply::seq_guard_rejects(new_value.seq(), cur.as_ref()) {
                             l2p_remap_range_lba_count += 1;
@@ -507,7 +513,7 @@ impl Db {
                         let cur = match shard.l2p_buffer.lookup(*lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
-                            BufferLookup::Absent => read_view.get(*lba)?,
+                            BufferLookup::Absent => load_view().get(*lba)?,
                         };
                         if super::apply::seq_guard_rejects(value.seq(), cur.as_ref()) {
                             l2p_put_count += 1;
@@ -523,7 +529,7 @@ impl Db {
                         let cur = match shard.l2p_buffer.lookup(*lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
-                            BufferLookup::Absent => read_view.get(*lba)?,
+                            BufferLookup::Absent => load_view().get(*lba)?,
                         };
                         shard.l2p_buffer.insert_tombstone(*lba, lsn);
                         l2p_delete_count += 1;
@@ -559,7 +565,7 @@ impl Db {
                         let cur = match shard.l2p_buffer.lookup(*lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
-                            BufferLookup::Absent => read_view.get(*lba)?,
+                            BufferLookup::Absent => load_view().get(*lba)?,
                         };
                         if super::apply::seq_guard_rejects(new_value.seq(), cur.as_ref()) {
                             l2p_remap_count += 1;

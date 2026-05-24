@@ -241,20 +241,12 @@ fn run_equivalence(seed_ops: Vec<Op>, batch_sizes: Vec<usize>) -> Result<(), Str
         let outs_sync = h_sync
             .recv()
             .map_err(|e| format!("sync recv batch {batch_idx}: {e:?}"))?;
-        // Drive one compactor pass on **both** dbs after each batch.
-        // The deferred db requires the pass to release the staged
-        // handle (the whole point of [`DeferredOutcomeAggregator`]).
-        // The sync db runs the pass too — without it, sync's
-        // `L2pBuffer.active` accumulates pending entries across
-        // batches while the deferred db's buffer was just emptied by
-        // its own compaction, so the next batch's `prev` reads would
-        // come from different layers of the (buffer, read_view)
-        // overlay across the two dbs. Equalising the post-batch
-        // buffer/tree state isolates the comparison to outcome
-        // *delivery*, which is the contract Phase 2 is changing —
-        // any buffer-vs-tree apply non-equivalence is orthogonal
-        // and belongs in a separate metadb-side test.
-        db_sync.test_force_compact_pass();
+        // Only the deferred db needs a compactor pass — sync delivery
+        // is in-line. apply_l2p_bucket_buffer's per-Absent re-fetch of
+        // `shard.read_view` (vs the previous capture-once pattern)
+        // closes the race that previously required equalising both
+        // dbs' buffer state to compare outcomes. See
+        // [`deep_overlap_remap_range_prevs_match_without_sync_compact`].
         db_def.test_force_compact_pass();
         let outs_def = h_def
             .recv()
@@ -403,7 +395,103 @@ fn drain_midway_panic_disconnects_pending_handles() {
     }
 }
 
-/// Sanity check that the fault hook is a true no-op when the
+/// Investigation test for [[zfs-txg-clone-phase2-remaining]] follow-up
+/// #3a: the `sync_vs_deferred_outcomes_match` proptest needed
+/// `db_sync.test_force_compact_pass()` to be called between batches
+/// alongside the deferred db's pass, otherwise `prev` values for an
+/// overlapping L2pRemapRange diverged. This test pins the smallest
+/// scenario that surfaces the divergence so the root cause can be
+/// isolated without proptest-shrink noise:
+///
+///   1. Both dbs receive identical L2pRemapRange ops.
+///   2. Only `db_def` runs `test_force_compact_pass` between batches.
+///   3. A later overlapping L2pRemapRange's `prevs` must match
+///      between the two dbs.
+///
+/// If this assertion fires, the metadb buffer-vs-tree apply layers
+/// observe stale state at different timing windows — that would be a
+/// real correctness gap independent of Phase 2. If it passes, the
+/// proptest divergence was actually noise from the background
+/// compactor racing with apply, and the workaround
+/// (`db_sync.test_force_compact_pass()` per batch) is purely a test
+/// stability tweak.
+#[test]
+fn overlap_remap_range_prevs_match_without_sync_compact() {
+    let (_d_sync, db_sync) = open_db(false);
+    let (_d_def, db_def) = open_db(true);
+
+    let prime: Vec<WalOp> = vec![WalOp::L2pRemapRange {
+        vol_ord: BOOTSTRAP_VOL,
+        start_lba: 10,
+        values: (0..10u64)
+            .map(|i| mk_l2p_value(0x1000 + i, 0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    }];
+    let (_, h_sync) = db_sync.commit_ops_deferred(&prime).unwrap();
+    let (_, h_def) = db_def.commit_ops_deferred(&prime).unwrap();
+    h_sync.recv().unwrap();
+    db_def.test_force_compact_pass();
+    h_def.recv().unwrap();
+
+    // Overlapping range — lba 5..25 — should see prev values from
+    // `prime` at offsets 5..15 (lba 10..20).
+    let overlap: Vec<WalOp> = vec![WalOp::L2pRemapRange {
+        vol_ord: BOOTSTRAP_VOL,
+        start_lba: 5,
+        values: (0..20u64)
+            .map(|i| mk_l2p_value(0x2000 + i, 0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    }];
+    let (_, h_sync) = db_sync.commit_ops_deferred(&overlap).unwrap();
+    let (_, h_def) = db_def.commit_ops_deferred(&overlap).unwrap();
+    let outs_sync = h_sync.recv().unwrap();
+    db_def.test_force_compact_pass();
+    let outs_def = h_def.recv().unwrap();
+
+    assert_eq!(
+        format!("{outs_sync:?}"),
+        format!("{outs_def:?}"),
+        "single-overlap L2pRemapRange must produce identical prevs"
+    );
+}
+
+/// Deeper version of [`overlap_remap_range_prevs_match_without_sync_compact`]:
+/// stack many overlapping ranges so the sync db's L2pBuffer accumulates
+/// hundreds of entries before the next observation. If the bug is in
+/// buffer-lookup ordering or eviction, depth makes it more likely to
+/// surface.
+#[test]
+fn deep_overlap_remap_range_prevs_match_without_sync_compact() {
+    let (_d_sync, db_sync) = open_db(false);
+    let (_d_def, db_def) = open_db(true);
+
+    // 32 overlapping batches, each writing 20 LBAs sliding by 3.
+    for batch_idx in 0..32u64 {
+        let start = batch_idx * 3;
+        let base_pba = 0x10_0000 + batch_idx * 100;
+        let ops: Vec<WalOp> = vec![WalOp::L2pRemapRange {
+            vol_ord: BOOTSTRAP_VOL,
+            start_lba: start,
+            values: (0..20u64)
+                .map(|i| mk_l2p_value(base_pba + i, 0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }];
+        let (_, h_sync) = db_sync.commit_ops_deferred(&ops).unwrap();
+        let (_, h_def) = db_def.commit_ops_deferred(&ops).unwrap();
+        let outs_sync = h_sync.recv().unwrap();
+        db_def.test_force_compact_pass();
+        let outs_def = h_def.recv().unwrap();
+
+        if format!("{outs_sync:?}") != format!("{outs_def:?}") {
+            panic!(
+                "batch {batch_idx} prev divergence\nsync={outs_sync:?}\ndef ={outs_def:?}"
+            );
+        }
+    }
+}
 /// controller has no trigger installed — `drain_up_to_lsn` still
 /// delivers staged outcomes normally and the panic path stays
 /// unreachable.
