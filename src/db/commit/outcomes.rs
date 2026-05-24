@@ -98,6 +98,15 @@ impl DeferredOutcomeHandle {
         self.lsn
     }
 
+    /// Non-consuming readiness probe. Returns `true` when the channel
+    /// has the staged outcome (or has been disconnected — `recv` /
+    /// `try_recv` will then resolve without blocking). Used by the
+    /// onyx commit_worker pipeline to opportunistically drain ready
+    /// chunks without paying for a blocking `recv`.
+    pub fn is_ready(&self) -> bool {
+        !self.rx.is_empty()
+    }
+
     /// Non-blocking probe. Returns `Some(outcomes)` if the compactor
     /// drain has already released this entry; `None` if still pending.
     /// Consumes the handle on `Some` (channel is one-shot).
