@@ -88,6 +88,31 @@ impl MetaMetrics {
         );
     }
 
+    /// ZFS-TXG-clone Phase 2: increment per-stage counter and update
+    /// the pending depth gauge. Pending depth is recorded as a
+    /// `Store` (last value wins) plus a `fetch_max` tracking
+    /// observed peak.
+    pub(crate) fn record_deferred_outcomes_pending(&self, depth: usize) {
+        let d = depth as u64;
+        self.commit_deferred_outcomes_pending
+            .store(d, Ordering::Relaxed);
+        fetch_max(&self.commit_deferred_outcomes_pending_max, d);
+    }
+
+    /// ZFS-TXG-clone Phase 2: per-stage call counter.
+    pub(crate) fn record_deferred_outcomes_staged(&self) {
+        self.commit_deferred_outcomes_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// ZFS-TXG-clone Phase 2: count of entries released by the
+    /// compactor's step-6 drain. Used to verify the drain is keeping
+    /// up with the stage rate during soak.
+    pub(crate) fn record_deferred_outcomes_released(&self, count: u64) {
+        self.commit_deferred_outcomes_released_total
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_commit_plan(&self, elapsed: Duration) {
         record_duration(&self.commit_plan_us, &self.commit_plan_max_us, elapsed);
     }

@@ -137,6 +137,9 @@ impl Db {
             ApplyLaneKind::DedupMaintenance,
             metrics.clone(),
         );
+        let deferred_outcomes = Arc::new(
+            crate::db::commit::DeferredOutcomeAggregator::new(metrics.clone()),
+        );
         let db = Self {
             page_store,
             page_cache,
@@ -182,6 +185,8 @@ impl Db {
             },
             lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
             freed_pbas_sink: Mutex::new(None),
+            deferred_outcomes,
+            commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
         };
         // Spawn refcount drainers (priority 3) — fresh DB has no
         // replay to worry about, so we can spawn unconditionally
@@ -720,6 +725,9 @@ impl Db {
             metrics.clone(),
         );
 
+        let deferred_outcomes = Arc::new(
+            crate::db::commit::DeferredOutcomeAggregator::new(metrics.clone()),
+        );
         let db = Self {
             page_store,
             page_cache,
@@ -765,6 +773,8 @@ impl Db {
             },
             lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
             freed_pbas_sink: Mutex::new(None),
+            deferred_outcomes,
+            commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
         };
         db.recompute_all_snap_infos();
         // Spawn refcount drainers AFTER WAL replay finished above so

@@ -562,3 +562,178 @@ fn direct_apply_equivalent_to_lane_path() {
     );
 }
 
+// -------- ZFS-TXG-clone Phase 2: deferred outcome API --------
+
+fn mk_deferred_apply_db(deferred: bool) -> (tempfile::TempDir, Db) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.commit_direct_apply_enabled = true;
+    cfg.commit_deferred_outcomes_enabled = deferred;
+    // Quick compactor so the deferred drain runs promptly during tests.
+    cfg.l2p_buffer_soft_entries = 1;
+    cfg.l2p_buffer_max_interval_ms = 25;
+    let db = Db::create_with_config(cfg).unwrap();
+    (dir, db)
+}
+
+/// commit_ops_deferred MUST produce the same `(lsn, Vec<ApplyOutcome>)`
+/// as commit_ops on master would have. We confirm equivalence by
+/// running the same op stream through two databases — one
+/// deferred=false (immediate-release handle), one deferred=true (drain
+/// at compactor) — and comparing every outcome variant byte-for-byte.
+#[test]
+fn commit_ops_deferred_l2p_only_equivalence() {
+    let (_d_sync, db_sync) = mk_deferred_apply_db(false);
+    let (_d_def, db_def) = mk_deferred_apply_db(true);
+
+    let ops: Vec<WalOp> = (0..32u64)
+        .map(|i| WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: i,
+            value: l2p_value_with_pba(0xDEED + i),
+        })
+        .collect();
+
+    let (lsn_sync, h_sync) = db_sync.commit_ops_deferred(&ops).unwrap();
+    let (lsn_def, h_def) = db_def.commit_ops_deferred(&ops).unwrap();
+    assert_eq!(lsn_sync, lsn_def);
+
+    // Sync mode resolves immediately (no compactor wait).
+    let outs_sync = h_sync.recv().unwrap();
+    // Deferred mode waits for the compactor's per-pass drain. Drive
+    // one pass on the caller thread instead of sleeping — tests
+    // remain deterministic under heavy parallel runs (`cargo test`
+    // default test_threads != 1).
+    db_def.test_force_compact_pass();
+    let outs_def = h_def.recv().unwrap();
+    assert_eq!(outs_sync.len(), outs_def.len());
+    for (i, (a, b)) in outs_sync.iter().zip(outs_def.iter()).enumerate() {
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "deferred vs sync outcome mismatch at idx {i}"
+        );
+    }
+}
+
+/// Deferred outcomes carry the same seq_guard reject information as
+/// the sync path: an `L2pRemap` with `new_value.seq() <= cur.seq()`
+/// surfaces `applied=false, prev=Some(cur), freed_pba=None`.
+#[test]
+fn commit_ops_deferred_seqguard_reject_carries_prev() {
+    let (_d, db) = mk_deferred_apply_db(true);
+
+    // Seed an entry with seq=10 at lba 10. seq_guard_rejects treats
+    // new_seq=0 and cur.seq=0 as never-reject (recovery-friendly
+    // accept-on-equality), so we need both seqs strictly positive.
+    let seeded = l2p_value_with_pba(0x100).with_seq(10);
+    let mut tx = db.begin();
+    tx.insert(BOOTSTRAP_VOLUME_ORD, 10, seeded);
+    tx.commit().unwrap();
+    let cur = db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap().unwrap();
+    assert_eq!(cur.seq(), 10);
+
+    // Attempt remap with seq < cur.seq → seq_guard rejects.
+    let rejected = l2p_value_with_pba(0x200).with_seq(5);
+    let (_, handle) = db
+        .commit_ops_deferred(&[WalOp::L2pRemap {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 10,
+            new_value: rejected,
+            guard: None,
+        }])
+        .unwrap();
+    db.test_force_compact_pass();
+    let outcomes = handle.recv().unwrap();
+    assert_eq!(outcomes.len(), 1);
+    match &outcomes[0] {
+        ApplyOutcome::L2pRemap {
+            applied,
+            prev,
+            freed_pba,
+        } => {
+            assert!(!*applied, "lower-seq remap must be rejected");
+            assert_eq!(prev.unwrap(), cur);
+            assert!(freed_pba.is_none());
+        }
+        other => panic!("expected L2pRemap outcome, got {other:?}"),
+    }
+}
+
+/// Drop the handle before recv. The aggregator's drain still releases
+/// the entry; the underlying send fails silently. The aggregator must
+/// not leak the staged outcomes, and a subsequent commit must
+/// continue to function (no aggregator state corruption).
+#[test]
+fn commit_ops_deferred_handle_drop_does_not_leak_sender() {
+    let (_d, db) = mk_deferred_apply_db(true);
+
+    let (_, handle) = db
+        .commit_ops_deferred(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 1,
+            value: l2p_value_with_pba(0xABCD),
+        }])
+        .unwrap();
+    drop(handle);
+
+    // Drive one compactor pass deterministically.
+    db.test_force_compact_pass();
+
+    // Aggregator should be empty (drained).
+    let pending = db.deferred_outcomes.pending_depth();
+    assert_eq!(pending, 0, "aggregator drained the dropped entry");
+
+    // Follow-up commit works fine.
+    let (_, h2) = db
+        .commit_ops_deferred(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 2,
+            value: l2p_value_with_pba(0xDCBA),
+        }])
+        .unwrap();
+    db.test_force_compact_pass();
+    let outs = h2.recv().unwrap();
+    assert_eq!(outs.len(), 1);
+}
+
+/// Deferred mode delivers the L2pRemapRange merged outcome shape
+/// correctly (cross-shard fan-in via `merge_l2p_outcome`).
+#[test]
+fn commit_ops_deferred_remap_range_round_trip() {
+    let (_d, db) = mk_deferred_apply_db(true);
+    let start = 0u64;
+    let values: Box<[L2pValue]> = (0..64u64)
+        .map(|i| l2p_value_with_pba(0xF000 + i))
+        .collect();
+    let (_lsn, handle) = db
+        .commit_ops_deferred(&[WalOp::L2pRemapRange {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            start_lba: start,
+            values,
+        }])
+        .unwrap();
+    db.test_force_compact_pass();
+    let outs = handle.recv().unwrap();
+    assert_eq!(outs.len(), 1);
+    match &outs[0] {
+        ApplyOutcome::L2pRemapRange {
+            applied,
+            prevs,
+            freed_pbas,
+        } => {
+            assert_eq!(applied.len(), 64);
+            assert_eq!(prevs.len(), 64);
+            // All fresh writes: every applied bit is true.
+            for (i, bit) in applied.iter().enumerate() {
+                assert!(*bit, "fresh remap-range write at off {i} must apply");
+            }
+            // Phase 5 default: freed_pbas always empty (Lineage GC
+            // owns freed-PBA delivery now).
+            assert!(freed_pbas.is_empty());
+        }
+        other => panic!("expected L2pRemapRange outcome, got {other:?}"),
+    }
+}
+

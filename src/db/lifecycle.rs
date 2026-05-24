@@ -398,6 +398,7 @@ impl Db {
             self.volumes.clone(),
             self.metrics.clone(),
             self.l2p_compactor_params,
+            self.deferred_outcomes.clone(),
         );
         *self.l2p_compactor.lock() = Some(worker);
     }

@@ -83,6 +83,26 @@ pub struct Config {
     /// force the legacy lane path (e.g. for differential debugging).
     pub commit_direct_apply_enabled: bool,
 
+    /// ZFS-TXG-clone Phase 2: when true, `commit_ops_deferred` parks
+    /// the freshly-computed `Vec<ApplyOutcome>` in the
+    /// [`crate::DeferredOutcomeAggregator`] keyed by LSN and returns
+    /// immediately. The L2P compactor's per-pass loop drains every
+    /// staged entry whose touched `(volume, shard)` pairs have all
+    /// been folded into the on-disk tree (the metadb equivalent of a
+    /// ZFS TXG sync). When false (default during the first-month
+    /// soak), `commit_ops_deferred` is a thin wrapper that delivers
+    /// outcomes synchronously — call sites then either upgrade
+    /// transparently or are routed through the legacy
+    /// `commit_ops_sync` shape; on-disk format is unchanged.
+    ///
+    /// This flag governs whether the staging path is exercised at all;
+    /// the deferred API is *always* compiled in. Flip to `true` after
+    /// the 8h `deferred_outcomes_proptest` soak gate on nvme-box
+    /// passes. Behaviour is byte-equivalent to the sync path —
+    /// outcomes for a given LSN match exactly; only delivery timing
+    /// shifts (compactor boundary instead of caller thread).
+    pub commit_deferred_outcomes_enabled: bool,
+
     /// Upper bound on a single group-commit batch, in bytes.
     pub group_commit_max_batch_bytes: usize,
 
@@ -362,6 +382,10 @@ impl Config {
             // path for any commit that doesn't match the eligibility
             // check (see `commit_direct_apply_enabled` doc).
             commit_direct_apply_enabled: true,
+            // ZFS-TXG-clone Phase 2 — default off until the new
+            // `deferred_outcomes_proptest` soak gate on nvme-box passes.
+            // See `commit_deferred_outcomes_enabled` doc.
+            commit_deferred_outcomes_enabled: false,
             group_commit_max_batch_bytes: 4 * 1024 * 1024,
             group_commit_timeout_us: 1,
             page_cache_bytes: 512 * 1024 * 1024,

@@ -287,6 +287,20 @@ pub struct Db {
     /// no consumer has subscribed (the default — keeps Phase 4 tests
     /// that drive the GC directly free of side effects).
     freed_pbas_sink: Mutex<Option<FreedPbasSink>>,
+    /// ZFS-TXG-clone Phase 2: staged-outcome map shared between
+    /// `commit_ops_deferred` (stager) and the L2P compactor's per-pass
+    /// drain. Always constructed even when
+    /// `Config::commit_deferred_outcomes_enabled = false`, so the sync
+    /// path can transparently route through the deferred entry point
+    /// without an extra branch on the hot path. See
+    /// [`crate::db::commit::outcomes`] and
+    /// `/root/.claude/plans/soft-doodling-snail.md`.
+    deferred_outcomes: Arc<crate::db::commit::DeferredOutcomeAggregator>,
+    /// Cached copy of `Config::commit_deferred_outcomes_enabled` so the
+    /// commit path can decide whether to park the outcome vec
+    /// (`deferred=true`) or send it through the channel immediately
+    /// (`deferred=false`, restoring the pre-Phase-2 latency profile).
+    commit_deferred_outcomes_enabled: bool,
 }
 
 /// Synchronous callback invoked with the freed-PBA set produced by a
@@ -1109,6 +1123,7 @@ mod snapshot;
 mod streaming_flush;
 mod volume;
 
+pub use commit::DeferredOutcomeHandle;
 pub use snapshot::{DropReport, SnapshotView};
 
 use apply::*;
@@ -1133,6 +1148,13 @@ impl Drop for Db {
         if let Some(mut worker) = self.l2p_compactor.lock().take() {
             worker.stop();
         }
+        // ZFS-TXG-clone Phase 2: release any deferred-outcome
+        // handles still parked in the aggregator. After the compactor
+        // has joined no further drain runs, so an awaiting `recv()`
+        // would block forever; poison_all sends an `Err` to every
+        // pending receiver instead.
+        self.deferred_outcomes
+            .poison_all("metadb: db shutting down");
         // Stop the async reclaim worker before page_store /
         // page_cache go away. It holds `Arc<PageStore>` +
         // `Arc<PageCache>` clones; join it here so the page-store
@@ -1155,6 +1177,17 @@ impl Drop for Db {
 
 #[cfg(test)]
 impl Db {
+    /// Test helper: synchronously run one L2P-compactor pass on the
+    /// caller thread. Used by Phase 2 deferred-outcome tests so they
+    /// do not have to sleep waiting for the background compactor's
+    /// 25 ms wakeup. Drives the same code path as the worker thread,
+    /// including the step-7 deferred-outcome drain.
+    pub(crate) fn test_force_compact_pass(&self) {
+        if let Some(compactor) = self.l2p_compactor.lock().as_ref() {
+            compactor.force_compact_all();
+        }
+    }
+
     /// Test helper: drain and return the in-memory dead-list buffer
     /// for one volume. Used by Phase 2 tests in `db::tests::dead_list`
     /// to inspect per-emit records without going through a flush.

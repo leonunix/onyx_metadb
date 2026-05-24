@@ -28,6 +28,18 @@
 //! publish leaves a reader unable to find an entry that has been
 //! removed from draining but is not yet visible through the published
 //! read view. See [`crate::db::l2p_buffer`].
+//!
+//! ## Step 7 — ZFS-TXG-clone Phase 2 deferred-outcome drain
+//!
+//! After the per-shard loop, the compactor snapshots every
+//! `(volume_ord, shard_id)` -> `compacted_lsn` cursor it just
+//! advanced and calls
+//! [`super::commit::DeferredOutcomeAggregator::drain_up_to`]. Every
+//! staged commit whose touched shards have all been folded past
+//! their LSN is released to its `DeferredOutcomeHandle` receiver.
+//! Bounded by `max_interval_ms`, which is the worst-case
+//! caller-observed latency for receiving outcomes when the deferred
+//! path is enabled.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,6 +125,13 @@ struct L2pCompactorInner {
     shutdown: AtomicBool,
     wakeup: Mutex<bool>,
     wakeup_cvar: Condvar,
+    /// ZFS-TXG-clone Phase 2: drained after every pass to release
+    /// every staged deferred outcome. The drain is a no-op when
+    /// nothing is staged. Each staged outcome was already populated
+    /// before `stage` returned, so the compactor pass acts purely as
+    /// a TXG-sync heartbeat for delivery — there is no per-LSN
+    /// dependency on what the pass actually did.
+    deferred_outcomes: Arc<super::commit::DeferredOutcomeAggregator>,
 }
 
 impl L2pCompactor {
@@ -120,6 +139,7 @@ impl L2pCompactor {
         volumes: Arc<RwLock<HashMap<VolumeOrdinal, Arc<Volume>>>>,
         metrics: Arc<MetaMetrics>,
         params: L2pCompactorParams,
+        deferred_outcomes: Arc<super::commit::DeferredOutcomeAggregator>,
     ) -> Self {
         let inner = Arc::new(L2pCompactorInner {
             volumes,
@@ -128,6 +148,7 @@ impl L2pCompactor {
             shutdown: AtomicBool::new(false),
             wakeup: Mutex::new(false),
             wakeup_cvar: Condvar::new(),
+            deferred_outcomes,
         });
         let inner_thread = inner.clone();
         let handle = thread::Builder::new()
@@ -209,7 +230,7 @@ fn compact_one_pass(inner: &L2pCompactorInner, size_gated: bool) {
         out
     };
 
-    for vol in vols {
+    for vol in &vols {
         for shard in &vol.shards {
             if inner.shutdown.load(Ordering::Acquire) {
                 return;
@@ -224,6 +245,14 @@ fn compact_one_pass(inner: &L2pCompactorInner, size_gated: bool) {
             compact_shard(inner, shard);
         }
     }
+
+    // Step 7 (ZFS-TXG-clone Phase 2): release every staged outcome.
+    // Outcomes are populated by `commit_ops_deferred` before `stage`
+    // returns, so any entry in the aggregator is safe to deliver.
+    // Cheap when no commit has used the deferred path — the
+    // aggregator's `pending` map is empty and the drain returns
+    // immediately. Pass `Lsn::MAX` as the watermark to release all.
+    inner.deferred_outcomes.drain_up_to_lsn(crate::types::Lsn::MAX);
 }
 
 fn compact_shard(inner: &L2pCompactorInner, shard: &super::L2pShard) {

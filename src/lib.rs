@@ -52,8 +52,8 @@ pub mod wal;
 pub use cache::{PageCache, PageCacheStats};
 pub use config::{Config, MAX_DEDUP_SHARDS, PAGE_SIZE};
 pub use db::{
-    Db, DbDedupIter, DbRangeIter, DbRefcountIter, DropReport, DropVolumeReport, FreedPbasSink,
-    PendingState, SnapshotView,
+    Db, DbDedupIter, DbRangeIter, DbRefcountIter, DeferredOutcomeHandle, DropReport,
+    DropVolumeReport, FreedPbasSink, PendingState, SnapshotView,
 };
 pub use dedup_types::{DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash8, LsmStats};
 pub use error::{MetaDbError, Result};

@@ -74,6 +74,21 @@ pub struct MetaMetrics {
     commit_direct_apply_us: AtomicU64,
     commit_direct_apply_max_us: AtomicU64,
 
+    // ZFS-TXG-clone Phase 2 (deferred outcome API). Each commit that
+    // routes through `commit_ops_deferred` parks its `Vec<ApplyOutcome>`
+    // in the [`DeferredOutcomeAggregator`] keyed by LSN. The L2P
+    // compactor's step-6 drain releases each entry once every
+    // `(volume, shard)` it touched has been folded into the on-disk
+    // tree. `commit_deferred_outcomes_count` counts entries staged,
+    // `commit_deferred_outcomes_released_total` counts entries the
+    // compactor has released, `commit_deferred_outcomes_pending` is a
+    // gauge written on every stage / drain (last value wins —
+    // intentional, since pending depth is a steady-state property).
+    commit_deferred_outcomes_count: AtomicU64,
+    commit_deferred_outcomes_released_total: AtomicU64,
+    commit_deferred_outcomes_pending: AtomicU64,
+    commit_deferred_outcomes_pending_max: AtomicU64,
+
     // Per-phase split of `commit_apply_us`. `apply_ops_laned` runs
     // L2P → refcount → dedup as three sequential lane-barrier
     // phases; each blocks commit ack. Use these counters to

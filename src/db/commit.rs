@@ -1,6 +1,10 @@
 use super::*;
 
 mod lanes;
+pub(crate) mod outcomes;
+
+pub use outcomes::DeferredOutcomeHandle;
+pub(crate) use outcomes::DeferredOutcomeAggregator;
 
 #[derive(Clone, Copy, Debug)]
 struct RcApplyAction {
@@ -516,6 +520,56 @@ impl Db {
             },
             "metadb: slow commit_with_outcomes (>=1s)",
         )
+    }
+
+    /// ZFS-TXG-clone Phase 2 entry point. Same WAL + apply pipeline as
+    /// [`Self::commit_ops`], but the returned outcome `Vec` is parked
+    /// in the [`DeferredOutcomeAggregator`] keyed by the freshly
+    /// assigned LSN and delivered through the
+    /// [`DeferredOutcomeHandle`] later — once the L2P compactor's
+    /// per-pass drain confirms every `(volume, shard)` the batch
+    /// touched has been folded into the on-disk tree. Equivalent to
+    /// `commit_ops` followed by an immediate-release on the handle
+    /// when `Config::commit_deferred_outcomes_enabled = false`, so
+    /// callers can route through the deferred surface unconditionally
+    /// and let configuration decide whether outcomes arrive at the
+    /// caller thread or at the next compactor cycle. The on-disk
+    /// state observed by readers is identical in both modes — only
+    /// outcome *delivery* shifts.
+    pub fn commit_ops_deferred(
+        &self,
+        ops: &[WalOp],
+    ) -> Result<(Lsn, DeferredOutcomeHandle)> {
+        // Empty op batch — return the no-work LSN immediately. Matches
+        // the `commit_ops` early-out at line ~382 of this file.
+        if ops.is_empty() {
+            self.metrics.record_commit_empty();
+            let lsn = self.last_applied_lsn();
+            return Ok((lsn, DeferredOutcomeHandle::ready(lsn, Ok(Vec::new()))));
+        }
+
+        // Run the synchronous commit path. This executes WAL submit +
+        // fsync + dispatch + apply (including L2pBuffer insert) and
+        // returns a fully-populated `Vec<ApplyOutcome>`. The L2pBuffer
+        // is updated before this returns, so readers can already
+        // observe the new mappings.
+        let (lsn, outcomes) = self.commit_ops(ops)?;
+
+        // Choose delivery mode based on the live config flag.
+        let handle = if self.commit_deferred_outcomes_enabled {
+            // The compactor's per-pass drain releases this entry once
+            // its `last_applied_lsn` watermark catches up. See
+            // [`crate::db::commit::outcomes`].
+            self.deferred_outcomes.stage(lsn, outcomes)
+        } else {
+            // Flag off — deliver immediately so callers see
+            // sync-path latency. Compile-in infrastructure stays
+            // routed through the deferred surface so the same call
+            // site works in both modes.
+            DeferredOutcomeHandle::ready(lsn, Ok(outcomes))
+        };
+
+        Ok((lsn, handle))
     }
 
     /// Experimental: apply a batch without writing a WAL record.
