@@ -88,6 +88,14 @@ struct Model {
     state: HashMap<(VolumeOrdinal, u64), L2pValue>,
     snapshots: HashMap<SnapshotId, (VolumeOrdinal, BTreeMap<u64, L2pValue>)>,
     snap_ids: Vec<SnapshotId>,
+    /// Phase 4 [[no-refcount-hot-path-design]] lineage pin: `parents[child] = parent`
+    /// records the source vol of every clone whose
+    /// `WalOp::PromotionComplete` has not fired yet. `db.drop_volume`
+    /// refuses to drop a parent while any descendant still points at
+    /// it (see [`Db::drop_volume`] InvalidArgument branch). This proptest
+    /// never drives promotion, so once a clone is created its parent
+    /// stays pinned for the rest of the run.
+    parents: HashMap<VolumeOrdinal, VolumeOrdinal>,
 }
 
 impl Model {
@@ -168,18 +176,26 @@ fn run_lifecycle_body(ops: Vec<Op>, deferred: bool) -> Result<(), TestCaseError>
                 Op::DropVolume(slot) => {
                     let Some(ord) = model.vol_at(slot) else { continue; };
                     if ord == 0 { continue; } // bootstrap refused
-                    // drop_volume refuses if any snapshot pins the vol.
-                    let pinned = model.snapshots.values().any(|(v, _)| *v == ord);
+                    // drop_volume refuses if any snapshot pins the vol
+                    // OR if any descendant clone still references it
+                    // through its in-manifest `parent_vol_ord`. The
+                    // proptest never drives promotion explicitly, so
+                    // once a clone is created the model treats its
+                    // parent as pinned for the remainder of the run.
+                    let snap_pinned = model.snapshots.values().any(|(v, _)| *v == ord);
+                    let clone_pinned = model.parents.values().any(|p| *p == ord);
+                    let pinned = snap_pinned || clone_pinned;
                     match db.drop_volume(ord) {
                         Ok(Some(report)) => {
-                            prop_assert!(!pinned, "drop_volume succeeded but model had live snapshot");
+                            prop_assert!(!pinned, "drop_volume succeeded but model had a live pinner");
                             prop_assert_eq!(report.vol_ord, ord);
                             model.volumes.retain(|o| *o != ord);
                             model.state.retain(|(o, _), _| *o != ord);
+                            model.parents.retain(|c, _| *c != ord);
                         }
                         Ok(None) => unreachable!("volume {ord} should exist"),
                         Err(MetaDbError::InvalidArgument(_)) => {
-                            prop_assert!(pinned, "drop_volume refused but model had no snapshot pinning it");
+                            prop_assert!(pinned, "drop_volume refused but model had no pinner");
                         }
                         Err(e) => prop_assert!(false, "unexpected drop_volume error {e:?}"),
                     }
@@ -221,10 +237,12 @@ fn run_lifecycle_body(ops: Vec<Op>, deferred: bool) -> Result<(), TestCaseError>
                     prop_assert!(!model.volumes.contains(&new_ord));
                     model.volumes.push(new_ord);
                     // Seed clone state from the source snapshot.
-                    let (_, ref frozen) = model.snapshots[&src_snap];
+                    let (parent_ord, ref frozen) = model.snapshots[&src_snap];
                     for (lba, val) in frozen.iter() {
                         model.state.insert((new_ord, *lba), *val);
                     }
+                    // Track the parent_vol_ord pin (Phase 4 lineage).
+                    model.parents.insert(new_ord, parent_ord);
                 }
                 Op::VerifyRange(slot) => {
                     let Some(ord) = model.vol_at(slot) else { continue; };
@@ -304,6 +322,19 @@ proptest! {
     #[test]
     fn volume_lifecycle_matches_reference(ops in proptest::collection::vec(arb_op(), 1..120)) {
         run_lifecycle_body(ops, false)?;
+    }
+
+    /// #3b investigation — restore the original deferred-axis name
+    /// (proptest seeds are name-derived, so we want the SAME random
+    /// op sequences that previously failed) and see whether the
+    /// apply_l2p_bucket_buffer read_view fix indirectly closes the
+    /// "drop_volume refused after clone-of-dropped-snapshot vol"
+    /// divergence.
+    #[test]
+    fn volume_lifecycle_matches_reference_deferred(
+        ops in proptest::collection::vec(arb_op(), 1..120)
+    ) {
+        run_lifecycle_body(ops, true)?;
     }
 }
 
