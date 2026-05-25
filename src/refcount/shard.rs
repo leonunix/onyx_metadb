@@ -877,11 +877,26 @@ impl DrainerWorker {
                     if self.state.preempt.load(Ordering::Acquire) {
                         self.metrics.record_rc_drainer_preempt();
                         self.state.in_cycle.store(false, Ordering::Release);
-                        self.state.preempt_done.store(true, Ordering::Release);
-                        self.state.cv.notify_all();
-                        while self.state.preempt.load(Ordering::Acquire)
-                            && !self.state.shutdown.load(Ordering::Acquire)
-                        {
+                        // Re-assert `preempt_done=true` on every loop
+                        // iteration. A concurrent `preempt_and_wait`
+                        // resets `preempt_done=false` after the previous
+                        // caller resumed but before the worker exited
+                        // the while-park below; without the per-iteration
+                        // re-store the worker stays parked at line ~885
+                        // and the new caller hangs at `preempt_and_wait`
+                        // line ~269. Both stores now happen under
+                        // `self.state.mu` (caller via the lock-first
+                        // shape in `DrainerHandle::preempt_and_wait`,
+                        // worker via the outer guard), but the linearisation
+                        // can still see the caller's `false` after the
+                        // worker's first `true` — re-affirming on each
+                        // iteration restores the invariant.
+                        while {
+                            self.state.preempt_done.store(true, Ordering::Release);
+                            self.state.cv.notify_all();
+                            self.state.preempt.load(Ordering::Acquire)
+                                && !self.state.shutdown.load(Ordering::Acquire)
+                        } {
                             self.state.cv.wait(&mut guard);
                         }
                         continue;

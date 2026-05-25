@@ -251,6 +251,25 @@ impl DrainerHandle {
     /// `apply_gate.write()`.
     pub fn preempt_and_wait(&self) -> Duration {
         let started = Instant::now();
+        // Lock-then-store ordering is load-bearing. The worker's
+        // `preempt_done.store(true)` at the head of its preempt handler
+        // (`shard.rs::DrainerWorker::run` line ~880) runs under
+        // `self.state.mu`. If we set `preempt_done=false` outside the
+        // mutex, the two stores race: when the false-store wins
+        // ordering against the worker's earlier true-store, the
+        // caller observes `false` forever even though the worker has
+        // already entered its `while preempt { cv.wait }` parking
+        // loop (line ~885) and won't run another preempt handler.
+        // Result: caller hangs on `cv.wait` at line ~269 below while
+        // every drainer thread idles at line ~885. The previous "set
+        // atomics, notify, then lock" sequence hit this race in
+        // `volume_lifecycle_matches_reference_async_wal` under
+        // `PROPTEST_CASES=64` (≈20–30% per run). Reproduction +
+        // diagnosis: per-shard `[rc-drainer STALL]` lines showed
+        // `preempt=true preempt_done=false in_cycle=false` indefinitely
+        // while all 16 `rc-drainer-N` threads were parked at
+        // `shard.rs:885`.
+        let mut guard = self.state.mu.lock();
         self.state.preempt.store(true, Ordering::Release);
         self.state.preempt_done.store(false, Ordering::Release);
         // Wake the worker so it can observe `preempt` even if it was
@@ -259,7 +278,6 @@ impl DrainerHandle {
         // Wait until the worker either finishes its cycle (sets
         // `preempt_done=true`) or confirms it was idle when preempt
         // was set (also sets `preempt_done=true` immediately).
-        let mut guard = self.state.mu.lock();
         loop {
             if self.state.preempt_done.load(Ordering::Acquire)
                 && !self.state.in_cycle.load(Ordering::Acquire)
