@@ -67,8 +67,23 @@ enum Op {
         assigned_lsn: Option<Lsn>,
         body: Vec<u8>,
         ack: Sender<Result<Lsn>>,
+        /// ZFS-TXG-clone Phase 3: when false, the writer thread acks
+        /// the submit after `seg.append` (body in OS page cache) and
+        /// skips the per-batch fsync. Durability is reasserted at the
+        /// next `Op::FsyncAll` (TXG sync boundary). A mixed batch
+        /// (any submit `synchronous=true`) still fsyncs — see
+        /// `commit_batch`.
+        synchronous: bool,
     },
     Shutdown {
+        ack: Sender<Result<()>>,
+    },
+    /// Force-fsync everything written to the current segment so far,
+    /// then ack. Modelled on `Shutdown`'s mid-batch handling: drained
+    /// in-flight submits get committed (forced sync), acked in LSN
+    /// order, then the FsyncAll caller is acked. Used by the
+    /// `WalSet::fsync_all_lanes` TXG-sync barrier.
+    FsyncAll {
         ack: Sender<Result<()>>,
     },
 }
@@ -132,6 +147,7 @@ impl Wal {
                 assigned_lsn: None,
                 body,
                 ack: ack_tx,
+                synchronous: true,
             })
             .map_err(|_| writer_exited())?;
         let result = ack_rx.recv().map_err(|_| writer_exited())?;
@@ -144,6 +160,21 @@ impl Wal {
     /// same-lane enqueue order matches global LSN order, then waits for
     /// the fsync ack outside that mutex.
     pub(crate) fn submit_assigned_async(&self, lsn: Lsn, body: Vec<u8>) -> Result<PendingWalAck> {
+        self.submit_assigned_async_with_options(lsn, body, /* synchronous */ true)
+    }
+
+    /// ZFS-TXG-clone Phase 3: enqueue an already-assigned record with an
+    /// explicit `synchronous` toggle. When `synchronous=false`, the
+    /// writer thread acks the caller after `seg.append` (body in OS page
+    /// cache) and skips the per-batch fsync. A mixed batch (any submit
+    /// `synchronous=true`) still fsyncs. Durability is reasserted at
+    /// the next `fsync_pending` call.
+    pub(crate) fn submit_assigned_async_with_options(
+        &self,
+        lsn: Lsn,
+        body: Vec<u8>,
+        synchronous: bool,
+    ) -> Result<PendingWalAck> {
         if body.len() > WAL_MAX_BODY {
             return Err(wal_body_too_large(body.len()));
         }
@@ -154,6 +185,7 @@ impl Wal {
                 assigned_lsn: Some(lsn),
                 body,
                 ack: ack_tx,
+                synchronous,
             })
             .map_err(|_| writer_exited())?;
         Ok(PendingWalAck {
@@ -161,6 +193,29 @@ impl Wal {
             started,
             metrics: Arc::clone(&self.metrics),
         })
+    }
+
+    /// Force-fsync everything appended to this lane's current segment
+    /// so far. Returns when the fsync syscall returns (or fails). The
+    /// `WalSet::fsync_all_lanes` TXG-sync barrier fans this across every
+    /// lane before promoting `manifest.checkpoint_lsn`.
+    ///
+    /// Safety argument (non-local — read before touching):
+    /// `flush_with_gate` samples `wal_checkpoint = last_applied_lsn`
+    /// under `apply_gate.write()`. Every commit ≤ `wal_checkpoint` has
+    /// completed `finish_global_apply`, which is gated on
+    /// `wal.submit*().wait()` returning, which means the writer thread
+    /// has at minimum executed `seg.append(&buf)` (body in OS page
+    /// cache). `fsync_pending` after the sample makes those bytes
+    /// durable. Without this barrier, an async commit could land in a
+    /// checkpoint that no surviving WAL record covers, breaking
+    /// recovery.
+    pub(crate) fn fsync_pending(&self) -> Result<()> {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        self.sender
+            .send(Op::FsyncAll { ack: ack_tx })
+            .map_err(|_| writer_exited())?;
+        ack_rx.recv().map_err(|_| writer_exited())?
     }
 
     /// Drain any in-flight batch and stop the writer thread. After
@@ -213,6 +268,11 @@ struct WriterState {
     max_segment_bytes: u64,
     max_batch_bytes: usize,
     timeout: Duration,
+    /// ZFS-TXG-clone Phase 3: deadline applied when every submit in
+    /// the in-flight batch has `synchronous=false`. Defaults to
+    /// `config.wal_async_group_commit_window_us` (1 ms). Collapses to
+    /// `timeout` the moment a sync submit lands — see `writer_main`.
+    async_timeout: Duration,
     faults: Arc<FaultController>,
     metrics: Arc<MetaMetrics>,
 }
@@ -221,6 +281,7 @@ struct PendingSubmit {
     assigned_lsn: Option<Lsn>,
     body: Vec<u8>,
     ack: Sender<Result<Lsn>>,
+    synchronous: bool,
 }
 
 impl WriterState {
@@ -257,6 +318,7 @@ impl WriterState {
             max_segment_bytes: config.wal_segment_bytes,
             max_batch_bytes: config.group_commit_max_batch_bytes,
             timeout: Duration::from_micros(config.group_commit_timeout_us),
+            async_timeout: Duration::from_micros(config.wal_async_group_commit_window_us),
             faults,
             metrics,
         })
@@ -275,6 +337,23 @@ impl WriterState {
         }
         let seg = SegmentFile::create(&self.dir, start_lsn)?;
         self.current = Some(seg);
+        Ok(())
+    }
+
+    /// ZFS-TXG-clone Phase 3: data-fsync the current segment without
+    /// writing anything. Used when `Op::FsyncAll` arrives with no
+    /// in-flight submits — the batch path's normal `seg.sync()` covers
+    /// the mid-batch case. Mirrors the data-only `seg.sync()` flavour
+    /// to keep the XFS/ext4 fsync cost consistent with the per-batch
+    /// path; `sync_all` (metadata) is reserved for finalize/rotate.
+    fn fsync_current(&mut self) -> Result<()> {
+        if let Some(seg) = self.current.as_mut() {
+            self.faults.inject(FaultPoint::WalFsyncBefore)?;
+            let started = Instant::now();
+            seg.sync()?;
+            self.metrics.record_wal_fsync(started.elapsed());
+            self.faults.inject(FaultPoint::WalFsyncAfter)?;
+        }
         Ok(())
     }
 }
@@ -297,10 +376,17 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
             return;
         }
 
+        // ZFS-TXG-clone Phase 3: an FsyncAll at the head with no submits
+        // in flight is a no-op aside from the explicit segment sync.
+        if let Op::FsyncAll { ack } = first {
+            let _ = ack.send(state.fsync_current());
+            continue;
+        }
+
         // Start a batch with the submit we already dequeued.
         let first_len = match &first {
             Op::Submit { body, .. } => body.len() + WAL_HEADER_SIZE,
-            Op::Shutdown { .. } => unreachable!(),
+            Op::Shutdown { .. } | Op::FsyncAll { .. } => unreachable!(),
         };
         let mut submits: Vec<PendingSubmit> = Vec::new();
         match first {
@@ -308,37 +394,63 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
                 assigned_lsn,
                 body,
                 ack,
+                synchronous,
             } => submits.push(PendingSubmit {
                 assigned_lsn,
                 body,
                 ack,
+                synchronous,
             }),
-            Op::Shutdown { .. } => unreachable!(),
+            Op::Shutdown { .. } | Op::FsyncAll { .. } => unreachable!(),
         }
         let mut batch_bytes = first_len;
 
         // Drain more submits up to the byte cap or the timeout. Always
         // consume immediately queued records before looking at the clock, so
         // a tiny timeout still forms batches when submitters already lined up.
-        let deadline = Instant::now() + state.timeout;
+        //
+        // Phase 3 dynamic deadline: while every submit is async, wait up
+        // to `async_timeout` to amortise the eventual TXG-sync fsync; the
+        // moment a sync submit lands, collapse to `timeout` so sync
+        // hot-path latency is protected. Recomputed every loop iteration
+        // — cheap and matches the head-arrival anchor.
+        let base = Instant::now();
         let mut pending_shutdown: Option<Sender<Result<()>>> = None;
-        while batch_bytes < state.max_batch_bytes && pending_shutdown.is_none() {
+        let mut pending_fsync_all: Option<Sender<Result<()>>> = None;
+        while batch_bytes < state.max_batch_bytes
+            && pending_shutdown.is_none()
+            && pending_fsync_all.is_none()
+        {
+            let all_async = submits.iter().all(|s| !s.synchronous);
+            let timeout = if all_async {
+                state.async_timeout
+            } else {
+                state.timeout
+            };
+            let deadline = base + timeout;
+
             match receiver.try_recv() {
                 Ok(Op::Submit {
                     assigned_lsn,
                     body,
                     ack,
+                    synchronous,
                 }) => {
                     batch_bytes += body.len() + WAL_HEADER_SIZE;
                     submits.push(PendingSubmit {
                         assigned_lsn,
                         body,
                         ack,
+                        synchronous,
                     });
                     continue;
                 }
                 Ok(Op::Shutdown { ack }) => {
                     pending_shutdown = Some(ack);
+                    break;
+                }
+                Ok(Op::FsyncAll { ack }) => {
+                    pending_fsync_all = Some(ack);
                     break;
                 }
                 Err(TryRecvError::Empty) => {}
@@ -354,16 +466,22 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
                     assigned_lsn,
                     body,
                     ack,
+                    synchronous,
                 }) => {
                     batch_bytes += body.len() + WAL_HEADER_SIZE;
                     submits.push(PendingSubmit {
                         assigned_lsn,
                         body,
                         ack,
+                        synchronous,
                     });
                 }
                 Ok(Op::Shutdown { ack }) => {
                     pending_shutdown = Some(ack);
+                    break;
+                }
+                Ok(Op::FsyncAll { ack }) => {
+                    pending_fsync_all = Some(ack);
                     break;
                 }
                 Err(RecvTimeoutError::Timeout) => break,
@@ -374,7 +492,12 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
         // Commit the batch atomically.  On success, ack in order.  On
         // failure, ack every submitter in the batch with a freshly-
         // constructed error and exit the thread.
-        let commit_result = commit_batch(&mut state, &mut submits);
+        //
+        // Phase 3 force_fsync: when FsyncAll arrived mid-batch, the
+        // batch is promoted to synchronous so the FsyncAll caller can
+        // ack with confidence that every pending byte is durable.
+        let force_fsync = pending_fsync_all.is_some();
+        let commit_result = commit_batch(&mut state, &mut submits, force_fsync);
         match commit_result {
             Ok(assigned) => {
                 for (ack, lsn) in assigned {
@@ -399,8 +522,20 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
                         "wal shutdown after commit failure: {msg}"
                     ))));
                 }
+                if let Some(ack) = pending_fsync_all {
+                    let _ = ack.send(Err(MetaDbError::Corruption(format!(
+                        "wal fsync_all after commit failure: {msg}"
+                    ))));
+                }
                 return;
             }
+        }
+
+        // FsyncAll ack only AFTER in-batch ack drain — preserves the
+        // "ack order matches LSN order" invariant. force_fsync above
+        // ensured the batch already fsynced; no extra syscall here.
+        if let Some(ack) = pending_fsync_all {
+            let _ = ack.send(Ok(()));
         }
 
         if let Some(ack) = pending_shutdown {
@@ -410,14 +545,23 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
     }
 }
 
-/// Encode the batch, rotate if needed, write, fsync. Returns the list
-/// of `(ack, lsn)` pairs so the caller can dispatch on success.
+/// Encode the batch, rotate if needed, write, conditionally fsync.
+/// Returns the list of `(ack, lsn)` pairs so the caller can dispatch
+/// on success.
 ///
 /// `submits` is consumed on success (drained). On failure, `submits`
 /// is left intact so the caller can iterate and send error acks.
+///
+/// `force_fsync=true` (ZFS-TXG-clone Phase 3) means the batch must
+/// fsync regardless of submit flags — used when `Op::FsyncAll` arrived
+/// mid-batch and promoted the batch to synchronous. Otherwise the
+/// batch fsyncs iff any submit had `synchronous=true`. An all-async
+/// batch returns without fsync; durability is reasserted at the next
+/// FsyncAll (TXG sync barrier).
 fn commit_batch(
     state: &mut WriterState,
     submits: &mut Vec<PendingSubmit>,
+    force_fsync: bool,
 ) -> Result<Vec<(Sender<Result<Lsn>>, Lsn)>> {
     if submits.is_empty() {
         return Ok(Vec::new());
@@ -452,6 +596,7 @@ fn commit_batch(
     // Encode into a single buffer so the write is one syscall.
     let mut buf = Vec::with_capacity(batch_bytes);
     let mut assigned = Vec::with_capacity(submits.len());
+    let mut any_sync = force_fsync;
     for pending in submits.drain(..) {
         let lsn = pending.assigned_lsn.unwrap_or(state.next_lsn);
         if lsn < state.next_lsn {
@@ -466,11 +611,12 @@ fn commit_batch(
             .checked_add(1)
             .ok_or(MetaDbError::OutOfSpace)?;
         try_encode(&mut buf, lsn, &pending.body).map_err(|len| wal_body_too_large(len as usize))?;
+        any_sync |= pending.synchronous;
         assigned.push((pending.ack, lsn));
     }
 
-    // Write + fsync. Fault points straddle the fsync so tests can
-    // simulate both a partial write (before fsync returns) and a
+    // Write + (maybe) fsync. Fault points straddle the fsync so tests
+    // can simulate both a partial write (before fsync returns) and a
     // post-durability crash.
     let seg = state
         .current
@@ -479,11 +625,13 @@ fn commit_batch(
     let write_started = Instant::now();
     seg.append(&buf)?;
     state.metrics.record_wal_write(write_started.elapsed());
-    state.faults.inject(FaultPoint::WalFsyncBefore)?;
-    let fsync_started = Instant::now();
-    seg.sync()?;
-    state.metrics.record_wal_fsync(fsync_started.elapsed());
-    state.faults.inject(FaultPoint::WalFsyncAfter)?;
+    if any_sync {
+        state.faults.inject(FaultPoint::WalFsyncBefore)?;
+        let fsync_started = Instant::now();
+        seg.sync()?;
+        state.metrics.record_wal_fsync(fsync_started.elapsed());
+        state.faults.inject(FaultPoint::WalFsyncAfter)?;
+    }
     state.metrics.record_wal_batch(assigned.len(), buf.len());
     Ok(assigned)
 }
@@ -743,5 +891,109 @@ mod tests {
         let all = read_all(dir.path());
         assert_eq!(all.len(), 10);
         assert_eq!(last_lsn.load(Ordering::Relaxed), 10);
+    }
+
+    /// Phase 3: a batch made entirely of `synchronous=false` submits
+    /// must NOT trigger the per-batch fsync. We count fsync calls via
+    /// the `WalFsyncBefore` fault hit counter (no trigger that fires).
+    #[test]
+    fn async_only_batch_skips_fsync() {
+        let dir = TempDir::new().unwrap();
+        let faults = FaultController::new();
+        faults.install(FaultPoint::WalFsyncBefore, u64::MAX, FaultAction::Error);
+        let wal = Wal::create(dir.path(), &cfg_fast_batch(), 1, faults.clone()).unwrap();
+
+        for i in 1..=20u64 {
+            wal.submit_assigned_async_with_options(i, format!("a{i}").into_bytes(), false)
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+
+        // No fsyncs yet. Pre-shutdown read avoids the shutdown-time
+        // sync_all dirtying the counter.
+        assert_eq!(faults.hits(FaultPoint::WalFsyncBefore), 0);
+
+        // FsyncAll drains the writer and forces one fsync.
+        wal.fsync_pending().unwrap();
+        assert_eq!(faults.hits(FaultPoint::WalFsyncBefore), 1);
+
+        wal.shutdown().unwrap();
+        let on_disk = read_all(dir.path());
+        assert_eq!(on_disk.len(), 20);
+    }
+
+    /// Phase 3: a mixed batch (any submit with `synchronous=true`)
+    /// must fsync, so the async submits in that batch ride along
+    /// behind the sync one. Verified via the fsync hit counter.
+    #[test]
+    fn mixed_batch_fsyncs_once() {
+        let dir = TempDir::new().unwrap();
+        let faults = FaultController::new();
+        faults.install(FaultPoint::WalFsyncBefore, u64::MAX, FaultAction::Error);
+        // Lengthen the deadline so the burst lands as one batch.
+        let mut cfg = cfg_fast_batch();
+        cfg.wal_async_group_commit_window_us = 5_000;
+        let wal = Arc::new(Wal::create(dir.path(), &cfg, 1, faults.clone()).unwrap());
+
+        // Queue an async submit + a sync submit from two threads. The
+        // sync submit forces the batch to fsync.
+        let w1 = Arc::clone(&wal);
+        let t_async = std::thread::spawn(move || {
+            w1.submit_assigned_async_with_options(1, b"a".to_vec(), false)
+                .unwrap()
+                .wait()
+                .unwrap();
+        });
+        // Small stagger to keep the async submit at the head of the batch.
+        std::thread::sleep(Duration::from_millis(1));
+        let w2 = Arc::clone(&wal);
+        let t_sync = std::thread::spawn(move || {
+            w2.submit_assigned_async_with_options(2, b"b".to_vec(), true)
+                .unwrap()
+                .wait()
+                .unwrap();
+        });
+        t_async.join().unwrap();
+        t_sync.join().unwrap();
+
+        assert_eq!(
+            faults.hits(FaultPoint::WalFsyncBefore),
+            1,
+            "mixed batch should fsync exactly once"
+        );
+
+        // shutdown() triggers a metadata sync_all but that doesn't go
+        // through WalFsyncBefore.
+        Arc::try_unwrap(wal).ok().unwrap().shutdown().unwrap();
+    }
+
+    /// Phase 3: `Op::FsyncAll` at the head of the queue (no pending
+    /// submits) still drives one fsync of the current segment.
+    #[test]
+    fn fsync_pending_idle_writer_syncs_current_segment() {
+        let dir = TempDir::new().unwrap();
+        let faults = FaultController::new();
+        faults.install(FaultPoint::WalFsyncBefore, u64::MAX, FaultAction::Error);
+        let wal = Wal::create(dir.path(), &cfg_fast_batch(), 1, faults.clone()).unwrap();
+
+        // One async submit so there's something to fsync.
+        wal.submit_assigned_async_with_options(1, b"only".to_vec(), false)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(faults.hits(FaultPoint::WalFsyncBefore), 0);
+
+        // FsyncAll arrives with the writer idle — drives one fsync.
+        wal.fsync_pending().unwrap();
+        assert_eq!(faults.hits(FaultPoint::WalFsyncBefore), 1);
+
+        // A second FsyncAll with no new submits in between still fsyncs
+        // (Phase 3 doesn't track durable_lsn — it's an unconditional
+        // segment data-sync). Cheap on an empty segment.
+        wal.fsync_pending().unwrap();
+        assert_eq!(faults.hits(FaultPoint::WalFsyncBefore), 2);
+
+        wal.shutdown().unwrap();
     }
 }

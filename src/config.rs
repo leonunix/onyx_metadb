@@ -110,6 +110,42 @@ pub struct Config {
     /// a partial batch, in microseconds.
     pub group_commit_timeout_us: u64,
 
+    /// ZFS-TXG-clone Phase 3: when true, `commit_ops_deferred` submits to
+    /// the WAL with `synchronous=false`. The writer thread writes the
+    /// batch to OS page cache and acks the caller without calling fsync.
+    /// Durability is consolidated at the next `flush_with_gate`, which
+    /// fans an `Op::FsyncAll` to every WAL lane before promoting the
+    /// manifest's `checkpoint_lsn`.
+    ///
+    /// Safety relies on two invariants outside metadb:
+    /// 1. The onyx LV2 write buffer fsyncs every user write before ack,
+    ///    acting as the ZIL equivalent. Anything past the last metadb
+    ///    TXG sync is re-driven by the onyx commit_worker on restart.
+    /// 2. The metadb `apply_gate.write()` barrier in `flush_with_gate`
+    ///    sampled `last_applied_lsn` only after every in-flight commit
+    ///    completed `finish_global_apply`, which is itself gated on
+    ///    `wal.submit*().wait()` returning — so the writer thread has at
+    ///    minimum appended the body to OS page cache. `fsync_all_lanes`
+    ///    after the sample makes those bytes durable.
+    ///
+    /// **Requires `commit_deferred_outcomes_enabled = true`.** Async
+    /// WAL without deferred outcomes is an untested combination — the
+    /// commit_ops_deferred guard rejects the mismatch. Flip to `true`
+    /// after the 24h nvme-box soak + 10 SIGKILLs + 5 sysrq power-loss
+    /// matrix passes.
+    pub wal_async_commits_enabled: bool,
+
+    /// Deadline (microseconds) for group-commit batches whose submits
+    /// are all `synchronous=false`. Only consulted when the batch is
+    /// async-only; the moment a `synchronous=true` submit lands, the
+    /// deadline collapses back to `group_commit_timeout_us` so sync
+    /// hot-path latency is protected.
+    ///
+    /// Default 1000 (1 ms) — large enough to amortise the rare TXG
+    /// fsync over many async commits, small enough to keep the inflight
+    /// WAL-on-OS-page-cache window bounded.
+    pub wal_async_group_commit_window_us: u64,
+
     /// Maximum bytes held by the in-memory page cache.
     pub page_cache_bytes: u64,
 
@@ -388,6 +424,11 @@ impl Config {
             commit_deferred_outcomes_enabled: false,
             group_commit_max_batch_bytes: 4 * 1024 * 1024,
             group_commit_timeout_us: 1,
+            // ZFS-TXG-clone Phase 3 — default off until the
+            // `wal_async_proptest` soak gate on nvme-box passes.
+            // See `wal_async_commits_enabled` doc.
+            wal_async_commits_enabled: false,
+            wal_async_group_commit_window_us: 1000,
             page_cache_bytes: 512 * 1024 * 1024,
             lsm_memtable_bytes: 64 * 1024 * 1024,
             lsm_bloom_bits_per_entry: 10,
