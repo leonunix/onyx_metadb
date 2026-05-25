@@ -202,6 +202,25 @@ fn deferred_tiny_cache_config(path: &Path) -> Config {
     cfg
 }
 
+/// ZFS-TXG-clone Phase 3 axis: layer async-WAL on top of the
+/// deferred-outcome config. Same regression guard scope — none of
+/// the `apply_to_db` helpers route through `commit_ops_deferred`
+/// today, so flipping the WAL async flag should be a no-op on this
+/// property. Tests the integration plumbing (manifest commit + WAL
+/// fsync barrier across many synthetic reopens) under the async-WAL
+/// open-path config, which is itself non-trivial.
+fn async_wal_config(path: &Path) -> Config {
+    let mut cfg = deferred_config(path);
+    cfg.wal_async_commits_enabled = true;
+    cfg
+}
+
+fn async_wal_tiny_cache_config(path: &Path) -> Config {
+    let mut cfg = deferred_tiny_cache_config(path);
+    cfg.wal_async_commits_enabled = true;
+    cfg
+}
+
 fn run_ops_with_config(ops: &[Op], cfg: &Config) -> Result<(), TestCaseError> {
     let mut current_l2p: L2pRef = BTreeMap::new();
     let mut current_refcount: RefcountRef = BTreeMap::new();
@@ -341,6 +360,27 @@ proptest! {
     ) {
         let dir = TempDir::new().unwrap();
         run_ops_with_config(&ops, &deferred_tiny_cache_config(dir.path()))?;
+    }
+
+    /// ZFS-TXG-clone Phase 3 axis: same property under async-WAL
+    /// config. The reopen at end of each ops chunk exercises the
+    /// `fsync_all_lanes` barrier — without it, any commit between
+    /// the last flush and reopen would be lost on the OS-page-cache
+    /// boundary the reopen straddles.
+    #[test]
+    fn db_vs_reference_with_reopens_async_wal(
+        ops in proptest::collection::vec(arb_op(), 30..80)
+    ) {
+        let dir = TempDir::new().unwrap();
+        run_ops_with_config(&ops, &async_wal_config(dir.path()))?;
+    }
+
+    #[test]
+    fn db_vs_reference_with_reopens_tiny_cache_async_wal(
+        ops in proptest::collection::vec(arb_op(), 30..80)
+    ) {
+        let dir = TempDir::new().unwrap();
+        run_ops_with_config(&ops, &async_wal_tiny_cache_config(dir.path()))?;
     }
 }
 

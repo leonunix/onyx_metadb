@@ -28,8 +28,10 @@ use tempfile::TempDir;
 /// today; this is the regression guard for "enabling the flag does
 /// not perturb existing semantics", matching the
 /// /root/.claude/plans/soft-doodling-snail.md step-(c) brief.
-fn db_open_or_create(dir: &TempDir, deferred: bool) -> Db {
-    if deferred {
+fn db_open_or_create(dir: &TempDir, deferred: bool, async_wal: bool) -> Db {
+    if async_wal {
+        Db::create_with_config(async_wal_cfg(dir.path())).unwrap()
+    } else if deferred {
         Db::create_with_config(deferred_cfg(dir.path())).unwrap()
     } else {
         Db::create(path_of(dir)).unwrap()
@@ -39,6 +41,15 @@ fn db_open_or_create(dir: &TempDir, deferred: bool) -> Db {
 fn deferred_cfg(path: &Path) -> Config {
     let mut cfg = Config::new(path);
     cfg.commit_deferred_outcomes_enabled = true;
+    cfg
+}
+
+/// ZFS-TXG-clone Phase 3 axis: layer async-WAL on top of the
+/// deferred-outcome config. The async path is conjunctive (both
+/// flags required), so this implies `deferred_cfg`.
+fn async_wal_cfg(path: &Path) -> Config {
+    let mut cfg = deferred_cfg(path);
+    cfg.wal_async_commits_enabled = true;
     cfg
 }
 
@@ -126,8 +137,10 @@ impl Model {
     }
 }
 
-fn reopen(dir: &TempDir, deferred: bool) -> Db {
-    if deferred {
+fn reopen(dir: &TempDir, deferred: bool, async_wal: bool) -> Db {
+    if async_wal {
+        Db::open_with_config(async_wal_cfg(dir.path())).unwrap()
+    } else if deferred {
         Db::open_with_config(deferred_cfg(dir.path())).unwrap()
     } else {
         Db::open(dir.path()).unwrap()
@@ -138,9 +151,13 @@ fn path_of(dir: &TempDir) -> &Path {
     dir.path()
 }
 
-fn run_lifecycle_body(ops: Vec<Op>, deferred: bool) -> Result<(), TestCaseError> {
+fn run_lifecycle_body(
+    ops: Vec<Op>,
+    deferred: bool,
+    async_wal: bool,
+) -> Result<(), TestCaseError> {
     let dir = TempDir::new().unwrap();
-    let mut db = db_open_or_create(&dir, deferred);
+    let mut db = db_open_or_create(&dir, deferred, async_wal);
     let mut model = Model::new();
 
     for op in ops {
@@ -281,7 +298,7 @@ fn run_lifecycle_body(ops: Vec<Op>, deferred: bool) -> Result<(), TestCaseError>
                     // manifest — so WAL replay alone recovers the
                     // snapshot / volume lifecycle state.
                     drop(db);
-                    db = reopen(&dir, deferred);
+                    db = reopen(&dir, deferred, async_wal);
                 }
             }
     }
@@ -321,7 +338,7 @@ proptest! {
 
     #[test]
     fn volume_lifecycle_matches_reference(ops in proptest::collection::vec(arb_op(), 1..120)) {
-        run_lifecycle_body(ops, false)?;
+        run_lifecycle_body(ops, false, false)?;
     }
 
     /// #3b investigation — restore the original deferred-axis name
@@ -334,7 +351,21 @@ proptest! {
     fn volume_lifecycle_matches_reference_deferred(
         ops in proptest::collection::vec(arb_op(), 1..120)
     ) {
-        run_lifecycle_body(ops, true)?;
+        run_lifecycle_body(ops, true, false)?;
+    }
+
+    /// ZFS-TXG-clone Phase 3 axis: same ops, async-WAL on top of
+    /// deferred outcomes. The reopen branch around line 301 of this
+    /// file exercises the `fsync_all_lanes` TXG-sync barrier (via
+    /// the explicit `Op::Flush` and the drop-time `Wal::shutdown` →
+    /// `finalize` → `sync_all` path), so an async-submitted commit
+    /// that landed in OS page cache before a reopen must still be
+    /// recoverable. Same seed-name convention as the deferred axis.
+    #[test]
+    fn volume_lifecycle_matches_reference_async_wal(
+        ops in proptest::collection::vec(arb_op(), 1..120)
+    ) {
+        run_lifecycle_body(ops, true, true)?;
     }
 }
 
@@ -356,8 +387,23 @@ proptest! {
 /// commit_ops wrappers used by these methods.
 #[test]
 fn deferred_flag_preserves_high_level_lifecycle_semantics() {
+    high_level_lifecycle_semantics_under_cfg(deferred_cfg);
+}
+
+/// ZFS-TXG-clone Phase 3 sibling: same hand-rolled scenario, async
+/// WAL on top of deferred outcomes. `db.flush()` between the
+/// in-memory ops and the reopen exercises the new
+/// `fsync_all_lanes` TXG-sync barrier; without it the reopen would
+/// see an old checkpoint and the snapshot/clone state would not
+/// recover.
+#[test]
+fn async_wal_flag_preserves_high_level_lifecycle_semantics() {
+    high_level_lifecycle_semantics_under_cfg(async_wal_cfg);
+}
+
+fn high_level_lifecycle_semantics_under_cfg(mk_cfg: fn(&Path) -> Config) {
     let dir = TempDir::new().unwrap();
-    let db = Db::create_with_config(deferred_cfg(dir.path())).unwrap();
+    let db = Db::create_with_config(mk_cfg(dir.path())).unwrap();
 
     let value_a = v(1);
     let value_b = v(2);
@@ -378,7 +424,7 @@ fn deferred_flag_preserves_high_level_lifecycle_semantics() {
     db.flush().unwrap();
     drop(db);
 
-    let db = Db::open_with_config(deferred_cfg(dir.path())).unwrap();
+    let db = Db::open_with_config(mk_cfg(dir.path())).unwrap();
     assert_eq!(db.get(0, 7).unwrap(), Some(value_a));
     assert_eq!(db.get(cloned, 8).unwrap(), Some(value_b));
     assert!(db.drop_snapshot(snap).unwrap().is_some());
@@ -546,7 +592,7 @@ fn volume_lifecycle_matches_reference_long_run() {
                         // the deferred axis lives in the short
                         // proptest above.
                         drop(db);
-                        db = reopen(&dir, false);
+                        db = reopen(&dir, false, false);
                     }
                 }
             }
