@@ -380,6 +380,22 @@ impl Db {
     /// for global LSN order again after its lanes finish, right before it
     /// advances the contiguous `last_applied_lsn`.
     pub(crate) fn commit_ops(&self, ops: &[WalOp]) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+        self.commit_ops_with_options(ops, crate::wal::set::SubmitOptions::default())
+    }
+
+    /// ZFS-TXG-clone Phase 3 entry point. Same body as [`commit_ops`]
+    /// but threads `SubmitOptions` into the WAL submit. Used by
+    /// [`commit_ops_deferred`] to flip to `synchronous=false` when
+    /// both `commit_deferred_outcomes_enabled` and
+    /// `wal_async_commits_enabled` are on — the WAL writer thread
+    /// then acks after `seg.append` and skips the per-batch fsync.
+    /// Durability is restored at the next `flush_with_gate` via
+    /// `WalSet::fsync_all_lanes` before the manifest commit.
+    pub(crate) fn commit_ops_with_options(
+        &self,
+        ops: &[WalOp],
+        options: crate::wal::set::SubmitOptions,
+    ) -> Result<(Lsn, Vec<ApplyOutcome>)> {
         if ops.is_empty() {
             self.metrics.record_commit_empty();
             return Ok((self.last_applied_lsn(), Vec::new()));
@@ -470,7 +486,7 @@ impl Db {
         self.metrics.record_commit_encode(timing.encode);
         self.metrics.record_commit_wal_body_bytes(body.len());
         let wal_started = std::time::Instant::now();
-        let lsn = match self.submit_wal_ops(ops, body, Some(dispatch_footprint)) {
+        let lsn = match self.submit_wal_ops(ops, body, Some(dispatch_footprint), options) {
             Ok(lsn) => {
                 timing.wal_submit = wal_started.elapsed();
                 self.metrics.record_commit_wal_submit(timing.wal_submit);
@@ -548,12 +564,28 @@ impl Db {
             return Ok((lsn, DeferredOutcomeHandle::ready(lsn, Ok(Vec::new()))));
         }
 
-        // Run the synchronous commit path. This executes WAL submit +
-        // fsync + dispatch + apply (including L2pBuffer insert) and
-        // returns a fully-populated `Vec<ApplyOutcome>`. The L2pBuffer
-        // is updated before this returns, so readers can already
-        // observe the new mappings.
-        let (lsn, outcomes) = self.commit_ops(ops)?;
+        // ZFS-TXG-clone Phase 3: route through the WAL with
+        // `synchronous=false` IFF both Phase 2 and Phase 3 flags are
+        // enabled. Async WAL on the inline outcome path is an untested
+        // combination — `commit_deferred_outcomes_enabled = false`
+        // forces sync so the deferred-outcome handle code below is
+        // exercised in the legacy latency profile during the soak
+        // window. The on-disk state observed by readers is identical
+        // across the four combinations; only WAL fsync timing shifts.
+        let submit_options = if self.commit_deferred_outcomes_enabled
+            && self.wal_async_commits_enabled
+        {
+            crate::wal::set::SubmitOptions::async_()
+        } else {
+            crate::wal::set::SubmitOptions::default()
+        };
+        // Run the commit path. This executes WAL submit (sync or
+        // async per `submit_options`) + dispatch + apply (including
+        // L2pBuffer insert) and returns a fully-populated
+        // `Vec<ApplyOutcome>`. The L2pBuffer is updated before this
+        // returns, so readers can already observe the new mappings;
+        // the only thing the async branch defers is WAL fsync.
+        let (lsn, outcomes) = self.commit_ops_with_options(ops, submit_options)?;
 
         // Choose delivery mode based on the live config flag.
         let handle = if self.commit_deferred_outcomes_enabled {
@@ -1085,13 +1117,21 @@ impl Db {
         ops: &[WalOp],
         body: Vec<u8>,
         footprint: Option<DispatchFootprint>,
+        options: crate::wal::set::SubmitOptions,
     ) -> Result<Lsn> {
         let lane = self.wal_lane_for_ops(ops);
         match footprint {
-            Some(footprint) => self.wal.submit_to_reserved(lane, body, |lsn| {
-                self.register_dispatch_intent(lsn, footprint);
-            }),
-            None => self.wal.submit_to(lane, body),
+            Some(footprint) => self.wal.submit_to_reserved_with_options(
+                lane,
+                body,
+                options,
+                |lsn| {
+                    self.register_dispatch_intent(lsn, footprint);
+                },
+            ),
+            None => self
+                .wal
+                .submit_to_reserved_with_options(lane, body, options, |_| {}),
         }
     }
 

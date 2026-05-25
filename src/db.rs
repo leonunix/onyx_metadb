@@ -301,6 +301,17 @@ pub struct Db {
     /// (`deferred=true`) or send it through the channel immediately
     /// (`deferred=false`, restoring the pre-Phase-2 latency profile).
     commit_deferred_outcomes_enabled: bool,
+    /// ZFS-TXG-clone Phase 3: cached copy of
+    /// `Config::wal_async_commits_enabled`. Only consulted by
+    /// `commit_ops_deferred` and only when
+    /// `commit_deferred_outcomes_enabled` is also true — async WAL on
+    /// the synchronous outcome path is an untested combination. When
+    /// both flags are on, the deferred-outcome commit path threads
+    /// `SubmitOptions { synchronous: false }` into the WAL so the
+    /// writer thread acks after `seg.append` and skips the per-batch
+    /// fsync. Durability is restored at the next `flush_with_gate`
+    /// via `WalSet::fsync_all_lanes` before the manifest commit.
+    wal_async_commits_enabled: bool,
 }
 
 /// Synchronous callback invoked with the freed-PBA set produced by a

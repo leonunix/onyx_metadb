@@ -475,7 +475,12 @@ impl Db {
             pba_decrefs: pba_decrefs.clone(),
         };
         let body = try_encode_body(std::slice::from_ref(&op))?;
-        let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body, None)?;
+        let lsn = self.submit_wal_ops(
+            std::slice::from_ref(&op),
+            body,
+            None,
+            crate::wal::set::SubmitOptions::default(),
+        )?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Block until every prior LSN has applied. Under our locks,

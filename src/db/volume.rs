@@ -72,7 +72,12 @@ impl Db {
 
         let op = WalOp::CreateVolume { ord, shard_count };
         let body = try_encode_body(std::slice::from_ref(&op))?;
-        let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body, None)?;
+        let lsn = self.submit_wal_ops(
+            std::slice::from_ref(&op),
+            body,
+            None,
+            crate::wal::set::SubmitOptions::default(),
+        )?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Under our two write gates no other commit is between submit
@@ -310,7 +315,12 @@ impl Db {
             pages: pages.clone(),
         };
         let body = try_encode_body(std::slice::from_ref(&op))?;
-        let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body, None)?;
+        let lsn = self.submit_wal_ops(
+            std::slice::from_ref(&op),
+            body,
+            None,
+            crate::wal::set::SubmitOptions::default(),
+        )?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
         // Fault window specific to drop_volume: WAL record durable, no
         // page decref has touched disk yet. Recovery re-drives the full
@@ -455,7 +465,12 @@ impl Db {
             src_shard_roots: src_shard_roots.clone(),
         };
         let body = try_encode_body(std::slice::from_ref(&op))?;
-        let lsn = self.submit_wal_ops(std::slice::from_ref(&op), body, None)?;
+        let lsn = self.submit_wal_ops(
+            std::slice::from_ref(&op),
+            body,
+            None,
+            crate::wal::set::SubmitOptions::default(),
+        )?;
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Under our two write gates no other commit sits between submit

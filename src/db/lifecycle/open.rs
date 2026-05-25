@@ -187,6 +187,7 @@ impl Db {
             freed_pbas_sink: Mutex::new(None),
             deferred_outcomes,
             commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
+            wal_async_commits_enabled: cfg.wal_async_commits_enabled,
         };
         // Spawn refcount drainers (priority 3) — fresh DB has no
         // replay to worry about, so we can spawn unconditionally
@@ -775,6 +776,7 @@ impl Db {
             freed_pbas_sink: Mutex::new(None),
             deferred_outcomes,
             commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
+            wal_async_commits_enabled: cfg.wal_async_commits_enabled,
         };
         db.recompute_all_snap_infos();
         // Spawn refcount drainers AFTER WAL replay finished above so
