@@ -60,6 +60,17 @@ pub struct MetaMetricsSnapshot {
     pub wal_fsync_max_us: u64,
     pub wal_batch_records_max: u64,
     pub wal_batch_bytes_max: u64,
+    /// ZFS-TXG-clone Phase 3: cumulative count of submits acked
+    /// without an inline fsync. See `MetaMetrics::wal_async_acks_total`.
+    pub wal_async_acks_total: u64,
+    /// ZFS-TXG-clone Phase 3: cumulative bytes written via async-only
+    /// batches. See `MetaMetrics::wal_async_pending_bytes_total`.
+    pub wal_async_pending_bytes_total: u64,
+    /// ZFS-TXG-clone Phase 3: cumulative time spent in
+    /// `fsync_all_lanes` (max + sum). See
+    /// `MetaMetrics::wal_fsync_at_txg_sync_us`.
+    pub wal_fsync_at_txg_sync_us: u64,
+    pub wal_fsync_at_txg_sync_max_us: u64,
     pub range_delete_calls: u64,
     pub range_delete_success: u64,
     pub range_delete_errors: u64,

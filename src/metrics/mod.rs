@@ -155,6 +155,26 @@ pub struct MetaMetrics {
     wal_batch_records_max: AtomicU64,
     wal_batch_bytes_max: AtomicU64,
 
+    /// ZFS-TXG-clone Phase 3: cumulative count of submits acked
+    /// without a per-batch fsync (the writer thread skipped
+    /// `seg.sync` because every submit in the batch had
+    /// `synchronous=false`). Stays zero when
+    /// `Config::wal_async_commits_enabled = false`.
+    wal_async_acks_total: AtomicU64,
+    /// ZFS-TXG-clone Phase 3: cumulative bytes written to WAL
+    /// segments via async-only batches (the bytes that landed in OS
+    /// page cache but had no inline fsync). Diff against the
+    /// post-FsyncAll snapshot to estimate the inflight window. Stays
+    /// zero when async WAL is off.
+    wal_async_pending_bytes_total: AtomicU64,
+    /// ZFS-TXG-clone Phase 3: cumulative time spent inside
+    /// `WalSet::fsync_all_lanes` (the TXG-sync barrier in
+    /// `flush_with_gate`). With sync-only submits this is the cost
+    /// of a no-op double-fsync; with async submits it is the only
+    /// fsync the batch ever takes.
+    wal_fsync_at_txg_sync_us: AtomicU64,
+    wal_fsync_at_txg_sync_max_us: AtomicU64,
+
     range_delete_calls: AtomicU64,
     range_delete_success: AtomicU64,
     range_delete_errors: AtomicU64,

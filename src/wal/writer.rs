@@ -631,6 +631,13 @@ fn commit_batch(
         seg.sync()?;
         state.metrics.record_wal_fsync(fsync_started.elapsed());
         state.faults.inject(FaultPoint::WalFsyncAfter)?;
+    } else {
+        // ZFS-TXG-clone Phase 3: pure-async batch — bytes landed in
+        // OS page cache, no fsync. Account for the inflight window
+        // so the reader can correlate against the next FsyncAll.
+        state
+            .metrics
+            .record_wal_async_batch(assigned.len(), buf.len());
     }
     state.metrics.record_wal_batch(assigned.len(), buf.len());
     Ok(assigned)

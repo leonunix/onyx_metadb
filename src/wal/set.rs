@@ -52,6 +52,7 @@ impl SubmitOptions {
 pub struct WalSet {
     lanes: Vec<Wal>,
     state: Mutex<WalSetState>,
+    metrics: Arc<MetaMetrics>,
 }
 
 struct WalSetState {
@@ -72,7 +73,11 @@ impl WalSet {
         let mut lanes = Vec::with_capacity(lane_count);
         if lane_count == 1 {
             lanes.push(Wal::create_with_metrics(
-                dir, config, start_lsn, faults, metrics,
+                dir,
+                config,
+                start_lsn,
+                faults,
+                metrics.clone(),
             )?);
         } else {
             for lane in 0..lane_count {
@@ -91,6 +96,7 @@ impl WalSet {
                 next_lsn: start_lsn,
                 failed: None,
             }),
+            metrics,
         })
     }
 
@@ -210,6 +216,7 @@ impl WalSet {
     /// could record an LSN whose async-submitted WAL body sits in OS
     /// page cache and would be lost on power failure.
     pub(crate) fn fsync_all_lanes(&self) -> Result<()> {
+        let started = std::time::Instant::now();
         let mut first_err: Option<MetaDbError> = None;
         for lane in &self.lanes {
             if let Err(err) = lane.fsync_pending() {
@@ -218,6 +225,8 @@ impl WalSet {
                 }
             }
         }
+        self.metrics
+            .record_wal_fsync_at_txg_sync(started.elapsed());
         match first_err {
             Some(err) => {
                 self.state.lock().failed = Some(err.to_string());
