@@ -56,6 +56,68 @@ use crate::types::VolumeOrdinal;
 use super::Volume;
 use super::apply::publish_l2p_read_view;
 
+/// Wake handle shared by the L2P compactor worker and any producer that
+/// wants the worker to run a pass sooner than `max_interval_ms`. Held
+/// as `Arc<CompactorNotifier>` so the
+/// [`crate::db::commit::DeferredOutcomeAggregator`] can fire a wake on
+/// every `stage()` call — without it the aggregator's drain happens
+/// only on the compactor's 30 s timer tick, which is the regression
+/// behind the Phase 2 drain stall (onyx commit_worker `pending_q` hits
+/// depth_cap, blocks on `handle.recv()` for the full timer interval,
+/// LV3 throughput collapses to 0 MB/s).
+///
+/// Single-flag / single-cvar model: notifications collapse (multiple
+/// stages between two passes wake the worker once), `wait()` returns
+/// either when a wake arrives or after `max_interval` elapses, and
+/// always clears the flag on return so the next iteration parks again.
+pub(crate) struct CompactorNotifier {
+    wakeup: Mutex<bool>,
+    wakeup_cvar: Condvar,
+}
+
+impl CompactorNotifier {
+    pub(crate) fn new() -> Self {
+        Self {
+            wakeup: Mutex::new(false),
+            wakeup_cvar: Condvar::new(),
+        }
+    }
+
+    /// Wake the worker (or no-op when it is already running a pass).
+    /// Producer-side. The first wake between two passes wins; further
+    /// wakes coalesce into the same flag, so high-frequency stages
+    /// from `DeferredOutcomeAggregator::stage` impose only one
+    /// `Mutex` acquire + `notify_one` per call.
+    pub(crate) fn notify(&self) {
+        let mut wakeup = self.wakeup.lock();
+        *wakeup = true;
+        self.wakeup_cvar.notify_one();
+    }
+
+    /// Consumer-side park. Returns when a wake arrives or
+    /// `max_interval` elapses, then resets the flag so the next
+    /// `wait()` parks again. `pub(crate)` so the wake-up regression
+    /// tests in `crate::db::commit::outcomes::tests` can drive the
+    /// producer-consumer dance directly without spawning a real
+    /// `L2pCompactor`.
+    pub(crate) fn wait(&self, max_interval: Duration) {
+        let mut wakeup = self.wakeup.lock();
+        if !*wakeup {
+            self.wakeup_cvar.wait_for(&mut wakeup, max_interval);
+        }
+        *wakeup = false;
+    }
+
+    /// Wake any waiter without waiting for `notify()` semantics. Used
+    /// by `L2pCompactor::stop` to unblock the worker from its park so
+    /// it observes the shutdown flag.
+    fn wake_all(&self) {
+        let mut wakeup = self.wakeup.lock();
+        *wakeup = true;
+        self.wakeup_cvar.notify_all();
+    }
+}
+
 /// Apply every `draining` entry into `tree`. Groups by leaf so that
 /// inserts touching the same leaf share one CoW (matches the laned
 /// bucket's `insert_leaf_run_at_lsn_deferred_finish` optimisation).
@@ -123,8 +185,11 @@ struct L2pCompactorInner {
     metrics: Arc<MetaMetrics>,
     params: L2pCompactorParams,
     shutdown: AtomicBool,
-    wakeup: Mutex<bool>,
-    wakeup_cvar: Condvar,
+    /// Shared wake handle. Also held by the deferred-outcome
+    /// aggregator so `stage()` can wake the worker at commit
+    /// frequency (the per-pass drain is what releases each staged
+    /// `DeferredOutcomeHandle`'s `recv()`).
+    notifier: Arc<CompactorNotifier>,
     /// ZFS-TXG-clone Phase 2: drained after every pass to release
     /// every staged deferred outcome. The drain is a no-op when
     /// nothing is staged. Each staged outcome was already populated
@@ -139,6 +204,7 @@ impl L2pCompactor {
         volumes: Arc<RwLock<HashMap<VolumeOrdinal, Arc<Volume>>>>,
         metrics: Arc<MetaMetrics>,
         params: L2pCompactorParams,
+        notifier: Arc<CompactorNotifier>,
         deferred_outcomes: Arc<super::commit::DeferredOutcomeAggregator>,
     ) -> Self {
         let inner = Arc::new(L2pCompactorInner {
@@ -146,8 +212,7 @@ impl L2pCompactor {
             metrics,
             params,
             shutdown: AtomicBool::new(false),
-            wakeup: Mutex::new(false),
-            wakeup_cvar: Condvar::new(),
+            notifier,
             deferred_outcomes,
         });
         let inner_thread = inner.clone();
@@ -162,17 +227,12 @@ impl L2pCompactor {
     }
 
     pub(super) fn notify(&self) {
-        let mut wakeup = self.inner.wakeup.lock();
-        *wakeup = true;
-        self.inner.wakeup_cvar.notify_one();
+        self.inner.notifier.notify();
     }
 
     pub(super) fn stop(&mut self) {
         self.inner.shutdown.store(true, Ordering::Release);
-        let mut wakeup = self.inner.wakeup.lock();
-        *wakeup = true;
-        self.inner.wakeup_cvar.notify_all();
-        drop(wakeup);
+        self.inner.notifier.wake_all();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -203,11 +263,7 @@ fn run_worker(inner: Arc<L2pCompactorInner>) {
         if inner.shutdown.load(Ordering::Acquire) {
             break;
         }
-        let mut wakeup = inner.wakeup.lock();
-        if !*wakeup {
-            inner.wakeup_cvar.wait_for(&mut wakeup, max_interval);
-        }
-        *wakeup = false;
+        inner.notifier.wait(max_interval);
     }
 }
 

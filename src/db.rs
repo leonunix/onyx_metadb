@@ -296,6 +296,14 @@ pub struct Db {
     /// [`crate::db::commit::outcomes`] and
     /// `/root/.claude/plans/soft-doodling-snail.md`.
     deferred_outcomes: Arc<crate::db::commit::DeferredOutcomeAggregator>,
+    /// L2P compactor wake handle, shared with `deferred_outcomes` so
+    /// `stage()` can run at commit frequency rather than waiting for
+    /// the worker's `max_interval_ms` timer. `None` only when the
+    /// L2P buffer is disabled (the compactor itself is then
+    /// inactive). Held on `Db` (not just inside the compactor) so the
+    /// aggregator can hold its own `Arc` clone without taking the
+    /// `l2p_compactor` mutex on every `stage()`.
+    l2p_compactor_notifier: Option<Arc<l2p_compactor::CompactorNotifier>>,
     /// Cached copy of `Config::commit_deferred_outcomes_enabled` so the
     /// commit path can decide whether to park the outcome vec
     /// (`deferred=true`) or send it through the channel immediately

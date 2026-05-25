@@ -59,6 +59,7 @@ use std::sync::Arc;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use parking_lot::Mutex;
 
+use crate::db::l2p_compactor::CompactorNotifier;
 use crate::error::{MetaDbError, Result};
 use crate::metrics::MetaMetrics;
 use crate::testing::faults::{FaultController, FaultPoint};
@@ -148,14 +149,31 @@ pub(crate) struct DeferredOutcomeAggregator {
     pending: Mutex<BTreeMap<Lsn, StagedOutcome>>,
     metrics: Arc<MetaMetrics>,
     faults: Arc<FaultController>,
+    /// Wake the L2P compactor on every `stage()` so its
+    /// per-pass drain runs at commit frequency. Without this the
+    /// compactor relies on its `max_interval_ms` timer (default 30 s);
+    /// the onyx commit_worker pipeline fills `pending_q` to depth_cap
+    /// within a few commits and then every subsequent issue blocks on
+    /// `handle.recv()` for the full timer interval. LV3 throughput
+    /// collapses to 0 MB/s — this is the regression documented in
+    /// memory `phase3_async_wal_inflight_handoff`. `None` only during
+    /// the brief window where the aggregator exists but the compactor
+    /// has not been started yet (l2p_buffer disabled); in that mode
+    /// the deferred-outcome path is never exercised.
+    compactor_notifier: Option<Arc<CompactorNotifier>>,
 }
 
 impl DeferredOutcomeAggregator {
-    pub(crate) fn new(metrics: Arc<MetaMetrics>, faults: Arc<FaultController>) -> Self {
+    pub(crate) fn new(
+        metrics: Arc<MetaMetrics>,
+        faults: Arc<FaultController>,
+        compactor_notifier: Option<Arc<CompactorNotifier>>,
+    ) -> Self {
         Self {
             pending: Mutex::new(BTreeMap::new()),
             metrics,
             faults,
+            compactor_notifier,
         }
     }
 
@@ -183,6 +201,13 @@ impl DeferredOutcomeAggregator {
         };
         self.metrics.record_deferred_outcomes_staged();
         self.metrics.record_deferred_outcomes_pending(depth);
+        // Wake the compactor so its next pass runs at commit
+        // frequency rather than after `max_interval_ms`. Cheap: one
+        // Mutex acquire + `notify_one`; the worker collapses bursts
+        // by clearing the flag on each pass.
+        if let Some(notifier) = self.compactor_notifier.as_ref() {
+            notifier.notify();
+        }
         DeferredOutcomeHandle { rx, lsn }
     }
 
@@ -217,9 +242,15 @@ impl DeferredOutcomeAggregator {
         // on-disk is unaffected because `commit_ops_deferred`
         // populated `outcomes` and stamped `last_applied_lsn` before
         // staging. Action::Error is treated as Panic here because
-        // `drain_up_to_lsn` returns `usize`.
-        if let Err(err) = self.faults.inject(FaultPoint::DeferredOutcomeDrainMidway) {
-            panic!("metadb: {} (mid-drain fault)", err);
+        // `drain_up_to_lsn` returns `usize`. Gated on a non-empty
+        // drain: the compactor now wakes on every `stage()` (see
+        // `CompactorNotifier`) so empty-drain passes are common, and
+        // injecting on those would burn the trigger before any real
+        // staged outcome is in flight.
+        if released_count > 0 {
+            if let Err(err) = self.faults.inject(FaultPoint::DeferredOutcomeDrainMidway) {
+                panic!("metadb: {} (mid-drain fault)", err);
+            }
         }
         for staged in released_senders {
             // Receiver may have been dropped; ignore the send error.
@@ -266,7 +297,15 @@ mod tests {
     }
 
     fn fresh_agg() -> DeferredOutcomeAggregator {
-        DeferredOutcomeAggregator::new(metrics(), FaultController::disabled())
+        DeferredOutcomeAggregator::new(metrics(), FaultController::disabled(), None)
+    }
+
+    fn agg_with_notifier(notifier: Arc<CompactorNotifier>) -> DeferredOutcomeAggregator {
+        DeferredOutcomeAggregator::new(
+            metrics(),
+            FaultController::disabled(),
+            Some(notifier),
+        )
     }
 
     #[test]
@@ -335,5 +374,81 @@ mod tests {
         assert_eq!(released, 1);
         let outcomes = handle.recv().expect("outcomes delivered");
         assert_eq!(outcomes.len(), 1);
+    }
+
+    /// Regression for the Phase 2 drain stall: `stage()` must wake the
+    /// compactor immediately, not on the next `max_interval_ms` timer.
+    /// Without this wake, the onyx commit_worker pipeline blocks on
+    /// `handle.recv()` for 30 s after each chunk hits the depth cap.
+    /// We assert the wake here by having a consumer thread park on the
+    /// notifier with a long timeout, then verifying it returns
+    /// promptly after `stage()`.
+    #[test]
+    fn stage_wakes_compactor_notifier() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let notifier = Arc::new(CompactorNotifier::new());
+        let agg = agg_with_notifier(notifier.clone());
+
+        // Park on the notifier with a 5 s timeout (much longer than
+        // the wall time we expect — a successful wake completes in
+        // microseconds).
+        let parked_done = Arc::new(AtomicBool::new(false));
+        let parked_done_thread = parked_done.clone();
+        let notifier_thread = notifier.clone();
+        let waiter = thread::spawn(move || {
+            let started = Instant::now();
+            notifier_thread.wait(Duration::from_secs(5));
+            parked_done_thread.store(true, Ordering::Release);
+            started.elapsed()
+        });
+
+        // Brief yield so the waiter parks on the cvar before we stage.
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !parked_done.load(Ordering::Acquire),
+            "waiter resolved before stage — wake test is racy"
+        );
+
+        let handle = agg.stage(99, vec![ApplyOutcome::L2pPrev(None)]);
+        let elapsed = waiter.join().expect("waiter joined");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "stage() must wake the compactor notifier, but wait took {:?}",
+            elapsed
+        );
+        // Drop the handle so the receiver side closes cleanly.
+        drop(handle);
+    }
+
+    /// Multiple `stage()` calls between two passes must coalesce into
+    /// a single wake — the worker observes one flag set regardless of
+    /// burst size.
+    #[test]
+    fn stage_bursts_coalesce_into_single_wake() {
+        let notifier = Arc::new(CompactorNotifier::new());
+        let agg = agg_with_notifier(notifier.clone());
+        let _h1 = agg.stage(1, vec![ApplyOutcome::L2pPrev(None)]);
+        let _h2 = agg.stage(2, vec![ApplyOutcome::L2pPrev(None)]);
+        let _h3 = agg.stage(3, vec![ApplyOutcome::L2pPrev(None)]);
+        // First wait observes the burst and returns immediately.
+        let started = std::time::Instant::now();
+        notifier.wait(std::time::Duration::from_secs(1));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "wait after burst must return immediately"
+        );
+        // Subsequent wait parks for the full timeout because the flag
+        // was cleared.
+        let started = std::time::Instant::now();
+        notifier.wait(std::time::Duration::from_millis(50));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(40),
+            "second wait should park for ~50 ms, got {:?}",
+            started.elapsed()
+        );
     }
 }

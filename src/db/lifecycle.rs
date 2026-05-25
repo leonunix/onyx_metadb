@@ -394,10 +394,15 @@ impl Db {
     /// Start the B2 L2P buffer compactor. Caller (`Db::create` /
     /// `Db::open`) checks `cfg.l2p_buffer_enabled`.
     fn start_l2p_compactor(&self) {
+        let notifier = self
+            .l2p_compactor_notifier
+            .clone()
+            .expect("metadb: compactor notifier must exist when l2p_buffer is enabled");
         let worker = super::l2p_compactor::L2pCompactor::start(
             self.volumes.clone(),
             self.metrics.clone(),
             self.l2p_compactor_params,
+            notifier,
             self.deferred_outcomes.clone(),
         );
         *self.l2p_compactor.lock() = Some(worker);

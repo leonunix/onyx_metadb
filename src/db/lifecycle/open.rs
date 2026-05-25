@@ -137,8 +137,17 @@ impl Db {
             ApplyLaneKind::DedupMaintenance,
             metrics.clone(),
         );
+        let l2p_compactor_notifier = if cfg.l2p_buffer_enabled {
+            Some(Arc::new(crate::db::l2p_compactor::CompactorNotifier::new()))
+        } else {
+            None
+        };
         let deferred_outcomes = Arc::new(
-            crate::db::commit::DeferredOutcomeAggregator::new(metrics.clone(), faults.clone()),
+            crate::db::commit::DeferredOutcomeAggregator::new(
+                metrics.clone(),
+                faults.clone(),
+                l2p_compactor_notifier.clone(),
+            ),
         );
         let db = Self {
             page_store,
@@ -186,6 +195,7 @@ impl Db {
             lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
             freed_pbas_sink: Mutex::new(None),
             deferred_outcomes,
+            l2p_compactor_notifier,
             commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
             wal_async_commits_enabled: cfg.wal_async_commits_enabled,
         };
@@ -726,8 +736,17 @@ impl Db {
             metrics.clone(),
         );
 
+        let l2p_compactor_notifier = if cfg.l2p_buffer_enabled {
+            Some(Arc::new(crate::db::l2p_compactor::CompactorNotifier::new()))
+        } else {
+            None
+        };
         let deferred_outcomes = Arc::new(
-            crate::db::commit::DeferredOutcomeAggregator::new(metrics.clone(), faults.clone()),
+            crate::db::commit::DeferredOutcomeAggregator::new(
+                metrics.clone(),
+                faults.clone(),
+                l2p_compactor_notifier.clone(),
+            ),
         );
         let db = Self {
             page_store,
@@ -775,6 +794,7 @@ impl Db {
             lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
             freed_pbas_sink: Mutex::new(None),
             deferred_outcomes,
+            l2p_compactor_notifier,
             commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
             wal_async_commits_enabled: cfg.wal_async_commits_enabled,
         };

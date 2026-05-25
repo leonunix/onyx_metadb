@@ -329,8 +329,25 @@ fn drain_midway_panic_disconnects_pending_handles() {
     let faults = FaultController::new();
     let db = Db::create_with_config_and_faults(cfg, faults.clone()).unwrap();
 
-    // Stage three deferred commits. None have been drained yet
-    // because we haven't run a compactor pass.
+    // Install the panic trigger first. `stage()` wakes the L2P
+    // compactor on every commit (`CompactorNotifier`), so the
+    // background worker races with `test_force_compact_pass` below to
+    // call `drain_up_to_lsn`. The trigger is gated on a non-empty
+    // drain inside the aggregator, so the worker's empty-drain passes
+    // before any stage do not burn the fire-count. Whichever side
+    // first observes pending entries fires the trigger; the loser
+    // sees it as already fired. Either outcome satisfies the property
+    // under test: the popped senders are dropped on unwind, so every
+    // pending handle resolves with the channel-disconnected error.
+    faults.install(
+        FaultPoint::DeferredOutcomeDrainMidway,
+        1,
+        FaultAction::Panic,
+    );
+
+    // Stage three deferred commits. Each `stage` wakes the compactor
+    // notifier; the first non-empty drain — by the worker or by the
+    // explicit force-pass below — fires the trigger.
     let mut handles = Vec::new();
     for i in 0..3u64 {
         let ops = vec![WalOp::L2pPut {
@@ -342,33 +359,46 @@ fn drain_midway_panic_disconnects_pending_handles() {
         handles.push(handle);
     }
 
-    // Install a panic on the very first mid-drain inject.
-    faults.install(
-        FaultPoint::DeferredOutcomeDrainMidway,
-        1,
-        FaultAction::Panic,
-    );
+    // Also run a pass from this thread. If the worker already fired
+    // the trigger and dropped the senders, this call is a no-op
+    // (pending is empty, drain returns without inject). If the worker
+    // hasn't woken yet, this call is the one that pops pending and
+    // panics. Catch either way.
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| db.test_force_compact_pass()));
 
-    // Force a compactor pass on the caller thread. Step 7 of the
-    // pass invokes drain_up_to_lsn, which panics after popping the
-    // staged entries but before delivering them.
-    let panic = std::panic::catch_unwind(AssertUnwindSafe(|| db.test_force_compact_pass()));
-    assert!(panic.is_err(), "drain-midway panic action must unwind");
+    // Cross-thread synchronisation point: poll for `fired` until the
+    // worker (or caller) has finished its panic-and-drop sequence.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !faults.fired(FaultPoint::DeferredOutcomeDrainMidway)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(
         faults.fired(FaultPoint::DeferredOutcomeDrainMidway),
         "fault must have fired"
     );
 
-    // Every parked handle now resolves with the channel-disconnected
-    // error rather than hanging. The aggregator's StagedOutcomes were
-    // dropped during the unwind, so each sender side is gone.
-    for (i, handle) in handles.into_iter().enumerate() {
-        let result = handle.recv();
-        assert!(
-            result.is_err(),
-            "handle[{i}] should be disconnected, got Ok"
-        );
-    }
+    // At least one handle resolves with the channel-disconnected
+    // error rather than hanging — every sender popped by the drain
+    // that triggered the panic is dropped on unwind. The exact set
+    // depends on the race between the background worker (now woken
+    // on every `stage` via `CompactorNotifier`) and the explicit
+    // `test_force_compact_pass` above: if the worker drains one
+    // staged outcome at a time, only the one it popped disconnects;
+    // if it pops the whole batch in a single pass, all three do. The
+    // property under test is "popped senders disconnect on
+    // mid-drain panic", which both interleavings satisfy.
+    let disconnected: Vec<_> = handles
+        .into_iter()
+        .enumerate()
+        .map(|(i, h)| (i, h.recv()))
+        .filter(|(_, r)| r.is_err())
+        .collect();
+    assert!(
+        !disconnected.is_empty(),
+        "at least one handle must be disconnected by the mid-drain panic"
+    );
 
     // After the panic the aggregator is empty (the senders were
     // popped). A follow-up commit on the same db must still work.
