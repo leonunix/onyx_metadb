@@ -130,6 +130,29 @@ pub enum FaultPoint {
     /// treated as a Panic since `drain_up_to_lsn` returns `usize`
     /// (no Result to propagate).
     DeferredOutcomeDrainMidway,
+    /// ZFS-TXG-clone Phase 3 fault: inside `flush_with_gate`, AFTER
+    /// `WalSet::fsync_all_lanes` returned Ok (every async WAL byte
+    /// is on durable storage) BUT BEFORE
+    /// `manifest_state.store.commit()` has fsynced the new
+    /// `checkpoint_lsn`. `FaultAction::Panic` simulates a crash in
+    /// this window: WAL records up to `wal_checkpoint` are durable,
+    /// the manifest still points at the OLD checkpoint, recovery
+    /// replays from the old checkpoint and re-applies the records
+    /// idempotently (apply guards on `page.generation >= lsn`,
+    /// refcount delta merge, cuckoo put-if-absent). End state must
+    /// be byte-equivalent to a clean flush.
+    TxgSyncMidway,
+    /// ZFS-TXG-clone Phase 3 fault: inside the WAL writer thread,
+    /// fires in lieu of `seg.append(&buf)` for an async-only batch.
+    /// Simulates the strongest possible loss case: the kernel never
+    /// flushes the OS page cache write for an async-submitted
+    /// record. Tests the LV2-buffer-driven recovery path on the
+    /// onyx side — the metadb-side contract is "anything past the
+    /// last successful fsync is lost; downstream durable log must
+    /// re-drive". `FaultAction::Error` returns a fault error from
+    /// `seg.append`, propagating through `commit_batch` to every
+    /// in-batch ack.
+    WalSubmitAsyncDropped,
 }
 
 impl FaultPoint {
@@ -156,6 +179,8 @@ impl FaultPoint {
             Self::LineageGcPostHeadAdvanceBeforeFree => "lineage_gc.post_head_advance.before_free",
             Self::LineageGcMidSegmentRead => "lineage_gc.mid_segment_read",
             Self::DeferredOutcomeDrainMidway => "deferred_outcomes.drain.midway",
+            Self::TxgSyncMidway => "flush.txg_sync.midway",
+            Self::WalSubmitAsyncDropped => "wal.submit_async.dropped",
         }
     }
 }

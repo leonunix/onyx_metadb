@@ -729,6 +729,50 @@ impl Db {
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
+        // ZFS-TXG-clone Phase 3 TXG-sync barrier. When async WAL
+        // submits are enabled, prior `commit_ops_deferred` calls have
+        // body bytes sitting in OS page cache but no fsync yet. The
+        // manifest about to be committed records
+        // `checkpoint_lsn = new_checkpoint_lsn`; recovery on the next
+        // open will assume every LSN ≤ checkpoint_lsn is durable.
+        // We must therefore force-fsync every lane BEFORE the manifest
+        // commit fsyncs the new checkpoint_lsn — otherwise a power
+        // failure between this fsync and the manifest commit would
+        // leave the manifest pointing at LSNs whose WAL bodies were
+        // lost.
+        //
+        // The fsync timing is provably safe via the
+        // `apply_gate.write()` barrier this function holds: every
+        // LSN ≤ `wal_checkpoint` (sampled at flush.rs ~line 284) has
+        // completed `finish_global_apply`, which is gated on
+        // `wal.submit*().wait()` returning, which means the writer
+        // thread has at minimum executed `seg.append(&buf)` (body in
+        // OS page cache). `fsync_all_lanes` after the sample makes
+        // those bytes durable. With sync-only submits this is a
+        // no-op double-fsync (writer already fsynced per-batch); with
+        // async submits it is the only fsync.
+        if let Err(err) = self.wal.fsync_all_lanes() {
+            self.metrics
+                .record_flush_manifest(manifest_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
+            drop(manifest_state);
+            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+            return Err(err);
+        }
+        if let Err(err) = self.faults.inject(FaultPoint::TxgSyncMidway) {
+            self.metrics
+                .record_flush_manifest(manifest_started.elapsed());
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
+            drop(manifest_state);
+            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+            return Err(err);
+        }
         let manifest = manifest_state.manifest.clone();
         if let Err(err) = manifest_state.store.commit(&manifest) {
             self.metrics

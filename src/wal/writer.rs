@@ -613,11 +613,15 @@ fn commit_batch(
 
     // Write + (maybe) fsync. Fault points straddle the fsync so tests
     // can simulate both a partial write (before fsync returns) and a
-    // post-durability crash.
+    // post-durability crash. Phase 3 adds `WalSubmitAsyncDropped`
+    // before append for the async-only-batch-loss test.
     let seg = state
         .current
         .as_mut()
         .expect("writer has no current segment");
+    if !any_sync {
+        state.faults.inject(FaultPoint::WalSubmitAsyncDropped)?;
+    }
     let write_started = Instant::now();
     seg.append(&buf)?;
     state.metrics.record_wal_write(write_started.elapsed());
