@@ -545,8 +545,12 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
 /// Returns the list of `(ack, lsn)` pairs so the caller can dispatch
 /// on success.
 ///
-/// `submits` is consumed on success (drained). On failure, `submits`
-/// is left intact so the caller can iterate and send error acks.
+/// `submits` is consumed on success (drained). **On failure `submits`
+/// is left fully intact** so the caller's error handler can iterate
+/// and send a uniform error ack on every Sender — the contract is
+/// enforced by the two-pass structure below (Pass 1 only iterates by
+/// reference; Pass 2 drains only after every fallible step has
+/// returned Ok).
 ///
 /// `force_fsync=true` (ZFS-TXG-clone Phase 3) means the batch must
 /// fsync regardless of submit flags — used when `Op::FsyncAll` arrived
@@ -589,26 +593,42 @@ fn commit_batch(
         state.metrics.record_wal_rotate();
     }
 
-    // Encode into a single buffer so the write is one syscall.
+    // Two-pass design to honour the doc-stated "submits left intact on
+    // failure" contract:
+    //
+    //   Pass 1 (this loop) walks submits by reference. All fallible work
+    //   — LSN validation, body encoding, IO append, optional fsync,
+    //   fault-injection probes — happens here. If any step returns Err,
+    //   `submits` is still fully populated and the caller's error
+    //   handler can iterate and ack errors.
+    //
+    //   Pass 2 (below) drains `submits` only after every fallible step
+    //   has succeeded. The drain itself is infallible, so it cannot
+    //   leak a partially-drained Vec back to the caller.
+    //
+    // The single-pass `submits.drain(..)` that lived here previously
+    // dropped ack senders silently when any step past the drain start
+    // returned Err — the caller's drain saw an empty Vec and the
+    // pre-drained pending records' Senders were destroyed mid-iteration.
+    // That violated the documented contract; the regression test
+    // `commit_batch_failure_leaves_submits_intact_for_ack` guards the
+    // new invariant.
     let mut buf = Vec::with_capacity(batch_bytes);
-    let mut assigned = Vec::with_capacity(submits.len());
+    let mut lsns = Vec::with_capacity(submits.len());
     let mut any_sync = force_fsync;
-    for pending in submits.drain(..) {
-        let lsn = pending.assigned_lsn.unwrap_or(state.next_lsn);
-        if lsn < state.next_lsn {
+    let mut next_cursor = state.next_lsn;
+    for pending in submits.iter() {
+        let lsn = pending.assigned_lsn.unwrap_or(next_cursor);
+        if lsn < next_cursor {
             return Err(MetaDbError::Corruption(format!(
                 "wal assigned lsn {} is behind writer cursor {}",
-                lsn, state.next_lsn
+                lsn, next_cursor
             )));
         }
-        state.next_lsn = state
-            .next_lsn
-            .max(lsn)
-            .checked_add(1)
-            .ok_or(MetaDbError::OutOfSpace)?;
+        next_cursor = lsn.checked_add(1).ok_or(MetaDbError::OutOfSpace)?;
         try_encode(&mut buf, lsn, &pending.body).map_err(|len| wal_body_too_large(len as usize))?;
         any_sync |= pending.synchronous;
-        assigned.push((pending.ack, lsn));
+        lsns.push(lsn);
     }
 
     // Write + (maybe) fsync. Fault points straddle the fsync so tests
@@ -637,9 +657,18 @@ fn commit_batch(
         // so the reader can correlate against the next FsyncAll.
         state
             .metrics
-            .record_wal_async_batch(assigned.len(), buf.len());
+            .record_wal_async_batch(submits.len(), buf.len());
     }
-    state.metrics.record_wal_batch(assigned.len(), buf.len());
+    state.metrics.record_wal_batch(submits.len(), buf.len());
+
+    // Pass 2: every path past Pass 1 has succeeded. Advance the writer
+    // cursor and drain `submits` into the returned (ack, lsn) pairs.
+    // Nothing here can fail, so we never strand a Sender.
+    state.next_lsn = next_cursor;
+    let mut assigned = Vec::with_capacity(submits.len());
+    for (pending, lsn) in submits.drain(..).zip(lsns) {
+        assigned.push((pending.ack, lsn));
+    }
     Ok(assigned)
 }
 
@@ -810,6 +839,58 @@ mod tests {
         let wal = Wal::create(dir.path(), &cfg_fast_batch(), 1, faults).unwrap();
         assert!(wal.submit(b"doomed".to_vec()).is_err());
         let _ = wal.shutdown();
+    }
+
+    /// Regression for the two-pass `commit_batch` contract: when the
+    /// IO step fails after multiple submits have been batched together,
+    /// EVERY submitter must receive an error ack (no hang, no Ok
+    /// returned for any record). The old single-pass implementation
+    /// drained `submits` while encoding and stranded the already-pulled
+    /// senders inside a local `assigned: Vec` that was dropped on the
+    /// error return path — the writer's error handler then iterated an
+    /// emptied Vec and acked no one explicitly. The senders still got
+    /// dropped through Vec destructors so callers technically observed
+    /// `Err`, but the doc-stated "submits left intact" invariant was
+    /// silently violated and any future refactor that swapped the
+    /// destructor-driven Sender drop for explicit handling would
+    /// surface as a hang. This test guards the structural invariant
+    /// by submitting a burst of sync records that should batch into a
+    /// single `commit_batch` call, tripping the fsync fault, and
+    /// asserting every caller sees `Err`.
+    #[test]
+    fn commit_batch_failure_acks_every_submitter() {
+        let dir = TempDir::new().unwrap();
+        let faults = FaultController::new();
+        // First fsync attempt trips. The writer batches N sync submits,
+        // tries to fsync, hits the fault, returns Err from commit_batch.
+        faults.install(FaultPoint::WalFsyncBefore, 1, FaultAction::Error);
+        let mut cfg = cfg_fast_batch();
+        // Wide enough window for the burst to collapse into one batch.
+        cfg.group_commit_timeout_us = 50_000;
+        let wal = Arc::new(Wal::create(dir.path(), &cfg, 1, faults).unwrap());
+
+        let n = 16usize;
+        let barrier = Arc::new(std::sync::Barrier::new(n));
+        let threads: Vec<_> = (0..n)
+            .map(|i| {
+                let wal = Arc::clone(&wal);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    wal.submit(format!("doomed-{i}").into_bytes())
+                })
+            })
+            .collect();
+
+        let mut err_count = 0usize;
+        for t in threads {
+            match t.join().unwrap() {
+                Err(_) => err_count += 1,
+                Ok(lsn) => panic!("expected Err on submit, got Ok(lsn={lsn})"),
+            }
+        }
+        assert_eq!(err_count, n, "every submit must observe Err");
+        let _ = Arc::try_unwrap(wal).ok().unwrap().shutdown();
     }
 
     #[test]
