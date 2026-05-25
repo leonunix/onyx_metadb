@@ -159,13 +159,9 @@ impl Wal {
     /// `WalSet` calls this while holding its short LSN/order mutex so
     /// same-lane enqueue order matches global LSN order, then waits for
     /// the fsync ack outside that mutex.
-    pub(crate) fn submit_assigned_async(&self, lsn: Lsn, body: Vec<u8>) -> Result<PendingWalAck> {
-        self.submit_assigned_async_with_options(lsn, body, /* synchronous */ true)
-    }
-
-    /// ZFS-TXG-clone Phase 3: enqueue an already-assigned record with an
-    /// explicit `synchronous` toggle. When `synchronous=false`, the
-    /// writer thread acks the caller after `seg.append` (body in OS page
+    ///
+    /// When `synchronous=false` (ZFS-TXG-clone Phase 3), the writer
+    /// thread acks the caller after `seg.append` (body in OS page
     /// cache) and skips the per-batch fsync. A mixed batch (any submit
     /// `synchronous=true`) still fsyncs. Durability is reasserted at
     /// the next `fsync_pending` call.

@@ -22,6 +22,32 @@ use super::writer::Wal;
 
 const WAL_LANE_DIR_PREFIX: &str = "lane-";
 
+/// ZFS-TXG-clone Phase 3 submission knobs.
+///
+/// `synchronous=true` (default) preserves the legacy contract: the
+/// submit blocks until the WAL writer thread has fsynced the
+/// containing batch. `synchronous=false` enables WAL-on-OS-page-cache
+/// mode: the submit returns as soon as the writer thread has executed
+/// `seg.append(&buf)`; per-batch fsync is skipped. Durability is
+/// reasserted at the next [`WalSet::fsync_all_lanes`] call (the TXG
+/// sync barrier in `flush_with_gate`).
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SubmitOptions {
+    pub(crate) synchronous: bool,
+}
+
+impl Default for SubmitOptions {
+    fn default() -> Self {
+        Self { synchronous: true }
+    }
+}
+
+impl SubmitOptions {
+    pub(crate) fn async_() -> Self {
+        Self { synchronous: false }
+    }
+}
+
 /// A set of WAL writer lanes sharing one global LSN allocator.
 pub struct WalSet {
     lanes: Vec<Wal>,
@@ -101,6 +127,26 @@ impl WalSet {
     where
         F: FnOnce(Lsn),
     {
+        self.submit_to_reserved_with_options(lane, body, SubmitOptions::default(), reserve)
+    }
+
+    /// ZFS-TXG-clone Phase 3 entry point: same contract as
+    /// [`submit_to_reserved`], with explicit `SubmitOptions`. When
+    /// `options.synchronous=false` the writer thread acks the submit
+    /// after `seg.append(&buf)` and skips the per-batch fsync; the
+    /// returned LSN is monotonic but not durable until the next
+    /// [`fsync_all_lanes`] call. Per-LSN order across submits is
+    /// preserved by the global allocator mutex regardless of mode.
+    pub(crate) fn submit_to_reserved_with_options<F>(
+        &self,
+        lane: usize,
+        body: Vec<u8>,
+        options: SubmitOptions,
+        reserve: F,
+    ) -> Result<Lsn>
+    where
+        F: FnOnce(Lsn),
+    {
         if body.len() > WAL_MAX_BODY {
             return Err(MetaDbError::InvalidArgument(format!(
                 "WAL body too large: {} bytes exceeds WAL_MAX_BODY {WAL_MAX_BODY}",
@@ -121,7 +167,11 @@ impl WalSet {
                 .next_lsn
                 .checked_add(1)
                 .ok_or(MetaDbError::OutOfSpace)?;
-            let ack = match self.lanes[lane].submit_assigned_async(lsn, body) {
+            let ack = match self.lanes[lane].submit_assigned_async_with_options(
+                lsn,
+                body,
+                options.synchronous,
+            ) {
                 Ok(ack) => ack,
                 Err(err) => {
                     let msg = err.to_string();
@@ -143,6 +193,37 @@ impl WalSet {
                 self.state.lock().failed = Some(msg);
                 Err(err)
             }
+        }
+    }
+
+    /// ZFS-TXG-clone Phase 3 TXG-sync barrier. Force-fsyncs every WAL
+    /// lane's current segment, returning when every lane has acked.
+    /// Returns the first error encountered (best-effort: still drives
+    /// FsyncAll on later lanes even if an earlier one failed, so the
+    /// writer threads don't park indefinitely).
+    ///
+    /// Must be called between `flush_with_gate`'s sample of
+    /// `wal_checkpoint = last_applied_lsn` and the manifest commit.
+    /// The safety argument is non-local — see
+    /// [`crate::wal::writer::Wal::fsync_pending`] for the full
+    /// derivation. Without this barrier, `manifest.checkpoint_lsn`
+    /// could record an LSN whose async-submitted WAL body sits in OS
+    /// page cache and would be lost on power failure.
+    pub(crate) fn fsync_all_lanes(&self) -> Result<()> {
+        let mut first_err: Option<MetaDbError> = None;
+        for lane in &self.lanes {
+            if let Err(err) = lane.fsync_pending() {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        match first_err {
+            Some(err) => {
+                self.state.lock().failed = Some(err.to_string());
+                Err(err)
+            }
+            None => Ok(()),
         }
     }
 
