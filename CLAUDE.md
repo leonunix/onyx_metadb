@@ -12,7 +12,7 @@ crate 引用——onyx **唯一**的 meta backend，已经替掉 RocksDB（onyx 
 cargo build
 cargo test
 cargo build --release
-cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前必跑
+cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前必跑 ，测试需要限定1个线程。不然会相互锁死
 ```
 
 测试覆盖率目标 90%+。`--ignored` 的用例不是可选，是发布门控。仓库当前 `#[test]` 标
