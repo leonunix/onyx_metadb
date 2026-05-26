@@ -29,7 +29,7 @@ use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::testing::faults::{FaultController, FaultPoint};
 use crate::types::{
-    Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, SnapshotId, VolumeOrdinal,
+    Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, SnapshotId, Txg, VolumeOrdinal,
 };
 
 /// Version of the current manifest body layout.
@@ -61,6 +61,14 @@ use crate::types::{
 /// lineages by incref'ing the global rc per shared PBA. Old v13
 /// manifests are hard-rejected on open — no on-disk migration.
 ///
+/// v15 (ZFS-TXG-clone Phase 4): added `checkpoint_txg: u64` at the end
+/// of the fixed header (offset 52). `OFF_VARIABLE_START` shifts from
+/// 52 → 60. `checkpoint_lsn` is retained and continues to drive WAL
+/// prune + recovery; `checkpoint_txg` is the durable TXG counter
+/// maintained by the [`crate::txg::TxgStateMachine`]. Old v14 manifests
+/// are hard-rejected on open — no on-disk migration (zfs-txg-clone.md
+/// explicitly waives backcompat).
+///
 /// (Compact leaf format independently bumped from v4 → v5: per-leaf
 /// `base_pba` (8 B) added to the leaf header and per-unit `base_pba`
 /// (8 B) shrunk to a u32 `pba_delta` (4 B) against it, restoring
@@ -68,7 +76,7 @@ use crate::types::{
 /// LEAF_ENTRY_COUNT. Leaf version is checked per page in
 /// `paged::leaf_compact`; manifest body version stays at 14 because
 /// no manifest field changes.)
-pub const MANIFEST_BODY_VERSION: u32 = 14;
+pub const MANIFEST_BODY_VERSION: u32 = 15;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -95,7 +103,11 @@ const OFF_NEXT_VOLUME_ORD: usize = 40;
 // 42..44 reserved for alignment / future flags
 const OFF_SNAPSHOT_COUNT: usize = 44;
 const OFF_VOLUME_COUNT: usize = 48;
-const OFF_VARIABLE_START: usize = 52;
+// v15 inserts `checkpoint_txg: u64` at offset 52. All earlier offsets are
+// unchanged so v14 readers reject the new layout via the version field at
+// offset 0 (decode hard-rejects v14).
+const OFF_CHECKPOINT_TXG: usize = 52;
+const OFF_VARIABLE_START: usize = 60;
 
 /// Per-snapshot row size on disk. v6 packs: id(8) + vol_ord(2) + 6 pad +
 /// l2p_roots_page(8) + created_lsn(8). We keep the row at 32 bytes so
@@ -115,7 +127,8 @@ const _: () = {
     assert!(OFF_NEXT_SNAPSHOT_ID + 8 == OFF_NEXT_VOLUME_ORD);
     assert!(OFF_NEXT_VOLUME_ORD + 4 == OFF_SNAPSHOT_COUNT);
     assert!(OFF_SNAPSHOT_COUNT + 4 == OFF_VOLUME_COUNT);
-    assert!(OFF_VOLUME_COUNT + 4 == OFF_VARIABLE_START);
+    assert!(OFF_VOLUME_COUNT + 4 == OFF_CHECKPOINT_TXG);
+    assert!(OFF_CHECKPOINT_TXG + 8 == OFF_VARIABLE_START);
     assert!(SNAPSHOT_ENTRY_SIZE == 32);
 };
 
@@ -219,12 +232,17 @@ pub use volume::{
     encode_volume_entry_inline, volume_entry_inline_size,
 };
 
-/// Decoded manifest body (v9).
+/// Decoded manifest body (v15).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub body_version: u32,
     /// Greatest LSN whose WAL record has been applied to durable state.
     pub checkpoint_lsn: Lsn,
+    /// ZFS-TXG-clone Phase 4: greatest TXG that the `TxgSyncThread` has
+    /// marked synced. Always satisfies `checkpoint_txg + 1 <= open_txg`
+    /// at runtime. Persisted in the v15 fixed header (offset 52);
+    /// recovery reconstructs `TxgStateMachine` from this value.
+    pub checkpoint_txg: Txg,
     /// Head of the persisted free-list page chain, or [`NULL_PAGE`].
     pub free_list_head: PageId,
     /// Current per-shard PBA-refcount B+tree roots. Refcount is a global
@@ -272,6 +290,7 @@ impl Manifest {
         Self {
             body_version: MANIFEST_BODY_VERSION,
             checkpoint_lsn: 0,
+            checkpoint_txg: 0,
             free_list_head: NULL_PAGE,
             refcount_shard_roots: Vec::new().into_boxed_slice(),
             refcount_durable_seq: Vec::new().into_boxed_slice(),
@@ -434,6 +453,8 @@ impl Manifest {
             .copy_from_slice(&(self.snapshots.len() as u32).to_le_bytes());
         p[OFF_VOLUME_COUNT..OFF_VOLUME_COUNT + 4]
             .copy_from_slice(&(self.volumes.len() as u32).to_le_bytes());
+        p[OFF_CHECKPOINT_TXG..OFF_CHECKPOINT_TXG + 8]
+            .copy_from_slice(&self.checkpoint_txg.to_le_bytes());
 
         let mut off = OFF_VARIABLE_START;
         for root in self.refcount_shard_roots.iter().copied() {
@@ -476,27 +497,33 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            14 => Self::decode_v14(page, page_store),
+            15 => Self::decode_v15(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v14 (Phase 4 \
-                 lineage tracking) is readable — older databases (v7/v8 carried \
-                 the retired dedup_reverse section; v9 carried the compact leaf \
-                 v2 encoding with the 100-unit cap; v10/v11 used compact leaf v3 \
-                 which predates birth_lsn; v12 had birth_lsn but no per-volume \
-                 dead-list anchor; v13 had dead-list but no lineage tracking) \
-                 must be rebuilt"
+                "unsupported manifest body version {other}; only v15 \
+                 (ZFS-TXG-clone Phase 4 checkpoint_txg) is readable — older \
+                 databases (v7/v8 carried the retired dedup_reverse section; \
+                 v9 carried the compact leaf v2 encoding with the 100-unit cap; \
+                 v10/v11 used compact leaf v3 which predates birth_lsn; v12 had \
+                 birth_lsn but no per-volume dead-list anchor; v13 had dead-list \
+                 but no lineage tracking; v14 had lineage tracking but no \
+                 checkpoint_txg) must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v14(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 14)
+    fn decode_v15(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 15)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {
         let p = page.payload();
         let checkpoint_lsn = u64::from_le_bytes(
             p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let checkpoint_txg = u64::from_le_bytes(
+            p[OFF_CHECKPOINT_TXG..OFF_CHECKPOINT_TXG + 8]
                 .try_into()
                 .unwrap(),
         );
@@ -575,6 +602,7 @@ impl Manifest {
         Ok(Self {
             body_version: MANIFEST_BODY_VERSION,
             checkpoint_lsn,
+            checkpoint_txg,
             free_list_head,
             refcount_shard_roots,
             refcount_durable_seq,

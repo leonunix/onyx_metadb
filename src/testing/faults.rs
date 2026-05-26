@@ -142,6 +142,19 @@ pub enum FaultPoint {
     /// refcount delta merge, cuckoo put-if-absent). End state must
     /// be byte-equivalent to a clean flush.
     TxgSyncMidway,
+    /// ZFS-TXG-clone Phase 4 fault: inside
+    /// `TxgQuiesceThread::run_worker`, fires AFTER
+    /// `state.roll_to_quiescing` has closed the Open TXG + advanced
+    /// `open_txg` to the next slot BUT BEFORE `promote_to_syncing`
+    /// flips the Quiescing slot to Syncing. `FaultAction::Panic`
+    /// simulates a crash in this window: the in-memory state machine
+    /// is mid-quiesce; the on-disk manifest still records the old
+    /// `checkpoint_txg`. Recovery reconstructs the state machine from
+    /// the durable manifest, replays WAL, and folds replayed ops into
+    /// the post-recovery open TXG — the discarded mid-quiesce state
+    /// must be unreachable (no on-disk visible side effect from a
+    /// non-promoted TXG).
+    TxgQuiesceMidway,
     /// ZFS-TXG-clone Phase 3 fault: inside the WAL writer thread,
     /// fires in lieu of `seg.append(&buf)` for an async-only batch.
     /// Simulates the strongest possible loss case: the kernel never
@@ -180,6 +193,7 @@ impl FaultPoint {
             Self::LineageGcMidSegmentRead => "lineage_gc.mid_segment_read",
             Self::DeferredOutcomeDrainMidway => "deferred_outcomes.drain.midway",
             Self::TxgSyncMidway => "flush.txg_sync.midway",
+            Self::TxgQuiesceMidway => "txg.quiesce.midway",
             Self::WalSubmitAsyncDropped => "wal.submit_async.dropped",
         }
     }

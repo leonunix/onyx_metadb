@@ -198,6 +198,16 @@ impl Db {
             l2p_compactor_notifier,
             commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
             wal_async_commits_enabled: cfg.wal_async_commits_enabled,
+            // Phase 4 Step 4: fresh DB starts with checkpoint_txg = 0 so the
+            // first Open TXG is 1.
+            txg: Arc::new(crate::txg::TxgStateMachine::new(0)),
+            txg_threads_enabled: cfg.txg_threads_enabled,
+            // Phase 4 Step 7: notifiers allocated regardless; the worker
+            // threads are spawned conditionally below.
+            txg_quiesce_notifier: Arc::new(crate::db::txg_quiesce::QuiesceNotifier::new()),
+            txg_sync_notifier: Arc::new(crate::db::txg_sync::SyncNotifier::new()),
+            txg_quiesce: Mutex::new(None),
+            txg_sync: Mutex::new(None),
         };
         // Spawn refcount drainers (priority 3) — fresh DB has no
         // replay to worry about, so we can spawn unconditionally
@@ -233,6 +243,9 @@ impl Db {
         // is a no-op until commits start populating the buffer.
         if db.l2p_buffer_enabled {
             db.start_l2p_compactor();
+        }
+        if db.txg_threads_enabled {
+            db.start_txg_threads(cfg.txg_timeout_ms);
         }
         Ok(db)
     }
@@ -381,6 +394,12 @@ impl Db {
         // `commit_ops` entirely).
         let wal_path = wal_dir(&cfg.path);
         let from_lsn = manifest.checkpoint_lsn + 1;
+        // ZFS-TXG-clone Phase 4 Step 8a: capture the durable TXG BEFORE
+        // entering the replay closure so the closure (which immutably
+        // borrows `manifest`) doesn't need to read it. Replay folds into
+        // `checkpoint_txg + 1` — the Open TXG the new TxgStateMachine
+        // will be constructed with below.
+        let replay_open_txg = manifest.checkpoint_txg + 1;
         let mut replayed_drop = false;
         let mut mutated_volumes = false;
         let replay_outcome =
@@ -404,6 +423,7 @@ impl Db {
                         &page_store,
                         &metrics,
                         lsn,
+                        replay_open_txg,
                         ops,
                         &snap_lookup,
                     )?;
@@ -568,6 +588,7 @@ impl Db {
                                 &dedup_index,
                                 &page_store,
                                 lsn,
+                                replay_open_txg,
                                 op,
                                 &snap_lookup,
                             )?;
@@ -706,6 +727,7 @@ impl Db {
 
         // Capture before `manifest` is moved into `ManifestState` below.
         let manifest_dedup_shards = manifest.dedup_shards as usize;
+        let manifest_checkpoint_txg = manifest.checkpoint_txg;
         let drainer_cfg = cfg.clone();
         let page_store_for_drainers = page_store.clone();
         let metrics_for_drainers = metrics.clone();
@@ -797,6 +819,16 @@ impl Db {
             l2p_compactor_notifier,
             commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
             wal_async_commits_enabled: cfg.wal_async_commits_enabled,
+            // Phase 4 Step 4: resume TXG accounting at the manifest's last
+            // synced TXG. open_txg will be checkpoint_txg + 1 — replayed
+            // ops fold into that TXG so the next quiesce/sync persists
+            // them with a fresh checkpoint_txg.
+            txg: Arc::new(crate::txg::TxgStateMachine::new(manifest_checkpoint_txg)),
+            txg_threads_enabled: cfg.txg_threads_enabled,
+            txg_quiesce_notifier: Arc::new(crate::db::txg_quiesce::QuiesceNotifier::new()),
+            txg_sync_notifier: Arc::new(crate::db::txg_sync::SyncNotifier::new()),
+            txg_quiesce: Mutex::new(None),
+            txg_sync: Mutex::new(None),
         };
         db.recompute_all_snap_infos();
         // Spawn refcount drainers AFTER WAL replay finished above so
@@ -836,6 +868,9 @@ impl Db {
         // race the post-replay flush's `tree.write()`.
         if db.l2p_buffer_enabled {
             db.start_l2p_compactor();
+        }
+        if db.txg_threads_enabled {
+            db.start_txg_threads(cfg.txg_timeout_ms);
         }
         Ok(db)
     }

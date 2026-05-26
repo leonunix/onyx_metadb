@@ -238,6 +238,7 @@ impl Db {
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         lsn: Lsn,
+        txg: crate::types::Txg,
         plan: LaneDispatchPlan,
         ops: Arc<Vec<WalOp>>,
     ) -> QueuedLanePlan {
@@ -264,6 +265,7 @@ impl Db {
                         sid,
                         indices,
                         lsn,
+                        txg,
                         apply_ops.as_slice(),
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),

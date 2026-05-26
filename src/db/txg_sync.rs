@@ -1,0 +1,327 @@
+//! ZFS-TXG-clone Phase 4 sync thread.
+//!
+//! `TxgSyncThread` is the worker driven by `TxgQuiesceThread` (Step 6).
+//! Each cycle persists one Syncing TXG:
+//!
+//! 1. Drain the syncing slot of every L2P shard into the tree (no
+//!    `apply_gate.write` — the slot is frozen by quiesce so no commit
+//!    can insert into it). Step 5 still uses
+//!    [`crate::db::l2p_buffer::L2pBuffer::swap_for_compaction`] (which
+//!    merges every TXG slot into the legacy draining intermediate) so
+//!    callers haven't been retargeted at `take_syncing_slot(txg)` yet;
+//!    Step 8 flips the buffer call sites to the TXG-aware API and
+//!    retires this shim.
+//! 2. Refcount + dead-list checkpoint (delegated to the caller's
+//!    `sync_work` callback so this module stays Db-agnostic).
+//! 3. Page IO + WAL fsync barrier (same — caller's callback).
+//! 4. Manifest commit (callback, briefly holds `apply_gate.write`).
+//! 5. `state.mark_synced(txg)`.
+//! 6. Drain `DeferredOutcomeAggregator` so commit handles
+//!    waiting on this TXG's outcomes wake up.
+//!
+//! Concurrency:
+//! - Single worker thread, parked on a `Condvar`. A wake from
+//!   `TxgQuiesceThread` (or shutdown) is the only event the worker
+//!   responds to.
+//! - The wake is **edge-triggered + level-checked**: every wake-up the
+//!   worker re-reads `txg.snapshot().syncing_txg` to find work, so a
+//!   stale notification (no Syncing TXG) is a cheap no-op.
+//! - `Drop` issues a shutdown signal and joins the worker.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+
+use parking_lot::{Condvar, Mutex};
+
+use crate::error::Result;
+use crate::metrics::MetaMetrics;
+use crate::txg::TxgStateMachine;
+use crate::types::Txg;
+
+/// Callback that performs the actual per-TXG sync work for one cycle.
+///
+/// Returns `Ok(())` on success; the worker calls
+/// [`TxgStateMachine::mark_synced`] after a successful invocation.
+/// `Err` is logged and the TXG is left in Syncing state so a subsequent
+/// notify can retry (a degraded mode used for transient IO errors).
+pub type SyncWorkFn = Arc<dyn Fn(Txg) -> Result<()> + Send + Sync>;
+
+/// Notifier shared between the quiesce side (producer of wake-ups) and
+/// the sync worker (consumer). Edge-triggered with a level recheck
+/// inside the worker loop.
+pub struct SyncNotifier {
+    wake: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl SyncNotifier {
+    pub fn new() -> Self {
+        Self {
+            wake: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Wake the sync worker. Multiple notifies between two wake-ups
+    /// collapse into one.
+    pub fn notify(&self) {
+        let mut wake = self.wake.lock();
+        *wake = true;
+        self.cv.notify_one();
+    }
+
+    fn wait(&self) {
+        let mut wake = self.wake.lock();
+        while !*wake {
+            self.cv.wait(&mut wake);
+        }
+        *wake = false;
+    }
+
+    fn wake_all_for_shutdown(&self) {
+        let mut wake = self.wake.lock();
+        *wake = true;
+        self.cv.notify_all();
+    }
+}
+
+impl Default for SyncNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct TxgSyncThread {
+    inner: Arc<Inner>,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct Inner {
+    state: Arc<TxgStateMachine>,
+    notifier: Arc<SyncNotifier>,
+    sync_work: SyncWorkFn,
+    shutdown: AtomicBool,
+    #[allow(dead_code)]
+    metrics: Arc<MetaMetrics>,
+}
+
+impl TxgSyncThread {
+    /// Spawn the sync worker.
+    ///
+    /// `sync_work` is invoked by the worker thread once per notification
+    /// (when a Syncing TXG is present). It must:
+    ///
+    /// - drain the L2P shards for the given TXG into the trees,
+    /// - perform refcount checkpoint + page IO + WAL fsync,
+    /// - briefly hold `apply_gate.write()` to commit the manifest
+    ///   (updating both `checkpoint_lsn` and `checkpoint_txg`),
+    ///
+    /// after which this worker calls
+    /// [`TxgStateMachine::mark_synced`] to advance the in-memory
+    /// `checkpoint_txg` and notify ring-full / `wait_until_synced`
+    /// waiters.
+    pub fn start(
+        state: Arc<TxgStateMachine>,
+        notifier: Arc<SyncNotifier>,
+        sync_work: SyncWorkFn,
+        metrics: Arc<MetaMetrics>,
+    ) -> Self {
+        let inner = Arc::new(Inner {
+            state,
+            notifier,
+            sync_work,
+            shutdown: AtomicBool::new(false),
+            metrics,
+        });
+        let worker = Arc::clone(&inner);
+        let handle = thread::Builder::new()
+            .name("metadb-txg-sync".into())
+            .spawn(move || run_worker(worker))
+            .expect("metadb: failed to spawn txg sync worker");
+        Self {
+            inner,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn notifier(&self) -> Arc<SyncNotifier> {
+        self.inner.notifier.clone()
+    }
+
+    pub fn stop(&mut self) {
+        if self.inner.shutdown.swap(true, Ordering::Release) {
+            // Already stopped.
+            return;
+        }
+        self.inner.notifier.wake_all_for_shutdown();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for TxgSyncThread {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn run_worker(inner: Arc<Inner>) {
+    while !inner.shutdown.load(Ordering::Acquire) {
+        inner.notifier.wait();
+        if inner.shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        // Level check: is there actually a Syncing TXG to process?
+        let Some(txg) = inner.state.snapshot().syncing_txg else {
+            continue;
+        };
+        match (inner.sync_work)(txg) {
+            Ok(()) => {
+                inner.state.mark_synced(txg);
+            }
+            Err(err) => {
+                tracing::error!(error = %err, txg, "metadb: TxgSyncThread cycle failed; TXG stays Syncing");
+                // Do not advance checkpoint_txg. A subsequent notify
+                // will retry. The quiesce thread will eventually time
+                // out and surface as a soak alarm.
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    fn noop_metrics() -> Arc<MetaMetrics> {
+        Arc::new(MetaMetrics::new())
+    }
+
+    #[test]
+    fn wakes_and_processes_syncing_txg() {
+        let state = Arc::new(TxgStateMachine::new(0));
+        let notifier = Arc::new(SyncNotifier::new());
+        let processed = Arc::new(AtomicU64::new(0));
+        let processed_clone = Arc::clone(&processed);
+        let work: SyncWorkFn = Arc::new(move |txg| {
+            processed_clone.store(txg, Ordering::Release);
+            Ok(())
+        });
+        let mut sync = TxgSyncThread::start(
+            Arc::clone(&state),
+            Arc::clone(&notifier),
+            work,
+            noop_metrics(),
+        );
+        // Set up a Syncing TXG.
+        let q = state.roll_to_quiescing();
+        state.promote_to_syncing(q);
+        notifier.notify();
+        // Wait for worker.
+        for _ in 0..100 {
+            if state.checkpoint_txg() == q {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.checkpoint_txg(), q);
+        assert_eq!(processed.load(Ordering::Acquire), q);
+        sync.stop();
+    }
+
+    #[test]
+    fn spurious_notify_with_no_syncing_txg_is_noop() {
+        let state = Arc::new(TxgStateMachine::new(0));
+        let notifier = Arc::new(SyncNotifier::new());
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let work: SyncWorkFn = Arc::new(move |_txg| {
+            calls_clone.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        });
+        let mut sync = TxgSyncThread::start(
+            Arc::clone(&state),
+            Arc::clone(&notifier),
+            work,
+            noop_metrics(),
+        );
+        // No syncing_txg, just notify.
+        notifier.notify();
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(state.checkpoint_txg(), 0);
+        sync.stop();
+    }
+
+    #[test]
+    fn failed_sync_leaves_txg_in_syncing_state() {
+        let state = Arc::new(TxgStateMachine::new(0));
+        let notifier = Arc::new(SyncNotifier::new());
+        let work: SyncWorkFn = Arc::new(|_txg| {
+            Err(crate::error::MetaDbError::Corruption(
+                "test-induced failure".into(),
+            ))
+        });
+        let mut sync = TxgSyncThread::start(
+            Arc::clone(&state),
+            Arc::clone(&notifier),
+            work,
+            noop_metrics(),
+        );
+        let q = state.roll_to_quiescing();
+        state.promote_to_syncing(q);
+        notifier.notify();
+        thread::sleep(Duration::from_millis(40));
+        // checkpoint_txg did NOT advance because mark_synced was not called.
+        assert_eq!(state.checkpoint_txg(), 0);
+        // syncing_txg is still set so a retry can pick it up.
+        assert_eq!(state.snapshot().syncing_txg, Some(q));
+        sync.stop();
+    }
+
+    #[test]
+    fn stop_joins_worker_cleanly() {
+        let state = Arc::new(TxgStateMachine::new(0));
+        let notifier = Arc::new(SyncNotifier::new());
+        let work: SyncWorkFn = Arc::new(|_| Ok(()));
+        let mut sync = TxgSyncThread::start(
+            Arc::clone(&state),
+            Arc::clone(&notifier),
+            work,
+            noop_metrics(),
+        );
+        sync.stop();
+        // Calling stop a second time is a no-op (idempotent).
+        sync.stop();
+    }
+
+    #[test]
+    fn multiple_txg_cycles_advance_checkpoint() {
+        let state = Arc::new(TxgStateMachine::new(0));
+        let notifier = Arc::new(SyncNotifier::new());
+        let work: SyncWorkFn = Arc::new(|_| Ok(()));
+        let mut sync = TxgSyncThread::start(
+            Arc::clone(&state),
+            Arc::clone(&notifier),
+            work,
+            noop_metrics(),
+        );
+        for expected_cp in 1..=5u64 {
+            let q = state.roll_to_quiescing();
+            state.promote_to_syncing(q);
+            notifier.notify();
+            for _ in 0..100 {
+                if state.checkpoint_txg() == expected_cp {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(state.checkpoint_txg(), expected_cp);
+        }
+        sync.stop();
+    }
+}

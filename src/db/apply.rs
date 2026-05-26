@@ -63,6 +63,7 @@ pub(super) fn apply_op_bare(
     dedup_index: &crate::dedup::DedupIndex,
     page_store: &Arc<PageStore>,
     lsn: Lsn,
+    txg: crate::types::Txg,
     op: &WalOp,
     snap_info_for_vol: &dyn Fn(VolumeOrdinal) -> Vec<SnapInfo>,
 ) -> Result<ApplyOutcome> {
@@ -82,7 +83,7 @@ pub(super) fn apply_op_bare(
             // caller distinguishes accept vs reject by comparing
             // `value.seq()` against `cur.seq()`.
             let cur = if use_buffer {
-                match volume.shards[sid].l2p_buffer.lookup(*lba) {
+                match volume.shards[sid].l2p_buffer.lookup_for_open_txg(txg, *lba) {
                     crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
                     crate::db::l2p_buffer::BufferLookup::Tombstone => None,
                     crate::db::l2p_buffer::BufferLookup::Absent => tree.get(*lba)?,
@@ -95,7 +96,9 @@ pub(super) fn apply_op_bare(
             }
             let stamped = stamp_birth_lsn(*value, lsn);
             let prev = if use_buffer {
-                volume.shards[sid].l2p_buffer.insert(*lba, stamped, lsn);
+                volume.shards[sid]
+                    .l2p_buffer
+                    .insert_at_txg(txg, *lba, stamped, lsn);
                 cur
             } else {
                 let p = tree.insert_at_lsn(*lba, stamped, lsn)?;
@@ -113,12 +116,14 @@ pub(super) fn apply_op_bare(
             let use_buffer = volume.shards[sid].use_buffer;
             let mut tree = volume.shards[sid].tree.write();
             let prev = if use_buffer {
-                let cur = match volume.shards[sid].l2p_buffer.lookup(*lba) {
+                let cur = match volume.shards[sid].l2p_buffer.lookup_for_open_txg(txg, *lba) {
                     crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
                     crate::db::l2p_buffer::BufferLookup::Tombstone => None,
                     crate::db::l2p_buffer::BufferLookup::Absent => tree.get(*lba)?,
                 };
-                volume.shards[sid].l2p_buffer.insert_tombstone(*lba, lsn);
+                volume.shards[sid]
+                    .l2p_buffer
+                    .insert_tombstone_at_txg(txg, *lba, lsn);
                 cur
             } else {
                 let p = tree.delete_at_lsn(*lba, lsn)?;
@@ -220,6 +225,7 @@ pub(super) fn apply_op_bare(
             volumes,
             refcount_shards,
             lsn,
+            txg,
             *vol_ord,
             *lba,
             *new_value,
@@ -247,6 +253,7 @@ pub(super) fn apply_op_bare(
             volumes,
             refcount_shards,
             lsn,
+            txg,
             *vol_ord,
             *start_lba,
             values,

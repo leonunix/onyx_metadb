@@ -10,6 +10,12 @@
 /// most recently written in its header (`generation`).
 pub type Lsn = u64;
 
+/// Transaction-group epoch number. ZFS-style: every committed op is stamped
+/// with the open TXG at enter-time; persistence happens per-TXG at
+/// quiesce/sync boundaries. Strictly monotonic; ring index in the
+/// `TxgStateMachine` is `txg & (TXG_SIZE - 1)`.
+pub type Txg = u64;
+
 /// Index of a 4 KiB page within the page file.  Page 0 and page 1 are the
 /// double-buffered manifest slots; data pages start at [`FIRST_DATA_PAGE`].
 pub type PageId = u64;

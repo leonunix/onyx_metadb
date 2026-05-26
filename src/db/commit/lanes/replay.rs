@@ -1,6 +1,7 @@
 use super::*;
 
 impl Db {
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::db) fn apply_replay_batch(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
@@ -8,6 +9,7 @@ impl Db {
         page_store: &Arc<PageStore>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
+        txg: crate::types::Txg,
         ops: &[WalOp],
         snap_info_for_vol: &dyn Fn(VolumeOrdinal) -> Vec<SnapInfo>,
     ) -> Result<Vec<ApplyOutcome>> {
@@ -23,6 +25,7 @@ impl Db {
                     dedup_index.as_ref(),
                     page_store,
                     lsn,
+                    txg,
                     op,
                     snap_info_for_vol,
                 )?);
@@ -30,15 +33,25 @@ impl Db {
             return Ok(outcomes);
         }
 
-        Self::apply_ops_grouped_to_lanes(volumes, refcount_shards, dedup_index, metrics, lsn, ops)
+        Self::apply_ops_grouped_to_lanes(
+            volumes,
+            refcount_shards,
+            dedup_index,
+            metrics,
+            lsn,
+            txg,
+            ops,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::db::commit) fn apply_ops_grouped_to_lanes(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
         dedup_index: &Arc<crate::dedup::DedupIndex>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
+        txg: crate::types::Txg,
         ops: &[WalOp],
     ) -> Result<Vec<ApplyOutcome>> {
         let ops = Arc::new(ops.to_vec());
@@ -135,6 +148,7 @@ impl Db {
                         sid,
                         indices,
                         lsn,
+                        txg,
                         apply_ops.as_slice(),
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
@@ -252,12 +266,14 @@ impl Db {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::db::commit) fn apply_ops_grouped_to(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
         dedup_index: &Arc<crate::dedup::DedupIndex>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
+        txg: crate::types::Txg,
         ops: &[WalOp],
     ) -> Result<Vec<ApplyOutcome>> {
         let mut outcomes: Vec<Option<ApplyOutcome>> = (0..ops.len()).map(|_| None).collect();
@@ -341,6 +357,7 @@ impl Db {
                 sid,
                 indices,
                 lsn,
+                txg,
                 ops,
                 &refcount_shards_vec,
                 metrics.as_ref(),
@@ -410,6 +427,7 @@ impl Db {
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         lsn: Lsn,
+        txg: crate::types::Txg,
         ops: &[WalOp],
     ) -> Result<Vec<ApplyOutcome>> {
         Self::apply_ops_grouped_to(
@@ -418,6 +436,7 @@ impl Db {
             &self.dedup_index,
             &self.metrics,
             lsn,
+            txg,
             ops,
         )
     }

@@ -498,6 +498,7 @@ impl Db {
             &self.dedup_index,
             &self.page_store,
             lsn,
+            self.txg.open_txg(),
             &op,
             &snap_lookup,
         )?;

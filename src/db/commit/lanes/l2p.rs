@@ -2,11 +2,13 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 impl Db {
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::db::commit) fn apply_l2p_bucket(
         volume: Arc<Volume>,
         sid: usize,
         indices: Vec<L2pBucketEntry>,
         lsn: Lsn,
+        txg: crate::types::Txg,
         ops: &[WalOp],
         refcount_shards: &[Arc<crate::refcount::RcShard>],
         metrics: &MetaMetrics,
@@ -20,6 +22,7 @@ impl Db {
                 sid,
                 indices,
                 lsn,
+                txg,
                 ops,
                 refcount_shards,
                 metrics,
@@ -422,11 +425,13 @@ impl Db {
     /// skipping the apply-lane channel hop. Buffer mode never produces
     /// `rc_actions`, so the returned `L2pBucketApplyResult.rc_actions`
     /// is always empty here.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::db::commit) fn apply_l2p_bucket_buffer(
         volume: Arc<Volume>,
         sid: usize,
         indices: Vec<L2pBucketEntry>,
         lsn: Lsn,
+        txg: crate::types::Txg,
         ops: &[WalOp],
         refcount_shards: &[Arc<crate::refcount::RcShard>],
         metrics: &MetaMetrics,
@@ -477,7 +482,7 @@ impl Db {
                     for &off in lba_offsets.iter() {
                         let lba = range_start_lba + off as u64;
                         let new_value = range_values[off as usize];
-                        let cur = match shard.l2p_buffer.lookup(lba) {
+                        let cur = match shard.l2p_buffer.lookup_for_open_txg(txg, lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
                             BufferLookup::Absent => load_view().get(lba)?,
@@ -487,7 +492,7 @@ impl Db {
                             prevs_box[off as usize] = cur;
                             continue;
                         }
-                        shard.l2p_buffer.insert(lba, new_value, lsn);
+                        shard.l2p_buffer.insert_at_txg(txg, lba, new_value, lsn);
                         super::apply::record_dead(&volume, cur, lsn);
                         l2p_remap_range_lba_count += 1;
                         applied_bits[off as usize] = true;
@@ -510,7 +515,7 @@ impl Db {
                 };
                 let outcome = match &ops[idx] {
                     WalOp::L2pPut { lba, value, .. } => {
-                        let cur = match shard.l2p_buffer.lookup(*lba) {
+                        let cur = match shard.l2p_buffer.lookup_for_open_txg(txg, *lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
                             BufferLookup::Absent => load_view().get(*lba)?,
@@ -520,18 +525,18 @@ impl Db {
                             outcomes.push((idx, ApplyOutcome::L2pPrev(cur)));
                             continue;
                         }
-                        shard.l2p_buffer.insert(*lba, *value, lsn);
+                        shard.l2p_buffer.insert_at_txg(txg, *lba, *value, lsn);
                         super::apply::record_dead(&volume, cur, lsn);
                         l2p_put_count += 1;
                         ApplyOutcome::L2pPrev(cur)
                     }
                     WalOp::L2pDelete { lba, .. } => {
-                        let cur = match shard.l2p_buffer.lookup(*lba) {
+                        let cur = match shard.l2p_buffer.lookup_for_open_txg(txg, *lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
                             BufferLookup::Absent => load_view().get(*lba)?,
                         };
-                        shard.l2p_buffer.insert_tombstone(*lba, lsn);
+                        shard.l2p_buffer.insert_tombstone_at_txg(txg, *lba, lsn);
                         l2p_delete_count += 1;
                         ApplyOutcome::L2pPrev(cur)
                     }
@@ -562,7 +567,7 @@ impl Db {
                                 continue;
                             }
                         }
-                        let cur = match shard.l2p_buffer.lookup(*lba) {
+                        let cur = match shard.l2p_buffer.lookup_for_open_txg(txg, *lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
                             BufferLookup::Absent => load_view().get(*lba)?,
@@ -579,7 +584,7 @@ impl Db {
                             ));
                             continue;
                         }
-                        shard.l2p_buffer.insert(*lba, *new_value, lsn);
+                        shard.l2p_buffer.insert_at_txg(txg, *lba, *new_value, lsn);
                         super::apply::record_dead(&volume, cur, lsn);
                         l2p_remap_count += 1;
                         ApplyOutcome::L2pRemap {

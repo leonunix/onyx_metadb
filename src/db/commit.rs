@@ -177,6 +177,11 @@ struct CommitApplyContext<'a> {
     plan_dedup_ops: usize,
     dispatch_lanes: usize,
     ops: &'a [WalOp],
+    /// ZFS-TXG-clone Phase 4 Step 8a: the TXG that the committing thread
+    /// pinned via [`crate::txg::TxgStateMachine::enter`]. Threads down
+    /// into every L2pBuffer write so the slot stamp matches the slot
+    /// the [`crate::txg::TxgGuard`] is keeping alive.
+    txg: crate::types::Txg,
 }
 
 struct ActiveApplyGuard<'a> {
@@ -485,6 +490,15 @@ impl Db {
         timing.encode = encode_started.elapsed();
         self.metrics.record_commit_encode(timing.encode);
         self.metrics.record_commit_wal_body_bytes(body.len());
+        // ZFS-TXG-clone Phase 4 Step 4: acquire a TxgGuard BEFORE WAL submit
+        // so the slot stamp is locked in before the WAL allocator can hand
+        // out a higher LSN to a later TXG. The guard's drop (at function
+        // exit) decrements the slot's inflight counter, which is what the
+        // `TxgQuiesceThread` parks on. Holding it across the apply also
+        // means `take_syncing_slot` cannot race with this commit's tree
+        // mutations because the slot stays pinned (state == Open or
+        // Quiescing — never Syncing while inflight > 0).
+        let _txg_guard = self.txg.enter();
         let wal_started = std::time::Instant::now();
         let lsn = match self.submit_wal_ops(ops, body, Some(dispatch_footprint), options) {
             Ok(lsn) => {
@@ -500,6 +514,7 @@ impl Db {
                 return Err(err);
             }
         };
+        _txg_guard.record_lsn(lsn);
         drop(unlogged_commit_guard);
         if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
             self.metrics.record_commit_error(commit_started.elapsed());
@@ -533,6 +548,7 @@ impl Db {
                 plan_dedup_ops,
                 dispatch_lanes,
                 ops,
+                txg: _txg_guard.txg(),
             },
             "metadb: slow commit_with_outcomes (>=1s)",
         )
@@ -676,6 +692,10 @@ impl Db {
             .unwrap_or_else(DispatchFootprint::global);
         let dispatch_lanes = dispatch_footprint.lanes.len();
 
+        // ZFS-TXG-clone Phase 4 Step 4: same TxgGuard pattern as
+        // commit_ops_with_options. Acquire before WAL reserve to preserve
+        // the LSN-monotonicity invariant across the unlogged path.
+        let _txg_guard = self.txg.enter();
         let dispatch_started = std::time::Instant::now();
         let lsn = match self.wal.reserve_unlogged(|lsn| {
             self.register_dispatch_intent(lsn, dispatch_footprint);
@@ -687,6 +707,7 @@ impl Db {
                 return Err(err);
             }
         };
+        _txg_guard.record_lsn(lsn);
         if let Err(err) = self.mark_wal_durable_and_wait_for_dispatch(lsn) {
             timing.dispatch_wait = dispatch_started.elapsed();
             self.metrics.record_commit_apply_wait(timing.dispatch_wait);
@@ -710,6 +731,7 @@ impl Db {
                 plan_dedup_ops,
                 dispatch_lanes,
                 ops,
+                txg: _txg_guard.txg(),
             },
             "metadb: slow unlogged commit_with_outcomes (>=1s)",
         );
@@ -785,6 +807,7 @@ impl Db {
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         lsn: Lsn,
+        txg: crate::types::Txg,
         plan: LaneDispatchPlan,
         ops: &[WalOp],
     ) -> Result<Vec<ApplyOutcome>> {
@@ -808,6 +831,7 @@ impl Db {
                 sid,
                 entries,
                 lsn,
+                txg,
                 ops,
                 &refcount_shards_snapshot,
                 &self.metrics,
@@ -873,7 +897,7 @@ impl Db {
             if self.commit_direct_apply_enabled
                 && Self::plan_is_l2p_direct_eligible(&plan, &ctx.volumes)
             {
-                match self.apply_l2p_direct(&ctx.volumes, lsn, plan, ctx.ops) {
+                match self.apply_l2p_direct(&ctx.volumes, lsn, ctx.txg, plan, ctx.ops) {
                     Ok(outcomes) => {
                         ctx.timing.apply = apply_started.elapsed();
                         self.metrics.record_commit_apply(ctx.timing.apply);
@@ -900,8 +924,13 @@ impl Db {
                 }
             } else {
                 let enqueue_started = std::time::Instant::now();
-                let queued_plan =
-                    self.enqueue_lane_plan(&ctx.volumes, lsn, plan, Arc::new(ctx.ops.to_vec()));
+                let queued_plan = self.enqueue_lane_plan(
+                    &ctx.volumes,
+                    lsn,
+                    ctx.txg,
+                    plan,
+                    Arc::new(ctx.ops.to_vec()),
+                );
                 ctx.timing.lane_enqueue = enqueue_started.elapsed();
                 match self.apply_ops_laned(lsn, ctx.ops.len(), queued_plan) {
                     Ok((outcomes, laned_timing)) => {
@@ -935,7 +964,7 @@ impl Db {
                     .record_commit_error(ctx.commit_started.elapsed());
                 return Err(err);
             }
-            match self.apply_commit_batch(&ctx.volumes, lsn, ctx.ops) {
+            match self.apply_commit_batch(&ctx.volumes, lsn, ctx.txg, ctx.ops) {
                 Ok(outcomes) => {
                     ctx.timing.apply = apply_started.elapsed();
                     self.metrics.record_commit_apply(ctx.timing.apply);
@@ -1039,6 +1068,7 @@ impl Db {
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         lsn: Lsn,
+        txg: crate::types::Txg,
         op: &WalOp,
     ) -> Result<ApplyOutcome> {
         let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
@@ -1049,6 +1079,7 @@ impl Db {
             &self.dedup_index,
             &self.page_store,
             lsn,
+            txg,
             op,
             &snap_lookup,
         )?;
@@ -1176,17 +1207,18 @@ impl Db {
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         lsn: Lsn,
+        txg: crate::types::Txg,
         ops: &[WalOp],
     ) -> Result<Vec<ApplyOutcome>> {
         const BUCKET_THRESHOLD: usize = 8;
         if ops.len() < BUCKET_THRESHOLD || self.batch_requires_serial_apply(ops) {
             let mut outcomes = Vec::with_capacity(ops.len());
             for op in ops {
-                outcomes.push(self.apply_op(volumes, lsn, op)?);
+                outcomes.push(self.apply_op(volumes, lsn, txg, op)?);
             }
             return Ok(outcomes);
         }
-        self.apply_ops_grouped(volumes, lsn, ops)
+        self.apply_ops_grouped(volumes, lsn, txg, ops)
     }
 
     fn batch_requires_serial_apply(&self, ops: &[WalOp]) -> bool {

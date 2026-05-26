@@ -45,6 +45,7 @@ pub mod recovery;
 pub mod refcount;
 pub mod testing;
 pub mod tx;
+pub mod txg;
 pub mod types;
 pub mod verify;
 pub mod wal;

@@ -291,6 +291,23 @@ pub struct Config {
     /// lag and WAL retention on idle systems.
     pub l2p_buffer_max_interval_ms: u64,
 
+    /// ZFS-TXG-clone Phase 4: when `true`, spawn the
+    /// [`crate::db::txg_quiesce::TxgQuiesceThread`] and
+    /// [`crate::db::txg_sync::TxgSyncThread`] at `Db::open` time.
+    /// Default `false` — Phase 4 lands in sub-steps and the threads
+    /// don't yet drive the persistence path (Step 7 ships the threading
+    /// model + state machine in parallel with the existing
+    /// `L2pCompactor`; Step 8 retires the compactor and routes
+    /// flush through the new threads). Turning this on without Step 8
+    /// is observable only as advancing `manifest.checkpoint_txg` in
+    /// memory; no on-disk effect.
+    pub txg_threads_enabled: bool,
+
+    /// `txg_timeout_ms` mirrors ZFS `zfs_txg_timeout` (default 5 s) —
+    /// the quiesce thread rolls a TXG at least this often even with
+    /// no force_roll signal. Ignored when `txg_threads_enabled = false`.
+    pub txg_timeout_ms: u64,
+
     /// Run a background L2P streaming writeback worker that continuously
     /// seals dirty pages and writes them through the centralised
     /// `IoSubmitter`, *outside* `apply_gate.write()`. The next `Db::flush`
@@ -531,6 +548,9 @@ impl Config {
             // compactor will fire at least this often so
             // `checkpoint_lsn` and WAL retention don't drift.
             l2p_buffer_max_interval_ms: 30_000,
+            // ZFS-TXG-clone Phase 4 threads default-off — see field doc.
+            txg_threads_enabled: false,
+            txg_timeout_ms: 5_000,
             // Streaming writeback ships default-off in this generic
             // `Config::new` so unit tests that assert on page-allocator
             // / snapshot state observe a quiescent backend (no

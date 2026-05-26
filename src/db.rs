@@ -320,6 +320,32 @@ pub struct Db {
     /// fsync. Durability is restored at the next `flush_with_gate`
     /// via `WalSet::fsync_all_lanes` before the manifest commit.
     wal_async_commits_enabled: bool,
+    /// ZFS-TXG-clone Phase 4: global TXG epoch state machine. Commit
+    /// path acquires a [`crate::txg::TxgGuard`] before applying ops so
+    /// the eventual `TxgSyncThread` can drain a frozen TXG slot.
+    /// Initialised from `manifest.checkpoint_txg` so a re-open resumes
+    /// accounting where the previous run's last sync left off.
+    pub(crate) txg: Arc<crate::txg::TxgStateMachine>,
+    /// Cached copy of `Config::txg_threads_enabled`. When `true`, the
+    /// background TXG quiesce + sync workers are spawned at open time
+    /// and `flush_with_gate` reaches durability via `force_roll +
+    /// wait_until_synced`. Step 7 lands the threading scaffold;
+    /// Step 8 retargets the actual sync work at it.
+    pub(crate) txg_threads_enabled: bool,
+    /// Notifier always allocated so `flush_with_gate` can hand a clone
+    /// to the (optional) quiesce worker without taking a mutex. Cheap —
+    /// just a `Mutex<bool> + Condvar`.
+    pub(crate) txg_quiesce_notifier: Arc<txg_quiesce::QuiesceNotifier>,
+    /// Sync-side notifier, always allocated; see above.
+    pub(crate) txg_sync_notifier: Arc<txg_sync::SyncNotifier>,
+    /// Quiesce worker handle. `Some` iff `txg_threads_enabled`. `Mutex`
+    /// so `Drop` can take + stop it from a `&self` context.
+    pub(crate) txg_quiesce: Mutex<Option<txg_quiesce::TxgQuiesceThread>>,
+    /// Sync worker handle. `Some` iff `txg_threads_enabled`. Stop order
+    /// in `Drop` is quiesce → sync so no new TXG enters Syncing after
+    /// the quiesce side is gone, and the sync side drains whatever it
+    /// has before exiting.
+    pub(crate) txg_sync: Mutex<Option<txg_sync::TxgSyncThread>>,
 }
 
 /// Synchronous callback invoked with the freed-PBA set produced by a
@@ -1140,6 +1166,8 @@ mod lifecycle;
 mod promotion;
 mod snapshot;
 mod streaming_flush;
+mod txg_quiesce;
+mod txg_sync;
 mod volume;
 
 pub use commit::DeferredOutcomeHandle;
@@ -1159,6 +1187,11 @@ impl Drop for Db {
         if let Some(mut flusher) = self.l2p_writeback.lock().take() {
             flusher.stop();
         }
+        // ZFS-TXG-clone Phase 4 Step 7: stop the TXG worker pair before
+        // the L2P compactor / volume trees / page cache go away.
+        // Quiesce stops first so no new TXG enters Syncing; sync drains
+        // any in-flight cycle. Inert when `txg_threads_enabled = false`.
+        self.stop_txg_threads();
         // Stop the L2P buffer compactor before volume trees / page
         // cache go away. The compactor holds clones of the volume
         // map, runs `tree.write()` on shards, and calls
@@ -1208,6 +1241,13 @@ impl Db {
         if let Some(compactor) = self.l2p_compactor.lock().as_ref() {
             compactor.force_compact_all();
         }
+    }
+
+    /// ZFS-TXG-clone Phase 4 inspection hook used by the
+    /// `db_phase4_txg` integration test. Returns the in-memory state
+    /// machine's `checkpoint_txg` snapshot.
+    pub fn txg_checkpoint_for_test(&self) -> u64 {
+        self.txg.checkpoint_txg()
     }
 }
 

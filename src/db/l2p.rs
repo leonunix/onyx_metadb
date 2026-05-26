@@ -153,7 +153,10 @@ impl Db {
         let sid = shard_for_key_l2p(&volume.shards, lba);
         let shard = &volume.shards[sid];
         if shard.use_buffer {
-            match shard.l2p_buffer.lookup(lba) {
+            // Phase 4: read path uses the LIVE open_txg (no pinned commit
+            // guard here) so we walk the newest 3 ring slots.
+            let open_txg = self.txg.open_txg();
+            match shard.l2p_buffer.lookup_for_open_txg(open_txg, lba) {
                 crate::db::l2p_buffer::BufferLookup::Present(v) => {
                     self.metrics.record_l2p_buffer_lookup_hit();
                     self.metrics.record_l2p_get(pin_wait, Duration::ZERO);
@@ -516,6 +519,7 @@ impl Db {
                 &self.dedup_index,
                 &self.page_store,
                 lsn,
+                self.txg.open_txg(),
                 &op,
                 &snap_lookup,
             );

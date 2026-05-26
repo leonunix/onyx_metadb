@@ -408,6 +408,49 @@ impl Db {
         *self.l2p_compactor.lock() = Some(worker);
     }
 
+    /// ZFS-TXG-clone Phase 4 Step 7: spawn the quiesce + sync workers
+    /// when `cfg.txg_threads_enabled = true`. Step 7 ships an inert
+    /// `sync_work` callback (just returns Ok), so the only observable
+    /// effect is that `Db::txg.checkpoint_txg()` advances on the
+    /// `txg_timeout_ms` cadence. Step 8 retargets the callback at the
+    /// real flush body and retires `L2pCompactor`.
+    fn start_txg_threads(&self, txg_timeout_ms: u64) {
+        let state = self.txg.clone();
+        let sync_notifier = self.txg_sync_notifier.clone();
+        let metrics = self.metrics.clone();
+        let sync_work: super::txg_sync::SyncWorkFn = Arc::new(|_txg| Ok(()));
+        let sync = super::txg_sync::TxgSyncThread::start(
+            state.clone(),
+            sync_notifier.clone(),
+            sync_work,
+            metrics.clone(),
+        );
+        *self.txg_sync.lock() = Some(sync);
+
+        let quiesce = super::txg_quiesce::TxgQuiesceThread::start(
+            state,
+            self.txg_quiesce_notifier.clone(),
+            sync_notifier,
+            super::txg_quiesce::QuiesceParams { txg_timeout_ms },
+            metrics,
+            self.faults.clone(),
+        );
+        *self.txg_quiesce.lock() = Some(quiesce);
+    }
+
+    /// ZFS-TXG-clone Phase 4 Step 7: stop the TXG worker pair, quiesce
+    /// first then sync, so no new TXG enters Syncing during teardown
+    /// and the sync side drains its current cycle before exiting.
+    /// Idempotent: a second call is a no-op.
+    pub(super) fn stop_txg_threads(&self) {
+        if let Some(mut q) = self.txg_quiesce.lock().take() {
+            q.stop();
+        }
+        if let Some(mut s) = self.txg_sync.lock().take() {
+            s.stop();
+        }
+    }
+
     /// Force-compact every L2P shard's buffer into its tree
     /// synchronously. Called from `flush_with_gate` (with
     /// `apply_gate.write()` held) and from the post-replay path in

@@ -81,10 +81,12 @@ pub(in crate::db) fn record_dead(volume: &Volume, prev: Option<L2pValue>, death_
 ///
 /// `guard` still applies — onyx-side dedup-hit promote relies on a
 /// liveness floor read of a target PBA's rc to gate the remap.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::db) fn apply_l2p_remap(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     lsn: Lsn,
+    txg: crate::types::Txg,
     vol_ord: VolumeOrdinal,
     lba: Lba,
     new_value: L2pValue,
@@ -120,7 +122,10 @@ pub(in crate::db) fn apply_l2p_remap(
 
     // Read current value: buffer-first when B2 is active, else tree.
     let cur = if use_buffer {
-        match volume.shards[l2p_sid].l2p_buffer.lookup(lba) {
+        match volume.shards[l2p_sid]
+            .l2p_buffer
+            .lookup_for_open_txg(txg, lba)
+        {
             crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
             crate::db::l2p_buffer::BufferLookup::Tombstone => None,
             crate::db::l2p_buffer::BufferLookup::Absent => tree.get(lba)?,
@@ -143,7 +148,7 @@ pub(in crate::db) fn apply_l2p_remap(
     let prev = if use_buffer {
         volume.shards[l2p_sid]
             .l2p_buffer
-            .insert(lba, new_value, lsn);
+            .insert_at_txg(txg, lba, new_value, lsn);
         cur
     } else {
         tree.insert_at_lsn(lba, new_value, lsn)?
@@ -191,6 +196,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     lsn: Lsn,
+    txg: crate::types::Txg,
     vol_ord: VolumeOrdinal,
     start_lba: Lba,
     values: &[L2pValue],
@@ -229,7 +235,10 @@ pub(in crate::db) fn apply_l2p_remap_range(
 
             // Buffer-first lookup matching apply_l2p_remap's path.
             let cur = if use_buffer {
-                match volume.shards[l2p_sid].l2p_buffer.lookup(lba) {
+                match volume.shards[l2p_sid]
+                    .l2p_buffer
+                    .lookup_for_open_txg(txg, lba)
+                {
                     crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
                     crate::db::l2p_buffer::BufferLookup::Tombstone => None,
                     crate::db::l2p_buffer::BufferLookup::Absent => tree.get(lba)?,
@@ -250,7 +259,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
             let prev = if use_buffer {
                 volume.shards[l2p_sid]
                     .l2p_buffer
-                    .insert(lba, new_value, lsn);
+                    .insert_at_txg(txg, lba, new_value, lsn);
                 cur
             } else {
                 tree.insert_at_lsn(lba, new_value, lsn)?

@@ -706,6 +706,17 @@ impl Db {
         let new_checkpoint_lsn =
             self.compute_min_last_flushed_lsn_after(&volumes, &selected, wal_checkpoint);
         manifest_state.manifest.checkpoint_lsn = new_checkpoint_lsn;
+        // ZFS-TXG-clone Phase 4: persist `checkpoint_txg = open_txg - 1`
+        // so a re-open's `TxgStateMachine::new(checkpoint_txg)` resumes
+        // with `open_txg = checkpoint_txg + 1` and the new open slot
+        // sits where the previous open left off. We use `open_txg - 1`
+        // rather than `checkpoint_txg()` because the live state machine
+        // only advances `checkpoint_txg` when `TxgSyncThread::mark_synced`
+        // is called — Phase 4 Step 7 ships the threads default-off, so
+        // `mark_synced` never fires unless the operator enables them.
+        // Saturating sub guards the bootstrap path where `open_txg == 1`
+        // and `checkpoint_txg = 0` is the correct durable value.
+        manifest_state.manifest.checkpoint_txg = self.txg.open_txg().saturating_sub(1);
         // Tier 2.B Stage 1: persist per-shard durable_seq alongside
         // the global checkpoint_lsn. Same inputs as the min()
         // computation above, but expanded into per-shard arrays.
