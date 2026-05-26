@@ -401,6 +401,37 @@ fn async_wal_flag_preserves_high_level_lifecycle_semantics() {
     high_level_lifecycle_semantics_under_cfg(async_wal_cfg);
 }
 
+#[test]
+fn drop_snapshot_replay_tolerates_truncated_tail_pages() {
+    let ops = vec![
+        Op::CreateVolume,
+        Op::DropVolume(1),
+        Op::Reopen,
+        Op::TakeSnapshot(3),
+        Op::DropSnapshot(1),
+        Op::Insert(7, 29, 60),
+        Op::TakeSnapshot(2),
+        Op::TakeSnapshot(2),
+        Op::DropSnapshot(3),
+        Op::Reopen,
+        Op::Insert(6, 10, 206),
+        Op::Insert(4, 14, 239),
+        Op::VerifyRange(6),
+        Op::VerifyRange(6),
+        Op::Insert(6, 28, 177),
+        Op::Insert(4, 2, 70),
+        Op::DropVolume(7),
+        Op::CreateVolume,
+        Op::Insert(5, 23, 249),
+        Op::VerifyRange(1),
+        Op::Flush,
+        Op::Reopen,
+        Op::DropSnapshot(0),
+        Op::Reopen,
+    ];
+    run_lifecycle_body(ops, false, false).unwrap();
+}
+
 fn high_level_lifecycle_semantics_under_cfg(mk_cfg: fn(&Path) -> Config) {
     let dir = TempDir::new().unwrap();
     let db = Db::create_with_config(mk_cfg(dir.path())).unwrap();

@@ -75,6 +75,7 @@ fn apply_lane_maintenance_bypasses_queued_wal_work() {
     done_rx
         .recv_timeout(std::time::Duration::from_secs(1))
         .unwrap();
+    lane.wait_for_drain();
     assert_eq!(*order.lock().unwrap(), vec![1, 99, 2]);
     assert_eq!(lane.last_applied_lsn(), 2);
 }

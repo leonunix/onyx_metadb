@@ -189,7 +189,19 @@ pub(in crate::db) fn apply_drop_snapshot_pages(
     let mut pages_freed: usize = 0;
 
     for &pid in pages {
-        let mut page = page_store.read_page_unchecked(pid)?;
+        let mut page = match page_store.read_page_unchecked(pid) {
+            Ok(page) => page,
+            Err(MetaDbError::PageOutOfRange(out_of_range)) if out_of_range == pid => {
+                // A prior replay may already have freed a tail page and
+                // `PageStore::open` may then have truncated that zero/Free
+                // suffix below this pid. Replaying the same DropSnapshot /
+                // DropVolume WAL record is still idempotent: the page is
+                // gone because this very cascade already completed.
+                pages_freed += 1;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         if page.bytes().iter().all(|b| *b == 0) {
             // `free_idempotent` punches freed pages after writing the
             // Free header. On reopen, a page already processed by a
