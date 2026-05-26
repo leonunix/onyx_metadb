@@ -406,6 +406,19 @@ impl Db {
             return Err(err);
         }
 
+        // Phase 4 gate-shrink: record this lifecycle op's WAL LSNs into
+        // `slot_max_lsn(open_txg)` so `run_sync_cycle_body`'s
+        // `wal_checkpoint = slot_max_lsn(txg)` watermark reflects them.
+        // Must be entered AFTER `flush_with_gate(Forced)` returns —
+        // that call rolls the current Open TXG; entering before would
+        // race `roll_to_quiescing` waiting for `inflight == 0`.
+        // Range delete submits one WAL record per chunk; the guard is
+        // entered once and `record_lsn` is called per chunk inside the
+        // submit loop. Only the final lsn actually matters
+        // (slot_max_lsn is max-monotonic), but stamping per chunk keeps
+        // the metric tight and costs nothing.
+        let _txg_guard = self.txg.enter();
+
         let apply_gate_started = std::time::Instant::now();
         let _apply_guard = self.apply_gate.write();
         self.metrics
@@ -513,6 +526,7 @@ impl Db {
                     return Err(err);
                 }
             };
+            _txg_guard.record_lsn(lsn);
             if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
                 self.metrics
                     .record_range_delete_error(total_started.elapsed());

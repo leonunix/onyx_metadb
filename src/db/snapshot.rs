@@ -277,6 +277,13 @@ impl Db {
         // deadlock against our outer hold. See `take_snapshot` for the
         // full rationale.
         self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
+        // Phase 4 gate-shrink: record this lifecycle op's WAL LSN into
+        // `slot_max_lsn(open_txg)` so `run_sync_cycle_body`'s
+        // `wal_checkpoint = slot_max_lsn(txg)` watermark reflects it.
+        // Must be entered AFTER `flush_with_gate(Forced)` returns —
+        // that call rolls the current Open TXG; entering before would
+        // race `roll_to_quiescing` waiting for `inflight == 0`.
+        let _txg_guard = self.txg.enter();
         let _apply_guard = self.apply_gate.write();
         let _view_guard = self.snapshot_views.write();
 
@@ -510,6 +517,7 @@ impl Db {
             None,
             crate::wal::set::SubmitOptions::default(),
         )?;
+        _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Block until every prior LSN has applied. Under our locks,

@@ -806,6 +806,22 @@ impl Db {
             txg_quiesce: Mutex::new(None),
             txg_sync: Mutex::new(None),
         };
+        // Stamp `slot_max_lsn(open_txg)` with the post-replay
+        // `last_applied`. `apply_replay_batch` and `apply_op_bare` fold
+        // every replayed op into `manifest.checkpoint_txg + 1` without
+        // going through `TxgGuard::record_lsn`, so without this stamp
+        // `slot_max_lsn(open_txg)` would be 0 — which would regress
+        // `manifest.checkpoint_lsn` to 0 on the next flush body that
+        // reads `wal_checkpoint = self.txg.slot_max_lsn(txg)`.
+        //
+        // Stamping is safe before any commit thread starts: the
+        // commit path's own `record_lsn` is max-monotonic, so a later
+        // commit with `lsn > last_applied` correctly bumps the slot.
+        // We also stamp when nothing was replayed (so `last_applied =
+        // manifest.checkpoint_lsn`); that keeps the very first flush's
+        // `wal_checkpoint` >= the durable manifest's `checkpoint_lsn`
+        // even on a clean open with no commits yet.
+        db.txg.record_lsn(db.txg.open_txg(), last_applied);
         db.recompute_all_snap_infos();
         // Spawn refcount drainers AFTER WAL replay finished above so
         // the drainer never observes mid-replay state.

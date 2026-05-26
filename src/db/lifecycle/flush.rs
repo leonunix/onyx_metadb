@@ -306,24 +306,50 @@ impl Db {
     /// `(manifest, last_flushed_lsn)` pair stays consistent against
     /// other `apply_gate.write()` holders.
     ///
-    /// `txg` is also threaded through the manifest commit so the
-    /// persisted `checkpoint_txg` reflects the slot just synced; a
-    /// future revision can swap `wal_checkpoint = last_applied_lsn`
-    /// for `txg.slot_max_lsn(txg)` once the recovery TXG-stamp gap is
-    /// closed (currently `apply_replay_batch` doesn't go through
-    /// `TxgGuard::record_lsn`, so `slot_max_lsn(replay_open_txg)` is 0
-    /// after recovery).
+    /// `txg` is threaded through to the body. `wal_checkpoint` is now
+    /// read from `self.txg.slot_max_lsn(txg)` (was
+    /// `last_applied_lsn`). Reasons:
+    ///
+    /// - `slot_max_lsn(txg)` is **frozen** for the Syncing slot:
+    ///   `promote_to_syncing` precondition is `inflight == 0` and
+    ///   `record_lsn` cannot fire on a non-Open slot. By contrast
+    ///   `last_applied_lsn` can advance during the gateless sample if
+    ///   a commit stamped to a later TXG completes its apply.
+    /// - `slot_max_lsn(txg)` precisely delineates "the LSNs in THIS
+    ///   TXG"; any commit stamped to TXG > `txg` belongs to a future
+    ///   sync, not this one.
+    ///
+    /// Post-recovery: `apply_replay_batch` does NOT go through
+    /// `TxgGuard::record_lsn`, so without intervention
+    /// `slot_max_lsn(open_txg)` would be 0 after replay.
+    /// [`Db::open_with_config_and_faults`] stamps the open slot with
+    /// the post-replay `last_applied` LSN right after constructing the
+    /// `TxgStateMachine`, closing that gap. The
+    /// `compute_min_last_flushed_lsn_after` projection still uses
+    /// `max(wal_checkpoint, prev)` per shard as defense-in-depth.
+    ///
+    /// Lifecycle ops (drop_snapshot / drop_volume / clone_volume /
+    /// create_volume / range_delete) symmetrically enter
+    /// `self.txg.enter()` after their forced sync barrier and call
+    /// `_txg_guard.record_lsn(lsn)` after `submit_wal_ops`, so their
+    /// LSNs land in `slot_max_lsn(open_txg)` exactly like the
+    /// `commit_ops` hot path. Without that, the lifecycle WAL records
+    /// would never reach `wal_checkpoint` and `prune_all_segments`
+    /// would leave their segments alive forever.
     pub(crate) fn run_sync_cycle(
         &self,
         txg: crate::types::Txg,
         kind: crate::metrics::FlushKind,
     ) -> Result<()> {
-        let _ = txg;
-        self.run_sync_cycle_body(kind)?;
+        self.run_sync_cycle_body(txg, kind)?;
         Ok(())
     }
 
-    fn run_sync_cycle_body(&self, kind: crate::metrics::FlushKind) -> Result<()> {
+    fn run_sync_cycle_body(
+        &self,
+        txg: crate::types::Txg,
+        kind: crate::metrics::FlushKind,
+    ) -> Result<()> {
         // ZFS-TXG-clone Phase 4 gate-shrink (final): the SAMPLE phase
         // runs gateless. The serialisation it used to get from
         // `apply_gate.write()` is now provided by:
@@ -403,18 +429,30 @@ impl Db {
         self.force_compact_l2p_buffers()?;
 
         let sample_started = std::time::Instant::now();
-        // With no sample-phase gate, `last_applied_lsn` can still
-        // advance during the sample. That is acceptable: every commit
-        // that lands during the sample has its tree mutation applied
-        // by its own per-shard `tree.write()` apply lane, and either
-        // we've already crossed that shard in this round (in which
-        // case its dirty Arc is captured in `Checkpoint::dirty` and
-        // gets written; `last_applied_lsn` reflects an LSN whose
-        // payload IS on the durability path) or we haven't (in which
-        // case the post-manifest `fetch_max(wal_checkpoint)` projection
-        // keeps the shard's `last_flushed_lsn` at the prior value
-        // until the next round catches it).
-        let wal_checkpoint = *self.last_applied_lsn.lock();
+        // `slot_max_lsn(txg)` is the TXG-frozen high-water LSN of
+        // commits stamped to the Syncing slot. `promote_to_syncing`
+        // closed the slot to new `record_lsn` calls before this body
+        // runs, and `roll_to_quiescing` already drained the inflight
+        // commits (each commit holds its `TxgGuard` across submit +
+        // apply + finish_global_apply), so by the time we read this
+        // every commit in TXG `txg` has completed its tree mutation
+        // and the value is stable for the rest of the sync cycle.
+        //
+        // We deliberately do NOT read `self.last_applied_lsn` here —
+        // it can include commits stamped to TXGs > `txg` (the new
+        // Open slot opened by `roll_to_quiescing`), which belong to a
+        // future sync, not this one. Using `slot_max_lsn(txg)` keeps
+        // each TXG's WAL prune watermark cleanly bounded by its own
+        // stamps.
+        //
+        // Recovery: `apply_replay_batch` does NOT call `record_lsn`
+        // on a TxgGuard, so without intervention `slot_max_lsn(open_txg)`
+        // would be 0 after replay. `Db::open_with_config_and_faults`
+        // stamps the open slot with the post-replay `last_applied` LSN
+        // (see Cut 2 below). The `compute_min_last_flushed_lsn_after`
+        // projection still uses `max(wal_checkpoint, prev)` per shard
+        // as defense-in-depth.
+        let wal_checkpoint = self.txg.slot_max_lsn(txg);
         let volumes = self.volumes_snapshot();
         // Decide which shards this round samples. Forced flushes
         // (`flush()`, snapshot, shutdown) always select everything;

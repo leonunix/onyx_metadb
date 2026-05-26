@@ -36,6 +36,13 @@ impl Db {
         // required (no whole-page rc RMW happens here) but kept so the
         // lifecycle API has a uniform shape.
         self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
+        // Phase 4 gate-shrink: record this lifecycle op's WAL LSN into
+        // `slot_max_lsn(open_txg)` so `run_sync_cycle_body`'s
+        // `wal_checkpoint = slot_max_lsn(txg)` watermark reflects it.
+        // Must be entered AFTER `flush_with_gate(Forced)` returns —
+        // that call rolls the current Open TXG; entering before would
+        // race `roll_to_quiescing` waiting for `inflight == 0`.
+        let _txg_guard = self.txg.enter();
         let _apply_guard = self.apply_gate.write();
 
         let (ord, shard_count) = {
@@ -88,6 +95,7 @@ impl Db {
             None,
             crate::wal::set::SubmitOptions::default(),
         )?;
+        _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Under our two write gates no other commit is between submit
@@ -194,6 +202,13 @@ impl Db {
         // otherwise the sync thread's manifest-commit gate would
         // deadlock against our outer hold.
         self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
+        // Phase 4 gate-shrink: record this lifecycle op's WAL LSN into
+        // `slot_max_lsn(open_txg)` so `run_sync_cycle_body`'s
+        // `wal_checkpoint = slot_max_lsn(txg)` watermark reflects it.
+        // Must be entered AFTER `flush_with_gate(Forced)` returns —
+        // that call rolls the current Open TXG; entering before would
+        // race `roll_to_quiescing` waiting for `inflight == 0`.
+        let _txg_guard = self.txg.enter();
         let _apply_guard = self.apply_gate.write();
         let _view_guard = self.snapshot_views.write();
 
@@ -340,6 +355,7 @@ impl Db {
             None,
             crate::wal::set::SubmitOptions::default(),
         )?;
+        _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
         // Fault window specific to drop_volume: WAL record durable, no
         // page decref has touched disk yet. Recovery re-drives the full
@@ -430,6 +446,13 @@ impl Db {
         // Forced TXG sync before apply_gate.write to avoid the threaded
         // sync thread's manifest-commit gate deadlocking against us.
         self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
+        // Phase 4 gate-shrink: record this lifecycle op's WAL LSN into
+        // `slot_max_lsn(open_txg)` so `run_sync_cycle_body`'s
+        // `wal_checkpoint = slot_max_lsn(txg)` watermark reflects it.
+        // Must be entered AFTER `flush_with_gate(Forced)` returns —
+        // that call rolls the current Open TXG; entering before would
+        // race `roll_to_quiescing` waiting for `inflight == 0`.
+        let _txg_guard = self.txg.enter();
         let _apply_guard = self.apply_gate.write();
 
         // Resolve the snapshot entry + allocate the new ord under the
@@ -498,6 +521,7 @@ impl Db {
             None,
             crate::wal::set::SubmitOptions::default(),
         )?;
+        _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Under our two write gates no other commit sits between submit
