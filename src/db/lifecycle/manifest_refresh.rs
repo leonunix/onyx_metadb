@@ -143,19 +143,23 @@ pub(in crate::db::lifecycle) fn refresh_manifest_durable_seq(
             entry.l2p_shard_durable_seq = vec![0; vol.shards.len()].into_boxed_slice();
         }
         for (s_idx, shard) in vol.shards.iter().enumerate() {
+            let prev = shard.last_flushed_lsn.load(Ordering::Acquire);
+            // Phase 4 gate-shrink: `wal_checkpoint = slot_max_lsn(txg)`
+            // can be 0 if the Syncing slot had no commits. Use
+            // `max(wal_checkpoint, prev)` for selected shards so
+            // durable_seq is monotonically non-decreasing — matches
+            // the projection in `compute_min_last_flushed_lsn_after`
+            // and the `fetch_max` atomic store post-manifest.
             let tree_lsn = if selected.l2p[v_idx][s_idx] {
-                wal_checkpoint
+                wal_checkpoint.max(prev)
             } else {
-                shard.last_flushed_lsn.load(Ordering::Acquire)
+                prev
             };
             // Same B2 buffer term as `compute_min_last_flushed_lsn_after`:
             // any uncompacted buffer entry represents committed-but-
             // not-tree-durable state; WAL replay rebuilds it, so the
             // per-shard durable_seq must not advance past
-            // `buffer.compacted_lsn`. `flush_with_gate` force-compacts
-            // before this runs so the term equals `last_applied_lsn`
-            // in normal flushes; it's the safety net for paths that
-            // skip force-compact.
+            // `buffer.compacted_lsn`.
             let lsn = if shard.use_buffer {
                 tree_lsn.min(shard.l2p_buffer.compacted_lsn())
             } else {
@@ -168,10 +172,11 @@ pub(in crate::db::lifecycle) fn refresh_manifest_durable_seq(
         manifest.refcount_durable_seq = vec![0; refcount_shards.len()].into_boxed_slice();
     }
     for (s_idx, shard) in refcount_shards.iter().enumerate() {
+        let prev = shard.last_flushed_lsn.load(Ordering::Acquire);
         let lsn = if selected.rc[s_idx] {
-            wal_checkpoint
+            wal_checkpoint.max(prev)
         } else {
-            shard.last_flushed_lsn.load(Ordering::Acquire)
+            prev
         };
         manifest.refcount_durable_seq[s_idx] = lsn;
     }

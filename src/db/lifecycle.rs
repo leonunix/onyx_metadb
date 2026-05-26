@@ -64,10 +64,12 @@ struct CheckpointInstallReceiver {
 }
 
 /// One volume's drained dead-list records during a flush round.
-/// Carried from the drain step (under `apply_gate.write()`) through
-/// segment build + IO + manifest commit. On any failure between drain
-/// and commit, `records` is moved back into the volume's buffer via
-/// `restore_front` (see [`crate::deadlist::DeadListState::restore_front`]).
+/// Carried from the drain step (under the sample-phase
+/// `apply_gate.write()`, with `death_lsn <= wal_checkpoint` filter
+/// for defense-in-depth) through segment build + IO + manifest commit.
+/// On any failure between drain and commit, `records` is moved back
+/// into the volume's buffer via `restore_front` (see
+/// [`crate::deadlist::DeadListState::restore_front`]).
 struct DeadListDrainEntry {
     vol: Arc<Volume>,
     records: Vec<crate::deadlist::DeadRecord>,

@@ -5,9 +5,13 @@
 //! # Concurrency
 //!
 //! Apply path pushes into [`DeadListState::push`] under `apply_gate.read()`.
-//! Checkpoint flush drains via [`DeadListState::drain`] under
-//! `apply_gate.write()`, so the buffer cannot race new apply ops at drain
-//! time. The internal `Mutex` only guards the `Vec` itself.
+//! Checkpoint flush drains via [`DeadListState::drain`] /
+//! [`DeadListState::drain_up_to_lsn`] under `apply_gate.write()` held by
+//! the flush's sample phase, so no concurrent apply pushes during the
+//! drain. The internal `Mutex<Vec<_>>` makes push/drain atomic; the
+//! gate is what bounds `death_lsn` of drained records to
+//! `<= wal_checkpoint`, which is what keeps the segment chain's
+//! "max_lsn strictly older going backward" invariant true.
 //!
 //! # On-disk layout
 //!
@@ -66,6 +70,31 @@ impl DeadListState {
 
     pub fn drain(&self) -> Vec<DeadRecord> {
         std::mem::take(&mut *self.records.lock())
+    }
+
+    /// Drain only records with `death_lsn <= max_lsn`; keep the rest
+    /// in the buffer for a later flush. Used by `run_sync_cycle`'s
+    /// gate-free sample phase: concurrent apply for commits stamped to
+    /// `open_txg > syncing_txg` may keep pushing `DeadRecord`s with
+    /// `death_lsn > wal_checkpoint` during / after the drain, and
+    /// folding those into this flush's segment would produce a chain
+    /// whose `max_lsn` overlaps the next flush's `min_lsn` (the
+    /// "chain must be strictly older going backward" invariant in
+    /// [`crate::verify`]).
+    pub fn drain_up_to_lsn(&self, max_lsn: Lsn) -> Vec<DeadRecord> {
+        let mut guard = self.records.lock();
+        let buffered = std::mem::take(&mut *guard);
+        let mut taken: Vec<DeadRecord> = Vec::with_capacity(buffered.len());
+        let mut keep: Vec<DeadRecord> = Vec::new();
+        for rec in buffered {
+            if rec.death_lsn <= max_lsn {
+                taken.push(rec);
+            } else {
+                keep.push(rec);
+            }
+        }
+        *guard = keep;
+        taken
     }
 
     /// Return drained records to the head of the buffer in their original

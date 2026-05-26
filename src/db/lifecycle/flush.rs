@@ -285,13 +285,24 @@ impl Db {
     /// the `TxgSyncThread`'s `sync_work` callback can drive it via
     /// `Weak<Db>` upgrade.
     ///
-    /// The `txg` parameter identifies which TXG slot the caller has
-    /// already promoted to Syncing in the state machine; the body
-    /// doesn't yet consult it directly (the conservative path still
-    /// uses `apply_gate.write()` + `last_applied_lsn` for the
-    /// wal_checkpoint sample), but it's threaded through so the
-    /// future "shrink apply_gate.write to manifest commit only"
-    /// optimisation can swap in `txg.slot_max_lsn(txg)`.
+    /// `txg` identifies the slot the caller has already promoted to
+    /// Syncing in the state machine. The body holds `apply_gate.write()`
+    /// across the sample phase (matches pre-Step-8 behaviour — the
+    /// snapshot / range_delete paths still race the sample's IO
+    /// otherwise), then drops it for IO, then re-acquires it around
+    /// the manifest commit + post-manifest atomics bump so the on-disk
+    /// `(manifest, last_flushed_lsn)` pair stays consistent and the
+    /// commit orders against other `apply_gate.write()` holders
+    /// (snapshot / range_delete / drop_volume / drop_snapshot /
+    /// async_reclaim GC). The manifest-commit gate window is the new
+    /// behaviour vs pre-Step-8 (which left the manifest commit
+    /// completely ungated).
+    ///
+    /// `txg` is also threaded through the manifest commit so the
+    /// persisted `checkpoint_txg` reflects the slot just synced; a
+    /// future revision can swap `wal_checkpoint = last_applied_lsn`
+    /// for `txg.slot_max_lsn(txg)` once the snapshot path is also
+    /// TXG-aware.
     pub(crate) fn run_sync_cycle(
         &self,
         txg: crate::types::Txg,
@@ -303,42 +314,45 @@ impl Db {
     }
 
     fn run_sync_cycle_body(&self, kind: crate::metrics::FlushKind) -> Result<()> {
-        // Exclude every in-flight apply phase only while sampling the
-        // checkpoint boundary. Each tree protects the private pages in
-        // the sampled roots before we drop its shard lock; later commits
-        // COW away from those pages, so dirty page IO can run without
-        // holding either the global gate or every shard lock.
+        // ZFS-TXG-clone Phase 4 gate-shrink (partial): the SAMPLE phase
+        // continues to run under `apply_gate.write()` to preserve the
+        // serialization the snapshot / range_delete / drop_volume paths
+        // depend on. Without it, snapshot's `atomic_incref` on a tree
+        // root page would race the dirty-Arc write in this flush's IO
+        // phase — both persist the same page header, last writer wins,
+        // and the snapshot's refcount bump gets lost (DropSnapshot then
+        // hits "page already at refcount 0"). The original Phase 4 plan
+        // to drop the sample-phase gate needs the snapshot path to be
+        // TXG-aware first; deferred. What this revision DOES win:
+        //
+        // - `apply_gate.write()` is RE-acquired around the manifest
+        //   commit + post-manifest atomics bump so the on-disk
+        //   `(manifest, last_flushed_lsn)` pair stays consistent
+        //   against other `apply_gate.write()` holders — fixes a
+        //   pre-existing race where snapshot / drop_volume could
+        //   manifest-commit between this flush's IO and its manifest
+        //   commit, leaving stale checkpoint metadata.
+        // - Dead-list drain takes only records with
+        //   `death_lsn <= wal_checkpoint` (defensive — the sample-phase
+        //   gate already blocks new pushes, but the filter keeps the
+        //   chain-monotonicity invariant correct under future paths
+        //   that may drop the gate).
+        // - `compute_min_last_flushed_lsn_after` and
+        //   `refresh_manifest_durable_seq` use `max(wal_checkpoint,
+        //   prev)` per shard, and the post-manifest atomic store is
+        //   `fetch_max` instead of `store` — never regresses an
+        //   individual shard's durability (defensive against
+        //   non-monotonic `wal_checkpoint` sources).
         //
         // `kind` separates the steady-state `try_flush()` cadence from
         // forced `flush()` (shutdown drain, explicit force_checkpoint)
         // in the metrics — `flush_sample_max_us_steady` excludes the
         // shutdown blast that otherwise dominates the aggregate max.
-        //
-        // Pre-Step-8 the body itself made the try_write vs blocking
-        // decision based on `kind`. The outer `flush_with_gate` now
-        // owns the "is now a good moment" decision (and for the
-        // threaded path the sync thread is the sole caller, so the
-        // decision is always Forced-equivalent). The body therefore
-        // unconditionally blocks on `apply_gate.write()` here — by
-        // the time we land in this function the caller has already
-        // committed to the sync.
         self.metrics.record_flush_attempt(kind);
         let flush_started = std::time::Instant::now();
         let gate_started = std::time::Instant::now();
-        let apply_guard = self.apply_gate.write();
+        let sample_gate = self.apply_gate.write();
         self.metrics.record_flush_gate_wait(gate_started.elapsed());
-
-        // B2: force-compact all L2P buffers so the sample phase
-        // observes a tree that reflects every committed LSN up to
-        // `last_applied_lsn`. After this call, each shard's
-        // `buffer.compacted_lsn` matches its tree's last applied
-        // generation, so `compute_min_last_flushed_lsn_after` can
-        // safely use `wal_checkpoint` as a per-shard projected LSN
-        // without underestimating durability. Holding
-        // `apply_gate.write()` above ensures no concurrent commits
-        // can re-populate the buffer between this call and the
-        // sample step. No-op when `l2p_buffer_enabled = false`.
-        self.force_compact_l2p_buffers()?;
 
         // RAII guard: every refcount shard's `begin_checkpoint` below
         // preempts that shard's drainer (priority-3 drainer-mode). The
@@ -355,22 +369,42 @@ impl Db {
         let _drainer_resume_guard = RcDrainerResumeGuard {
             shards: &self.refcount_shards,
         };
+
+        // B2: force-compact all L2P buffers so the sample phase
+        // observes a tree that reflects every committed LSN up to
+        // `last_applied_lsn`. After this call, each shard's
+        // `buffer.compacted_lsn` matches its tree's last applied
+        // generation. Sample-phase `apply_gate.write()` above blocks
+        // concurrent commits from re-populating any slot mid-drain.
+        self.force_compact_l2p_buffers()?;
+
         let sample_started = std::time::Instant::now();
+        // Sample-phase apply_gate.write() above prevents new applies
+        // from advancing `last_applied_lsn`, so this snapshot is the
+        // high water LSN of completed-apply commits.
+        let wal_checkpoint = *self.last_applied_lsn.lock();
         let volumes = self.volumes_snapshot();
         // Decide which shards this round samples. Forced flushes
         // (`flush()`, snapshot, shutdown) always select everything;
         // steady-state `try_flush()` honours the budget cap.
         let selected = self
             .select_shards_for_flush(&volumes, matches!(kind, crate::metrics::FlushKind::Forced));
-        // Drain per-volume dead-list buffers while still holding
-        // `apply_gate.write()` — late drainers would race new apply
-        // ops pushing into the same buffer. The drained records are
-        // either flushed to a new segment below (then committed via
-        // the manifest tail/head atomics post-sync) or restored to
-        // the front of the buffer if any subsequent step fails.
+        // Drain per-volume dead-list buffers. `DeadListState`'s internal
+        // `Mutex<Vec<_>>` makes push/drain atomic. With the sample-phase
+        // gate held above, no concurrent apply can push records during
+        // this drain, so every drained record has `death_lsn <=
+        // wal_checkpoint` already. The `drain_up_to_lsn(wal_checkpoint)`
+        // filter is defensive — it stays correct under any future path
+        // that drops the sample-phase gate (the "chain must be strictly
+        // older going backward" invariant in [`crate::verify`] requires
+        // segment `min_lsn` to exceed the prior segment's `max_lsn`).
+        //
+        // `manifest_state.lock()` (acquired in the gate window below)
+        // serialises flush-vs-flush so the `old_head` / `old_tail`
+        // snapshot here matches what gets promoted post-commit.
         let mut drained_deadlists: Vec<DeadListDrainEntry> = Vec::new();
         for vol in &volumes {
-            let records = vol.dead_list.drain();
+            let records = vol.dead_list.drain_up_to_lsn(wal_checkpoint);
             if records.is_empty() {
                 continue;
             }
@@ -387,9 +421,9 @@ impl Db {
         }
         if selected.is_empty() && drained_deadlists.is_empty() {
             // Nothing dirty enough to flush this round. Bail out
-            // before locking any shards — release the gate and
-            // record an empty sample. Caller will retry next tick.
-            drop(apply_guard);
+            // before locking any shards. `sample_gate` and
+            // `_drainer_resume_guard` drop at scope end.
+            drop(sample_gate);
             self.metrics
                 .record_flush_sample(kind, sample_started.elapsed());
             self.metrics
@@ -400,7 +434,6 @@ impl Db {
         let mut l2p_guards = lock_selected_l2p_shards_for(&volumes, &selected.l2p);
         let lock_elapsed = lock_started.elapsed();
         let tree_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
-        let wal_checkpoint = *self.last_applied_lsn.lock();
         let l2p_walk_started = std::time::Instant::now();
         // Sparse per-(volume, shard) checkpoint vector. `None`
         // entries are unselected shards: their root in the manifest
@@ -426,8 +459,8 @@ impl Db {
         debug_assert!(guard_iter.next().is_none());
         let l2p_walk_elapsed = l2p_walk_started.elapsed();
         // Refcount sample: drain delta + stage sealed pages in memory.
-        // No disk IO under the gate. Meta-chain rewrite + page writes
-        // happen in the IO phase below; install runs post-manifest.
+        // No disk IO. Meta-chain rewrite + page writes happen in the
+        // IO phase below; install runs post-manifest.
         //
         // Per-shard `begin_checkpoint` is independent — each shard
         // touches only its own DeltaMap, page_table, overlay, and
@@ -437,6 +470,12 @@ impl Db {
         // saturation at the observed ~7.5k alloc/s. Parallelizing across
         // shards collapses the previously-serial 16× cost into one
         // shard's worth (modulo any skew).
+        //
+        // Runs under the sample-phase `apply_gate.write()` held above,
+        // so `RcShard::stage` from concurrent commits is excluded —
+        // see the "Refcount drainer layer atomicity" memory for the
+        // lock-order invariants that would otherwise need to carry
+        // the race themselves.
         //
         // Sparse over `selected.rc`: only spawn threads for selected
         // shards; unselected slots remain `None`. Failure handling
@@ -487,7 +526,6 @@ impl Db {
                 .rc
                 .abort_checkpoint(ckpt, wal_checkpoint);
         }
-        drop(apply_guard);
         self.metrics
             .record_flush_sample(kind, sample_started.elapsed());
         self.metrics.record_flush_sample_breakdown(
@@ -497,9 +535,8 @@ impl Db {
         );
         // Sample workload size: L2P dirty pages snapshotted, refcount
         // delta entries drained, fresh refcount data pages allocated.
-        // Recorded after gate release so the cost of these accessors
-        // doesn't extend the gate hold time. Lets dashboards correlate
-        // sample wall-time growth with workload-size growth.
+        // Lets dashboards correlate sample wall-time growth with
+        // workload-size growth.
         let l2p_dirty_pages: usize = l2p_checkpoints
             .iter()
             .flat_map(|cps| cps.iter())
@@ -525,12 +562,19 @@ impl Db {
             // Roll back every L2P + RC checkpoint that this partial
             // sample successfully produced; the unselected `None`
             // slots are no-ops in the sparse aborters.
+            drop(sample_gate);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             return Err(err);
         }
+        // Release the sample-phase gate before IO. IO runs without the
+        // gate (matches pre-Step-8 behaviour); concurrent commits can
+        // resume and the dirty page Arcs we hold in the checkpoints
+        // make the IO independent of further tree mutations. The
+        // manifest commit + atomics bump below re-acquires the gate.
+        drop(sample_gate);
 
         let io_started = std::time::Instant::now();
         let mut total_pages_written = 0usize;
@@ -757,6 +801,29 @@ impl Db {
             .collect();
 
         let manifest_started = std::time::Instant::now();
+        // ZFS-TXG-clone Phase 4 gate-shrink: this is the only point in
+        // `run_sync_cycle_body` that acquires `apply_gate.write()`. The
+        // window covers manifest commit prep, `wal.fsync_all_lanes()`,
+        // `manifest_state.store.commit`, dead-list head/tail promotion,
+        // the per-shard `last_flushed_lsn.store(wal_checkpoint, ...)`
+        // loop, and the `unlogged_pending_lsn` clear. Rationale:
+        //
+        // - Serializes the manifest commit against other
+        //   `apply_gate.write()` holders (snapshot / range_delete /
+        //   drop_volume / drop_snapshot / `async_reclaim` GC) so the
+        //   on-disk `(manifest, atomics)` pair stays consistent and
+        //   so readers never observe a transient half-bumped state.
+        // - Blocks new apply across `fsync_all_lanes` — so no commit
+        //   at LSN > `wal_checkpoint` can complete its apply between
+        //   the fsync and the manifest commit (which would violate
+        //   "manifest checkpoint_lsn reflects a strict prefix of
+        //   applied ops").
+        // - Releases before IO-heavy post-manifest work (RC meta
+        //   install, L2P checkpoint install via apply lanes, reclaim,
+        //   WAL prune) — those paths take their own per-shard locks.
+        let gate_started = std::time::Instant::now();
+        let apply_guard = self.apply_gate.write();
+        self.metrics.record_flush_gate_wait(gate_started.elapsed());
         let mut manifest_state = self.manifest_state.lock();
         let dedup_update = match self
             .prepare_dedup_manifest_update(&mut manifest_state.manifest, tree_generation)
@@ -768,6 +835,7 @@ impl Db {
                 self.metrics
                     .record_flush_total(kind, flush_started.elapsed());
                 drop(manifest_state);
+                drop(apply_guard);
                 self.rollback_dead_list_drain(
                     &mut drained_deadlists,
                     &dead_list_plans,
@@ -787,6 +855,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
+            drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
@@ -804,6 +873,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
+            drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
@@ -854,6 +924,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
+            drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
@@ -871,22 +942,21 @@ impl Db {
         // leave the manifest pointing at LSNs whose WAL bodies were
         // lost.
         //
-        // The fsync timing is provably safe via the
-        // `apply_gate.write()` barrier this function holds: every
-        // LSN ≤ `wal_checkpoint` (sampled at flush.rs ~line 284) has
-        // completed `finish_global_apply`, which is gated on
-        // `wal.submit*().wait()` returning, which means the writer
-        // thread has at minimum executed `seg.append(&buf)` (body in
-        // OS page cache). `fsync_all_lanes` after the sample makes
-        // those bytes durable. With sync-only submits this is a
-        // no-op double-fsync (writer already fsynced per-batch); with
-        // async submits it is the only fsync.
+        // Phase 4 gate-shrink note: the fsync runs under the narrow
+        // `apply_gate.write()` window acquired just above, so no
+        // commit at `LSN > wal_checkpoint` can land between the fsync
+        // and the manifest commit. Without that barrier, an apply
+        // that completed (bumping `last_applied_lsn`) but whose WAL
+        // body is still in OS page cache could be silently dropped
+        // by a crash that happens after the manifest commit publishes
+        // a `checkpoint_lsn` strictly less than that apply's LSN.
         if let Err(err) = self.wal.fsync_all_lanes() {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
+            drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
@@ -898,6 +968,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
+            drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
@@ -910,6 +981,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
+            drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
@@ -942,6 +1014,13 @@ impl Db {
         // future calls to `compute_min_last_flushed_lsn` will read
         // these values back. Release ordering pairs with the
         // Acquire load in `compute_min_last_flushed_lsn`.
+        //
+        // `fetch_max` (rather than `store`) preserves monotonicity
+        // when `wal_checkpoint = slot_max_lsn(txg) = 0` (no commits
+        // in this Syncing slot): the shard's atomic stays at the
+        // higher value a previous flush established. Matches the
+        // `wal_checkpoint.max(prev)` projection in
+        // `compute_min_last_flushed_lsn_after`.
         {
             use std::sync::atomic::Ordering;
             for (v_idx, vol) in volumes.iter().enumerate() {
@@ -949,7 +1028,7 @@ impl Db {
                     if selected.l2p[v_idx][s_idx] {
                         shard
                             .last_flushed_lsn
-                            .store(wal_checkpoint, Ordering::Release);
+                            .fetch_max(wal_checkpoint, Ordering::Release);
                     }
                 }
             }
@@ -957,7 +1036,7 @@ impl Db {
                 if selected.rc[s_idx] {
                     shard
                         .last_flushed_lsn
-                        .store(wal_checkpoint, Ordering::Release);
+                        .fetch_max(wal_checkpoint, Ordering::Release);
                 }
             }
         }
@@ -967,6 +1046,11 @@ impl Db {
                 *unlogged = None;
             }
         }
+        // End of the narrow `apply_gate.write()` window. Everything
+        // below this point (RC meta install, L2P checkpoint install
+        // via apply lanes, reclaim, WAL prune) takes its own per-shard
+        // locks and does not need the global gate.
+        drop(apply_guard);
 
         // Manifest is durable. Install refcount meta chains in memory
         // so subsequent `begin_checkpoint` sees the new chain when
@@ -1222,6 +1306,15 @@ impl Db {
     /// manifest lock, before storing the new atomics (the stores
     /// can't happen before the commit because a commit failure
     /// would leave them lying).
+    ///
+    /// Phase 4 gate-shrink note: with `wal_checkpoint =
+    /// txg.slot_max_lsn(txg)`, a flush whose Syncing slot had no
+    /// commits gets `wal_checkpoint = 0`. The selected-shard
+    /// projection therefore takes `max(wal_checkpoint, prev_atomic)`
+    /// so the per-shard contribution to `min_last_flushed_lsn` never
+    /// regresses below the durability previous flushes already
+    /// established. Recovery on the next open relies on
+    /// `checkpoint_lsn` being monotonic.
     fn compute_min_last_flushed_lsn_after(
         &self,
         volumes: &[Arc<Volume>],
@@ -1232,10 +1325,11 @@ impl Db {
         let mut min_lsn = Lsn::MAX;
         for (v_idx, vol) in volumes.iter().enumerate() {
             for (s_idx, shard) in vol.shards.iter().enumerate() {
+                let prev = shard.last_flushed_lsn.load(Ordering::Acquire);
                 let candidate = if selected.l2p[v_idx][s_idx] {
-                    wal_checkpoint
+                    wal_checkpoint.max(prev)
                 } else {
-                    shard.last_flushed_lsn.load(Ordering::Acquire)
+                    prev
                 };
                 if candidate < min_lsn {
                     min_lsn = candidate;
@@ -1244,11 +1338,7 @@ impl Db {
                 // in this shard's buffer represents a committed LSN
                 // not yet durable in the tree. Crash recovery will
                 // rebuild it from WAL, so `checkpoint_lsn` must not
-                // advance past `buffer.compacted_lsn`. When
-                // `flush_with_gate` force-compacts at the top, this
-                // term equals `last_applied_lsn` and doesn't bind;
-                // it's the safety net for the (future) path where
-                // force-compact is skipped.
+                // advance past `buffer.compacted_lsn`.
                 if shard.use_buffer {
                     let buf_lsn = shard.l2p_buffer.compacted_lsn();
                     if buf_lsn < min_lsn {
@@ -1258,10 +1348,11 @@ impl Db {
             }
         }
         for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
+            let prev = shard.last_flushed_lsn.load(Ordering::Acquire);
             let candidate = if selected.rc[s_idx] {
-                wal_checkpoint
+                wal_checkpoint.max(prev)
             } else {
-                shard.last_flushed_lsn.load(Ordering::Acquire)
+                prev
             };
             if candidate < min_lsn {
                 min_lsn = candidate;
