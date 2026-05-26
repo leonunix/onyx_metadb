@@ -64,11 +64,12 @@ struct CheckpointInstallReceiver {
 }
 
 /// One volume's drained dead-list records during a flush round.
-/// Carried from the drain step (under the sample-phase
-/// `apply_gate.write()`, with `death_lsn <= wal_checkpoint` filter
-/// for defense-in-depth) through segment build + IO + manifest commit.
-/// On any failure between drain and commit, `records` is moved back
-/// into the volume's buffer via `restore_front` (see
+/// Carried from the drain step (with `death_lsn <= wal_checkpoint`
+/// filter — no sample-phase gate any more, so this filter is the
+/// load-bearing bound on what gets folded into a segment) through
+/// segment build + IO + manifest commit. On any failure between drain
+/// and commit, `records` is moved back into the volume's buffer via
+/// `restore_front` (see
 /// [`crate::deadlist::DeadListState::restore_front`]).
 struct DeadListDrainEntry {
     vol: Arc<Volume>,
@@ -455,21 +456,24 @@ impl Db {
     /// tree synchronously. Used by:
     ///
     /// - [`Db::flush_with_gate`]'s inline path (when
-    ///   `txg_threads_enabled = false`), under `apply_gate.write()`
-    ///   so no commit can stamp a new buffer entry mid-drain.
-    /// - The snapshot / `range_delete` paths, also under
-    ///   `apply_gate.write()`, to make the tree reflect every
-    ///   committed LSN before they read it.
+    ///   `txg_threads_enabled = false`). The sample-phase no longer
+    ///   holds `apply_gate.write`; serialisation against concurrent
+    ///   commits' `cow_for_write` falls on the per-shard `tree.write()`
+    ///   this helper takes.
+    /// - The snapshot / `range_delete` / `drop_volume` / `clone_volume`
+    ///   / `drop_snapshot` paths. Those paths now drive a forced TXG
+    ///   sync via `flush_with_gate(Forced)` at entry, so by the time
+    ///   they call this helper the slots are already drained — the
+    ///   call becomes a defensive no-op. `drop_gate.write` held by
+    ///   the lifecycle op then keeps slots empty.
     /// - The post-replay path in `open_with_config_and_faults`,
     ///   before any commit can race the recovered buffer state.
     ///
     /// When `txg_threads_enabled = true`, the `TxgSyncThread` is the
-    /// regular drainer (one slot per TXG cycle). Snapshot /
-    /// range_delete still call this helper to short-circuit the wait
-    /// for the next quiesce/sync cycle — both hold `apply_gate.write`
-    /// so no new commit can race, and the sync thread takes per-shard
-    /// `tree.write()` for the same race so the two drain paths
-    /// serialise per shard.
+    /// regular drainer (one slot per TXG cycle). Lifecycle ops still
+    /// call this helper as a belt-and-braces defensive drain; the
+    /// per-shard `tree.write()` serialises it against the sync thread
+    /// so the two drain paths cannot conflict.
     ///
     /// Returns the first error encountered; any successfully drained
     /// shards have already advanced their `compacted_lsn`.

@@ -394,17 +394,28 @@ impl Db {
         self.metrics
             .record_range_delete_drop_gate_wait(drop_gate_started.elapsed());
 
+        // Forced TXG sync before apply_gate.write to avoid the threaded
+        // sync thread's manifest-commit gate deadlocking against our
+        // outer apply guard. Drains pre-existing L2P Dirty Arcs so
+        // `apply_l2p_range_delete`'s rc-mutating apply cannot be
+        // clobbered by a concurrent flush IO phase. See
+        // [`Db::take_snapshot`] for the full rationale.
+        if let Err(err) = self.flush_with_gate(crate::metrics::FlushKind::Forced) {
+            self.metrics
+                .record_range_delete_error(total_started.elapsed());
+            return Err(err);
+        }
+
         let apply_gate_started = std::time::Instant::now();
         let _apply_guard = self.apply_gate.write();
         self.metrics
             .record_range_delete_apply_gate_wait(apply_gate_started.elapsed());
 
         // B2: drain L2P buffer into tree so the per-shard `tree.range`
-        // scan below sees buffer-only entries. Apply_gate.write
-        // excludes concurrent commits, so no new buffer entries land
-        // between this drain and the scan. Safe to call here because
-        // we hold no per-shard write guards yet — `force_compact_l2p_buffers`
-        // takes them one at a time. No-op when buffer disabled.
+        // scan below sees buffer-only entries. The forced sync above
+        // already did this; `drop_gate.write` keeps the slots empty.
+        // The call below is defensive — no-op in the steady case, and
+        // also a no-op when the buffer is disabled.
         if let Err(err) = self.force_compact_l2p_buffers() {
             self.metrics
                 .record_range_delete_error(total_started.elapsed());

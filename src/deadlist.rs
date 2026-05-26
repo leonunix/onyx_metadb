@@ -6,12 +6,15 @@
 //!
 //! Apply path pushes into [`DeadListState::push`] under `apply_gate.read()`.
 //! Checkpoint flush drains via [`DeadListState::drain`] /
-//! [`DeadListState::drain_up_to_lsn`] under `apply_gate.write()` held by
-//! the flush's sample phase, so no concurrent apply pushes during the
-//! drain. The internal `Mutex<Vec<_>>` makes push/drain atomic; the
-//! gate is what bounds `death_lsn` of drained records to
-//! `<= wal_checkpoint`, which is what keeps the segment chain's
-//! "max_lsn strictly older going backward" invariant true.
+//! [`DeadListState::drain_up_to_lsn`] from the flush's sample phase.
+//! That phase no longer holds `apply_gate.write()` — concurrent apply
+//! pushes ARE possible during the drain. The internal `Mutex<Vec<_>>`
+//! makes push/drain atomic at the slot level; the
+//! `drain_up_to_lsn(wal_checkpoint)` filter is what bounds `death_lsn`
+//! of drained records to `<= wal_checkpoint`, which is what keeps the
+//! segment chain's "max_lsn strictly older going backward" invariant
+//! true (a later-LSN push during the drain stays buffered for the
+//! next round).
 //!
 //! # On-disk layout
 //!

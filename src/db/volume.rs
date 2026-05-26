@@ -13,8 +13,14 @@ impl Db {
     ///   for in-flight commits to finish so our subsequent WAL submit +
     ///   `commit_cvar` wait cannot deadlock behind an LSN assigned to a
     ///   commit that hasn't reached apply yet.
-    /// - `apply_gate.write()` — excludes `flush` / `take_snapshot` /
-    ///   `drop_snapshot`.
+    /// - **Forced TXG sync** — kept for consistency with the other
+    ///   lifecycle ops, so future maintainers do not have to reason
+    ///   about a mixed model. `create_volume` itself does not perform
+    ///   any whole-page rc RMW, so the sync is not strictly required
+    ///   for correctness.
+    /// - `apply_gate.write()` — taken AFTER the forced sync. Serialises
+    ///   the WAL submit + apply against
+    ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
     ///
     /// Crash semantics:
     /// - Before WAL fsync: no effect observable.
@@ -26,6 +32,10 @@ impl Db {
     /// [`flush`](Self::flush) captures the new volumes table.
     pub fn create_volume(&self) -> Result<VolumeOrdinal> {
         let _drop_guard = self.drop_gate.write();
+        // Forced sync mirrors the other lifecycle ops. Not strictly
+        // required (no whole-page rc RMW happens here) but kept so the
+        // lifecycle API has a uniform shape.
+        self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
         let _apply_guard = self.apply_gate.write();
 
         let (ord, shard_count) = {
@@ -155,8 +165,13 @@ impl Db {
     /// - `drop_gate.write()` — excludes every `commit_ops` path. The
     ///   rc-dependent drop plan relies on no concurrent `cow_for_write`
     ///   moving rcs out from under us.
-    /// - `apply_gate.write()` — excludes `flush` / `take_snapshot` /
-    ///   `drop_snapshot` / `create_volume`.
+    /// - **Forced TXG sync** — drains pre-existing L2P Dirty Arcs to
+    ///   disk so `apply_drop_volume`'s page-decref whole-page writes
+    ///   cannot be clobbered by a concurrent flush IO phase. See
+    ///   [`Db::take_snapshot`] for the full rationale.
+    /// - `apply_gate.write()` — taken AFTER the forced sync. Serialises
+    ///   the WAL submit + apply against
+    ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
     /// - `snapshot_views.write()` — waits for outstanding
     ///   [`SnapshotView`]s to drop before any page is freed.
     ///
@@ -175,6 +190,10 @@ impl Db {
             ));
         }
         let _drop_guard = self.drop_gate.write();
+        // Drive a forced TXG sync BEFORE acquiring apply_gate.write —
+        // otherwise the sync thread's manifest-commit gate would
+        // deadlock against our outer hold.
+        self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
         let _apply_guard = self.apply_gate.write();
         let _view_guard = self.snapshot_views.write();
 
@@ -389,8 +408,13 @@ impl Db {
     /// Serialisation mirrors [`create_volume`](Self::create_volume):
     /// - `drop_gate.write()` — waits for all in-flight commits to finish
     ///   so our LSN sits right after `last_applied_lsn`.
-    /// - `apply_gate.write()` — excludes flush / take_snapshot /
-    ///   drop_snapshot.
+    /// - **Forced TXG sync** — drains pre-existing L2P Dirty Arcs so
+    ///   `apply_clone_volume_incref`'s whole-page rc bumps on each
+    ///   source root cannot be clobbered by a concurrent flush IO
+    ///   phase. See [`Db::take_snapshot`] for the rationale.
+    /// - `apply_gate.write()` — taken AFTER the forced sync. Serialises
+    ///   the WAL submit + apply against
+    ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
     ///
     /// Crash semantics:
     /// - Before WAL fsync: no effect observable.
@@ -403,6 +427,9 @@ impl Db {
     /// [`open`](Self::open) — captures the new volumes table.
     pub fn clone_volume(&self, src_snap_id: SnapshotId) -> Result<VolumeOrdinal> {
         let _drop_guard = self.drop_gate.write();
+        // Forced TXG sync before apply_gate.write to avoid the threaded
+        // sync thread's manifest-commit gate deadlocking against us.
+        self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
         let _apply_guard = self.apply_gate.write();
 
         // Resolve the snapshot entry + allocate the new ord under the

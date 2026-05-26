@@ -12,26 +12,43 @@ impl Db {
     /// shard roots + an incref on each of them so the snapshot's view
     /// outlives subsequent COW writes on the target volume.
     ///
-    /// Takes `apply_gate.write()` so `last_applied_lsn` and the shard
-    /// roots we sample below describe the same LSN point. Holds shard
-    /// mutexes for every volume for the flush-before-manifest-commit
-    /// step — checkpoint_lsn advances across all volumes, so every
-    /// volume's dirty pages must be on disk before the commit fsyncs
-    /// the manifest slot.
+    /// Serialisation:
+    /// - `drop_gate.write()` — blocks `commit_ops` so no new Dirty Arcs
+    ///   form between the forced TXG sync below and our `atomic_incref`.
+    ///   Also freezes `last_applied_lsn` so the `created_lsn` sample
+    ///   below is stable.
+    /// - **Forced TXG sync** ([`Db::flush_with_gate`] with
+    ///   [`crate::metrics::FlushKind::Forced`]) — drains every
+    ///   pre-existing L2P Dirty Arc to disk. Without this, the flush
+    ///   IO phase that captured those Arcs could clobber the on-disk
+    ///   refcount field after our `incref_root_for_snapshot` RMWs it
+    ///   (whole-page writes via `write_sealed_page_runs` bypass the
+    ///   per-pid `rc_locks` that `atomic_rc_delta` takes).
+    /// - `apply_gate.write()` — taken AFTER the forced sync (else the
+    ///   sync thread's own manifest-commit gate would deadlock against
+    ///   us). Serialises our manifest commit against
+    ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
     pub fn take_snapshot(&self, vol_ord: VolumeOrdinal) -> Result<SnapshotId> {
-        // Exclude in-flight apply phases so `last_applied_lsn` and the
-        // per-shard roots we sample below describe the same LSN point.
+        // Exclude commits so no new Dirty Arcs (or `atomic_rc_delta` RMWs)
+        // form across the forced-sync barrier and our subsequent
+        // `incref_root_for_snapshot` calls.
+        let _drop_guard = self.drop_gate.write();
+        // Drive the current Open TXG through the full sync pipeline. After
+        // this returns, every pre-existing Dirty Arc on every L2P /
+        // refcount shard is durable on disk, and no flush IO phase is
+        // in-flight. See the module-level comment for why this is the
+        // TXG-aware substitute for the old sample-phase `apply_gate.write`.
+        self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
+        // Now safe to take `apply_gate.write()` — the sync thread (if
+        // running) has already released its manifest-commit gate.
         let _apply_guard = self.apply_gate.write();
         // Resolve the target volume before touching manifest state so an
         // unknown ordinal short-circuits with a clean `InvalidArgument`.
         let target = self.volume(vol_ord)?;
-        // B2: drain L2P buffer into tree so the roots we sample below
-        // reflect every LSN ≤ last_applied_lsn. Without this,
-        // `SnapshotView.get` (which walks tree only) would miss
-        // committed-but-uncompacted writes. Compactor calls its own
-        // `tree.write()` per shard — safe here because we haven't
-        // acquired any per-shard guards yet, only apply_gate.write.
-        // No-op when `l2p_buffer_enabled = false`.
+        // Defensive: the forced sync above already drained every L2P
+        // buffer slot. `drop_gate.write` blocks new commits from
+        // inserting fresh entries. This call is therefore a no-op in
+        // practice; kept to make the post-condition explicit.
         self.force_compact_l2p_buffers()?;
         let mut manifest_state = self.manifest_state.lock();
         let volumes = self.volumes_snapshot();
@@ -234,7 +251,14 @@ impl Db {
     /// - `drop_gate.write()` — excludes every `commit_ops` path. The
     ///   rc-dependent plan walk relies on no concurrent `cow_for_write`
     ///   moving rcs out from under us.
-    /// - `apply_gate.write()` — excludes `flush` / `take_snapshot`.
+    /// - **Forced TXG sync** — drains pre-existing L2P Dirty Arcs to
+    ///   disk so the subsequent `apply_drop_snapshot_pages` whole-page
+    ///   writes (via `page_store.write_page`, which bypasses
+    ///   `rc_locks`) cannot be clobbered by a concurrent flush IO
+    ///   phase that captured those Arcs before this drop began.
+    /// - `apply_gate.write()` — taken AFTER the forced sync. Serialises
+    ///   our WAL submit + apply + manifest-side bookkeeping against
+    ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
     /// - `snapshot_views.write()` — waits for outstanding
     ///   [`SnapshotView`]s to drop before any page is freed.
     ///
@@ -248,6 +272,11 @@ impl Db {
     /// natural [`flush`](Self::flush) captures the new snapshot list.
     pub fn drop_snapshot(&self, id: SnapshotId) -> Result<Option<DropReport>> {
         let _drop_guard = self.drop_gate.write();
+        // Drive a forced TXG sync BEFORE acquiring apply_gate.write —
+        // otherwise the sync thread's manifest-commit gate would
+        // deadlock against our outer hold. See `take_snapshot` for the
+        // full rationale.
+        self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
         let _apply_guard = self.apply_gate.write();
         let _view_guard = self.snapshot_views.write();
 
