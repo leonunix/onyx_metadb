@@ -418,16 +418,19 @@ impl Config {
             // path for any commit that doesn't match the eligibility
             // check (see `commit_direct_apply_enabled` doc).
             commit_direct_apply_enabled: true,
-            // ZFS-TXG-clone Phase 2 — default off until the new
-            // `deferred_outcomes_proptest` soak gate on nvme-box passes.
-            // See `commit_deferred_outcomes_enabled` doc.
-            commit_deferred_outcomes_enabled: false,
+            // ZFS-TXG-clone Phase 2 — production default. Validated by
+            // the 8h nvme-phase23-soak (verify-clean, zero underflow,
+            // engine alive end-to-end). See `commit_deferred_outcomes_enabled` doc.
+            commit_deferred_outcomes_enabled: true,
             group_commit_max_batch_bytes: 4 * 1024 * 1024,
             group_commit_timeout_us: 1,
-            // ZFS-TXG-clone Phase 3 — default off until the
-            // `wal_async_proptest` soak gate on nvme-box passes.
-            // See `wal_async_commits_enabled` doc.
-            wal_async_commits_enabled: false,
+            // ZFS-TXG-clone Phase 3 — production default. Validated by
+            // the same 8h nvme-phase23-soak as Phase 2 (both flags ran
+            // hot together). Async-WAL durability still relies on the
+            // onyx LV2 buffer as the ZIL equivalent (see
+            // `wal_async_commits_enabled` doc); 24h SIGKILL/sysrq crash
+            // matrix is a later hardening gate, not a prerequisite.
+            wal_async_commits_enabled: true,
             wal_async_group_commit_window_us: 1000,
             page_cache_bytes: 512 * 1024 * 1024,
             lsm_memtable_bytes: 64 * 1024 * 1024,
