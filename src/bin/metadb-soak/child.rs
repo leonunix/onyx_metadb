@@ -3,7 +3,8 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
     if let Some(fault) = cfg.fault {
         faults.install(fault.point, fault.hit, fault.action);
     }
-    let db = Arc::new(open_or_create_with_faults(&cfg.path, faults).map_err(|e| e.to_string())?);
+    // Constructors already return `Arc<Db>` — no need to re-wrap.
+    let db = open_or_create_with_faults(&cfg.path, faults).map_err(|e| e.to_string())?;
 
     let deadlock_seen = Arc::new(AtomicBool::new(false));
     let deadlock_stop = Arc::new(AtomicBool::new(false));

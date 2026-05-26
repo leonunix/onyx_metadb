@@ -581,7 +581,7 @@ fn parse_hash32(s: &str) -> Result<Hash8, String> {
 
 // -------- helpers --------------------------------------------------------
 
-fn open_db(path: &Path) -> Result<Db, String> {
+fn open_db(path: &Path) -> Result<std::sync::Arc<Db>, String> {
     Db::open(path).map_err(|e| e.to_string())
 }
 

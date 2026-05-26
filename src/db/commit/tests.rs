@@ -358,7 +358,7 @@ fn two_disjoint_l2p_remap_range_commits_do_not_conflict() {
 /// quickly folded into the tree, exercising the lookup-fallthrough
 /// (read_view) leg of `apply_l2p_bucket_buffer` as well as the
 /// buffer hit leg.
-fn mk_direct_apply_db() -> (tempfile::TempDir, Db) {
+fn mk_direct_apply_db() -> (tempfile::TempDir, std::sync::Arc<Db>) {
     let dir = tempfile::TempDir::new().unwrap();
     let mut cfg = crate::config::Config::new(dir.path());
     cfg.l2p_buffer_enabled = true;
@@ -372,7 +372,7 @@ fn mk_direct_apply_db() -> (tempfile::TempDir, Db) {
 /// Same harness but with `commit_direct_apply_enabled = false`. Used
 /// for the equivalence test that compares direct- vs lane-path
 /// outcomes byte-for-byte.
-fn mk_lane_only_db() -> (tempfile::TempDir, Db) {
+fn mk_lane_only_db() -> (tempfile::TempDir, std::sync::Arc<Db>) {
     let dir = tempfile::TempDir::new().unwrap();
     let mut cfg = crate::config::Config::new(dir.path());
     cfg.l2p_buffer_enabled = true;
@@ -564,7 +564,7 @@ fn direct_apply_equivalent_to_lane_path() {
 
 // -------- ZFS-TXG-clone Phase 2: deferred outcome API --------
 
-fn mk_deferred_apply_db(deferred: bool) -> (tempfile::TempDir, Db) {
+fn mk_deferred_apply_db(deferred: bool) -> (tempfile::TempDir, std::sync::Arc<Db>) {
     let dir = tempfile::TempDir::new().unwrap();
     let mut cfg = crate::config::Config::new(dir.path());
     cfg.l2p_buffer_enabled = true;

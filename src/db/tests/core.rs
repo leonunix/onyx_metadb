@@ -267,7 +267,7 @@ fn multiple_snapshots_isolated() {
 
 // -------- B2: L2P buffer + periodic compaction --------
 
-fn mk_db_with_buffer() -> (TempDir, Db) {
+fn mk_db_with_buffer() -> (TempDir, std::sync::Arc<Db>) {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
     cfg.l2p_buffer_enabled = true;

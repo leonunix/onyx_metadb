@@ -271,7 +271,7 @@ fn phase4_lineage_gc_pins_parent_pba_via_descendant_branched_lsn() {
 
 // ── Phase 4 Step 4: GC emits WalOp::FreePbas when flag is on ──
 
-fn mk_db_with_emit_freepbas(flag: bool) -> (tempfile::TempDir, Db) {
+fn mk_db_with_emit_freepbas(flag: bool) -> (tempfile::TempDir, std::sync::Arc<Db>) {
     use crate::Config;
     let dir = tempfile::TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());

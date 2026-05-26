@@ -18,13 +18,13 @@ pub(super) fn v(n: u8) -> L2pValue {
     L2pValue(x)
 }
 
-pub(super) fn mk_db() -> (TempDir, Db) {
+pub(super) fn mk_db() -> (TempDir, std::sync::Arc<Db>) {
     let dir = TempDir::new().unwrap();
     let db = Db::create(dir.path()).unwrap();
     (dir, db)
 }
 
-pub(super) fn mk_db_with_shards(shards: u32) -> (TempDir, Db) {
+pub(super) fn mk_db_with_shards(shards: u32) -> (TempDir, std::sync::Arc<Db>) {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
     cfg.shards_per_partition = shards;
@@ -32,7 +32,7 @@ pub(super) fn mk_db_with_shards(shards: u32) -> (TempDir, Db) {
     (dir, db)
 }
 
-pub(super) fn mk_db_with_cache_bytes(page_cache_bytes: u64) -> (TempDir, Db) {
+pub(super) fn mk_db_with_cache_bytes(page_cache_bytes: u64) -> (TempDir, std::sync::Arc<Db>) {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
     cfg.page_cache_bytes = page_cache_bytes;

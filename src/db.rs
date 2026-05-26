@@ -258,18 +258,15 @@ pub struct Db {
     /// Wrapped in `Mutex` so `Drop` can take + stop the worker
     /// even from a `&self` context.
     async_reclaim: Mutex<Option<async_reclaim::AsyncReclaim>>,
-    /// B2 background compactor that drains per-shard L2P buffers into
-    /// the paged radix tree. `None` when `l2p_buffer_enabled = false`
-    /// — in that case commits write directly to the tree and the
-    /// buffer is never populated.
-    l2p_compactor: Mutex<Option<l2p_compactor::L2pCompactor>>,
-    /// Whether the B2 buffered-commit path is active. Read by
-    /// commit and read paths to decide whether to consult the L2P
-    /// buffer or go straight to the tree.
+    /// Whether the B2 buffered-commit path is active. Read by commit
+    /// and read paths to decide whether to consult the L2P buffer or
+    /// go straight to the tree. When `true`, the per-shard ring buffer
+    /// in [`crate::db::l2p_buffer::L2pBuffer`] stamps commits by their
+    /// `TxgGuard.txg`; the [`crate::db::txg_sync::TxgSyncThread`]
+    /// drains each Syncing TXG's slot into the tree (or
+    /// `flush_with_gate` does so inline when `txg_threads_enabled =
+    /// false`).
     l2p_buffer_enabled: bool,
-    /// Compactor params captured at Db construction so the worker
-    /// can be (re)started without re-reading the full Config.
-    l2p_compactor_params: l2p_compactor::L2pCompactorParams,
     /// [[no-refcount-hot-path-design]] Phase 4 Step 4. Cached copy
     /// of `Config::lineage_gc_emit_freepbas` so the GC driver
     /// (`run_lineage_gc_cycle_inner`) and the async-reclaim worker
@@ -296,14 +293,6 @@ pub struct Db {
     /// [`crate::db::commit::outcomes`] and
     /// `/root/.claude/plans/soft-doodling-snail.md`.
     deferred_outcomes: Arc<crate::db::commit::DeferredOutcomeAggregator>,
-    /// L2P compactor wake handle, shared with `deferred_outcomes` so
-    /// `stage()` can run at commit frequency rather than waiting for
-    /// the worker's `max_interval_ms` timer. `None` only when the
-    /// L2P buffer is disabled (the compactor itself is then
-    /// inactive). Held on `Db` (not just inside the compactor) so the
-    /// aggregator can hold its own `Arc` clone without taking the
-    /// `l2p_compactor` mutex on every `stage()`.
-    l2p_compactor_notifier: Option<Arc<l2p_compactor::CompactorNotifier>>,
     /// Cached copy of `Config::commit_deferred_outcomes_enabled` so the
     /// commit path can decide whether to park the outcome vec
     /// (`deferred=true`) or send it through the channel immediately
@@ -1161,7 +1150,6 @@ mod helpers;
 mod indexes;
 mod l2p;
 mod l2p_buffer;
-mod l2p_compactor;
 mod lifecycle;
 mod promotion;
 mod snapshot;
@@ -1187,24 +1175,15 @@ impl Drop for Db {
         if let Some(mut flusher) = self.l2p_writeback.lock().take() {
             flusher.stop();
         }
-        // ZFS-TXG-clone Phase 4 Step 7: stop the TXG worker pair before
-        // the L2P compactor / volume trees / page cache go away.
-        // Quiesce stops first so no new TXG enters Syncing; sync drains
-        // any in-flight cycle. Inert when `txg_threads_enabled = false`.
+        // ZFS-TXG-clone Phase 4 Step 8: stop the TXG worker pair before
+        // volume trees / page cache go away. Quiesce stops first so no
+        // new TXG enters Syncing; sync drains any in-flight cycle.
+        // Inert when `txg_threads_enabled = false`. With the legacy
+        // `L2pCompactor` retired this is the only background owner of
+        // `tree.write()` + `publish_l2p_read_view` per shard.
         self.stop_txg_threads();
-        // Stop the L2P buffer compactor before volume trees / page
-        // cache go away. The compactor holds clones of the volume
-        // map, runs `tree.write()` on shards, and calls
-        // `publish_l2p_read_view`; joining it here ensures no
-        // in-flight cycle outlives the L2pShard fields.
-        if let Some(mut worker) = self.l2p_compactor.lock().take() {
-            worker.stop();
-        }
-        // ZFS-TXG-clone Phase 2: release any deferred-outcome
-        // handles still parked in the aggregator. After the compactor
-        // has joined no further drain runs, so an awaiting `recv()`
-        // would block forever; poison_all sends an `Err` to every
-        // pending receiver instead.
+        // Phase 4 inline-delivery: nothing parks in the aggregator, so
+        // poison_all is a no-op kept only for API parity.
         self.deferred_outcomes
             .poison_all("metadb: db shutting down");
         // Stop the async reclaim worker before page_store /
@@ -1228,19 +1207,20 @@ impl Drop for Db {
 }
 
 impl Db {
-    /// Test helper: synchronously run one L2P-compactor pass on the
-    /// caller thread. Used by Phase 2 deferred-outcome tests so they
-    /// do not have to sleep waiting for the background compactor's
-    /// 25 ms wakeup. Drives the same code path as the worker thread,
-    /// including the step-7 deferred-outcome drain. Public because
-    /// the soak gate lives in an integration test
-    /// (`tests/deferred_outcomes_proptest.rs`) and proptest cases
-    /// otherwise have to busy-poll on the aggregator depth. The hook
-    /// is inert when no compactor is running.
+    /// Test helper: synchronously drain every L2P shard's TXG ring
+    /// buffer into the on-disk tree on the caller thread. Pre-Phase-4
+    /// this drove the `L2pCompactor`'s force-pass; after Step 8 the
+    /// compactor is retired, so this is now a thin alias for
+    /// [`Db::force_compact_l2p_buffers`] (the same helper the
+    /// snapshot / range_delete / [`Db::flush_with_gate`] inline path
+    /// uses to make the tree reflect every buffered LSN before
+    /// reading). Kept under the `test_*` name so the existing
+    /// commit / wal-async / deferred-outcomes proptest harnesses
+    /// continue to compile without modification.
     pub fn test_force_compact_pass(&self) {
-        if let Some(compactor) = self.l2p_compactor.lock().as_ref() {
-            compactor.force_compact_all();
-        }
+        // Inert when `l2p_buffer_enabled = false`; otherwise loops
+        // shards and drains their slots into the tree.
+        let _ = self.force_compact_l2p_buffers();
     }
 
     /// ZFS-TXG-clone Phase 4 inspection hook used by the

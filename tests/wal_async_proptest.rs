@@ -113,7 +113,7 @@ fn op_to_walop(op: &Op, fresh_pba_seed: u64) -> WalOp {
 /// Open a fresh db with deferred outcomes on + the async-WAL toggle
 /// selected by the caller. Both modes seed `NUM_VOLUMES` so the
 /// proptest can address the same ordinals across the pair.
-fn open_db_with_async(async_wal: bool) -> (TempDir, Db) {
+fn open_db_with_async(async_wal: bool) -> (TempDir, std::sync::Arc<Db>) {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
     cfg.l2p_buffer_enabled = true;

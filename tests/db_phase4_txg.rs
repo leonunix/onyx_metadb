@@ -41,27 +41,35 @@ fn open_close_with_txg_threads_enabled_is_clean() {
 #[test]
 fn checkpoint_txg_persists_across_reopen() {
     let dir = TempDir::new().unwrap();
+    let after_first_flush: u64;
     {
-        // Open with threads OFF (fastest path; we just want flush to
-        // persist `checkpoint_txg = open_txg - 1 = 0`).
+        // ZFS-TXG-clone Phase 4 Step 8: `flush_with_gate` is now a
+        // thin shell that drives `roll_to_quiescing` → `mark_synced`
+        // on every successful flush, even with threads OFF. So
+        // `checkpoint_txg` advances per flush instead of staying at
+        // the initial 0. Pre-Step-8 the test asserted == 0; the
+        // post-Step-8 invariant is "advances monotonically and
+        // persists across reopen".
         let db = Db::create(dir.path()).unwrap();
         let ord = db.create_volume().unwrap();
         db.insert(ord, 0, v(1)).unwrap();
         db.flush().unwrap();
-        // open_txg stayed at 1 throughout (no quiesce thread); flush
-        // persisted checkpoint_txg = 0.
-        assert_eq!(db.manifest().checkpoint_txg, 0);
+        after_first_flush = db.manifest().checkpoint_txg;
+        assert!(
+            after_first_flush >= 1,
+            "first flush should advance checkpoint_txg past the initial 0, got {after_first_flush}"
+        );
     }
     let db = Db::open(dir.path()).unwrap();
-    assert_eq!(db.manifest().checkpoint_txg, 0);
-    // TxgStateMachine resumes at open_txg = checkpoint_txg + 1 = 1.
-    // We can't directly read open_txg from the public API; the
-    // invariant is tested in the unit tests of the txg module.
-    // What we can assert: the resumed db keeps operating cleanly.
+    // checkpoint_txg persisted across reopen.
+    assert_eq!(db.manifest().checkpoint_txg, after_first_flush);
+    // TxgStateMachine resumes at open_txg = checkpoint_txg + 1, so a
+    // fresh flush rolls forward one more TXG and increments the
+    // persisted value by exactly 1.
     let ord = db.volumes().into_iter().find(|o| *o != 0).unwrap();
     db.insert(ord, 1, v(2)).unwrap();
     db.flush().unwrap();
-    assert_eq!(db.manifest().checkpoint_txg, 0);
+    assert_eq!(db.manifest().checkpoint_txg, after_first_flush + 1);
 }
 
 #[test]

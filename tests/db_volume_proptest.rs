@@ -28,7 +28,7 @@ use tempfile::TempDir;
 /// today; this is the regression guard for "enabling the flag does
 /// not perturb existing semantics", matching the
 /// /root/.claude/plans/soft-doodling-snail.md step-(c) brief.
-fn db_open_or_create(dir: &TempDir, deferred: bool, async_wal: bool) -> Db {
+fn db_open_or_create(dir: &TempDir, deferred: bool, async_wal: bool) -> std::sync::Arc<Db> {
     if async_wal {
         Db::create_with_config(async_wal_cfg(dir.path())).unwrap()
     } else if deferred {
@@ -137,7 +137,7 @@ impl Model {
     }
 }
 
-fn reopen(dir: &TempDir, deferred: bool, async_wal: bool) -> Db {
+fn reopen(dir: &TempDir, deferred: bool, async_wal: bool) -> std::sync::Arc<Db> {
     if async_wal {
         Db::open_with_config(async_wal_cfg(dir.path())).unwrap()
     } else if deferred {

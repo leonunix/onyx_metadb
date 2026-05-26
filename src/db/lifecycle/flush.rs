@@ -182,7 +182,127 @@ impl Db {
         self.flush_with_gate(crate::metrics::FlushKind::Steady)
     }
 
+    /// ZFS-TXG-clone Phase 4 Step 8: `flush_with_gate` is now a thin
+    /// shell. The actual per-TXG sync work lives in
+    /// [`Db::run_sync_cycle`]. Two modes:
+    ///
+    /// - **`txg_threads_enabled = true`** (production default): force
+    ///   the [`crate::db::txg_quiesce::TxgQuiesceThread`] to roll the
+    ///   current Open TXG immediately, then park on
+    ///   [`crate::txg::TxgStateMachine::wait_until_synced`] until the
+    ///   [`crate::db::txg_sync::TxgSyncThread`] has finished
+    ///   `run_sync_cycle` for that TXG (which is what
+    ///   `start_txg_threads` wired the worker's `sync_work` callback
+    ///   to).
+    /// - **`txg_threads_enabled = false`**: the worker threads are not
+    ///   spawned. `flush_with_gate` drives the TXG state machine and
+    ///   `run_sync_cycle` synchronously on the caller thread,
+    ///   recreating the legacy stop-the-world flush semantics.
+    ///
+    /// Returns `Ok(false)` only on the threads-off `Steady` path when
+    /// `apply_gate.try_write()` does not immediately succeed (the same
+    /// best-effort behaviour `try_flush` had pre-Step-8).
     fn flush_with_gate(&self, kind: crate::metrics::FlushKind) -> Result<bool> {
+        if self.txg_threads_enabled {
+            // Threads-on: hand off to the sync thread and wait.
+            // `signal_force` only sets the quiesce notifier flag; the
+            // quiesce worker then calls `roll_to_quiescing`, which
+            // does its own inflight-drain wait. No
+            // `apply_gate.try_write` race here — the threaded path
+            // always runs to completion.
+            let target = self.txg.open_txg();
+            self.txg_quiesce_notifier.signal_force(target);
+            self.txg.wait_until_synced(target);
+            self.metrics
+                .record_flush_attempt(kind);
+            // Wall-time accounting kept consistent with the inline
+            // path: every threaded `flush()` records as a completed
+            // forced-flush (Steady never lands here because Steady is
+            // only emitted by `try_flush`, which routes the threads-on
+            // side through `wait_until_synced` regardless).
+            self.metrics
+                .record_flush_total(kind, std::time::Duration::from_micros(0));
+            return Ok(true);
+        }
+        // Threads-off: drive the TXG state machine ourselves so the
+        // sync metadata bookkeeping (slot.max_lsn, open_txg advance,
+        // checkpoint_txg / wait_until_synced cv release) stays in
+        // lock-step with what the threaded path would have done.
+        // `roll_to_quiescing` waits for any in-flight commits' txg
+        // guards to drop, mirroring the apply-gate barrier the body
+        // would have taken anyway. After `mark_synced` returns,
+        // `wait_until_synced(target)` (used by any concurrent
+        // threads-off caller) wakes up.
+        //
+        // Steady-kind try_flush keeps best-effort semantics: skip the
+        // roll entirely when `apply_gate.try_write()` fails. Forced
+        // kind always rolls.
+        let blocking_gate = matches!(kind, crate::metrics::FlushKind::Forced);
+        if !blocking_gate
+            && let None = self.apply_gate.try_write()
+        {
+            self.metrics.record_flush_attempt(kind);
+            self.metrics
+                .record_flush_total(kind, std::time::Duration::ZERO);
+            return Ok(false);
+        }
+        // We don't actually hold `apply_gate.write()` here — the
+        // run_sync_cycle body re-acquires it for the sample phase.
+        // The try-write above is purely a "should we even bother
+        // rolling" gate matching pre-Step-8 try_flush behaviour.
+        let target = self.txg.roll_to_quiescing();
+        // `roll_to_quiescing` is idempotent under shutdown (returns
+        // current open without advancing). Re-check whether the slot
+        // actually moved to Quiescing before promoting; mismatch
+        // means shutdown raced and we should skip.
+        if self.txg.snapshot().quiescing_txg != Some(target) {
+            return Ok(false);
+        }
+        self.txg.promote_to_syncing(target);
+        let result = self.run_sync_cycle(target, kind);
+        match result {
+            Ok(()) => {
+                self.txg.mark_synced(target);
+                Ok(true)
+            }
+            Err(err) => {
+                // Sync work failed; leave the slot in Syncing so a
+                // subsequent flush can retry (matches the threaded
+                // path's `failed_sync_leaves_txg_in_syncing_state`
+                // semantics). The next inline `flush_with_gate` will
+                // hit `quiescing_txg != Some(...)` and short-circuit
+                // — recovery from a failed inline flush requires a
+                // process restart, same as the pre-Step-8 behaviour
+                // (a sample-phase err there would have left the
+                // shards' deferred RC apply state inconsistent).
+                Err(err)
+            }
+        }
+    }
+
+    /// Per-TXG sync work: drain L2P buffers, sample + IO + manifest
+    /// commit. Extracted from `flush_with_gate`'s pre-Step-8 body so
+    /// the `TxgSyncThread`'s `sync_work` callback can drive it via
+    /// `Weak<Db>` upgrade.
+    ///
+    /// The `txg` parameter identifies which TXG slot the caller has
+    /// already promoted to Syncing in the state machine; the body
+    /// doesn't yet consult it directly (the conservative path still
+    /// uses `apply_gate.write()` + `last_applied_lsn` for the
+    /// wal_checkpoint sample), but it's threaded through so the
+    /// future "shrink apply_gate.write to manifest commit only"
+    /// optimisation can swap in `txg.slot_max_lsn(txg)`.
+    pub(crate) fn run_sync_cycle(
+        &self,
+        txg: crate::types::Txg,
+        kind: crate::metrics::FlushKind,
+    ) -> Result<()> {
+        let _ = txg;
+        self.run_sync_cycle_body(kind)?;
+        Ok(())
+    }
+
+    fn run_sync_cycle_body(&self, kind: crate::metrics::FlushKind) -> Result<()> {
         // Exclude every in-flight apply phase only while sampling the
         // checkpoint boundary. Each tree protects the private pages in
         // the sampled roots before we drop its shard lock; later commits
@@ -193,20 +313,19 @@ impl Db {
         // forced `flush()` (shutdown drain, explicit force_checkpoint)
         // in the metrics — `flush_sample_max_us_steady` excludes the
         // shutdown blast that otherwise dominates the aggregate max.
-        let blocking_gate = matches!(kind, crate::metrics::FlushKind::Forced);
+        //
+        // Pre-Step-8 the body itself made the try_write vs blocking
+        // decision based on `kind`. The outer `flush_with_gate` now
+        // owns the "is now a good moment" decision (and for the
+        // threaded path the sync thread is the sole caller, so the
+        // decision is always Forced-equivalent). The body therefore
+        // unconditionally blocks on `apply_gate.write()` here — by
+        // the time we land in this function the caller has already
+        // committed to the sync.
         self.metrics.record_flush_attempt(kind);
         let flush_started = std::time::Instant::now();
         let gate_started = std::time::Instant::now();
-        let Some(apply_guard) = (if blocking_gate {
-            Some(self.apply_gate.write())
-        } else {
-            self.apply_gate.try_write()
-        }) else {
-            self.metrics.record_flush_gate_wait(gate_started.elapsed());
-            self.metrics
-                .record_flush_total(kind, flush_started.elapsed());
-            return Ok(false);
-        };
+        let apply_guard = self.apply_gate.write();
         self.metrics.record_flush_gate_wait(gate_started.elapsed());
 
         // B2: force-compact all L2P buffers so the sample phase
@@ -275,7 +394,7 @@ impl Db {
                 .record_flush_sample(kind, sample_started.elapsed());
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
-            return Ok(true);
+            return Ok(());
         }
         let lock_started = std::time::Instant::now();
         let mut l2p_guards = lock_selected_l2p_shards_for(&volumes, &selected.l2p);
@@ -1023,7 +1142,7 @@ impl Db {
         self.metrics.record_flush_reclaim(reclaim_started.elapsed());
         self.metrics
             .record_flush_total(kind, flush_started.elapsed());
-        Ok(true)
+        Ok(())
     }
 
     /// Sparse-checkpoint variant of the L2P abort path: walks the

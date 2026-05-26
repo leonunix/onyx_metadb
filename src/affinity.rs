@@ -10,11 +10,19 @@ pub struct AffinityConfig {
     /// Same syntax as the other knobs ("0-3,8,12-15"). Leave empty to
     /// inherit the OS default.
     pub refcount_drainer_cpus: String,
-    /// CPU set for the L2P buffer compactor (single serial thread).
-    /// Pinning to 1–2 CPUs on the same NUMA node as `l2p_apply_cpus`
-    /// stops the scheduler from co-locating the compactor on an
-    /// apply-lane CPU during flush — without this, apply-lane
-    /// exec-max tails rise noticeably in the flush window.
+    /// CPU set for the ZFS-TXG-clone Phase 4 background workers — the
+    /// `TxgSyncThread` (single serial thread that drains the syncing
+    /// TXG slot per shard, writes RC + L2P checkpoint pages, fsyncs,
+    /// commits the manifest) plus the `TxgQuiesceThread` (also a
+    /// single thread, on the same role).
+    ///
+    /// Field name kept for backward compatibility with operator
+    /// config (`metadb_l2p_compactor_cpus`) — the retired
+    /// `L2pCompactor` was the historical occupant of this CPU set
+    /// and the placement reasoning carries over verbatim: pinning to
+    /// 1–2 CPUs on the same NUMA node as `l2p_apply_cpus` stops the
+    /// scheduler from co-locating the sync worker on an apply-lane
+    /// CPU during the flush window.
     pub l2p_compactor_cpus: String,
     /// CPU set for the io_uring submitter threads. With pool>1, each
     /// submitter thread picks `cpus[ordinal % len]` so distinct
@@ -32,10 +40,13 @@ pub enum ThreadRole {
     RefcountApply,
     DedupApply,
     RefcountDrainer,
-    /// L2P buffer compactor (single serial thread). Bound to a small
-    /// dedicated CPU set so the kernel scheduler cannot co-locate it
-    /// on an apply-lane CPU during a flush window.
-    L2pCompactor,
+    /// ZFS-TXG-clone Phase 4 sync + quiesce workers. Bound to a small
+    /// dedicated CPU set so the kernel scheduler cannot co-locate
+    /// them on an apply-lane CPU during a flush window. Replaces the
+    /// retired `L2pCompactor` role; the affinity config field
+    /// (`l2p_compactor_cpus`) keeps its legacy name for backward
+    /// compatibility with operator configs.
+    TxgSync,
     /// io_uring submitter thread. With pool>1 each ordinal binds to a
     /// distinct CPU so the kernel mq-block layer routes its IO to a
     /// different NVMe hardware queue. Without pinning, multiple
@@ -51,6 +62,9 @@ struct AffinityLayout {
     refcount_apply: CpuSet,
     dedup_apply: CpuSet,
     refcount_drainer: CpuSet,
+    /// Backs `ThreadRole::TxgSync`. Field name kept for backward
+    /// compatibility with the `l2p_compactor_cpus` config knob the
+    /// retired `L2pCompactor` used.
     l2p_compactor: CpuSet,
     io_submitter: CpuSet,
 }
@@ -112,7 +126,7 @@ impl AffinityLayout {
             ThreadRole::RefcountApply => &self.refcount_apply,
             ThreadRole::DedupApply => &self.dedup_apply,
             ThreadRole::RefcountDrainer => &self.refcount_drainer,
-            ThreadRole::L2pCompactor => &self.l2p_compactor,
+            ThreadRole::TxgSync => &self.l2p_compactor,
             ThreadRole::IoSubmitter => &self.io_submitter,
         }
     }

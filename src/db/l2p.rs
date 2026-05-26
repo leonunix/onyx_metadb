@@ -105,9 +105,14 @@ impl Db {
                 // Absent falls through to a batched tree.multi_get_into
                 // on the remaining indices.
                 let buffer = &volume.shards[sid].l2p_buffer;
+                // Phase 4: read path uses the LIVE open_txg snapshot so
+                // we walk the newest 3 ring slots; no pinned commit
+                // guard here. Re-read per shard's batch — the cost is
+                // one atomic load.
+                let open_txg = self.txg.open_txg();
                 let mut tree_indices: Vec<usize> = Vec::with_capacity(end - start);
                 for &idx in &order[start..end] {
-                    match buffer.lookup(lbas[idx]) {
+                    match buffer.lookup_for_open_txg(open_txg, lbas[idx]) {
                         crate::db::l2p_buffer::BufferLookup::Present(v) => {
                             out[idx] = Some(v);
                             self.metrics.record_l2p_buffer_lookup_hit();

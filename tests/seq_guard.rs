@@ -42,7 +42,7 @@ enum Mode {
     AsyncWal,
 }
 
-fn mk_db_for_mode(mode: Mode) -> (TempDir, Db) {
+fn mk_db_for_mode(mode: Mode) -> (TempDir, std::sync::Arc<Db>) {
     let dir = TempDir::new().unwrap();
     let cfg = mode_config(dir.path(), mode);
     let db = Db::create_with_config(cfg).unwrap();

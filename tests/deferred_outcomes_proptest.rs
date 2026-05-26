@@ -1,5 +1,4 @@
-//! ZFS-TXG-clone Phase 2 soak gate — sync vs deferred outcome equivalence
-//! and fault-injection coverage for `FaultPoint::DeferredOutcomeDrainMidway`.
+//! ZFS-TXG-clone Phase 2 soak gate — sync vs deferred outcome equivalence.
 //!
 //! ## What this gates
 //!
@@ -18,12 +17,6 @@
 //! `lineage_gc_emit_freepbas = true` default: any populated freed-PBA
 //! field is treated as a Phase 5 regression and the proptest fails.
 //!
-//! The fault-injection test panics mid-drain and confirms the parked
-//! receivers resolve with the channel-disconnected error rather than
-//! hanging forever. On-disk state is unchanged because `apply` finished
-//! during `commit_ops_deferred` itself — the drain only delivers the
-//! already-staged outcomes.
-//!
 //! ## Why this is a soak gate
 //!
 //! The plan in `/root/.claude/plans/soft-doodling-snail.md` makes this
@@ -32,11 +25,19 @@
 //! `true` by default. Both flags must stay opt-in until the 8h nvme-box
 //! concurrent soak built around this property passes; see
 //! `[[zfs-txg-clone-phase2-remaining]]` in memory for the bigger picture.
+//!
+//! ## Phase 4 Step 8 follow-up
+//!
+//! `DeferredOutcomeAggregator` was simplified to inline delivery (the
+//! `L2pCompactor` it used to wake is gone). The
+//! `FaultPoint::DeferredOutcomeDrainMidway` injection test was removed
+//! with the parking lot; the equivalence proptest below is unaffected
+//! because it asserts the visible API (`handle.recv()` returns the
+//! same outcomes as the sync path), which inline delivery still
+//! satisfies.
 
 use std::collections::BTreeMap;
-use std::panic::AssertUnwindSafe;
 
-use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
 use onyx_metadb::wal::op::WalOp;
 use onyx_metadb::{ApplyOutcome, Config, Db, L2pValue, VolumeOrdinal};
 use proptest::prelude::*;
@@ -129,7 +130,7 @@ fn op_to_walop(op: &Op, fresh_pba_seed: u64) -> WalOp {
     }
 }
 
-fn open_db(deferred: bool) -> (TempDir, Db) {
+fn open_db(deferred: bool) -> (TempDir, std::sync::Arc<Db>) {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
     cfg.l2p_buffer_enabled = true;
@@ -307,123 +308,15 @@ proptest! {
 }
 
 // -------- fault injection: DeferredOutcomeDrainMidway --------
-
-/// `FaultPoint::DeferredOutcomeDrainMidway` fires *after* the
-/// aggregator has popped its ready outcomes from the pending map but
-/// *before* any `sender.send` has run. A `FaultAction::Panic` here
-/// drops every popped sender on unwind, so all in-flight handles
-/// resolve with the channel-disconnected error. On-disk state is
-/// unaffected because apply finished synchronously inside
-/// `commit_ops_deferred` (well before stage), and the next commit
-/// after the panic keeps working.
-#[test]
-fn drain_midway_panic_disconnects_pending_handles() {
-    // Build the db with a fault controller we can install triggers on.
-    let dir = TempDir::new().unwrap();
-    let mut cfg = Config::new(dir.path());
-    cfg.l2p_buffer_enabled = true;
-    cfg.commit_direct_apply_enabled = true;
-    cfg.commit_deferred_outcomes_enabled = true;
-    cfg.l2p_buffer_soft_entries = 1;
-    cfg.l2p_buffer_max_interval_ms = 25;
-    let faults = FaultController::new();
-    let db = Db::create_with_config_and_faults(cfg, faults.clone()).unwrap();
-
-    // Install the panic trigger first. `stage()` wakes the L2P
-    // compactor on every commit (`CompactorNotifier`), so the
-    // background worker races with `test_force_compact_pass` below to
-    // call `drain_up_to_lsn`. The trigger is gated on a non-empty
-    // drain inside the aggregator, so the worker's empty-drain passes
-    // before any stage do not burn the fire-count. Whichever side
-    // first observes pending entries fires the trigger; the loser
-    // sees it as already fired. Either outcome satisfies the property
-    // under test: the popped senders are dropped on unwind, so every
-    // pending handle resolves with the channel-disconnected error.
-    faults.install(
-        FaultPoint::DeferredOutcomeDrainMidway,
-        1,
-        FaultAction::Panic,
-    );
-
-    // Stage three deferred commits. Each `stage` wakes the compactor
-    // notifier; the first non-empty drain — by the worker or by the
-    // explicit force-pass below — fires the trigger.
-    let mut handles = Vec::new();
-    for i in 0..3u64 {
-        let ops = vec![WalOp::L2pPut {
-            vol_ord: BOOTSTRAP_VOL,
-            lba: i,
-            value: mk_l2p_value(0xE000 + i, 0),
-        }];
-        let (_, handle) = db.commit_ops_deferred(&ops).unwrap();
-        handles.push(handle);
-    }
-
-    // Also run a pass from this thread. If the worker already fired
-    // the trigger and dropped the senders, this call is a no-op
-    // (pending is empty, drain returns without inject). If the worker
-    // hasn't woken yet, this call is the one that pops pending and
-    // panics. Catch either way.
-    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| db.test_force_compact_pass()));
-
-    // Cross-thread synchronisation point: poll for `fired` until the
-    // worker (or caller) has finished its panic-and-drop sequence.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !faults.fired(FaultPoint::DeferredOutcomeDrainMidway)
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(
-        faults.fired(FaultPoint::DeferredOutcomeDrainMidway),
-        "fault must have fired"
-    );
-
-    // At least one handle resolves with the channel-disconnected
-    // error rather than hanging — every sender popped by the drain
-    // that triggered the panic is dropped on unwind. The exact set
-    // depends on the race between the background worker (now woken
-    // on every `stage` via `CompactorNotifier`) and the explicit
-    // `test_force_compact_pass` above: if the worker drains one
-    // staged outcome at a time, only the one it popped disconnects;
-    // if it pops the whole batch in a single pass, all three do. The
-    // property under test is "popped senders disconnect on
-    // mid-drain panic", which both interleavings satisfy.
-    let disconnected: Vec<_> = handles
-        .into_iter()
-        .enumerate()
-        .map(|(i, h)| (i, h.recv()))
-        .filter(|(_, r)| r.is_err())
-        .collect();
-    assert!(
-        !disconnected.is_empty(),
-        "at least one handle must be disconnected by the mid-drain panic"
-    );
-
-    // After the panic the aggregator is empty (the senders were
-    // popped). A follow-up commit on the same db must still work.
-    let (_, h2) = db
-        .commit_ops_deferred(&[WalOp::L2pPut {
-            vol_ord: BOOTSTRAP_VOL,
-            lba: 100,
-            value: mk_l2p_value(0xF000, 0),
-        }])
-        .unwrap();
-    db.test_force_compact_pass();
-    let outs = h2.recv().expect("follow-up recv after fault");
-    assert_eq!(outs.len(), 1);
-
-    // On-disk state on lbas 0..3 must reflect the pre-fault commits.
-    // apply ran before stage, so the panic does not roll back the
-    // L2pPuts.
-    for i in 0..3u64 {
-        let value = db.get(BOOTSTRAP_VOL, i).unwrap();
-        assert!(
-            value.is_some(),
-            "lba {i} L2pPut must be visible despite drain-midway fault"
-        );
-    }
-}
+//
+// ZFS-TXG-clone Phase 4 Step 8: the `DeferredOutcomeAggregator` no
+// longer parks staged outcomes — `stage()` populates the handle's
+// channel inline and returns. There is no later drain to inject a
+// fault into, so the `DeferredOutcomeDrainMidway` fault point is
+// now dead code; the test that exercised it (and asserted the
+// pop-then-panic-then-disconnect chain) has been retired with the
+// aggregator's pending map. See `src/db/commit/outcomes.rs` for
+// the inline-delivery rationale.
 
 /// Investigation test for [[zfs-txg-clone-phase2-remaining]] follow-up
 /// #3a: the `sync_vs_deferred_outcomes_match` proptest needed

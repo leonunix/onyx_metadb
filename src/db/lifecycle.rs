@@ -391,34 +391,32 @@ impl Db {
         self.async_reclaim.lock().is_some()
     }
 
-    /// Start the B2 L2P buffer compactor. Caller (`Db::create` /
-    /// `Db::open`) checks `cfg.l2p_buffer_enabled`.
-    fn start_l2p_compactor(&self) {
-        let notifier = self
-            .l2p_compactor_notifier
-            .clone()
-            .expect("metadb: compactor notifier must exist when l2p_buffer is enabled");
-        let worker = super::l2p_compactor::L2pCompactor::start(
-            self.volumes.clone(),
-            self.metrics.clone(),
-            self.l2p_compactor_params,
-            notifier,
-            self.deferred_outcomes.clone(),
-        );
-        *self.l2p_compactor.lock() = Some(worker);
-    }
-
-    /// ZFS-TXG-clone Phase 4 Step 7: spawn the quiesce + sync workers
-    /// when `cfg.txg_threads_enabled = true`. Step 7 ships an inert
-    /// `sync_work` callback (just returns Ok), so the only observable
-    /// effect is that `Db::txg.checkpoint_txg()` advances on the
-    /// `txg_timeout_ms` cadence. Step 8 retargets the callback at the
-    /// real flush body and retires `L2pCompactor`.
-    fn start_txg_threads(&self, txg_timeout_ms: u64) {
+    /// ZFS-TXG-clone Phase 4 Step 8: spawn the quiesce + sync workers
+    /// when `cfg.txg_threads_enabled = true`. Step 7 shipped an inert
+    /// `sync_work` callback; Step 8 retargets it at
+    /// [`Db::run_sync_cycle`], the real per-TXG flush body extracted
+    /// from `flush_with_gate`.
+    ///
+    /// The closure captures a [`Weak<Db>`] so the worker thread does
+    /// not extend `Db`'s lifetime — `Drop` calls `stop_txg_threads`
+    /// before the strong refcount falls to zero (the strong refcount
+    /// is what the caller holds via `Arc<Db>`), so a successful
+    /// `weak.upgrade()` inside the closure always sees a live `Db`.
+    /// A failed upgrade (would only happen if shutdown raced with a
+    /// stale wake-up; the worker checks `shutdown` before calling)
+    /// is a no-op success: the TXG just stays in Syncing and the
+    /// shutdown path observes it.
+    fn start_txg_threads(self: &Arc<Self>, txg_timeout_ms: u64) {
         let state = self.txg.clone();
         let sync_notifier = self.txg_sync_notifier.clone();
         let metrics = self.metrics.clone();
-        let sync_work: super::txg_sync::SyncWorkFn = Arc::new(|_txg| Ok(()));
+        let weak_db = Arc::downgrade(self);
+        let sync_work: super::txg_sync::SyncWorkFn = Arc::new(move |txg| {
+            let Some(db) = weak_db.upgrade() else {
+                return Ok(());
+            };
+            db.run_sync_cycle(txg, crate::metrics::FlushKind::Forced)
+        });
         let sync = super::txg_sync::TxgSyncThread::start(
             state.clone(),
             sync_notifier.clone(),
@@ -451,14 +449,28 @@ impl Db {
         }
     }
 
-    /// Force-compact every L2P shard's buffer into its tree
-    /// synchronously. Called from `flush_with_gate` (with
-    /// `apply_gate.write()` held) and from the post-replay path in
-    /// `open_with_config_and_faults` (before the background compactor
-    /// is started). Skips shards whose buffer is empty.
+    /// Force-fold every L2P shard's TXG ring buffer into its on-disk
+    /// tree synchronously. Used by:
     ///
-    /// Returns the first error encountered; any successfully
-    /// compacted shards have already advanced their `compacted_lsn`.
+    /// - [`Db::flush_with_gate`]'s inline path (when
+    ///   `txg_threads_enabled = false`), under `apply_gate.write()`
+    ///   so no commit can stamp a new buffer entry mid-drain.
+    /// - The snapshot / `range_delete` paths, also under
+    ///   `apply_gate.write()`, to make the tree reflect every
+    ///   committed LSN before they read it.
+    /// - The post-replay path in `open_with_config_and_faults`,
+    ///   before any commit can race the recovered buffer state.
+    ///
+    /// When `txg_threads_enabled = true`, the `TxgSyncThread` is the
+    /// regular drainer (one slot per TXG cycle). Snapshot /
+    /// range_delete still call this helper to short-circuit the wait
+    /// for the next quiesce/sync cycle — both hold `apply_gate.write`
+    /// so no new commit can race, and the sync thread takes per-shard
+    /// `tree.write()` for the same race so the two drain paths
+    /// serialise per shard.
+    ///
+    /// Returns the first error encountered; any successfully drained
+    /// shards have already advanced their `compacted_lsn`.
     pub(super) fn force_compact_l2p_buffers(&self) -> Result<()> {
         use std::time::Instant;
         if !self.l2p_buffer_enabled {
@@ -475,26 +487,28 @@ impl Db {
                 if !shard.use_buffer {
                     continue;
                 }
-                let swap = match shard.l2p_buffer.swap_for_compaction() {
-                    Some(h) => h,
-                    None => continue,
-                };
                 let started = Instant::now();
                 let mut tree = shard.tree.write();
-                let apply_result: Result<()> = shard.l2p_buffer.with_draining(|d| -> Result<()> {
-                    let draining = match d {
-                        Some(map) => map,
-                        None => return Ok(()),
-                    };
-                    super::l2p_compactor::compact_drain_into_tree(&mut tree, draining)
-                });
+                // Drain ALL four TXG slots in one shot (caller holds
+                // `apply_gate.write` so no commit can stamp into a
+                // slot mid-drain; the sync thread serialises on the
+                // same `tree.write()` so it won't conflict either).
+                let drained = shard.l2p_buffer.drain_all_slots();
+                if drained.is_empty() {
+                    drop(tree);
+                    continue;
+                }
+                let count = drained.len();
+                let max_lsn = drained.values().map(|e| e.lsn).max().unwrap_or(0);
+                let apply_result =
+                    super::txg_sync::compact_drain_into_tree(&mut tree, &drained);
                 match apply_result {
                     Ok(()) => {
                         super::apply::publish_l2p_read_view(shard, &tree);
                         drop(tree);
-                        shard.l2p_buffer.finish_compaction(swap.max_lsn);
+                        shard.l2p_buffer.note_compacted(max_lsn);
                         self.metrics
-                            .record_l2p_buffer_compaction(swap.count, started.elapsed());
+                            .record_l2p_buffer_compaction(count, started.elapsed());
                     }
                     Err(err) => {
                         drop(tree);

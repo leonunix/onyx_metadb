@@ -266,11 +266,12 @@ struct DedupEntry {
 fn run_benchmark(cfg: &BenchConfig) -> Result<BenchReport, String> {
     prepare_dir(&cfg.path, cfg.reset, cfg.reuse_existing)?;
     let db_cfg = db_config(&cfg.path, cfg.shards, cfg.page_cache_bytes);
-    let db = Arc::new(if cfg.reuse_existing {
+    // Constructors already return `Arc<Db>` — no need to re-wrap.
+    let db = if cfg.reuse_existing {
         Db::open_with_config(db_cfg.clone()).map_err(|e| e.to_string())?
     } else {
         Db::create_with_config(db_cfg.clone()).map_err(|e| e.to_string())?
-    });
+    };
 
     match cfg.scenario {
         Scenario::L2pPrefill => run_l2p_prefill(cfg, db_cfg),
@@ -351,7 +352,7 @@ fn run_l2p_get(cfg: &BenchConfig, db_cfg: Config) -> Result<BenchReport, String>
             cfg.prefill_flush_keys,
         )?
     };
-    let db = Arc::new(Db::open_with_config(db_cfg).map_err(|e| e.to_string())?);
+    let db = Db::open_with_config(db_cfg).map_err(|e| e.to_string())?;
 
     // Warm cache before measuring steady-state read latency.
     if cfg.warmup_ops > 0 {
@@ -411,7 +412,7 @@ fn run_l2p_multi_get(cfg: &BenchConfig, db_cfg: Config) -> Result<BenchReport, S
             cfg.prefill_flush_keys,
         )?
     };
-    let db = Arc::new(Db::open_with_config(db_cfg).map_err(|e| e.to_string())?);
+    let db = Db::open_with_config(db_cfg).map_err(|e| e.to_string())?;
 
     if cfg.warmup_ops > 0 {
         warmup_l2p_multi_reads(

@@ -1,7 +1,7 @@
 fn open_or_create_with_faults(
     path: &Path,
     faults: Arc<FaultController>,
-) -> onyx_metadb::Result<Db> {
+) -> onyx_metadb::Result<Arc<Db>> {
     match Db::open_with_faults(path, faults.clone()) {
         Ok(db) => Ok(db),
         Err(_) => Db::create_with_faults(path, faults),

@@ -1,23 +1,21 @@
 //! ZFS-TXG-clone Phase 4 sync thread.
 //!
-//! `TxgSyncThread` is the worker driven by `TxgQuiesceThread` (Step 6).
-//! Each cycle persists one Syncing TXG:
+//! `TxgSyncThread` is the worker driven by [`super::txg_quiesce::TxgQuiesceThread`].
+//! Each cycle persists one Syncing TXG by invoking the `sync_work`
+//! callback (the body of [`crate::db::Db::run_sync_cycle`]) which:
 //!
-//! 1. Drain the syncing slot of every L2P shard into the tree (no
-//!    `apply_gate.write` — the slot is frozen by quiesce so no commit
-//!    can insert into it). Step 5 still uses
-//!    [`crate::db::l2p_buffer::L2pBuffer::swap_for_compaction`] (which
-//!    merges every TXG slot into the legacy draining intermediate) so
-//!    callers haven't been retargeted at `take_syncing_slot(txg)` yet;
-//!    Step 8 flips the buffer call sites to the TXG-aware API and
-//!    retires this shim.
-//! 2. Refcount + dead-list checkpoint (delegated to the caller's
-//!    `sync_work` callback so this module stays Db-agnostic).
-//! 3. Page IO + WAL fsync barrier (same — caller's callback).
-//! 4. Manifest commit (callback, briefly holds `apply_gate.write`).
-//! 5. `state.mark_synced(txg)`.
-//! 6. Drain `DeferredOutcomeAggregator` so commit handles
-//!    waiting on this TXG's outcomes wake up.
+//! 1. Drains the syncing slot of every L2P shard into the tree
+//!    (`L2pBuffer::take_syncing_slot(txg)`) — the slot is frozen by
+//!    quiesce so no commit can insert into it.
+//! 2. Performs the refcount + dead-list checkpoint (per-shard
+//!    `begin_checkpoint`).
+//! 3. Page IO + WAL fsync barrier.
+//! 4. Manifest commit (briefly holds `apply_gate.write`).
+//!
+//! After a successful callback the worker calls
+//! [`TxgStateMachine::mark_synced`] to advance `checkpoint_txg` and
+//! wake any [`TxgStateMachine::wait_until_synced`] waiters (in
+//! particular `flush_with_gate`'s threaded path).
 //!
 //! Concurrency:
 //! - Single worker thread, parked on a `Condvar`. A wake from
@@ -27,7 +25,13 @@
 //!   worker re-reads `txg.snapshot().syncing_txg` to find work, so a
 //!   stale notification (no Syncing TXG) is a cheap no-op.
 //! - `Drop` issues a shutdown signal and joins the worker.
+//!
+//! This module also owns [`compact_drain_into_tree`], the per-shard
+//! buffer → tree fold helper that both the `TxgSyncThread`'s
+//! per-slot drain and the inline
+//! [`crate::db::Db::force_compact_l2p_buffers`] path share.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -38,6 +42,67 @@ use crate::error::Result;
 use crate::metrics::MetaMetrics;
 use crate::txg::TxgStateMachine;
 use crate::types::Txg;
+
+/// Apply every `draining` entry into `tree`. Groups by leaf so that
+/// inserts touching the same leaf share one CoW (matches the laned
+/// bucket's `insert_leaf_run_at_lsn_deferred_finish` optimisation).
+/// Tombstones go through `delete_at_lsn_deferred_finish` individually
+/// because no leaf-run delete API exists today; deletes are rare on
+/// the L2P hot path so this is acceptable. Finalises deferred RC
+/// deltas in `finish_batch_apply` at the end.
+///
+/// Both the per-TXG syncing-slot drain (sync thread) and the
+/// "merge every slot" inline drain (`force_compact_l2p_buffers`) call
+/// this with their own pre-merged map; the helper itself is agnostic
+/// to slot identity.
+pub(crate) fn compact_drain_into_tree(
+    tree: &mut crate::paged::PagedL2p,
+    draining: &HashMap<u64, super::l2p_buffer::BufferEntry>,
+) -> Result<()> {
+    use crate::paged::format::LEAF_SHIFT;
+    if draining.is_empty() {
+        return Ok(());
+    }
+    // (leaf_idx) -> (insert run sorted by lba, tombstone list)
+    let mut by_leaf: HashMap<
+        u64,
+        (
+            Vec<(u64, crate::paged::L2pValue, crate::types::Lsn)>,
+            Vec<(u64, crate::types::Lsn)>,
+        ),
+    > = HashMap::with_capacity(draining.len() / 32 + 1);
+    for (lba, entry) in draining {
+        let leaf_idx = *lba >> LEAF_SHIFT;
+        let bucket = by_leaf.entry(leaf_idx).or_default();
+        if entry.tombstone {
+            bucket.1.push((*lba, entry.lsn));
+        } else {
+            bucket.0.push((*lba, entry.value, entry.lsn));
+        }
+    }
+    // Process in leaf-idx order for determinism / better page locality.
+    let mut leaf_indices: Vec<u64> = by_leaf.keys().copied().collect();
+    leaf_indices.sort_unstable();
+    for leaf_idx in leaf_indices {
+        let (mut inserts, tombstones) = by_leaf.remove(&leaf_idx).expect("leaf present");
+        if !inserts.is_empty() {
+            inserts.sort_unstable_by_key(|(lba, _, _)| *lba);
+            // All inserts in this group share `leaf_idx`. Use max LSN
+            // of the group as the run's stamp so any prior-LSN replay
+            // of these entries is correctly suppressed by
+            // `page.generation >= lsn`.
+            let max_lsn = inserts.iter().map(|(_, _, l)| *l).max().unwrap_or(0);
+            let entries: Vec<(u64, crate::paged::L2pValue)> =
+                inserts.iter().map(|(lba, v, _)| (*lba, *v)).collect();
+            tree.insert_leaf_run_at_lsn_deferred_finish(&entries, max_lsn)?;
+        }
+        for (lba, lsn) in tombstones {
+            tree.delete_at_lsn_deferred_finish(lba, lsn)?;
+        }
+    }
+    tree.finish_batch_apply()?;
+    Ok(())
+}
 
 /// Callback that performs the actual per-TXG sync work for one cycle.
 ///

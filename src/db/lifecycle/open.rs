@@ -2,17 +2,17 @@ use super::*;
 
 impl Db {
     /// Create a fresh database in `root_dir` using the default config.
-    pub fn create(root_dir: &Path) -> Result<Self> {
+    pub fn create(root_dir: &Path) -> Result<Arc<Self>> {
         Self::create_with_config(Config::new(root_dir))
     }
 
     /// Create a fresh database with an explicit config.
-    pub fn create_with_config(cfg: Config) -> Result<Self> {
+    pub fn create_with_config(cfg: Config) -> Result<Arc<Self>> {
         Self::create_with_config_and_faults(cfg, FaultController::disabled())
     }
 
     /// As [`create`](Self::create) but with an injectable fault controller.
-    pub fn create_with_faults(root_dir: &Path, faults: Arc<FaultController>) -> Result<Self> {
+    pub fn create_with_faults(root_dir: &Path, faults: Arc<FaultController>) -> Result<Arc<Self>> {
         Self::create_with_config_and_faults(Config::new(root_dir), faults)
     }
 
@@ -21,7 +21,7 @@ impl Db {
     pub fn create_with_config_and_faults(
         cfg: Config,
         faults: Arc<FaultController>,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Self>> {
         let shard_count = validate_shard_count(cfg.shards_per_partition)?;
         let dedup_shards = validate_dedup_shards(cfg.dedup_shards)?;
         std::fs::create_dir_all(&cfg.path)?;
@@ -137,16 +137,10 @@ impl Db {
             ApplyLaneKind::DedupMaintenance,
             metrics.clone(),
         );
-        let l2p_compactor_notifier = if cfg.l2p_buffer_enabled {
-            Some(Arc::new(crate::db::l2p_compactor::CompactorNotifier::new()))
-        } else {
-            None
-        };
         let deferred_outcomes = Arc::new(
             crate::db::commit::DeferredOutcomeAggregator::new(
                 metrics.clone(),
                 faults.clone(),
-                l2p_compactor_notifier.clone(),
             ),
         );
         let db = Self {
@@ -186,16 +180,10 @@ impl Db {
             flush_cursor: AtomicUsize::new(0),
             flush_select_budget: cfg.flush_select_budget,
             async_reclaim: Mutex::new(None),
-            l2p_compactor: Mutex::new(None),
             l2p_buffer_enabled: cfg.l2p_buffer_enabled,
-            l2p_compactor_params: crate::db::l2p_compactor::L2pCompactorParams {
-                soft_entries: cfg.l2p_buffer_soft_entries,
-                max_interval_ms: cfg.l2p_buffer_max_interval_ms,
-            },
             lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
             freed_pbas_sink: Mutex::new(None),
             deferred_outcomes,
-            l2p_compactor_notifier,
             commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
             wal_async_commits_enabled: cfg.wal_async_commits_enabled,
             // Phase 4 Step 4: fresh DB starts with checkpoint_txg = 0 so the
@@ -238,36 +226,36 @@ impl Db {
         if async_reclaim_enabled {
             db.start_async_reclaim(async_reclaim_params);
         }
-        // Spawn the B2 L2P buffer compactor when enabled. A fresh DB
-        // has no replay so we can spawn unconditionally — the worker
-        // is a no-op until commits start populating the buffer.
-        if db.l2p_buffer_enabled {
-            db.start_l2p_compactor();
-        }
+        // ZFS-TXG-clone Phase 4 Step 8: the background L2P drainer
+        // is now the `TxgSyncThread`, spawned below when
+        // `txg_threads_enabled` is true. When the threads are off,
+        // `flush_with_gate`'s inline path drives the per-shard drain
+        // via `force_compact_l2p_buffers` synchronously.
+        let db = Arc::new(db);
         if db.txg_threads_enabled {
-            db.start_txg_threads(cfg.txg_timeout_ms);
+            Self::start_txg_threads(&db, cfg.txg_timeout_ms);
         }
         Ok(db)
     }
 
     /// Open an existing database from `root_dir` using the default config.
-    pub fn open(root_dir: &Path) -> Result<Self> {
+    pub fn open(root_dir: &Path) -> Result<Arc<Self>> {
         Self::open_with_config(Config::new(root_dir))
     }
 
     /// Open an existing database with an explicit config.
-    pub fn open_with_config(cfg: Config) -> Result<Self> {
+    pub fn open_with_config(cfg: Config) -> Result<Arc<Self>> {
         Self::open_with_config_and_faults(cfg, FaultController::disabled())
     }
 
     /// As [`open`](Self::open) but with an injectable fault controller.
-    pub fn open_with_faults(root_dir: &Path, faults: Arc<FaultController>) -> Result<Self> {
+    pub fn open_with_faults(root_dir: &Path, faults: Arc<FaultController>) -> Result<Arc<Self>> {
         Self::open_with_config_and_faults(Config::new(root_dir), faults)
     }
 
     /// As [`open_with_config`](Self::open_with_config) but with an
     /// injectable fault controller.
-    pub fn open_with_config_and_faults(cfg: Config, faults: Arc<FaultController>) -> Result<Self> {
+    pub fn open_with_config_and_faults(cfg: Config, faults: Arc<FaultController>) -> Result<Arc<Self>> {
         let pages_path = page_file(&cfg.path);
         let page_store = Arc::new(if cfg.rebuild_free_list_on_open {
             PageStore::open_with_grow_chunk_and_bg_cap(
@@ -758,16 +746,10 @@ impl Db {
             metrics.clone(),
         );
 
-        let l2p_compactor_notifier = if cfg.l2p_buffer_enabled {
-            Some(Arc::new(crate::db::l2p_compactor::CompactorNotifier::new()))
-        } else {
-            None
-        };
         let deferred_outcomes = Arc::new(
             crate::db::commit::DeferredOutcomeAggregator::new(
                 metrics.clone(),
                 faults.clone(),
-                l2p_compactor_notifier.clone(),
             ),
         );
         let db = Self {
@@ -807,16 +789,10 @@ impl Db {
             flush_cursor: AtomicUsize::new(0),
             flush_select_budget: cfg.flush_select_budget,
             async_reclaim: Mutex::new(None),
-            l2p_compactor: Mutex::new(None),
             l2p_buffer_enabled: cfg.l2p_buffer_enabled,
-            l2p_compactor_params: crate::db::l2p_compactor::L2pCompactorParams {
-                soft_entries: cfg.l2p_buffer_soft_entries,
-                max_interval_ms: cfg.l2p_buffer_max_interval_ms,
-            },
             lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
             freed_pbas_sink: Mutex::new(None),
             deferred_outcomes,
-            l2p_compactor_notifier,
             commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
             wal_async_commits_enabled: cfg.wal_async_commits_enabled,
             // Phase 4 Step 4: resume TXG accounting at the manifest's last
@@ -859,18 +835,17 @@ impl Db {
         if async_reclaim_enabled {
             db.start_async_reclaim(async_reclaim_params);
         }
-        // Spawn the B2 L2P buffer compactor AFTER WAL replay so the
-        // worker only observes post-replay state. Recovery's
-        // `apply_op_bare` populates the buffer; the post-replay
-        // flush at the bottom of `open_with_config_and_faults` is
-        // expected to force-compact via the same path, but we start
-        // the worker afterwards so the compactor itself doesn't
-        // race the post-replay flush's `tree.write()`.
-        if db.l2p_buffer_enabled {
-            db.start_l2p_compactor();
-        }
+        // ZFS-TXG-clone Phase 4 Step 8: the background L2P drainer
+        // is now the `TxgSyncThread`, spawned below when
+        // `txg_threads_enabled` is true. With the legacy
+        // `L2pCompactor` retired, the post-replay flush at the
+        // bottom of `open_with_config_and_faults` is the sole
+        // initial drainer; subsequent drains come from either the
+        // sync thread (threads on) or `flush_with_gate`'s inline
+        // path (threads off).
+        let db = Arc::new(db);
         if db.txg_threads_enabled {
-            db.start_txg_threads(cfg.txg_timeout_ms);
+            Self::start_txg_threads(&db, cfg.txg_timeout_ms);
         }
         Ok(db)
     }

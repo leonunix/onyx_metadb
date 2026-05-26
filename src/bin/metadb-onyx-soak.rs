@@ -270,11 +270,12 @@ fn run() -> Result<bool, String> {
     cfg.page_cache_bytes = 4 * 1024 * 1024 * 1024; // 4 GiB, matches onyx prod
     cfg.rebuild_free_list_on_open = false;
     cfg.reclaim_orphans_on_open = false;
-    let db = Arc::new(if args.db_path.join(PAGE_FILE).exists() {
+    // Constructors already return `Arc<Db>` — no need to re-wrap.
+    let db = if args.db_path.join(PAGE_FILE).exists() {
         Db::open_with_config(cfg).map_err(|e| format!("open: {e}"))?
     } else {
         Db::create_with_config(cfg).map_err(|e| format!("create: {e}"))?
-    });
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
     let writer_stats: Vec<Arc<WriterStats>> = (0..args.writers)

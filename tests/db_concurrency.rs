@@ -36,7 +36,7 @@ fn keys_for_shard(shard_id: usize, shard_count: usize, want: usize, start: u64) 
     out
 }
 
-fn db_with_shards(dir: &TempDir, shards: u32) -> Db {
+fn db_with_shards(dir: &TempDir, shards: u32) -> std::sync::Arc<Db> {
     let mut cfg = Config::new(dir.path());
     cfg.shards_per_partition = shards;
     Db::create_with_config(cfg).unwrap()
