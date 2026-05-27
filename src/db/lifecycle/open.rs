@@ -608,13 +608,64 @@ impl Db {
                 }
                 Ok(())
             })?;
-        let last_applied = replay_outcome
+        let wal_replay_last_applied = replay_outcome
             .merged
             .last_lsn
             .unwrap_or(manifest.checkpoint_lsn);
         // If the last segment ended torn, truncate it to the last clean
         // record before handing the directory to the new Wal.
         crate::recovery::truncate_wal_set_torn_tails(&replay_outcome)?;
+
+        // Buffer-as-sole-journal Phase C.4: replay any uncovered
+        // lifecycle records into the same in-memory state WAL replay
+        // just finished folding into. Lifecycle records carry a
+        // monotonic `seq` but not an LSN; we synthesise replay LSNs
+        // sequentially starting from `wal_replay_last_applied + 1` so
+        // every page generation stamp the original apply wrote is
+        // strictly >= our replay LSN, and the `header.generation >=
+        // lsn` idempotency guard in `apply_drop_snapshot_pages` /
+        // `apply_clone_volume_incref` correctly fires SKIP on a
+        // page already processed before the crash.
+        //
+        // Lifecycle records sit between manifest commits — i.e. above
+        // `manifest.lifecycle_replay_seq` — and the new WAL is created
+        // BELOW (after lifecycle replay finishes) so its `next_lsn`
+        // does not collide with the LSNs we just consumed.
+        let mut last_applied = wal_replay_last_applied;
+        let mut lifecycle_max_seq = manifest.lifecycle_replay_seq;
+        let mut lifecycle_replayed_anything = false;
+        if !cfg.journal_mode.wal_authoritative() {
+            let dir = lifecycle_log_dir(&cfg.path);
+            if dir.exists() {
+                let from_seq = manifest.lifecycle_replay_seq;
+                let outcome = replay_lifecycle_journal_into(
+                    &dir,
+                    &mut manifest,
+                    &mut volumes,
+                    &refcount_shards,
+                    &dedup_index,
+                    &page_store,
+                    &page_cache,
+                    &faults,
+                    metrics.clone(),
+                    last_applied,
+                    replay_open_txg,
+                    cfg.l2p_buffer_enabled,
+                    from_seq,
+                )?;
+                lifecycle_max_seq = outcome.max_seq;
+                last_applied = last_applied.saturating_add(outcome.lsns_consumed);
+                lifecycle_replayed_anything =
+                    outcome.lsns_consumed > 0 || outcome.replayed_drop_snapshot;
+                if outcome.mutated_volumes {
+                    mutated_volumes = true;
+                }
+                if outcome.replayed_drop_snapshot {
+                    replayed_drop = true;
+                }
+            }
+        }
+
         let wal = WalSet::create_with_metrics(
             &wal_path,
             &cfg,
@@ -623,36 +674,17 @@ impl Db {
             metrics.clone(),
         )?;
 
-        // Buffer-as-sole-journal Phase C.3: open the lifecycle journal
-        // pointing at the next un-checkpointed seq. Phase C.4 will fold
-        // any uncovered records into the in-memory state *before*
-        // returning to clients; for now we open at
-        // `manifest.lifecycle_replay_seq + 1` and reject if the on-disk
-        // tail outruns the manifest watermark — better an explicit
-        // error than silently dropping durable lifecycle work.
+        // Buffer-as-sole-journal Phase C.4: open the lifecycle journal
+        // for further append at the seq immediately after whatever
+        // replay just folded in. `lifecycle_max_seq` is the manifest
+        // watermark when replay was a no-op (no segments / nothing
+        // beyond the checkpoint) or the highest seq observed otherwise;
+        // in either case `next_seq = lifecycle_max_seq + 1` is the next
+        // free slot. The post-replay manifest commit below stamps this
+        // value into `manifest.lifecycle_replay_seq`.
         let lifecycle_journal = if !cfg.journal_mode.wal_authoritative() {
             let dir = lifecycle_log_dir(&cfg.path);
-            let next_seq = manifest.lifecycle_replay_seq.saturating_add(1);
-            // Detect uncovered records before `LifecycleJournal::open`
-            // would silently extend the live segment.
-            let mut max_observed: u64 = manifest.lifecycle_replay_seq;
-            if dir.exists() {
-                crate::lifecycle_log::LifecycleJournal::replay(
-                    &dir,
-                    manifest.lifecycle_replay_seq,
-                    |rec| {
-                        max_observed = max_observed.max(rec.seq);
-                        Ok(())
-                    },
-                )?;
-            }
-            if max_observed > manifest.lifecycle_replay_seq {
-                return Err(MetaDbError::Corruption(format!(
-                    "metadb open found lifecycle records seq > {} (max observed {}) \
-                     but lifecycle replay is not implemented yet (Phase C.4 pending)",
-                    manifest.lifecycle_replay_seq, max_observed,
-                )));
-            }
+            let next_seq = lifecycle_max_seq.saturating_add(1);
             Some(Mutex::new(crate::lifecycle_log::LifecycleJournal::open(
                 &dir,
                 next_seq,
@@ -682,7 +714,7 @@ impl Db {
         // Skipping this block when nothing was replayed keeps the
         // common "close + reopen with no WAL tail" path zero-cost.
         let replayed_anything = replay_outcome.merged.last_lsn.is_some();
-        if replayed_anything || replayed_drop || mutated_volumes {
+        if replayed_anything || replayed_drop || mutated_volumes || lifecycle_replayed_anything {
             let sorted: Vec<Arc<Volume>> = {
                 let mut v: Vec<Arc<Volume>> = volumes.values().cloned().collect();
                 v.sort_by_key(|vol| vol.ord);
@@ -718,6 +750,14 @@ impl Db {
                 Some(last_applied),
             )?;
             manifest.checkpoint_lsn = last_applied;
+            // Phase C.4: stamp the lifecycle replay watermark alongside
+            // `checkpoint_lsn` so any lifecycle records we just folded
+            // in are now "covered" by the durable manifest. Without
+            // this stamp the next open would re-replay the same
+            // records (legal: replays are idempotent via page
+            // generation guards) but would also synthesise fresh LSNs
+            // that overlap with later WAL traffic.
+            manifest.lifecycle_replay_seq = lifecycle_max_seq;
             manifest_store.commit(&manifest)?;
             commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
             commit_refcount_checkpoint(&refcount_shards, last_applied.max(1) + 1)?;
@@ -865,7 +905,12 @@ impl Db {
             txg_quiesce: Mutex::new(None),
             txg_sync: Mutex::new(None),
             buffer_applied_watermark: AtomicU64::new(0),
-            lifecycle_applied_watermark: AtomicU64::new(0),
+            // Phase C.4: resume the lifecycle watermark from whatever
+            // the post-replay manifest commit just persisted. Future
+            // lifecycle ops `fetch_max` onto this value so the next
+            // checkpoint stamps a monotonic `lifecycle_replay_seq`
+            // rather than regressing it to 0.
+            lifecycle_applied_watermark: AtomicU64::new(lifecycle_max_seq),
             lifecycle_journal,
         };
         // Stamp `slot_max_lsn(open_txg)` with the post-replay
@@ -927,4 +972,327 @@ impl Db {
         }
         Ok(db)
     }
+}
+
+/// Result of [`replay_lifecycle_journal_into`]: how far we got and
+/// what kinds of state changed, so the post-replay flush block knows
+/// whether it has to run and which gauges to bump.
+struct LifecycleReplayOutcome {
+    /// Highest seq we folded in. Equals the caller-supplied `from_seq`
+    /// when the journal had no uncovered records.
+    max_seq: u64,
+    /// Number of synthetic LSNs consumed (== number of records replayed).
+    /// Callers advance `last_applied` by this much before creating the
+    /// new WAL so its `next_lsn` does not collide with these LSNs.
+    lsns_consumed: u64,
+    /// True if at least one CreateVolume / DropVolume / CloneVolume
+    /// record was applied — caller folds this into the
+    /// `mutated_volumes` flag that gates the post-replay flush.
+    mutated_volumes: bool,
+    /// True if at least one DropSnapshot record was applied — caller
+    /// folds this into the `replayed_drop` flag (same gate as the WAL
+    /// replay arm).
+    replayed_drop_snapshot: bool,
+}
+
+/// Phase C.4: replay every lifecycle-log record above
+/// `manifest.lifecycle_replay_seq` against the post-WAL-replay
+/// in-memory state. Mirrors the per-op dispatch in the WAL-replay
+/// closure for the variants that have migrated to the lifecycle
+/// journal in Phase C.3 (CreateVolume / DropVolume / CloneVolume /
+/// DropSnapshot / PromotionChunk / PromotionComplete).
+///
+/// LSN assignment: each record gets `starting_lsn + i + 1` (`i` = its
+/// position in the seq-ordered iteration). The original apply
+/// reserved its LSN via `wal.reserve_unlogged` AFTER the WAL's
+/// `next_lsn` was already >= `starting_lsn + 1`, so every page
+/// generation stamp on disk is strictly >= the LSN we use here. That
+/// keeps the `header.generation >= lsn` idempotency guards in
+/// `apply_drop_snapshot_pages` / `apply_clone_volume_incref` firing
+/// SKIP correctly when the original apply finished before the crash.
+#[allow(clippy::too_many_arguments)]
+fn replay_lifecycle_journal_into(
+    dir: &Path,
+    manifest: &mut Manifest,
+    volumes: &mut HashMap<VolumeOrdinal, Arc<Volume>>,
+    refcount_shards: &[Shard],
+    dedup_index: &Arc<crate::dedup::DedupIndex>,
+    page_store: &Arc<PageStore>,
+    page_cache: &Arc<PageCache>,
+    faults: &Arc<FaultController>,
+    metrics: Arc<MetaMetrics>,
+    starting_lsn: Lsn,
+    replay_open_txg: crate::types::Txg,
+    l2p_buffer_enabled: bool,
+    from_seq: u64,
+) -> Result<LifecycleReplayOutcome> {
+    use crate::lifecycle_log::{LifecycleJournal, op as lifecycle_op};
+    let mut outcome = LifecycleReplayOutcome {
+        max_seq: from_seq,
+        lsns_consumed: 0,
+        mutated_volumes: false,
+        replayed_drop_snapshot: false,
+    };
+    LifecycleJournal::replay(dir, from_seq, |rec| {
+        if rec.seq <= from_seq {
+            // `LifecycleJournal::replay` already filters at this
+            // threshold; the defensive check keeps the apply path
+            // immune to a future relaxation of that contract.
+            return Ok(());
+        }
+        let op = lifecycle_op::decode(&rec.body)?;
+        outcome.lsns_consumed = outcome
+            .lsns_consumed
+            .checked_add(1)
+            .ok_or(MetaDbError::OutOfSpace)?;
+        let lsn = starting_lsn
+            .checked_add(outcome.lsns_consumed)
+            .ok_or(MetaDbError::OutOfSpace)?;
+        apply_lifecycle_record_replay(
+            manifest,
+            volumes,
+            refcount_shards,
+            dedup_index,
+            page_store,
+            page_cache,
+            faults,
+            &metrics,
+            lsn,
+            replay_open_txg,
+            l2p_buffer_enabled,
+            &op,
+            &mut outcome,
+        )?;
+        outcome.max_seq = outcome.max_seq.max(rec.seq);
+        Ok(())
+    })?;
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_lifecycle_record_replay(
+    manifest: &mut Manifest,
+    volumes: &mut HashMap<VolumeOrdinal, Arc<Volume>>,
+    refcount_shards: &[Shard],
+    dedup_index: &Arc<crate::dedup::DedupIndex>,
+    page_store: &Arc<PageStore>,
+    page_cache: &Arc<PageCache>,
+    faults: &Arc<FaultController>,
+    metrics: &Arc<MetaMetrics>,
+    lsn: Lsn,
+    replay_open_txg: crate::types::Txg,
+    l2p_buffer_enabled: bool,
+    op: &crate::lifecycle_log::LifecycleOp,
+    outcome: &mut LifecycleReplayOutcome,
+) -> Result<()> {
+    use crate::lifecycle_log::LifecycleOp;
+    match op {
+        LifecycleOp::CreateVolume { ord, shard_count } => {
+            // Idempotent: a prior replay (or the original apply
+            // before the crash) may already have inserted this
+            // volume into our in-memory map. In that case the
+            // shards are already materialised and the manifest
+            // already lists the entry — nothing more to do.
+            if !volumes.contains_key(ord) {
+                let (shards, roots) = apply_create_volume(
+                    page_store,
+                    page_cache,
+                    *shard_count,
+                    metrics.clone(),
+                    l2p_buffer_enabled,
+                )?;
+                volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
+                let durable_seqs =
+                    vec![lsn; *shard_count as usize].into_boxed_slice();
+                manifest.volumes.push(VolumeEntry {
+                    ord: *ord,
+                    shard_count: *shard_count,
+                    l2p_shard_roots: roots,
+                    l2p_shard_durable_seq: durable_seqs,
+                    created_lsn: lsn,
+                    flags: 0,
+                    dead_list_head_pid: crate::types::NULL_PAGE,
+                    dead_list_tail_pid: crate::types::NULL_PAGE,
+                    parent_vol_ord: None,
+                    branched_at_lsn: 0,
+                    promotion_cursor: None,
+                });
+                outcome.mutated_volumes = true;
+            }
+            manifest.next_volume_ord = manifest
+                .next_volume_ord
+                .max(ord.checked_add(1).unwrap_or(u16::MAX));
+        }
+        LifecycleOp::DropVolume { ord, pages } => {
+            if volumes.contains_key(ord) {
+                apply_drop_volume(page_store, lsn, pages)?;
+                volumes.remove(ord);
+                manifest.volumes.retain(|v| v.ord != *ord);
+                outcome.mutated_volumes = true;
+            }
+        }
+        LifecycleOp::CloneVolume {
+            src_ord,
+            new_ord,
+            src_snap_id,
+            src_shard_roots,
+        } => {
+            if !volumes.contains_key(new_ord) {
+                apply_clone_volume_incref(page_store, faults, lsn, src_shard_roots)?;
+                // Same stale-buffer hazard as the WAL replay arm for
+                // CloneVolume: every PagedL2p opened above may hold
+                // a pre-incref Clean copy of one of these roots.
+                // Sweep all volumes so a later cow_for_write during
+                // continued replay can't flush a stale rc back over
+                // our disk-direct bump.
+                let all_vols: Vec<Arc<Volume>> =
+                    volumes.values().cloned().collect();
+                for &pid in src_shard_roots {
+                    if pid == crate::types::NULL_PAGE {
+                        continue;
+                    }
+                    page_cache.invalidate(pid);
+                    for vol in &all_vols {
+                        for shard in &vol.shards {
+                            shard.tree.write().forget_page(pid);
+                        }
+                    }
+                }
+                let (shards, actual_roots) = build_clone_volume_shards(
+                    src_shard_roots,
+                    page_store,
+                    page_cache,
+                    lsn,
+                    metrics.clone(),
+                    l2p_buffer_enabled,
+                )?;
+                let shard_count = shards.len() as u32;
+                let branched_at_lsn = manifest
+                    .snapshots
+                    .iter()
+                    .find(|s| s.id == *src_snap_id)
+                    .map(|s| s.created_lsn)
+                    .ok_or_else(|| {
+                        MetaDbError::Corruption(format!(
+                            "CloneVolume lifecycle replay: snapshot \
+                             {src_snap_id} missing from manifest at \
+                             lsn {lsn}"
+                        ))
+                    })?;
+                volumes.insert(
+                    *new_ord,
+                    Arc::new(Volume::with_lineage(
+                        *new_ord,
+                        shards,
+                        lsn,
+                        crate::types::NULL_PAGE,
+                        crate::types::NULL_PAGE,
+                        Some(*src_ord),
+                        branched_at_lsn,
+                        None,
+                    )),
+                );
+                let durable_seqs =
+                    vec![lsn; shard_count as usize].into_boxed_slice();
+                manifest.volumes.push(VolumeEntry {
+                    ord: *new_ord,
+                    shard_count,
+                    l2p_shard_roots: actual_roots,
+                    l2p_shard_durable_seq: durable_seqs,
+                    created_lsn: lsn,
+                    flags: 0,
+                    dead_list_head_pid: crate::types::NULL_PAGE,
+                    dead_list_tail_pid: crate::types::NULL_PAGE,
+                    parent_vol_ord: Some(*src_ord),
+                    branched_at_lsn,
+                    promotion_cursor: None,
+                });
+                outcome.mutated_volumes = true;
+            }
+            manifest.next_volume_ord = manifest
+                .next_volume_ord
+                .max(new_ord.checked_add(1).unwrap_or(u16::MAX));
+        }
+        LifecycleOp::DropSnapshot {
+            id,
+            pages,
+            pba_decrefs,
+        } => {
+            // Convert to the equivalent WalOp and route through the
+            // shared bare-apply path so the snap-pin / refcount
+            // cascade matches the live `Db::drop_snapshot` call
+            // site exactly (mirrors the `_` arm in the WAL replay
+            // closure above).
+            let wal_op = WalOp::DropSnapshot {
+                id: *id,
+                pages: pages.clone(),
+                pba_decrefs: pba_decrefs.clone(),
+            };
+            let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
+                manifest
+                    .snapshots
+                    .iter()
+                    .filter(|s| s.vol_ord == vol)
+                    .map(|s| SnapInfo {
+                        created_lsn: s.created_lsn,
+                        l2p_shard_roots: s.l2p_shard_roots.clone(),
+                    })
+                    .collect()
+            };
+            apply_op_bare(
+                volumes,
+                refcount_shards,
+                dedup_index,
+                page_store,
+                lsn,
+                replay_open_txg,
+                &wal_op,
+                &snap_lookup,
+            )?;
+            manifest.snapshots.retain(|s| s.id != *id);
+            outcome.replayed_drop_snapshot = true;
+        }
+        LifecycleOp::PromotionChunk {
+            vol_ord,
+            pba_increfs,
+            next_cursor,
+        } => {
+            // `apply_promotion_chunk` increfs each PBA in
+            // `pba_increfs` and stamps the in-memory
+            // `promotion_cursor`. The manifest mirror is rebuilt by
+            // the post-replay `refresh_manifest_entries` call.
+            // Idempotency rides on the cursor: if a prior apply
+            // already advanced past `next_cursor` we still re-incref
+            // (the rc is staged per-record, with replay scope
+            // bounded by `checkpoint_lsn`); the cursor write is
+            // last-writer-wins and `next_cursor` is the durable
+            // value from the record.
+            apply_promotion_chunk(
+                volumes,
+                refcount_shards,
+                lsn,
+                *vol_ord,
+                pba_increfs,
+                *next_cursor,
+            )?;
+        }
+        LifecycleOp::PromotionComplete { vol_ord } => {
+            apply_promotion_complete(volumes, *vol_ord)?;
+        }
+        // Phase C.3 doesn't yet route TakeSnapshot or Discard through
+        // the lifecycle journal (`TakeSnapshot` is manifest-only;
+        // `Discard` / range-delete still goes through the WAL). A
+        // record carrying either variant on disk indicates the on-disk
+        // schema has moved ahead of this binary — surface it as
+        // corruption rather than silently misapplying.
+        LifecycleOp::TakeSnapshot { .. } | LifecycleOp::Discard { .. } => {
+            return Err(MetaDbError::Corruption(format!(
+                "lifecycle replay: op tag 0x{:02x} not handled by this \
+                 binary (TakeSnapshot / Discard are not yet routed \
+                 through the lifecycle journal in Phase C.3)",
+                op.tag(),
+            )));
+        }
+    }
+    Ok(())
 }
