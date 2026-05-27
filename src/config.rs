@@ -26,6 +26,34 @@ pub const MAX_APPLY_LANE_SHARDS: usize = 64;
 /// so it lives here as a compile-time constant rather than a config field.
 pub const PAGE_SIZE: usize = 4096;
 
+/// Buffer-as-sole-journal selector. Matches `onyx::config::MetadbJournalMode`
+/// one-to-one — onyx threads its toml value through `metadb_config_from_onyx`
+/// into the field on [`Config`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MetaDbJournalMode {
+    /// Legacy: every `commit_ops` writes a WAL record and (eventually)
+    /// fsyncs it; recovery replays WAL.
+    Wal,
+    /// Phase B observability: WAL is still authoritative, but each
+    /// checkpoint also persists `manifest.last_processed_buffer_seq`
+    /// from `Db::buffer_applied_watermark` so a parallel buffer-replay
+    /// path can be diffed against the WAL-derived state. No commit-path
+    /// latency cost.
+    Shadow,
+    /// Phase C cutover: `commit_ops` skips the WAL submit for
+    /// data-plane ops. Lifecycle ops still hit the WAL until their
+    /// migration to the dedicated lifecycle journal lands. The embedder
+    /// is responsible for replaying the upper-layer journal (onyx LV2
+    /// buffer) before accepting client IO.
+    Buffer,
+}
+
+impl MetaDbJournalMode {
+    pub fn wal_authoritative(self) -> bool {
+        !matches!(self, Self::Buffer)
+    }
+}
+
 /// Embedder-provided configuration for opening a database.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -145,6 +173,13 @@ pub struct Config {
     /// fsync over many async commits, small enough to keep the inflight
     /// WAL-on-OS-page-cache window bounded.
     pub wal_async_group_commit_window_us: u64,
+
+    /// Buffer-as-sole-journal selector. See [`MetaDbJournalMode`] for
+    /// the three modes. Default is [`MetaDbJournalMode::Wal`] which
+    /// preserves the legacy commit path bit-for-bit; opt into
+    /// [`MetaDbJournalMode::Shadow`] for observability or
+    /// [`MetaDbJournalMode::Buffer`] for the production cutover.
+    pub journal_mode: MetaDbJournalMode,
 
     /// Maximum bytes held by the in-memory page cache.
     pub page_cache_bytes: u64,
@@ -449,6 +484,7 @@ impl Config {
             // matrix is a later hardening gate, not a prerequisite.
             wal_async_commits_enabled: true,
             wal_async_group_commit_window_us: 1000,
+            journal_mode: MetaDbJournalMode::Wal,
             page_cache_bytes: 512 * 1024 * 1024,
             lsm_memtable_bytes: 64 * 1024 * 1024,
             lsm_bloom_bits_per_entry: 10,

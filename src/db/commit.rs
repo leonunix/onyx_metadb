@@ -479,39 +479,68 @@ impl Db {
             .unwrap_or_else(DispatchFootprint::global);
         let dispatch_lanes = dispatch_footprint.lanes.len();
 
-        let encode_started = std::time::Instant::now();
-        let body = match try_encode_body(ops) {
-            Ok(body) => body,
-            Err(err) => {
-                self.metrics.record_commit_error(commit_started.elapsed());
-                return Err(err);
-            }
-        };
-        timing.encode = encode_started.elapsed();
-        self.metrics.record_commit_encode(timing.encode);
-        self.metrics.record_commit_wal_body_bytes(body.len());
-        // ZFS-TXG-clone Phase 4 Step 4: acquire a TxgGuard BEFORE WAL submit
-        // so the slot stamp is locked in before the WAL allocator can hand
-        // out a higher LSN to a later TXG. The guard's drop (at function
-        // exit) decrements the slot's inflight counter, which is what the
-        // `TxgQuiesceThread` parks on. Holding it across the apply also
-        // means `take_syncing_slot` cannot race with this commit's tree
-        // mutations because the slot stays pinned (state == Open or
-        // Quiescing — never Syncing while inflight > 0).
+        // Buffer-as-sole-journal Phase C: skip body encoding and WAL
+        // submit entirely when the journal mode is Buffer. The
+        // recovery source is the upper-layer LV2 buffer, so there's
+        // no point spending µs on `try_encode_body` or paying the
+        // writer-thread round-trip for an LSN we can allocate
+        // directly via `WalSet::reserve_unlogged`.
+        let buffer_mode = !self.journal_mode.wal_authoritative();
+        // ZFS-TXG-clone Phase 4 Step 4: acquire a TxgGuard BEFORE WAL
+        // submit (or the equivalent reserve) so the slot stamp is
+        // locked in before the WAL allocator can hand out a higher
+        // LSN to a later TXG. The guard's drop (at function exit)
+        // decrements the slot's inflight counter, which is what the
+        // `TxgQuiesceThread` parks on. Holding it across the apply
+        // also means `take_syncing_slot` cannot race with this
+        // commit's tree mutations because the slot stays pinned
+        // (state == Open or Quiescing — never Syncing while
+        // inflight > 0).
         let _txg_guard = self.txg.enter();
         let wal_started = std::time::Instant::now();
-        let lsn = match self.submit_wal_ops(ops, body, Some(dispatch_footprint), options) {
-            Ok(lsn) => {
-                timing.wal_submit = wal_started.elapsed();
-                self.metrics.record_commit_wal_submit(timing.wal_submit);
-                lsn
+        let lsn = if buffer_mode {
+            // Buffer mode: allocate an LSN without writing a WAL
+            // body. `register_dispatch_intent` still runs under the
+            // WalSet allocator mutex so concurrent dispatch ordering
+            // is preserved.
+            let result = self.wal.reserve_unlogged(|lsn| {
+                self.register_dispatch_intent(lsn, dispatch_footprint);
+            });
+            timing.wal_submit = wal_started.elapsed();
+            self.metrics.record_commit_wal_submit(timing.wal_submit);
+            match result {
+                Ok(lsn) => lsn,
+                Err(err) => {
+                    self.metrics.record_commit_error(commit_started.elapsed());
+                    self.poison_commit_waiters(&err);
+                    return Err(err);
+                }
             }
-            Err(err) => {
-                timing.wal_submit = wal_started.elapsed();
-                self.metrics.record_commit_wal_submit(timing.wal_submit);
-                self.metrics.record_commit_error(commit_started.elapsed());
-                self.poison_commit_waiters(&err);
-                return Err(err);
+        } else {
+            let encode_started = std::time::Instant::now();
+            let body = match try_encode_body(ops) {
+                Ok(body) => body,
+                Err(err) => {
+                    self.metrics.record_commit_error(commit_started.elapsed());
+                    return Err(err);
+                }
+            };
+            timing.encode = encode_started.elapsed();
+            self.metrics.record_commit_encode(timing.encode);
+            self.metrics.record_commit_wal_body_bytes(body.len());
+            match self.submit_wal_ops(ops, body, Some(dispatch_footprint), options) {
+                Ok(lsn) => {
+                    timing.wal_submit = wal_started.elapsed();
+                    self.metrics.record_commit_wal_submit(timing.wal_submit);
+                    lsn
+                }
+                Err(err) => {
+                    timing.wal_submit = wal_started.elapsed();
+                    self.metrics.record_commit_wal_submit(timing.wal_submit);
+                    self.metrics.record_commit_error(commit_started.elapsed());
+                    self.poison_commit_waiters(&err);
+                    return Err(err);
+                }
             }
         };
         _txg_guard.record_lsn(lsn);

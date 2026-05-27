@@ -112,6 +112,11 @@ pub struct Db {
     /// uncheckpointed no-WAL LSN.
     unlogged_commit_gate: RwLock<()>,
     unlogged_commits_enabled: bool,
+    /// Buffer-as-sole-journal selector. Snapshotted from
+    /// `Config::journal_mode` on open; immutable for the lifetime of
+    /// the Db. Drives the WAL vs unlogged routing in
+    /// `commit_ops_with_options`.
+    journal_mode: crate::config::MetaDbJournalMode,
     /// ZFS-TXG-clone Phase 1: when true, L2P-only commits skip the
     /// apply-lane channel hop and apply directly on the caller
     /// thread. See `Config::commit_direct_apply_enabled`.
