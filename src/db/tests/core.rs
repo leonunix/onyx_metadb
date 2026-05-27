@@ -355,8 +355,10 @@ fn b2_buffer_flush_reopen_round_trip() {
 fn b2_buffer_no_flush_reopen_replays_from_wal() {
     // Skip the explicit flush so the buffer's contents are
     // recreated only from WAL replay on reopen.
+    // Phase D.4: WAL replay is a Wal-mode-only behaviour — Buffer
+    // mode relies on the upper-layer LV2 buffer to replay.
     let dir = TempDir::new().unwrap();
-    let mut cfg = Config::new(dir.path());
+    let mut cfg = wal_mode_cfg(dir.path());
     cfg.l2p_buffer_enabled = true;
     cfg.l2p_buffer_soft_entries = 4;
     cfg.l2p_buffer_max_interval_ms = 50;

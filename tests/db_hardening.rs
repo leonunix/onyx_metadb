@@ -1,9 +1,40 @@
 use std::panic::AssertUnwindSafe;
+use std::path::Path;
 use std::sync::Arc;
 
 use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
-use onyx_metadb::{Db, DedupValue, Hash8, L2pValue, VerifyOptions, verify_path};
+use onyx_metadb::{
+    Config, Db, DedupValue, Hash8, L2pValue, MetaDbJournalMode, VerifyOptions, verify_path,
+};
 use tempfile::TempDir;
+
+// Phase D.4: every Db construction in this file flows through these
+// Wal-mode helpers. The file tests WAL crash-replay semantics — fault
+// injection at `CommitPostWalBeforeApply`, on-disk WAL segment
+// inspection, multi-LSN replay coalescing, etc. — none of which
+// apply once the default journal mode shifts to Buffer. After D.5
+// retires Wal mode entirely, this whole file goes away with it.
+fn wal_cfg(path: &Path) -> Config {
+    let mut cfg = Config::new(path);
+    cfg.journal_mode = MetaDbJournalMode::Wal;
+    cfg
+}
+
+fn wal_create(path: &Path) -> std::sync::Arc<Db> {
+    Db::create_with_config(wal_cfg(path)).unwrap()
+}
+
+fn wal_create_with_faults(path: &Path, faults: Arc<FaultController>) -> std::sync::Arc<Db> {
+    Db::create_with_config_and_faults(wal_cfg(path), faults).unwrap()
+}
+
+fn wal_open(path: &Path) -> std::sync::Arc<Db> {
+    Db::open_with_config(wal_cfg(path)).unwrap()
+}
+
+fn wal_open_with_faults(path: &Path, faults: Arc<FaultController>) -> std::sync::Arc<Db> {
+    Db::open_with_config_and_faults(wal_cfg(path), faults).unwrap()
+}
 
 fn l2p(n: u8) -> L2pValue {
     let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
@@ -33,7 +64,7 @@ fn h(n: u64) -> Hash8 {
 #[test]
 fn clean_db_passes_verifier() {
     let dir = TempDir::new().unwrap();
-    let db = Db::create(dir.path()).unwrap();
+    let db = wal_create(dir.path());
     for i in 0..32u64 {
         db.insert(0, i, l2p((i % 64) as u8)).unwrap();
         db.put_dedup(h(10_000 + i), dval(i as u8)).unwrap();
@@ -59,7 +90,7 @@ fn crash_after_wal_before_apply_recovers_committed_tx() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             // Seed rc(42) before installing the fault so the post-WAL
             // crash exercises the L2P + dedup path alongside an
             // already-persistent shared PBA.
@@ -72,7 +103,7 @@ fn crash_after_wal_before_apply_recovers_committed_tx() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     assert_eq!(db.get(0, 1).unwrap(), Some(l2p(9)));
     assert_eq!(db.get_dedup(&h(7)).unwrap(), Some(dval(7)));
     assert_eq!(db.get_refcount(42).unwrap(), 2);
@@ -86,7 +117,7 @@ fn crash_after_apply_before_lsn_bump_does_not_double_apply_on_reopen() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             // Phase 5: standalone Incref WAL ops are gone, so the
             // double-apply check uses the test-only seed (which
             // commits via PromotionChunk) for the second rc bump too.
@@ -104,7 +135,7 @@ fn crash_after_apply_before_lsn_bump_does_not_double_apply_on_reopen() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     assert_eq!(db.get(0, 1).unwrap(), Some(l2p(1)));
     assert_eq!(db.get_dedup(&h(99)).unwrap(), Some(dval(9)));
     assert_eq!(db.get_refcount(100).unwrap(), 7);
@@ -119,7 +150,7 @@ fn manifest_swap_crash_reclaims_orphans_on_open() {
         let faults = Arc::clone(&faults);
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             for i in 0..64u64 {
                 db.insert(0, i, l2p((i % 64) as u8)).unwrap();
                 db.put_dedup(h(i), dval(i as u8)).unwrap();
@@ -138,7 +169,7 @@ fn manifest_swap_crash_reclaims_orphans_on_open() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     for i in 0..128u64 {
         assert_eq!(db.get(0, i).unwrap(), Some(l2p((i % 64) as u8)));
         assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dval(i as u8)));
@@ -159,7 +190,7 @@ fn flush_before_manifest_fault_does_not_checkpoint_refcount_in_place() {
     let dir = TempDir::new().unwrap();
     let faults = FaultController::new();
     {
-        let db = Db::create_with_faults(dir.path(), faults.clone()).unwrap();
+        let db = wal_create_with_faults(dir.path(), faults.clone());
 
         let mut tx = db.begin();
         tx.l2p_remap(0, 0, remap_val(195, 1), None);
@@ -181,7 +212,7 @@ fn flush_before_manifest_fault_does_not_checkpoint_refcount_in_place() {
         assert!(db.flush().is_err());
     }
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     assert_eq!(db.get(0, 0).unwrap(), None);
     assert_eq!(db.get_refcount(195).unwrap(), 0);
     drop(db);
@@ -199,11 +230,11 @@ fn flush_before_manifest_fault_does_not_checkpoint_refcount_in_place() {
 fn snapshot_checkpoint_does_not_drop_unflushed_dedup_rows() {
     let dir = TempDir::new().unwrap();
     {
-        let db = Db::create(dir.path()).unwrap();
+        let db = wal_create(dir.path());
         db.put_dedup(h(777), dval(7)).unwrap();
         let _ = db.take_snapshot(0).unwrap();
     }
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     assert_eq!(db.get_dedup(&h(777)).unwrap(), Some(dval(7)));
 }
 
@@ -211,12 +242,12 @@ fn snapshot_checkpoint_does_not_drop_unflushed_dedup_rows() {
 fn drop_snapshot_checkpoint_does_not_drop_unflushed_dedup_rows() {
     let dir = TempDir::new().unwrap();
     {
-        let db = Db::create(dir.path()).unwrap();
+        let db = wal_create(dir.path());
         let snap = db.take_snapshot(0).unwrap();
         db.put_dedup(h(888), dval(8)).unwrap();
         let _ = db.drop_snapshot(snap).unwrap();
     }
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     assert_eq!(db.get_dedup(&h(888)).unwrap(), Some(dval(8)));
 }
 
@@ -244,7 +275,7 @@ fn drop_snapshot_crash_at_manifest_commit_preserves_refcount_consistency() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
 
             // Populate enough entries to force the L2P tree to span
             // multiple index/leaf pages so the snapshot genuinely shares
@@ -276,7 +307,7 @@ fn drop_snapshot_crash_at_manifest_commit_preserves_refcount_consistency() {
     // apply on open, or (b) the record is a torn tail and the snapshot
     // is still intact — either way every live page has the refcount the
     // tree structure implies.
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     for i in 0..512u64 {
         assert_eq!(db.get(0, i).unwrap(), Some(l2p((i % 64) as u8)));
     }
@@ -307,7 +338,7 @@ fn create_volume_crash_after_wal_before_manifest_reconstructs() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             faults.install(
                 FaultPoint::CreateVolumePostWalBeforeManifest,
                 1,
@@ -318,7 +349,7 @@ fn create_volume_crash_after_wal_before_manifest_reconstructs() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     // Post-recovery, the clone/creation op replays and the new volume
     // should appear in `volumes()`.
     let vols = db.volumes();
@@ -351,7 +382,7 @@ fn drop_volume_crash_after_wal_before_apply_recovers() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             let ord = db.create_volume().unwrap();
             for i in 0u64..32 {
                 db.insert(ord, i, l2p((i % 64) as u8)).unwrap();
@@ -368,7 +399,7 @@ fn drop_volume_crash_after_wal_before_apply_recovers() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     assert_eq!(
         db.volumes(),
         vec![0],
@@ -396,7 +427,7 @@ fn clone_volume_crash_mid_incref_completes_on_recovery() {
 
     let snap_id;
     let setup = |path: &std::path::Path| {
-        let db = Db::create(path).unwrap();
+        let db = wal_create(path);
         for i in 0u64..16 {
             db.insert(0, i, l2p((i % 64) as u8)).unwrap();
         }
@@ -410,14 +441,14 @@ fn clone_volume_crash_mid_incref_completes_on_recovery() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::open_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_open_with_faults(&path, faults.clone());
             faults.install(FaultPoint::CloneVolumeMidIncref, 1, FaultAction::Panic);
             let _ = db.clone_volume(snap_id);
             panic!("clone_volume returned but fault should have panicked");
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     // The clone completed via replay.
     let vols = db.volumes();
     assert!(
@@ -467,7 +498,7 @@ fn crash_after_wal_before_apply_replays_l2p_remap() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             // Phase 5: L2pRemap is rc-neutral, so the guarded op
             // below would never see rc(100) > 0 from the seed remap
             // alone. Drive rc(100)=1 explicitly via PromotionChunk so
@@ -484,7 +515,7 @@ fn crash_after_wal_before_apply_replays_l2p_remap() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     assert_eq!(db.get(0, 10).unwrap(), Some(remap_val(100, 1)));
     assert_eq!(
         db.get(0, 11).unwrap(),
@@ -516,7 +547,7 @@ fn crash_after_apply_before_lsn_bump_l2p_remap_idempotent() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             // Seed two L2P mappings so the post-crash remap has a
             // prev value to overwrite. All three commits are
             // rc-neutral under Phase 5.
@@ -538,7 +569,7 @@ fn crash_after_apply_before_lsn_bump_l2p_remap_idempotent() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     // L2P state: lba=10 settled on pba=200 (the post-fault remap was
     // applied before the crash, then replayed idempotently). lba=11
     // still maps to its original pba=100.
@@ -567,7 +598,7 @@ fn crash_after_wal_before_apply_replays_l2p_range_delete() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             // Seed 4 lbas at distinct pbas, and drive rc(100..104)=1
             // explicitly via PromotionChunk so range_delete has
             // something to decref without underflow.
@@ -582,7 +613,7 @@ fn crash_after_wal_before_apply_replays_l2p_range_delete() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     for i in 0..4u64 {
         assert_eq!(db.get(0, 10 + i).unwrap(), None);
         assert_eq!(db.get_refcount(100 + i).unwrap(), 0);
@@ -605,7 +636,7 @@ fn crash_after_apply_before_lsn_bump_l2p_range_delete_idempotent() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             // Seed lbas 0..6 with pbas 100..106, and drive each
             // rc(100+i)=1 via PromotionChunk so the range delete can
             // decref without underflow.
@@ -624,7 +655,7 @@ fn crash_after_apply_before_lsn_bump_l2p_range_delete_idempotent() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     // Deleted lbas gone, surviving lbas intact.
     for i in 0..3u64 {
         assert_eq!(db.get(0, i).unwrap(), None);
@@ -653,7 +684,7 @@ fn crash_after_wal_with_rejecting_guard_stays_a_no_op_on_replay() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             // rc(100) stays 0: guard min_rc=1 must fail.
             faults.install(FaultPoint::CommitPostWalBeforeApply, 1, FaultAction::Panic);
             let mut tx = db.begin();
@@ -662,7 +693,7 @@ fn crash_after_wal_with_rejecting_guard_stays_a_no_op_on_replay() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     assert_eq!(db.get(0, 10).unwrap(), None, "guard rejected op on replay");
     assert_eq!(db.get_refcount(100).unwrap(), 0);
     assert_eq!(
@@ -686,7 +717,7 @@ fn drop_snapshot_crash_after_wal_before_apply_replays_pba_decrefs() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             // Seed L2P + rc(100)=1. Phase 5 L2pRemap is rc-neutral
             // on both LANED and SERIAL paths, so the snap-on-vol
             // remap below does not bump rc(200) either; the only
@@ -711,7 +742,7 @@ fn drop_snapshot_crash_after_wal_before_apply_replays_pba_decrefs() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     // Replay must have re-driven the pba_decref(100) from the WAL record.
     assert_eq!(
         db.get_refcount(100).unwrap(),
@@ -745,7 +776,7 @@ fn drop_snapshot_crash_after_apply_before_lsn_bump_does_not_double_decref() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             // Seed L2P + rc(100)=2. Phase 5 L2pRemap is rc-neutral,
             // so the seed rc must be driven explicitly via
             // PromotionChunk.
@@ -777,7 +808,7 @@ fn drop_snapshot_crash_after_apply_before_lsn_bump_does_not_double_decref() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     // drop_snapshot emitted exactly one pba_decref(100). Replay must
     // apply it once, not twice — so rc(100) ends at 1.
     assert_eq!(
@@ -811,7 +842,7 @@ fn drop_snapshot_crash_mid_page_cascade_recovers_consistent_refcounts() {
         let faults = faults.clone();
         let path = dir.path().to_path_buf();
         move || {
-            let db = Db::create_with_faults(&path, faults.clone()).unwrap();
+            let db = wal_create_with_faults(&path, faults.clone());
             // Enough writes to guarantee multi-page L2P trees so the
             // drop_snapshot page cascade is non-trivial. Use LBA = i*4
             // to spread 256 unique PBAs across multiple leaves (32
@@ -848,7 +879,7 @@ fn drop_snapshot_crash_mid_page_cascade_recovers_consistent_refcounts() {
         }
     }));
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = wal_open(dir.path());
     // rc(100..128) must end at 0 — they were only referenced by the
     // dropped snapshot after the post-snap remap redirected lba→500+i.
     for i in 0u64..128 {

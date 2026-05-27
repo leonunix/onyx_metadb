@@ -96,8 +96,11 @@ fn multi_writer_stress_finishes_and_reopens_cleanly() {
 
 #[test]
 fn multi_lane_wal_replay_survives_reopen_without_flush() {
+    // Phase D.4: Wal-mode-only — multi-lane WAL replay is a Wal-
+    // mode feature; Buffer mode has no WAL writer to lane.
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
+    cfg.journal_mode = onyx_metadb::MetaDbJournalMode::Wal;
     cfg.shards_per_partition = 4;
     cfg.wal_lanes = 4;
 

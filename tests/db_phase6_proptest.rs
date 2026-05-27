@@ -177,8 +177,21 @@ fn apply_to_db(op: &Op, db: &Db) -> Result<(), MetaDbError> {
     Ok(())
 }
 
-fn tiny_cache_config(path: &Path) -> Config {
+/// Phase D.4: every config builder in this file pins
+/// `MetaDbJournalMode::Wal` because `Op::Reopen` exercises WAL replay
+/// of data-plane ops. The default journal mode is now Buffer, which
+/// has no metadb-side WAL — Op::Reopen would lose every uncheckpointed
+/// commit and the proptest assertions on cross-reopen equivalence
+/// would all break. After D.5 retires Wal mode, the proptest needs a
+/// rewrite that simulates onyx-side buffer replay between reopens.
+fn wal_base_config(path: &Path) -> Config {
     let mut cfg = Config::new(path);
+    cfg.journal_mode = onyx_metadb::MetaDbJournalMode::Wal;
+    cfg
+}
+
+fn tiny_cache_config(path: &Path) -> Config {
+    let mut cfg = wal_base_config(path);
     cfg.page_cache_bytes = 1024 * 1024;
     cfg
 }
@@ -191,7 +204,7 @@ fn tiny_cache_config(path: &Path) -> Config {
 /// regression guard: any future change that lets the flag affect
 /// sync `commit_ops` will surface here.
 fn deferred_config(path: &Path) -> Config {
-    let mut cfg = Config::new(path);
+    let mut cfg = wal_base_config(path);
     cfg.commit_deferred_outcomes_enabled = true;
     cfg
 }
@@ -329,7 +342,7 @@ proptest! {
     #[test]
     fn db_vs_reference_with_reopens(ops in proptest::collection::vec(arb_op(), 30..80)) {
         let dir = TempDir::new().unwrap();
-        run_ops_with_config(&ops, &Config::new(dir.path()))?;
+        run_ops_with_config(&ops, &wal_base_config(dir.path()))?;
     }
 
     #[test]
@@ -410,7 +423,7 @@ fn run_phase8a_budget(tiny_cache: bool) -> Result<(), TestCaseError> {
         let cfg = if tiny_cache {
             tiny_cache_config(dir.path())
         } else {
-            Config::new(dir.path())
+            wal_base_config(dir.path())
         };
         run_ops_with_config(&ops, &cfg)
     })?)
@@ -424,9 +437,12 @@ fn failed_commit_does_not_apply_to_memory_state() {
     // bytes before the process exited; that's a durability question,
     // not an atomicity one, and is covered separately by the
     // torn-tail recovery test in `src/recovery.rs`.)
+    // Phase D.4: this test installs `FaultPoint::WalFsyncBefore`,
+    // which only fires inside the WAL writer — Buffer mode bypasses
+    // the writer entirely, so the fault never trips. Pin to Wal mode.
     let dir = TempDir::new().unwrap();
     let faults = FaultController::new();
-    let db = Db::create_with_faults(dir.path(), faults.clone()).unwrap();
+    let db = Db::create_with_config_and_faults(wal_base_config(dir.path()), faults.clone()).unwrap();
 
     db.insert(0, 1, l2p(1)).unwrap();
     db.incref_pba(10, 5).unwrap();

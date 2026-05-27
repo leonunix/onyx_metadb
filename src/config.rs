@@ -175,10 +175,12 @@ pub struct Config {
     pub wal_async_group_commit_window_us: u64,
 
     /// Buffer-as-sole-journal selector. See [`MetaDbJournalMode`] for
-    /// the three modes. Default is [`MetaDbJournalMode::Wal`] which
-    /// preserves the legacy commit path bit-for-bit; opt into
-    /// [`MetaDbJournalMode::Shadow`] for observability or
-    /// [`MetaDbJournalMode::Buffer`] for the production cutover.
+    /// the three modes. Phase D made [`MetaDbJournalMode::Buffer`]
+    /// the default — production onyx already runs in Buffer mode and
+    /// the lifecycle journal + buffer replay path now cover every
+    /// durability boundary the old WAL did. Pre-D tests that depend
+    /// on WAL replay behaviour still set this knob explicitly to
+    /// [`MetaDbJournalMode::Wal`] until they migrate.
     pub journal_mode: MetaDbJournalMode,
 
     /// Maximum bytes held by the in-memory page cache.
@@ -484,7 +486,7 @@ impl Config {
             // matrix is a later hardening gate, not a prerequisite.
             wal_async_commits_enabled: true,
             wal_async_group_commit_window_us: 1000,
-            journal_mode: MetaDbJournalMode::Wal,
+            journal_mode: MetaDbJournalMode::Buffer,
             page_cache_bytes: 512 * 1024 * 1024,
             lsm_memtable_bytes: 64 * 1024 * 1024,
             lsm_bloom_bits_per_entry: 10,

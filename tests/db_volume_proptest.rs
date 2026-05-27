@@ -34,12 +34,23 @@ fn db_open_or_create(dir: &TempDir, deferred: bool, async_wal: bool) -> std::syn
     } else if deferred {
         Db::create_with_config(deferred_cfg(dir.path())).unwrap()
     } else {
-        Db::create(path_of(dir)).unwrap()
+        Db::create_with_config(default_cfg(path_of(dir))).unwrap()
     }
 }
 
-fn deferred_cfg(path: &Path) -> Config {
+/// Phase D.4: pin the proptest to `MetaDbJournalMode::Wal` because
+/// `Op::Reopen` exercises WAL replay of data-plane ops. After D.5
+/// retires Wal mode the proptest needs a rewrite that simulates
+/// onyx-side buffer replay between reopens (the current `Op::Reopen`
+/// would lose every uncheckpointed commit in Buffer mode).
+fn default_cfg(path: &Path) -> Config {
     let mut cfg = Config::new(path);
+    cfg.journal_mode = onyx_metadb::MetaDbJournalMode::Wal;
+    cfg
+}
+
+fn deferred_cfg(path: &Path) -> Config {
+    let mut cfg = default_cfg(path);
     cfg.commit_deferred_outcomes_enabled = true;
     cfg
 }
@@ -143,7 +154,7 @@ fn reopen(dir: &TempDir, deferred: bool, async_wal: bool) -> std::sync::Arc<Db> 
     } else if deferred {
         Db::open_with_config(deferred_cfg(dir.path())).unwrap()
     } else {
-        Db::open(dir.path()).unwrap()
+        Db::open_with_config(default_cfg(dir.path())).unwrap()
     }
 }
 
@@ -475,7 +486,7 @@ fn volume_lifecycle_matches_reference_long_run() {
     runner
         .run(&proptest::collection::vec(arb_op(), 1..400), |ops| {
             let dir = TempDir::new().unwrap();
-            let mut db = Db::create(path_of(&dir)).unwrap();
+            let mut db = Db::create_with_config(default_cfg(path_of(&dir))).unwrap();
             let mut model = Model::new();
 
             for op in ops {

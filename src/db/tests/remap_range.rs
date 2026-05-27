@@ -232,15 +232,18 @@ fn l2p_remap_survives_restart_via_wal_replay() {
     // which is rc-neutral. Replay restores the L2P mapping; rc stays
     // at 0 because no rc-mutating op (DedupPut / PromotionChunk /
     // FreePbas) ran.
+    // Phase D.4: Wal-mode-only — Buffer mode relies on the upper-
+    // layer LV2 buffer for the same crash-without-flush recovery.
     let dir = TempDir::new().unwrap();
+    let cfg = wal_mode_cfg(dir.path());
     {
-        let db = Db::create(dir.path()).unwrap();
+        let db = Db::create_with_config(cfg.clone()).unwrap();
         let mut tx = db.begin();
         tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(100, 7), None);
         tx.commit_with_outcomes().unwrap();
         // Crash without flush: only WAL persists.
     }
-    let db = Db::open(dir.path()).unwrap();
+    let db = Db::open_with_config(cfg).unwrap();
     assert_eq!(
         db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(),
         Some(remap_val(100, 7))
@@ -286,13 +289,15 @@ fn l2p_remap_guard_reject_does_not_replay_after_later_refcount_growth() {
     // it via the test helper. Use a high guard threshold (rc≥100) so
     // even with WAL replay re-applying the legacy rc-mutating
     // `apply_l2p_remap` the guard can't accidentally pass.
+    // Phase D.4: Wal-mode-only — exercises WAL replay behaviour.
     let dir = TempDir::new().unwrap();
+    let cfg = wal_mode_cfg(dir.path());
     {
-        let mut db = Db::create(dir.path()).unwrap();
+        let mut db = Db::create_with_config(cfg.clone()).unwrap();
 
         remap(&db, 10, remap_val(100, 1), None);
         db.incref_pba(100, 1).unwrap();
-        db = Db::open(dir.path()).unwrap();
+        db = Db::open_with_config(cfg.clone()).unwrap();
 
         // Guarded remap with min_rc=100 → rejected (current rc is
         // well below).
@@ -317,7 +322,7 @@ fn l2p_remap_guard_reject_does_not_replay_after_later_refcount_growth() {
         assert!(refs.iter().any(|&(pba, _)| pba == 100));
     }
 
-    let db = Db::open(dir.path()).unwrap();
+    let db = Db::open_with_config(cfg).unwrap();
     // L2P state must round-trip; lba=11 never accepted the guarded
     // remap, even though replay walks the rejected WAL record.
     assert_eq!(
@@ -336,15 +341,17 @@ fn l2p_remap_freed_pba_round_trips_through_replay() {
     // Phase 5: L2pRemap is rc-neutral on both the live hot path and
     // WAL replay. The load-bearing invariant is that the L2P mapping
     // at lba=10 is the post-overwrite value after replay.
+    // Phase D.4: Wal-mode-only — checks WAL replay outcome.
     let dir = TempDir::new().unwrap();
+    let cfg = wal_mode_cfg(dir.path());
     {
-        let db = Db::create(dir.path()).unwrap();
+        let db = Db::create_with_config(cfg.clone()).unwrap();
         remap(&db, 10, remap_val(100, 1), None);
         remap(&db, 10, remap_val(200, 1), None);
         // Hot-path didn't touch rc.
         assert_eq!(db.get_refcount(100).unwrap(), 0);
     }
-    let db = Db::open(dir.path()).unwrap();
+    let db = Db::open_with_config(cfg).unwrap();
     assert_eq!(db.get_refcount(100).unwrap(), 0);
     assert_eq!(db.get_refcount(200).unwrap(), 0);
     assert_eq!(
@@ -572,9 +579,13 @@ fn range_delete_auto_splits_above_cap() {
     // records + two final applies. Use batched seed commits so this
     // regression test exercises range_delete instead of spending most
     // of its time on single-op WAL round trips.
+    // Phase D.4: this test pins captured-list chunking behaviour
+    // that exists only on the Wal-mode `range_delete_via_wal` path;
+    // Buffer-mode `range_delete_via_lifecycle` chunks by Discard's
+    // `count: u32` LBA range instead of captured-list length.
     let cap = crate::wal::op::MAX_RANGE_DELETE_CAPTURED;
     let total = cap + 37;
-    let (_d, db) = mk_db();
+    let (_d, db) = mk_wal_db();
     seed_distinct_remaps_batched(&db, total);
     let pre_lsn = db.last_applied_lsn();
     let lsn = db

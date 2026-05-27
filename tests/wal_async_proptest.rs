@@ -38,7 +38,7 @@ use std::panic::AssertUnwindSafe;
 
 use onyx_metadb::testing::faults::{FaultAction, FaultController, FaultPoint};
 use onyx_metadb::wal::op::WalOp;
-use onyx_metadb::{Config, Db, L2pValue, VolumeOrdinal};
+use onyx_metadb::{Config, Db, L2pValue, MetaDbJournalMode, VolumeOrdinal};
 use proptest::prelude::*;
 use tempfile::TempDir;
 
@@ -115,7 +115,11 @@ fn op_to_walop(op: &Op, fresh_pba_seed: u64) -> WalOp {
 /// proptest can address the same ordinals across the pair.
 fn open_db_with_async(async_wal: bool) -> (TempDir, std::sync::Arc<Db>) {
     let dir = TempDir::new().unwrap();
+    // Phase D.4: this file exists specifically to gate async-WAL
+    // crash-replay semantics, so it pins `MetaDbJournalMode::Wal`.
+    // After D.5 retires Wal mode the whole file goes away with it.
     let mut cfg = Config::new(dir.path());
+    cfg.journal_mode = MetaDbJournalMode::Wal;
     cfg.l2p_buffer_enabled = true;
     cfg.commit_direct_apply_enabled = true;
     cfg.commit_deferred_outcomes_enabled = true;
@@ -260,6 +264,7 @@ proptest! {
 fn txg_sync_midway_panic_recovers_via_wal_replay() {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
+    cfg.journal_mode = MetaDbJournalMode::Wal;
     cfg.l2p_buffer_enabled = true;
     cfg.commit_direct_apply_enabled = true;
     cfg.commit_deferred_outcomes_enabled = true;
@@ -332,6 +337,7 @@ fn txg_sync_midway_panic_recovers_via_wal_replay() {
 fn wal_submit_async_dropped_propagates_to_caller() {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
+    cfg.journal_mode = MetaDbJournalMode::Wal;
     cfg.l2p_buffer_enabled = true;
     cfg.commit_direct_apply_enabled = true;
     cfg.commit_deferred_outcomes_enabled = true;

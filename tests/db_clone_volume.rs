@@ -3,8 +3,14 @@
 //! drop ordering between snapshots, source volumes, and clones, and
 //! crash-recovery after WAL replay.
 
-use onyx_metadb::{Db, L2pValue};
+use onyx_metadb::{Config, Db, L2pValue, MetaDbJournalMode};
 use tempfile::TempDir;
+
+fn wal_cfg(dir: &TempDir) -> Config {
+    let mut cfg = Config::new(dir.path());
+    cfg.journal_mode = MetaDbJournalMode::Wal;
+    cfg
+}
 
 fn v(n: u8) -> L2pValue {
     let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
@@ -75,9 +81,15 @@ fn clone_survives_reopen_after_flush() {
 
 #[test]
 fn clone_survives_reopen_via_wal_replay() {
+    // Phase D.4: Wal-mode-only — the test crashes after data-plane
+    // inserts (lba 0..8 on src, 0 on clone) WITHOUT flushing, and
+    // expects WAL replay to restore them. Buffer mode handles the
+    // same recovery via the LV2 buffer (covered by
+    // tests/db_buffer_journal_replay.rs).
     let dir = TempDir::new().unwrap();
+    let cfg = wal_cfg(&dir);
     let (src, clone) = {
-        let db = Db::create(dir.path()).unwrap();
+        let db = Db::create_with_config(cfg.clone()).unwrap();
         let src = db.create_volume().unwrap();
         for i in 0u64..8 {
             db.insert(src, i, v(i as u8)).unwrap();
@@ -88,7 +100,7 @@ fn clone_survives_reopen_via_wal_replay() {
         // No flush — recovery must replay CloneVolume from the WAL.
         (src, clone)
     };
-    let db = Db::open(dir.path()).unwrap();
+    let db = Db::open_with_config(cfg).unwrap();
     assert_eq!(db.volumes(), vec![0, src, clone]);
     assert_eq!(db.get(clone, 0).unwrap(), Some(v(0xFF)));
     for i in 1u64..8 {

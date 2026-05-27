@@ -125,8 +125,10 @@ fn iter_dedup_survives_flush_and_reopen() {
 
 #[test]
 fn flush_prunes_checkpointed_wal_segments() {
+    // Phase D.4: Wal-mode-only — directly inspects on-disk WAL
+    // segments. Buffer mode doesn't write WAL records at all.
     let dir = TempDir::new().unwrap();
-    let mut cfg = Config::new(dir.path());
+    let mut cfg = wal_mode_cfg(dir.path());
     cfg.wal_segment_bytes = 512;
     cfg.wal_lanes = 1;
     let wal_dir = dir.path().join("wal");
@@ -407,15 +409,19 @@ fn drop_snapshot_releases_refcount_state() {
 
 #[test]
 fn writes_without_flush_survive_reopen_via_wal_replay() {
+    // Phase D.4: Wal-mode-only — Buffer mode relies on the upper-
+    // layer LV2 buffer for crash-without-flush recovery, not the
+    // metadb-side WAL replay this test exercises.
     let dir = TempDir::new().unwrap();
+    let cfg = wal_mode_cfg(dir.path());
     {
-        let db = Db::create(dir.path()).unwrap();
+        let db = Db::create_with_config(cfg.clone()).unwrap();
         for i in 0u64..50 {
             db.insert(0, i, v(i as u8)).unwrap();
         }
         // NO flush() before drop — only WAL is durable.
     }
-    let db = Db::open(dir.path()).unwrap();
+    let db = Db::open_with_config(cfg).unwrap();
     for i in 0u64..50 {
         assert_eq!(db.get(0, i).unwrap(), Some(v(i as u8)));
     }
@@ -438,14 +444,17 @@ fn refcount_writes_survive_reopen_without_flush() {
 
 #[test]
 fn dedup_writes_survive_reopen_without_flush() {
+    // Phase D.4: Wal-mode-only — exercises WAL replay of `DedupPut`
+    // records that the live commit path emitted without flushing.
     let dir = TempDir::new().unwrap();
+    let cfg = wal_mode_cfg(dir.path());
     {
-        let db = Db::create(dir.path()).unwrap();
+        let db = Db::create_with_config(cfg.clone()).unwrap();
         for i in 0u64..30 {
             db.put_dedup(h(i), dv(i as u8)).unwrap();
         }
     }
-    let db = Db::open(dir.path()).unwrap();
+    let db = Db::open_with_config(cfg).unwrap();
     for i in 0u64..30 {
         assert_eq!(db.get_dedup(&h(i)).unwrap(), Some(dv(i as u8)));
     }
@@ -472,16 +481,19 @@ fn multi_op_tx_commits_atomically_and_all_ops_visible() {
 
 #[test]
 fn multi_op_tx_survives_reopen_all_or_nothing() {
+    // Phase D.4: Wal-mode-only — exercises WAL replay of a
+    // multi-op WAL record after crash-without-flush.
     let dir = TempDir::new().unwrap();
+    let cfg = wal_mode_cfg(dir.path());
     {
-        let db = Db::create(dir.path()).unwrap();
+        let db = Db::create_with_config(cfg.clone()).unwrap();
         let mut tx = db.begin();
         tx.insert(0, 1, v(1));
         tx.insert(0, 2, v(2));
         tx.put_dedup(h(1), dv(9));
         tx.commit().unwrap();
     }
-    let db = Db::open(dir.path()).unwrap();
+    let db = Db::open_with_config(cfg).unwrap();
     assert_eq!(db.get(0, 1).unwrap(), Some(v(1)));
     assert_eq!(db.get(0, 2).unwrap(), Some(v(2)));
     assert_eq!(db.get_dedup(&h(1)).unwrap(), Some(dv(9)));
@@ -546,15 +558,18 @@ fn empty_tx_commit_is_noop() {
 
 #[test]
 fn reopen_replay_advances_last_applied() {
+    // Phase D.4: Wal-mode-only — Buffer mode discards in-flight
+    // commits on close (the buffer is the durability layer).
     let dir = TempDir::new().unwrap();
+    let cfg = wal_mode_cfg(dir.path());
     let committed_lsn = {
-        let db = Db::create(dir.path()).unwrap();
+        let db = Db::create_with_config(cfg.clone()).unwrap();
         for i in 0u64..5 {
             db.insert(0, i, v(i as u8)).unwrap();
         }
         db.last_applied_lsn()
     };
-    let db = Db::open(dir.path()).unwrap();
+    let db = Db::open_with_config(cfg).unwrap();
     assert_eq!(db.last_applied_lsn(), committed_lsn);
     // New commits after reopen start at committed_lsn + 1.
     db.insert(0, 100, v(0)).unwrap();
