@@ -510,13 +510,12 @@ impl Db {
             pages: pages.clone(),
             pba_decrefs: pba_decrefs.clone(),
         };
-        let body = try_encode_body(std::slice::from_ref(&op))?;
-        let lsn = self.submit_wal_ops(
-            std::slice::from_ref(&op),
-            body,
-            None,
-            crate::wal::set::SubmitOptions::default(),
-        )?;
+        let lifecycle_op = crate::lifecycle_log::LifecycleOp::DropSnapshot {
+            id,
+            pages: pages.clone(),
+            pba_decrefs: pba_decrefs.clone(),
+        };
+        let lsn = self.submit_lifecycle_op(&op, &lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 

@@ -77,14 +77,17 @@ fn buffer_mode_manifest_watermark_only_moves_when_published() {
 #[test]
 fn buffer_mode_data_plane_commits_do_not_grow_wal_records() {
     // Smoke check that data-plane commits in Buffer mode don't write
-    // WAL records. Lifecycle ops (e.g. `create_volume`) still emit
-    // WAL records until Phase C.3 routes them to the lifecycle
-    // journal, so we capture the count AFTER setup and compare it to
-    // the count after the data-plane inserts.
+    // WAL records. Phase C.3 also moves lifecycle ops out of the WAL,
+    // so after a fresh `create_volume` the WAL counter is still 0 —
+    // no need to anchor on a post-setup baseline.
     let dir = TempDir::new().unwrap();
     let db = Db::create_with_config(buffer_cfg(&dir)).unwrap();
     let ord = db.create_volume().unwrap();
-    let setup_wal_records = db.metrics_snapshot().wal_records;
+    assert_eq!(
+        db.metrics_snapshot().wal_records,
+        0,
+        "Phase C.3: Buffer-mode create_volume must not write a WAL record"
+    );
 
     for k in 0..32u64 {
         db.insert(ord, k, v(k as u8)).unwrap();
@@ -93,8 +96,92 @@ fn buffer_mode_data_plane_commits_do_not_grow_wal_records() {
 
     let after = db.metrics_snapshot().wal_records;
     assert_eq!(
-        after, setup_wal_records,
-        "Buffer-mode data-plane commits must not grow wal_records \
-         (setup: {setup_wal_records}, after: {after})"
+        after, 0,
+        "Buffer-mode data-plane commits must not grow wal_records (after: {after})"
+    );
+}
+
+#[test]
+fn buffer_mode_lifecycle_ops_grow_lifecycle_journal_only() {
+    // Phase C.3: each lifecycle op should bump
+    // `lifecycle_applied_watermark` by exactly one and leave
+    // `wal_records` at zero. We exercise create + clone + snapshot +
+    // drop_snapshot + drop_volume from a single Db instance so the
+    // watermark deltas are observable per op.
+    let dir = TempDir::new().unwrap();
+    let db = Db::create_with_config(buffer_cfg(&dir)).unwrap();
+
+    // create_volume #1
+    let baseline_seq = db.lifecycle_applied_watermark();
+    let v1 = db.create_volume().unwrap();
+    let after_create = db.lifecycle_applied_watermark();
+    assert_eq!(
+        after_create,
+        baseline_seq + 1,
+        "create_volume must advance lifecycle seq by 1 \
+         (was {baseline_seq}, now {after_create})"
+    );
+    assert_eq!(db.metrics_snapshot().wal_records, 0);
+
+    // Insert something so take_snapshot has data to capture and so
+    // drop_snapshot has a real cascade.
+    db.insert(v1, 7, v(11)).unwrap();
+    let snap_id = db.take_snapshot(v1).unwrap();
+    // `take_snapshot` is manifest-only today (no WAL, no lifecycle
+    // journal entry — see lifecycle_log/op.rs comment on TakeSnapshot).
+    // Confirm the seq did not advance.
+    assert_eq!(
+        db.lifecycle_applied_watermark(),
+        after_create,
+        "take_snapshot is still manifest-only in Phase C.3"
+    );
+
+    // clone_volume from the live snapshot.
+    let pre_clone = db.lifecycle_applied_watermark();
+    let v2 = db.clone_volume(snap_id).unwrap();
+    assert_eq!(db.lifecycle_applied_watermark(), pre_clone + 1);
+
+    // drop_snapshot — `take_snapshot` was the v1 baseline so this
+    // cascade has real page-decref work for apply to drive.
+    let pre_drop_snap = db.lifecycle_applied_watermark();
+    db.drop_snapshot(snap_id).unwrap();
+    assert_eq!(db.lifecycle_applied_watermark(), pre_drop_snap + 1);
+
+    // drop_volume on the clone (parent v1 still has a live PBA ref).
+    let pre_drop_vol = db.lifecycle_applied_watermark();
+    db.drop_volume(v2).unwrap();
+    assert_eq!(db.lifecycle_applied_watermark(), pre_drop_vol + 1);
+
+    assert_eq!(
+        db.metrics_snapshot().wal_records,
+        0,
+        "no Buffer-mode lifecycle path should have touched the WAL"
+    );
+}
+
+#[test]
+fn buffer_mode_lifecycle_watermark_persists_through_flush() {
+    // The next `flush` after each lifecycle op must copy
+    // `lifecycle_applied_watermark` into `manifest.lifecycle_replay_seq`
+    // so a re-open (Phase C.4) can decide which records are already
+    // covered by the manifest checkpoint.
+    let dir = TempDir::new().unwrap();
+    let db = Db::create_with_config(buffer_cfg(&dir)).unwrap();
+    let _ord = db.create_volume().unwrap();
+    let live_watermark = db.lifecycle_applied_watermark();
+    assert!(
+        live_watermark > 0,
+        "create_volume must have stamped the live watermark"
+    );
+    assert_eq!(
+        db.manifest().lifecycle_replay_seq,
+        0,
+        "pre-flush manifest watermark is still 0"
+    );
+    db.flush().unwrap();
+    assert_eq!(
+        db.manifest().lifecycle_replay_seq,
+        live_watermark,
+        "flush must publish the live lifecycle watermark"
     );
 }

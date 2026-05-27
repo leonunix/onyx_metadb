@@ -87,14 +87,9 @@ impl Db {
             (ord, shard_count)
         };
 
-        let op = WalOp::CreateVolume { ord, shard_count };
-        let body = try_encode_body(std::slice::from_ref(&op))?;
-        let lsn = self.submit_wal_ops(
-            std::slice::from_ref(&op),
-            body,
-            None,
-            crate::wal::set::SubmitOptions::default(),
-        )?;
+        let wal_op = WalOp::CreateVolume { ord, shard_count };
+        let lifecycle_op = crate::lifecycle_log::LifecycleOp::CreateVolume { ord, shard_count };
+        let lsn = self.submit_lifecycle_op(&wal_op, &lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
@@ -344,17 +339,15 @@ impl Db {
         self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
         drop(l2p_guards);
 
-        let op = WalOp::DropVolume {
+        let wal_op = WalOp::DropVolume {
             ord: vol_ord,
             pages: pages.clone(),
         };
-        let body = try_encode_body(std::slice::from_ref(&op))?;
-        let lsn = self.submit_wal_ops(
-            std::slice::from_ref(&op),
-            body,
-            None,
-            crate::wal::set::SubmitOptions::default(),
-        )?;
+        let lifecycle_op = crate::lifecycle_log::LifecycleOp::DropVolume {
+            ord: vol_ord,
+            pages: pages.clone(),
+        };
+        let lsn = self.submit_lifecycle_op(&wal_op, &lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
         // Fault window specific to drop_volume: WAL record durable, no
@@ -508,19 +501,19 @@ impl Db {
             )
         };
 
-        let op = WalOp::CloneVolume {
+        let wal_op = WalOp::CloneVolume {
             src_ord,
             new_ord,
             src_snap_id,
             src_shard_roots: src_shard_roots.clone(),
         };
-        let body = try_encode_body(std::slice::from_ref(&op))?;
-        let lsn = self.submit_wal_ops(
-            std::slice::from_ref(&op),
-            body,
-            None,
-            crate::wal::set::SubmitOptions::default(),
-        )?;
+        let lifecycle_op = crate::lifecycle_log::LifecycleOp::CloneVolume {
+            src_ord,
+            new_ord,
+            src_snap_id,
+            src_shard_roots: src_shard_roots.clone(),
+        };
+        let lsn = self.submit_lifecycle_op(&wal_op, &lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
