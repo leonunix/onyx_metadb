@@ -507,39 +507,31 @@ impl Db {
             .unwrap_or_else(DispatchFootprint::global);
         let dispatch_lanes = dispatch_footprint.lanes.len();
 
-        // Buffer-as-sole-journal Phase C: skip body encoding and WAL
-        // submit entirely when the journal mode is Buffer. The
-        // recovery source is the upper-layer LV2 buffer, so there's
-        // no point spending µs on `try_encode_body` or paying the
-        // writer-thread round-trip for an LSN we can allocate
-        // directly via `WalSet::reserve_unlogged`.
-        let buffer_mode = !self.journal_mode.wal_authoritative();
-        // ZFS-TXG-clone Phase 4 Step 4: acquire a TxgGuard BEFORE WAL
-        // submit (or the equivalent reserve) so the slot stamp is
-        // locked in before the WAL allocator can hand out a higher
-        // LSN to a later TXG. The guard's drop (at function exit)
-        // decrements the slot's inflight counter, which is what the
-        // `TxgQuiesceThread` parks on. Holding it across the apply
-        // also means `take_syncing_slot` cannot race with this
-        // commit's tree mutations because the slot stays pinned
-        // (state == Open or Quiescing — never Syncing while
-        // inflight > 0).
+        // Buffer-mode commit path: data-plane ops have no metadb-side
+        // durable footprint (recovery comes from onyx's LV2 buffer);
+        // only promotion records — which the buffer cannot
+        // synthesise — get folded into the lifecycle journal here.
+        // For every other op we simply allocate an LSN via
+        // `reserve_unlogged` so apply ordering / dispatch tracking
+        // stays consistent.
+        //
+        // ZFS-TXG-clone Phase 4 Step 4: acquire a TxgGuard BEFORE the
+        // LSN reservation so the slot stamp is locked in before the
+        // allocator can hand out a higher LSN to a later TXG. The
+        // guard's drop (at function exit) decrements the slot's
+        // inflight counter, which is what the `TxgQuiesceThread`
+        // parks on. Holding it across the apply also means
+        // `take_syncing_slot` cannot race with this commit's tree
+        // mutations because the slot stays pinned (state == Open or
+        // Quiescing — never Syncing while inflight > 0).
         let _txg_guard = self.txg.enter();
         let wal_started = std::time::Instant::now();
-        let lsn = if buffer_mode {
-            // Phase C.3: single-op promotion records use the lifecycle
-            // journal as their durable footprint in Buffer mode (same
-            // contract as the `Db::create_volume` / `drop_volume`
-            // paths). FreePbas / L2pRangeDelete and any future
-            // lifecycle WalOp without a matching `LifecycleOp` variant
-            // fall through to plain `reserve_unlogged` and rely on the
-            // embedder's upper-layer journal until they grow their own
-            // lifecycle entry.
+        let lsn = {
             let promotion_lifecycle = ops_as_promotion_lifecycle(ops);
             let result = if let Some(lifecycle_op) = promotion_lifecycle {
                 let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
                     MetaDbError::Corruption(
-                        "commit_ops: buffer mode without lifecycle journal".into(),
+                        "commit_ops: lifecycle journal not open".into(),
                     )
                 });
                 match journal {
@@ -571,32 +563,6 @@ impl Db {
             match result {
                 Ok(lsn) => lsn,
                 Err(err) => {
-                    self.metrics.record_commit_error(commit_started.elapsed());
-                    self.poison_commit_waiters(&err);
-                    return Err(err);
-                }
-            }
-        } else {
-            let encode_started = std::time::Instant::now();
-            let body = match try_encode_body(ops) {
-                Ok(body) => body,
-                Err(err) => {
-                    self.metrics.record_commit_error(commit_started.elapsed());
-                    return Err(err);
-                }
-            };
-            timing.encode = encode_started.elapsed();
-            self.metrics.record_commit_encode(timing.encode);
-            self.metrics.record_commit_wal_body_bytes(body.len());
-            match self.submit_wal_ops(ops, body, Some(dispatch_footprint), options) {
-                Ok(lsn) => {
-                    timing.wal_submit = wal_started.elapsed();
-                    self.metrics.record_commit_wal_submit(timing.wal_submit);
-                    lsn
-                }
-                Err(err) => {
-                    timing.wal_submit = wal_started.elapsed();
-                    self.metrics.record_commit_wal_submit(timing.wal_submit);
                     self.metrics.record_commit_error(commit_started.elapsed());
                     self.poison_commit_waiters(&err);
                     return Err(err);
@@ -1232,38 +1198,29 @@ impl Db {
         Ok(outcome)
     }
 
-    /// Buffer-as-sole-journal Phase C.3 routing for lifecycle ops.
+    /// Append a lifecycle op to the dedicated journal and reserve an
+    /// LSN for its apply slot. The journal's per-record fsync is the
+    /// durability event; `wal.reserve_unlogged` only bumps the
+    /// in-memory LSN counter so apply ordering and `last_applied_lsn`
+    /// semantics stay intact.
     ///
-    /// In WAL mode (`journal_mode.wal_authoritative() == true`) this
-    /// degenerates to the legacy `submit_wal_ops` path — encodes the
-    /// `WalOp`, hands it to the WAL writer, returns the assigned LSN.
-    ///
-    /// In Buffer mode the WAL writer is bypassed: we reserve an LSN via
-    /// `WalSet::reserve_unlogged` (so apply still sees a monotonic LSN
-    /// and `last_applied_lsn` semantics are unchanged) and append the
-    /// equivalent `LifecycleOp` to the lifecycle journal. The journal's
-    /// per-record fsync replaces the WAL group-commit fsync as the
-    /// durability event for this op. The returned seq is published
-    /// through `lifecycle_applied_watermark` so the next checkpoint
-    /// commit stamps `manifest.lifecycle_replay_seq`.
+    /// The returned seq is published through
+    /// `lifecycle_applied_watermark` so the next checkpoint commit
+    /// stamps `manifest.lifecycle_replay_seq`.
     ///
     /// Callers must hold `apply_gate.write()` (every existing lifecycle
     /// callsite does) — the watermark bump and the LSN reservation are
     /// not synchronised against concurrent lifecycle submits otherwise.
+    ///
+    /// The `wal_op` parameter is retained because `apply_op_bare` (the
+    /// shared apply dispatcher) still keys off `WalOp` variants. After
+    /// the planned `WalOp → DbOp` rename it should be dropped from the
+    /// signature.
     pub(super) fn submit_lifecycle_op(
         &self,
-        wal_op: &WalOp,
+        _wal_op: &WalOp,
         lifecycle_op: &crate::lifecycle_log::LifecycleOp,
     ) -> Result<Lsn> {
-        if self.journal_mode.wal_authoritative() {
-            let body = try_encode_body(std::slice::from_ref(wal_op))?;
-            return self.submit_wal_ops(
-                std::slice::from_ref(wal_op),
-                body,
-                None,
-                crate::wal::set::SubmitOptions::default(),
-            );
-        }
         let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
             MetaDbError::Corruption(
                 "submit_lifecycle_op called without an open lifecycle journal".into(),

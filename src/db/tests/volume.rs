@@ -83,25 +83,10 @@ fn drop_volume_removes_ord_from_map_and_manifest() {
     }
 }
 
-#[test]
-fn volume_lifecycle_survives_reopen_without_flush() {
-    // Phase D.4: the `insert(ord, 100, v(42))` step is a data-plane
-    // commit, which is durable via the WAL in Wal mode only —
-    // Buffer mode relies on the upper-layer LV2 buffer for that.
-    let dir = TempDir::new().unwrap();
-    let cfg = wal_mode_cfg(dir.path());
-    let ord;
-    {
-        let db = Db::create_with_config(cfg.clone()).unwrap();
-        ord = db.create_volume().unwrap();
-        db.insert(ord, 100, v(42)).unwrap();
-        // No flush — rely on WAL replay.
-    }
-    let db = Db::open_with_config(cfg).unwrap();
-    assert_eq!(db.volumes(), vec![0, ord]);
-    assert_eq!(db.get(ord, 100).unwrap(), Some(v(42)));
-    assert_eq!(db.manifest().next_volume_ord, ord + 1);
-}
+// Phase D.5: `volume_lifecycle_survives_reopen_without_flush` exercised
+// data-plane WAL replay, which is gone. Buffer-mode reopens of an
+// unflushed `create_volume` are covered by
+// `tests/db_buffer_journal_replay.rs::replay_recovers_create_volume_without_flush`.
 
 #[test]
 fn drop_volume_lifecycle_survives_reopen_without_flush() {
@@ -416,31 +401,9 @@ fn clone_assigns_fresh_monotonic_ord() {
     assert_eq!(db.manifest().next_volume_ord, clone_b + 1);
 }
 
-#[test]
-fn clone_survives_reopen_wal_replay() {
-    // Phase D.4: pinned to Wal mode — the test inserts data-plane
-    // writes (lba 5 / 10) without flushing, expecting WAL replay to
-    // restore them. Buffer mode hands that role to the upper-layer
-    // LV2 buffer, which this unit test does not simulate.
-    let dir = TempDir::new().unwrap();
-    let cfg = wal_mode_cfg(dir.path());
-    let (src, snap, clone) = {
-        let db = Db::create_with_config(cfg.clone()).unwrap();
-        let src = db.create_volume().unwrap();
-        db.insert(src, 5, v(50)).unwrap();
-        let snap = db.take_snapshot(src).unwrap();
-        let clone = db.clone_volume(snap).unwrap();
-        db.insert(clone, 10, v(100)).unwrap();
-        (src, snap, clone)
-    };
-    let db = Db::open_with_config(cfg).unwrap();
-    assert_eq!(db.volumes(), vec![0, src, clone]);
-    assert_eq!(db.get(clone, 5).unwrap(), Some(v(50)));
-    assert_eq!(db.get(clone, 10).unwrap(), Some(v(100)));
-    // Source volume unaffected by clone divergence.
-    assert_eq!(db.get(src, 5).unwrap(), Some(v(50)));
-    assert_eq!(db.snapshot_view(snap).unwrap().get(5).unwrap(), Some(v(50)));
-}
+// Phase D.5: `clone_survives_reopen_wal_replay` exercised data-plane
+// WAL replay across a clone barrier; covered for Buffer mode by
+// `tests/db_buffer_journal_replay.rs::replay_recovers_clone_volume_without_flush`.
 
 #[test]
 fn clone_of_empty_volume_is_empty_and_writable() {

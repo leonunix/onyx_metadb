@@ -26,32 +26,20 @@ pub const MAX_APPLY_LANE_SHARDS: usize = 64;
 /// so it lives here as a compile-time constant rather than a config field.
 pub const PAGE_SIZE: usize = 4096;
 
-/// Buffer-as-sole-journal selector. Matches `onyx::config::MetadbJournalMode`
-/// one-to-one — onyx threads its toml value through `metadb_config_from_onyx`
-/// into the field on [`Config`].
+/// Buffer-as-sole-journal selector. Phase D retired the legacy Wal
+/// and Shadow modes; Buffer is the only remaining variant. The enum
+/// (and the [`Config::journal_mode`] field) survive as a single-arm
+/// shape so the on-disk config wire format is unchanged for onyx and
+/// the toml deserialiser still accepts the historical `"buffer"`
+/// string — future expansion (e.g. an inline-WAL hybrid for embedded
+/// callers) would re-introduce variants here.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MetaDbJournalMode {
-    /// Legacy: every `commit_ops` writes a WAL record and (eventually)
-    /// fsyncs it; recovery replays WAL.
-    Wal,
-    /// Phase B observability: WAL is still authoritative, but each
-    /// checkpoint also persists `manifest.last_processed_buffer_seq`
-    /// from `Db::buffer_applied_watermark` so a parallel buffer-replay
-    /// path can be diffed against the WAL-derived state. No commit-path
-    /// latency cost.
-    Shadow,
-    /// Phase C cutover: `commit_ops` skips the WAL submit for
-    /// data-plane ops. Lifecycle ops still hit the WAL until their
-    /// migration to the dedicated lifecycle journal lands. The embedder
-    /// is responsible for replaying the upper-layer journal (onyx LV2
-    /// buffer) before accepting client IO.
+    /// Data-plane commits skip any metadb-side journal entirely. Onyx's
+    /// LV2 buffer replays uncheckpointed mutations through `commit_ops`
+    /// on reopen. Lifecycle ops live in `lifecycle_log/` and are
+    /// replayed by `Db::open` directly.
     Buffer,
-}
-
-impl MetaDbJournalMode {
-    pub fn wal_authoritative(self) -> bool {
-        !matches!(self, Self::Buffer)
-    }
 }
 
 /// Embedder-provided configuration for opening a database.
@@ -174,13 +162,9 @@ pub struct Config {
     /// WAL-on-OS-page-cache window bounded.
     pub wal_async_group_commit_window_us: u64,
 
-    /// Buffer-as-sole-journal selector. See [`MetaDbJournalMode`] for
-    /// the three modes. Phase D made [`MetaDbJournalMode::Buffer`]
-    /// the default — production onyx already runs in Buffer mode and
-    /// the lifecycle journal + buffer replay path now cover every
-    /// durability boundary the old WAL did. Pre-D tests that depend
-    /// on WAL replay behaviour still set this knob explicitly to
-    /// [`MetaDbJournalMode::Wal`] until they migrate.
+    /// Buffer-as-sole-journal selector. See [`MetaDbJournalMode`]. Phase D
+    /// collapsed this to a single variant; the field is preserved so
+    /// the on-disk config wire format remains compatible.
     pub journal_mode: MetaDbJournalMode,
 
     /// Maximum bytes held by the in-memory page cache.

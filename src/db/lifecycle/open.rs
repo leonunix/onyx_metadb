@@ -104,20 +104,16 @@ impl Db {
             metrics.clone(),
         )?;
 
-        // Buffer-as-sole-journal Phase C.3: open a fresh lifecycle
-        // journal directory whenever the embedder runs in a non-WAL
-        // mode. Fresh DB → no segments yet, so `next_seq` is 1 and
-        // `LifecycleJournal::open` simply creates the directory and
-        // its first segment.
-        let lifecycle_journal = if !cfg.journal_mode.wal_authoritative() {
-            Some(Mutex::new(crate::lifecycle_log::LifecycleJournal::open(
+        // Open a fresh lifecycle journal. Fresh DB → no segments
+        // yet, so `next_seq` is 1 and `LifecycleJournal::open` simply
+        // creates the directory and its first segment.
+        let lifecycle_journal = Some(Mutex::new(
+            crate::lifecycle_log::LifecycleJournal::open(
                 &lifecycle_log_dir(&cfg.path),
                 1,
                 cfg.wal_segment_bytes,
-            )?))
-        } else {
-            None
-        };
+            )?,
+        ));
 
         let volume_zero = Arc::new(Volume::new(BOOTSTRAP_VOLUME_ORD, l2p_shards, 0));
         let mut volumes = HashMap::with_capacity(1);
@@ -634,35 +630,33 @@ impl Db {
         let mut last_applied = wal_replay_last_applied;
         let mut lifecycle_max_seq = manifest.lifecycle_replay_seq;
         let mut lifecycle_replayed_anything = false;
-        if !cfg.journal_mode.wal_authoritative() {
-            let dir = lifecycle_log_dir(&cfg.path);
-            if dir.exists() {
-                let from_seq = manifest.lifecycle_replay_seq;
-                let outcome = replay_lifecycle_journal_into(
-                    &dir,
-                    &mut manifest,
-                    &mut volumes,
-                    &refcount_shards,
-                    &dedup_index,
-                    &page_store,
-                    &page_cache,
-                    &faults,
-                    metrics.clone(),
-                    last_applied,
-                    replay_open_txg,
-                    cfg.l2p_buffer_enabled,
-                    from_seq,
-                )?;
-                lifecycle_max_seq = outcome.max_seq;
-                last_applied = last_applied.saturating_add(outcome.lsns_consumed);
-                lifecycle_replayed_anything =
-                    outcome.lsns_consumed > 0 || outcome.replayed_drop_snapshot;
-                if outcome.mutated_volumes {
-                    mutated_volumes = true;
-                }
-                if outcome.replayed_drop_snapshot {
-                    replayed_drop = true;
-                }
+        let lifecycle_dir = lifecycle_log_dir(&cfg.path);
+        if lifecycle_dir.exists() {
+            let from_seq = manifest.lifecycle_replay_seq;
+            let outcome = replay_lifecycle_journal_into(
+                &lifecycle_dir,
+                &mut manifest,
+                &mut volumes,
+                &refcount_shards,
+                &dedup_index,
+                &page_store,
+                &page_cache,
+                &faults,
+                metrics.clone(),
+                last_applied,
+                replay_open_txg,
+                cfg.l2p_buffer_enabled,
+                from_seq,
+            )?;
+            lifecycle_max_seq = outcome.max_seq;
+            last_applied = last_applied.saturating_add(outcome.lsns_consumed);
+            lifecycle_replayed_anything =
+                outcome.lsns_consumed > 0 || outcome.replayed_drop_snapshot;
+            if outcome.mutated_volumes {
+                mutated_volumes = true;
+            }
+            if outcome.replayed_drop_snapshot {
+                replayed_drop = true;
             }
         }
 
@@ -674,24 +668,21 @@ impl Db {
             metrics.clone(),
         )?;
 
-        // Buffer-as-sole-journal Phase C.4: open the lifecycle journal
-        // for further append at the seq immediately after whatever
-        // replay just folded in. `lifecycle_max_seq` is the manifest
-        // watermark when replay was a no-op (no segments / nothing
-        // beyond the checkpoint) or the highest seq observed otherwise;
-        // in either case `next_seq = lifecycle_max_seq + 1` is the next
-        // free slot. The post-replay manifest commit below stamps this
-        // value into `manifest.lifecycle_replay_seq`.
-        let lifecycle_journal = if !cfg.journal_mode.wal_authoritative() {
-            let dir = lifecycle_log_dir(&cfg.path);
+        // Open the lifecycle journal for further append at the seq
+        // immediately after whatever replay just folded in.
+        // `lifecycle_max_seq` is the manifest watermark when replay was a
+        // no-op (no segments / nothing beyond the checkpoint) or the
+        // highest seq observed otherwise; in either case `next_seq =
+        // lifecycle_max_seq + 1` is the next free slot. The post-replay
+        // manifest commit below stamps this value into
+        // `manifest.lifecycle_replay_seq`.
+        let lifecycle_journal = {
             let next_seq = lifecycle_max_seq.saturating_add(1);
             Some(Mutex::new(crate::lifecycle_log::LifecycleJournal::open(
-                &dir,
+                &lifecycle_dir,
                 next_seq,
                 cfg.wal_segment_bytes,
             )?))
-        } else {
-            None
         };
 
         // If anything was replayed, flush every tree + dedup memtable,

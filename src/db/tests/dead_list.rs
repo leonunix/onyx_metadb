@@ -3,7 +3,7 @@
 //! segment, chain extension across two flushes), WAL replay re-emit,
 //! buffer-only flush trigger, and drop_volume chain reclaim.
 
-use super::{mk_db, v, wal_mode_cfg};
+use super::{mk_db, v};
 use crate::deadlist::{DEAD_RECORD_BYTES, DeadRecord, SegmentHeader, segment_pages_for};
 use crate::page::PageType;
 use crate::types::NULL_PAGE;
@@ -155,30 +155,11 @@ fn buffer_nonempty_triggers_flush_even_with_no_l2p_dirty() {
     assert_ne!(tail_after, tail_before, "flush must advance tail when buffer has records");
 }
 
-#[test]
-fn wal_replay_re_emits_dead_records_into_buffer() {
-    // Phase D.4: Wal-mode-only — the test verifies that the WAL's
-    // L2pPut replay path re-stamps dead-list records. Buffer mode
-    // doesn't store data-plane ops in any metadb-side journal.
-    let dir = TempDir::new().unwrap();
-    let cfg = wal_mode_cfg(dir.path());
-    {
-        let db = Db::create_with_config(cfg.clone()).unwrap();
-        db.insert(0, 1, v(0xAA)).unwrap();
-        db.insert(0, 1, v(0xBB)).unwrap();
-        db.insert(0, 1, v(0xCC)).unwrap();
-        // Drain ahead of close: nothing else flushes the volume so
-        // every record stays in the buffer + WAL when we drop.
-        drain_dead_list(&db, 0);
-        db.insert(0, 1, v(0xDD)).unwrap();
-        // NOTE: no flush() — only WAL is durable for the latest write.
-    }
-    let db = Db::open_with_config(cfg).unwrap();
-    // Replay should have re-stamped every overwrite's dead record into
-    // the buffer. The 3 emit sites (PUT history above) leave 3 records.
-    let records = drain_dead_list(&db, 0);
-    assert!(records.len() >= 3, "WAL replay must reproduce dead records");
-}
+// Phase D.5: `wal_replay_re_emits_dead_records_into_buffer` tested
+// the L2pPut WAL-replay arm's dead-list emission; the WAL is gone.
+// Dead-list emission on the buffer-replay path lives on the onyx
+// side (the LV2 flusher re-issues each L2pPut on recovery and the
+// live commit emits the dead record).
 
 #[test]
 fn drop_volume_reclaims_dead_list_chain_pages() {

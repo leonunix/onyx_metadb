@@ -475,143 +475,20 @@ impl Db {
             return Ok(self.last_applied_lsn());
         }
 
-        let result = if self.journal_mode.wal_authoritative() {
-            self.range_delete_via_wal(
-                &volumes_map,
-                vol_ord,
-                start,
-                end,
-                &captured,
-                &_txg_guard,
-                total_started,
-            )
-        } else {
-            self.range_delete_via_lifecycle(
-                &volumes_map,
-                vol_ord,
-                start,
-                end,
-                &captured,
-                &_txg_guard,
-                total_started,
-            )
-        };
+        let result = self.range_delete_via_lifecycle(
+            &volumes_map,
+            vol_ord,
+            start,
+            end,
+            &captured,
+            &_txg_guard,
+            total_started,
+        );
         if result.is_ok() {
             self.metrics
                 .record_range_delete_success(total_started.elapsed());
         }
         result
-    }
-
-    /// Wal/Shadow-mode `range_delete` body: per-chunk
-    /// `WalOp::L2pRangeDelete` records, each their own WAL submit +
-    /// apply. Preserved verbatim from the pre-Phase-D path so the
-    /// legacy crash-replay regressions in `db_hardening.rs` keep
-    /// passing while D moves Buffer-mode callers to the lifecycle
-    /// journal.
-    #[allow(clippy::too_many_arguments)]
-    fn range_delete_via_wal(
-        &self,
-        volumes_map: &HashMap<VolumeOrdinal, Arc<Volume>>,
-        vol_ord: VolumeOrdinal,
-        start: Lba,
-        end: Lba,
-        captured: &[(Lba, L2pValue)],
-        txg_guard: &crate::txg::TxgGuard<'_>,
-        total_started: std::time::Instant,
-    ) -> Result<Lsn> {
-        self.metrics.record_range_delete_chunks(
-            captured
-                .chunks(crate::wal::op::MAX_RANGE_DELETE_CAPTURED)
-                .len(),
-        );
-
-        // Phase 2: split into WAL records of at most
-        // MAX_RANGE_DELETE_CAPTURED entries. Each chunk gets its own
-        // WAL submit + apply, so a 100k-entry range becomes two
-        // consecutive records and replay sees them as two separate
-        // ops — both atomic on their own. Apply order is identical
-        // to submit order under the held apply gate.
-        let mut last_lsn = self.last_applied_lsn();
-        for chunk in captured.chunks(crate::wal::op::MAX_RANGE_DELETE_CAPTURED) {
-            let op = WalOp::L2pRangeDelete {
-                vol_ord,
-                start,
-                end,
-                captured: chunk.to_vec(),
-            };
-            let body = try_encode_body(std::slice::from_ref(&op))?;
-            let wal_started = std::time::Instant::now();
-            let lsn = match self.submit_wal_ops(
-                std::slice::from_ref(&op),
-                body,
-                None,
-                crate::wal::set::SubmitOptions::default(),
-            ) {
-                Ok(lsn) => {
-                    self.metrics.record_range_delete_wal(wal_started.elapsed());
-                    lsn
-                }
-                Err(err) => {
-                    self.metrics.record_range_delete_wal(wal_started.elapsed());
-                    self.metrics
-                        .record_range_delete_error(total_started.elapsed());
-                    self.poison_commit_waiters(&err);
-                    return Err(err);
-                }
-            };
-            txg_guard.record_lsn(lsn);
-            if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
-                self.metrics
-                    .record_range_delete_error(total_started.elapsed());
-                self.poison_commit_waiters(&err);
-                return Err(err);
-            }
-
-            // Under apply_gate.write no one else can apply, so the
-            // cvar wait is defensive and usually passes immediately.
-            let wait_started = std::time::Instant::now();
-            self.wait_for_global_apply_turn(lsn)?;
-            self.metrics
-                .record_range_delete_apply_wait(wait_started.elapsed());
-
-            let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
-            let apply_started = std::time::Instant::now();
-            let apply_result = apply_op_bare(
-                volumes_map,
-                &self.refcount_shards,
-                &self.dedup_index,
-                &self.page_store,
-                lsn,
-                self.txg.open_txg(),
-                &op,
-                &snap_lookup,
-            );
-            match apply_result {
-                Ok(_outcome) => self
-                    .metrics
-                    .record_range_delete_apply(apply_started.elapsed()),
-                Err(err) => {
-                    self.metrics
-                        .record_range_delete_apply(apply_started.elapsed());
-                    self.metrics
-                        .record_range_delete_error(total_started.elapsed());
-                    self.poison_commit_waiters(&err);
-                    return Err(err);
-                }
-            }
-            if let Err(err) = self.faults.inject(FaultPoint::CommitPostApplyBeforeLsnBump) {
-                self.metrics
-                    .record_range_delete_error(total_started.elapsed());
-                self.poison_commit_waiters(&err);
-                return Err(err);
-            }
-
-            self.finish_global_apply(lsn)?;
-            self.advance_dispatch_lsn(lsn);
-            last_lsn = lsn;
-        }
-        Ok(last_lsn)
     }
 
     /// Buffer-mode `range_delete` body: emit

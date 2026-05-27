@@ -1,15 +1,9 @@
 //! Phase 7 commit 8 integration: per-volume `create_volume` /
-//! `drop_volume` lifecycle. Covers create/drop/read isolation, flush +
-//! manifest persistence, and WAL-replay recovery without a prior flush.
+//! `drop_volume` lifecycle. Covers create/drop/read isolation and
+//! flush + manifest persistence.
 
-use onyx_metadb::{Config, Db, L2pValue, MetaDbJournalMode, VolumeOrdinal};
+use onyx_metadb::{Db, L2pValue, VolumeOrdinal};
 use tempfile::TempDir;
-
-fn wal_cfg(dir: &TempDir) -> Config {
-    let mut cfg = Config::new(dir.path());
-    cfg.journal_mode = MetaDbJournalMode::Wal;
-    cfg
-}
 
 fn v(n: u8) -> L2pValue {
     let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
@@ -53,27 +47,16 @@ fn create_drop_flush_reopen_sees_only_bootstrap() {
     assert_eq!(db.volumes(), vec![0]);
 }
 
-#[test]
-fn create_insert_reopen_wal_replay() {
-    // Phase D.4: Wal-mode-only — Buffer mode doesn't replay
-    // data-plane inserts on reopen.
-    let dir = TempDir::new().unwrap();
-    let cfg = wal_cfg(&dir);
-    let ord;
-    {
-        let db = Db::create_with_config(cfg.clone()).unwrap();
-        ord = db.create_volume().unwrap();
-        db.insert(ord, 42, v(9)).unwrap();
-        // No flush — force WAL replay on reopen.
-    }
-    let db = Db::open_with_config(cfg).unwrap();
-    assert_eq!(db.volumes(), vec![0, ord]);
-    assert_eq!(db.get(ord, 42).unwrap(), Some(v(9)));
-    assert_eq!(db.manifest().next_volume_ord, ord + 1);
-}
+// Phase D.5: `create_insert_reopen_wal_replay` exercised WAL replay
+// of data-plane inserts; Buffer-mode coverage is in
+// `tests/db_buffer_journal_replay.rs::replay_recovers_create_volume_without_flush`.
 
 #[test]
 fn create_drop_reopen_wal_replay() {
+    // Phase D: drop_volume is durable via the lifecycle journal even
+    // without an explicit flush. Reopen folds the DropVolume record
+    // back in, leaving only the bootstrap volume — the same outcome
+    // the WAL path used to deliver.
     let dir = TempDir::new().unwrap();
     {
         let db = Db::create(dir.path()).unwrap();
@@ -118,29 +101,11 @@ fn ord_is_not_reused_after_drop() {
     assert!(b > a, "new ord {b} must exceed dropped ord {a}");
 }
 
-#[test]
-fn multi_volume_crash_recovery_without_flush() {
-    // Phase D.4: Wal-mode-only — Buffer mode doesn't replay
-    // data-plane inserts on reopen.
-    let dir = TempDir::new().unwrap();
-    let cfg = wal_cfg(&dir);
-    let (a, b) = {
-        let db = Db::create_with_config(cfg.clone()).unwrap();
-        let a = db.create_volume().unwrap();
-        let b = db.create_volume().unwrap();
-        for i in 0u64..16 {
-            db.insert(a, i, v(0xA0 | i as u8)).unwrap();
-            db.insert(b, i, v(0xB0 | i as u8)).unwrap();
-        }
-        (a, b)
-    };
-    let db = Db::open_with_config(cfg).unwrap();
-    assert_eq!(db.volumes(), vec![0, a, b]);
-    for i in 0u64..16 {
-        assert_eq!(db.get(a, i).unwrap(), Some(v(0xA0 | i as u8)));
-        assert_eq!(db.get(b, i).unwrap(), Some(v(0xB0 | i as u8)));
-    }
-}
+// Phase D.5: `multi_volume_crash_recovery_without_flush` exercised
+// WAL replay of inserts on multiple volumes. Buffer-mode lifecycle
+// replay across multiple volumes is covered by the create/drop
+// tests in `tests/db_buffer_journal_replay.rs`; data-plane replay
+// is the embedder's responsibility via the LV2 buffer.
 
 #[test]
 fn bootstrap_volume_is_untouchable() {

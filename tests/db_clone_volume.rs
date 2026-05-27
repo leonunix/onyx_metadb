@@ -1,16 +1,9 @@
 //! Phase 7 commit 10 integration: VDO-style `clone_volume`. Covers the
 //! read-path (clone mirrors snapshot state), CoW divergence on writes,
-//! drop ordering between snapshots, source volumes, and clones, and
-//! crash-recovery after WAL replay.
+//! and drop ordering between snapshots, source volumes, and clones.
 
-use onyx_metadb::{Config, Db, L2pValue, MetaDbJournalMode};
+use onyx_metadb::{Db, L2pValue};
 use tempfile::TempDir;
-
-fn wal_cfg(dir: &TempDir) -> Config {
-    let mut cfg = Config::new(dir.path());
-    cfg.journal_mode = MetaDbJournalMode::Wal;
-    cfg
-}
 
 fn v(n: u8) -> L2pValue {
     let mut x = [0u8; onyx_metadb::paged::LEAF_VALUE_SIZE];
@@ -79,36 +72,9 @@ fn clone_survives_reopen_after_flush() {
     assert_eq!(snaps[0].vol_ord, src);
 }
 
-#[test]
-fn clone_survives_reopen_via_wal_replay() {
-    // Phase D.4: Wal-mode-only — the test crashes after data-plane
-    // inserts (lba 0..8 on src, 0 on clone) WITHOUT flushing, and
-    // expects WAL replay to restore them. Buffer mode handles the
-    // same recovery via the LV2 buffer (covered by
-    // tests/db_buffer_journal_replay.rs).
-    let dir = TempDir::new().unwrap();
-    let cfg = wal_cfg(&dir);
-    let (src, clone) = {
-        let db = Db::create_with_config(cfg.clone()).unwrap();
-        let src = db.create_volume().unwrap();
-        for i in 0u64..8 {
-            db.insert(src, i, v(i as u8)).unwrap();
-        }
-        let snap = db.take_snapshot(src).unwrap();
-        let clone = db.clone_volume(snap).unwrap();
-        db.insert(clone, 0, v(0xFF)).unwrap();
-        // No flush — recovery must replay CloneVolume from the WAL.
-        (src, clone)
-    };
-    let db = Db::open_with_config(cfg).unwrap();
-    assert_eq!(db.volumes(), vec![0, src, clone]);
-    assert_eq!(db.get(clone, 0).unwrap(), Some(v(0xFF)));
-    for i in 1u64..8 {
-        assert_eq!(db.get(clone, i).unwrap(), Some(v(i as u8)));
-        assert_eq!(db.get(src, i).unwrap(), Some(v(i as u8)));
-    }
-    assert!(db.manifest().next_volume_ord >= clone + 1);
-}
+// Phase D.5: `clone_survives_reopen_via_wal_replay` exercised WAL
+// replay of CloneVolume + data-plane inserts. Buffer-mode
+// equivalent: tests/db_buffer_journal_replay.rs::replay_recovers_clone_volume_without_flush.
 
 #[test]
 fn drop_snapshot_does_not_affect_live_clone() {

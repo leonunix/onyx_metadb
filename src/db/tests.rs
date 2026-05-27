@@ -24,23 +24,6 @@ pub(super) fn mk_db() -> (TempDir, std::sync::Arc<Db>) {
     (dir, db)
 }
 
-/// Phase D transitional helper: build a `Db` pinned to
-/// [`crate::config::MetaDbJournalMode::Wal`] for tests whose
-/// assertions are about WAL-replay behaviour specifically. After
-/// Wal/Shadow modes retire (D.5) these tests + this helper go away
-/// together; the equivalent Buffer-mode recovery is exercised by
-/// `tests/db_buffer_journal_replay.rs`.
-pub(super) fn wal_mode_cfg(path: &std::path::Path) -> Config {
-    let mut cfg = Config::new(path);
-    cfg.journal_mode = crate::config::MetaDbJournalMode::Wal;
-    cfg
-}
-
-pub(super) fn mk_wal_db() -> (TempDir, std::sync::Arc<Db>) {
-    let dir = TempDir::new().unwrap();
-    let db = Db::create_with_config(wal_mode_cfg(dir.path())).unwrap();
-    (dir, db)
-}
 
 pub(super) fn mk_db_with_shards(shards: u32) -> (TempDir, std::sync::Arc<Db>) {
     let dir = TempDir::new().unwrap();

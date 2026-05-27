@@ -351,29 +351,10 @@ fn b2_buffer_flush_reopen_round_trip() {
     }
 }
 
-#[test]
-fn b2_buffer_no_flush_reopen_replays_from_wal() {
-    // Skip the explicit flush so the buffer's contents are
-    // recreated only from WAL replay on reopen.
-    // Phase D.4: WAL replay is a Wal-mode-only behaviour — Buffer
-    // mode relies on the upper-layer LV2 buffer to replay.
-    let dir = TempDir::new().unwrap();
-    let mut cfg = wal_mode_cfg(dir.path());
-    cfg.l2p_buffer_enabled = true;
-    cfg.l2p_buffer_soft_entries = 4;
-    cfg.l2p_buffer_max_interval_ms = 50;
-    {
-        let db = Db::create_with_config(cfg.clone()).unwrap();
-        for i in 0u64..30 {
-            db.insert(0, i, v(i as u8)).unwrap();
-        }
-        // No flush — close while buffer may still hold entries.
-    }
-    let db = Db::open_with_config(cfg).unwrap();
-    for i in 0u64..30 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v(i as u8)));
-    }
-}
+// Phase D.5: `b2_buffer_no_flush_reopen_replays_from_wal` exercised
+// WAL replay of an unflushed L2P buffer — covered for the Buffer
+// path by `tests/db_buffer_journal_replay.rs`'s lifecycle journal
+// tests + the embedder-side LV2 buffer replay. Test deleted.
 
 // -------- B2 Phase 4: snapshot + range_delete with buffer --------
 

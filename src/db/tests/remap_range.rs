@@ -226,30 +226,8 @@ fn l2p_remap_packed_slot_multi_lba_refcount_aggregates_correctly() {
     assert_eq!(db.get_refcount(100).unwrap(), 0);
 }
 
-#[test]
-fn l2p_remap_survives_restart_via_wal_replay() {
-    // Phase 5: WAL replay reuses `apply_op_bare` → `apply_l2p_remap`,
-    // which is rc-neutral. Replay restores the L2P mapping; rc stays
-    // at 0 because no rc-mutating op (DedupPut / PromotionChunk /
-    // FreePbas) ran.
-    // Phase D.4: Wal-mode-only — Buffer mode relies on the upper-
-    // layer LV2 buffer for the same crash-without-flush recovery.
-    let dir = TempDir::new().unwrap();
-    let cfg = wal_mode_cfg(dir.path());
-    {
-        let db = Db::create_with_config(cfg.clone()).unwrap();
-        let mut tx = db.begin();
-        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(100, 7), None);
-        tx.commit_with_outcomes().unwrap();
-        // Crash without flush: only WAL persists.
-    }
-    let db = Db::open_with_config(cfg).unwrap();
-    assert_eq!(
-        db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(),
-        Some(remap_val(100, 7))
-    );
-    assert_eq!(db.get_refcount(100).unwrap(), 0);
-}
+// Phase D.5: `l2p_remap_survives_restart_via_wal_replay` exercised
+// WAL replay of L2pRemap across reopen — the WAL is gone.
 
 #[test]
 fn l2p_remap_guarded_survives_restart_with_same_decision() {
@@ -283,82 +261,9 @@ fn l2p_remap_guarded_survives_restart_with_same_decision() {
     assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 11).unwrap(), None);
 }
 
-#[test]
-fn l2p_remap_guard_reject_does_not_replay_after_later_refcount_growth() {
-    // Phase 5 note: hot-path L2pRemap no longer bumps rc, so we seed
-    // it via the test helper. Use a high guard threshold (rc≥100) so
-    // even with WAL replay re-applying the legacy rc-mutating
-    // `apply_l2p_remap` the guard can't accidentally pass.
-    // Phase D.4: Wal-mode-only — exercises WAL replay behaviour.
-    let dir = TempDir::new().unwrap();
-    let cfg = wal_mode_cfg(dir.path());
-    {
-        let mut db = Db::create_with_config(cfg.clone()).unwrap();
-
-        remap(&db, 10, remap_val(100, 1), None);
-        db.incref_pba(100, 1).unwrap();
-        db = Db::open_with_config(cfg.clone()).unwrap();
-
-        // Guarded remap with min_rc=100 → rejected (current rc is
-        // well below).
-        let mut tx = db.begin();
-        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 11, remap_val(100, 2), Some((100, 100)));
-        let (_, outcomes) = tx.commit_with_outcomes().unwrap();
-        assert!(matches!(
-            outcomes.as_slice(),
-            [ApplyOutcome::L2pRemap { applied: false, .. }]
-        ));
-
-        // Later state still well below 100 even after the snapshot
-        // path bumps rc via legacy apply.
-        remap(&db, 12, remap_val(100, 3), None);
-
-        let refs: Vec<_> = db
-            .iter_refcounts()
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        // Some rc(100) entry exists; exact value depends on replay.
-        assert!(refs.iter().any(|&(pba, _)| pba == 100));
-    }
-
-    let db = Db::open_with_config(cfg).unwrap();
-    // L2P state must round-trip; lba=11 never accepted the guarded
-    // remap, even though replay walks the rejected WAL record.
-    assert_eq!(
-        db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(),
-        Some(remap_val(100, 1))
-    );
-    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 11).unwrap(), None);
-    assert_eq!(
-        db.get(BOOTSTRAP_VOLUME_ORD, 12).unwrap(),
-        Some(remap_val(100, 3))
-    );
-}
-
-#[test]
-fn l2p_remap_freed_pba_round_trips_through_replay() {
-    // Phase 5: L2pRemap is rc-neutral on both the live hot path and
-    // WAL replay. The load-bearing invariant is that the L2P mapping
-    // at lba=10 is the post-overwrite value after replay.
-    // Phase D.4: Wal-mode-only — checks WAL replay outcome.
-    let dir = TempDir::new().unwrap();
-    let cfg = wal_mode_cfg(dir.path());
-    {
-        let db = Db::create_with_config(cfg.clone()).unwrap();
-        remap(&db, 10, remap_val(100, 1), None);
-        remap(&db, 10, remap_val(200, 1), None);
-        // Hot-path didn't touch rc.
-        assert_eq!(db.get_refcount(100).unwrap(), 0);
-    }
-    let db = Db::open_with_config(cfg).unwrap();
-    assert_eq!(db.get_refcount(100).unwrap(), 0);
-    assert_eq!(db.get_refcount(200).unwrap(), 0);
-    assert_eq!(
-        db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(),
-        Some(remap_val(200, 1))
-    );
-}
+// Phase D.5: `l2p_remap_guard_reject_does_not_replay_after_later_refcount_growth`
+// and `l2p_remap_freed_pba_round_trips_through_replay` exercised
+// WAL-replay specifics that are gone with the WAL.
 
 // ---------------- L2pRangeDelete apply (SPEC §3.2 / §4.7) -------
 
@@ -572,39 +477,10 @@ fn range_delete_survives_restart_via_wal_replay() {
     assert_eq!(db.get_refcount(100).unwrap(), 0);
 }
 
-#[test]
-fn range_delete_auto_splits_above_cap() {
-    // Force captured.len() to exceed MAX_RANGE_DELETE_CAPTURED so
-    // the auto-split path runs. Seed MAX + 37 entries; expect two WAL
-    // records + two final applies. Use batched seed commits so this
-    // regression test exercises range_delete instead of spending most
-    // of its time on single-op WAL round trips.
-    // Phase D.4: this test pins captured-list chunking behaviour
-    // that exists only on the Wal-mode `range_delete_via_wal` path;
-    // Buffer-mode `range_delete_via_lifecycle` chunks by Discard's
-    // `count: u32` LBA range instead of captured-list length.
-    let cap = crate::wal::op::MAX_RANGE_DELETE_CAPTURED;
-    let total = cap + 37;
-    let (_d, db) = mk_wal_db();
-    seed_distinct_remaps_batched(&db, total);
-    let pre_lsn = db.last_applied_lsn();
-    let lsn = db
-        .range_delete(BOOTSTRAP_VOLUME_ORD, 0, total as u64)
-        .unwrap();
-    // Two chunks → two WAL records → LSN bumped by 2.
-    assert_eq!(
-        lsn,
-        pre_lsn + 2,
-        "auto-split emitted exactly two WAL records",
-    );
-    for i in 0..total {
-        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, i as u64).unwrap(), None);
-    }
-    // Spot-check a few refcounts.
-    assert_eq!(db.get_refcount(100).unwrap(), 0);
-    assert_eq!(db.get_refcount(100 + cap as u64).unwrap(), 0);
-    assert_eq!(db.get_refcount(100 + (total - 1) as u64).unwrap(), 0);
-}
+// Phase D.5: `range_delete_auto_splits_above_cap` exercised the
+// Wal-mode `range_delete_via_wal` per-chunk WAL splitting. Buffer
+// mode chunks by Discard's `count: u32` LBA range; basic coverage
+// lives in `tests/db_buffer_journal_mode.rs::buffer_mode_range_delete_grows_lifecycle_journal`.
 
 #[test]
 fn range_delete_crosses_shard_boundaries() {

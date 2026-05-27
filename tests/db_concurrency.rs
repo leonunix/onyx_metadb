@@ -94,59 +94,10 @@ fn multi_writer_stress_finishes_and_reopens_cleanly() {
     assert_eq!(after_reopen, before_reopen);
 }
 
-#[test]
-fn multi_lane_wal_replay_survives_reopen_without_flush() {
-    // Phase D.4: Wal-mode-only — multi-lane WAL replay is a Wal-
-    // mode feature; Buffer mode has no WAL writer to lane.
-    let dir = TempDir::new().unwrap();
-    let mut cfg = Config::new(dir.path());
-    cfg.journal_mode = onyx_metadb::MetaDbJournalMode::Wal;
-    cfg.shards_per_partition = 4;
-    cfg.wal_lanes = 4;
-
-    let mut expected = BTreeMap::new();
-    let db = Db::create_with_config(cfg.clone()).unwrap();
-    let mut commits = 0u64;
-    // Keep distinct values per leaf below MAX_UNITS_PER_LEAF=128
-    // (v5 cap = LEAF_ENTRY_COUNT). `key % 64` gives 64 distinct
-    // values; 4 keys map to each value within a leaf (leaf_idx =
-    // lba >> 7 ⇒ 128 LBAs per leaf, 64 unique values per leaf).
-    for key in 0..512u64 {
-        let value = v((key % 64) as u8);
-        db.insert(0, key, value).unwrap();
-        expected.insert(key, value);
-        commits += 1;
-    }
-    for key in (0..512u64).step_by(7) {
-        db.delete(0, key).unwrap();
-        expected.remove(&key);
-        commits += 1;
-    }
-
-    let wal_root = dir.path().join("wal");
-    let non_empty_lanes = (0..cfg.wal_lanes)
-        .filter(|lane| {
-            let lane_dir = wal_root.join(format!("lane-{lane:04}"));
-            !onyx_metadb::wal::read_all(&lane_dir).unwrap().is_empty()
-        })
-        .count();
-    assert!(
-        non_empty_lanes > 1,
-        "test must exercise more than one WAL lane"
-    );
-
-    drop(db);
-    let reopened = Db::open_with_config(cfg).unwrap();
-    assert_eq!(reopened.last_applied_lsn(), commits);
-    let got: BTreeMap<u64, L2pValue> = reopened
-        .range(0, ..)
-        .unwrap()
-        .collect::<Result<Vec<_>>>()
-        .unwrap()
-        .into_iter()
-        .collect();
-    assert_eq!(got, expected);
-}
+// Phase D.5: `multi_lane_wal_replay_survives_reopen_without_flush`
+// exercised the multi-lane WAL writer + replay. The lanes existed
+// only inside the WAL subsystem, which is gone; Buffer mode has no
+// per-lane fan-out today.
 
 #[test]
 fn snapshots_match_reference_during_multi_writer_rounds() {
