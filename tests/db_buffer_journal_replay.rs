@@ -237,6 +237,60 @@ fn replay_is_noop_when_manifest_already_covers_journal() {
     );
 }
 
+/// `range_delete` in Buffer mode writes a `LifecycleOp::Discard`
+/// record. Replay rescans the L2P range and re-runs the same
+/// `apply_l2p_range_delete` path the live commit used — so a crash
+/// after the Discard fsync but before the manifest commit must leave
+/// the range empty on reopen.
+#[test]
+fn replay_recovers_range_delete_without_flush() {
+    let dir = TempDir::new().unwrap();
+    let post_discard_watermark;
+    let ord;
+    {
+        let db = Db::create_with_config(buffer_cfg(&dir)).unwrap();
+        ord = db.create_volume().unwrap();
+        for lba in 0..64u64 {
+            db.insert(ord, lba, lv(2000 + lba)).unwrap();
+        }
+        db.flush().unwrap(); // baseline with the live mappings
+        let _ = db.range_delete(ord, 8, 40).unwrap();
+        post_discard_watermark = db.lifecycle_applied_watermark();
+        // Sanity: visible to live reads pre-crash.
+        for lba in 8..40u64 {
+            assert_eq!(db.get(ord, lba).unwrap(), None);
+        }
+        // Drop WITHOUT flushing — the Discard record is durable but
+        // the manifest still lists the pre-discard L2P roots.
+        drop(db);
+    }
+    let db = Db::open_with_config(buffer_cfg(&dir)).unwrap();
+    // Range [8, 40) must be empty post-replay; the surrounding
+    // ranges must be intact.
+    for lba in 0..8u64 {
+        assert_eq!(
+            db.get(ord, lba).unwrap(),
+            Some(lv(2000 + lba)),
+            "lba {lba} (below discard range) must survive replay"
+        );
+    }
+    for lba in 8..40u64 {
+        assert_eq!(
+            db.get(ord, lba).unwrap(),
+            None,
+            "lba {lba} (inside discard range) must stay deleted after replay"
+        );
+    }
+    for lba in 40..64u64 {
+        assert_eq!(
+            db.get(ord, lba).unwrap(),
+            Some(lv(2000 + lba)),
+            "lba {lba} (above discard range) must survive replay"
+        );
+    }
+    assert_eq!(db.manifest().lifecycle_replay_seq, post_discard_watermark);
+}
+
 /// Promotion records routed via `commit_ops` in Buffer mode also live
 /// in the lifecycle journal; replay must restore the cursor advance.
 #[test]

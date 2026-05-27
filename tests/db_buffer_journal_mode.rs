@@ -91,7 +91,10 @@ fn buffer_mode_data_plane_commits_do_not_grow_wal_records() {
     // Smoke check that data-plane commits in Buffer mode don't write
     // WAL records. Phase C.3 also moves lifecycle ops out of the WAL,
     // so after a fresh `create_volume` the WAL counter is still 0 —
-    // no need to anchor on a post-setup baseline.
+    // no need to anchor on a post-setup baseline. Phase D.1 also
+    // moves `range_delete` (the last data-plane WAL writer) onto the
+    // lifecycle journal, so its commit must not grow `wal_records`
+    // either.
     let dir = TempDir::new().unwrap();
     let db = Db::create_with_config(buffer_cfg(&dir)).unwrap();
     let ord = db.create_volume().unwrap();
@@ -111,6 +114,46 @@ fn buffer_mode_data_plane_commits_do_not_grow_wal_records() {
         after, 0,
         "Buffer-mode data-plane commits must not grow wal_records (after: {after})"
     );
+
+    // Phase D.1: range_delete now writes a LifecycleOp::Discard
+    // instead of a WalOp::L2pRangeDelete. The WAL record counter
+    // must stay at zero.
+    let _ = db.range_delete(ord, 0, 32).unwrap();
+    let after_discard = db.metrics_snapshot().wal_records;
+    assert_eq!(
+        after_discard, 0,
+        "Phase D.1: Buffer-mode range_delete must not grow wal_records \
+         (before: {after}, after: {after_discard})"
+    );
+    // The discard must have been visible to readers and persisted
+    // through to the post-flush manifest.
+    for k in 0..32u64 {
+        assert_eq!(db.get(ord, k).unwrap(), None, "lba {k} should be deleted");
+    }
+}
+
+#[test]
+fn buffer_mode_range_delete_grows_lifecycle_journal() {
+    // Phase D.1: `range_delete` in Buffer mode emits at least one
+    // `LifecycleOp::Discard` record. The watermark advances by the
+    // number of Discard records written (typical TRIM ranges fit in
+    // one `u32::MAX` chunk, so the delta is exactly 1).
+    let dir = TempDir::new().unwrap();
+    let db = Db::create_with_config(buffer_cfg(&dir)).unwrap();
+    let ord = db.create_volume().unwrap();
+    for k in 0..16u64 {
+        db.insert(ord, k, v(k as u8)).unwrap();
+    }
+    let before = db.lifecycle_applied_watermark();
+    let _ = db.range_delete(ord, 0, 16).unwrap();
+    let after = db.lifecycle_applied_watermark();
+    assert_eq!(
+        after,
+        before + 1,
+        "range_delete must append exactly one Discard record \
+         (before: {before}, after: {after})"
+    );
+    assert_eq!(db.metrics_snapshot().wal_records, 0);
 }
 
 #[test]

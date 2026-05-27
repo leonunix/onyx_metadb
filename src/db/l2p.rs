@@ -455,19 +455,7 @@ impl Db {
         // are released before WAL submit so the submit path can rotate
         // segments / fsync without the shard mutex held.
         let scan_started = std::time::Instant::now();
-        let captured_result: Result<Vec<(Lba, L2pValue)>> = {
-            let mut acc: Vec<(Lba, L2pValue)> = Vec::new();
-            for shard in &volume.shards {
-                let mut tree = shard.tree.write();
-                let iter = tree.range(start..end)?;
-                for item in iter {
-                    let (lba, value) = item?;
-                    acc.push((lba, value));
-                }
-            }
-            acc.sort_unstable_by_key(|(lba, _)| *lba);
-            Ok(acc)
-        };
+        let captured_result = scan_l2p_range(&volume, start, end);
         let captured_len = captured_result.as_ref().map_or(0, Vec::len);
         self.metrics
             .record_range_delete_scan(scan_started.elapsed(), captured_len);
@@ -486,6 +474,52 @@ impl Db {
                 .record_range_delete_success(total_started.elapsed());
             return Ok(self.last_applied_lsn());
         }
+
+        let result = if self.journal_mode.wal_authoritative() {
+            self.range_delete_via_wal(
+                &volumes_map,
+                vol_ord,
+                start,
+                end,
+                &captured,
+                &_txg_guard,
+                total_started,
+            )
+        } else {
+            self.range_delete_via_lifecycle(
+                &volumes_map,
+                vol_ord,
+                start,
+                end,
+                &captured,
+                &_txg_guard,
+                total_started,
+            )
+        };
+        if result.is_ok() {
+            self.metrics
+                .record_range_delete_success(total_started.elapsed());
+        }
+        result
+    }
+
+    /// Wal/Shadow-mode `range_delete` body: per-chunk
+    /// `WalOp::L2pRangeDelete` records, each their own WAL submit +
+    /// apply. Preserved verbatim from the pre-Phase-D path so the
+    /// legacy crash-replay regressions in `db_hardening.rs` keep
+    /// passing while D moves Buffer-mode callers to the lifecycle
+    /// journal.
+    #[allow(clippy::too_many_arguments)]
+    fn range_delete_via_wal(
+        &self,
+        volumes_map: &HashMap<VolumeOrdinal, Arc<Volume>>,
+        vol_ord: VolumeOrdinal,
+        start: Lba,
+        end: Lba,
+        captured: &[(Lba, L2pValue)],
+        txg_guard: &crate::txg::TxgGuard<'_>,
+        total_started: std::time::Instant,
+    ) -> Result<Lsn> {
         self.metrics.record_range_delete_chunks(
             captured
                 .chunks(crate::wal::op::MAX_RANGE_DELETE_CAPTURED)
@@ -526,7 +560,7 @@ impl Db {
                     return Err(err);
                 }
             };
-            _txg_guard.record_lsn(lsn);
+            txg_guard.record_lsn(lsn);
             if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
                 self.metrics
                     .record_range_delete_error(total_started.elapsed());
@@ -544,7 +578,7 @@ impl Db {
             let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
             let apply_started = std::time::Instant::now();
             let apply_result = apply_op_bare(
-                &volumes_map,
+                volumes_map,
                 &self.refcount_shards,
                 &self.dedup_index,
                 &self.page_store,
@@ -577,8 +611,164 @@ impl Db {
             self.advance_dispatch_lsn(lsn);
             last_lsn = lsn;
         }
-        self.metrics
-            .record_range_delete_success(total_started.elapsed());
+        Ok(last_lsn)
+    }
+
+    /// Buffer-mode `range_delete` body: emit
+    /// [`crate::lifecycle_log::LifecycleOp::Discard`] records covering
+    /// `[start, end)`. Each record pairs `reserve_unlogged` (one LSN
+    /// for the apply slot) with `journal.append` (per-record fsync),
+    /// then drives the captured subrange through
+    /// [`apply_l2p_range_delete`]. One LSN per record keeps the
+    /// `next_lsn` / `last_applied_lsn` contract intact (every reserved
+    /// LSN is matched by exactly one `finish_global_apply`) —
+    /// mirroring the WAL path's per-chunk pattern but with the
+    /// lifecycle journal as the durability target.
+    ///
+    /// Range chunking: Discard's `count: u32` caps a single record at
+    /// `u32::MAX` LBAs (≈ 17 TiB at 4 KiB), so a range above that
+    /// emits multiple records. Typical TRIM never trips the limit;
+    /// the loop iterates once in steady state.
+    ///
+    /// Crash semantics: every `journal.append` is a per-record fsync,
+    /// so the Discard intent is durable before apply runs. A crash
+    /// between records, or mid-apply within a record, is recovered
+    /// by `Db::open` rescanning the L2P over `[start_lba, start_lba +
+    /// count)` per Discard record (whatever the live apply has
+    /// already deleted is gone from the rescan) and re-applying via
+    /// [`apply_l2p_range_delete`]; page-generation guards keep
+    /// already-stamped pages skip-safe.
+    #[allow(clippy::too_many_arguments)]
+    fn range_delete_via_lifecycle(
+        &self,
+        volumes_map: &HashMap<VolumeOrdinal, Arc<Volume>>,
+        vol_ord: VolumeOrdinal,
+        start: Lba,
+        end: Lba,
+        captured: &[(Lba, L2pValue)],
+        txg_guard: &crate::txg::TxgGuard<'_>,
+        total_started: std::time::Instant,
+    ) -> Result<Lsn> {
+        let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
+            MetaDbError::Corruption(
+                "range_delete: buffer mode without lifecycle journal".into(),
+            )
+        })?;
+
+        // How many u32::MAX-sized LBA chunks does the range need?
+        // Almost always 1; bigger values are recorded so dashboards
+        // see the real shape if a caller TRIMs > 17 TiB.
+        let total_range = end - start;
+        let chunk_count =
+            ((total_range + u32::MAX as u64 - 1) / u32::MAX as u64).max(1) as usize;
+        self.metrics.record_range_delete_chunks(chunk_count);
+
+        let mut last_lsn = self.last_applied_lsn();
+        let mut cursor = start;
+        let mut captured_cursor = 0usize;
+        while cursor < end {
+            let chunk_end = if end - cursor > u32::MAX as u64 {
+                cursor + u32::MAX as u64
+            } else {
+                end
+            };
+            let count = (chunk_end - cursor) as u32;
+
+            // Pick the slice of `captured` that falls inside this
+            // chunk's LBA range. captured is sorted by lba, so we
+            // can walk forward.
+            let chunk_start_idx = captured_cursor;
+            while captured_cursor < captured.len()
+                && captured[captured_cursor].0 < chunk_end
+            {
+                captured_cursor += 1;
+            }
+            let chunk_captured = &captured[chunk_start_idx..captured_cursor];
+
+            // Reserve one LSN that doubles as the apply slot and the
+            // discard intent's "logical" position. `journal.append`
+            // is the actual durability fsync; `reserve_unlogged`
+            // only bumps the WAL counter so commit_cvar / dispatch
+            // ordering stays in lockstep with the live apply
+            // sequence.
+            let wal_started = std::time::Instant::now();
+            let lifecycle_op = crate::lifecycle_log::LifecycleOp::Discard {
+                vol_ord,
+                start_lba: cursor,
+                count,
+            };
+            let body = crate::lifecycle_log::op::encode(&lifecycle_op);
+            let submit_result = self.wal.reserve_unlogged(|_| {}).and_then(|reserved_lsn| {
+                journal.lock().append(&body).map(|seq| {
+                    self.set_lifecycle_applied_watermark(seq);
+                    reserved_lsn
+                })
+            });
+            let lsn = match submit_result {
+                Ok(lsn) => {
+                    self.metrics.record_range_delete_wal(wal_started.elapsed());
+                    lsn
+                }
+                Err(err) => {
+                    self.metrics.record_range_delete_wal(wal_started.elapsed());
+                    self.metrics
+                        .record_range_delete_error(total_started.elapsed());
+                    self.poison_commit_waiters(&err);
+                    return Err(err);
+                }
+            };
+            txg_guard.record_lsn(lsn);
+            if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
+                self.metrics
+                    .record_range_delete_error(total_started.elapsed());
+                self.poison_commit_waiters(&err);
+                return Err(err);
+            }
+
+            // Under apply_gate.write no one else can apply, so the
+            // cvar wait is defensive and usually passes immediately.
+            let wait_started = std::time::Instant::now();
+            self.wait_for_global_apply_turn(lsn)?;
+            self.metrics
+                .record_range_delete_apply_wait(wait_started.elapsed());
+
+            let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
+                self.snap_info_for_vol(vol)
+            };
+            let apply_started = std::time::Instant::now();
+            let apply_result = apply_l2p_range_delete(
+                volumes_map,
+                &self.refcount_shards,
+                lsn,
+                vol_ord,
+                chunk_captured,
+                &snap_lookup(vol_ord),
+            );
+            match apply_result {
+                Ok(_outcome) => self
+                    .metrics
+                    .record_range_delete_apply(apply_started.elapsed()),
+                Err(err) => {
+                    self.metrics
+                        .record_range_delete_apply(apply_started.elapsed());
+                    self.metrics
+                        .record_range_delete_error(total_started.elapsed());
+                    self.poison_commit_waiters(&err);
+                    return Err(err);
+                }
+            }
+            if let Err(err) = self.faults.inject(FaultPoint::CommitPostApplyBeforeLsnBump) {
+                self.metrics
+                    .record_range_delete_error(total_started.elapsed());
+                self.poison_commit_waiters(&err);
+                return Err(err);
+            }
+
+            self.finish_global_apply(lsn)?;
+            self.advance_dispatch_lsn(lsn);
+            last_lsn = lsn;
+            cursor = chunk_end;
+        }
         Ok(last_lsn)
     }
 }

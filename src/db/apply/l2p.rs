@@ -285,6 +285,33 @@ pub(in crate::db) fn apply_l2p_remap_range(
     })
 }
 
+/// Scan one volume's L2P over `[start, end)` and return every live
+/// `(lba, value)` pair, sorted by lba. Used by `Db::range_delete`
+/// (live path) and by the Phase C.4 lifecycle replay for
+/// [`crate::lifecycle_log::LifecycleOp::Discard`] — both need the
+/// same captured list before calling
+/// [`apply_l2p_range_delete`]. Takes a `write` lock on each shard's
+/// tree so the caller (which holds `apply_gate.write`) gets a
+/// consistent view; the lock is released as soon as the iterator
+/// is drained.
+pub(in crate::db) fn scan_l2p_range(
+    volume: &Volume,
+    start: Lba,
+    end: Lba,
+) -> Result<Vec<(Lba, L2pValue)>> {
+    let mut acc: Vec<(Lba, L2pValue)> = Vec::new();
+    for shard in &volume.shards {
+        let mut tree = shard.tree.write();
+        let iter = tree.range(start..end)?;
+        for item in iter {
+            let (lba, value) = item?;
+            acc.push((lba, value));
+        }
+    }
+    acc.sort_unstable_by_key(|(lba, _)| *lba);
+    Ok(acc)
+}
+
 /// Apply one [`WalOp::L2pRangeDelete`]. Walks the `captured` list,
 /// deleting each lba from its volume's L2P shard and emitting a
 /// decref against `old_pba` — modulo birth/death LSN suppression: if

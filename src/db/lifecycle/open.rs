@@ -1279,17 +1279,62 @@ fn apply_lifecycle_record_replay(
         LifecycleOp::PromotionComplete { vol_ord } => {
             apply_promotion_complete(volumes, *vol_ord)?;
         }
-        // Phase C.3 doesn't yet route TakeSnapshot or Discard through
-        // the lifecycle journal (`TakeSnapshot` is manifest-only;
-        // `Discard` / range-delete still goes through the WAL). A
-        // record carrying either variant on disk indicates the on-disk
-        // schema has moved ahead of this binary — surface it as
-        // corruption rather than silently misapplying.
-        LifecycleOp::TakeSnapshot { .. } | LifecycleOp::Discard { .. } => {
+        LifecycleOp::Discard {
+            vol_ord,
+            start_lba,
+            count,
+        } => {
+            // Phase D.1 replay: the record only carries the range —
+            // rescan the L2P at apply time to rebuild the captured
+            // list, then drive the same `apply_l2p_range_delete` the
+            // live path uses. The rescan naturally observes whatever
+            // pre-crash apply progress had already deleted (those
+            // LBAs are gone from the tree), so the call is
+            // idempotent across repeated replays.
+            let volume = volumes.get(vol_ord).ok_or_else(|| {
+                MetaDbError::Corruption(format!(
+                    "lifecycle replay: Discard for unknown volume ord {vol_ord}"
+                ))
+            })?;
+            let end = (*start_lba)
+                .checked_add(*count as u64)
+                .ok_or_else(|| {
+                    MetaDbError::Corruption(format!(
+                        "lifecycle replay: Discard range overflow on vol \
+                         {vol_ord}: start={start_lba} count={count}"
+                    ))
+                })?;
+            let captured = scan_l2p_range(volume, *start_lba, end)?;
+            if !captured.is_empty() {
+                let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
+                    manifest
+                        .snapshots
+                        .iter()
+                        .filter(|s| s.vol_ord == vol)
+                        .map(|s| SnapInfo {
+                            created_lsn: s.created_lsn,
+                            l2p_shard_roots: s.l2p_shard_roots.clone(),
+                        })
+                        .collect()
+                };
+                apply_l2p_range_delete(
+                    volumes,
+                    refcount_shards,
+                    lsn,
+                    *vol_ord,
+                    &captured,
+                    &snap_lookup(*vol_ord),
+                )?;
+            }
+        }
+        // `TakeSnapshot` is still manifest-only in Phase D — no
+        // journal entry today. A record on disk indicates the
+        // on-disk schema has moved ahead of this binary; surface
+        // it as corruption rather than silently misapplying.
+        LifecycleOp::TakeSnapshot { .. } => {
             return Err(MetaDbError::Corruption(format!(
-                "lifecycle replay: op tag 0x{:02x} not handled by this \
-                 binary (TakeSnapshot / Discard are not yet routed \
-                 through the lifecycle journal in Phase C.3)",
+                "lifecycle replay: TakeSnapshot (tag 0x{:02x}) is not \
+                 yet routed through the lifecycle journal",
                 op.tag(),
             )));
         }
