@@ -35,6 +35,7 @@ pub mod epoch;
 pub mod error;
 pub mod fuzz;
 pub(crate) mod io_submitter;
+pub mod lifecycle_log;
 pub mod manifest;
 pub mod metrics;
 pub mod page;
