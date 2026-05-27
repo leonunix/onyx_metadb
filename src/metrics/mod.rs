@@ -143,6 +143,19 @@ pub struct MetaMetrics {
     wal_submit_calls: AtomicU64,
     wal_submit_wait_us: AtomicU64,
     wal_submit_wait_max_us: AtomicU64,
+    /// `wal_submit_wait_us` decomposed into three segments. Each
+    /// submit contributes one sample to every segment. Sum across
+    /// segments approximates `wal_submit_wait_us` modulo a handful of
+    /// nanoseconds of timestamp slop.
+    /// - queue_wait: caller's `Op::Submit` send → writer dequeue
+    /// - writer_busy: writer dequeue → writer ack send
+    /// - wake_roundtrip: writer ack send → caller's `recv` return
+    wal_queue_wait_us: AtomicU64,
+    wal_queue_wait_max_us: AtomicU64,
+    wal_writer_busy_us: AtomicU64,
+    wal_writer_busy_max_us: AtomicU64,
+    wal_wake_roundtrip_us: AtomicU64,
+    wal_wake_roundtrip_max_us: AtomicU64,
     wal_batches: AtomicU64,
     wal_records: AtomicU64,
     wal_bytes: AtomicU64,

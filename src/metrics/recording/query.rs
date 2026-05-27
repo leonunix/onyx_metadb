@@ -73,6 +73,40 @@ impl MetaMetrics {
         );
     }
 
+    /// Caller-side `Op::Submit` send → writer dequeue. Recorded by
+    /// the writer thread when it first sees each submit. One sample
+    /// per submit (counts should match `wal_submit_calls`).
+    pub(crate) fn record_wal_queue_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.wal_queue_wait_us,
+            &self.wal_queue_wait_max_us,
+            elapsed,
+        );
+    }
+
+    /// Writer dequeue → writer ack send (per submit). Captures
+    /// batch-assembly delay, encode, write, and any fsync amortised
+    /// over the batch. Recorded by the writer thread just before each
+    /// ack is sent. One sample per submit.
+    pub(crate) fn record_wal_writer_busy(&self, elapsed: Duration) {
+        record_duration(
+            &self.wal_writer_busy_us,
+            &self.wal_writer_busy_max_us,
+            elapsed,
+        );
+    }
+
+    /// Writer ack send → caller's `recv` return. Captures channel
+    /// wakeup latency. Recorded by the caller after `ack.recv()`
+    /// returns. One sample per submit.
+    pub(crate) fn record_wal_wake_roundtrip(&self, elapsed: Duration) {
+        record_duration(
+            &self.wal_wake_roundtrip_us,
+            &self.wal_wake_roundtrip_max_us,
+            elapsed,
+        );
+    }
+
     pub(crate) fn record_wal_rotate(&self) {
         self.wal_rotates.fetch_add(1, Ordering::Relaxed);
     }

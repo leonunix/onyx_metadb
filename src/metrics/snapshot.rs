@@ -49,6 +49,15 @@ pub struct MetaMetricsSnapshot {
     pub wal_submit_calls: u64,
     pub wal_submit_wait_us: u64,
     pub wal_submit_wait_max_us: u64,
+    /// `wal_submit_wait_us` decomposed into three per-submit segments
+    /// (queue_wait + writer_busy + wake_roundtrip). See
+    /// `MetaMetrics::wal_queue_wait_us` for the contract.
+    pub wal_queue_wait_us: u64,
+    pub wal_queue_wait_max_us: u64,
+    pub wal_writer_busy_us: u64,
+    pub wal_writer_busy_max_us: u64,
+    pub wal_wake_roundtrip_us: u64,
+    pub wal_wake_roundtrip_max_us: u64,
     pub wal_batches: u64,
     pub wal_records: u64,
     pub wal_bytes: u64,

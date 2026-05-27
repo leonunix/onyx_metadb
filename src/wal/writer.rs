@@ -48,17 +48,34 @@ pub struct Wal {
     metrics: Arc<MetaMetrics>,
 }
 
+/// Ack payload sent from the writer thread back to a submit caller.
+///
+/// Carries `ack_sent_at` so the caller can record the wake-roundtrip
+/// segment of submit latency (writer → caller wakeup) independently of
+/// the writer-side busy window. Together with the `submitted_at` stamp
+/// the caller embeds in `Op::Submit` and the `dequeued_at` stamp the
+/// writer takes when it first sees the op, this lets us split the
+/// per-submit `wal_submit_wait_us` into `queue_wait + writer_busy +
+/// wake_roundtrip`.
+pub(crate) struct WalAckMsg {
+    pub(crate) result: Result<Lsn>,
+    pub(crate) ack_sent_at: Instant,
+}
+
 pub(crate) struct PendingWalAck {
-    ack: Receiver<Result<Lsn>>,
+    ack: Receiver<WalAckMsg>,
     started: Instant,
     metrics: Arc<MetaMetrics>,
 }
 
 impl PendingWalAck {
     pub(crate) fn wait(self) -> Result<Lsn> {
-        let result = self.ack.recv().map_err(|_| writer_exited())?;
+        let msg = self.ack.recv().map_err(|_| writer_exited())?;
+        let now = Instant::now();
+        self.metrics
+            .record_wal_wake_roundtrip(now.saturating_duration_since(msg.ack_sent_at));
         self.metrics.record_wal_submit_wait(self.started.elapsed());
-        result
+        msg.result
     }
 }
 
@@ -66,7 +83,12 @@ enum Op {
     Submit {
         assigned_lsn: Option<Lsn>,
         body: Vec<u8>,
-        ack: Sender<Result<Lsn>>,
+        ack: Sender<WalAckMsg>,
+        /// Instant captured by the submit caller just before sending
+        /// the op down the writer channel. The writer compares this
+        /// against the `Instant::now()` it takes on dequeue to record
+        /// `wal_queue_wait_us` per submit.
+        submitted_at: Instant,
         /// ZFS-TXG-clone Phase 3: when false, the writer thread acks
         /// the submit after `seg.append` (body in OS page cache) and
         /// skips the per-batch fsync. Durability is reasserted at the
@@ -142,17 +164,22 @@ impl Wal {
         }
         let started = Instant::now();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let submitted_at = Instant::now();
         self.sender
             .send(Op::Submit {
                 assigned_lsn: None,
                 body,
                 ack: ack_tx,
+                submitted_at,
                 synchronous: true,
             })
             .map_err(|_| writer_exited())?;
-        let result = ack_rx.recv().map_err(|_| writer_exited())?;
+        let msg = ack_rx.recv().map_err(|_| writer_exited())?;
+        let woke_at = Instant::now();
+        self.metrics
+            .record_wal_wake_roundtrip(woke_at.saturating_duration_since(msg.ack_sent_at));
         self.metrics.record_wal_submit_wait(started.elapsed());
-        result
+        msg.result
     }
 
     /// Enqueue an already-assigned record and return an ack handle.
@@ -176,11 +203,13 @@ impl Wal {
         }
         let started = Instant::now();
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let submitted_at = Instant::now();
         self.sender
             .send(Op::Submit {
                 assigned_lsn: Some(lsn),
                 body,
                 ack: ack_tx,
+                submitted_at,
                 synchronous,
             })
             .map_err(|_| writer_exited())?;
@@ -276,7 +305,15 @@ struct WriterState {
 struct PendingSubmit {
     assigned_lsn: Option<Lsn>,
     body: Vec<u8>,
-    ack: Sender<Result<Lsn>>,
+    ack: Sender<WalAckMsg>,
+    /// Caller-side stamp from `Op::Submit::submitted_at`. Kept on
+    /// `PendingSubmit` for symmetry with `dequeued_at`; queue_wait is
+    /// recorded eagerly on dequeue so this field is currently unread.
+    #[allow(dead_code)]
+    submitted_at: Instant,
+    /// Writer-side stamp captured when this op was dequeued from the
+    /// channel. `wal_writer_busy_us = ack_sent_at - dequeued_at`.
+    dequeued_at: Instant,
     synchronous: bool,
 }
 
@@ -390,13 +427,22 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
                 assigned_lsn,
                 body,
                 ack,
+                submitted_at,
                 synchronous,
-            } => submits.push(PendingSubmit {
-                assigned_lsn,
-                body,
-                ack,
-                synchronous,
-            }),
+            } => {
+                let dequeued_at = Instant::now();
+                state.metrics.record_wal_queue_wait(
+                    dequeued_at.saturating_duration_since(submitted_at),
+                );
+                submits.push(PendingSubmit {
+                    assigned_lsn,
+                    body,
+                    ack,
+                    submitted_at,
+                    dequeued_at,
+                    synchronous,
+                });
+            }
             Op::Shutdown { .. } | Op::FsyncAll { .. } => unreachable!(),
         }
         let mut batch_bytes = first_len;
@@ -430,13 +476,20 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
                     assigned_lsn,
                     body,
                     ack,
+                    submitted_at,
                     synchronous,
                 }) => {
+                    let dequeued_at = Instant::now();
+                    state.metrics.record_wal_queue_wait(
+                        dequeued_at.saturating_duration_since(submitted_at),
+                    );
                     batch_bytes += body.len() + WAL_HEADER_SIZE;
                     submits.push(PendingSubmit {
                         assigned_lsn,
                         body,
                         ack,
+                        submitted_at,
+                        dequeued_at,
                         synchronous,
                     });
                     continue;
@@ -462,13 +515,20 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
                     assigned_lsn,
                     body,
                     ack,
+                    submitted_at,
                     synchronous,
                 }) => {
+                    let dequeued_at = Instant::now();
+                    state.metrics.record_wal_queue_wait(
+                        dequeued_at.saturating_duration_since(submitted_at),
+                    );
                     batch_bytes += body.len() + WAL_HEADER_SIZE;
                     submits.push(PendingSubmit {
                         assigned_lsn,
                         body,
                         ack,
+                        submitted_at,
+                        dequeued_at,
                         synchronous,
                     });
                 }
@@ -496,8 +556,15 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
         let commit_result = commit_batch(&mut state, &mut submits, force_fsync);
         match commit_result {
             Ok(assigned) => {
-                for (ack, lsn) in assigned {
-                    let _ = ack.send(Ok(lsn));
+                for (ack, lsn, dequeued_at) in assigned {
+                    let ack_sent_at = Instant::now();
+                    state.metrics.record_wal_writer_busy(
+                        ack_sent_at.saturating_duration_since(dequeued_at),
+                    );
+                    let _ = ack.send(WalAckMsg {
+                        result: Ok(lsn),
+                        ack_sent_at,
+                    });
                 }
             }
             Err(e) => {
@@ -509,9 +576,16 @@ fn writer_main(receiver: crossbeam_channel::Receiver<Op>, mut state: WriterState
                     "metadb wal writer: commit batch failed; stopping writer"
                 );
                 for pending in submits.drain(..) {
-                    let _ = pending.ack.send(Err(MetaDbError::Corruption(format!(
-                        "wal commit failed: {msg}"
-                    ))));
+                    let ack_sent_at = Instant::now();
+                    state.metrics.record_wal_writer_busy(
+                        ack_sent_at.saturating_duration_since(pending.dequeued_at),
+                    );
+                    let _ = pending.ack.send(WalAckMsg {
+                        result: Err(MetaDbError::Corruption(format!(
+                            "wal commit failed: {msg}"
+                        ))),
+                        ack_sent_at,
+                    });
                 }
                 if let Some(ack) = pending_shutdown {
                     let _ = ack.send(Err(MetaDbError::Corruption(format!(
@@ -562,7 +636,7 @@ fn commit_batch(
     state: &mut WriterState,
     submits: &mut Vec<PendingSubmit>,
     force_fsync: bool,
-) -> Result<Vec<(Sender<Result<Lsn>>, Lsn)>> {
+) -> Result<Vec<(Sender<WalAckMsg>, Lsn, Instant)>> {
     if submits.is_empty() {
         return Ok(Vec::new());
     }
@@ -662,12 +736,14 @@ fn commit_batch(
     state.metrics.record_wal_batch(submits.len(), buf.len());
 
     // Pass 2: every path past Pass 1 has succeeded. Advance the writer
-    // cursor and drain `submits` into the returned (ack, lsn) pairs.
-    // Nothing here can fail, so we never strand a Sender.
+    // cursor and drain `submits` into the returned (ack, lsn,
+    // dequeued_at) tuples. Nothing here can fail, so we never strand a
+    // Sender. `dequeued_at` is carried out so the caller can stamp
+    // `wal_writer_busy_us = ack_sent_at - dequeued_at` per submit.
     state.next_lsn = next_cursor;
     let mut assigned = Vec::with_capacity(submits.len());
     for (pending, lsn) in submits.drain(..).zip(lsns) {
-        assigned.push((pending.ack, lsn));
+        assigned.push((pending.ack, lsn, pending.dequeued_at));
     }
     Ok(assigned)
 }
