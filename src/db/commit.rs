@@ -313,6 +313,34 @@ fn dispatch_ready(state: &DispatchState, lsn: Lsn) -> bool {
             .all(|(_, lower)| !entry.footprint.conflicts(&lower.footprint))
 }
 
+/// Phase C.3: convert a single-op `commit_ops` batch into its
+/// [`crate::lifecycle_log::LifecycleOp`] equivalent if and only if the
+/// batch is one of the promotion records carried by
+/// [`crate::db::promotion::Db::run_promotion_chunk`]. Any other shape
+/// (multi-op batch, data-plane op, lifecycle WalOp without a matching
+/// lifecycle variant such as `FreePbas` / `L2pRangeDelete`) returns
+/// `None`, letting the caller fall back to plain `reserve_unlogged`.
+fn ops_as_promotion_lifecycle(ops: &[WalOp]) -> Option<crate::lifecycle_log::LifecycleOp> {
+    if ops.len() != 1 {
+        return None;
+    }
+    match &ops[0] {
+        WalOp::PromotionChunk {
+            vol_ord,
+            pba_increfs,
+            next_cursor,
+        } => Some(crate::lifecycle_log::LifecycleOp::PromotionChunk {
+            vol_ord: *vol_ord,
+            pba_increfs: pba_increfs.to_vec(),
+            next_cursor: *next_cursor,
+        }),
+        WalOp::PromotionComplete { vol_ord } => {
+            Some(crate::lifecycle_log::LifecycleOp::PromotionComplete { vol_ord: *vol_ord })
+        }
+        _ => None,
+    }
+}
+
 impl Db {
     // -------- transaction / commit --------------------------------------
 
@@ -499,13 +527,45 @@ impl Db {
         let _txg_guard = self.txg.enter();
         let wal_started = std::time::Instant::now();
         let lsn = if buffer_mode {
-            // Buffer mode: allocate an LSN without writing a WAL
-            // body. `register_dispatch_intent` still runs under the
-            // WalSet allocator mutex so concurrent dispatch ordering
-            // is preserved.
-            let result = self.wal.reserve_unlogged(|lsn| {
-                self.register_dispatch_intent(lsn, dispatch_footprint);
-            });
+            // Phase C.3: single-op promotion records use the lifecycle
+            // journal as their durable footprint in Buffer mode (same
+            // contract as the `Db::create_volume` / `drop_volume`
+            // paths). FreePbas / L2pRangeDelete and any future
+            // lifecycle WalOp without a matching `LifecycleOp` variant
+            // fall through to plain `reserve_unlogged` and rely on the
+            // embedder's upper-layer journal until they grow their own
+            // lifecycle entry.
+            let promotion_lifecycle = ops_as_promotion_lifecycle(ops);
+            let result = if let Some(lifecycle_op) = promotion_lifecycle {
+                let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
+                    MetaDbError::Corruption(
+                        "commit_ops: buffer mode without lifecycle journal".into(),
+                    )
+                });
+                match journal {
+                    Ok(journal) => {
+                        let body = crate::lifecycle_log::op::encode(&lifecycle_op);
+                        let reserve_result = self.wal.reserve_unlogged(|lsn| {
+                            self.register_dispatch_intent(lsn, dispatch_footprint);
+                        });
+                        match reserve_result {
+                            Ok(lsn) => match journal.lock().append(&body) {
+                                Ok(seq) => {
+                                    self.set_lifecycle_applied_watermark(seq);
+                                    Ok(lsn)
+                                }
+                                Err(err) => Err(err),
+                            },
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                self.wal.reserve_unlogged(|lsn| {
+                    self.register_dispatch_intent(lsn, dispatch_footprint);
+                })
+            };
             timing.wal_submit = wal_started.elapsed();
             self.metrics.record_commit_wal_submit(timing.wal_submit);
             match result {

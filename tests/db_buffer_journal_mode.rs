@@ -15,7 +15,8 @@
 //! the onyx-side flusher and is covered in
 //! `src/buffer/flush/tests/replay.rs`.
 
-use onyx_metadb::{Config, Db, L2pValue, MetaDbJournalMode};
+use onyx_metadb::paged::format::LEAF_VALUE_SIZE;
+use onyx_metadb::{Config, Db, L2pValue, MetaDbJournalMode, Pba};
 use tempfile::TempDir;
 
 fn v(n: u8) -> L2pValue {
@@ -23,6 +24,17 @@ fn v(n: u8) -> L2pValue {
     x[7] = n;
     x[onyx_metadb::paged::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(x)
+}
+
+/// Build an L2pValue whose head 8B encode `pba` (big-endian, matches
+/// the head_pba contract used by the promotion walker). Avoids the
+/// `v(n)` helper's `(n as u64) << 56` PBA which would balloon the
+/// refcount page-table.
+fn lv(pba: Pba) -> L2pValue {
+    let mut bytes = [0u8; LEAF_VALUE_SIZE];
+    bytes[..8].copy_from_slice(&pba.to_be_bytes());
+    bytes[LEAF_VALUE_SIZE - 1] = 1;
+    L2pValue(bytes)
 }
 
 fn buffer_cfg(dir: &TempDir) -> Config {
@@ -156,6 +168,53 @@ fn buffer_mode_lifecycle_ops_grow_lifecycle_journal_only() {
         db.metrics_snapshot().wal_records,
         0,
         "no Buffer-mode lifecycle path should have touched the WAL"
+    );
+}
+
+#[test]
+fn buffer_mode_promotion_ops_grow_lifecycle_journal_only() {
+    // Phase C.3: promotion records routed through `commit_ops` must
+    // also land in the lifecycle journal in Buffer mode (not the WAL).
+    // The clone scenario gives us a volume with `parent_vol_ord` set
+    // so a synthetic `PromotionChunk` + `PromotionComplete` round-trip
+    // through the apply path.
+    let dir = TempDir::new().unwrap();
+    let db = Db::create_with_config(buffer_cfg(&dir)).unwrap();
+    let src = db.create_volume().unwrap();
+    let pbas: [Pba; 4] = [301, 302, 303, 304];
+    for (lba, pba) in pbas.iter().enumerate() {
+        db.insert(src, lba as u64, lv(*pba)).unwrap();
+    }
+    let snap = db.take_snapshot(src).unwrap();
+    let clone = db.clone_volume(snap).unwrap();
+
+    let before = db.lifecycle_applied_watermark();
+    let mut tx = db.begin();
+    tx.promotion_chunk(clone, Box::new(pbas), None);
+    tx.commit().unwrap();
+    let after_chunk = db.lifecycle_applied_watermark();
+    assert_eq!(
+        after_chunk,
+        before + 1,
+        "PromotionChunk via commit_ops must append one lifecycle record \
+         (before: {before}, after: {after_chunk})"
+    );
+
+    let mut tx = db.begin();
+    tx.promotion_complete(clone);
+    tx.commit().unwrap();
+    let after_complete = db.lifecycle_applied_watermark();
+    assert_eq!(
+        after_complete,
+        after_chunk + 1,
+        "PromotionComplete via commit_ops must append one lifecycle record \
+         (after chunk: {after_chunk}, after complete: {after_complete})"
+    );
+
+    assert_eq!(
+        db.metrics_snapshot().wal_records,
+        0,
+        "promotion ops in Buffer mode must not touch the WAL"
     );
 }
 
