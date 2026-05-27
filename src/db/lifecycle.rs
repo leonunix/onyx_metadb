@@ -318,6 +318,42 @@ impl Db {
         *self.freed_pbas_sink.lock() = None;
     }
 
+    /// Buffer-as-sole-journal Phase B / C: stamp the watermark the
+    /// next checkpoint will copy into `manifest.last_processed_buffer_seq`.
+    ///
+    /// Onyx calls this from the flusher's `post_commit` path with the
+    /// highest LV2 buffer entry seq whose mutations are now in metadb's
+    /// in-memory state. Monotonic `fetch_max` so out-of-order callers
+    /// (multiple commit_workers) cannot regress the watermark.
+    ///
+    /// Returns the previous value for caller observability; the new
+    /// effective watermark is `max(prev, seq)`.
+    pub fn set_buffer_applied_watermark(&self, seq: u64) -> u64 {
+        self.buffer_applied_watermark
+            .fetch_max(seq, std::sync::atomic::Ordering::Release)
+    }
+
+    /// Read the watermark that the next checkpoint will persist. Used
+    /// by tests and by the checkpoint commit hook in `flush_with_gate`.
+    pub fn buffer_applied_watermark(&self) -> u64 {
+        self.buffer_applied_watermark
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Same contract as [`set_buffer_applied_watermark`] but for the
+    /// lifecycle journal. Called after a lifecycle-log apply lands in
+    /// metadb's in-memory state.
+    pub fn set_lifecycle_applied_watermark(&self, seq: u64) -> u64 {
+        self.lifecycle_applied_watermark
+            .fetch_max(seq, std::sync::atomic::Ordering::Release)
+    }
+
+    /// Read the lifecycle-log replay watermark.
+    pub fn lifecycle_applied_watermark(&self) -> u64 {
+        self.lifecycle_applied_watermark
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Internal helper: pluck `ApplyOutcome::FreePbas` entries out of a
     /// commit-ops result and forward their `freed_pbas` to the
     /// registered sink (if any). Non-`FreePbas` outcomes and

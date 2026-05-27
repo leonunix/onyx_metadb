@@ -196,6 +196,8 @@ impl Db {
             txg_sync_notifier: Arc::new(crate::db::txg_sync::SyncNotifier::new()),
             txg_quiesce: Mutex::new(None),
             txg_sync: Mutex::new(None),
+            buffer_applied_watermark: AtomicU64::new(0),
+            lifecycle_applied_watermark: AtomicU64::new(0),
         };
         // Spawn refcount drainers (priority 3) — fresh DB has no
         // replay to worry about, so we can spawn unconditionally
@@ -805,6 +807,8 @@ impl Db {
             txg_sync_notifier: Arc::new(crate::db::txg_sync::SyncNotifier::new()),
             txg_quiesce: Mutex::new(None),
             txg_sync: Mutex::new(None),
+            buffer_applied_watermark: AtomicU64::new(0),
+            lifecycle_applied_watermark: AtomicU64::new(0),
         };
         // Stamp `slot_max_lsn(open_txg)` with the post-replay
         // `last_applied`. `apply_replay_batch` and `apply_op_bare` fold

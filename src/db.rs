@@ -335,6 +335,21 @@ pub struct Db {
     /// the quiesce side is gone, and the sync side drains whatever it
     /// has before exiting.
     pub(crate) txg_sync: Mutex<Option<txg_sync::TxgSyncThread>>,
+    /// Buffer-as-sole-journal Phase B watermark hook. The onyx engine
+    /// stamps this atomic to "the highest LV2 buffer entry seq whose
+    /// flusher-derived mutations are now in metadb's in-memory state".
+    /// The next checkpoint commit copies it into
+    /// `manifest.last_processed_buffer_seq` so a future open can scope
+    /// buffer replay to `seq > this`.
+    ///
+    /// Zero until a Shadow/Buffer-mode caller starts publishing — the
+    /// legacy WAL path leaves it at 0 and the manifest field also
+    /// stays 0 (recovery falls back to `checkpoint_lsn` semantics).
+    pub(crate) buffer_applied_watermark: AtomicU64,
+    /// Companion watermark for the lifecycle journal. Highest
+    /// lifecycle-log seq whose effects are in memory. Persisted as
+    /// `manifest.lifecycle_replay_seq`.
+    pub(crate) lifecycle_applied_watermark: AtomicU64,
 }
 
 /// Synchronous callback invoked with the freed-PBA set produced by a

@@ -962,6 +962,23 @@ impl Db {
         let new_checkpoint_lsn =
             self.compute_min_last_flushed_lsn_after(&volumes, &selected, wal_checkpoint);
         manifest_state.manifest.checkpoint_lsn = new_checkpoint_lsn;
+        // Buffer-as-sole-journal Phase B / C: persist the buffer +
+        // lifecycle replay watermarks alongside `checkpoint_lsn`. Both
+        // are sampled here, inside `apply_gate.write()`, so the values
+        // are exactly consistent with the page roots this checkpoint
+        // commits — there are no in-flight applies that could advance
+        // either watermark past what the manifest will record.
+        //
+        // The atomics are zero on the legacy `MetadbJournalMode::Wal`
+        // path (onyx never publishes), so this is effectively a no-op
+        // there: the manifest field stays 0 and recovery still falls
+        // back to `checkpoint_lsn` semantics.
+        manifest_state.manifest.last_processed_buffer_seq = self
+            .buffer_applied_watermark
+            .load(std::sync::atomic::Ordering::Acquire);
+        manifest_state.manifest.lifecycle_replay_seq = self
+            .lifecycle_applied_watermark
+            .load(std::sync::atomic::Ordering::Acquire);
         // ZFS-TXG-clone Phase 4: persist `checkpoint_txg = open_txg - 1`
         // so a re-open's `TxgStateMachine::new(checkpoint_txg)` resumes
         // with `open_txg = checkpoint_txg + 1` and the new open slot
