@@ -38,7 +38,7 @@
 
 use std::collections::BTreeMap;
 
-use onyx_metadb::wal::op::WalOp;
+use onyx_metadb::op::WalOp;
 use onyx_metadb::{ApplyOutcome, Config, Db, L2pValue, VolumeOrdinal};
 use proptest::prelude::*;
 use tempfile::TempDir;

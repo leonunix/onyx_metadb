@@ -324,34 +324,16 @@ fn bucketed_apply_remap_batch_handles_shared_new_pba() {
     }
 }
 
-/// Helper used by `batch_contains_lifecycle_op` covers every
-/// lifecycle variant — spot-check via direct unit tests since
-/// these ops cannot be pushed through Transaction.
+/// `commit_ops` only ever receives data-plane ops in Buffer-mode
+/// (Phase D.5b). `batch_contains_lifecycle_op` is kept as a defensive
+/// `false`-returning shim so future variants don't silently bypass the
+/// fallback; this test pins that behaviour.
 #[test]
-fn lifecycle_predicate_detects_every_lifecycle_variant() {
+fn lifecycle_predicate_returns_false_for_dataplane_ops() {
     assert!(!batch_contains_lifecycle_op(&[WalOp::L2pPut {
         vol_ord: 0,
         lba: 0,
         value: v(0),
-    }]));
-    assert!(batch_contains_lifecycle_op(&[WalOp::DropSnapshot {
-        id: 1,
-        pages: Vec::new(),
-        pba_decrefs: Vec::new(),
-    }]));
-    assert!(batch_contains_lifecycle_op(&[WalOp::CreateVolume {
-        ord: 1,
-        shard_count: 1,
-    }]));
-    assert!(batch_contains_lifecycle_op(&[WalOp::DropVolume {
-        ord: 1,
-        pages: Vec::new(),
-    }]));
-    assert!(batch_contains_lifecycle_op(&[WalOp::CloneVolume {
-        src_ord: 0,
-        new_ord: 1,
-        src_snap_id: 0,
-        src_shard_roots: Vec::new(),
     }]));
     assert!(!batch_contains_lifecycle_op(&[WalOp::L2pRemap {
         vol_ord: 0,

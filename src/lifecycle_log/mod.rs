@@ -27,26 +27,18 @@
 //! are covered by the last manifest commit. On open, the recovery
 //! driver scans the journal in seq order, replays every record with
 //! `seq > manifest.lifecycle_replay_seq`, and tolerates a torn record
-//! only as the last entry of the last segment (mirrors the WAL
-//! convention in [`crate::wal::recovery`]).
+//! only as the last entry of the last segment.
 //!
-//! # Reuse
+//! # Record framing
 //!
-//! Record framing is identical to the WAL ([`crate::wal::record`]); we
-//! re-export `encode` / `decode` so both journals share one frame
-//! format and one CRC32C path. Segment filename + listing helpers are
-//! delegated to [`crate::wal::segment`] via a thin wrapper that swaps
-//! the `wal-` prefix for `lifecycle-`.
-//!
-//! # Phase A status
-//!
-//! This module is dead code outside its own tests. Phase A pins down
-//! the framing, op enum, and journal/replay surface so Phase B can
-//! shadow-validate against the existing WAL path without further
-//! shape changes.
+//! Frame layout (LSN slot reused as monotonic seq, body + crc32c)
+//! lives in [`record`]. Segment filenames use a `lifecycle-` prefix
+//! and a 20-digit start seq; listing/parsing is inlined in
+//! [`journal`].
 
 pub mod journal;
 pub mod op;
+pub mod record;
 
 #[cfg(test)]
 mod tests;

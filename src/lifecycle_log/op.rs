@@ -8,10 +8,7 @@
 //! # Wire format
 //!
 //! Each record body starts with one tag byte; the rest is op-specific.
-//! Tags live in their own namespace from `wal::op`'s — both modules
-//! frame records with [`crate::wal::record`] but the bodies are
-//! independent codecs, so there's no risk of a stale WAL segment
-//! decoding here.
+//! Records are framed with [`super::record`].
 //!
 //! Numeric encoding is little-endian (matches manifest convention).
 //! Variable-length lists are prefixed by a `u32` count.
@@ -35,10 +32,7 @@ const _: fn() = || {
     let _: VolumeOrdinal = 0;
 };
 
-/// Tag byte that prefixes each lifecycle record body. Distinct values
-/// from [`crate::wal::op::TAG_*`] are not required (different framing
-/// namespaces), but using the same numeric tags for the same operations
-/// keeps decoding intuitive when debugging.
+/// Tag byte that prefixes each lifecycle record body.
 pub const TAG_TAKE_SNAPSHOT: u8 = 0x01;
 pub const TAG_DROP_SNAPSHOT: u8 = 0x30;
 pub const TAG_CREATE_VOLUME: u8 = 0x40;
@@ -53,13 +47,9 @@ pub const TAG_DISCARD: u8 = 0x50;
 /// Bumped on incompatible body changes the same way the WAL does it.
 pub const LIFECYCLE_BODY_SCHEMA_VERSION: u8 = 0xC0;
 
-/// All op variants the lifecycle journal carries. Shape mirrors the
-/// matching `crate::wal::op::WalOp` variants where one exists, plus
-/// `TakeSnapshot` (manifest-only today; journalled here once the
-/// metadb WAL is gone so the manifest commit no longer doubles as a
-/// "this snapshot exists" durable record) and `Discard` (today a
-/// `L2pRangeDelete` WalOp; here so range-deletes don't have to round
-/// trip through the buffer).
+/// All op variants the lifecycle journal carries. Each variant
+/// captures everything `apply` needs to redo the op idempotently —
+/// frozen plan lists, page generations, etc.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LifecycleOp {
     /// Pre-allocate snapshot id `id` for volume `vol_ord`. The
@@ -72,8 +62,7 @@ pub enum LifecycleOp {
     },
     /// Decref every page in `pages` (already frozen at plan time) and
     /// retire the snapshot entry. Replay-idempotent via the
-    /// `page.generation >= lsn` check in `apply_op` (same protocol as
-    /// the legacy `WalOp::DropSnapshot`).
+    /// `page.generation >= lsn` check in `apply_op`.
     DropSnapshot {
         id: SnapshotId,
         pages: Vec<PageId>,
@@ -117,8 +106,7 @@ pub enum LifecycleOp {
     /// `promotion_cursor` on `vol_ord`. Idempotent.
     PromotionComplete { vol_ord: VolumeOrdinal },
     /// User-side TRIM / range-delete over `[start_lba, start_lba + count)`.
-    /// Apply runs the same code path as the legacy `WalOp::L2pRangeDelete`
-    /// (clear the range, decref freed PBAs) but the captured per-LBA
+    /// Apply clears the range and decrefs freed PBAs; the captured per-LBA
     /// list is rebuilt from the current L2P at apply time — replay
     /// after crash is naturally idempotent because the same LBAs are
     /// already empty.

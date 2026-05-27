@@ -240,12 +240,12 @@ impl Db {
         Ok(out)
     }
 
-    /// Drop a snapshot. The drop is logged as `WalOp::DropSnapshot` so
-    /// the page-refcount work (decref every page the snapshot shares
+    /// Drop a snapshot. The drop is logged as `LifecycleOp::DropSnapshot`
+    /// so the page-refcount work (decref every page the snapshot shares
     /// with the current tree, free any page that hits rc=0) and the
     /// in-memory manifest update are atomic against process crash:
-    /// after the WAL fsync, recovery replays the op and re-drives the
-    /// work to completion.
+    /// after the lifecycle-journal fsync, recovery replays the op and
+    /// re-drives the work to completion.
     ///
     /// Serialisation:
     /// - `drop_gate.write()` — excludes every `commit_ops` path. The
@@ -505,17 +505,12 @@ impl Db {
         // Under drop_gate.write, no concurrent submits have been
         // accepted (they'd be waiting on drop_gate.read), so our
         // submission gets the next LSN in sequence.
-        let op = WalOp::DropSnapshot {
-            id,
-            pages: pages.clone(),
-            pba_decrefs: pba_decrefs.clone(),
-        };
         let lifecycle_op = crate::lifecycle_log::LifecycleOp::DropSnapshot {
             id,
             pages: pages.clone(),
             pba_decrefs: pba_decrefs.clone(),
         };
-        let lsn = self.submit_lifecycle_op(&op, &lifecycle_op)?;
+        let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
@@ -526,17 +521,12 @@ impl Db {
         // was in flight at the moment we took the gate.
         self.wait_for_global_apply_turn(lsn)?;
 
-        let volumes_map = self.volumes.read().clone();
-        let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
-        let outcome = apply_op_bare(
-            &volumes_map,
-            &self.refcount_shards,
-            &self.dedup_index,
+        let outcome = apply_drop_snapshot_pages_and_decrefs(
             &self.page_store,
+            &self.refcount_shards,
             lsn,
-            self.txg.open_txg(),
-            &op,
-            &snap_lookup,
+            &pages,
+            &pba_decrefs,
         )?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;

@@ -289,9 +289,9 @@ fn run_l2p_checkpoint_install_step(
 
 impl Db {
     /// [[no-refcount-hot-path-design]] Phase 4 Step 7. Subscribe to
-    /// `WalOp::FreePbas` apply outcomes produced by metadb's internal
+    /// `commit_free_pbas` apply outcomes produced by metadb's internal
     /// lineage-GC commit path. The sink is invoked exactly once per
-    /// successful internal `commit_ops(&[WalOp::FreePbas {..}])` with
+    /// successful internal `commit_free_pbas(vol_ord, ..)` call with
     /// the volume ordinal of the GC cycle and the non-empty
     /// `ApplyOutcome::FreePbas.freed_pbas` vector (PBAs whose rc
     /// transitioned to 0 plus exclusive PBAs that arrived at rc=0).

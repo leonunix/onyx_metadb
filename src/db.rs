@@ -37,7 +37,7 @@ use crate::testing::faults::{FaultController, FaultPoint};
 use crate::tx::{ApplyOutcome, Transaction};
 use crate::types::{FIRST_DATA_PAGE, Lba, Lsn, PageId, Pba, SnapshotId, VolumeOrdinal};
 use crate::verify;
-use crate::wal::{WalOp, WalSet, try_encode_body};
+use crate::op::WalOp;
 
 /// Ordinal of the always-present bootstrap volume. Phase B commit 5 keeps the
 /// surface API single-volume, so every L2P routing decision lands here. Later
@@ -99,9 +99,14 @@ pub struct Db {
     /// background flush jobs once the active LSM crosses its
     /// threshold.
     dedup_maintenance_queued: Box<[Arc<AtomicBool>]>,
-    /// Write-ahead log. All mutations route through here so they survive
-    /// crash between checkpoints.
-    wal: WalSet,
+    /// LSN allocator. Buffer-as-sole-journal Phase D.5b retired the WAL
+    /// writer; data-plane durability rides on onyx's LV2 buffer, lifecycle
+    /// records ride on [`crate::lifecycle_log`]. The allocator just bumps
+    /// a monotonic counter under a mutex while the caller registers its
+    /// dispatch footprint in the same critical section, preserving the
+    /// "every lower LSN's footprint is known before a higher LSN can be
+    /// assigned" invariant the dispatch scheduler relies on.
+    lsn_alloc: LsnAllocator,
     /// Highest unlogged LSN applied in memory but not yet covered by a
     /// durable checkpoint. This is only for embedder fast paths whose
     /// recovery source is an upper-layer durable log.
@@ -278,7 +283,7 @@ pub struct Db {
     /// pick up the same value without re-reading the full config.
     lineage_gc_emit_freepbas: bool,
     /// [[no-refcount-hot-path-design]] Phase 4 Step 7. Optional sink
-    /// invoked when a `WalOp::FreePbas` apply produces a non-empty
+    /// invoked when a `commit_free_pbas` apply produces a non-empty
     /// `ApplyOutcome::FreePbas.freed_pbas`. Onyx registers a sink at
     /// startup so the engine-side cleanup (`SpaceAllocator::retire_*`
     /// + dedup candidate cache invalidation) can drain reclamation
@@ -366,7 +371,7 @@ pub struct Db {
 }
 
 /// Synchronous callback invoked with the freed-PBA set produced by a
-/// `WalOp::FreePbas` apply. Used by onyx to receive lineage-GC retire
+/// `commit_free_pbas` apply. Used by onyx to receive lineage-GC retire
 /// signals; see [`Db::set_freed_pbas_sink`]. The vector is owned and
 /// can be drained by the sink without copy.
 pub type FreedPbasSink = Arc<dyn Fn(VolumeOrdinal, Vec<Pba>) + Send + Sync>;
@@ -377,7 +382,7 @@ struct ManifestState {
 }
 
 #[derive(Clone, Debug)]
-struct DispatchFootprint {
+pub(crate) struct DispatchFootprint {
     global: bool,
     lanes: BTreeSet<DispatchLaneKey>,
 }
@@ -394,6 +399,39 @@ enum DispatchLaneKey {
 #[derive(Default)]
 struct DispatchState {
     pending: BTreeMap<Lsn, DispatchEntry>,
+}
+
+/// Monotonic LSN allocator. Replaces the WAL set's `reserve_unlogged`
+/// path after [[buffer-as-sole-journal-d-progress]] Phase D.5b retired
+/// the WAL writer. Allocation runs under a short mutex so the caller's
+/// `reserve` callback (which registers the commit's dispatch footprint)
+/// completes before any higher LSN is handed out — the dispatch
+/// scheduler relies on every lower-LSN footprint being visible before a
+/// higher LSN can race ahead.
+pub(crate) struct LsnAllocator {
+    next_lsn: Mutex<Lsn>,
+}
+
+impl LsnAllocator {
+    pub(crate) fn new(start_lsn: Lsn) -> Self {
+        Self {
+            next_lsn: Mutex::new(start_lsn),
+        }
+    }
+
+    /// Reserve the next LSN. The `reserve` callback runs while the
+    /// allocator mutex is still held, so a higher LSN cannot be assigned
+    /// until the callback returns.
+    pub(crate) fn reserve<F>(&self, reserve: F) -> Result<Lsn>
+    where
+        F: FnOnce(Lsn),
+    {
+        let mut g = self.next_lsn.lock();
+        let lsn = *g;
+        *g = g.checked_add(1).ok_or(MetaDbError::OutOfSpace)?;
+        reserve(lsn);
+        Ok(lsn)
+    }
 }
 
 struct DispatchEntry {
@@ -1264,6 +1302,28 @@ impl Db {
     pub fn txg_checkpoint_for_test(&self) -> u64 {
         self.txg.checkpoint_txg()
     }
+
+    /// Test helper: directly commit a `PromotionChunk` lifecycle record
+    /// with caller-supplied PBAs and cursor. Production code drives
+    /// this path through [`Db::run_promotion_chunk`], which derives
+    /// both from the clone's L2P; this shim lets integration tests pin
+    /// specific PBAs / cursors (e.g. simulating a crash mid-walk)
+    /// without requiring MAX_PROMOTION_CHUNK_PBAS-many real L2P
+    /// entries.
+    pub fn test_commit_promotion_chunk(
+        &self,
+        vol_ord: VolumeOrdinal,
+        pba_increfs: Vec<Pba>,
+        next_cursor: Option<Lba>,
+    ) -> Result<()> {
+        self.commit_promotion_chunk(vol_ord, pba_increfs, next_cursor)
+    }
+
+    /// Test helper: directly commit a `PromotionComplete` lifecycle
+    /// record. See [`Db::test_commit_promotion_chunk`] for rationale.
+    pub fn test_commit_promotion_complete(&self, vol_ord: VolumeOrdinal) -> Result<()> {
+        self.commit_promotion_complete(vol_ord)
+    }
 }
 
 #[cfg(test)]
@@ -1344,7 +1404,7 @@ impl Db {
     ///
     /// When the flag is `true` ([[no-refcount-hot-path-design]] Phase 4
     /// Step 4 / Phase 5 default), each volume's plan + execute is
-    /// interleaved with a `WalOp::FreePbas` commit carrying the
+    /// interleaved with a `commit_free_pbas` call carrying the
     /// segment's dead-record PBAs. Phase 4 hot path still maintains
     /// rc, so `apply_free_pbas` sees rc=0 for every PBA we surface
     /// (the plan's rc==0 gate guarantees this) and takes the
@@ -1375,11 +1435,11 @@ impl Db {
             return async_reclaim::test_run_lineage_gc_cycle(&self.page_store, &ctx);
         }
 
-        // Flag ON: per-volume plan → FreePbas commit → execute. We
-        // can't fold FreePbas into a single WAL record across
-        // volumes because `WalOp::FreePbas { vol_ord, … }` is
-        // per-volume; multi-vol cycles emit one record per advancing
-        // volume, identical to how Phase 5 will work.
+        // Flag ON: per-volume plan → commit_free_pbas → execute. We
+        // can't fold FreePbas across volumes because the apply path
+        // is keyed on `vol_ord`; multi-vol cycles emit one
+        // `commit_free_pbas` per advancing volume, identical to how
+        // Phase 5 will work.
         let vol_handles: Vec<(crate::types::VolumeOrdinal, Arc<Volume>)> = {
             let guard = self.volumes.read();
             guard.iter().map(|(k, v)| (*k, v.clone())).collect()
@@ -1416,9 +1476,8 @@ impl Db {
                 // already 0 → exclusive branch) and onyx retire
                 // dedups via set semantics.
                 let pbas = plan.dead_pbas.clone().into_boxed_slice();
-                let (_lsn, outcomes) =
-                    self.commit_ops(&[WalOp::FreePbas { vol_ord, pbas }])?;
-                self.dispatch_freed_pbas_outcomes(vol_ord, outcomes);
+                let outcome = self.commit_free_pbas(vol_ord, &pbas)?;
+                self.dispatch_freed_pbas_outcomes(vol_ord, vec![outcome]);
             }
             if let Err(err) =
                 async_reclaim::gc_execute_head_advance(&self.page_store, &ctx, &vol, vol_ord, &plan)

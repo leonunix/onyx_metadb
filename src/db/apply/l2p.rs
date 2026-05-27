@@ -312,7 +312,7 @@ pub(in crate::db) fn scan_l2p_range(
     Ok(acc)
 }
 
-/// Apply one [`WalOp::L2pRangeDelete`]. Walks the `captured` list,
+/// Apply one [`LifecycleOp::Discard`]. Walks the `captured` list,
 /// deleting each lba from its volume's L2P shard and emitting a
 /// decref against `old_pba` — modulo birth/death LSN suppression: if
 /// `min_alive_snap_lsn` is `Some(snap_lsn)` and `pba.birth_lsn <=

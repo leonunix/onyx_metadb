@@ -184,7 +184,7 @@ struct CommitApplyContext<'a> {
     txg: crate::types::Txg,
 }
 
-struct ActiveApplyGuard<'a> {
+pub(super) struct ActiveApplyGuard<'a> {
     db: &'a Db,
     lsn: Lsn,
 }
@@ -229,56 +229,6 @@ impl DispatchFootprint {
     }
 }
 
-fn wal_lane_key(op: &WalOp) -> u64 {
-    match op {
-        WalOp::L2pPut { vol_ord, lba, .. }
-        | WalOp::L2pDelete { vol_ord, lba }
-        | WalOp::L2pRemap { vol_ord, lba, .. } => {
-            let mut bytes = [0u8; 10];
-            bytes[..2].copy_from_slice(&vol_ord.to_be_bytes());
-            bytes[2..].copy_from_slice(&lba.to_be_bytes());
-            xxh3_64(&bytes)
-        }
-        WalOp::L2pRangeDelete { vol_ord, start, .. } => {
-            let mut bytes = [0u8; 10];
-            bytes[..2].copy_from_slice(&vol_ord.to_be_bytes());
-            bytes[2..].copy_from_slice(&start.to_be_bytes());
-            xxh3_64(&bytes)
-        }
-        WalOp::L2pRemapRange {
-            vol_ord, start_lba, ..
-        } => {
-            let mut bytes = [0u8; 10];
-            bytes[..2].copy_from_slice(&vol_ord.to_be_bytes());
-            bytes[2..].copy_from_slice(&start_lba.to_be_bytes());
-            xxh3_64(&bytes)
-        }
-        WalOp::DedupPut { hash, .. }
-        | WalOp::DedupPutGuarded { hash, .. }
-        | WalOp::DedupDelete { hash, .. }
-        | WalOp::DedupCompareDelete { hash, .. }
-        | WalOp::DedupComparePut { hash, .. } => xxh3_64(hash),
-        WalOp::DropSnapshot { id, .. } => xxh3_64(&id.to_be_bytes()),
-        WalOp::CreateVolume { ord, .. } | WalOp::DropVolume { ord, .. } => {
-            xxh3_64(&ord.to_be_bytes())
-        }
-        WalOp::CloneVolume { new_ord, .. } => xxh3_64(&new_ord.to_be_bytes()),
-        // FreePbas applies global-shape changes to the refcount table
-        // and isn't routable on a single lane; the caller forces it into
-        // the global lane via [`OpFootprint::global = true`] (see
-        // `op_footprint`).
-        WalOp::FreePbas { vol_ord, .. } => xxh3_64(&vol_ord.to_be_bytes()),
-        // PromotionChunk / PromotionComplete are global-footprint
-        // lifecycle ops (same reason as FreePbas: they mutate the
-        // refcount table + the in-memory manifest's lineage edges).
-        // The lane key is used only to pick a WAL writer lane; we hash
-        // by vol_ord so different volumes' walker commits can fan out.
-        WalOp::PromotionChunk { vol_ord, .. } | WalOp::PromotionComplete { vol_ord } => {
-            xxh3_64(&vol_ord.to_be_bytes())
-        }
-    }
-}
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn thread_cpu_time() -> Option<std::time::Duration> {
     let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
@@ -313,34 +263,6 @@ fn dispatch_ready(state: &DispatchState, lsn: Lsn) -> bool {
             .all(|(_, lower)| !entry.footprint.conflicts(&lower.footprint))
 }
 
-/// Phase C.3: convert a single-op `commit_ops` batch into its
-/// [`crate::lifecycle_log::LifecycleOp`] equivalent if and only if the
-/// batch is one of the promotion records carried by
-/// [`crate::db::promotion::Db::run_promotion_chunk`]. Any other shape
-/// (multi-op batch, data-plane op, lifecycle WalOp without a matching
-/// lifecycle variant such as `FreePbas` / `L2pRangeDelete`) returns
-/// `None`, letting the caller fall back to plain `reserve_unlogged`.
-fn ops_as_promotion_lifecycle(ops: &[WalOp]) -> Option<crate::lifecycle_log::LifecycleOp> {
-    if ops.len() != 1 {
-        return None;
-    }
-    match &ops[0] {
-        WalOp::PromotionChunk {
-            vol_ord,
-            pba_increfs,
-            next_cursor,
-        } => Some(crate::lifecycle_log::LifecycleOp::PromotionChunk {
-            vol_ord: *vol_ord,
-            pba_increfs: pba_increfs.to_vec(),
-            next_cursor: *next_cursor,
-        }),
-        WalOp::PromotionComplete { vol_ord } => {
-            Some(crate::lifecycle_log::LifecycleOp::PromotionComplete { vol_ord: *vol_ord })
-        }
-        _ => None,
-    }
-}
-
 impl Db {
     // -------- transaction / commit --------------------------------------
 
@@ -354,7 +276,7 @@ impl Db {
         *self.last_applied_lsn.lock()
     }
 
-    fn enter_active_apply(&self, lsn: Lsn) -> ActiveApplyGuard<'_> {
+    pub(super) fn enter_active_apply(&self, lsn: Lsn) -> ActiveApplyGuard<'_> {
         self.active_apply_lsns.lock().insert(lsn);
         ActiveApplyGuard { db: self, lsn }
     }
@@ -367,7 +289,7 @@ impl Db {
             .is_some_and(|active| *active > lsn)
     }
 
-    fn acquire_commit_apply_gate(&self, lsn: Lsn) -> crate::apply_gate::ReadGuard<'_> {
+    pub(super) fn acquire_commit_apply_gate(&self, lsn: Lsn) -> crate::apply_gate::ReadGuard<'_> {
         const RECHECK: std::time::Duration = std::time::Duration::from_micros(100);
 
         let started = std::time::Instant::now();
@@ -413,22 +335,6 @@ impl Db {
     /// for global LSN order again after its lanes finish, right before it
     /// advances the contiguous `last_applied_lsn`.
     pub(crate) fn commit_ops(&self, ops: &[WalOp]) -> Result<(Lsn, Vec<ApplyOutcome>)> {
-        self.commit_ops_with_options(ops, crate::wal::set::SubmitOptions::default())
-    }
-
-    /// ZFS-TXG-clone Phase 3 entry point. Same body as [`commit_ops`]
-    /// but threads `SubmitOptions` into the WAL submit. Used by
-    /// [`commit_ops_deferred`] to flip to `synchronous=false` when
-    /// both `commit_deferred_outcomes_enabled` and
-    /// `wal_async_commits_enabled` are on — the WAL writer thread
-    /// then acks after `seg.append` and skips the per-batch fsync.
-    /// Durability is restored at the next `flush_with_gate` via
-    /// `WalSet::fsync_all_lanes` before the manifest commit.
-    pub(crate) fn commit_ops_with_options(
-        &self,
-        ops: &[WalOp],
-        options: crate::wal::set::SubmitOptions,
-    ) -> Result<(Lsn, Vec<ApplyOutcome>)> {
         if ops.is_empty() {
             self.metrics.record_commit_empty();
             return Ok((self.last_applied_lsn(), Vec::new()));
@@ -527,37 +433,9 @@ impl Db {
         let _txg_guard = self.txg.enter();
         let wal_started = std::time::Instant::now();
         let lsn = {
-            let promotion_lifecycle = ops_as_promotion_lifecycle(ops);
-            let result = if let Some(lifecycle_op) = promotion_lifecycle {
-                let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
-                    MetaDbError::Corruption(
-                        "commit_ops: lifecycle journal not open".into(),
-                    )
-                });
-                match journal {
-                    Ok(journal) => {
-                        let body = crate::lifecycle_log::op::encode(&lifecycle_op);
-                        let reserve_result = self.wal.reserve_unlogged(|lsn| {
-                            self.register_dispatch_intent(lsn, dispatch_footprint);
-                        });
-                        match reserve_result {
-                            Ok(lsn) => match journal.lock().append(&body) {
-                                Ok(seq) => {
-                                    self.set_lifecycle_applied_watermark(seq);
-                                    Ok(lsn)
-                                }
-                                Err(err) => Err(err),
-                            },
-                            Err(err) => Err(err),
-                        }
-                    }
-                    Err(err) => Err(err),
-                }
-            } else {
-                self.wal.reserve_unlogged(|lsn| {
-                    self.register_dispatch_intent(lsn, dispatch_footprint);
-                })
-            };
+            let result = self.lsn_alloc.reserve(|lsn| {
+                self.register_dispatch_intent(lsn, dispatch_footprint);
+            });
             timing.wal_submit = wal_started.elapsed();
             self.metrics.record_commit_wal_submit(timing.wal_submit);
             match result {
@@ -638,25 +516,12 @@ impl Db {
         // ZFS-TXG-clone Phase 3: route through the WAL with
         // `synchronous=false` IFF both Phase 2 and Phase 3 flags are
         // enabled. Async WAL on the inline outcome path is an untested
-        // combination — `commit_deferred_outcomes_enabled = false`
-        // forces sync so the deferred-outcome handle code below is
-        // exercised in the legacy latency profile during the soak
-        // window. The on-disk state observed by readers is identical
-        // across the four combinations; only WAL fsync timing shifts.
-        let submit_options = if self.commit_deferred_outcomes_enabled
-            && self.wal_async_commits_enabled
-        {
-            crate::wal::set::SubmitOptions::async_()
-        } else {
-            crate::wal::set::SubmitOptions::default()
-        };
-        // Run the commit path. This executes WAL submit (sync or
-        // async per `submit_options`) + dispatch + apply (including
-        // L2pBuffer insert) and returns a fully-populated
-        // `Vec<ApplyOutcome>`. The L2pBuffer is updated before this
-        // returns, so readers can already observe the new mappings;
-        // the only thing the async branch defers is WAL fsync.
-        let (lsn, outcomes) = self.commit_ops_with_options(ops, submit_options)?;
+        // Buffer-as-sole-journal Phase D.5b retired the WAL writer, so
+        // there is no sync/async fsync choice to thread through any
+        // more — every commit runs the same path. The `wal_async_*`
+        // flag is preserved on `Config` as dead-but-accepted so older
+        // call sites don't break.
+        let (lsn, outcomes) = self.commit_ops(ops)?;
 
         // Choose delivery mode based on the live config flag.
         let handle = if self.commit_deferred_outcomes_enabled {
@@ -752,7 +617,7 @@ impl Db {
         // the LSN-monotonicity invariant across the unlogged path.
         let _txg_guard = self.txg.enter();
         let dispatch_started = std::time::Instant::now();
-        let lsn = match self.wal.reserve_unlogged(|lsn| {
+        let lsn = match self.lsn_alloc.reserve(|lsn| {
             self.register_dispatch_intent(lsn, dispatch_footprint);
         }) {
             Ok(lsn) => lsn,
@@ -1139,62 +1004,6 @@ impl Db {
             &snap_lookup,
         )?;
         record_per_op_apply(&self.metrics, op, op_started.elapsed());
-        // DropSnapshot also mutates the in-memory manifest's snapshot
-        // list; the page work lives in apply_op_bare so it can be
-        // shared with the replay path. Lock order (apply_gate.read →
-        // manifest_state) matches every other call site.
-        if let WalOp::DropSnapshot { id, .. } = op {
-            let dropped_vol = {
-                let mut mstate = self.manifest_state.lock();
-                let dropped = mstate
-                    .manifest
-                    .snapshots
-                    .iter()
-                    .find(|s| s.id == *id)
-                    .map(|s| s.vol_ord);
-                mstate.manifest.snapshots.retain(|s| s.id != *id);
-                dropped
-            };
-            if let Some(vol) = dropped_vol {
-                self.recompute_snap_info(vol);
-            }
-        }
-        // Phase 4 Step 5: mirror walker-driven manifest mutations into
-        // `manifest_state` so the next checkpoint persists them. The
-        // bare layer already advanced `Volume::promotion_cursor` /
-        // cleared `parent_vol_ord`; here we propagate the same change
-        // into the in-memory manifest. Lock order: apply_gate.read →
-        // manifest_state (same as DropSnapshot).
-        match op {
-            WalOp::PromotionChunk {
-                vol_ord,
-                next_cursor,
-                ..
-            } => {
-                let mut mstate = self.manifest_state.lock();
-                if let Some(entry) = mstate
-                    .manifest
-                    .volumes
-                    .iter_mut()
-                    .find(|e| e.ord == *vol_ord)
-                {
-                    entry.promotion_cursor = *next_cursor;
-                }
-            }
-            WalOp::PromotionComplete { vol_ord } => {
-                let mut mstate = self.manifest_state.lock();
-                if let Some(entry) = mstate
-                    .manifest
-                    .volumes
-                    .iter_mut()
-                    .find(|e| e.ord == *vol_ord)
-                {
-                    entry.parent_vol_ord = None;
-                    entry.promotion_cursor = None;
-                }
-            }
-            _ => {}
-        }
         Ok(outcome)
     }
 
@@ -1212,13 +1021,38 @@ impl Db {
     /// callsite does) — the watermark bump and the LSN reservation are
     /// not synchronised against concurrent lifecycle submits otherwise.
     ///
-    /// The `wal_op` parameter is retained because `apply_op_bare` (the
-    /// shared apply dispatcher) still keys off `WalOp` variants. After
-    /// the planned `WalOp → DbOp` rename it should be dropped from the
-    /// signature.
+    /// Commit a single Lineage-GC `FreePbas` op outside of `commit_ops`.
+    ///
+    /// FreePbas has no lifecycle-journal entry by design — apply is
+    /// idempotent and the walker re-emits any still-dead PBA on the
+    /// next GC cycle, so a crash before this LSN gets covered by a
+    /// manifest checkpoint is harmless. We allocate an LSN under
+    /// `lsn_alloc.reserve` (so dispatch ordering stays intact), wait
+    /// for global LSN turn, then apply on the caller thread.
+    pub(crate) fn commit_free_pbas(
+        &self,
+        vol_ord: VolumeOrdinal,
+        pbas: &[Pba],
+    ) -> Result<ApplyOutcome> {
+        let _txg_guard = self.txg.enter();
+        let _drop_guard = self.drop_gate.read();
+        let footprint = DispatchFootprint::global();
+        let lsn = self.lsn_alloc.reserve(|lsn| {
+            self.register_dispatch_intent(lsn, footprint);
+        })?;
+        _txg_guard.record_lsn(lsn);
+        self.mark_wal_durable_and_wait_for_dispatch(lsn)?;
+
+        let _apply_guard = self.acquire_commit_apply_gate(lsn);
+        let _active = self.enter_active_apply(lsn);
+        let outcome = apply_free_pbas(&self.refcount_shards, lsn, pbas)?;
+        self.finish_global_apply(lsn)?;
+        self.advance_dispatch_lsn(lsn);
+        Ok(outcome)
+    }
+
     pub(super) fn submit_lifecycle_op(
         &self,
-        _wal_op: &WalOp,
         lifecycle_op: &crate::lifecycle_log::LifecycleOp,
     ) -> Result<Lsn> {
         let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
@@ -1227,44 +1061,53 @@ impl Db {
             )
         })?;
         let body = crate::lifecycle_log::op::encode(lifecycle_op);
-        let lsn = self.wal.reserve_unlogged(|_| {})?;
+        let lsn = self.lsn_alloc.reserve(|_| {})?;
         let seq = journal.lock().append(&body)?;
         self.set_lifecycle_applied_watermark(seq);
         Ok(lsn)
     }
 
-    pub(super) fn submit_wal_ops(
+    /// Lifecycle commit variant for callers that hold only
+    /// `drop_gate.read()` (PromotionChunk / PromotionComplete) and
+    /// therefore race with concurrent `commit_ops` / `commit_free_pbas`.
+    /// Unlike `submit_lifecycle_op` (which presumes `apply_gate.write()`
+    /// upstream), this registers a Global dispatch footprint so the
+    /// scheduler serializes the rc-mutating lifecycle apply against
+    /// every other in-flight commit in LSN order. Without this, an
+    /// out-of-order apply of a lower-LSN PromotionChunk against a
+    /// higher-LSN FreePbas-stamped rc page hit the strict-`>`
+    /// replay-skip in `RcShard::stage` and silently dropped the incref
+    /// (refcount_drainer concurrent test caught this).
+    ///
+    /// On return the caller must still acquire `apply_gate.read()`,
+    /// run the apply, then call `finish_global_apply` +
+    /// `advance_dispatch_lsn` to release the dispatch entry.
+    pub(super) fn submit_lifecycle_op_with_dispatch(
         &self,
-        ops: &[WalOp],
-        body: Vec<u8>,
-        footprint: Option<DispatchFootprint>,
-        options: crate::wal::set::SubmitOptions,
+        lifecycle_op: &crate::lifecycle_log::LifecycleOp,
     ) -> Result<Lsn> {
-        let lane = self.wal_lane_for_ops(ops);
-        match footprint {
-            Some(footprint) => self.wal.submit_to_reserved_with_options(
-                lane,
-                body,
-                options,
-                |lsn| {
-                    self.register_dispatch_intent(lsn, footprint);
-                },
-            ),
-            None => self
-                .wal
-                .submit_to_reserved_with_options(lane, body, options, |_| {}),
+        let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
+            MetaDbError::Corruption(
+                "submit_lifecycle_op_with_dispatch called without an open lifecycle journal"
+                    .into(),
+            )
+        })?;
+        let body = crate::lifecycle_log::op::encode(lifecycle_op);
+        let footprint = DispatchFootprint::global();
+        let lsn = self.lsn_alloc.reserve(|lsn| {
+            self.register_dispatch_intent(lsn, footprint);
+        })?;
+        match journal.lock().append(&body) {
+            Ok(seq) => {
+                self.set_lifecycle_applied_watermark(seq);
+            }
+            Err(err) => {
+                self.forget_dispatch_intent(lsn);
+                return Err(err);
+            }
         }
-    }
-
-    fn wal_lane_for_ops(&self, ops: &[WalOp]) -> usize {
-        let lanes = self.wal.lane_count();
-        if lanes <= 1 {
-            return 0;
-        }
-        let Some(op) = ops.first() else {
-            return 0;
-        };
-        (wal_lane_key(op) as usize) % lanes
+        self.mark_wal_durable_and_wait_for_dispatch(lsn)?;
+        Ok(lsn)
     }
 
     /// Apply a commit batch under `apply_gate.read()`. Large batches
@@ -1364,7 +1207,7 @@ impl Db {
             .map(|msg| MetaDbError::Corruption(format!("commit pipeline failed: {msg}")))
     }
 
-    fn register_dispatch_intent(&self, lsn: Lsn, footprint: DispatchFootprint) {
+    pub(super) fn register_dispatch_intent(&self, lsn: Lsn, footprint: DispatchFootprint) {
         let mut state = self.dispatch_state.lock();
         let old = state.pending.insert(
             lsn,
@@ -1380,7 +1223,7 @@ impl Db {
         self.dispatch_cvar.notify_all();
     }
 
-    fn mark_wal_durable_and_wait_for_dispatch(&self, lsn: Lsn) -> Result<()> {
+    pub(super) fn mark_wal_durable_and_wait_for_dispatch(&self, lsn: Lsn) -> Result<()> {
         let mut state = self.dispatch_state.lock();
         let entry = state.pending.get_mut(&lsn).ok_or_else(|| {
             MetaDbError::Corruption(format!("missing dispatch reservation for LSN {lsn}"))
@@ -1399,7 +1242,7 @@ impl Db {
         }
     }
 
-    fn forget_dispatch_intent(&self, lsn: Lsn) {
+    pub(super) fn forget_dispatch_intent(&self, lsn: Lsn) {
         let mut state = self.dispatch_state.lock();
         state.pending.remove(&lsn);
         self.dispatch_cvar.notify_all();
@@ -1511,7 +1354,6 @@ fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Du
         WalOp::L2pPut { .. } => metrics.record_apply_l2p_put(elapsed),
         WalOp::L2pDelete { .. } => metrics.record_apply_l2p_delete(elapsed),
         WalOp::L2pRemap { .. } => metrics.record_apply_l2p_remap(elapsed),
-        WalOp::L2pRangeDelete { .. } => metrics.record_apply_l2p_range_delete(elapsed),
         WalOp::L2pRemapRange { values, .. } => {
             metrics.record_apply_l2p_remap_range(values.len() as u64, elapsed)
         }
@@ -1520,13 +1362,6 @@ fn record_per_op_apply(metrics: &MetaMetrics, op: &WalOp, elapsed: std::time::Du
         | WalOp::DedupDelete { .. }
         | WalOp::DedupCompareDelete { .. }
         | WalOp::DedupComparePut { .. } => metrics.record_apply_dedup(elapsed),
-        WalOp::DropSnapshot { .. }
-        | WalOp::CreateVolume { .. }
-        | WalOp::DropVolume { .. }
-        | WalOp::CloneVolume { .. }
-        | WalOp::FreePbas { .. }
-        | WalOp::PromotionChunk { .. }
-        | WalOp::PromotionComplete { .. } => {}
     }
 }
 

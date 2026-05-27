@@ -87,9 +87,8 @@ impl Db {
             (ord, shard_count)
         };
 
-        let wal_op = WalOp::CreateVolume { ord, shard_count };
         let lifecycle_op = crate::lifecycle_log::LifecycleOp::CreateVolume { ord, shard_count };
-        let lsn = self.submit_lifecycle_op(&wal_op, &lifecycle_op)?;
+        let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
@@ -232,7 +231,7 @@ impl Db {
             // the descendant to COW from. Reject and let the caller
             // either promote the descendants to independence first or
             // drop them. `parent_vol_ord` is cleared by
-            // `WalOp::PromotionComplete`, so this naturally accepts
+            // `LifecycleOp::PromotionComplete`, so this naturally accepts
             // post-promotion descendants.
             if let Some(child) = mstate
                 .manifest
@@ -339,15 +338,11 @@ impl Db {
         self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
         drop(l2p_guards);
 
-        let wal_op = WalOp::DropVolume {
-            ord: vol_ord,
-            pages: pages.clone(),
-        };
         let lifecycle_op = crate::lifecycle_log::LifecycleOp::DropVolume {
             ord: vol_ord,
             pages: pages.clone(),
         };
-        let lsn = self.submit_lifecycle_op(&wal_op, &lifecycle_op)?;
+        let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
         // Fault window specific to drop_volume: WAL record durable, no
@@ -501,19 +496,13 @@ impl Db {
             )
         };
 
-        let wal_op = WalOp::CloneVolume {
-            src_ord,
-            new_ord,
-            src_snap_id,
-            src_shard_roots: src_shard_roots.clone(),
-        };
         let lifecycle_op = crate::lifecycle_log::LifecycleOp::CloneVolume {
             src_ord,
             new_ord,
             src_snap_id,
             src_shard_roots: src_shard_roots.clone(),
         };
-        let lsn = self.submit_lifecycle_op(&wal_op, &lifecycle_op)?;
+        let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 

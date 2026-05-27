@@ -1014,38 +1014,11 @@ impl Db {
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
-        // ZFS-TXG-clone Phase 3 TXG-sync barrier. When async WAL
-        // submits are enabled, prior `commit_ops_deferred` calls have
-        // body bytes sitting in OS page cache but no fsync yet. The
-        // manifest about to be committed records
-        // `checkpoint_lsn = new_checkpoint_lsn`; recovery on the next
-        // open will assume every LSN ≤ checkpoint_lsn is durable.
-        // We must therefore force-fsync every lane BEFORE the manifest
-        // commit fsyncs the new checkpoint_lsn — otherwise a power
-        // failure between this fsync and the manifest commit would
-        // leave the manifest pointing at LSNs whose WAL bodies were
-        // lost.
-        //
-        // Phase 4 gate-shrink note: the fsync runs under the narrow
-        // `apply_gate.write()` window acquired just above, so no
-        // commit at `LSN > wal_checkpoint` can land between the fsync
-        // and the manifest commit. Without that barrier, an apply
-        // that completed (bumping `last_applied_lsn`) but whose WAL
-        // body is still in OS page cache could be silently dropped
-        // by a crash that happens after the manifest commit publishes
-        // a `checkpoint_lsn` strictly less than that apply's LSN.
-        if let Err(err) = self.wal.fsync_all_lanes() {
-            self.metrics
-                .record_flush_manifest(manifest_started.elapsed());
-            self.metrics
-                .record_flush_total(kind, flush_started.elapsed());
-            drop(manifest_state);
-            drop(apply_guard);
-            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
-            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
-            return Err(err);
-        }
+        // Buffer-as-sole-journal Phase D.5b retired the WAL TXG-sync
+        // barrier: there is no WAL page cache to flush. The lifecycle
+        // journal already fsyncs each record at append time, and
+        // data-plane durability rides on onyx's LV2 buffer (which
+        // restarts replay from its own state on crash).
         if let Err(err) = self.faults.inject(FaultPoint::TxgSyncMidway) {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
@@ -1273,16 +1246,9 @@ impl Db {
             // can fire the next flush as soon as WAL prune
             // returns.
             self.notify_async_reclaim();
-            // WAL prune is fast (file removal) and depends on
-            // `wal_checkpoint`, which this flush just made
-            // durable via the manifest commit. Keep it inline so
-            // recovery's replay-from-`checkpoint_lsn` doesn't
-            // chase stale segments.
-            crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
         } else {
             let reclaim_budget = flush_reclaim_budget(deferred_before, total_pages_written);
             let reclaim_outcome = self.reclaim_freed_pages_budget(reclaim_budget)?;
-            crate::wal::set::prune_all_segments(&wal_dir(&self.db_path), wal_checkpoint)?;
             let deferred_after = self.page_store.deferred_free_len();
             let blocked = reclaim_budget
                 .min(deferred_before)

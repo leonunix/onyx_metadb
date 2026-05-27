@@ -422,8 +422,8 @@ pub struct Config {
     /// hits this on truly idle systems.
     pub async_reclaim_idle_interval_ms: u64,
     /// [[no-refcount-hot-path-design]] Phase 4 Step 4: when true, the
-    /// Lineage GC pass emits a [`crate::wal::WalOp::FreePbas`] WAL
-    /// record for every dead-list record it retires (decref each
+    /// Lineage GC pass emits a `FreePbas` lifecycle/dispatch record
+    /// for every dead-list record it retires (decref each
     /// shared PBA via the global rc, surface exclusive PBAs
     /// directly) before truncating the chain. When false (the
     /// default), GC behaves exactly as in Phase 3 — chain

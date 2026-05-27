@@ -363,7 +363,7 @@ impl Db {
     /// plan-apply path mirrors [`drop_snapshot`](Self::drop_snapshot):
     /// take `drop_gate.write()` + `apply_gate.write()`, scan the range
     /// to build the `(lba, head_pba(value))` `captured` list, submit a
-    /// `WalOp::L2pRangeDelete` (auto-split when the scan exceeds
+    /// `LifecycleOp::Discard` (auto-split when the scan exceeds
     /// [`MAX_RANGE_DELETE_CAPTURED`]), and apply inline under the held
     /// apply gate. Each apply emits one decref per captured entry
     /// under SPEC §4.4 leaf-rc-suppress.
@@ -575,7 +575,7 @@ impl Db {
                 count,
             };
             let body = crate::lifecycle_log::op::encode(&lifecycle_op);
-            let submit_result = self.wal.reserve_unlogged(|_| {}).and_then(|reserved_lsn| {
+            let submit_result = self.lsn_alloc.reserve(|_| {}).and_then(|reserved_lsn| {
                 journal.lock().append(&body).map(|seq| {
                     self.set_lifecycle_applied_watermark(seq);
                     reserved_lsn

@@ -23,7 +23,7 @@
 //! LSN-ordered condvar queue described above so WAL group commit can
 //! actually form batches.
 //!
-//! [`WalOp`]: crate::wal::WalOp
+//! [`WalOp`]: crate::op::WalOp
 
 use std::collections::HashMap;
 
@@ -31,7 +31,7 @@ use crate::dedup_types::{DedupValue, Hash8};
 use crate::error::Result;
 use crate::paged::L2pValue;
 use crate::types::{Lba, Lsn, Pba, VolumeOrdinal};
-use crate::wal::WalOp;
+use crate::op::WalOp;
 
 /// Per-op outcome returned from the apply phase. Auto-commit wrappers
 /// around `Transaction` use these to surface pre-images through the
@@ -40,9 +40,9 @@ use crate::wal::WalOp;
 /// Phase A reserves variants for the onyx-adapter ops that land in
 /// sessions S2–S4 of [`docs/ONYX_INTEGRATION_PLAN.md`]:
 /// * [`ApplyOutcome::L2pRemap`] — landed in S2 (`WalOp::L2pRemap`).
-/// * [`ApplyOutcome::RangeDelete`] — landed in S3 (`WalOp::L2pRangeDelete`).
+/// * [`ApplyOutcome::RangeDelete`] — landed in S3 (lifecycle `Discard`).
 /// * The `freed_pbas` field on [`ApplyOutcome::DropSnapshot`] —
-///   populated by S4 when `WalOp::DropSnapshot.pba_decrefs` is added.
+///   populated by S4 when `LifecycleOp::DropSnapshot.pba_decrefs` is added.
 ///
 /// S1 declares the shape so apply-path plumbing is stable for the
 /// follow-up sessions; each session fills in its own producer.
@@ -99,7 +99,7 @@ pub enum ApplyOutcome {
         prev: Option<L2pValue>,
         freed_pba: Option<Pba>,
     },
-    /// Outcome of `WalOp::L2pRangeDelete` — bulk delete across `[start,
+    /// Outcome of the lifecycle `Discard` op — bulk delete across `[start,
     /// end)` for one volume, with per-(lba, pba) decrefs applied under
     /// the leaf-rc-suppress rule. Reserved in S1; populated in S3.
     ///
@@ -127,7 +127,7 @@ pub enum ApplyOutcome {
         prevs: Box<[Option<L2pValue>]>,
         freed_pbas: Vec<Pba>,
     },
-    /// Outcome of [`WalOp::FreePbas`] — [[no-refcount-hot-path-design]]
+    /// Outcome of [`Db::commit_free_pbas`] — [[no-refcount-hot-path-design]]
     /// Phase 4 Step 3 retire-surface for the Lineage GC consumer.
     /// `freed_pbas` is the union of:
     ///
@@ -143,7 +143,7 @@ pub enum ApplyOutcome {
     /// surfaces (across replays or across cycles) are harmless because
     /// retire is a set operation.
     FreePbas { freed_pbas: Box<[Pba]> },
-    /// Outcome of [`WalOp::PromotionChunk`] —
+    /// Outcome of [`LifecycleOp::PromotionChunk`] —
     /// [[no-refcount-hot-path-design]] Phase 4 Step 5 background
     /// promotion walker progress record. The walker incref'd
     /// `increfs_applied` PBAs against the global refcount table and
@@ -157,7 +157,7 @@ pub enum ApplyOutcome {
         increfs_applied: usize,
         cursor_advanced_to: Option<crate::types::Lba>,
     },
-    /// Outcome of [`WalOp::PromotionComplete`] —
+    /// Outcome of [`LifecycleOp::PromotionComplete`] —
     /// [[no-refcount-hot-path-design]] Phase 4 Step 5 walker finish
     /// record. Apply cleared the volume's `parent_vol_ord` and
     /// `promotion_cursor`. No data is carried; the outcome slot exists
@@ -257,7 +257,7 @@ impl<'db> Transaction<'db> {
     /// path's existing leaf-run batching does the actual tree work
     /// (one descend + CoW cascade per `leaf_idx = lba >> 7`).
     ///
-    /// `values.len() ≤ crate::wal::op::MAX_REMAP_RANGE_LBAS`. The Box
+    /// `values.len() ≤ crate::op::MAX_REMAP_RANGE_LBAS`. The Box
     /// is moved into the op; callers building from a `Vec` should call
     /// `.into_boxed_slice()` once and forward.
     pub fn l2p_remap_range(
@@ -341,62 +341,7 @@ impl<'db> Transaction<'db> {
         self
     }
 
-    /// [[no-refcount-hot-path-design]] Lineage GC emitter. Buffers a
-    /// [`WalOp::FreePbas`] that asks apply to classify each pba as
-    /// shared (rc>0, decref by 1, surface if it reaches 0) or
-    /// exclusive (rc=0, surface without touching rc) and report the
-    /// retire set in [`ApplyOutcome::FreePbas.freed_pbas`]. Apply is
-    /// idempotent: re-running the same op surfaces the same PBAs (or
-    /// a superset thereof) and onyx-side retire dedups via set
-    /// semantics.
-    ///
-    /// `pbas` may be empty — the op then commits as a no-op but the
-    /// outcome slot is still present (`ApplyOutcome::FreePbas { freed_pbas: [] }`),
-    /// preserving the index correspondence callers rely on.
-    pub fn free_pbas(&mut self, vol_ord: VolumeOrdinal, pbas: Box<[Pba]>) -> &mut Self {
-        self.ops.push(WalOp::FreePbas { vol_ord, pbas });
-        self
-    }
-
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 background
-    /// promotion walker emitter. Buffers a [`WalOp::PromotionChunk`]
-    /// that records one chunk of incref work against the global
-    /// refcount table and advances the volume's `promotion_cursor` to
-    /// `next_cursor`.
-    ///
-    /// `next_cursor = Some(lba)` means "resume from `lba` on the next
-    /// chunk"; `None` means "this was the walker's last chunk — the
-    /// follow-up [`WalOp::PromotionComplete`] will clear the lineage
-    /// edge".
-    ///
-    /// `pba_increfs` may be empty — the chunk then carries only the
-    /// cursor advance (a sparse leaf scan that yielded no shared
-    /// extents). The outcome slot is still present.
-    pub fn promotion_chunk(
-        &mut self,
-        vol_ord: VolumeOrdinal,
-        pba_increfs: Box<[Pba]>,
-        next_cursor: Option<Lba>,
-    ) -> &mut Self {
-        self.ops.push(WalOp::PromotionChunk {
-            vol_ord,
-            pba_increfs,
-            next_cursor,
-        });
-        self
-    }
-
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 walker
-    /// finish emitter. Buffers a [`WalOp::PromotionComplete`] that
-    /// clears the clone's `parent_vol_ord` and `promotion_cursor` —
-    /// after this record the parent's Lineage GC stops treating the
-    /// clone's `branched_at_lsn` as a pin point.
-    pub fn promotion_complete(&mut self, vol_ord: VolumeOrdinal) -> &mut Self {
-        self.ops.push(WalOp::PromotionComplete { vol_ord });
-        self
-    }
-
-    /// Commit the buffered ops. Returns the WAL LSN assigned to the
+    /// Commit the buffered ops. Returns the LSN assigned to the
     /// record. Nothing is written if the transaction is empty; we
     /// return the last applied LSN instead, so read-your-writes still
     /// works when a caller races a commit against an empty commit.

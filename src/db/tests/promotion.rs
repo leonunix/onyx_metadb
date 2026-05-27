@@ -110,8 +110,8 @@ fn promotion_walker_completes_makes_clone_independent() {
 fn promotion_walker_resume_after_crash() {
     // Drive a partial walk by committing a manually-constructed
     // PromotionChunk with `next_cursor=Some(4)` (so apply leaves the
-    // cursor mid-volume), close the Db without flushing, reopen — WAL
-    // replay restores `promotion_cursor=Some(4)` and
+    // cursor mid-volume), close the Db without flushing, reopen — the
+    // lifecycle journal replay restores `promotion_cursor=Some(4)` and
     // `parent_vol_ord=Some(src)` — then let the walker finish from the
     // resume point and assert every PBA got exactly one incref total.
     let dir = tempfile::TempDir::new().unwrap();
@@ -128,16 +128,13 @@ fn promotion_walker_resume_after_crash() {
         clone = db.clone_volume(snap).unwrap();
 
         // Manually commit a partial chunk for the first 4 PBAs. The
-        // walker would normally emit one chunk per call; constructing
-        // the op directly lets the test simulate "crashed mid-walk"
-        // without requiring MAX_PROMOTION_CHUNK_PBAS-many entries.
+        // walker would normally emit one chunk per call; driving the
+        // lifecycle commit helper directly lets the test simulate
+        // "crashed mid-walk" without requiring
+        // MAX_PROMOTION_CHUNK_PBAS-many entries.
         let partial_pbas: Vec<Pba> = pbas[..4].to_vec();
-        db.commit_ops(&[crate::wal::WalOp::PromotionChunk {
-            vol_ord: clone,
-            pba_increfs: partial_pbas.into_boxed_slice(),
-            next_cursor: Some(4),
-        }])
-        .unwrap();
+        db.commit_promotion_chunk(clone, partial_pbas, Some(4))
+            .unwrap();
 
         // First half of the PBAs is now incref'd to 1; the rest are
         // still at 0; cursor sits at 4 (mid-volume).
@@ -151,7 +148,7 @@ fn promotion_walker_resume_after_crash() {
     }
 
     let db = Db::open(dir.path()).unwrap();
-    // WAL replay restored the in-memory manifest mirror.
+    // Lifecycle journal replay restored the in-memory manifest mirror.
     assert_eq!(parent_of(&db, clone), Some(src));
     assert_eq!(cursor_of(&db, clone), Some(4));
 

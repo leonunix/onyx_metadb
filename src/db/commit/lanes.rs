@@ -198,18 +198,6 @@ impl Db {
                     mark_rc(old_value.head_pba(), &mut rc_shards_touched);
                     mark_rc(new_value.head_pba(), &mut rc_shards_touched);
                 }
-                WalOp::DropSnapshot { .. }
-                | WalOp::CreateVolume { .. }
-                | WalOp::DropVolume { .. }
-                | WalOp::CloneVolume { .. }
-                | WalOp::L2pRangeDelete { .. }
-                | WalOp::FreePbas { .. }
-                | WalOp::PromotionChunk { .. }
-                | WalOp::PromotionComplete { .. } => {
-                    return Err(MetaDbError::Corruption(
-                        "lifecycle op reached lane dispatch path".into(),
-                    ));
-                }
             }
         }
 

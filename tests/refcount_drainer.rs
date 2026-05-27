@@ -254,16 +254,14 @@ fn drainer_enabled_same_lsn_multi_slot_same_page_no_loss() {
     // bucket with N stages back-to-back, identical shape to the
     // pre-Phase-5 multi-Incref tx the bug needed).
     for _ in 0..200 {
-        let mut tx = db.begin();
-        tx.promotion_chunk(
+        db.test_commit_promotion_chunk(
             0,
             pbas.iter()
                 .map(|pba| onyx_metadb::Pba::from(*pba))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+                .collect::<Vec<_>>(),
             None,
-        );
-        tx.commit().unwrap();
+        )
+        .unwrap();
     }
 
     // Drain delta_active fully so reads reflect the merged state.

@@ -17,14 +17,14 @@
 //! "shared PBA" rc edges.
 //!
 //! The walker is intentionally simple:
-//! * One [`WalOp::PromotionChunk`] per call carries up to
+//! * One [`LifecycleOp::PromotionChunk`] per call carries up to
 //!   `MAX_PROMOTION_CHUNK_PBAS` incref edges, ordered by ascending LBA.
 //! * The volume's `promotion_cursor` advances to the LBA *just after*
 //!   the largest LBA processed in the chunk; the next call resumes
 //!   from there.
 //! * When the scan from the current cursor yields nothing, the walker
-//!   emits a final [`WalOp::PromotionComplete`] that clears the clone's
-//!   `parent_vol_ord` + `promotion_cursor` and lets the parent's
+//!   emits a final [`LifecycleOp::PromotionComplete`] that clears the
+//!   clone's `parent_vol_ord` + `promotion_cursor` and lets the parent's
 //!   lineage GC stop treating this clone's `branched_at_lsn` as a pin
 //!   point.
 //!
@@ -38,17 +38,16 @@
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::lifecycle_log::LifecycleOp;
 use crate::types::{Lba, Pba, VolumeOrdinal};
-use crate::wal::WalOp;
 
 use super::Db;
 
 /// Cap on the number of incref edges packed into one
-/// [`WalOp::PromotionChunk`] record. Sized so the encoded WAL body
-/// stays well below the segment boundary while still amortising the
-/// per-chunk fsync. Mirrors the runtime check in
-/// [`crate::wal::op::MAX_PROMOTION_CHUNK_PBAS`].
-pub(crate) const MAX_PROMOTION_CHUNK_PBAS: usize = crate::wal::op::MAX_PROMOTION_CHUNK_PBAS;
+/// [`LifecycleOp::PromotionChunk`] record. Sized so the encoded
+/// journal body stays well below the segment boundary while still
+/// amortising the per-chunk fsync.
+pub(crate) const MAX_PROMOTION_CHUNK_PBAS: usize = 65536;
 
 /// Outcome of one [`Db::run_promotion_chunk`] iteration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +56,7 @@ pub(crate) enum PromotionStep {
     /// finished (`parent_vol_ord = None`). Callers can move on to
     /// the next volume.
     NotApplicable,
-    /// A [`WalOp::PromotionChunk`] was committed. `increfs` is the
+    /// A [`LifecycleOp::PromotionChunk`] was committed. `increfs` is the
     /// number of PBA edges in this chunk; `next_cursor` is what the
     /// volume's `promotion_cursor` was advanced to.
     ChunkApplied {
@@ -65,8 +64,8 @@ pub(crate) enum PromotionStep {
         next_cursor: Option<Lba>,
     },
     /// Either this call found no remaining mappings from the cursor
-    /// onward (and emitted a bare [`WalOp::PromotionComplete`]), or
-    /// the prior chunk already exhausted the L2P (this call only
+    /// onward (and emitted a bare [`LifecycleOp::PromotionComplete`]),
+    /// or the prior chunk already exhausted the L2P (this call only
     /// emitted the trailing completion record). Either way the
     /// volume's `parent_vol_ord` is now `None`.
     Completed,
@@ -76,13 +75,14 @@ impl Db {
     /// Run one promotion step for `vol_ord`. Returns
     /// [`PromotionStep::NotApplicable`] when the volume isn't a clone
     /// (or has already been promoted). Otherwise commits a
-    /// [`WalOp::PromotionChunk`] (and possibly a trailing
-    /// [`WalOp::PromotionComplete`]) and reports what changed.
+    /// [`LifecycleOp::PromotionChunk`] (and possibly a trailing
+    /// [`LifecycleOp::PromotionComplete`]) and reports what changed.
     ///
-    /// Idempotent across crashes via the WAL `checkpoint_lsn` cutoff:
-    /// records ≤ `checkpoint_lsn` aren't replayed, so per-PBA increfs
-    /// land at most once per WAL record. A crash between chunks
-    /// resumes from the persisted `promotion_cursor`.
+    /// Idempotent across crashes via the lifecycle-journal
+    /// `lifecycle_replay_seq` cutoff: records ≤ the persisted seq
+    /// aren't replayed, so per-PBA increfs land at most once per
+    /// lifecycle record. A crash between chunks resumes from the
+    /// persisted `promotion_cursor`.
     pub(crate) fn run_promotion_chunk(&self, vol_ord: VolumeOrdinal) -> Result<PromotionStep> {
         let volume = match self.volumes.read().get(&vol_ord).cloned() {
             Some(v) => v,
@@ -108,24 +108,20 @@ impl Db {
             // Cursor is past every live mapping. Emit the completion
             // record and return; the apply path clears both
             // `parent_vol_ord` and `promotion_cursor`.
-            self.commit_ops(&[WalOp::PromotionComplete { vol_ord }])?;
+            self.commit_promotion_complete(vol_ord)?;
             return Ok(PromotionStep::Completed);
         }
 
         let next_cursor = chunk.next_cursor;
         let increfs = chunk.pbas.len();
-        self.commit_ops(&[WalOp::PromotionChunk {
-            vol_ord,
-            pba_increfs: chunk.pbas.into_boxed_slice(),
-            next_cursor,
-        }])?;
+        self.commit_promotion_chunk(vol_ord, chunk.pbas, next_cursor)?;
 
         if next_cursor.is_none() {
             // Last chunk by construction (we drained all remaining
             // mappings). Emit the trailing completion record in the
             // same call so the caller doesn't need a follow-up
             // iteration just to clear the lineage edge.
-            self.commit_ops(&[WalOp::PromotionComplete { vol_ord }])?;
+            self.commit_promotion_complete(vol_ord)?;
             Ok(PromotionStep::Completed)
         } else {
             Ok(PromotionStep::ChunkApplied {
@@ -133,6 +129,81 @@ impl Db {
                 next_cursor,
             })
         }
+    }
+
+    pub(crate) fn commit_promotion_chunk(
+        &self,
+        vol_ord: VolumeOrdinal,
+        pba_increfs: Vec<Pba>,
+        next_cursor: Option<Lba>,
+    ) -> Result<()> {
+        let _txg_guard = self.txg.enter();
+        let _drop_guard = self.drop_gate.read();
+        let lifecycle_op = LifecycleOp::PromotionChunk {
+            vol_ord,
+            pba_increfs: pba_increfs.clone(),
+            next_cursor,
+        };
+        let lsn = self.submit_lifecycle_op_with_dispatch(&lifecycle_op)?;
+        _txg_guard.record_lsn(lsn);
+
+        let _apply_guard = self.acquire_commit_apply_gate(lsn);
+        let _active = self.enter_active_apply(lsn);
+
+        super::apply_promotion_chunk(
+            &self.volumes.read(),
+            &self.refcount_shards,
+            lsn,
+            vol_ord,
+            &pba_increfs,
+            next_cursor,
+        )?;
+
+        {
+            let mut mstate = self.manifest_state.lock();
+            if let Some(entry) = mstate
+                .manifest
+                .volumes
+                .iter_mut()
+                .find(|e| e.ord == vol_ord)
+            {
+                entry.promotion_cursor = next_cursor;
+            }
+        }
+
+        self.finish_global_apply(lsn)?;
+        self.advance_dispatch_lsn(lsn);
+        Ok(())
+    }
+
+    pub(crate) fn commit_promotion_complete(&self, vol_ord: VolumeOrdinal) -> Result<()> {
+        let _txg_guard = self.txg.enter();
+        let _drop_guard = self.drop_gate.read();
+        let lifecycle_op = LifecycleOp::PromotionComplete { vol_ord };
+        let lsn = self.submit_lifecycle_op_with_dispatch(&lifecycle_op)?;
+        _txg_guard.record_lsn(lsn);
+
+        let _apply_guard = self.acquire_commit_apply_gate(lsn);
+        let _active = self.enter_active_apply(lsn);
+
+        super::apply_promotion_complete(&self.volumes.read(), vol_ord)?;
+
+        {
+            let mut mstate = self.manifest_state.lock();
+            if let Some(entry) = mstate
+                .manifest
+                .volumes
+                .iter_mut()
+                .find(|e| e.ord == vol_ord)
+            {
+                entry.parent_vol_ord = None;
+                entry.promotion_cursor = None;
+            }
+        }
+
+        self.finish_global_apply(lsn)?;
+        self.advance_dispatch_lsn(lsn);
+        Ok(())
     }
 }
 

@@ -200,13 +200,12 @@ fn prune_drops_segments_wholly_below_checkpoint() {
 }
 
 #[test]
-fn frame_shares_layout_with_wal() {
-    // Belt-and-suspenders: the journal's append uses the WAL frame
-    // encoder. If the WAL frame ever changes shape without the
-    // lifecycle log noticing, this test catches it.
+fn frame_shares_layout() {
+    // Belt-and-suspenders: confirm the journal's append actually
+    // produces the [`super::record`] framing the iterator expects.
     let body = encode(&LifecycleOp::PromotionComplete { vol_ord: 3 });
     let framed = super::journal::frame_one(42, &body);
-    let iter = crate::wal::record::WalRecordIter::new(&framed);
+    let iter = crate::lifecycle_log::record::WalRecordIter::new(&framed);
     let recs: Vec<_> = iter.collect();
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].lsn, 42);

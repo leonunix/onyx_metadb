@@ -259,7 +259,7 @@ pub(in crate::db) fn apply_drop_snapshot_pages(
     Ok((freed_leaf_values, pages_freed))
 }
 
-/// Apply a full `WalOp::DropSnapshot`: the page-refcount cascade for
+/// Apply a full `LifecycleOp::DropSnapshot`: the page-refcount cascade for
 /// `pages` followed by the SPEC §3.3 leaf-rc-suppress compensation —
 /// one `decref(pba, 1)` per entry in `pba_decrefs`, collected at plan
 /// time via `diff_with_current`.

@@ -1,7 +1,7 @@
 //! Append-only lifecycle journal.
 //!
 //! A directory of `lifecycle-{start_seq:020}.log` segments holding
-//! [`crate::wal::record`]-framed bodies. Each body is a single
+//! [`super::record`]-framed bodies. Each body is a single
 //! [`super::op::LifecycleOp`] encoded by [`super::op::encode`].
 //!
 //! Lifecycle ops are rare (≈ 1 record/min in production) so the journal
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use crc32c::crc32c;
 
 use crate::error::{MetaDbError, Result};
-use crate::wal::record::{
+use super::record::{
     DecodeError, WAL_HEADER_SIZE, WAL_MAX_BODY, WalRecordIter, WalRecordRef, encode as encode_frame,
 };
 
@@ -162,8 +162,7 @@ impl LifecycleJournal {
     }
 
     /// Delete segments wholly covered by `checkpoint_seq` so the
-    /// journal doesn't grow without bound. Mirrors
-    /// [`crate::wal::segment::prune_segments`]. The newest segment is
+    /// journal doesn't grow without bound. The newest segment is
     /// always retained (the writer might still be appending to it).
     pub fn prune(dir: &Path, checkpoint_seq: u64) -> Result<usize> {
         let segments = list_segments(dir)?;

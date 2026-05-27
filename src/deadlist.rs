@@ -329,7 +329,7 @@ fn decode_records(buf: &[u8], count: usize, out: &mut Vec<DeadRecord>) {
 /// `prev_seg_pid` links and return every page id owned by the chain
 /// (each segment contributes its full `seg_page_count` consecutive
 /// pids starting at the segment's first page). Returns empty if the
-/// chain is empty. Used by `drop_volume` to feed `WalOp::DropVolume.pages`
+/// chain is empty. Used by `drop_volume` to feed `LifecycleOp::DropVolume.pages`
 /// and by `metadb-verify` for chain auditing.
 pub fn walk_chain_pages<F>(tail_pid: PageId, read_page: F) -> Result<Vec<PageId>>
 where

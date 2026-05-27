@@ -83,7 +83,7 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
     Ok(())
 }
 
-/// Apply a batched `WalOp::FreePbas` with exclusive/shared split
+/// Apply a batched `commit_free_pbas` with exclusive/shared split
 /// ([[no-refcount-hot-path-design]] Phase 4 Step 3).
 ///
 /// For each PBA we classify by **current refcount**:
@@ -106,7 +106,7 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
 /// surface so onyx can do the retire that previously rode on the
 /// `L2pRemap` outcome.
 ///
-/// Replay idempotency: re-applying the same `WalOp::FreePbas` after a
+/// Replay idempotency: re-applying the same `commit_free_pbas` after a
 /// crash sees rc=0 for everything it already drained on the first
 /// pass; those PBAs surface again. Onyx-side retire is a set, so
 /// duplicate surfaces are harmless. The previous Phase 3 defensive

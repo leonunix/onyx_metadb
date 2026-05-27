@@ -8,17 +8,6 @@ use crate::config::PAGE_SIZE;
 use crate::manifest::decode_page_for_fuzz;
 use crate::page::Page;
 use crate::page_store::PageStore;
-use crate::wal::WalRecordIter;
-use crate::wal::op::decode_body;
-
-#[doc(hidden)]
-pub fn wal_record_decode(input: &[u8]) {
-    let mut iter = WalRecordIter::new(input);
-    for record in iter.by_ref() {
-        let _ = decode_body(record.body);
-    }
-    let _ = iter.stopped();
-}
 
 #[doc(hidden)]
 pub fn page_header_decode(input: &[u8]) {

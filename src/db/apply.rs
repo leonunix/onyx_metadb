@@ -232,19 +232,6 @@ pub(super) fn apply_op_bare(
             *guard,
             &snap_info_for_vol(*vol_ord),
         ),
-        WalOp::L2pRangeDelete {
-            vol_ord,
-            start: _,
-            end: _,
-            captured,
-        } => apply_l2p_range_delete(
-            volumes,
-            refcount_shards,
-            lsn,
-            *vol_ord,
-            captured,
-            &snap_info_for_vol(*vol_ord),
-        ),
         WalOp::L2pRemapRange {
             vol_ord,
             start_lba,
@@ -259,58 +246,6 @@ pub(super) fn apply_op_bare(
             values,
             &snap_info_for_vol(*vol_ord),
         ),
-        WalOp::DropSnapshot {
-            id: _,
-            pages,
-            pba_decrefs,
-        } => apply_drop_snapshot_pages_and_decrefs(
-            page_store,
-            refcount_shards,
-            lsn,
-            pages,
-            pba_decrefs,
-        ),
-        // Phase 7 per-volume lifecycle ops: decodable since Phase A, but
-        // their apply semantics land with commit 8/9. Commit 6 still
-        // expects to see `vol_ord = 0` on L2P ops only; any of these
-        // three tags in the WAL means either a mixed-binary recovery
-        // attempt or a logic bug in the caller.
-        WalOp::CreateVolume { ord, .. }
-        | WalOp::DropVolume { ord, .. }
-        | WalOp::CloneVolume { new_ord: ord, .. } => Err(MetaDbError::Corruption(format!(
-            "Phase 7 volume-lifecycle WAL op for ord {ord} hit the commit-6 apply path; \
-             commit 8/9 implements these — this binary is too old to replay it"
-        ))),
-        // [[no-refcount-hot-path-design]] Phase 4 Step 3: Lineage GC
-        // (or any caller) emits [`WalOp::FreePbas`] for a batch of
-        // PBAs whose dead-list records have cleared snap-pin and
-        // descendant pin. Apply classifies each PBA into shared
-        // (rc>0, decref by 1) or exclusive (rc=0, surface without
-        // touching rc); see [`apply_free_pbas`] for the full contract.
-        WalOp::FreePbas { vol_ord: _, pbas } => apply_free_pbas(refcount_shards, lsn, pbas),
-        // [[no-refcount-hot-path-design]] Phase 4 Step 5: background
-        // promotion walker chunk. Bare layer only mutates the
-        // refcount table (incref each PBA by 1) and the volume's
-        // in-memory `promotion_cursor`. The manifest mirror lives in
-        // the live `apply_op` wrapper (and the lifecycle replay path),
-        // mirroring the `DropSnapshot` split.
-        WalOp::PromotionChunk {
-            vol_ord,
-            pba_increfs,
-            next_cursor,
-        } => apply_promotion_chunk(
-            volumes,
-            refcount_shards,
-            lsn,
-            *vol_ord,
-            pba_increfs,
-            *next_cursor,
-        ),
-        // [[no-refcount-hot-path-design]] Phase 4 Step 5: walker
-        // finish. Bare layer clears the volume's in-memory
-        // `parent_vol_ord` and `promotion_cursor`; the manifest mirror
-        // happens in the wrapper.
-        WalOp::PromotionComplete { vol_ord } => apply_promotion_complete(volumes, *vol_ord),
     }
 }
 
@@ -348,38 +283,12 @@ pub(super) fn shard_for_key_l2p(shards: &[L2pShard], key: u64) -> usize {
 }
 
 /// Returns true if the batch contains any op whose apply has manifest
-/// or volume-lifecycle side effects. Used to fall back to serial apply.
-pub(super) fn batch_contains_lifecycle_op(ops: &[WalOp]) -> bool {
-    ops.iter().any(|op| {
-        matches!(
-            op,
-            WalOp::DropSnapshot { .. }
-                | WalOp::CreateVolume { .. }
-                | WalOp::DropVolume { .. }
-                | WalOp::CloneVolume { .. }
-                // L2pRangeDelete has its own Db entry point
-                // (`Db::range_delete`) that submits + applies inline
-                // under apply_gate.write, mirroring drop_snapshot.
-                // It never reaches commit_ops; this arm just keeps
-                // the bucketed path safe if a future caller routes
-                // it through here by mistake.
-                | WalOp::L2pRangeDelete { .. }
-                // FreePbas is the Phase 3 (no-refcount-hot-path)
-                // Lineage GC emitter. Its apply path is the serial
-                // `apply_op` arm, which forwards to `apply_free_pbas`;
-                // it never participates in the bucketed lane path.
-                | WalOp::FreePbas { .. }
-                // PromotionChunk / PromotionComplete are the Phase 4
-                // Step 5 (no-refcount-hot-path) walker emissions. They
-                // mutate the in-memory manifest (`promotion_cursor` and
-                // `parent_vol_ord`), so apply must run on the serial
-                // `apply_op` path that holds `manifest_state` —
-                // identical pattern to `DropSnapshot`. PromotionChunk
-                // also stages global rc bumps, but routing that through
-                // the laned path would split the manifest mirror from
-                // the rc bump across thread boundaries.
-                | WalOp::PromotionChunk { .. }
-                | WalOp::PromotionComplete { .. }
-        )
-    })
+/// or volume-lifecycle side effects. With Buffer-as-sole-journal D.5b
+/// the only ops `commit_ops` accepts are data-plane variants, so this
+/// is always `false`. The function is kept so the bucketed path's
+/// defensive `if batch_contains_lifecycle_op { serial }` fallback
+/// continues to compile; any future op variant with manifest side
+/// effects should be added here.
+pub(super) fn batch_contains_lifecycle_op(_ops: &[WalOp]) -> bool {
+    false
 }

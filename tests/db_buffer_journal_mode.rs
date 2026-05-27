@@ -216,11 +216,10 @@ fn buffer_mode_lifecycle_ops_grow_lifecycle_journal_only() {
 
 #[test]
 fn buffer_mode_promotion_ops_grow_lifecycle_journal_only() {
-    // Phase C.3: promotion records routed through `commit_ops` must
-    // also land in the lifecycle journal in Buffer mode (not the WAL).
-    // The clone scenario gives us a volume with `parent_vol_ord` set
-    // so a synthetic `PromotionChunk` + `PromotionComplete` round-trip
-    // through the apply path.
+    // Phase C.3 / D.5b: promotion records must land in the lifecycle
+    // journal in Buffer mode (no WAL exists). The clone scenario gives
+    // us a volume with `parent_vol_ord` set so the `commit_promotion_*`
+    // helpers drive a real apply through the lifecycle journal.
     let dir = TempDir::new().unwrap();
     let db = Db::create_with_config(buffer_cfg(&dir)).unwrap();
     let src = db.create_volume().unwrap();
@@ -232,32 +231,23 @@ fn buffer_mode_promotion_ops_grow_lifecycle_journal_only() {
     let clone = db.clone_volume(snap).unwrap();
 
     let before = db.lifecycle_applied_watermark();
-    let mut tx = db.begin();
-    tx.promotion_chunk(clone, Box::new(pbas), None);
-    tx.commit().unwrap();
+    db.test_commit_promotion_chunk(clone, pbas.to_vec(), None)
+        .unwrap();
     let after_chunk = db.lifecycle_applied_watermark();
     assert_eq!(
         after_chunk,
         before + 1,
-        "PromotionChunk via commit_ops must append one lifecycle record \
+        "PromotionChunk must append one lifecycle record \
          (before: {before}, after: {after_chunk})"
     );
 
-    let mut tx = db.begin();
-    tx.promotion_complete(clone);
-    tx.commit().unwrap();
+    db.test_commit_promotion_complete(clone).unwrap();
     let after_complete = db.lifecycle_applied_watermark();
     assert_eq!(
         after_complete,
         after_chunk + 1,
-        "PromotionComplete via commit_ops must append one lifecycle record \
+        "PromotionComplete must append one lifecycle record \
          (after chunk: {after_chunk}, after complete: {after_complete})"
-    );
-
-    assert_eq!(
-        db.metrics_snapshot().wal_records,
-        0,
-        "promotion ops in Buffer mode must not touch the WAL"
     );
 }
 

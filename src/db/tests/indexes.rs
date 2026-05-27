@@ -222,14 +222,14 @@ fn incref_and_decref_roundtrip() {
 }
 
 // Phase 5: `decref_underflow_errors` removed — `Db::decref_pba` now
-// drives `WalOp::FreePbas` which never underflows (rc>0 → decref by 1;
+// drives `commit_free_pbas` which never underflows (rc>0 → decref by 1;
 // rc==0 → exclusive surface, no error). The underlying refcount
 // overflow/underflow guard is covered by the rc shard's own unit tests
 // in `src/refcount/`.
 //
 // `incref_overflow_errors` removed — `Db::incref_pba` now drives
-// `WalOp::PromotionChunk` so driving u32::MAX worth of staged ops
-// requires hundreds of WAL records and would take minutes. The
+// `commit_promotion_chunk` so driving u32::MAX worth of staged ops
+// requires hundreds of lifecycle records and would take minutes. The
 // overflow guard sits in `RcShard::stage` / `apply_delta_pure` and is
 // covered by `refcount::apply_delta_tests::overflow_errors`.
 
@@ -495,7 +495,7 @@ fn apply_lane_h2_metrics_record_wakeups_and_bursts() {
     //
     // Phase 5: refcount lane no longer wakes from L2pRemap commits
     // (hot-path RC was removed). `Db::incref_pba` drives
-    // `WalOp::PromotionChunk` through `apply_op_bare`, not through the
+    // `commit_promotion_chunk` through `apply_op_bare`, not through the
     // per-shard rc apply lane; the RC lane wakeup assertion has been
     // dropped. The L2P lane assertions still hold.
     let (_d, db) = mk_db();

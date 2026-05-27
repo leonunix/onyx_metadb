@@ -107,16 +107,6 @@ impl Db {
                 | WalOp::DedupComparePut { .. } => {
                     dedup_idxs.push(idx);
                 }
-                WalOp::DropSnapshot { .. }
-                | WalOp::CreateVolume { .. }
-                | WalOp::DropVolume { .. }
-                | WalOp::CloneVolume { .. }
-                | WalOp::L2pRangeDelete { .. }
-                | WalOp::FreePbas { .. }
-                | WalOp::PromotionChunk { .. }
-                | WalOp::PromotionComplete { .. } => {
-                    unreachable!("lifecycle op must not reach apply_ops_grouped_to_lanes");
-                }
             }
         }
 
@@ -327,16 +317,6 @@ impl Db {
                 | WalOp::DedupCompareDelete { .. }
                 | WalOp::DedupComparePut { .. } => {
                     dedup_idxs.push(idx);
-                }
-                WalOp::DropSnapshot { .. }
-                | WalOp::CreateVolume { .. }
-                | WalOp::DropVolume { .. }
-                | WalOp::CloneVolume { .. }
-                | WalOp::L2pRangeDelete { .. }
-                | WalOp::FreePbas { .. }
-                | WalOp::PromotionChunk { .. }
-                | WalOp::PromotionComplete { .. } => {
-                    unreachable!("lifecycle op must not reach apply_ops_grouped_to");
                 }
             }
         }

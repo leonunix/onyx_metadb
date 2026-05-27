@@ -96,13 +96,7 @@ impl Db {
         manifest.next_volume_ord = BOOTSTRAP_VOLUME_ORD + 1;
         manifest_store.commit(&manifest)?;
 
-        let wal = WalSet::create_with_metrics(
-            &wal_dir(&cfg.path),
-            &cfg,
-            manifest.checkpoint_lsn + 1,
-            faults.clone(),
-            metrics.clone(),
-        )?;
+        let lsn_alloc = LsnAllocator::new(manifest.checkpoint_lsn + 1);
 
         // Open a fresh lifecycle journal. Fresh DB → no segments
         // yet, so `next_seq` is 1 and `LifecycleJournal::open` simply
@@ -168,7 +162,7 @@ impl Db {
             dedup_lanes,
             dedup_maintenance_lanes,
             dedup_maintenance_queued: build_dedup_queued_flags(dedup_shards as usize),
-            wal,
+            lsn_alloc,
             unlogged_pending_lsn: Mutex::new(None),
             unlogged_commit_gate: RwLock::new(()),
             unlogged_commits_enabled: cfg.unlogged_commits_enabled,
@@ -380,254 +374,33 @@ impl Db {
             cfg.dedup_l1_cache_entries,
         )?);
 
-        // Replay WAL segments forward from checkpoint_lsn+1 onto the
-        // freshly-opened in-memory state. Applies every op exactly the
-        // way a live commit would. The result tells us the LSN of the
-        // last cleanly-decoded record so the new WAL can resume there.
+        // Buffer-as-sole-journal Phase D.5b retired the WAL writer.
+        // Recovery now starts from `manifest.checkpoint_lsn` (the last
+        // durable manifest commit) and folds the lifecycle journal
+        // forward; data-plane state is rebuilt from onyx's LV2 buffer
+        // on its own replay path, so this open() body only worries
+        // about lifecycle records sitting above the manifest
+        // watermark.
         //
-        // `DropSnapshot` replay also mutates `manifest.snapshots`; that
-        // is handled in the closure after `apply_op_bare` does the page
-        // work, mirroring the live path in `Db::apply_op`.
-        //
-        // `CreateVolume` / `DropVolume` mutate the volumes map + the
-        // manifest's volumes table, so they're dispatched ahead of
-        // `apply_op_bare` (whose volume-lifecycle arm is still
-        // `Err(Corruption)` — commit 8 routes live traffic through
-        // `Db::create_volume` / `Db::drop_volume`, which bypass
-        // `commit_ops` entirely).
-        let wal_path = wal_dir(&cfg.path);
-        let from_lsn = manifest.checkpoint_lsn + 1;
-        // ZFS-TXG-clone Phase 4 Step 8a: capture the durable TXG BEFORE
-        // entering the replay closure so the closure (which immutably
-        // borrows `manifest`) doesn't need to read it. Replay folds into
-        // `checkpoint_txg + 1` — the Open TXG the new TxgStateMachine
-        // will be constructed with below.
+        // ZFS-TXG-clone Phase 4 Step 8a: capture the durable TXG so
+        // every replayed lifecycle record folds into `checkpoint_txg
+        // + 1` — the Open TXG the new TxgStateMachine will be
+        // constructed with below.
         let replay_open_txg = manifest.checkpoint_txg + 1;
         let mut replayed_drop = false;
         let mut mutated_volumes = false;
-        let replay_outcome =
-            crate::recovery::replay_wal_set_records_into(&wal_path, from_lsn, |lsn, ops| {
-                if !batch_contains_lifecycle_op(ops) {
-                    let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
-                        manifest
-                            .snapshots
-                            .iter()
-                            .filter(|s| s.vol_ord == vol)
-                            .map(|s| SnapInfo {
-                                created_lsn: s.created_lsn,
-                                l2p_shard_roots: s.l2p_shard_roots.clone(),
-                            })
-                            .collect()
-                    };
-                    Self::apply_replay_batch(
-                        &volumes,
-                        &refcount_shards,
-                        &dedup_index,
-                        &page_store,
-                        &metrics,
-                        lsn,
-                        replay_open_txg,
-                        ops,
-                        &snap_lookup,
-                    )?;
-                    return Ok(());
-                }
-
-                for op in ops {
-                    match op {
-                        WalOp::CreateVolume { ord, shard_count } => {
-                            if !volumes.contains_key(ord) {
-                                let (shards, roots) = apply_create_volume(
-                                    &page_store,
-                                    &page_cache,
-                                    *shard_count,
-                                    metrics.clone(),
-                                    cfg.l2p_buffer_enabled,
-                                )?;
-                                volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
-                                let durable_seqs =
-                                    vec![lsn; *shard_count as usize].into_boxed_slice();
-                                manifest.volumes.push(VolumeEntry {
-                                    ord: *ord,
-                                    shard_count: *shard_count,
-                                    l2p_shard_roots: roots,
-                                    l2p_shard_durable_seq: durable_seqs,
-                                    created_lsn: lsn,
-                                    flags: 0,
-                                    dead_list_head_pid: crate::types::NULL_PAGE,
-                                    dead_list_tail_pid: crate::types::NULL_PAGE,
-                                    parent_vol_ord: None,
-                                    branched_at_lsn: 0,
-                                    promotion_cursor: None,
-                                });
-                                mutated_volumes = true;
-                            }
-                            manifest.next_volume_ord = manifest
-                                .next_volume_ord
-                                .max(ord.checked_add(1).unwrap_or(u16::MAX));
-                        }
-                        WalOp::DropVolume { ord, pages } => {
-                            if volumes.contains_key(ord) {
-                                apply_drop_volume(&page_store, lsn, pages)?;
-                                volumes.remove(ord);
-                                manifest.volumes.retain(|v| v.ord != *ord);
-                                mutated_volumes = true;
-                            }
-                        }
-                        WalOp::CloneVolume {
-                            src_ord,
-                            new_ord,
-                            src_snap_id,
-                            src_shard_roots,
-                        } => {
-                            if !volumes.contains_key(new_ord) {
-                                apply_clone_volume_incref(
-                                    &page_store,
-                                    &faults,
-                                    lsn,
-                                    src_shard_roots,
-                                )?;
-                                // Same stale-buffer hazard as `Db::clone_volume`:
-                                // every volume whose PagedL2p was opened above
-                                // may hold a pre-incref Clean copy of one of
-                                // these roots — not just the source. Sweep all
-                                // volumes so a later `incref_root_for_snapshot`
-                                // or `cow_for_write` during replay can't flush a
-                                // stale rc back over our disk-direct bump.
-                                let all_vols: Vec<Arc<Volume>> =
-                                    volumes.values().cloned().collect();
-                                for &pid in src_shard_roots {
-                                    if pid == crate::types::NULL_PAGE {
-                                        continue;
-                                    }
-                                    page_cache.invalidate(pid);
-                                    for vol in &all_vols {
-                                        for shard in &vol.shards {
-                                            shard.tree.write().forget_page(pid);
-                                        }
-                                    }
-                                }
-                                let (shards, actual_roots) = build_clone_volume_shards(
-                                    src_shard_roots,
-                                    &page_store,
-                                    &page_cache,
-                                    lsn,
-                                    metrics.clone(),
-                                    cfg.l2p_buffer_enabled,
-                                )?;
-                                let shard_count = shards.len() as u32;
-                                // Phase 4: recover the snapshot's
-                                // `created_lsn` so the clone's
-                                // `branched_at_lsn` round-trips through
-                                // replay the same way as the live
-                                // `clone_volume` path. `TakeSnapshot` is
-                                // serialized before its `CloneVolume`
-                                // in the WAL, so the snapshot is
-                                // already in `manifest.snapshots`
-                                // here unless the source was a
-                                // previously-checkpointed snapshot
-                                // that survived in the manifest from
-                                // the prior incarnation.
-                                let branched_at_lsn = manifest
-                                    .snapshots
-                                    .iter()
-                                    .find(|s| s.id == *src_snap_id)
-                                    .map(|s| s.created_lsn)
-                                    .ok_or_else(|| {
-                                        MetaDbError::Corruption(format!(
-                                            "CloneVolume replay: snapshot {src_snap_id} \
-                                             missing from manifest at lsn {lsn}"
-                                        ))
-                                    })?;
-                                volumes.insert(
-                                    *new_ord,
-                                    Arc::new(Volume::with_lineage(
-                                        *new_ord,
-                                        shards,
-                                        lsn,
-                                        crate::types::NULL_PAGE,
-                                        crate::types::NULL_PAGE,
-                                        Some(*src_ord),
-                                        branched_at_lsn,
-                                        None,
-                                    )),
-                                );
-                                let durable_seqs =
-                                    vec![lsn; shard_count as usize].into_boxed_slice();
-                                manifest.volumes.push(VolumeEntry {
-                                    ord: *new_ord,
-                                    shard_count,
-                                    l2p_shard_roots: actual_roots,
-                                    l2p_shard_durable_seq: durable_seqs,
-                                    created_lsn: lsn,
-                                    flags: 0,
-                                    dead_list_head_pid: crate::types::NULL_PAGE,
-                                    dead_list_tail_pid: crate::types::NULL_PAGE,
-                                    parent_vol_ord: Some(*src_ord),
-                                    branched_at_lsn,
-                                    promotion_cursor: None,
-                                });
-                                mutated_volumes = true;
-                            }
-                            manifest.next_volume_ord = manifest
-                                .next_volume_ord
-                                .max(new_ord.checked_add(1).unwrap_or(u16::MAX));
-                        }
-                        _ => {
-                            let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
-                                manifest
-                                    .snapshots
-                                    .iter()
-                                    .filter(|s| s.vol_ord == vol)
-                                    .map(|s| SnapInfo {
-                                        created_lsn: s.created_lsn,
-                                        l2p_shard_roots: s.l2p_shard_roots.clone(),
-                                    })
-                                    .collect()
-                            };
-                            apply_op_bare(
-                                &volumes,
-                                &refcount_shards,
-                                &dedup_index,
-                                &page_store,
-                                lsn,
-                                replay_open_txg,
-                                op,
-                                &snap_lookup,
-                            )?;
-                            if let WalOp::DropSnapshot { id, .. } = op {
-                                manifest.snapshots.retain(|s| s.id != *id);
-                                replayed_drop = true;
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            })?;
-        let wal_replay_last_applied = replay_outcome
-            .merged
-            .last_lsn
-            .unwrap_or(manifest.checkpoint_lsn);
-        // If the last segment ended torn, truncate it to the last clean
-        // record before handing the directory to the new Wal.
-        crate::recovery::truncate_wal_set_torn_tails(&replay_outcome)?;
 
         // Buffer-as-sole-journal Phase C.4: replay any uncovered
-        // lifecycle records into the same in-memory state WAL replay
-        // just finished folding into. Lifecycle records carry a
-        // monotonic `seq` but not an LSN; we synthesise replay LSNs
-        // sequentially starting from `wal_replay_last_applied + 1` so
-        // every page generation stamp the original apply wrote is
-        // strictly >= our replay LSN, and the `header.generation >=
-        // lsn` idempotency guard in `apply_drop_snapshot_pages` /
-        // `apply_clone_volume_incref` correctly fires SKIP on a
-        // page already processed before the crash.
-        //
-        // Lifecycle records sit between manifest commits — i.e. above
-        // `manifest.lifecycle_replay_seq` — and the new WAL is created
-        // BELOW (after lifecycle replay finishes) so its `next_lsn`
-        // does not collide with the LSNs we just consumed.
-        let mut last_applied = wal_replay_last_applied;
+        // lifecycle records into the freshly-opened in-memory state.
+        // Lifecycle records carry a monotonic `seq` but not an LSN; we
+        // synthesise replay LSNs sequentially starting from
+        // `manifest.checkpoint_lsn + 1` so every page generation
+        // stamp the original apply wrote is strictly >= our replay
+        // LSN, and the `header.generation >= lsn` idempotency guard
+        // in `apply_drop_snapshot_pages` / `apply_clone_volume_incref`
+        // correctly fires SKIP on a page already processed before the
+        // crash.
+        let mut last_applied = manifest.checkpoint_lsn;
         let mut lifecycle_max_seq = manifest.lifecycle_replay_seq;
         let mut lifecycle_replayed_anything = false;
         let lifecycle_dir = lifecycle_log_dir(&cfg.path);
@@ -660,13 +433,7 @@ impl Db {
             }
         }
 
-        let wal = WalSet::create_with_metrics(
-            &wal_path,
-            &cfg,
-            last_applied + 1,
-            faults.clone(),
-            metrics.clone(),
-        )?;
+        let lsn_alloc = LsnAllocator::new(last_applied + 1);
 
         // Open the lifecycle journal for further append at the seq
         // immediately after whatever replay just folded in.
@@ -704,8 +471,7 @@ impl Db {
         //
         // Skipping this block when nothing was replayed keeps the
         // common "close + reopen with no WAL tail" path zero-cost.
-        let replayed_anything = replay_outcome.merged.last_lsn.is_some();
-        if replayed_anything || replayed_drop || mutated_volumes || lifecycle_replayed_anything {
+        if replayed_drop || mutated_volumes || lifecycle_replayed_anything {
             let sorted: Vec<Arc<Volume>> = {
                 let mut v: Vec<Arc<Volume>> = volumes.values().cloned().collect();
                 v.sort_by_key(|vol| vol.ord);
@@ -855,7 +621,7 @@ impl Db {
             dedup_lanes,
             dedup_maintenance_lanes,
             dedup_maintenance_queued: build_dedup_queued_flags(manifest_dedup_shards),
-            wal,
+            lsn_alloc,
             unlogged_pending_lsn: Mutex::new(None),
             unlogged_commit_gate: RwLock::new(()),
             unlogged_commits_enabled: cfg.unlogged_commits_enabled,
@@ -1209,36 +975,15 @@ fn apply_lifecycle_record_replay(
             pages,
             pba_decrefs,
         } => {
-            // Convert to the equivalent WalOp and route through the
-            // shared bare-apply path so the snap-pin / refcount
-            // cascade matches the live `Db::drop_snapshot` call
-            // site exactly (mirrors the `_` arm in the WAL replay
-            // closure above).
-            let wal_op = WalOp::DropSnapshot {
-                id: *id,
-                pages: pages.clone(),
-                pba_decrefs: pba_decrefs.clone(),
-            };
-            let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
-                manifest
-                    .snapshots
-                    .iter()
-                    .filter(|s| s.vol_ord == vol)
-                    .map(|s| SnapInfo {
-                        created_lsn: s.created_lsn,
-                        l2p_shard_roots: s.l2p_shard_roots.clone(),
-                    })
-                    .collect()
-            };
-            apply_op_bare(
-                volumes,
-                refcount_shards,
-                dedup_index,
+            // Drive the same page-free + per-pba decref cascade the
+            // live `Db::drop_snapshot` path uses. Page generations
+            // gate idempotency across re-applies.
+            apply_drop_snapshot_pages_and_decrefs(
                 page_store,
+                refcount_shards,
                 lsn,
-                replay_open_txg,
-                &wal_op,
-                &snap_lookup,
+                pages,
+                pba_decrefs,
             )?;
             manifest.snapshots.retain(|s| s.id != *id);
             outcome.replayed_drop_snapshot = true;

@@ -11,9 +11,9 @@
 //!    advance the dead-list chain's `head_pid` past the oldest
 //!    segment whose records have all been freed by the hot path (rc
 //!    already 0) and no snapshot pins their `(birth, death)`
-//!    interval. Phase 3 doesn't emit `WalOp::FreePbas` itself — the
+//!    interval. Phase 3 doesn't emit `commit_free_pbas` itself — the
 //!    hot path still owns rc decref — so GC's only mutation is
-//!    chain truncation. Phase 5 will fold `WalOp::FreePbas`
+//!    chain truncation. Phase 5 will fold `commit_free_pbas`
 //!    emission into the same pass.
 //!
 //! ## Correctness
@@ -77,7 +77,7 @@ pub(super) struct LineageGcCtx {
     /// FreePbas-emitting GC driver (`Db::run_lineage_gc_cycle_inner`,
     /// reachable from `Db::test_run_lineage_gc_cycle` today and from
     /// the background worker in Phase 5) emits a
-    /// [`crate::wal::WalOp::FreePbas`] for every dead record retired
+    /// `FreePbas` lifecycle-style commit for every dead record retired
     /// before truncating the chain. The background worker on its own
     /// (this module's `lineage_gc_cycle`) cannot reach `Db::commit_ops`,
     /// so it keeps Phase 3 behavior regardless of this flag — Phase 5
@@ -416,9 +416,9 @@ pub(super) fn gc_plan_head_advance(
 /// the new head/tail atomics, and frees the old head segment's pages.
 ///
 /// The plan-then-execute split exists so the (Phase 4 Step 4)
-/// FreePbas-emitting driver can `commit_ops(WalOp::FreePbas { … })`
+/// FreePbas-emitting driver can call `commit_free_pbas(vol_ord, …)`
 /// between the two phases without deadlocking against `apply_gate`
-/// — `commit_ops` takes `apply_gate.read()` internally. Phase 4
+/// — `commit_free_pbas` takes `apply_gate.read()` internally. Phase 4
 /// keeps the hot path maintaining rc, so the FreePbas applied
 /// between plan and execute observes rc=0 for every PBA we
 /// surfaced (the plan's rc==0 gate) and takes the exclusive branch.

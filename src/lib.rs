@@ -1,25 +1,15 @@
 //! onyx-metadb: embedded metadata engine for Onyx Storage.
 //!
-//! Two workload-specialized indexes in a single engine, sharing one WAL:
-//! - Sharded COW B+tree for L2P (per-volume, fixed 8B key → 28B value).
-//! - Fixed-record LSM for global dedup (32B hash → 27B entry).
+//! Two workload-specialized indexes:
+//! - Sharded COW radix tree for L2P (per-volume, fixed 8B key → 36B value).
+//! - Cuckoo hash for global dedup (8B hash → 27B entry).
 //!
-//! Public API, recovery semantics, and snapshot model are documented in
-//! [`docs/DESIGN.md`](../docs/DESIGN.md). Implementation phases are in
-//! [`docs/ROADMAP.md`](../docs/ROADMAP.md).
-//!
-//! # What's implemented today
-//!
-//! Phase 1 is landing piecewise. The first slice (this commit) provides
-//! the shared foundation:
-//! - [`types`]: integer aliases and sentinels.
-//! - [`error`]: the flat `MetaDbError` enum and `Result` alias.
-//! - [`config`]: `Config` with defaults matching DESIGN §11.
-//! - [`page`]: 4 KiB page codec with CRC32C.
-//! - [`page_store`]: file-backed alloc / read / write / free.
-//!
-//! WAL, manifest, recovery, and the index types land in subsequent
-//! commits. See the roadmap.
+//! Durability comes from two sources: the LV2 write buffer (owned by
+//! onyx; replayed through the flusher on recovery) carries every
+//! data-plane mutation, and an internal lifecycle journal carries the
+//! rare non-data-plane ops (volume create/drop/clone, snapshot drop,
+//! promotion cursor, discard). The legacy metadb-internal WAL has been
+//! retired (Phase D.5b).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -38,18 +28,17 @@ pub(crate) mod io_submitter;
 pub mod lifecycle_log;
 pub mod manifest;
 pub mod metrics;
+pub mod op;
 pub mod page;
 pub mod page_store;
 pub mod paged;
 pub mod paged_meta;
-pub mod recovery;
 pub mod refcount;
 pub mod testing;
 pub mod tx;
 pub mod txg;
 pub mod types;
 pub mod verify;
-pub mod wal;
 
 pub use cache::{PageCache, PageCacheStats};
 pub use config::{Config, MAX_DEDUP_SHARDS, MetaDbJournalMode, PAGE_SIZE};
@@ -68,7 +57,6 @@ pub use metrics::{FlushKind, MetaMetrics, MetaMetricsSnapshot};
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 pub use page_store::{PageStore, ReclaimOutcome};
 pub use paged::{DiffEntry, L2pValue, PagedL2p};
-pub use recovery::{ReplayOutcome, replay};
 pub use tx::{ApplyOutcome, Transaction};
 pub use types::{
     FIRST_DATA_PAGE, INVALID_VOLUME, Lba, Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId,

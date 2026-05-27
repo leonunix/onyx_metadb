@@ -54,7 +54,7 @@ fn ref_bound(b: &Bound<u64>) -> Bound<&u64> {
 
 /// Rich outcome returned by [`PagedL2p::insert_at_lsn_with_share_info`]
 /// and [`PagedL2p::delete_at_lsn_with_share_info`]. The onyx-adapter
-/// apply path (`WalOp::L2pRemap`, `WalOp::L2pRangeDelete`) uses
+/// apply path (`WalOp::L2pRemap`, `LifecycleOp::Discard`) uses
 /// `leaf_was_shared` together with `prev` to decide whether to
 /// suppress the paired refcount decref (see SPEC §3.1 decision
 /// table): if the leaf that held the old mapping was shared with a
@@ -77,7 +77,7 @@ pub struct InsertOutcome {
 
 /// Delete-path analogue of [`InsertOutcome`]. Returned by
 /// [`PagedL2p::delete_at_lsn_with_share_info`]; consumed by the
-/// onyx-adapter `WalOp::L2pRangeDelete` apply path. `prev` is `None`
+/// onyx-adapter `LifecycleOp::Discard` apply path. `prev` is `None`
 /// when the lba was unmapped — the apply path short-circuits in that
 /// case and treats the op as a no-op for refcount accounting.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

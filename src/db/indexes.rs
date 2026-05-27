@@ -57,14 +57,12 @@ impl Db {
         // `MAX_PROMOTION_CHUNK_PBAS`; large deltas split across chunks.
         let mut remaining = delta as usize;
         while remaining > 0 {
-            let take = remaining.min(crate::wal::op::MAX_PROMOTION_CHUNK_PBAS);
+            let take = remaining.min(crate::db::promotion::MAX_PROMOTION_CHUNK_PBAS);
             let mut pba_increfs = Vec::with_capacity(take);
             for _ in 0..take {
                 pba_increfs.push(pba);
             }
-            let mut tx = self.begin();
-            tx.promotion_chunk(BOOTSTRAP_VOL_ORD, pba_increfs.into_boxed_slice(), None);
-            tx.commit()?;
+            self.commit_promotion_chunk(BOOTSTRAP_VOL_ORD, pba_increfs, None)?;
             remaining -= take;
         }
         self.get_refcount(pba)
@@ -83,9 +81,7 @@ impl Db {
         }
         const BOOTSTRAP_VOL_ORD: crate::types::VolumeOrdinal = 0;
         for _ in 0..delta {
-            let mut tx = self.begin();
-            tx.free_pbas(BOOTSTRAP_VOL_ORD, vec![pba].into_boxed_slice());
-            tx.commit()?;
+            self.commit_free_pbas(BOOTSTRAP_VOL_ORD, &[pba])?;
         }
         self.get_refcount(pba)
     }

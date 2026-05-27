@@ -811,7 +811,7 @@ impl PagedL2p {
 
     /// Variant of [`delete_at_lsn`](Self::delete_at_lsn) that also
     /// reports whether the leaf holding `lba` was shared with another
-    /// tree in the pre-op state. Used by `WalOp::L2pRangeDelete`'s
+    /// tree in the pre-op state. Used by `LifecycleOp::Discard`'s
     /// apply path for the same leaf-rc-suppress decision
     /// [`insert_at_lsn_with_share_info`](Self::insert_at_lsn_with_share_info)
     /// serves on the write side (SPEC §4.4).

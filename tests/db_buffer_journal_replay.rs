@@ -308,12 +308,9 @@ fn replay_recovers_promotion_chunk() {
         db.flush().unwrap();
         let snap = db.take_snapshot(src).unwrap();
         clone = db.clone_volume(snap).unwrap();
-        let mut tx = db.begin();
-        tx.promotion_chunk(clone, Box::new(pbas), None);
-        tx.commit().unwrap();
-        let mut tx = db.begin();
-        tx.promotion_complete(clone);
-        tx.commit().unwrap();
+        db.test_commit_promotion_chunk(clone, pbas.to_vec(), None)
+            .unwrap();
+        db.test_commit_promotion_complete(clone).unwrap();
         post_promote_watermark = db.lifecycle_applied_watermark();
         // Drop without flushing — promotion records survive only in
         // the lifecycle journal.
