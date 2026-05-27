@@ -104,6 +104,21 @@ impl Db {
             metrics.clone(),
         )?;
 
+        // Buffer-as-sole-journal Phase C.3: open a fresh lifecycle
+        // journal directory whenever the embedder runs in a non-WAL
+        // mode. Fresh DB → no segments yet, so `next_seq` is 1 and
+        // `LifecycleJournal::open` simply creates the directory and
+        // its first segment.
+        let lifecycle_journal = if !cfg.journal_mode.wal_authoritative() {
+            Some(Mutex::new(crate::lifecycle_log::LifecycleJournal::open(
+                &lifecycle_log_dir(&cfg.path),
+                1,
+                cfg.wal_segment_bytes,
+            )?))
+        } else {
+            None
+        };
+
         let volume_zero = Arc::new(Volume::new(BOOTSTRAP_VOLUME_ORD, l2p_shards, 0));
         let mut volumes = HashMap::with_capacity(1);
         volumes.insert(BOOTSTRAP_VOLUME_ORD, volume_zero);
@@ -199,6 +214,7 @@ impl Db {
             txg_sync: Mutex::new(None),
             buffer_applied_watermark: AtomicU64::new(0),
             lifecycle_applied_watermark: AtomicU64::new(0),
+            lifecycle_journal,
         };
         // Spawn refcount drainers (priority 3) — fresh DB has no
         // replay to worry about, so we can spawn unconditionally
@@ -607,6 +623,45 @@ impl Db {
             metrics.clone(),
         )?;
 
+        // Buffer-as-sole-journal Phase C.3: open the lifecycle journal
+        // pointing at the next un-checkpointed seq. Phase C.4 will fold
+        // any uncovered records into the in-memory state *before*
+        // returning to clients; for now we open at
+        // `manifest.lifecycle_replay_seq + 1` and reject if the on-disk
+        // tail outruns the manifest watermark — better an explicit
+        // error than silently dropping durable lifecycle work.
+        let lifecycle_journal = if !cfg.journal_mode.wal_authoritative() {
+            let dir = lifecycle_log_dir(&cfg.path);
+            let next_seq = manifest.lifecycle_replay_seq.saturating_add(1);
+            // Detect uncovered records before `LifecycleJournal::open`
+            // would silently extend the live segment.
+            let mut max_observed: u64 = manifest.lifecycle_replay_seq;
+            if dir.exists() {
+                crate::lifecycle_log::LifecycleJournal::replay(
+                    &dir,
+                    manifest.lifecycle_replay_seq,
+                    |rec| {
+                        max_observed = max_observed.max(rec.seq);
+                        Ok(())
+                    },
+                )?;
+            }
+            if max_observed > manifest.lifecycle_replay_seq {
+                return Err(MetaDbError::Corruption(format!(
+                    "metadb open found lifecycle records seq > {} (max observed {}) \
+                     but lifecycle replay is not implemented yet (Phase C.4 pending)",
+                    manifest.lifecycle_replay_seq, max_observed,
+                )));
+            }
+            Some(Mutex::new(crate::lifecycle_log::LifecycleJournal::open(
+                &dir,
+                next_seq,
+                cfg.wal_segment_bytes,
+            )?))
+        } else {
+            None
+        };
+
         // If anything was replayed, flush every tree + dedup memtable,
         // refresh the manifest from the post-replay in-memory roots,
         // advance `checkpoint_lsn`, and commit. This is important
@@ -811,6 +866,7 @@ impl Db {
             txg_sync: Mutex::new(None),
             buffer_applied_watermark: AtomicU64::new(0),
             lifecycle_applied_watermark: AtomicU64::new(0),
+            lifecycle_journal,
         };
         // Stamp `slot_max_lsn(open_txg)` with the post-replay
         // `last_applied`. `apply_replay_batch` and `apply_op_bare` fold

@@ -355,6 +355,14 @@ pub struct Db {
     /// lifecycle-log seq whose effects are in memory. Persisted as
     /// `manifest.lifecycle_replay_seq`.
     pub(crate) lifecycle_applied_watermark: AtomicU64,
+    /// Buffer-as-sole-journal Phase C.3 lifecycle journal. `Some` iff
+    /// the embedder selected a non-WAL [`crate::config::MetaDbJournalMode`]:
+    /// in that mode lifecycle ops (`CreateVolume`, `DropVolume`,
+    /// `CloneVolume`, `DropSnapshot`, promotion records) bypass the WAL
+    /// and append a single [`crate::lifecycle_log::op::LifecycleOp`]
+    /// record per fsync. WAL mode leaves the field `None` and the
+    /// existing `submit_wal_ops` path is unchanged.
+    pub(crate) lifecycle_journal: Option<Mutex<crate::lifecycle_log::LifecycleJournal>>,
 }
 
 /// Synchronous callback invoked with the freed-PBA set produced by a
@@ -1145,6 +1153,13 @@ fn page_file(root: &Path) -> PathBuf {
 /// Directory that holds the WAL segments.
 fn wal_dir(root: &Path) -> PathBuf {
     root.join("wal")
+}
+
+/// Directory that holds the lifecycle-log segments
+/// ([[buffer-as-sole-journal-c3]]). Only created when the embedder runs
+/// in a non-WAL [`crate::config::MetaDbJournalMode`].
+pub(crate) fn lifecycle_log_dir(root: &Path) -> PathBuf {
+    root.join("lifecycle_log")
 }
 
 fn clone_bound(bound: Bound<&u64>) -> Bound<u64> {

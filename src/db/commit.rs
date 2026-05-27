@@ -1172,6 +1172,50 @@ impl Db {
         Ok(outcome)
     }
 
+    /// Buffer-as-sole-journal Phase C.3 routing for lifecycle ops.
+    ///
+    /// In WAL mode (`journal_mode.wal_authoritative() == true`) this
+    /// degenerates to the legacy `submit_wal_ops` path — encodes the
+    /// `WalOp`, hands it to the WAL writer, returns the assigned LSN.
+    ///
+    /// In Buffer mode the WAL writer is bypassed: we reserve an LSN via
+    /// `WalSet::reserve_unlogged` (so apply still sees a monotonic LSN
+    /// and `last_applied_lsn` semantics are unchanged) and append the
+    /// equivalent `LifecycleOp` to the lifecycle journal. The journal's
+    /// per-record fsync replaces the WAL group-commit fsync as the
+    /// durability event for this op. The returned seq is published
+    /// through `lifecycle_applied_watermark` so the next checkpoint
+    /// commit stamps `manifest.lifecycle_replay_seq`.
+    ///
+    /// Callers must hold `apply_gate.write()` (every existing lifecycle
+    /// callsite does) — the watermark bump and the LSN reservation are
+    /// not synchronised against concurrent lifecycle submits otherwise.
+    pub(super) fn submit_lifecycle_op(
+        &self,
+        wal_op: &WalOp,
+        lifecycle_op: &crate::lifecycle_log::LifecycleOp,
+    ) -> Result<Lsn> {
+        if self.journal_mode.wal_authoritative() {
+            let body = try_encode_body(std::slice::from_ref(wal_op))?;
+            return self.submit_wal_ops(
+                std::slice::from_ref(wal_op),
+                body,
+                None,
+                crate::wal::set::SubmitOptions::default(),
+            );
+        }
+        let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
+            MetaDbError::Corruption(
+                "submit_lifecycle_op called without an open lifecycle journal".into(),
+            )
+        })?;
+        let body = crate::lifecycle_log::op::encode(lifecycle_op);
+        let lsn = self.wal.reserve_unlogged(|_| {})?;
+        let seq = journal.lock().append(&body)?;
+        self.set_lifecycle_applied_watermark(seq);
+        Ok(lsn)
+    }
+
     pub(super) fn submit_wal_ops(
         &self,
         ops: &[WalOp],
