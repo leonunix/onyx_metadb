@@ -662,6 +662,127 @@ impl Db {
         result
     }
 
+    /// Buffer-mode staging path. Identical apply semantics to
+    /// [`commit_ops_unlogged`] but skips:
+    ///
+    ///   * `register_dispatch_intent` — the dispatch_state per-LSN
+    ///     pending map is purely a serialisation handle for the lane
+    ///     path; stage runs apply on the caller thread, so there is no
+    ///     lane to coordinate.
+    ///   * `mark_wal_durable_and_wait_for_dispatch` — the 614 µs/commit
+    ///     wait observed on nvme-box. With no lane dispatch, there is
+    ///     nothing to wait on.
+    ///   * `acquire_commit_apply_gate` / `enter_active_apply` — the
+    ///     apply_gate read side is defence-in-depth against flush's
+    ///     manifest-commit write side; buffer-mode apply already
+    ///     serialises on each shard's `tree.write()` (via
+    ///     `force_compact_l2p_buffers` during sync) so the read gate
+    ///     is redundant for this path.
+    ///
+    /// What still happens — `finish_global_apply(lsn)` is REQUIRED:
+    /// `last_applied_lsn` is a contiguous-prefix watermark fed by
+    /// `applied_set` pops. Lifecycle ops (PromotionChunk / FreePbas /
+    /// range_delete / DropSnapshot) park on
+    /// `wait_for_global_apply_turn(lsn)` until the watermark covers
+    /// `lsn - 1`. Skipping `finish_global_apply` would leave gaps in
+    /// the prefix and any later lifecycle op would wait forever.
+    ///
+
+    /// What still happens, preserving correctness:
+    ///
+    ///   * `drop_gate.read()` — keeps lifecycle ops (drop_snapshot /
+    ///     drop_volume / clone_volume / range_delete / create_volume /
+    ///     take_snapshot) from racing with our apply. Lifecycle paths
+    ///     hold `drop_gate.write()` across their forced TXG sync and
+    ///     plan-then-apply, so they observe a quiesced state.
+    ///   * `TxgGuard` pinned **before** LSN allocation. The
+    ///     `closing_open` flag in `TxgStateMachine::roll_to_quiescing`
+    ///     blocks new `enter()` while a roll is mid-drain, preserving
+    ///     `max(LSN in TXG_n) <= min(LSN in TXG_n+1)`. This is the
+    ///     invariant `wal_checkpoint = slot_max_lsn(txg)` relies on.
+    ///   * `lsn_alloc.reserve(|_| {})` — bumps the global LSN counter
+    ///     under a brief mutex. The callback is a no-op (no dispatch
+    ///     intent registration).
+    ///   * `apply_commit_batch` — synchronous apply, identical to
+    ///     `commit_ops`'s serial-fallback path. For batches ≥ 8 ops
+    ///     it routes through `apply_ops_grouped` (per-shard bucketing).
+    ///     For smaller batches and snapshot-bearing volumes it loops
+    ///     `apply_op_bare`.
+    ///
+    /// Idempotency under onyx LV2 buffer replay:
+    ///
+    ///   * L2P: `L2pValue::seq` guards `apply_l2p_bucket_buffer` —
+    ///     stale-seq replays are rejected and produce no buffer
+    ///     mutation.
+    ///   * Refcount: `RcShard::stage` has a page_lsn-based replay-skip
+    ///     for entries whose target page already reflects this LSN.
+    ///   * Dedup: `apply_dedup_*_with_rc` reads the current value
+    ///     before mutating; same-LSN replays are no-ops.
+    ///
+    /// This is the **hot path** for onyx writes: the writer batches
+    /// dozens to hundreds of `L2pRemap` + `DedupPut` ops per call.
+    /// The savings vs `commit_ops_unlogged` is the per-call dispatch
+    /// wait (~614 µs at j16d32 randwrite on the nvme-box baseline);
+    /// the apply work itself is unchanged.
+    pub fn stage_ops(&self, ops: &[WalOp]) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+        if ops.is_empty() {
+            self.metrics.record_commit_empty();
+            return Ok((self.last_applied_lsn(), Vec::new()));
+        }
+        let stage_started = std::time::Instant::now();
+        self.metrics.record_commit_attempt(ops.len());
+
+        let drop_gate_started = std::time::Instant::now();
+        let _drop_guard = self.drop_gate.read();
+        self.metrics
+            .record_commit_drop_gate_wait(drop_gate_started.elapsed());
+
+        let volumes = self.volumes.read().clone();
+
+        // TxgGuard before LSN reserve: the `closing_open` invariant
+        // (txg/mod.rs) blocks `enter()` during a roll's drain, so any
+        // LSN we allocate is bounded above by every later TXG's LSNs.
+        let _txg_guard = self.txg.enter();
+        let lsn_started = std::time::Instant::now();
+        let lsn = match self.lsn_alloc.reserve(|_| {}) {
+            Ok(lsn) => lsn,
+            Err(err) => {
+                self.metrics.record_commit_error(stage_started.elapsed());
+                self.poison_commit_waiters(&err);
+                return Err(err);
+            }
+        };
+        self.metrics
+            .record_commit_wal_submit(lsn_started.elapsed());
+        _txg_guard.record_lsn(lsn);
+
+        let apply_started = std::time::Instant::now();
+        let outcomes = match self.apply_commit_batch(&volumes, lsn, _txg_guard.txg(), ops) {
+            Ok(outcomes) => outcomes,
+            Err(err) => {
+                self.metrics.record_commit_apply(apply_started.elapsed());
+                self.metrics.record_commit_error(stage_started.elapsed());
+                self.poison_commit_waiters(&err);
+                return Err(err);
+            }
+        };
+        self.metrics.record_commit_apply(apply_started.elapsed());
+
+        // Bump the contiguous-prefix watermark via applied_set. Without
+        // this, lifecycle ops parking on `wait_for_global_apply_turn`
+        // would stall forever — their LSN would always be `> applied + 1`
+        // because the staged LSNs never enter `applied_set`. The
+        // `finish_global_apply` call itself only touches in-memory
+        // counters; it does not interact with dispatch_state.
+        if let Err(err) = self.finish_global_apply(lsn) {
+            self.metrics.record_commit_error(stage_started.elapsed());
+            return Err(err);
+        }
+        self.metrics
+            .record_commit_success(stage_started.elapsed());
+        Ok((lsn, outcomes))
+    }
+
     /// ZFS-TXG-clone Phase 1 eligibility check.
     ///
     /// The L2P-direct fast path can carry a commit iff:

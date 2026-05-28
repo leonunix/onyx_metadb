@@ -698,6 +698,234 @@ fn commit_ops_deferred_handle_drop_does_not_leak_sender() {
     assert_eq!(outs.len(), 1);
 }
 
+// -------- ZFS-TXG-clone onyx-side stager (`Db::stage_ops`) --------
+
+/// Empty batch returns `(last_applied_lsn, [])` and bumps the
+/// `commit_empty` counter — same observable behaviour as
+/// `commit_ops_unlogged` / `commit_ops_deferred`.
+#[test]
+fn stage_ops_empty_batch_is_noop() {
+    let (_d, db) = mk_deferred_apply_db(true);
+    let pre = db.last_applied_lsn();
+    let (lsn, outs) = db.stage_ops(&[]).unwrap();
+    assert_eq!(lsn, pre);
+    assert!(outs.is_empty());
+}
+
+/// L2P-only batch: stage_ops applies into the buffer slot and reads
+/// observe the value immediately through `multi_get` (which consults
+/// `lookup_for_open_txg` before falling through to the tree).
+#[test]
+fn stage_ops_l2p_put_visible_to_reads() {
+    let (_d, db) = mk_deferred_apply_db(true);
+    let ops: Vec<WalOp> = (0..32u64)
+        .map(|i| WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 1_000 + i,
+            value: l2p_value_with_pba(0xCAFE + i),
+        })
+        .collect();
+    let (lsn, outs) = db.stage_ops(&ops).unwrap();
+    assert!(lsn > 0);
+    assert_eq!(outs.len(), 32);
+    for i in 0..32 {
+        let got = db.get(BOOTSTRAP_VOLUME_ORD, 1_000 + i).unwrap();
+        assert_eq!(got, Some(l2p_value_with_pba(0xCAFE + i)));
+    }
+}
+
+/// stage_ops + commit_ops_deferred operate on the same database
+/// state — a value written by stage is visible to a later
+/// deferred-commit batch's read, and vice-versa.
+#[test]
+fn stage_ops_interleaves_with_commit_ops_deferred() {
+    let (_d, db) = mk_deferred_apply_db(true);
+
+    // Stage at lba=5, then deferred-commit at lba=6.
+    let staged = l2p_value_with_pba(0x1111).with_seq(7);
+    let committed = l2p_value_with_pba(0x2222).with_seq(7);
+    let (lsn_a, _) = db
+        .stage_ops(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 5,
+            value: staged,
+        }])
+        .unwrap();
+    let (lsn_b, h) = db
+        .commit_ops_deferred(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 6,
+            value: committed,
+        }])
+        .unwrap();
+    db.test_force_compact_pass();
+    let _ = h.recv().unwrap();
+    assert!(lsn_b > lsn_a, "later commit must get a higher LSN");
+
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 5).unwrap(), Some(staged));
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 6).unwrap(), Some(committed));
+}
+
+/// stage_ops respects the L2pValue.seq guard: a later stage with a
+/// stale seq is rejected, leaving the on-disk value unchanged. This is
+/// what carries idempotency under onyx LV2 buffer replay (a re-staged
+/// op with the same per-LBA monotonic seq is silently dropped).
+#[test]
+fn stage_ops_seq_guard_rejects_stale_replay() {
+    let (_d, db) = mk_deferred_apply_db(true);
+
+    // Seed lba=42 with seq=10.
+    let seeded = l2p_value_with_pba(0xAAAA).with_seq(10);
+    let (_, _) = db
+        .stage_ops(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 42,
+            value: seeded,
+        }])
+        .unwrap();
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 42).unwrap(), Some(seeded));
+
+    // Replay with seq=5 → guard rejects, value stays at seeded.
+    let stale = l2p_value_with_pba(0xBBBB).with_seq(5);
+    let (_, outs) = db
+        .stage_ops(&[WalOp::L2pRemap {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 42,
+            new_value: stale,
+            guard: None,
+        }])
+        .unwrap();
+    assert_eq!(outs.len(), 1);
+    match &outs[0] {
+        ApplyOutcome::L2pRemap { applied, prev, .. } => {
+            assert!(!*applied, "stale-seq remap must be rejected");
+            assert_eq!(*prev, Some(seeded));
+        }
+        other => panic!("expected L2pRemap outcome, got {other:?}"),
+    }
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 42).unwrap(), Some(seeded));
+}
+
+/// Concurrent stage_ops from many threads land with distinct LSNs and
+/// every write is observable. Exercises the LsnAllocator + TxgGuard
+/// monotonicity invariant under contention.
+#[test]
+fn stage_ops_concurrent_writers_all_visible() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let (_d, db) = mk_deferred_apply_db(true);
+    let db = Arc::new(db);
+    let n_threads = 8;
+    let per_thread = 64;
+    let handles: Vec<_> = (0..n_threads)
+        .map(|t| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                let mut lsns = Vec::with_capacity(per_thread);
+                for i in 0..per_thread {
+                    let lba = (t as u64) * 10_000 + i as u64;
+                    let val = l2p_value_with_pba(0x10_000 + lba);
+                    let (lsn, _) = db
+                        .stage_ops(&[WalOp::L2pPut {
+                            vol_ord: BOOTSTRAP_VOLUME_ORD,
+                            lba,
+                            value: val,
+                        }])
+                        .unwrap();
+                    lsns.push(lsn);
+                }
+                lsns
+            })
+        })
+        .collect();
+    let mut all_lsns: Vec<u64> = Vec::new();
+    for h in handles {
+        all_lsns.extend(h.join().unwrap());
+    }
+    // Every assigned LSN must be unique (LsnAllocator under-mutex
+    // increment).
+    let unique: std::collections::HashSet<u64> = all_lsns.iter().copied().collect();
+    assert_eq!(unique.len(), all_lsns.len(), "LSNs must be unique");
+
+    // Every write must be observable post-stage.
+    for t in 0..n_threads {
+        for i in 0..per_thread {
+            let lba = (t as u64) * 10_000 + i as u64;
+            assert_eq!(
+                db.get(BOOTSTRAP_VOLUME_ORD, lba).unwrap(),
+                Some(l2p_value_with_pba(0x10_000 + lba)),
+                "lost stage for (t={t}, i={i}, lba={lba})"
+            );
+        }
+    }
+}
+
+/// stage_ops does NOT register a dispatch intent or wait on
+/// `mark_wal_durable_and_wait_for_dispatch`. After staging a batch,
+/// `dispatch_state.pending` must be empty — otherwise a later
+/// `commit_ops` would block forever on
+/// `mark_wal_durable_and_wait_for_dispatch`.
+#[test]
+fn stage_ops_does_not_register_dispatch_intent() {
+    let (_d, db) = mk_deferred_apply_db(true);
+    let ops: Vec<WalOp> = (0..16u64)
+        .map(|i| WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 7_000 + i,
+            value: l2p_value_with_pba(0x9000 + i),
+        })
+        .collect();
+    let _ = db.stage_ops(&ops).unwrap();
+    let pending = db.dispatch_state.lock().pending.len();
+    assert_eq!(
+        pending, 0,
+        "stage_ops must not leave dispatch reservations behind"
+    );
+
+    // Sanity: a subsequent commit_ops_deferred call completes without
+    // hanging on dispatch.
+    let (_, h) = db
+        .commit_ops_deferred(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 7_999,
+            value: l2p_value_with_pba(0xDEAD),
+        }])
+        .unwrap();
+    db.test_force_compact_pass();
+    let outs = h.recv().unwrap();
+    assert_eq!(outs.len(), 1);
+}
+
+/// stage_ops + force flush + reopen: the value persists through a
+/// metadb checkpoint cycle. This is the durability handover from the
+/// onyx LV2 buffer (which the caller would have already fsynced)
+/// to the metadb on-disk tree.
+#[test]
+fn stage_ops_persists_across_flush_and_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.commit_direct_apply_enabled = true;
+    cfg.commit_deferred_outcomes_enabled = true;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    let val = l2p_value_with_pba(0xC0DE_C0DE).with_seq(1);
+    let (_, _) = db
+        .stage_ops(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 99,
+            value: val,
+        }])
+        .unwrap();
+    db.flush().unwrap();
+    drop(db);
+
+    let cfg2 = crate::config::Config::new(dir.path());
+    let db2 = Db::open_with_config(cfg2).unwrap();
+    assert_eq!(db2.get(BOOTSTRAP_VOLUME_ORD, 99).unwrap(), Some(val));
+}
+
 /// Deferred mode delivers the L2pRemapRange merged outcome shape
 /// correctly (cross-shard fan-in via `merge_l2p_outcome`).
 #[test]

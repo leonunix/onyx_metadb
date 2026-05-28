@@ -378,6 +378,17 @@ impl<'db> Transaction<'db> {
         self.db.commit_ops_unlogged(&self.ops)
     }
 
+    /// ZFS-TXG-clone onyx-side stager. Like [`commit_unlogged_with_outcomes`]
+    /// but bypasses the per-LSN dispatch wait (`mark_wal_durable_and_wait_for_dispatch`,
+    /// ~614 µs/commit on nvme-box). Apply runs synchronously on the
+    /// caller thread under a `TxgGuard`; durability is via the caller's
+    /// LV2 buffer until the next metadb TXG sync covers this LSN.
+    /// See [`Db::stage_ops`] for the full invariant list.
+    pub fn commit_staged_with_outcomes(mut self) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+        self.resolve_dedup_old_pbas()?;
+        self.db.stage_ops(&self.ops)
+    }
+
     /// ZFS-TXG-clone Phase 2: like
     /// [`commit_with_outcomes`](Self::commit_with_outcomes) but returns
     /// a [`crate::DeferredOutcomeHandle`] instead of the outcomes vec.
