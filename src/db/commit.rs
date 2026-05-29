@@ -774,10 +774,17 @@ impl Db {
         // because the staged LSNs never enter `applied_set`. The
         // `finish_global_apply` call itself only touches in-memory
         // counters; it does not interact with dispatch_state.
+        let finish_started = std::time::Instant::now();
         if let Err(err) = self.finish_global_apply(lsn) {
             self.metrics.record_commit_error(stage_started.elapsed());
             return Err(err);
         }
+        // stage_ops is the buffer-direct hot path; the laned path records
+        // this via `record_commit_finish_global_wait` but stage_ops did
+        // not, leaving the global watermark-bump cost (last_applied_lsn +
+        // applied_set mutexes) folded into the opaque apply bucket.
+        self.metrics
+            .record_commit_finish_global_wait(finish_started.elapsed());
         self.metrics
             .record_commit_success(stage_started.elapsed());
         Ok((lsn, outcomes))
