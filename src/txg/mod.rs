@@ -240,12 +240,36 @@ impl TxgStateMachine {
     }
 
     /// Promote a Quiescing TXG to Syncing. `inflight` must be zero.
+    ///
+    /// **Blocks until the previous Syncing TXG has been consumed**
+    /// (`mark_synced` cleared `syncing_txg`), enforcing "at most one
+    /// Syncing". The quiesce worker is allowed to roll + quiesce TXG N+1
+    /// while TXG N is still syncing (ZFS-style 3-concurrent
+    /// open/quiescing/syncing, bounded by the ring-full wait in
+    /// `roll_to_quiescing`), but the handoff INTO Syncing must wait for
+    /// N's sync to finish. Without this wait, a `TxgSyncThread` that lags
+    /// the roll cadence (e.g. `write_dirty_pages` under load) would let
+    /// the worker promote a second TXG into Syncing — previously a
+    /// `debug_assert` that panicked the worker, orphaned the sync thread,
+    /// and hung every `wait_until_synced` (a shutdown deadlock). This is
+    /// the metadb equivalent of ZFS `txg_quiesce_thread` waiting on
+    /// `txg_has_quiesced_to_sync`.
+    ///
+    /// On the threads-off inline flush path this never waits:
+    /// `mark_synced` for the prior TXG has already run before the next
+    /// `roll_to_quiescing` → `promote_to_syncing`. Returns without
+    /// promoting under shutdown (the caller re-checks `quiescing_txg`).
     pub fn promote_to_syncing(&self, txg: Txg) {
         let mut g = self.inner.lock();
         let idx = (txg & TXG_INDEX_MASK) as usize;
+        while g.syncing_txg.is_some() && !g.shutdown {
+            self.cv.wait(&mut g);
+        }
+        if g.shutdown {
+            return;
+        }
         debug_assert_eq!(g.slots[idx].state, TxgState::Quiescing);
         debug_assert_eq!(g.slots[idx].inflight, 0);
-        debug_assert!(g.syncing_txg.is_none(), "two TXGs in Syncing");
         debug_assert_eq!(g.quiescing_txg, Some(txg));
         g.slots[idx].state = TxgState::Syncing;
         g.quiescing_txg = None;
@@ -475,6 +499,41 @@ mod tests {
         assert_eq!(s.slots[3].0, TxgState::Open);
         assert_eq!(s.slots[0].0, TxgState::Empty);
         let _ = q2;
+    }
+
+    #[test]
+    fn promote_blocks_until_prior_sync_consumed() {
+        // Regression for the threads-on shutdown deadlock: the quiesce
+        // worker may roll + quiesce TXG 2 while TXG 1 is still Syncing
+        // (3-concurrent), but promoting TXG 2 INTO Syncing must wait for
+        // TXG 1's sync to be consumed. This used to be a debug_assert
+        // ("two TXGs in Syncing") that panicked the quiesce worker when a
+        // slow TxgSyncThread let it get ahead — orphaning the sync worker
+        // and hanging every wait_until_synced.
+        let sm = Arc::new(TxgStateMachine::new(0));
+        let q1 = sm.roll_to_quiescing();
+        sm.promote_to_syncing(q1);
+        assert_eq!(sm.snapshot().syncing_txg, Some(1));
+        // Roll TXG 2 -> Quiescing while TXG 1 is still Syncing: allowed
+        // (ring-full has a free slot), this is the 3-concurrent state.
+        let q2 = sm.roll_to_quiescing();
+        assert_eq!(q2, 2);
+        assert_eq!(sm.snapshot().quiescing_txg, Some(2));
+        assert_eq!(sm.snapshot().syncing_txg, Some(1));
+        // promote(2) must BLOCK until TXG 1's sync is consumed.
+        let sm2 = Arc::clone(&sm);
+        let h = thread::spawn(move || sm2.promote_to_syncing(2));
+        thread::sleep(Duration::from_millis(40));
+        assert!(
+            !h.is_finished(),
+            "promote_to_syncing must block while another TXG is still Syncing"
+        );
+        // Consume TXG 1's sync; the blocked promote now proceeds.
+        sm.mark_synced(1);
+        h.join().unwrap();
+        let s = sm.snapshot();
+        assert_eq!(s.syncing_txg, Some(2));
+        assert_eq!(s.quiescing_txg, None);
     }
 
     // Ring-full block path (slot[(open+1) & 3] not Empty) is exercised by
