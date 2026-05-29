@@ -137,6 +137,21 @@ impl L2pBuffer {
         std::mem::take(&mut *self.slots[(txg & TXG_INDEX_MASK) as usize].lock())
     }
 
+    /// Clone (without removing) the entries of the slot indexed by
+    /// `txg & (TXG_SIZE - 1)`. Used by the threads-on per-syncing-slot
+    /// drain ([`crate::db::Db::drain_syncing_slot_into_trees`]) to fold
+    /// the entries into the tree and PUBLISH the read view *before*
+    /// clearing the slot — so a concurrent `lookup_for_open_txg` (a
+    /// commit's prev-value read or a user read, both of which lock this
+    /// slot during their walk) never observes the gap "slot already
+    /// emptied but tree/read_view not yet updated" and falsely reports
+    /// `prev = None`. Correct only when the slot is frozen (Syncing
+    /// state, no concurrent inserts) so the clone equals the subsequent
+    /// [`Self::take_syncing_slot`] clear.
+    pub fn snapshot_syncing_slot(&self, txg: Txg) -> HashMap<Lba, BufferEntry> {
+        self.slots[(txg & TXG_INDEX_MASK) as usize].lock().clone()
+    }
+
     /// Drain every slot and merge into a single map. Caller (the
     /// `flush_with_gate` inline path under `apply_gate.write()`) is
     /// the sole writer in this case — no commit can be stamping a TXG

@@ -179,6 +179,13 @@ impl Drop for TxgQuiesceThread {
 }
 
 fn run_worker(inner: Arc<Inner>) {
+    // Pin to the TxgSync CPU set (ordinal 1 so it lands on a different
+    // CPU than the heavy sync worker at ordinal 0 when the set has >1
+    // CPU). The quiesce worker is light (rolls on a timer + brief
+    // inflight-drain wait) but must not float onto the hot front-end
+    // cores where its roll's `closing_open` window would interleave
+    // with the commit path.
+    crate::affinity::bind_current(crate::affinity::ThreadRole::TxgSync, 1);
     let timeout = Duration::from_millis(inner.params.txg_timeout_ms.max(1));
     while !inner.shutdown.load(Ordering::Acquire) {
         // Wait either for the txg_timeout to elapse or a force-roll

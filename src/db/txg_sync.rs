@@ -233,6 +233,13 @@ impl Drop for TxgSyncThread {
 }
 
 fn run_worker(inner: Arc<Inner>) {
+    // Pin to the dedicated TxgSync CPU set (`l2p_compactor_cpus`). This
+    // is the heavy drain+checkpoint worker; without pinning the kernel
+    // co-locates it on the hot front-end / apply-lane CPUs and its
+    // `write_dirty_pages` work steals cycles from the commit path. In
+    // the threads-off model this work ran on the (pinned)
+    // metadb-checkpoint thread, so binding here restores that placement.
+    crate::affinity::bind_current(crate::affinity::ThreadRole::TxgSync, 0);
     while !inner.shutdown.load(Ordering::Acquire) {
         inner.notifier.wait();
         if inner.shutdown.load(Ordering::Acquire) {

@@ -24,6 +24,15 @@ fn cfg_threads_enabled(dir: &TempDir, txg_timeout_ms: u64) -> Config {
     cfg
 }
 
+/// Threads on + buffer mode: this is the onyx production shape, where
+/// the background sync drains only the frozen syncing slot per cycle
+/// (`drain_syncing_slot_into_trees`, publish-before-clear).
+fn cfg_threads_and_buffer(dir: &TempDir, txg_timeout_ms: u64) -> Config {
+    let mut cfg = cfg_threads_enabled(dir, txg_timeout_ms);
+    cfg.l2p_buffer_enabled = true;
+    cfg
+}
+
 #[test]
 fn open_close_with_txg_threads_enabled_is_clean() {
     let dir = TempDir::new().unwrap();
@@ -75,10 +84,11 @@ fn checkpoint_txg_persists_across_reopen() {
 #[test]
 fn quiesce_thread_advances_checkpoint_txg_over_time() {
     // Threads enabled with a fast timer; the in-memory checkpoint_txg
-    // should advance even without manual triggers. The default sync_work
-    // is a no-op (Step 7 wiring), so checkpoint_txg advances purely as
-    // a state-machine artifact — but it does advance, and that confirms
-    // the quiesce → sync thread plumbing works end-to-end.
+    // should advance even without manual triggers. `sync_work` is the
+    // real `run_sync_cycle` (Step 8 wiring), and with no dirty L2P
+    // shards each cycle is a near-no-op sync — but checkpoint_txg still
+    // advances, confirming the quiesce → sync thread plumbing works
+    // end-to-end.
     use onyx_metadb::Db;
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
@@ -99,4 +109,102 @@ fn quiesce_thread_advances_checkpoint_txg_over_time() {
         "expected checkpoint_txg >= 3 in 600ms, got {}",
         db.txg_checkpoint_for_test()
     );
+}
+
+#[test]
+fn threads_on_buffer_per_slot_drain_read_your_writes_and_recovery() {
+    // onyx production shape: threads on + buffer mode. The background
+    // TxgSyncThread drains only the frozen syncing slot per cycle
+    // (`drain_syncing_slot_into_trees`, publish-before-clear). Across
+    // many writes spread over several TXG cycles, every value must stay
+    // readable (read-your-writes through buffer → drain → tree), and a
+    // flush()+reopen must recover them all (the in-order sync chain
+    // started by flush drains every slot ≤ the forced TXG).
+    let dir = TempDir::new().unwrap();
+    const BATCHES: u64 = 6;
+    const PER_BATCH: u64 = 50;
+    let ord;
+    {
+        // Fast timer so the quiesce/sync threads roll repeatedly while
+        // we write — exercising the per-slot drain against live inserts.
+        let db = Db::create_with_config(cfg_threads_and_buffer(&dir, 30)).unwrap();
+        ord = db.create_volume().unwrap();
+        for b in 0..BATCHES {
+            for i in 0..PER_BATCH {
+                let lba = b * PER_BATCH + i;
+                db.insert(ord, lba, v((lba % 250) as u8 + 1)).unwrap();
+            }
+            // Let the background threads roll + drain this batch's slot
+            // before the next batch, so reads span buffered + folded.
+            thread::sleep(Duration::from_millis(45));
+        }
+        // Read-your-writes: every LBA still resolves, whether its entry
+        // is still in a buffer slot or already folded into the tree by a
+        // background sync.
+        for lba in 0..(BATCHES * PER_BATCH) {
+            let got = db.get(ord, lba).unwrap();
+            assert_eq!(
+                got,
+                Some(v((lba % 250) as u8 + 1)),
+                "read-your-writes failed for lba {lba} before flush"
+            );
+        }
+        // Forced flush drains every slot ≤ the forced TXG via the
+        // in-order sync chain, making all writes durable before drop.
+        db.flush().unwrap();
+    }
+    // Reopen: only durable (folded) state survives in standalone metadb
+    // (the RAM buffer is gone). The flush above must have folded
+    // everything, so all values recover.
+    let db = Db::open_with_config(cfg_threads_and_buffer(&dir, 30)).unwrap();
+    for lba in 0..(BATCHES * PER_BATCH) {
+        let got = db.get(ord, lba).unwrap();
+        assert_eq!(
+            got,
+            Some(v((lba % 250) as u8 + 1)),
+            "value for lba {lba} lost across flush+reopen"
+        );
+    }
+}
+
+#[test]
+fn threads_on_buffer_checkpoint_txg_consistent_across_cycles() {
+    // Guards the flush.rs `checkpoint_txg = txg` fix: under threads-on a
+    // background roll can advance open_txg past the syncing TXG while
+    // run_sync_cycle_body runs, so persisting `open_txg - 1` would drift
+    // checkpoint_txg ahead of the data this manifest committed. Across
+    // several write+flush cycles + reopens, checkpoint_txg must advance
+    // monotonically, persist, and never desync from recoverable data.
+    let dir = TempDir::new().unwrap();
+    let ord;
+    let mut last_cp: u64 = 0;
+    {
+        let db = Db::create_with_config(cfg_threads_and_buffer(&dir, 30)).unwrap();
+        ord = db.create_volume().unwrap();
+        for cycle in 0..4u64 {
+            for i in 0..20u64 {
+                let lba = cycle * 20 + i;
+                db.insert(ord, lba, v((lba % 250) as u8 + 1)).unwrap();
+            }
+            db.flush().unwrap();
+            let cp = db.manifest().checkpoint_txg;
+            assert!(
+                cp >= last_cp,
+                "checkpoint_txg regressed: {cp} < {last_cp} (cycle {cycle})"
+            );
+            last_cp = cp;
+        }
+    }
+    // Reopen resumes at the persisted checkpoint_txg and all data is
+    // present; a further flush advances checkpoint_txg by exactly one
+    // TXG from the resumed open (checkpoint_txg + 1).
+    let db = Db::open_with_config(cfg_threads_and_buffer(&dir, 30)).unwrap();
+    assert_eq!(db.manifest().checkpoint_txg, last_cp);
+    for lba in 0..80u64 {
+        assert_eq!(
+            db.get(ord, lba).unwrap(),
+            Some(v((lba % 250) as u8 + 1)),
+            "value for lba {lba} lost across reopen"
+        );
+    }
 }

@@ -414,19 +414,24 @@ impl Db {
             shards: &self.refcount_shards,
         };
 
-        // B2: force-compact all L2P buffers so the sample phase
-        // observes a tree that reflects every committed LSN up to
-        // `last_applied_lsn`. With the sample-phase gate dropped,
-        // concurrent commits could in principle re-populate slots
-        // mid-drain. In practice every lifecycle op (the only path
-        // that genuinely needs a TXG-frozen view) drives its own
-        // forced sync under `drop_gate.write`; that drain is what
-        // this call inside lifecycle is a defensive no-op of.
-        // For ordinary `try_flush` / `flush` callers, residual
-        // racing inserts are handled the same way they are at the
-        // shard-tree level: per-shard `tree.write()` serialises the
-        // compactor against any commit's `cow_for_write`.
-        self.force_compact_l2p_buffers()?;
+        // Fold the buffered L2P updates into the tree so the sample
+        // phase observes them. Two drains:
+        //
+        // - **threads-ON** (`TxgSyncThread` driving this for one TXG):
+        //   `drain_syncing_slot_into_trees(txg)` folds ONLY the frozen
+        //   syncing slot, publish-before-clear (the ZFS per-TXG
+        //   separation). Open/Quiescing slots stay buffered and drain on
+        //   their own future cycles, bounding each sync to one TXG's
+        //   writes.
+        // - **threads-OFF** (inline `flush_with_gate` is the sole
+        //   drainer): `force_compact_l2p_buffers` folds ALL slots so a
+        //   single flush persists everything. Lifecycle ops also use the
+        //   drain-all path under `drop_gate.write`.
+        if self.txg_threads_enabled {
+            self.drain_syncing_slot_into_trees(txg)?;
+        } else {
+            self.force_compact_l2p_buffers()?;
+        }
 
         let sample_started = std::time::Instant::now();
         // `slot_max_lsn(txg)` is the TXG-frozen high-water LSN of
@@ -979,17 +984,23 @@ impl Db {
         manifest_state.manifest.lifecycle_replay_seq = self
             .lifecycle_applied_watermark
             .load(std::sync::atomic::Ordering::Acquire);
-        // ZFS-TXG-clone Phase 4: persist `checkpoint_txg = open_txg - 1`
-        // so a re-open's `TxgStateMachine::new(checkpoint_txg)` resumes
-        // with `open_txg = checkpoint_txg + 1` and the new open slot
-        // sits where the previous open left off. We use `open_txg - 1`
-        // rather than `checkpoint_txg()` because the live state machine
-        // only advances `checkpoint_txg` when `TxgSyncThread::mark_synced`
-        // is called — Phase 4 Step 7 ships the threads default-off, so
-        // `mark_synced` never fires unless the operator enables them.
-        // Saturating sub guards the bootstrap path where `open_txg == 1`
-        // and `checkpoint_txg = 0` is the correct durable value.
-        manifest_state.manifest.checkpoint_txg = self.txg.open_txg().saturating_sub(1);
+        // ZFS-TXG-clone Phase 4/5: persist `checkpoint_txg = txg` — the
+        // TXG this sync cycle is actually syncing. The pages this
+        // manifest commits carry exactly `txg`'s data (the syncing slot
+        // folded above + everything ≤ `txg` already on disk), so
+        // `checkpoint_txg` must name `txg`.
+        //
+        // Do NOT use `open_txg() - 1`: under `txg_threads_enabled` the
+        // background `TxgQuiesceThread` can roll the Open TXG forward
+        // while this body runs, so `open_txg - 1` may be `txg + 1` even
+        // though this manifest only persisted `txg`'s pages. Persisting
+        // `txg + 1` would make a re-open's `TxgStateMachine::new(txg+1)`
+        // skip `txg+1`'s accounting. `txg` keeps the manifest invariant
+        // `checkpoint_txg + 1 <= open_txg` and stays consistent with the
+        // `checkpoint_lsn` computed from this same TXG's `slot_max_lsn`.
+        // (Threads-off is unaffected: there `open_txg - 1 == txg` because
+        // nothing rolls between promote and mark_synced.)
+        manifest_state.manifest.checkpoint_txg = txg;
         // Tier 2.B Stage 1: persist per-shard durable_seq alongside
         // the global checkpoint_lsn. Same inputs as the min()
         // computation above, but expanded into per-shard arrays.

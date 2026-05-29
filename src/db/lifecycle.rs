@@ -531,10 +531,17 @@ impl Db {
                 }
                 let started = Instant::now();
                 let mut tree = shard.tree.write();
-                // Drain ALL four TXG slots in one shot (caller holds
-                // `apply_gate.write` so no commit can stamp into a
-                // slot mid-drain; the sync thread serialises on the
-                // same `tree.write()` so it won't conflict either).
+                // Drain ALL four TXG slots in one shot. Used only by
+                // paths that need every slot folded NOW: lifecycle ops
+                // (which hold `drop_gate.write`, so the slots are
+                // quiesced), the post-replay open, and the threads-OFF
+                // inline flush. The regular threads-ON per-TXG sync uses
+                // `drain_syncing_slot_into_trees` instead (drains only
+                // the frozen syncing slot, publish-before-clear). Note:
+                // this drain is NOT publish-before-clear, so on the
+                // threads-OFF inline-flush path a concurrent commit can
+                // still hit the (rare) stale-`prev` race — acceptable
+                // there because that path is being retired.
                 let drained = shard.l2p_buffer.drain_all_slots();
                 if drained.is_empty() {
                     drop(tree);
@@ -548,6 +555,84 @@ impl Db {
                     Ok(()) => {
                         super::apply::publish_l2p_read_view(shard, &tree);
                         drop(tree);
+                        shard.l2p_buffer.note_compacted(max_lsn);
+                        self.metrics
+                            .record_l2p_buffer_compaction(count, started.elapsed());
+                    }
+                    Err(err) => {
+                        drop(tree);
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Threads-ON per-TXG sync drain: fold ONLY the frozen syncing slot
+    /// (`txg & 3`) of every L2P shard into its tree, the ZFS-faithful
+    /// per-TXG separation the 4-slot ring was built for. The Open and
+    /// Quiescing slots are left untouched — they drain on their own
+    /// future sync cycles, so each cycle's work is bounded by one TXG's
+    /// writes (≈ `txg_timeout`) instead of the whole accumulated backlog.
+    ///
+    /// **Publish-before-clear** is the load-bearing correctness rule.
+    /// `lookup_for_open_txg` (used by both a commit's prev-value read in
+    /// `apply_l2p_bucket_buffer` and a user read) walks `open .. open-2`,
+    /// which includes the syncing slot, and falls through to `read_view`
+    /// only on a miss. If we cleared the slot before folding+publishing,
+    /// a concurrent lookup could miss the (now empty) slot and read the
+    /// stale `read_view`, falsely reporting `prev = None` → a refcount /
+    /// space leak on the onyx side. So per shard, under `tree.write()`:
+    ///   1. snapshot the syncing slot (clone, NOT clear) — readers still
+    ///      hit the live slot entries during the fold;
+    ///   2. fold the snapshot into the tree;
+    ///   3. `publish_l2p_read_view` — the tree/read_view now carry the
+    ///      entries;
+    ///   4. `take_syncing_slot` (clear). A lookup that acquires the slot
+    ///      lock after this sees it empty, and the slot-lock release/
+    ///      acquire edge guarantees it then observes the published view.
+    /// The slot being frozen (Syncing state, no concurrent inserts) is
+    /// what makes the step-1 snapshot equal the step-4 clear.
+    ///
+    /// We clone in step 1 rather than hold the slot lock across the fold
+    /// so a concurrent `lookup_for_open_txg` is never blocked for the
+    /// fold's duration (read-latency protection).
+    pub(super) fn drain_syncing_slot_into_trees(&self, txg: crate::types::Txg) -> Result<()> {
+        use std::time::Instant;
+        if !self.l2p_buffer_enabled {
+            return Ok(());
+        }
+        let vols: Vec<Arc<Volume>> = {
+            let map = self.volumes.read();
+            let mut out: Vec<Arc<Volume>> = map.values().cloned().collect();
+            out.sort_by_key(|v| v.ord);
+            out
+        };
+        for vol in vols {
+            for shard in &vol.shards {
+                if !shard.use_buffer {
+                    continue;
+                }
+                let started = Instant::now();
+                // Snapshot (clone) the frozen syncing slot WITHOUT the
+                // tree lock so the brief slot-lock is not held across the
+                // fold. Empty → nothing to do for this shard.
+                let entries = shard.l2p_buffer.snapshot_syncing_slot(txg);
+                if entries.is_empty() {
+                    continue;
+                }
+                let count = entries.len();
+                let max_lsn = entries.values().map(|e| e.lsn).max().unwrap_or(0);
+                let mut tree = shard.tree.write();
+                match super::txg_sync::compact_drain_into_tree(&mut tree, &entries) {
+                    Ok(()) => {
+                        // Publish BEFORE clearing the slot (see method doc).
+                        super::apply::publish_l2p_read_view(shard, &tree);
+                        drop(tree);
+                        // Clear the now-folded+published slot. Frozen, so
+                        // this equals `entries`; return value discarded.
+                        let _ = shard.l2p_buffer.take_syncing_slot(txg);
                         shard.l2p_buffer.note_compacted(max_lsn);
                         self.metrics
                             .record_l2p_buffer_compaction(count, started.elapsed());
