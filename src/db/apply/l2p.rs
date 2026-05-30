@@ -226,53 +226,71 @@ pub(in crate::db) fn apply_l2p_remap_range(
         if indices.is_empty() {
             continue;
         }
-        let use_buffer = volume.shards[l2p_sid].use_buffer;
-        let mut tree = volume.shards[l2p_sid].tree.write();
+        let shard = &volume.shards[l2p_sid];
 
+        if shard.use_buffer {
+            // Lock-light buffer path — mirrors `apply_l2p_bucket_buffer`
+            // (the grouped/≥8-op path), which deliberately does NOT take
+            // `tree.write()`. The mutation lands in `l2p_buffer`
+            // (its own per-slot mutex), and fallthrough reads consult the
+            // published `read_view`, re-fetched per LBA: the TxgSync
+            // compactor publishes the read view *before* clearing the
+            // synced slot (publish-before-clear), so a `read_view.read()`
+            // snapshot is always consistent and a commit never observes a
+            // half-folded tree. Holding `tree.write()` here (as the old
+            // code did) needlessly serialised every small commit against
+            // the other commit workers AND the compactor's fold — the
+            // per-shard write lock was the apply-path chokepoint
+            // (perf 2026-05-29: commit workers parked in
+            // apply_l2p_remap_range -> tree RwLock). Range ops are always
+            // unguarded, so there is no guard-read+put atomicity to
+            // protect (unlike guarded `apply_l2p_remap`).
+            for &i in indices {
+                let lba = start_lba + i as u64;
+                let new_value = values[i];
+
+                let cur = match shard.l2p_buffer.lookup_for_open_txg(txg, lba) {
+                    crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
+                    crate::db::l2p_buffer::BufferLookup::Tombstone => None,
+                    crate::db::l2p_buffer::BufferLookup::Absent => {
+                        shard.read_view.read().clone().get(lba)?
+                    }
+                };
+
+                if seq_guard_rejects(new_value.seq(), cur.as_ref()) {
+                    prevs[i] = cur;
+                    continue;
+                }
+                let new_value = stamp_birth_lsn(new_value, lsn);
+                shard.l2p_buffer.insert_at_txg(txg, lba, new_value, lsn);
+                record_dead(volume, cur, lsn);
+                prevs[i] = cur;
+                applied[i] = true;
+            }
+            // No publish: the compactor republishes the read view on its
+            // next fold cycle (same contract as apply_l2p_bucket_buffer).
+            continue;
+        }
+
+        // Tree-mode (use_buffer = false): unchanged — one tree write lock
+        // per shard bucket, publish once after mutating.
+        let mut tree = shard.tree.write();
         for &i in indices {
             let lba = start_lba + i as u64;
             let new_value = values[i];
 
-            // Buffer-first lookup matching apply_l2p_remap's path.
-            let cur = if use_buffer {
-                match volume.shards[l2p_sid]
-                    .l2p_buffer
-                    .lookup_for_open_txg(txg, lba)
-                {
-                    crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
-                    crate::db::l2p_buffer::BufferLookup::Tombstone => None,
-                    crate::db::l2p_buffer::BufferLookup::Absent => tree.get(lba)?,
-                }
-            } else {
-                tree.get(lba)?
-            };
-
+            let cur = tree.get(lba)?;
             if seq_guard_rejects(new_value.seq(), cur.as_ref()) {
-                // Stale write — leave L2P untouched; surface the rejecting
-                // value as prev so onyx-side cleanup logic still sees a
-                // per-LBA outcome slot. applied stays false (default).
                 prevs[i] = cur;
                 continue;
             }
             let new_value = stamp_birth_lsn(new_value, lsn);
-
-            let prev = if use_buffer {
-                volume.shards[l2p_sid]
-                    .l2p_buffer
-                    .insert_at_txg(txg, lba, new_value, lsn);
-                cur
-            } else {
-                tree.insert_at_lsn(lba, new_value, lsn)?
-            };
+            let prev = tree.insert_at_lsn(lba, new_value, lsn)?;
             record_dead(volume, prev, lsn);
             prevs[i] = prev;
             applied[i] = true;
         }
-
-        // Publish once per shard, after all LBAs in this bucket mutated.
-        if !use_buffer {
-            publish_l2p_read_view(&volume.shards[l2p_sid], &tree);
-        }
+        publish_l2p_read_view(shard, &tree);
     }
 
     // Phase 5: hot-path L2P remaps are rc-neutral (see `apply_l2p_remap`
