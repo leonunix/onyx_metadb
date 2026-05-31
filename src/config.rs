@@ -324,6 +324,16 @@ pub struct Config {
     /// memory; no on-disk effect.
     pub txg_threads_enabled: bool,
 
+    /// Fan the per-TXG L2P syncing-slot drain out across shards (one task
+    /// per shard) instead of folding them serially on the single
+    /// `metadb-txg-sync` thread. Each shard is independent (own `tree`
+    /// lock + `l2p_buffer` + per-shard page alloc pool); the serial fold
+    /// was the txg-sync drain bottleneck (~74% of that thread in
+    /// `compact_drain_into_tree`), capping single-volume write throughput.
+    /// Default `true`; set `false` for the legacy serial fold (A/B,
+    /// fallback). Mirrors the already-parallel refcount `begin_checkpoint`.
+    pub parallel_l2p_drain_enabled: bool,
+
     /// `txg_timeout_ms` mirrors ZFS `zfs_txg_timeout` (default 5 s) —
     /// the quiesce thread rolls a TXG at least this often even with
     /// no force_roll signal. Ignored when `txg_threads_enabled = false`.
@@ -572,6 +582,11 @@ impl Config {
             l2p_buffer_max_interval_ms: 30_000,
             // ZFS-TXG-clone Phase 4 threads default-off — see field doc.
             txg_threads_enabled: false,
+            // Parallel per-shard L2P drain default-OFF: disproven on nvme-box
+            // (3-4× regression — spawned threads inherit the txg-sync CPU
+            // pinning + the drain wasn't the healthy-window gate). Kept behind
+            // the flag as a documented dead-end. See memory parallel_l2p_drain_impl.
+            parallel_l2p_drain_enabled: false,
             txg_timeout_ms: 5_000,
             // Streaming writeback ships default-off in this generic
             // `Config::new` so unit tests that assert on page-allocator

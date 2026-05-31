@@ -599,7 +599,6 @@ impl Db {
     /// so a concurrent `lookup_for_open_txg` is never blocked for the
     /// fold's duration (read-latency protection).
     pub(super) fn drain_syncing_slot_into_trees(&self, txg: crate::types::Txg) -> Result<()> {
-        use std::time::Instant;
         if !self.l2p_buffer_enabled {
             return Ok(());
         }
@@ -609,41 +608,91 @@ impl Db {
             out.sort_by_key(|v| v.ord);
             out
         };
-        for vol in vols {
-            for shard in &vol.shards {
-                if !shard.use_buffer {
-                    continue;
-                }
-                let started = Instant::now();
-                // Snapshot (clone) the frozen syncing slot WITHOUT the
-                // tree lock so the brief slot-lock is not held across the
-                // fold. Empty → nothing to do for this shard.
-                let entries = shard.l2p_buffer.snapshot_syncing_slot(txg);
-                if entries.is_empty() {
-                    continue;
-                }
-                let count = entries.len();
-                let max_lsn = entries.values().map(|e| e.lsn).max().unwrap_or(0);
-                let mut tree = shard.tree.write();
-                match super::txg_sync::compact_drain_into_tree(&mut tree, &entries) {
-                    Ok(()) => {
-                        // Publish BEFORE clearing the slot (see method doc).
-                        super::apply::publish_l2p_read_view(shard, &tree);
-                        drop(tree);
-                        // Clear the now-folded+published slot. Frozen, so
-                        // this equals `entries`; return value discarded.
-                        let _ = shard.l2p_buffer.take_syncing_slot(txg);
-                        shard.l2p_buffer.note_compacted(max_lsn);
-                        self.metrics
-                            .record_l2p_buffer_compaction(count, started.elapsed());
+        // Each L2P shard is independent: its own `l2p_buffer`, its own `tree`
+        // lock, and its COW page allocations draw from a per-shard `PageBuf`
+        // `alloc_pool` that batch-refills from `page_store` (so the global
+        // allocate mutex is touched only at refill granularity, not per page).
+        // The only shared resources — `page_store` and `self.metrics` — are
+        // internally synchronized. The previously-serial fold was the txg-sync
+        // drain bottleneck (on-CPU: ~74% of the `metadb-txg-sync` thread in
+        // `compact_drain_into_tree`); serializing 16 shards' COW folds on one
+        // thread bounded single-volume write throughput, so by default we fan
+        // out across shards (mirrors the refcount `begin_checkpoint` fan-out in
+        // `run_sync_cycle_body`). The `parallel_l2p_drain_enabled=false` path
+        // preserves the serial fold for A/B and as a fallback.
+        let metrics = &self.metrics;
+        if self.parallel_l2p_drain_enabled {
+            let results: Vec<Result<()>> = std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for vol in &vols {
+                    for shard in &vol.shards {
+                        if !shard.use_buffer {
+                            continue;
+                        }
+                        handles.push(scope.spawn(move || {
+                            // Clear the single-CPU affinity inherited from the
+                            // pinned `metadb-txg-sync` parent so these workers
+                            // actually spread across cores (ZFS `dp_sync_taskq`
+                            // runs unpinned at normal priority). Without this all
+                            // 16 pile onto one core → slower than serial.
+                            crate::affinity::unbind_current();
+                            Self::drain_one_syncing_shard(shard, txg, metrics)
+                        }));
                     }
-                    Err(err) => {
-                        drop(tree);
-                        return Err(err);
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                    .collect()
+            });
+            // First error wins. Every shard that could drain has drained and
+            // cleared its frozen slot, so a retry of this TXG only re-processes
+            // the shard(s) that errored (their slots are still populated).
+            for r in results {
+                r?;
+            }
+        } else {
+            for vol in &vols {
+                for shard in &vol.shards {
+                    if !shard.use_buffer {
+                        continue;
                     }
+                    Self::drain_one_syncing_shard(shard, txg, metrics)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Drain one L2P shard's frozen syncing slot into its tree. Shared by the
+    /// parallel (scope-spawned, one task per shard) and serial drain paths in
+    /// `drain_syncing_slot_into_trees`. Each shard is independent (its own
+    /// `l2p_buffer`, its own `tree` lock, per-shard `PageBuf` alloc pool), so
+    /// this is safe to run concurrently across shards.
+    fn drain_one_syncing_shard(
+        shard: &super::L2pShard,
+        txg: crate::types::Txg,
+        metrics: &crate::metrics::MetaMetrics,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
+        // Snapshot (clone) the frozen syncing slot WITHOUT the tree lock so the
+        // brief slot-lock is not held across the fold. Empty → nothing to do.
+        let entries = shard.l2p_buffer.snapshot_syncing_slot(txg);
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let count = entries.len();
+        let max_lsn = entries.values().map(|e| e.lsn).max().unwrap_or(0);
+        let mut tree = shard.tree.write();
+        super::txg_sync::compact_drain_into_tree(&mut tree, &entries)?;
+        // Publish BEFORE clearing the slot (see method doc).
+        super::apply::publish_l2p_read_view(shard, &tree);
+        drop(tree);
+        // Clear the now-folded+published slot. Frozen, so this equals `entries`;
+        // the return value is discarded.
+        let _ = shard.l2p_buffer.take_syncing_slot(txg);
+        shard.l2p_buffer.note_compacted(max_lsn);
+        metrics.record_l2p_buffer_compaction(count, started.elapsed());
         Ok(())
     }
 

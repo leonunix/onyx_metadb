@@ -196,6 +196,7 @@ impl Db {
             // first Open TXG is 1.
             txg: Arc::new(crate::txg::TxgStateMachine::new(0)),
             txg_threads_enabled: cfg.txg_threads_enabled,
+            parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
             // Phase 4 Step 7: notifiers allocated regardless; the worker
             // threads are spawned conditionally below.
             txg_quiesce_notifier: Arc::new(crate::db::txg_quiesce::QuiesceNotifier::new()),
@@ -657,6 +658,7 @@ impl Db {
             // them with a fresh checkpoint_txg.
             txg: Arc::new(crate::txg::TxgStateMachine::new(manifest_checkpoint_txg)),
             txg_threads_enabled: cfg.txg_threads_enabled,
+            parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
             txg_quiesce_notifier: Arc::new(crate::db::txg_quiesce::QuiesceNotifier::new()),
             txg_sync_notifier: Arc::new(crate::db::txg_sync::SyncNotifier::new()),
             txg_quiesce: Mutex::new(None),

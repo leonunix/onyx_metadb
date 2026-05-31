@@ -200,3 +200,40 @@ fn set_current_cpu(cpu: usize) -> std::io::Result<()> {
 fn set_current_cpu(_cpu: usize) -> std::io::Result<()> {
     Ok(())
 }
+
+/// Widen the calling thread's CPU affinity to ALL CPUs, clearing any
+/// inherited single-CPU pin. Worker threads spawned from a `bind_current`-
+/// pinned parent (e.g. the parallel L2P drain fanned out from the pinned
+/// `metadb-txg-sync` thread) inherit that one-CPU mask and would otherwise
+/// pile onto a single core instead of spreading — the ZFS `dp_sync_taskq`
+/// runs its sync threads at normal priority across all CPUs, not pinned.
+pub(crate) fn unbind_current() {
+    if let Err(err) = set_current_all_cpus() {
+        tracing::warn!(error = %err, "failed to widen metadb thread CPU affinity");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_current_all_cpus() -> std::io::Result<()> {
+    const CPU_SETSIZE: usize = 1024;
+    const BITS_PER_WORD: usize = 8 * std::mem::size_of::<libc::c_ulong>();
+    // All-ones mask = run on any CPU (kernel ignores bits past online CPUs).
+    let set = [!(0 as libc::c_ulong); CPU_SETSIZE / BITS_PER_WORD];
+    let rc = unsafe {
+        libc::sched_setaffinity(
+            0,
+            std::mem::size_of_val(&set),
+            set.as_ptr().cast::<libc::cpu_set_t>(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_current_all_cpus() -> std::io::Result<()> {
+    Ok(())
+}

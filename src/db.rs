@@ -331,6 +331,9 @@ pub struct Db {
     /// wait_until_synced`. Step 7 lands the threading scaffold;
     /// Step 8 retargets the actual sync work at it.
     pub(crate) txg_threads_enabled: bool,
+    /// Cached copy of `Config::parallel_l2p_drain_enabled`. Fans the
+    /// per-TXG L2P syncing-slot drain out across shards when `true`.
+    pub(crate) parallel_l2p_drain_enabled: bool,
     /// Notifier always allocated so `flush_with_gate` can hand a clone
     /// to the (optional) quiesce worker without taking a mutex. Cheap —
     /// just a `Mutex<bool> + Condvar`.
