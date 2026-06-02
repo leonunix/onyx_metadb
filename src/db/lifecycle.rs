@@ -110,6 +110,20 @@ impl Drop for RcDrainerResumeGuard<'_> {
     }
 }
 
+/// RAII counterpart for the async dedup-index drainers: the flush
+/// checkpoint barrier preempts them + final-drains staging, and this
+/// guard re-arms them on every flush exit path. `resume_drainers` is
+/// idempotent (no-op when the drainer is disabled / not attached).
+struct DedupDrainerResumeGuard<'a> {
+    dedup_index: &'a std::sync::Arc<crate::dedup::DedupIndex>,
+}
+
+impl Drop for DedupDrainerResumeGuard<'_> {
+    fn drop(&mut self) {
+        self.dedup_index.resume_drainers();
+    }
+}
+
 struct CheckpointInstallState<F> {
     flushed: F,
     flushed_pages: usize,

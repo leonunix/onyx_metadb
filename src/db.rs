@@ -1269,6 +1269,12 @@ impl Drop for Db {
         if let Some(mut worker) = self.async_reclaim.lock().take() {
             worker.stop();
         }
+        // Detach the async dedup-index drainers. Each worker holds an
+        // `Arc<DedupIndex>` (= self.dedup_index), so without joining
+        // them here the index (and the page_store it references) would
+        // never drop and the threads would run forever — the same
+        // circular-shutdown shape as the refcount drainers below.
+        self.dedup_index.detach_drainers();
         // Detach refcount drainers (priority 3) BEFORE the
         // refcount_shards Box drops. Each drainer worker holds an
         // `Arc<RcShard>` that would otherwise prevent

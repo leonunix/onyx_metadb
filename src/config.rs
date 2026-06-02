@@ -249,6 +249,41 @@ pub struct Config {
     /// IOPS but cost RAM 1:1.
     pub dedup_l1_cache_entries: usize,
 
+    /// Run a per-dedup-shard background drainer that absorbs staged
+    /// `(hash → value)` dedup-index mutations into the on-disk cuckoo
+    /// table outside the commit/apply critical path. When enabled, the
+    /// hot-path `apply_dedup_*` arms only merge into an in-RAM staging
+    /// map (last-LSN-wins) + warm L0/L1; the blocking 4 KiB cuckoo
+    /// page write happens on the drainer thread, and the checkpoint
+    /// barrier final-drains staging before sampling `checkpoint_lsn`.
+    /// When disabled (the default), `stage_put`/`stage_delete` fall
+    /// through to the verbatim eager `dedup_index.put`/`delete` —
+    /// byte-identical to the pre-drainer behaviour. The `rc.stage(±1)`
+    /// that pairs with every dedup mutation stays inline regardless, so
+    /// refcount semantics are unchanged.
+    pub dedup_drainer_enabled: bool,
+
+    /// Drainer cycle interval. Each shard's drainer parks for at most
+    /// this long before checking whether its staging map has work.
+    /// Threshold-driven wakeups fire sooner.
+    pub dedup_drainer_interval_ms: u64,
+
+    /// Staging-map size that wakes the drainer ahead of the next timer
+    /// tick. Sized so the in-gate final-drain catch-up at the
+    /// checkpoint barrier stays bounded.
+    pub dedup_drainer_threshold_entries: usize,
+
+    /// Hard cap on staged entries processed by a single drainer cycle.
+    /// Excess rolls into the next cycle.
+    pub dedup_drainer_max_entries_per_cycle: usize,
+
+    /// Backpressure trigger. When a shard's `active` staging map
+    /// exceeds this, `stage_put`/`stage_delete` synchronously drains
+    /// that shard (bounded) before returning, capping staging RAM.
+    /// Safe because cuckoo put/delete is idempotent (unlike the rc
+    /// overlay, this cannot lose contributions).
+    pub dedup_drainer_backpressure_entries: usize,
+
     /// Run a per-shard background drainer that absorbs `RcShard.delta`
     /// into a sealed-page staging overlay outside `apply_gate.write()`.
     /// When enabled (the default), `Db::flush()` sample-phase work
@@ -545,6 +580,18 @@ impl Config {
             // ~64 B, so 64 K ≈ 4 MiB. Production should bump in
             // lock-step with the working-set size.
             dedup_l1_cache_entries: 64_000,
+            // Dedup drainer ships **default-off**, behind a flag (mirrors
+            // parallel_l2p_drain, NOT the default-on refcount_drainer).
+            // This changes the hottest path (stage_ops, ~90% of commit
+            // apply) and read-after-write timing on the cuckoo, so it
+            // stays off until the soak gate + onyx NVMe soak + crash
+            // matrix pass; flipped on in a follow-up commit. Flag off ⇒
+            // stage_put/stage_delete are verbatim eager put/delete.
+            dedup_drainer_enabled: false,
+            dedup_drainer_interval_ms: 50,
+            dedup_drainer_threshold_entries: 4_096,
+            dedup_drainer_max_entries_per_cycle: 65_536,
+            dedup_drainer_backpressure_entries: 16_384,
             // Drainer ships **default-on** (Tier 1.A,
             // `/root/.claude/plans/ticklish-sparking-barto.md`). The
             // background drainer absorbs `RcShard.delta_active` into

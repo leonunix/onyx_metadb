@@ -552,6 +552,22 @@ pub struct MetaMetrics {
     /// large counts → checkpoint cadence dominates the drainer schedule.
     rc_drainer_preempts: AtomicU64,
 
+    // --- async dedup-index drainer (mirrors rc_drainer_*) ---
+    dedup_drainer_cycles: AtomicU64,
+    dedup_drainer_drained_entries: AtomicU64,
+    dedup_drainer_cycle_us: AtomicU64,
+    dedup_drainer_cycle_max_us: AtomicU64,
+    dedup_drainer_wakes: AtomicU64,
+    dedup_drainer_preempts: AtomicU64,
+    dedup_drainer_checkpoint_wait_us: AtomicU64,
+    dedup_drainer_checkpoint_wait_max_us: AtomicU64,
+    /// High-water mark of total staged (active) dedup entries across all
+    /// shards — the deferral backlog gauge.
+    dedup_drainer_staged_active_max: AtomicU64,
+    /// `stage_*` hit the per-shard backpressure threshold and drained
+    /// synchronously (Phase 3).
+    dedup_drainer_backpressure_drains: AtomicU64,
+
     // H4: bandwidth counter paired with `flush_pages_written` so a
     // window snapshot can compute writeback MB/s without assuming
     // page size. Bumped from `record_flush_io`.

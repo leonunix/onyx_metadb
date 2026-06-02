@@ -19,9 +19,11 @@
 //! L2 reuses [`crate::cache::PageCache`] without changes.
 
 pub mod cuckoo;
+pub(crate) mod drainer;
 pub mod index;
 pub mod l1_cache;
 pub mod sketch;
+pub(crate) mod staging;
 
 pub use cuckoo::CuckooHash;
 pub use index::{DedupIndex, TierSizes};

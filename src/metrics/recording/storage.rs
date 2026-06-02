@@ -401,4 +401,42 @@ impl MetaMetrics {
     pub(crate) fn record_rc_drainer_preempt(&self) {
         self.rc_drainer_preempts.fetch_add(1, Ordering::Relaxed);
     }
+
+    // --- async dedup-index drainer (mirrors rc_drainer_*) ---
+
+    pub(crate) fn record_dedup_drainer_cycle(&self, entries: usize, elapsed: Duration) {
+        self.dedup_drainer_cycles.fetch_add(1, Ordering::Relaxed);
+        self.dedup_drainer_drained_entries
+            .fetch_add(entries as u64, Ordering::Relaxed);
+        record_duration(
+            &self.dedup_drainer_cycle_us,
+            &self.dedup_drainer_cycle_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_dedup_drainer_wake(&self) {
+        self.dedup_drainer_wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dedup_drainer_preempt(&self) {
+        self.dedup_drainer_preempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dedup_drainer_checkpoint_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.dedup_drainer_checkpoint_wait_us,
+            &self.dedup_drainer_checkpoint_wait_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_dedup_drainer_staged_active(&self, total_active: usize) {
+        fetch_max(&self.dedup_drainer_staged_active_max, total_active as u64);
+    }
+
+    pub(crate) fn record_dedup_drainer_backpressure_drain(&self) {
+        self.dedup_drainer_backpressure_drains
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }

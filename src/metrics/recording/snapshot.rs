@@ -376,6 +376,17 @@ impl MetaMetrics {
             rc_drainer_wakes: load(&self.rc_drainer_wakes),
             rc_drainer_preempts: load(&self.rc_drainer_preempts),
 
+            dedup_drainer_cycles: load(&self.dedup_drainer_cycles),
+            dedup_drainer_drained_entries: load(&self.dedup_drainer_drained_entries),
+            dedup_drainer_cycle_us: load(&self.dedup_drainer_cycle_us),
+            dedup_drainer_cycle_max_us: load(&self.dedup_drainer_cycle_max_us),
+            dedup_drainer_wakes: load(&self.dedup_drainer_wakes),
+            dedup_drainer_preempts: load(&self.dedup_drainer_preempts),
+            dedup_drainer_checkpoint_wait_us: load(&self.dedup_drainer_checkpoint_wait_us),
+            dedup_drainer_checkpoint_wait_max_us: load(&self.dedup_drainer_checkpoint_wait_max_us),
+            dedup_drainer_staged_active_max: load(&self.dedup_drainer_staged_active_max),
+            dedup_drainer_backpressure_drains: load(&self.dedup_drainer_backpressure_drains),
+
             flush_io_bytes_total: load(&self.flush_io_bytes_total),
 
             meta_io_write_calls: load(&self.meta_io_write_calls),

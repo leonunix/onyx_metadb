@@ -53,7 +53,10 @@ pub(in crate::db) fn apply_dedup_put_with_rc(
         let sid = shard_for_key(refcount_shards, new_pba);
         refcount_shards[sid].rc.stage(new_pba, 1, lsn)?;
     }
-    dedup_index.put(hash, value, lsn)?;
+    // rc deltas above stay inline (correctness); only the cuckoo write is
+    // deferred. `stage_put` is the eager `put` verbatim when the drainer
+    // is disabled.
+    dedup_index.stage_put(hash, value, lsn)?;
     Ok(())
 }
 
@@ -79,7 +82,7 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
             refcount_shards[sid].rc.stage(pba, -1, lsn)?;
         }
     }
-    dedup_index.delete(hash, lsn)?;
+    dedup_index.stage_delete(hash, lsn)?;
     Ok(())
 }
 

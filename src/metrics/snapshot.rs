@@ -344,6 +344,17 @@ pub struct MetaMetricsSnapshot {
     pub rc_drainer_wakes: u64,
     pub rc_drainer_preempts: u64,
 
+    pub dedup_drainer_cycles: u64,
+    pub dedup_drainer_drained_entries: u64,
+    pub dedup_drainer_cycle_us: u64,
+    pub dedup_drainer_cycle_max_us: u64,
+    pub dedup_drainer_wakes: u64,
+    pub dedup_drainer_preempts: u64,
+    pub dedup_drainer_checkpoint_wait_us: u64,
+    pub dedup_drainer_checkpoint_wait_max_us: u64,
+    pub dedup_drainer_staged_active_max: u64,
+    pub dedup_drainer_backpressure_drains: u64,
+
     pub flush_io_bytes_total: u64,
 
     pub meta_io_write_calls: u64,

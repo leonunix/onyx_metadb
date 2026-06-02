@@ -63,6 +63,8 @@ impl Db {
             // pair works.
             0xDEAD_BEEF_CAFE_F00D,
             0x1234_5678_ABCD_EF01,
+            dedup_shards as usize,
+            cfg.dedup_drainer_enabled,
         )?);
         manifest.body_version = MANIFEST_BODY_VERSION;
         let refcount_count = refcount_roots.len();
@@ -219,6 +221,10 @@ impl Db {
                 idx,
             );
         }
+        // Spawn the async dedup-index drainers (no-op when
+        // `dedup_drainer_enabled = false`). Fresh DB → no replay.
+        db.dedup_index
+            .attach_drainers(&drainer_cfg, metrics_for_drainers.clone());
         // Spawn the L2P streaming writeback worker. Default-on; the
         // config toggle disables it for benchmarking / debugging
         // checkpoint behaviour without it.
@@ -373,6 +379,8 @@ impl Db {
             page_cache.clone(),
             dedup_index_meta_pid,
             cfg.dedup_l1_cache_entries,
+            manifest.dedup_shards as usize,
+            cfg.dedup_drainer_enabled,
         )?);
 
         // Buffer-as-sole-journal Phase D.5b retired the WAL writer.
@@ -699,6 +707,11 @@ impl Db {
                 idx,
             );
         }
+        // Spawn the async dedup-index drainers AFTER replay (so they
+        // never observe mid-replay state), mirroring the rc drainers.
+        // No-op when `dedup_drainer_enabled = false`.
+        db.dedup_index
+            .attach_drainers(&drainer_cfg, metrics_for_drainers.clone());
         // Spawn the L2P streaming writeback worker. Same as create:
         // default-on. Started AFTER WAL replay so it doesn't observe
         // mid-replay state.

@@ -40,6 +40,13 @@ pub enum ThreadRole {
     RefcountApply,
     DedupApply,
     RefcountDrainer,
+    /// Per-dedup-shard background drainer threads. Bound to the same
+    /// CPU set as `DedupApply` (`dedup_apply_cpus`): the dedup apply
+    /// lanes are idle on the `stage_ops` hot path, so their NUMA-local
+    /// CPU set is free for the drainer, and reusing it co-locates the
+    /// drainer with dedup work on the right NUMA node without a new
+    /// affinity config knob.
+    DedupDrainer,
     /// ZFS-TXG-clone Phase 4 sync + quiesce workers. Bound to a small
     /// dedicated CPU set so the kernel scheduler cannot co-locate
     /// them on an apply-lane CPU during a flush window. Replaces the
@@ -125,6 +132,7 @@ impl AffinityLayout {
             ThreadRole::L2pApply => &self.l2p_apply,
             ThreadRole::RefcountApply => &self.refcount_apply,
             ThreadRole::DedupApply => &self.dedup_apply,
+            ThreadRole::DedupDrainer => &self.dedup_apply,
             ThreadRole::RefcountDrainer => &self.refcount_drainer,
             ThreadRole::TxgSync => &self.l2p_compactor,
             ThreadRole::IoSubmitter => &self.io_submitter,

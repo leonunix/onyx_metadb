@@ -39,7 +39,10 @@
 //! L0 sketch so `lookup` can short-circuit the all-miss path
 //! immediately. L1 starts empty and warms up under traffic.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::cache::PageCache;
 use crate::dedup_types::{DedupValue, Hash8};
@@ -52,6 +55,8 @@ use super::cuckoo::{CuckooHash, CuckooPutEntry, ENTRIES_PER_BUCKET};
 use super::fp_of;
 use super::l1_cache::{L1HotCache, LookupResult};
 use super::sketch::FpSketch;
+use super::staging::{DedupStaging, StagedLookup, StagedMutation};
+use crate::refcount::overlay::{DrainerHandle, DrainerState};
 
 /// L0 capacity to use given the on-disk cuckoo bucket count. Mirrors
 /// L3 max capacity (`bucket_count × ENTRIES_PER_BUCKET`) so the filter
@@ -64,6 +69,23 @@ pub struct DedupIndex {
     sketch: FpSketch,
     l1: L1HotCache,
     cuckoo: CuckooHash,
+    /// Per-shard pending cuckoo mutations awaiting the background
+    /// drainer. Only populated when `drainer_enabled` (otherwise
+    /// `stage_*` write the cuckoo eagerly and this stays empty).
+    staging: DedupStaging,
+    /// When true, `stage_put`/`stage_delete` defer the blocking cuckoo
+    /// write into `staging` (drained off the commit critical path) and
+    /// reads consult `staging` first. When false, `stage_*` are verbatim
+    /// eager `put`/`delete` and reads skip the staging layer entirely —
+    /// byte-identical to the pre-drainer behaviour.
+    drainer_enabled: bool,
+    /// Per-shard background drainer handles (one per staging shard),
+    /// populated by [`attach_drainers`] after replay and joined by
+    /// [`detach_drainers`] on `Db::drop`. Empty when the drainer is
+    /// disabled. Each worker thread holds an `Arc<DedupIndex>`; the
+    /// detach-before-drop discipline (mirroring the refcount drainer)
+    /// breaks that cycle.
+    drainers: Mutex<Vec<DrainerHandle>>,
 }
 
 impl DedupIndex {
@@ -72,6 +94,7 @@ impl DedupIndex {
     /// where `load_factor_target` is typically 0.85. `l1_capacity`
     /// is the maximum number of `(fp → hash, value)` entries kept in
     /// the in-memory L1 LRU.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         page_store: Arc<PageStore>,
         page_cache: Arc<PageCache>,
@@ -79,6 +102,8 @@ impl DedupIndex {
         l1_capacity: usize,
         seed1: u64,
         seed2: u64,
+        staging_shards: usize,
+        drainer_enabled: bool,
     ) -> Result<Self> {
         let cuckoo = CuckooHash::create(page_store, page_cache, bucket_count, seed1, seed2)?;
         let l0_capacity = l0_capacity_for(cuckoo.bucket_count());
@@ -86,6 +111,9 @@ impl DedupIndex {
             sketch: FpSketch::with_capacity(l0_capacity),
             l1: L1HotCache::new(l1_capacity),
             cuckoo,
+            staging: DedupStaging::new(staging_shards),
+            drainer_enabled,
+            drainers: Mutex::new(Vec::new()),
         })
     }
 
@@ -96,6 +124,8 @@ impl DedupIndex {
         page_cache: Arc<PageCache>,
         meta_page_id: PageId,
         l1_capacity: usize,
+        staging_shards: usize,
+        drainer_enabled: bool,
     ) -> Result<Self> {
         let cuckoo = CuckooHash::open(page_store, page_cache, meta_page_id)?;
         // Size L0 to mirror the on-disk cuckoo capacity rather than the
@@ -104,7 +134,14 @@ impl DedupIndex {
         // L3 fills up, avoiding the saturation fallback.
         let sketch = FpSketch::with_capacity(l0_capacity_for(cuckoo.bucket_count()));
         let l1 = L1HotCache::new(l1_capacity);
-        let me = Self { sketch, l1, cuckoo };
+        let me = Self {
+            sketch,
+            l1,
+            cuckoo,
+            staging: DedupStaging::new(staging_shards),
+            drainer_enabled,
+            drainers: Mutex::new(Vec::new()),
+        };
         me.rebuild_l0_from_l3()?;
         Ok(me)
     }
@@ -131,6 +168,19 @@ impl DedupIndex {
         if !self.sketch.contains(fp) {
             return Ok(None);
         }
+        // Staging shadows the cuckoo for not-yet-drained mutations. It is
+        // checked AFTER the L0 short-circuit (so the all-miss fast path
+        // is untouched) and BEFORE L1/cuckoo. `stage_put` inserts the fp
+        // into L0, so any staged Put passes the L0 gate above and is
+        // observed here. Skipped entirely when the drainer is disabled
+        // (staging is always empty then) → byte-identical fast path.
+        if self.drainer_enabled {
+            match self.staging.lookup(hash) {
+                StagedLookup::Present(value) => return Ok(Some(value)),
+                StagedLookup::Tombstone => return Ok(None),
+                StagedLookup::Absent => {}
+            }
+        }
         if let LookupResult::Hit(value) = self.l1.lookup(fp, hash) {
             return Ok(Some(value));
         }
@@ -156,19 +206,37 @@ impl DedupIndex {
         let fps: Vec<u32> = hashes.iter().map(fp_of).collect();
         let in_l0 = self.sketch.contains_batch(&fps);
 
+        let mut out: Vec<Option<DedupValue>> = vec![None; hashes.len()];
+
         // Collect indices that survived L0 — these are the only ones
-        // worth touching L1 / L3 for.
+        // worth touching staging / L1 / L3 for. When the drainer is on,
+        // a staged Put/Delete shadows the cuckoo: resolve it here and
+        // drop the index from the L1/cuckoo residual. Survivors that are
+        // `Absent` in staging fall through unchanged.
         let mut l1_pairs: Vec<(u32, Hash8)> = Vec::new();
         let mut l1_indices: Vec<usize> = Vec::new();
         for (i, &alive) in in_l0.iter().enumerate() {
-            if alive {
-                l1_pairs.push((fps[i], hashes[i]));
-                l1_indices.push(i);
+            if !alive {
+                continue;
             }
+            if self.drainer_enabled {
+                match self.staging.lookup(&hashes[i]) {
+                    StagedLookup::Present(value) => {
+                        out[i] = Some(value);
+                        continue;
+                    }
+                    StagedLookup::Tombstone => {
+                        out[i] = None;
+                        continue;
+                    }
+                    StagedLookup::Absent => {}
+                }
+            }
+            l1_pairs.push((fps[i], hashes[i]));
+            l1_indices.push(i);
         }
         let l1_results = self.l1.lookup_batch(&l1_pairs);
 
-        let mut out: Vec<Option<DedupValue>> = vec![None; hashes.len()];
         for ((idx, l1_result), pair) in l1_indices.iter().zip(l1_results).zip(l1_pairs.iter()) {
             match l1_result {
                 LookupResult::Hit(value) => out[*idx] = Some(value),
@@ -259,12 +327,303 @@ impl DedupIndex {
         Ok(())
     }
 
+    // ---- staging layer (async dedup-index drainer) ----
+    //
+    // `stage_*` are the apply-path entry points. With the drainer
+    // disabled they are verbatim eager `put`/`delete` (byte-identical to
+    // the pre-drainer behaviour). With it enabled they merge into the
+    // in-RAM `staging` map and warm L0 (so `get`'s L0 short-circuit does
+    // not hide the staged entry); the blocking cuckoo write is deferred
+    // to `drain_shard_once`, run by the background drainer / checkpoint
+    // barrier (Phase 2).
+
+    /// Stage a `(hash → value)` put.
+    pub fn stage_put(&self, hash: Hash8, value: DedupValue, lsn: Lsn) -> Result<()> {
+        if !self.drainer_enabled {
+            return self.put(hash, value, lsn);
+        }
+        self.staging.merge_put(hash, value, lsn);
+        // Reflect the staged entry in L0 so reads pass the short-circuit
+        // and consult staging. L1 is intentionally NOT warmed here:
+        // staging is authoritative for staged hashes, and the drainer
+        // warms L1 with the value it writes to the cuckoo. (Matches the
+        // eager path's unconditional `sketch.insert`; the rare orphaned
+        // +1 from a put-then-delete that never reaches the cuckoo is
+        // bounded and self-heals on reopen via `rebuild_l0_from_l3`.)
+        self.sketch.insert(fp_of(&hash));
+        Ok(())
+    }
+
+    pub(crate) fn stage_put_with_metrics(
+        &self,
+        hash: Hash8,
+        value: DedupValue,
+        lsn: Lsn,
+        timings: &mut DedupPutStageTimings,
+    ) -> Result<()> {
+        if !self.drainer_enabled {
+            return self.put_with_metrics(hash, value, lsn, timings);
+        }
+        self.staging.merge_put(hash, value, lsn);
+        let started = std::time::Instant::now();
+        self.sketch.insert(fp_of(&hash));
+        timings.l0_insert += started.elapsed();
+        Ok(())
+    }
+
+    pub(crate) fn stage_put_many_with_metrics(
+        &self,
+        entries: &[(Hash8, DedupValue)],
+        lsn: Lsn,
+        timings: &mut DedupPutStageTimings,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if !self.drainer_enabled {
+            return self.put_many_with_metrics(entries, lsn, timings);
+        }
+        for (hash, value) in entries {
+            self.staging.merge_put(*hash, *value, lsn);
+            let started = std::time::Instant::now();
+            self.sketch.insert(fp_of(hash));
+            timings.l0_insert += started.elapsed();
+        }
+        Ok(())
+    }
+
+    /// Stage a delete (tombstone).
+    pub fn stage_delete(&self, hash: &Hash8, lsn: Lsn) -> Result<()> {
+        if !self.drainer_enabled {
+            return self.delete(hash, lsn);
+        }
+        // Do not touch L0/L1: the staging tombstone shadows reads (a hash
+        // that passes the L0 gate consults staging first → `Tombstone` →
+        // None). The drainer fixes up L0/L1 when it applies the delete to
+        // the cuckoo (`self.delete` below).
+        self.staging.merge_delete(*hash, lsn);
+        Ok(())
+    }
+
+    /// Drain one shard's staged mutations into the on-disk cuckoo: swap
+    /// `active`→`draining`, apply puts (page-grouped batch) + deletes,
+    /// then clear `draining`. Draining entries stay visible to readers
+    /// until the cuckoo write completes. Returns the entry count drained.
+    /// Caller (background drainer / checkpoint barrier) serialises drains
+    /// of a given shard.
+    pub(crate) fn drain_shard_once(&self, shard: usize) -> Result<usize> {
+        let snapshot = self.staging.swap_active_to_draining(shard);
+        if snapshot.is_empty() {
+            return Ok(0);
+        }
+        let n = snapshot.len();
+        // Each hash appears exactly once (last-LSN-wins map) so puts and
+        // deletes never collide and cross-hash order is irrelevant. The
+        // cuckoo page `generation` is a monotonic high-water stamp (never
+        // a skip gate), so batching puts at the max lsn is correct.
+        let apply = || -> Result<()> {
+            let mut cuckoo_entries: Vec<CuckooPutEntry> = Vec::new();
+            let mut max_put_lsn: Lsn = 0;
+            let mut deletes: Vec<(Hash8, Lsn)> = Vec::new();
+            for (hash, m) in &snapshot {
+                match m {
+                    StagedMutation::Put { value, lsn } => {
+                        cuckoo_entries.push(CuckooPutEntry {
+                            hash: *hash,
+                            value: *value,
+                        });
+                        max_put_lsn = max_put_lsn.max(*lsn);
+                    }
+                    StagedMutation::Delete { lsn } => deletes.push((*hash, *lsn)),
+                }
+            }
+            if !cuckoo_entries.is_empty() {
+                let mut timings = DedupPutStageTimings::default();
+                // Cuckoo only — L0 already carries each fp from
+                // `stage_put`; warm L1 with the drained value separately
+                // so post-drain reads hit memory.
+                self.cuckoo
+                    .put_many_with_metrics(&cuckoo_entries, max_put_lsn, &mut timings)?;
+                for entry in &cuckoo_entries {
+                    self.l1.put(fp_of(&entry.hash), entry.hash, entry.value);
+                }
+            }
+            for (hash, lsn) in &deletes {
+                // `self.delete` clears the cuckoo and, only if it actually
+                // removed an entry, decrements L0 + evicts L1 — matching
+                // the `+1` a prior drained `stage_put` added to L0.
+                self.delete(hash, *lsn)?;
+            }
+            Ok(())
+        };
+        match apply() {
+            Ok(()) => {
+                self.staging.clear_draining(shard);
+                Ok(n)
+            }
+            Err(err) => {
+                // Cuckoo put/delete are idempotent, so a partial apply +
+                // full re-stage + retry is safe. Restore the snapshot
+                // into `active` (last-LSN-wins preserves any newer
+                // post-swap mutations) and clear `draining` so the next
+                // swap's "draining is empty" invariant holds.
+                for (hash, m) in &snapshot {
+                    self.staging.merge_mutation(*hash, *m);
+                }
+                self.staging.clear_draining(shard);
+                Err(err)
+            }
+        }
+    }
+
+    /// Synchronously drain every shard's staging into the cuckoo. Used by
+    /// the checkpoint barrier before sampling `checkpoint_lsn`, and by
+    /// tests. Caller must ensure no background drainer is concurrently
+    /// draining the same shards (the barrier preempts them first).
+    pub(crate) fn drain_all(&self) -> Result<usize> {
+        let mut total = 0;
+        for shard in 0..self.staging.shard_count() {
+            total += self.drain_shard_once(shard)?;
+        }
+        Ok(total)
+    }
+
+    /// Spawn one background drainer thread per staging shard. Called by
+    /// `Db::open`/`create` AFTER replay (so the drainer never races
+    /// mid-replay state), mirroring `RcShard::attach_drainer`. No-op when
+    /// the drainer is disabled or already attached.
+    pub(crate) fn attach_drainers(
+        self: &Arc<Self>,
+        cfg: &crate::config::Config,
+        metrics: Arc<crate::metrics::MetaMetrics>,
+    ) {
+        if !self.drainer_enabled {
+            return;
+        }
+        let mut slot = self.drainers.lock();
+        if !slot.is_empty() {
+            return;
+        }
+        let shard_count = self.staging.shard_count();
+        tracing::info!(
+            shards = shard_count,
+            interval_ms = cfg.dedup_drainer_interval_ms,
+            threshold = cfg.dedup_drainer_threshold_entries,
+            "dedup-drainer: attaching drainer threads"
+        );
+        for shard_idx in 0..shard_count {
+            let state = Arc::new(DrainerState::new());
+            let worker = super::drainer::DedupDrainerWorker {
+                shard_idx,
+                dedup_index: self.clone(),
+                interval_ms: cfg.dedup_drainer_interval_ms,
+                threshold_entries: cfg.dedup_drainer_threshold_entries,
+                state: state.clone(),
+                metrics: metrics.clone(),
+            };
+            let join = std::thread::Builder::new()
+                .name(format!("dedup-drainer-{shard_idx}"))
+                .spawn(move || {
+                    crate::affinity::bind_current(
+                        crate::affinity::ThreadRole::DedupDrainer,
+                        shard_idx,
+                    );
+                    worker.run();
+                })
+                .expect("failed to spawn dedup drainer thread");
+            slot.push(DrainerHandle::new(state, join));
+        }
+    }
+
+    /// Signal shutdown + join every drainer thread. Idempotent. Called
+    /// by `Db::drop` BEFORE the `Arc<DedupIndex>` last-drop so the
+    /// worker→index Arc cycle is broken.
+    pub(crate) fn detach_drainers(&self) {
+        let mut slot = self.drainers.lock();
+        for handle in slot.iter_mut() {
+            handle.shutdown();
+        }
+        slot.clear();
+    }
+
+    /// Checkpoint barrier: preempt every drainer (wait for any in-flight
+    /// cycle to wind down) then synchronously final-drain all staging
+    /// into the cuckoo. Must run before the dedup manifest/`flush_meta`
+    /// update and the buffer-seq sample so `checkpoint_lsn` never
+    /// advances past an undrained staged entry. Caller re-arms the
+    /// drainers via [`resume_drainers`] (RAII guard in flush). No-op when
+    /// the drainer is disabled (staging is empty then).
+    pub(crate) fn preempt_and_drain_for_checkpoint(
+        &self,
+        metrics: &crate::metrics::MetaMetrics,
+    ) -> Result<()> {
+        if !self.drainer_enabled {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        {
+            let slot = self.drainers.lock();
+            for handle in slot.iter() {
+                handle.preempt_and_wait();
+            }
+        }
+        metrics.record_dedup_drainer_checkpoint_wait(started.elapsed());
+        // Drainers are paused; drain everything into the cuckoo.
+        self.drain_all()?;
+        Ok(())
+    }
+
+    /// Re-arm the drainers after the checkpoint barrier. Idempotent.
+    pub(crate) fn resume_drainers(&self) {
+        let slot = self.drainers.lock();
+        for handle in slot.iter() {
+            handle.resume();
+        }
+    }
+
+    pub(crate) fn staging_shard_count(&self) -> usize {
+        self.staging.shard_count()
+    }
+
+    pub(crate) fn staging_active_len(&self, shard: usize) -> usize {
+        self.staging.active_len(shard)
+    }
+
+    pub(crate) fn staging_total_active_len(&self) -> usize {
+        self.staging.total_active_len()
+    }
+
+    pub(crate) fn drainer_enabled(&self) -> bool {
+        self.drainer_enabled
+    }
+
     pub fn flush_meta(&self) -> Result<bool> {
         self.cuckoo.flush_meta()
     }
 
     pub fn iter(&self) -> Result<Vec<(Hash8, DedupValue)>> {
-        self.cuckoo.iter()
+        let base = self.cuckoo.iter()?;
+        if !self.drainer_enabled {
+            return Ok(base);
+        }
+        // Overlay not-yet-drained staged mutations so callers (the soak
+        // reference model, `iter_dedup`) see a complete logical snapshot.
+        let staged = self.staging.snapshot_all();
+        if staged.is_empty() {
+            return Ok(base);
+        }
+        let mut map: HashMap<Hash8, DedupValue> = base.into_iter().collect();
+        for (hash, m) in staged {
+            match m {
+                StagedMutation::Put { value, .. } => {
+                    map.insert(hash, value);
+                }
+                StagedMutation::Delete { .. } => {
+                    map.remove(&hash);
+                }
+            }
+        }
+        Ok(map.into_iter().collect())
     }
 
     /// Walk every allocated data page id (used by verifier).
@@ -309,8 +668,72 @@ mod tests {
         let path = dir.path().join("pages");
         let page_store = Arc::new(PageStore::create(&path).unwrap());
         let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
-        let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF).unwrap();
+        let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF, 4, false).unwrap();
         (dir, idx)
+    }
+
+    fn make_index_staged() -> (TempDir, DedupIndex) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pages");
+        let page_store = Arc::new(PageStore::create(&path).unwrap());
+        let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
+        // drainer_enabled = true: stage_* defer into the staging layer
+        // and reads consult it first.
+        let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF, 4, true).unwrap();
+        (dir, idx)
+    }
+
+    #[test]
+    fn staged_put_visible_before_and_after_drain() {
+        let (_d, idx) = make_index_staged();
+        idx.stage_put(h(0xAA), dv(7), 100).unwrap();
+        // Visible via staging before any drain.
+        assert_eq!(idx.get(&h(0xAA)).unwrap(), Some(dv(7)));
+        assert_eq!(idx.multi_get(&[h(0xAA)]).unwrap(), vec![Some(dv(7))]);
+        assert_eq!(idx.staging_total_active_len(), 1);
+        // Drain into the cuckoo: still visible, now from disk; staging empty.
+        let drained = idx.drain_all().unwrap();
+        assert_eq!(drained, 1);
+        assert_eq!(idx.staging_total_active_len(), 0);
+        assert_eq!(idx.get(&h(0xAA)).unwrap(), Some(dv(7)));
+    }
+
+    #[test]
+    fn staged_delete_tombstones_a_drained_entry() {
+        let (_d, idx) = make_index_staged();
+        idx.stage_put(h(0xAA), dv(7), 100).unwrap();
+        idx.drain_all().unwrap();
+        assert_eq!(idx.get(&h(0xAA)).unwrap(), Some(dv(7)));
+        // Tombstone shadows the on-disk entry immediately.
+        idx.stage_delete(&h(0xAA), 101).unwrap();
+        assert_eq!(idx.get(&h(0xAA)).unwrap(), None);
+        assert_eq!(idx.multi_get(&[h(0xAA)]).unwrap(), vec![None]);
+        // After draining the delete, the cuckoo entry is gone.
+        idx.drain_all().unwrap();
+        assert_eq!(idx.get(&h(0xAA)).unwrap(), None);
+    }
+
+    #[test]
+    fn staged_put_overwrites_before_drain_last_lsn_wins() {
+        let (_d, idx) = make_index_staged();
+        idx.stage_put(h(0xAA), dv(7), 100).unwrap();
+        idx.stage_put(h(0xAA), dv(9), 101).unwrap();
+        assert_eq!(idx.get(&h(0xAA)).unwrap(), Some(dv(9)));
+        idx.drain_all().unwrap();
+        assert_eq!(idx.get(&h(0xAA)).unwrap(), Some(dv(9)));
+    }
+
+    #[test]
+    fn staged_iter_includes_undrained_entries() {
+        let (_d, idx) = make_index_staged();
+        idx.stage_put(h(1), dv(1), 100).unwrap();
+        idx.drain_all().unwrap();
+        idx.stage_put(h(2), dv(2), 101).unwrap();
+        idx.stage_delete(&h(1), 102).unwrap();
+        // iter must reflect the drained h(2)... wait h(2) is staged, h(1) drained+tombstoned.
+        let mut got = idx.iter().unwrap();
+        got.sort_by_key(|(hh, _)| hh[0]);
+        assert_eq!(got, vec![(h(2), dv(2))]);
     }
 
     fn h(byte: u8) -> Hash8 {
@@ -449,7 +872,7 @@ mod tests {
         {
             let page_store = Arc::new(PageStore::create(&path).unwrap());
             let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
-            let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF).unwrap();
+            let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF, 4, false).unwrap();
             meta_page_id = idx.meta_page_id();
             for i in 0..30u8 {
                 idx.put(h(i), dv(i), (100 + i as u64) as Lsn).unwrap();
@@ -458,7 +881,7 @@ mod tests {
         }
         let page_store = Arc::new(PageStore::open(&path).unwrap());
         let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
-        let idx = DedupIndex::open(page_store, page_cache, meta_page_id, 16).unwrap();
+        let idx = DedupIndex::open(page_store, page_cache, meta_page_id, 16, 4, false).unwrap();
         // L0 fully restored.
         assert!(idx.tier_sizes().l0_distinct_fps >= 30);
         // L1 starts empty.

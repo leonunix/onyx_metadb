@@ -69,7 +69,7 @@ impl Db {
                     .collect();
                 let mut put_timings = DedupPutStageTimings::default();
                 let started = std::time::Instant::now();
-                dedup_index.put_many_with_metrics(&entries, lsn, &mut put_timings)?;
+                dedup_index.stage_put_many_with_metrics(&entries, lsn, &mut put_timings)?;
                 metrics
                     .record_dedup_forward_put_batch(pending_puts.len() as u64, started.elapsed());
                 metrics.record_dedup_put_stages(put_timings);
@@ -112,7 +112,7 @@ impl Db {
                     if rc >= *min_rc {
                         let mut put_timings = DedupPutStageTimings::default();
                         let started = std::time::Instant::now();
-                        dedup_index.put_with_metrics(*hash, *value, lsn, &mut put_timings)?;
+                        dedup_index.stage_put_with_metrics(*hash, *value, lsn, &mut put_timings)?;
                         metrics.record_dedup_forward_put(started.elapsed());
                         metrics.record_dedup_put_stages(put_timings);
                         let new_pba = value.head_pba();
@@ -128,7 +128,7 @@ impl Db {
                 WalOp::DedupDelete { hash, old_pba } => {
                     flush_pending_puts(&mut pending_puts, &mut outcomes)?;
                     let started = std::time::Instant::now();
-                    dedup_index.delete(hash, lsn)?;
+                    dedup_index.stage_delete(hash, lsn)?;
                     metrics.record_dedup_forward_delete(started.elapsed());
                     if let Some(op) = *old_pba {
                         stage_rc_decref_if_live(op)?;
@@ -141,7 +141,7 @@ impl Db {
                     let cur = dedup_index.get(hash)?;
                     let applied = cur.as_ref() == Some(old_value);
                     if applied {
-                        dedup_index.delete(hash, lsn)?;
+                        dedup_index.stage_delete(hash, lsn)?;
                         metrics.record_dedup_forward_delete(started.elapsed());
                         stage_rc_decref_if_live(old_value.head_pba())?;
                     }
@@ -158,7 +158,7 @@ impl Db {
                     let applied = cur.as_ref() == Some(old_value);
                     if applied {
                         let mut put_timings = DedupPutStageTimings::default();
-                        dedup_index.put_with_metrics(*hash, *new_value, lsn, &mut put_timings)?;
+                        dedup_index.stage_put_with_metrics(*hash, *new_value, lsn, &mut put_timings)?;
                         metrics.record_dedup_forward_put(started.elapsed());
                         metrics.record_dedup_put_stages(put_timings);
                         let old_pba = old_value.head_pba();

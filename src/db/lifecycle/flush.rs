@@ -414,6 +414,24 @@ impl Db {
             shards: &self.refcount_shards,
         };
 
+        // Dedup checkpoint barrier: preempt the async dedup drainers and
+        // synchronously final-drain all staged cuckoo mutations BEFORE
+        // the rc/L2P sample, the dedup manifest update / `flush_meta`,
+        // and the buffer-seq sample below. The TXG syncing slot is
+        // frozen (quiesce waited for all its commits, so every staged
+        // entry <= `checkpoint_lsn` is present and drained here); newer
+        // open-txg commits (lsn > checkpoint_lsn) stay staged for the
+        // next checkpoint, so `checkpoint_lsn` never advances past an
+        // undrained staged entry. Placed before any checkpoint is taken
+        // so a drain IO error returns cleanly with nothing to abort; the
+        // RAII guard re-arms the drainers on every exit path. No-op when
+        // `dedup_drainer_enabled = false` (staging is empty then).
+        let _dedup_drainer_resume_guard = DedupDrainerResumeGuard {
+            dedup_index: &self.dedup_index,
+        };
+        self.dedup_index
+            .preempt_and_drain_for_checkpoint(&self.metrics)?;
+
         // Fold the buffered L2P updates into the tree so the sample
         // phase observes them. Two drains:
         //
