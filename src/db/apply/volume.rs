@@ -260,22 +260,9 @@ pub(in crate::db) fn apply_drop_snapshot_pages(
 }
 
 /// Apply a full `LifecycleOp::DropSnapshot`: the page-refcount cascade for
-/// `pages` followed by the SPEC §3.3 leaf-rc-suppress compensation —
-/// one `decref(pba, 1)` per entry in `pba_decrefs`, collected at plan
-/// time via `diff_with_current`.
-///
-/// `pba_decrefs` is walked in shard-sorted order; each shard mutex is
-/// taken once, mirroring `apply_l2p_range_delete`'s pattern. The
-/// returned `freed_pbas` lists every pba whose refcount transitioned
-/// from `>0` to `0` during this apply. Duplicates in `pba_decrefs`
-/// are intentional (packed-slot many-LBA-share-one-pba case) and each
-/// produces one decref; only the one that drives rc to 0 adds the pba
-/// to `freed_pbas`.
-///
-/// No leaf-rc-suppress logic here: `drop_snapshot` holds
-/// `drop_gate.write()` + `apply_gate.write()`, so there is no
-/// concurrent mutation, and "suppress because a live snapshot still
-/// pins it" cannot apply — we *are* dropping the snapshot.
+/// `pages`. Phase 5 ignores `pba_decrefs`: global PBA rc is not a
+/// per-live-LBA counter, so dropping a snapshot must not subtract one PBA
+/// rc entry per logical LBA in the snapshot diff.
 pub(in crate::db) fn apply_drop_snapshot_pages_and_decrefs(
     page_store: &Arc<PageStore>,
     refcount_shards: &[Shard],
@@ -284,30 +271,12 @@ pub(in crate::db) fn apply_drop_snapshot_pages_and_decrefs(
     pba_decrefs: &[Pba],
 ) -> Result<ApplyOutcome> {
     let (freed_leaf_values, pages_freed) = apply_drop_snapshot_pages(page_store, lsn, pages)?;
-
-    let mut rc_bucket: Vec<Vec<usize>> = vec![Vec::new(); refcount_shards.len()];
-    for (idx, &pba) in pba_decrefs.iter().enumerate() {
-        rc_bucket[shard_for_key(refcount_shards, pba)].push(idx);
-    }
-
-    let mut freed_pbas: Vec<Pba> = Vec::new();
-    for (sid, indices) in rc_bucket.iter().enumerate() {
-        if indices.is_empty() {
-            continue;
-        }
-        let shard = &refcount_shards[sid];
-        for &idx in indices {
-            let pba = pba_decrefs[idx];
-            let (pre, new) = shard.rc.stage(pba, -1, lsn)?;
-            if new == 0 && pre > 0 {
-                freed_pbas.push(pba);
-            }
-        }
-    }
+    let _ = refcount_shards;
+    let _ = pba_decrefs;
 
     Ok(ApplyOutcome::DropSnapshot {
         freed_leaf_values,
         pages_freed,
-        freed_pbas,
+        freed_pbas: Vec::new(),
     })
 }

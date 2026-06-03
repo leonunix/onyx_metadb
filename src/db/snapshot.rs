@@ -330,7 +330,7 @@ impl Db {
             )));
         }
         // Lock ALL volumes' shards and refcount shards so we can flush +
-        // refresh manifest before the decref cascade.
+        // refresh manifest before the page-refcount cascade.
         //
         // Refreshing the manifest here is load-bearing: prior
         // `commit_ops` cows may have advanced each volume's root
@@ -343,11 +343,7 @@ impl Db {
         // Free page. Commit a refreshed manifest (snapshot still
         // present) so reopen always finds current roots.
         //
-        // B2: drain L2P buffer first so `diff_subtrees` below sees the
-        // post-buffer current root (otherwise post-snapshot overwrites
-        // sitting in buffer would be invisible to the diff and the
-        // snapshot's old PBA would not be decref'd). Also required for
-        // checkpoint_lsn safety: this path advances
+        // B2: drain L2P buffer first for checkpoint_lsn safety: this path advances
         // `manifest.checkpoint_lsn = last_applied_lsn`; if any buffer
         // entry sits at LSN ≤ last_applied_lsn the recovery cursor
         // would skip past it. Compaction here advances each shard's
@@ -380,68 +376,16 @@ impl Db {
         commit_refcount_checkpoint(&self.refcount_shards, dedup_generation)?;
         self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
 
-        // Locate the source volume's shard range within l2p_guards.
-        let mut source_start = 0usize;
-        for vol in &volumes_snap {
-            if vol.ord == entry.vol_ord {
-                break;
-            }
-            source_start += vol.shards.len();
-        }
-        let source_end = source_start + source_volume.shards.len();
-
         let all_current_roots: Vec<PageId> = l2p_guards.iter().map(|tree| tree.root()).collect();
-        // SPEC §3.3 pba_decrefs: for every lba where the snapshot has a
-        // value but the current tree diverged, emit one decref against
-        // the snap-side pba. Computed while we still hold the source
-        // volume's shard guards so `diff_subtrees` sees a coherent snap
-        // root vs current root pair. The `RemovedInB` / `Changed` arms
-        // cover "snap has it, current doesn't" and "snap has it, current
-        // has a different value" respectively; `AddedInB` is "current
-        // has it, snap doesn't" which has nothing for us to compensate.
-        let mut raw_pba_decrefs: Vec<(Lba, L2pValue)> = Vec::new();
-        for (tree, &snap_root) in l2p_guards[source_start..source_end]
-            .iter_mut()
-            .zip(entry.l2p_shard_roots.iter())
-        {
-            if snap_root == crate::types::NULL_PAGE {
-                continue;
-            }
-            let current_root = tree.root();
-            for diff in tree.diff_subtrees(snap_root, current_root)? {
-                match diff {
-                    DiffEntry::RemovedInB { key, old } | DiffEntry::Changed { key, old, .. } => {
-                        raw_pba_decrefs.push((key, old));
-                    }
-                    DiffEntry::AddedInB { .. } => {}
-                }
-            }
-        }
-        // Filter out pbas whose refcount is already 0. This happens when
-        // the volume was written via raw `insert` / `delete` (no
-        // refcount tracking) — production flows via `l2p_remap` always
-        // maintain `rc(snap_pba) >= 1` for every lba the snapshot
-        // references, so the filter is a no-op there. Without this
-        // guard the apply decref would underflow and corrupt state.
-        //
-        // We hold `refcount_guards` here, so reads are consistent with
-        // the subsequent apply under `apply_gate.write()`. Pending
-        // decref entries on the same pba within this same diff are
-        // accounted for via `pending[pba]` so the N-th appearance only
-        // survives if `rc(pba) > pending` — matches the apply's
-        // sequential decrefs.
-        let mut pending: HashMap<Pba, u32> = HashMap::new();
-        let mut pba_decrefs: Vec<Pba> = Vec::with_capacity(raw_pba_decrefs.len());
-        for (_lba, value) in raw_pba_decrefs {
-            let pba = value.head_pba();
-            let sid = shard_for_key(&self.refcount_shards, pba);
-            let rc = self.refcount_shards[sid].rc.get(pba)?;
-            let taken = pending.entry(pba).or_insert(0);
-            if *taken < rc {
-                *taken += 1;
-                pba_decrefs.push(pba);
-            }
-        }
+        // Phase 5: do not emit PBA decrefs for snapshot-only logical
+        // mappings. Global PBA rc is no longer a per-live-LBA counter
+        // (ordinary remaps and dedup hits are rc-neutral), so walking the
+        // snapshot/current diff and subtracting one per LBA can drive rc to
+        // zero while another live volume/LBA still references the same PBA.
+        // The L2P page-refcount cascade below still releases metadata pages;
+        // physical PBA reclaim is handled by dead-list / retired-extent
+        // confirmation paths.
+        let pba_decrefs: Vec<Pba> = Vec::new();
         drop(l2p_guards);
 
         // Page refcounts are physical-page ownership counts, not
@@ -450,9 +394,8 @@ impl Db {
         // pages as the snapshot being dropped. Build the decrement plan
         // from the complete manifest-visible page graph so a page is
         // decremented exactly when removing this snapshot removes one
-        // physical incoming edge. The PBA compensation above stays
-        // volume-scoped because it reasons about this snapshot's logical
-        // LBA values, not page-parent edges.
+        // physical incoming edge. PBA-level reclaim is deliberately absent
+        // here in Phase 5; dead-list / retired-extent confirmation owns it.
         let mut roots_before = all_current_roots.clone();
         roots_before.extend(entry.l2p_shard_roots.iter().copied());
         roots_before.extend(
@@ -580,10 +523,10 @@ impl Db {
         // until the long reader departs.
         self.reclaim_freed_pages()?;
 
-        // Wake the Phase 3 Lineage GC pass — dropping a snapshot may
-        // have un-pinned dead-list records whose `[birth, death)`
-        // interval overlapped the snapshot's `created_lsn`. The next
-        // GC cycle can advance `head_pid` past those segments.
+        // Wake reclaim bookkeeping — dropping a snapshot may have
+        // un-pinned dead-list records whose `[birth, death)` interval
+        // overlapped the snapshot's `created_lsn`. The FreePbas-emitting
+        // lineage driver can then advance past those segments.
         self.notify_async_reclaim();
 
         Ok(Some(DropReport {

@@ -42,7 +42,8 @@ use crate::op::WalOp;
 /// * [`ApplyOutcome::L2pRemap`] — landed in S2 (`WalOp::L2pRemap`).
 /// * [`ApplyOutcome::RangeDelete`] — landed in S3 (lifecycle `Discard`).
 /// * The `freed_pbas` field on [`ApplyOutcome::DropSnapshot`] —
-///   populated by S4 when `LifecycleOp::DropSnapshot.pba_decrefs` is added.
+///   retained for lifecycle-log compatibility; Phase 5 leaves it empty
+///   because DropSnapshot is PBA rc-neutral.
 ///
 /// S1 declares the shape so apply-path plumbing is stable for the
 /// follow-up sessions; each session fills in its own producer.
@@ -72,10 +73,9 @@ pub enum ApplyOutcome {
     /// the same arm but the collected vec is discarded — the numbers
     /// aren't load-bearing for recovery.
     ///
-    /// `freed_pbas` is the new-in-S4 slot: the set of pbas whose
-    /// refcount transitioned from `>0` to `0` while applying the
-    /// drop_snapshot op's pba_decrefs list (the "snap has it, current
-    /// has a different pba" diff). Empty until S4 wires it up.
+    /// `freed_pbas` is retained for the historical S4 lifecycle shape.
+    /// Phase 5 ignores `pba_decrefs`, so DropSnapshot never surfaces PBA
+    /// frees here.
     DropSnapshot {
         freed_leaf_values: Vec<L2pValue>,
         pages_freed: usize,

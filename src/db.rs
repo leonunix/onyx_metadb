@@ -277,10 +277,10 @@ pub struct Db {
     /// `flush_with_gate` does so inline when `txg_threads_enabled =
     /// false`).
     l2p_buffer_enabled: bool,
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 4. Cached copy
-    /// of `Config::lineage_gc_emit_freepbas` so the GC driver
-    /// (`run_lineage_gc_cycle_inner`) and the async-reclaim worker
-    /// pick up the same value without re-reading the full config.
+    /// [[no-refcount-hot-path-design]] Phase 5. Cached copy of
+    /// `Config::lineage_gc_emit_freepbas`. Create/open reject the old
+    /// Phase 3 flag-off mode; this stays as a compatibility field for
+    /// config/wire stability.
     lineage_gc_emit_freepbas: bool,
     /// [[no-refcount-hot-path-design]] Phase 4 Step 7. Optional sink
     /// invoked when a `commit_free_pbas` apply produces a non-empty
@@ -442,9 +442,9 @@ struct DispatchEntry {
     durable: bool,
 }
 
-/// Snapshot view info cached per volume, used by `apply_l2p_remap` /
-/// `apply_l2p_range_delete` to decide whether decref of a pba would
-/// orphan content a live snapshot still pins. See [`Db::snap_info_cache`].
+/// Snapshot view info cached per volume. Kept for remap-era compatibility
+/// and future snapshot-aware consumers; Phase 5 RangeDelete no longer uses
+/// it for PBA refcount decisions.
 #[derive(Clone, Debug)]
 struct SnapInfo {
     created_lsn: Lsn,
@@ -1407,20 +1407,11 @@ impl Db {
     /// `db::tests::lineage_gc` to assert chain truncation without
     /// racing the background worker.
     ///
-    /// When [`Config::lineage_gc_emit_freepbas`] is `false` (default),
-    /// behaves exactly like the Phase 3 worker: per-volume
-    /// plan + execute, no WAL side effects.
-    ///
-    /// When the flag is `true` ([[no-refcount-hot-path-design]] Phase 4
-    /// Step 4 / Phase 5 default), each volume's plan + execute is
-    /// interleaved with a `commit_free_pbas` call carrying the
-    /// segment's dead-record PBAs. Phase 4 hot path still maintains
-    /// rc, so `apply_free_pbas` sees rc=0 for every PBA we surface
-    /// (the plan's rc==0 gate guarantees this) and takes the
-    /// exclusive branch. The background-worker path
-    /// (`async_reclaim::lineage_gc_cycle`) keeps Phase 3 behavior
-    /// regardless of this flag because it has no access to
-    /// `commit_ops`; Phase 5 will wire a `Weak<Db>` bridge.
+    /// Phase 5 mode: each volume's plan + execute is interleaved with a
+    /// `commit_free_pbas` call carrying the segment's dead-record PBAs.
+    /// The plan's `rc==0` gate remains load-bearing because ordinary
+    /// shared refcounts should not reach zero unless the refcount event
+    /// ledger has already released them.
     pub(crate) fn test_run_lineage_gc_cycle(&self) -> Result<usize> {
         self.run_lineage_gc_cycle_inner()
     }
@@ -1439,16 +1430,17 @@ impl Db {
             emit_freepbas: self.lineage_gc_emit_freepbas,
         };
         if !self.lineage_gc_emit_freepbas {
-            // Flag OFF: chain truncation only, identical to Phase 3 /
-            // background-worker behavior.
-            return async_reclaim::test_run_lineage_gc_cycle(&self.page_store, &ctx);
+            return Err(MetaDbError::InvalidArgument(
+                "lineage_gc_emit_freepbas=false is no longer supported: Phase 5 forbids \
+                 the old Phase 3 chain-truncation-only GC mode"
+                    .into(),
+            ));
         }
 
-        // Flag ON: per-volume plan → commit_free_pbas → execute. We
-        // can't fold FreePbas across volumes because the apply path
-        // is keyed on `vol_ord`; multi-vol cycles emit one
-        // `commit_free_pbas` per advancing volume, identical to how
-        // Phase 5 will work.
+        // Per-volume plan → commit_free_pbas → execute. We can't fold
+        // FreePbas across volumes because the apply path is keyed on
+        // `vol_ord`; multi-vol cycles emit one `commit_free_pbas` per
+        // advancing volume.
         let vol_handles: Vec<(crate::types::VolumeOrdinal, Arc<Volume>)> = {
             let guard = self.volumes.read();
             guard.iter().map(|(k, v)| (*k, v.clone())).collect()
@@ -1467,7 +1459,7 @@ impl Db {
                     tracing::warn!(
                         vol_ord = vol_ord,
                         error = %err,
-                        "lineage GC: plan failed (flag ON)"
+                        "lineage GC: Phase 5 plan failed"
                     );
                     continue;
                 }
@@ -1494,7 +1486,7 @@ impl Db {
                 tracing::warn!(
                     vol_ord = vol_ord,
                     error = %err,
-                    "lineage GC: execute failed after FreePbas commit (flag ON)"
+                    "lineage GC: execute failed after FreePbas commit"
                 );
                 continue;
             }

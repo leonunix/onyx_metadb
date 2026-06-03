@@ -330,30 +330,29 @@ pub(in crate::db) fn scan_l2p_range(
     Ok(acc)
 }
 
-/// Apply one [`LifecycleOp::Discard`]. Walks the `captured` list,
-/// deleting each lba from its volume's L2P shard and emitting a
-/// decref against `old_pba` — modulo birth/death LSN suppression: if
-/// `min_alive_snap_lsn` is `Some(snap_lsn)` and `pba.birth_lsn <=
-/// snap_lsn`, the snapshot may still reference this pba and the
-/// decref is suppressed. `drop_snapshot` later compensates via the
-/// deadlist (next session) or via `diff_subtrees`-derived
-/// `pba_decrefs` (current).
+/// Apply one [`LifecycleOp::Discard`]. Walks the `captured` list and
+/// deletes each lba from its volume's L2P shard. Phase 5 keeps
+/// range-delete rc-neutral for PBA refcounts: global PBA rc is not a
+/// per-live-LBA counter anymore (ordinary remaps and dedup hits do not
+/// bump it), so a discard must not decref one rc entry per captured LBA.
+/// Physical reuse is driven by the onyx-side retired-extent path, which
+/// confirms absence of live L2P references before returning space to
+/// the allocator.
 ///
 /// Replay safety: the captured list is authoritative — both live
-/// apply and replay consume the same (lba, pba) pairs, and birth_lsn
-/// is part of the rc tree's persistent state, so suppress decisions
-/// reproduce across restarts.
+/// apply and replay consume the same (lba, value) pairs; already-deleted
+/// LBAs simply remain absent.
 /// Range-delete's `Db::range_delete` caller uses apply_gate.write
 /// (same pattern as `drop_snapshot`) to exclude concurrent commits
 /// while plan + submit + apply run, so captured is consistent with
 /// the tree state at apply time.
 pub(in crate::db) fn apply_l2p_range_delete(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
-    refcount_shards: &[Shard],
+    _refcount_shards: &[Shard],
     lsn: Lsn,
     vol_ord: VolumeOrdinal,
     captured: &[(Lba, L2pValue)],
-    snap_infos: &[SnapInfo],
+    _snap_infos: &[SnapInfo],
 ) -> Result<ApplyOutcome> {
     let volume = volumes.get(&vol_ord).ok_or_else(|| {
         MetaDbError::Corruption(format!("L2pRangeDelete for unknown volume ord {vol_ord}"))
@@ -367,84 +366,22 @@ pub(in crate::db) fn apply_l2p_range_delete(
         shard_buckets[shard_for_key_l2p(&volume.shards, *lba)].push(idx);
     }
 
-    // For each captured (lba, value): did it have a live mapping? And
-    // if so, does any live snap of V still hold the *exact same* full
-    // value at that lba? Full-value compare matches audit semantics
-    // (distinct `(V, lba, value_28B)` tuples). Both determined while
-    // holding the L2P shard mutex; snap reads use `get_at` on the same
-    // tree instance, different root.
-    let mut was_mapped: Vec<bool> = vec![false; captured.len()];
-    let mut snap_pinned: Vec<bool> = vec![false; captured.len()];
+    // Delete captured LBAs only. Snapshot pinning is enforced later by
+    // lineage GC's birth/death interval checks, not by per-discard PBA
+    // decrefs.
     for (sid, indices) in shard_buckets.iter().enumerate() {
         if indices.is_empty() {
             continue;
         }
         let mut tree = volume.shards[sid].tree.write();
         for &idx in indices {
-            let (lba, captured_value) = captured[idx];
-            let prev = tree.delete_at_lsn(lba, lsn)?;
-            was_mapped[idx] = prev.is_some();
-            if !snap_infos.is_empty() && was_mapped[idx] {
-                // Per-snap fast filter via birth_lsn, same shape as
-                // apply_l2p_remap. Look up birth_lsn first under the
-                // rc shard mutex, then walk only candidate snaps.
-                let captured_birth = lookup_birth_lsn(refcount_shards, captured_value.head_pba())?;
-                for s in snap_infos {
-                    if let Some(b) = captured_birth {
-                        if b > s.created_lsn {
-                            continue;
-                        }
-                    }
-                    let snap_root = s.l2p_shard_roots[sid];
-                    if let Some(snap_val) = tree.get_at(snap_root, lba)? {
-                        if snap_val == captured_value {
-                            snap_pinned[idx] = true;
-                            break;
-                        }
-                    }
-                }
-            }
+            let (lba, _) = captured[idx];
+            tree.delete_at_lsn(lba, lsn)?;
         }
         publish_l2p_read_view(&volume.shards[sid], &tree);
     }
 
-    // Second pass: precise snap-pin suppress + decref. Bucket by
-    // refcount shard so each shard mutex is taken at most once.
-    let mut rc_bucket: Vec<Vec<usize>> = vec![Vec::new(); refcount_shards.len()];
-    for (idx, (_, value)) in captured.iter().enumerate() {
-        if !was_mapped[idx] || snap_pinned[idx] || value.0[27] & 0x02 != 0 {
-            continue;
-        }
-        rc_bucket[shard_for_key(refcount_shards, value.head_pba())].push(idx);
-    }
-
-    let mut freed_pbas: Vec<Pba> = Vec::new();
-    for (sid, indices) in rc_bucket.iter().enumerate() {
-        if indices.is_empty() {
-            continue;
-        }
-        let shard = &refcount_shards[sid];
-        for &idx in indices {
-            let (_, value) = captured[idx];
-            let pba = value.head_pba();
-            // Phase 5: hot-path L2pRemap is rc-neutral, so a captured
-            // PBA may have `rc == 0` (fresh exclusive write that never
-            // entered dedup_index nor was promoted). Decref'ing such a
-            // PBA would underflow. The stale-entry skip mirrors the
-            // pattern in `apply_dedup_put_with_rc`: only mutate rc when
-            // it represents a live "shared via dedup_index /
-            // PromotionChunk" reference. Same on replay — `rc.get`
-            // observes the in-progress apply lane's state for this
-            // LSN.
-            if shard.rc.get(pba)? == 0 {
-                continue;
-            }
-            let (pre, new) = shard.rc.stage(pba, -1, lsn)?;
-            if new == 0 && pre > 0 {
-                freed_pbas.push(pba);
-            }
-        }
-    }
-
-    Ok(ApplyOutcome::RangeDelete { freed_pbas })
+    Ok(ApplyOutcome::RangeDelete {
+        freed_pbas: Vec::new(),
+    })
 }

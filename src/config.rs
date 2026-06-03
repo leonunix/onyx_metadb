@@ -466,14 +466,11 @@ pub struct Config {
     /// via a condvar, so under load the worker stays hot and only
     /// hits this on truly idle systems.
     pub async_reclaim_idle_interval_ms: u64,
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 4: when true, the
-    /// Lineage GC pass emits a `FreePbas` lifecycle/dispatch record
-    /// for every dead-list record it retires (decref each
-    /// shared PBA via the global rc, surface exclusive PBAs
-    /// directly) before truncating the chain. When false (the
-    /// default), GC behaves exactly as in Phase 3 — chain
-    /// truncation only, no PBA retire surface. Phase 5 will flip
-    /// the default ON once the hot path stops maintaining rc.
+    /// [[no-refcount-hot-path-design]] Phase 5: Lineage GC emits a
+    /// `FreePbas` lifecycle/dispatch record for every dead-list record it
+    /// retires before truncating the chain. The historical Phase 3
+    /// chain-truncation-only mode is no longer supported; create/open reject
+    /// `false` because rc-neutral L2P remaps require FreePbas retire events.
     pub lineage_gc_emit_freepbas: bool,
 }
 
@@ -561,9 +558,7 @@ impl Config {
             async_reclaim_idle_interval_ms: 50,
             // [[no-refcount-hot-path-design]] Phase 5: hot-path RC
             // writes are gone — Lineage GC is the sole producer of
-            // PBA-free decisions, so FreePbas emission must be on by
-            // default. The Phase 3/4 default-off mode is preserved
-            // only for offline tooling that explicitly opts out.
+            // PBA-free decisions, so FreePbas emission is mandatory.
             lineage_gc_emit_freepbas: true,
             rebuild_free_list_on_open: true,
             reclaim_orphans_on_open: true,

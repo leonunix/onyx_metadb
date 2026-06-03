@@ -455,10 +455,10 @@ fn b2_buffer_range_delete_drains_buffer() {
     // `range_delete` calls `force_compact_l2p_buffers` so the scan
     // sees buffer-only entries that haven't compacted yet.
     //
-    // Phase 5: hot-path `L2pRemap` no longer maintains global rc,
-    // but `apply_l2p_range_delete` still decrefs. Seed rc explicitly
-    // so range_delete has something to decref from without
-    // underflowing.
+    // Phase 5: hot-path `L2pRemap` no longer maintains global rc, and
+    // RangeDelete is PBA rc-neutral too. Seed rc explicitly so the test
+    // can assert the delete drains buffer-only L2P entries without
+    // mutating PBA rc.
     fn remap_val(pba: Pba, tag: u8) -> L2pValue {
         let mut v = [0u8; crate::paged::format::LEAF_VALUE_SIZE];
         v[..8].copy_from_slice(&pba.to_be_bytes());

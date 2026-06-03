@@ -662,8 +662,8 @@ impl Db {
     }
 
     /// Read-side: cloned snapshot info for `vol`. Empty Vec when no
-    /// snap is live on the volume. Used by [`apply_l2p_remap`] /
-    /// [`apply_l2p_range_delete`] to gate decref decisions.
+    /// snap is live on the volume. Phase 5 RangeDelete is PBA
+    /// rc-neutral, so it does not consult this cache for refcount work.
     pub(super) fn snap_info_for_vol(&self, vol: VolumeOrdinal) -> Vec<SnapInfo> {
         self.snap_info_cache
             .lock()

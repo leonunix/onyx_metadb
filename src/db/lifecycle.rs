@@ -398,12 +398,10 @@ impl Db {
     /// invoking; this method assumes the knob was true so it can
     /// stay on `&self` without re-reading config.
     ///
-    /// Also wires up the Phase 3 (no-refcount-hot-path) Lineage GC
-    /// pass via [`LineageGcCtx`]. The pass piggybacks on the same
-    /// worker thread + condvar that drains `deferred_free`; Phase 3
-    /// notifications come from `flush_with_gate` (after tail
-    /// advancement) and `drop_snapshot` (which may un-pin records),
-    /// both routed through [`notify_async_reclaim`].
+    /// Phase 5 passes a lineage context only so the worker can refuse the
+    /// historical chain-truncation-only path. FreePbas-emitting Lineage GC
+    /// must run through `Db::run_lineage_gc_cycle_inner`, where a `Db`
+    /// handle can commit the retire record before advancing the chain.
     fn start_async_reclaim(&self, params: super::async_reclaim::AsyncReclaimParams) {
         let lineage_gc = super::async_reclaim::LineageGcCtx {
             volumes: self.volumes.clone(),

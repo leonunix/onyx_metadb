@@ -1,20 +1,15 @@
-//! Background reclaim of `page_store.deferred_free` + Phase 3 Lineage GC.
+//! Background reclaim of `page_store.deferred_free`.
 //!
 //! ## Two passes per cycle
 //!
 //! 1. **Deferred-free reclaim**: keeps the page_store's deferred_free
 //!    queue draining off the `flush_with_gate` critical path. Same
 //!    semantics as the original priority-1 worker.
-//! 2. **Lineage GC** (Phase 3 of [[no-refcount-hot-path-design]],
-//!    default-on once a [`LineageGcCtx`] is wired in via
-//!    [`AsyncReclaim::start_with_lineage_gc`]): per volume, try to
-//!    advance the dead-list chain's `head_pid` past the oldest
-//!    segment whose records have all been freed by the hot path (rc
-//!    already 0) and no snapshot pins their `(birth, death)`
-//!    interval. Phase 3 doesn't emit `commit_free_pbas` itself — the
-//!    hot path still owns rc decref — so GC's only mutation is
-//!    chain truncation. Phase 5 will fold `commit_free_pbas`
-//!    emission into the same pass.
+//! 2. **Lineage GC planning**: Phase 5 cannot use the historical
+//!    background worker path because it only advanced the dead-list chain
+//!    and had no `Db` handle to emit `commit_free_pbas`. With rc-neutral
+//!    L2P remaps, that would drop the only retire signal. The worker
+//!    therefore refuses to run chain-truncation-only lineage GC in Phase 5.
 //!
 //! ## Correctness
 //!
@@ -118,9 +113,9 @@ struct AsyncReclaimInner {
     /// only — not part of correctness — but lets dashboards
     /// confirm the worker is actually running.
     last_cycle_us: AtomicU64,
-    /// Optional Phase 3 Lineage GC context. `None` means the
-    /// lineage_gc pass is skipped (legacy embedders that don't
-    /// wire up Db's manifest/apply_gate handles).
+    /// Optional lineage GC context. Phase 5 uses this only as a guard:
+    /// the old background worker cannot emit FreePbas, so it must not
+    /// advance chains while `emit_freepbas` is true.
     lineage_gc: Option<LineageGcCtx>,
 }
 
@@ -223,15 +218,17 @@ fn run_worker(inner: Arc<AsyncReclaimInner>) {
                 }
             }
         }
-        // PASS 2: Phase 3 Lineage GC. Walks each volume's dead-list
-        // head segment and (if every record is reclaim-eligible)
-        // commits a manifest update that advances `head_pid` past
-        // it, then deferred-frees the segment's pages back to the
-        // page store (which the next pass will reclaim). No
-        // mutation if no volume is eligible.
+        // PASS 2: Historical Phase 3 lineage GC is disabled in Phase 5.
+        // It can only truncate dead-list chains; it cannot emit FreePbas
+        // because this worker intentionally doesn't hold an Arc<Db>. Since
+        // rc-neutral L2P remaps rely on FreePbas as the retire signal, do
+        // not run the old chain-truncation-only path when emit_freepbas is
+        // required.
         if let Some(ctx) = &inner.lineage_gc {
-            if let Err(err) = lineage_gc_cycle(&inner.page_store, ctx) {
-                tracing::warn!(error = %err, "metadb: lineage GC cycle failed");
+            if !ctx.emit_freepbas {
+                if let Err(err) = lineage_gc_cycle(&inner.page_store, ctx) {
+                    tracing::warn!(error = %err, "metadb: lineage GC cycle failed");
+                }
             }
         }
         // Park until notified or until the idle interval elapses.
@@ -243,7 +240,7 @@ fn run_worker(inner: Arc<AsyncReclaimInner>) {
     }
 }
 
-/// One pass of Phase 3's Lineage GC: try to advance every volume's
+/// Historical Phase 3 Lineage GC: try to advance every volume's
 /// `dead_list_head_pid` by one segment when the head segment is
 /// fully reclaim-eligible. Returns the number of volumes whose head
 /// advanced. Per-volume failures are logged and don't abort the
@@ -273,8 +270,8 @@ fn lineage_gc_cycle(page_store: &Arc<PageStore>, ctx: &LineageGcCtx) -> Result<u
 
 /// Output of [`gc_plan_head_advance`]. Carries everything
 /// [`gc_execute_head_advance`] needs to actually advance the chain,
-/// plus the list of PBAs that the (Phase 4 Step 4) FreePbas-emitting
-/// driver wants to surface to onyx before the chain is truncated.
+/// plus the list of PBAs that the Phase 5 FreePbas-emitting driver wants
+/// to surface to onyx before the chain is truncated.
 ///
 /// `dead_pbas` is collected in segment order from the head segment's
 /// records, with no dedup. Phase 4 currently retires whole segments
@@ -294,8 +291,8 @@ pub(super) struct HeadAdvancePlan {
 /// cycle" (head empty, snap/descendant pin, or any record still
 /// rc>0). Does **not** mutate state and does **not** take
 /// `apply_gate`; safe to call from any context including the
-/// flag-ON FreePbas driver, which needs to commit a WAL record
-/// between plan and execute.
+/// FreePbas driver, which needs to commit a lifecycle record between plan
+/// and execute.
 pub(super) fn gc_plan_head_advance(
     page_store: &Arc<PageStore>,
     ctx: &LineageGcCtx,
@@ -369,10 +366,10 @@ pub(super) fn gc_plan_head_advance(
 
     // 3. Check every record: must be unpinned by any active
     // snapshot, unpinned by any descendant's branch point, AND
-    // the hot path must have already brought the rc to 0. If any
+    // no longer blocked by the global refcount event ledger. If any
     // record fails any check, leave the segment alone — it'll be
     // re-evaluated on the next cycle (e.g. after a drop_snapshot,
-    // a PromotionComplete, or further hot-path decrefs).
+    // a PromotionComplete, or further FreePbas/DedupDelete events).
     let n_shards = ctx.refcount_shards_rc.len();
     debug_assert!(n_shards > 0, "lineage GC: refcount_shards_rc must be non-empty");
     let mut dead_pbas: Vec<Pba> = Vec::with_capacity(records.len());
@@ -415,14 +412,10 @@ pub(super) fn gc_plan_head_advance(
 /// find the segment "newer than head", commits the manifest, promotes
 /// the new head/tail atomics, and frees the old head segment's pages.
 ///
-/// The plan-then-execute split exists so the (Phase 4 Step 4)
-/// FreePbas-emitting driver can call `commit_free_pbas(vol_ord, …)`
-/// between the two phases without deadlocking against `apply_gate`
-/// — `commit_free_pbas` takes `apply_gate.read()` internally. Phase 4
-/// keeps the hot path maintaining rc, so the FreePbas applied
-/// between plan and execute observes rc=0 for every PBA we
-/// surfaced (the plan's rc==0 gate) and takes the exclusive branch.
-/// A crash between FreePbas commit and execute is safe: the chain
+/// The plan-then-execute split exists so the FreePbas-emitting driver can
+/// call `commit_free_pbas(vol_ord, …)` between the two phases without
+/// deadlocking against `apply_gate` — `commit_free_pbas` takes
+/// `apply_gate.read()` internally. A crash between FreePbas commit and execute is safe: the chain
 /// is still intact, next GC cycle re-runs both phases and
 /// `apply_free_pbas` re-surfaces the same PBAs (onyx retire is a
 /// set). A crash inside execute (after manifest commit, before
@@ -455,10 +448,14 @@ fn try_advance_head_one(
     let Some(plan) = gc_plan_head_advance(page_store, ctx, vol, vol_ord)? else {
         return Ok(false);
     };
-    // Phase 3 worker path: no FreePbas emission, chain truncation
-    // only. Phase 4 Step 4's FreePbas-emitting driver lives in
-    // `Db::run_lineage_gc_cycle_inner` because `commit_ops` requires
-    // `&Db`, which a background worker doesn't hold (cycle hygiene).
+    // Phase 3 worker path: no FreePbas emission, chain truncation only.
+    // Phase 5 callers must not reach this path with emit_freepbas=true.
+    if ctx.emit_freepbas {
+        return Err(MetaDbError::InvalidArgument(
+            "Phase 5 forbids background lineage GC chain truncation without FreePbas emission"
+                .into(),
+        ));
+    }
     gc_execute_head_advance(page_store, ctx, vol, vol_ord, &plan)?;
     Ok(true)
 }

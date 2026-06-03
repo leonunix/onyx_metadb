@@ -72,8 +72,7 @@ fn l2p_remap_same_pba_leaf_shared_increfs_new() {
     // (lane) path and the serial path that snapshot-on-volume routes
     // through. The serial path still exists for the dead-list /
     // snap-pin recording inside `record_dead`, but the rc table is
-    // untouched. Snap-on-vol rc bookkeeping (when needed) lives on
-    // `drop_snapshot`'s `pba_decrefs` plan.
+    // untouched; DropSnapshot is PBA rc-neutral too.
     let (_d, db) = mk_db();
     remap(&db, 10, remap_val(100, 1), None);
     db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
@@ -105,7 +104,7 @@ fn l2p_remap_different_pba_exclusive_decrefs_old_increfs_new() {
 }
 
 #[test]
-fn l2p_remap_different_pba_leaf_shared_suppresses_decref() {
+fn l2p_remap_different_pba_leaf_shared_stays_rc_neutral() {
     // Phase 5: L2pRemap is rc-neutral regardless of routing. Snapshot
     // pinning of the old PBA is enforced by `record_dead` populating
     // the volume's dead-list with the prev `(pba, birth_lsn, death_lsn)`;
@@ -307,8 +306,7 @@ fn seed_distinct_remaps_batched(db: &Db, total: usize) {
         tx.commit().unwrap();
     }
     // Phase 5: hot-path L2pRemap no longer bumps global rc; seed it
-    // explicitly so range_delete's apply path can decref without
-    // underflowing.
+    // explicitly so range_delete can prove it leaves PBA rc untouched.
     for (pba, count) in pba_counts {
         db.incref_pba(pba, count).unwrap();
     }
@@ -350,10 +348,10 @@ fn range_delete_with_no_live_mappings_is_noop() {
 }
 
 #[test]
-fn range_delete_removes_mappings_and_decrefs() {
-    // Phase 5: seed rc explicitly because L2pRemap no longer does.
-    // `apply_l2p_range_delete` (still active) decrefs each captured
-    // entry; without seeded rc it would underflow.
+fn range_delete_removes_mappings_and_keeps_pba_rc() {
+    // Phase 5: range delete is L2P-only for PBA refcounts. Global PBA rc
+    // is not a per-live-LBA counter, so discard must not subtract one rc
+    // entry per captured LBA.
     let (_d, db) = mk_db();
     remap(&db, 10, remap_val(100, 0), None);
     remap(&db, 11, remap_val(200, 0), None);
@@ -365,9 +363,9 @@ fn range_delete_removes_mappings_and_decrefs() {
     assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(), None);
     assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 11).unwrap(), None);
     assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 12).unwrap(), None);
-    assert_eq!(db.get_refcount(100).unwrap(), 0);
-    assert_eq!(db.get_refcount(200).unwrap(), 0);
-    assert_eq!(db.get_refcount(300).unwrap(), 0);
+    assert_eq!(db.get_refcount(100).unwrap(), 1);
+    assert_eq!(db.get_refcount(200).unwrap(), 1);
+    assert_eq!(db.get_refcount(300).unwrap(), 1);
 }
 
 #[test]
@@ -389,31 +387,30 @@ fn range_delete_half_open_interval_excludes_end() {
         Some(remap_val(300, 0)),
         "end-exclusive: lba=12 survives",
     );
-    assert_eq!(db.get_refcount(100).unwrap(), 0);
-    assert_eq!(db.get_refcount(200).unwrap(), 0);
+    assert_eq!(db.get_refcount(100).unwrap(), 1);
+    assert_eq!(db.get_refcount(200).unwrap(), 1);
     assert_eq!(db.get_refcount(300).unwrap(), 1);
 }
 
 #[test]
-fn range_delete_dedup_multiple_lbas_same_pba_aggregates_decrefs() {
-    // SPEC §4.7: captured may have multiple (lba, pba) pairs with
-    // the same pba (dedup/packed-slot case). Apply must emit one
-    // decref per entry so refcount correctly hits zero.
+fn range_delete_dedup_multiple_lbas_same_pba_keeps_rc() {
+    // Captured may have multiple (lba, pba) pairs with the same pba
+    // (dedup/packed-slot case). Range delete must still avoid per-LBA
+    // PBA decrefs; the live-L2P confirm path owns physical reclaim.
     let (_d, db) = mk_db();
     seed_remaps(&db, 10, 4, 777, 0);
     assert_eq!(db.get_refcount(777).unwrap(), 4);
     db.range_delete(BOOTSTRAP_VOLUME_ORD, 10, 14).unwrap();
-    assert_eq!(db.get_refcount(777).unwrap(), 0);
+    assert_eq!(db.get_refcount(777).unwrap(), 4);
     for lba in 10..14 {
         assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, lba).unwrap(), None);
     }
 }
 
 #[test]
-fn range_delete_with_live_snapshot_suppresses_decref() {
-    // Snapshot holds the pre-op leaf → all decrefs for shared
-    // leaves are suppressed. Refcount survives until S4's
-    // drop_snapshot compensates.
+fn range_delete_with_live_snapshot_keeps_pba_rc() {
+    // Snapshot holds the pre-op leaf, but RangeDelete is PBA rc-neutral
+    // regardless of snapshot state. Lineage GC handles snapshot pinning.
     let (_d, db) = mk_db();
     seed_remaps(&db, 10, 3, 500, 0);
     assert_eq!(db.get_refcount(500).unwrap(), 3);
@@ -429,7 +426,7 @@ fn range_delete_with_live_snapshot_suppresses_decref() {
     assert_eq!(
         db.get_refcount(500).unwrap(),
         3,
-        "leaf shared with snapshot: all decrefs suppressed",
+        "range delete must not mutate PBA rc",
     );
 }
 
@@ -450,10 +447,11 @@ fn range_delete_mixed_shared_and_exclusive_leaves() {
 
     // Delete both ranges together in one call.
     db.range_delete(BOOTSTRAP_VOLUME_ORD, 10, 10_010).unwrap();
-    // Shared leaf: suppressed.
+    // Shared leaf: unchanged.
     assert_eq!(db.get_refcount(500).unwrap(), 3);
-    // Exclusive leaf: decref went through.
-    assert_eq!(db.get_refcount(600).unwrap(), 0);
+    // Fresh post-snapshot leaf: also unchanged; range delete is PBA
+    // rc-neutral in Phase 5.
+    assert_eq!(db.get_refcount(600).unwrap(), 3);
 }
 
 #[test]
@@ -474,7 +472,7 @@ fn range_delete_survives_restart_via_wal_replay() {
     for lba in 10..14 {
         assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, lba).unwrap(), None);
     }
-    assert_eq!(db.get_refcount(100).unwrap(), 0);
+    assert_eq!(db.get_refcount(100).unwrap(), 4);
 }
 
 // Phase D.5: `range_delete_auto_splits_above_cap` exercised the
@@ -491,12 +489,11 @@ fn range_delete_crosses_shard_boundaries() {
     // v2 caps `MAX_UNITS_PER_LEAF` at 100, so we share PBA across
     // 32-LBA chunks to keep ≤ 4 distinct units per 128-LBA leaf.
     // The shard-cross invariant we care about is "every LBA gets
-    // unmapped and all refcounts settle" — the PBA grouping is
+    // unmapped and all refcounts stay put" — the PBA grouping is
     // orthogonal to that.
     //
     // Phase 5: hot-path L2pRemap no longer bumps rc; we seed rc
-    // explicitly after the remaps so `apply_l2p_range_delete` can
-    // decref without underflow.
+    // explicitly after the remaps to assert RangeDelete keeps it stable.
     let (_d, db) = mk_db_with_shards(8);
     use std::collections::HashMap;
     let mut pba_counts: HashMap<Pba, u32> = HashMap::new();
@@ -516,17 +513,17 @@ fn range_delete_crosses_shard_boundaries() {
             "lba={i} should be unmapped after range_delete",
         );
     }
-    // Refcounts for the (potentially shared) PBAs all collapse to 0.
     for unit in 0..((200 + 31) / 32) {
-        assert_eq!(db.get_refcount(1_000 + unit).unwrap(), 0);
+        let expected = if unit < 6 { 32 } else { 8 };
+        assert_eq!(db.get_refcount(1_000 + unit).unwrap(), expected);
     }
 }
 
 #[test]
-fn range_delete_dedup_with_snapshot_suppresses_all() {
+fn range_delete_dedup_with_snapshot_keeps_rc() {
     // Combined SPEC §4.7 (dedup aggregation) + §4.4 (leaf shared).
     // Four lbas on the same pba, then snapshot, then range_delete:
-    // all four should have their decrefs suppressed.
+    // RangeDelete removes the L2P mappings but leaves the PBA rc intact.
     let (_d, db) = mk_db();
     seed_remaps(&db, 10, 4, 777, 0);
     assert_eq!(db.get_refcount(777).unwrap(), 4);
@@ -535,16 +532,14 @@ fn range_delete_dedup_with_snapshot_suppresses_all() {
     assert_eq!(
         db.get_refcount(777).unwrap(),
         4,
-        "all four lbas under a shared leaf: every decref suppressed",
+        "all four lbas removed, but PBA rc stays intact",
     );
 }
 
 #[test]
 fn l2p_remap_leaf_shared_plus_drop_snapshot_ends_at_correct_refcount() {
-    // Phase 5: L2pRemap is rc-neutral on all paths. `drop_snapshot`
-    // still walks the snapshot's L2P to plan `pba_decrefs`, but the
-    // `rc > pending` filter drops every entry because no rc bump ever
-    // happened. So `freed_pbas` is empty and both rcs stay at 0.
+    // Phase 5: L2pRemap and DropSnapshot are both PBA rc-neutral, so
+    // `freed_pbas` is empty and both rcs stay at 0.
     let (_d, db) = mk_db();
     remap(&db, 10, remap_val(100, 1), None);
     let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
@@ -556,7 +551,7 @@ fn l2p_remap_leaf_shared_plus_drop_snapshot_ends_at_correct_refcount() {
     assert_eq!(db.get_refcount(200).unwrap(), 0);
     assert!(
         report.freed_pbas.is_empty(),
-        "rc(100) was 0 → pba_decrefs filter drops it → not in freed",
+        "DropSnapshot does not emit per-LBA PBA decrefs",
     );
 }
 
@@ -594,12 +589,12 @@ fn drop_snapshot_symmetric_with_no_snapshot_refcounts() {
 }
 
 #[test]
-fn drop_snapshot_freed_pbas_covers_dedup_multi_lba_share() {
+fn drop_snapshot_keeps_pba_rc_for_dedup_multi_lba_share() {
     // Phase 5: rc must be seeded explicitly because hot-path L2pRemap
     // no longer maintains it. Seed rc(777)=4 (matches the four LBAs
     // sharing the PBA), then exercise the packed-slot drop-snapshot
-    // path. With pba_decrefs's rc-zero filter, drop_snapshot still
-    // turns rc(777) to 0 and surfaces it in freed_pbas.
+    // path. Phase 5 no longer subtracts one PBA rc entry per snapshot
+    // LBA diff, so rc(777) stays intact and no freed_pbas are surfaced.
     let (_d, db) = mk_db();
     for lba in 10u64..14 {
         remap(&db, lba, remap_val(777, (lba - 10) as u8), None);
@@ -613,11 +608,11 @@ fn drop_snapshot_freed_pbas_covers_dedup_multi_lba_share() {
     // Leaf shared: hot-path doesn't touch rc anyway, rc(777) still 4.
     assert_eq!(db.get_refcount(777).unwrap(), 4);
     let report = db.drop_snapshot(snap).unwrap().unwrap();
-    assert_eq!(db.get_refcount(777).unwrap(), 0);
+    assert_eq!(db.get_refcount(777).unwrap(), 4);
     let freed: std::collections::HashSet<Pba> = report.freed_pbas.iter().copied().collect();
     assert!(
-        freed.contains(&777),
-        "pba 777 should be in freed_pbas (hit zero)",
+        !freed.contains(&777),
+        "pba 777 should not be freed by per-LBA snapshot decrefs",
     );
     // Phase 5: L2pRemap is rc-neutral on all paths, so the new PBAs
     // stay at rc=0 and are not in `freed_pbas` (they were never live
@@ -630,13 +625,10 @@ fn drop_snapshot_freed_pbas_covers_dedup_multi_lba_share() {
 }
 
 #[test]
-fn drop_snapshot_and_pages_commit_atomically_via_wal() {
-    // SPEC §3.3: pages release and pba_decrefs share one WAL record.
-    // Crash before apply → replay must reconstruct both effects.
-    //
-    // Phase 5: rc must be seeded explicitly so drop_snapshot's
-    // pba_decrefs plan stays non-empty and we can verify that on
-    // replay both the page-release and the decref re-execute.
+fn drop_snapshot_pages_commit_atomically_via_wal_without_pba_decref() {
+    // Phase 5: DropSnapshot still releases metadata pages through the
+    // lifecycle WAL, but ignores PBA decrefs because global PBA rc is not
+    // a per-live-LBA counter.
     let dir = TempDir::new().unwrap();
     {
         let db = Db::create(dir.path()).unwrap();
@@ -646,12 +638,12 @@ fn drop_snapshot_and_pages_commit_atomically_via_wal() {
         remap(&db, 10, remap_val(200, 1), None);
         assert_eq!(db.get_refcount(100).unwrap(), 1);
         db.drop_snapshot(snap).unwrap();
-        assert_eq!(db.get_refcount(100).unwrap(), 0);
+        assert_eq!(db.get_refcount(100).unwrap(), 1);
         // Close without a flush — the drop is only in the WAL.
     }
     let db = Db::open(dir.path()).unwrap();
-    // Replay must re-run the pba_decref.
-    assert_eq!(db.get_refcount(100).unwrap(), 0);
+    // Replay must not run a per-LBA pba_decref.
+    assert_eq!(db.get_refcount(100).unwrap(), 1);
     // Phase 5: rc(200) stays at whatever the legacy apply_l2p_remap
     // assigned during replay (may be 0 or 1 depending on prev state);
     // the load-bearing snapshot-list invariant is below.
@@ -662,11 +654,9 @@ fn drop_snapshot_and_pages_commit_atomically_via_wal() {
 }
 
 #[test]
-fn drop_snapshot_skips_decref_when_pba_refcount_already_zero() {
-    // Non-refcount path (raw `insert`, without incref): plan must
-    // filter these out so apply doesn't underflow. Already covered
-    // by `drop_snapshot_reclaims_uniquely_owned_pages`; this test
-    // asserts the filter directly.
+fn drop_snapshot_keeps_zero_pba_refcount() {
+    // Non-refcount path (raw `insert`, without incref): DropSnapshot must
+    // leave PBA rc untouched and avoid surfacing freed PBAs.
     let (_d, db) = mk_db();
     // Raw inserts → no refcount touched.
     db.insert(BOOTSTRAP_VOLUME_ORD, 10, remap_val(500, 1))
@@ -678,7 +668,7 @@ fn drop_snapshot_skips_decref_when_pba_refcount_already_zero() {
     let report = db.drop_snapshot(snap).unwrap().unwrap();
     assert!(
         report.freed_pbas.is_empty(),
-        "filter dropped decrefs for rc=0 snap pba",
+        "DropSnapshot does not emit per-LBA PBA decrefs",
     );
 }
 
@@ -771,7 +761,7 @@ fn l2p_remap_range_crosses_l2p_shard_boundary() {
 }
 
 #[test]
-fn l2p_remap_range_snapshot_pin_suppresses_decref_per_lba() {
+fn l2p_remap_range_snapshot_pin_stays_rc_neutral() {
     // Phase 5: L2pRemapRange is rc-neutral on all paths. Pre- and
     // post-snapshot range writes leave global rc at 0 for every PBA;
     // freed_pbas surfaces nothing.
@@ -783,15 +773,14 @@ fn l2p_remap_range_snapshot_pin_suppresses_decref_per_lba() {
     let (_applied, _prevs, freed) = remap_range(&db, 10, new_values);
     assert!(
         freed.is_empty(),
-        "snap pins old → no decref → no freed PBAs"
+        "Phase 5 range remap is rc-neutral even with a snapshot"
     );
     for i in 0..4u8 {
         assert_eq!(db.get_refcount(700 + i as u64).unwrap(), 0);
     }
     assert_eq!(db.get_refcount(900).unwrap(), 0);
-    // drop_snapshot walks pba_decrefs; rc(700..704)=0 so filter drops
-    // them. rc(900) was never bumped (rc-neutral apply). freed_pbas
-    // empty.
+    // DropSnapshot is also PBA rc-neutral. rc(900) was never bumped
+    // either, so all PBA refs stay at 0.
     db.drop_snapshot(snap).unwrap();
     for i in 0..4u8 {
         assert_eq!(db.get_refcount(700 + i as u64).unwrap(), 0);

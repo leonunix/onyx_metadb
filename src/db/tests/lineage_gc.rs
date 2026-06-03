@@ -269,25 +269,24 @@ fn phase4_lineage_gc_pins_parent_pba_via_descendant_branched_lsn() {
     assert_eq!(head_after, head_before, "head_pid must not advance");
 }
 
-// ── Phase 4 Step 4: GC emits commit_free_pbas when flag is on ──
+// ── Phase 5: GC always emits commit_free_pbas ──
 
-fn mk_db_with_emit_freepbas(flag: bool) -> (tempfile::TempDir, std::sync::Arc<Db>) {
+fn mk_db_with_emit_freepbas() -> (tempfile::TempDir, std::sync::Arc<Db>) {
     use crate::Config;
     let dir = tempfile::TempDir::new().unwrap();
-    let mut cfg = Config::new(dir.path());
-    cfg.lineage_gc_emit_freepbas = flag;
+    let cfg = Config::new(dir.path());
     let db = Db::create_with_config(cfg).unwrap();
     (dir, db)
 }
 
-// Flag ON: GC emits a `commit_free_pbas` for each advancing volume.
+// Phase 5: GC emits a `commit_free_pbas` for each advancing volume.
 // We can't observe the outcome directly (the driver discards it), so
 // the contract test is "the cycle advanced AND the LSN advanced past
-// the writes' last LSN", which is only possible if GC committed at
-// least one record.
+// the writes' last LSN", which is only possible if GC committed at least
+// one record.
 #[test]
-fn gc_emits_freepbas_when_flag_on() {
-    let (_d, db) = mk_db_with_emit_freepbas(true);
+fn gc_emits_freepbas() {
+    let (_d, db) = mk_db_with_emit_freepbas();
     for i in 0u64..32 {
         db.insert(0, i, v(i as u8)).unwrap();
     }
@@ -303,45 +302,31 @@ fn gc_emits_freepbas_when_flag_on() {
     let advanced = db.test_run_lineage_gc_cycle().unwrap();
     assert_eq!(advanced, 1);
 
-    // Chain truncated (same as flag-OFF) AND the commit_free_pbas
-    // advanced last_applied_lsn (only happens under flag ON).
+    // Chain truncated and the commit_free_pbas advanced last_applied_lsn.
     let (head_after, tail_after) = dead_list_anchors(&db, 0);
     assert_eq!(head_after, NULL_PAGE);
     assert_eq!(tail_after, NULL_PAGE);
     let lsn_after_gc = db.last_applied_lsn();
     assert!(
         lsn_after_gc > lsn_before_gc,
-        "flag-ON GC must call commit_free_pbas (lsn {lsn_before_gc} -> {lsn_after_gc})"
+        "Phase 5 GC must call commit_free_pbas (lsn {lsn_before_gc} -> {lsn_after_gc})"
     );
 }
 
-// Flag OFF (the default): GC does chain truncation only — no WAL
-// record, no LSN advance.
 #[test]
-fn gc_does_not_emit_freepbas_when_flag_off() {
-    let (_d, db) = mk_db_with_emit_freepbas(false);
-    for i in 0u64..32 {
-        db.insert(0, i, v(i as u8)).unwrap();
-    }
-    for i in 0u64..32 {
-        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
-    }
-    db.flush().unwrap();
+fn lineage_gc_emit_freepbas_false_is_rejected() {
+    use crate::Config;
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.lineage_gc_emit_freepbas = false;
 
-    let lsn_before_gc = db.last_applied_lsn();
-    let (head_before, _) = dead_list_anchors(&db, 0);
-    assert_ne!(head_before, NULL_PAGE);
-
-    let advanced = db.test_run_lineage_gc_cycle().unwrap();
-    assert_eq!(advanced, 1);
-
-    let (head_after, tail_after) = dead_list_anchors(&db, 0);
-    assert_eq!(head_after, NULL_PAGE);
-    assert_eq!(tail_after, NULL_PAGE);
-    let lsn_after_gc = db.last_applied_lsn();
-    assert_eq!(
-        lsn_after_gc, lsn_before_gc,
-        "flag-OFF GC must not commit any free-pbas record"
+    let err = match Db::create_with_config(cfg) {
+        Ok(_) => panic!("lineage_gc_emit_freepbas=false should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("lineage_gc_emit_freepbas=false"),
+        "unexpected error: {err}"
     );
 }
 
@@ -354,7 +339,7 @@ fn freed_pbas_sink_receives_lineage_gc_outcomes() {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    let (_d, db) = mk_db_with_emit_freepbas(true);
+    let (_d, db) = mk_db_with_emit_freepbas();
     for i in 0u64..16 {
         db.insert(0, i, v(i as u8)).unwrap();
     }
@@ -382,34 +367,6 @@ fn freed_pbas_sink_receives_lineage_gc_outcomes() {
     let (vol_ord, pbas) = &captured[0];
     assert_eq!(*vol_ord, 0);
     assert!(!pbas.is_empty(), "GC cycle freed nothing: {pbas:?}");
-}
-
-// Flag OFF: no `commit_free_pbas` is issued, so the sink must not
-// fire even when registered. Guards against accidentally surfacing
-// chain-truncation work as if it were a retire signal.
-#[test]
-fn freed_pbas_sink_silent_when_flag_off() {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
-    let (_d, db) = mk_db_with_emit_freepbas(false);
-    for i in 0u64..16 {
-        db.insert(0, i, v(i as u8)).unwrap();
-    }
-    for i in 0u64..16 {
-        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
-    }
-    db.flush().unwrap();
-
-    let calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-    let calls_clone = calls.clone();
-    db.set_freed_pbas_sink(Arc::new(move |_v, _p| {
-        *calls_clone.lock().unwrap() += 1;
-    }));
-
-    let advanced = db.test_run_lineage_gc_cycle().unwrap();
-    assert_eq!(advanced, 1);
-    assert_eq!(*calls.lock().unwrap(), 0);
 }
 
 // Once the clone's `parent_vol_ord` is cleared (the Step 5 background

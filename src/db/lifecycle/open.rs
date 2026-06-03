@@ -22,6 +22,7 @@ impl Db {
         cfg: Config,
         faults: Arc<FaultController>,
     ) -> Result<Arc<Self>> {
+        validate_phase5_refcount_mode(&cfg)?;
         let shard_count = validate_shard_count(cfg.shards_per_partition)?;
         let dedup_shards = validate_dedup_shards(cfg.dedup_shards)?;
         std::fs::create_dir_all(&cfg.path)?;
@@ -272,6 +273,7 @@ impl Db {
     /// As [`open_with_config`](Self::open_with_config) but with an
     /// injectable fault controller.
     pub fn open_with_config_and_faults(cfg: Config, faults: Arc<FaultController>) -> Result<Arc<Self>> {
+        validate_phase5_refcount_mode(&cfg)?;
         let pages_path = page_file(&cfg.path);
         let page_store = Arc::new(if cfg.rebuild_free_list_on_open {
             PageStore::open_with_grow_chunk_and_bg_cap(
@@ -744,6 +746,17 @@ impl Db {
         }
         Ok(db)
     }
+}
+
+fn validate_phase5_refcount_mode(cfg: &Config) -> Result<()> {
+    if !cfg.lineage_gc_emit_freepbas {
+        return Err(MetaDbError::InvalidArgument(
+            "lineage_gc_emit_freepbas=false is no longer supported: Phase 5 rc-neutral \
+             L2P remaps require Lineage GC to emit FreePbas retire events"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Result of [`replay_lifecycle_journal_into`]: how far we got and
