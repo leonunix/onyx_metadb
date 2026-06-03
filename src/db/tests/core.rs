@@ -483,14 +483,11 @@ fn b2_buffer_range_delete_drains_buffer() {
     for i in 40u64..50 {
         assert_eq!(db.get(0, i).unwrap(), Some(remap_val(100 + i, i as u8)));
     }
-    // RC reflects deletions: surviving pbas keep rc=1, deleted ones go to 0.
-    for i in 0u64..10 {
-        assert_eq!(db.get_refcount(100 + i).unwrap(), 1);
-    }
-    for i in 10u64..40 {
-        assert_eq!(db.get_refcount(100 + i).unwrap(), 0);
-    }
-    for i in 40u64..50 {
+    // Phase 5: RangeDelete is PBA rc-neutral — it drains the L2P entries but
+    // does NOT decref PBA rc. So every seeded pba stays rc=1, *including* the
+    // deleted range. This is exactly the shared/dedup-safety property: deleting
+    // one LBA mapping must never knock a (possibly shared) PBA's rc toward 0.
+    for i in 0u64..50 {
         assert_eq!(db.get_refcount(100 + i).unwrap(), 1);
     }
 }
