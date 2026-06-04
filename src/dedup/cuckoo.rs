@@ -400,6 +400,72 @@ impl CuckooHash {
         Ok(())
     }
 
+    /// Resumable, bounded variant of [`Self::for_each`]: collect up to `limit`
+    /// live `(hash, value)` pairs starting at the cursor `(page_idx, slot)`,
+    /// returning the entries plus the cursor to resume from next call and a
+    /// `wrapped` flag that is true when the walk reached the end of the page
+    /// table (a full pass completed; the returned cursor is `(0, 0)`).
+    ///
+    /// O(`limit`) — does NOT materialise the whole index, so a background sweep
+    /// can lap a multi-billion-entry dedup index in bounded per-call steps where
+    /// [`Self::iter`] would allocate hundreds of GiB. A single call walks a
+    /// contiguous run of pages and stops at either `limit` entries or the end of
+    /// the table, whichever comes first (so it never laps more than once per
+    /// call). The page-table snapshot is taken per call; concurrent
+    /// growth/shrink between calls only reshuffles which entries a given cursor
+    /// lands on (best-effort coverage, like the L2P cold-tail cursor) — callers
+    /// must not rely on exactly-once visitation, which is correct for the
+    /// orphan-reclaim sweep (its safety is the Gate-2 confirm scan + guarded
+    /// delete, not scan completeness).
+    pub fn scan_from(
+        &self,
+        page_idx: usize,
+        slot: usize,
+        limit: usize,
+    ) -> Result<(Vec<(Hash8, DedupValue)>, usize, usize, bool)> {
+        let snapshot = {
+            let inner = self.inner.lock();
+            inner.page_table.clone()
+        };
+        let n = snapshot.len();
+        let mut out = Vec::new();
+        if n == 0 || limit == 0 {
+            return Ok((out, 0, 0, true));
+        }
+        // Out-of-range cursor (e.g. the table shrank since last call) → restart.
+        let mut pi = if page_idx >= n { 0 } else { page_idx };
+        let mut sl = if page_idx >= n { 0 } else { slot.min(SLOTS_PER_PAGE) };
+        loop {
+            let pid = snapshot[pi];
+            if pid != 0 {
+                let page = self.page_cache.get(pid)?;
+                let bitmap = read_bitmap(&page);
+                while sl < SLOTS_PER_PAGE {
+                    if bitmap & (1u128 << sl) != 0 {
+                        out.push(read_slot(&page, sl));
+                        if out.len() >= limit {
+                            // Resume after this slot; normalise a page overflow.
+                            sl += 1;
+                            if sl >= SLOTS_PER_PAGE {
+                                pi += 1;
+                                sl = 0;
+                            }
+                            let wrapped = pi >= n;
+                            return Ok((out, if wrapped { 0 } else { pi }, sl, wrapped));
+                        }
+                    }
+                    sl += 1;
+                }
+            }
+            // Page exhausted → advance. End of table ⇒ wrapped, resume at (0,0).
+            pi += 1;
+            sl = 0;
+            if pi >= n {
+                return Ok((out, 0, 0, true));
+            }
+        }
+    }
+
     /// Recompute `approx_len` from the current on-disk state. O(N).
     pub fn recount(&self) -> Result<u64> {
         let mut count = 0u64;

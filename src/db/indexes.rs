@@ -225,4 +225,30 @@ impl Db {
             inner: all.into_iter(),
         })
     }
+
+    /// Resumable, bounded scan over the dedup forward index. Returns up to
+    /// `limit` live `(Hash8, DedupValue)` entries starting at the cursor, plus
+    /// the cursor to resume from and `wrapped` (a full pass over the index
+    /// completed). O(`limit`) — for background sweeps over a very large index
+    /// that must not materialise the whole thing (`iter_dedup` allocates the
+    /// entire index; this does not). See
+    /// [`crate::dedup::cuckoo::Cuckoo::scan_from`] for the coverage / cursor
+    /// stability contract (best-effort under concurrent growth/shrink).
+    pub fn scan_dedup_from(
+        &self,
+        cursor: DedupScanCursor,
+        limit: usize,
+    ) -> Result<DedupScanBatch> {
+        let (entries, page_idx, slot, wrapped) =
+            self.dedup_index
+                .scan_from(cursor.page_idx as usize, cursor.slot as usize, limit)?;
+        Ok(DedupScanBatch {
+            entries,
+            next: DedupScanCursor {
+                page_idx: page_idx as u64,
+                slot: slot as u32,
+            },
+            wrapped,
+        })
+    }
 }

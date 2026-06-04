@@ -626,6 +626,26 @@ impl DedupIndex {
         Ok(map.into_iter().collect())
     }
 
+    /// Resumable, bounded scan over the on-disk cuckoo forward index — see
+    /// [`crate::dedup::cuckoo::Cuckoo::scan_from`]. Returns up to `limit` live
+    /// `(hash, value)` pairs from cursor `(page_idx, slot)`, the resume cursor,
+    /// and a `wrapped` flag (full pass completed).
+    ///
+    /// Unlike [`Self::iter`] this does NOT overlay not-yet-drained staged
+    /// mutations (a page-range scan cannot locate them): callers see the
+    /// committed on-disk state, and a staged put becomes visible once drained.
+    /// That is sufficient for the background orphan-reclaim sweep, whose
+    /// correctness rests on the onyx Gate-2 confirm scan + guarded delete, not
+    /// on scan completeness.
+    pub fn scan_from(
+        &self,
+        page_idx: usize,
+        slot: usize,
+        limit: usize,
+    ) -> Result<(Vec<(Hash8, DedupValue)>, usize, usize, bool)> {
+        self.cuckoo.scan_from(page_idx, slot, limit)
+    }
+
     /// Walk every allocated data page id (used by verifier).
     pub fn data_page_ids(&self) -> Vec<PageId> {
         self.cuckoo.data_page_ids()

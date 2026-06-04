@@ -1161,6 +1161,25 @@ impl Iterator for DbDedupIter {
     }
 }
 
+/// Opaque resume cursor for [`Db::scan_dedup_from`]. `Default` starts a fresh
+/// pass at the beginning of the index. It is a position into the cuckoo page
+/// table (not a key), so it is only meaningful to the same `Db` instance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DedupScanCursor {
+    pub page_idx: u64,
+    pub slot: u32,
+}
+
+/// One bounded batch from [`Db::scan_dedup_from`].
+pub struct DedupScanBatch {
+    pub entries: Vec<(Hash8, DedupValue)>,
+    /// Cursor to pass to the next call to continue the pass.
+    pub next: DedupScanCursor,
+    /// True when this batch reached the end of the index (a full pass
+    /// completed); `next` is then reset to the start.
+    pub wrapped: bool,
+}
+
 #[derive(Clone, Debug)]
 struct OwnedRange {
     start: Bound<u64>,

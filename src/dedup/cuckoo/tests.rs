@@ -86,6 +86,69 @@ fn iter_returns_all_live_pairs() {
 }
 
 #[test]
+fn scan_from_covers_iter_in_bounded_steps() {
+    let (_d, c) = make_index(64);
+    for i in 0..150u8 {
+        c.put(h(i), dv(i), 100).unwrap();
+    }
+    let want: std::collections::HashSet<Hash8> =
+        c.iter().unwrap().into_iter().map(|(hash, _)| hash).collect();
+    assert_eq!(want.len(), 150);
+
+    // Walk the whole index in small bounded batches via the resume cursor.
+    let mut got: Vec<Hash8> = Vec::new();
+    let (mut pi, mut sl) = (0usize, 0usize);
+    let limit = 7;
+    let mut batches = 0;
+    loop {
+        let (batch, npi, nsl, wrapped) = c.scan_from(pi, sl, limit).unwrap();
+        assert!(batch.len() <= limit, "batch must be bounded by limit");
+        got.extend(batch.into_iter().map(|(hash, _)| hash));
+        pi = npi;
+        sl = nsl;
+        batches += 1;
+        assert!(batches < 1000, "scan must terminate");
+        if wrapped {
+            break;
+        }
+    }
+    // One full pass visits every live entry EXACTLY once (no dup, no miss).
+    assert_eq!(got.len(), 150, "exactly-once coverage in one pass");
+    let got_set: std::collections::HashSet<Hash8> = got.into_iter().collect();
+    assert_eq!(got_set, want, "scan_from one pass == iter()");
+}
+
+#[test]
+fn scan_from_empty_index_wraps_immediately() {
+    let (_d, c) = make_index(64);
+    let (batch, pi, sl, wrapped) = c.scan_from(0, 0, 10).unwrap();
+    assert!(batch.is_empty());
+    assert!(wrapped);
+    assert_eq!((pi, sl), (0, 0));
+}
+
+#[test]
+fn scan_from_out_of_range_cursor_restarts() {
+    let (_d, c) = make_index(64);
+    for i in 0..20u8 {
+        c.put(h(i), dv(i), 100).unwrap();
+    }
+    // A stale/out-of-range cursor (table shrank) restarts at the beginning
+    // rather than returning nothing.
+    let (batch, _, _, _) = c.scan_from(usize::MAX, 999, 100).unwrap();
+    assert_eq!(batch.len(), 20);
+}
+
+#[test]
+fn scan_from_zero_limit_is_empty() {
+    let (_d, c) = make_index(64);
+    c.put(h(1), dv(1), 100).unwrap();
+    let (batch, _, _, wrapped) = c.scan_from(0, 0, 0).unwrap();
+    assert!(batch.is_empty());
+    assert!(wrapped);
+}
+
+#[test]
 fn recount_matches_iter_length() {
     let (_d, c) = make_index(64);
     for i in 0..30u8 {
