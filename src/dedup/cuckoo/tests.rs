@@ -257,6 +257,137 @@ fn concurrent_writers_across_pages() {
     assert_eq!(cuckoo.recount().unwrap(), 8000);
 }
 
+fn h64(x: u64) -> Hash8 {
+    x.to_be_bytes()
+}
+
+fn dv64(x: u64) -> DedupValue {
+    let mut v = [0u8; 28];
+    v[..8].copy_from_slice(&x.to_be_bytes());
+    DedupValue(v)
+}
+
+#[test]
+fn concurrent_reads_during_grow_never_error() {
+    // Regression for the page_table publish/read race: a writer sets
+    // `page_table[page_idx] = pid` (visible to lockless readers) BEFORE
+    // it finishes `write_page` + `replace_or_insert`. A reader that
+    // resolved the pid in that window used to read the still-unwritten
+    // on-disk slot — all-zeros for a freshly extended page (surfacing as
+    // `PageMagicMismatch(0x0)`) or stale-but-CRC-valid bytes for a reused
+    // free-list page (a silently mis-parsed bucket). The fix routes every
+    // read through the per-page shard lock the writer already holds, so a
+    // reader either sees `page_table[page_idx] == 0` (clean miss) or the
+    // fully written page. This test grows the index from several writers
+    // while several readers hammer the same key space; every `get` must
+    // return `Ok` (never the magic-mismatch error), and every committed
+    // key must round-trip afterwards.
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("pages");
+    let page_store = Arc::new(PageStore::create(&path).unwrap());
+    let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
+    // 4096 buckets / 28 buckets-per-page ≈ 147 data pages; 4000 unique
+    // keys spread across them keeps growth continuous throughout the run
+    // while staying under a 0.7 load factor (4096 * 4 = 16384 slots).
+    let cuckoo = Arc::new(CuckooHash::create(page_store, page_cache, 4096, 0xC0DE, 0xF00D).unwrap());
+
+    const WRITERS: u64 = 4;
+    const PER_WRITER: u64 = 1000;
+    const READERS: usize = 4;
+    let total = WRITERS * PER_WRITER;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let read_errors = Arc::new(AtomicU64::new(0));
+    let reads_ok = Arc::new(AtomicU64::new(0));
+
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let c = cuckoo.clone();
+            let done = done.clone();
+            let read_errors = read_errors.clone();
+            let reads_ok = reads_ok.clone();
+            std::thread::spawn(move || {
+                // Sweep the whole key space repeatedly while writers grow
+                // the index, so reads land on pages mid-publish.
+                while !done.load(Ordering::Acquire) {
+                    for x in 0..total {
+                        match c.get(&h64(x)) {
+                            // None is fine: the key may not be inserted yet.
+                            Ok(_) => {
+                                reads_ok.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                read_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let c = cuckoo.clone();
+            std::thread::spawn(move || {
+                // Disjoint, interleaved key stripes so every writer keeps
+                // allocating fresh pages across the whole table.
+                let mut x = w;
+                while x < total {
+                    c.put(h64(x), dv64(x), 100 + x as Lsn).unwrap();
+                    x += WRITERS;
+                }
+            })
+        })
+        .collect();
+
+    for t in writers {
+        t.join().unwrap();
+    }
+    done.store(true, Ordering::Release);
+    for t in readers {
+        t.join().unwrap();
+    }
+
+    assert_eq!(
+        read_errors.load(Ordering::Relaxed),
+        0,
+        "no concurrent read may surface an error (page_table publish race)"
+    );
+    assert!(
+        reads_ok.load(Ordering::Relaxed) > 0,
+        "readers must have actually run"
+    );
+    // Every committed key round-trips with its exact value.
+    for x in 0..total {
+        assert_eq!(cuckoo.get(&h64(x)).unwrap(), Some(dv64(x)), "x={x}");
+    }
+    assert_eq!(cuckoo.recount().unwrap(), total);
+}
+
+#[test]
+fn dangling_unwritten_page_without_writer_still_errors() {
+    // The fix relies on a concurrent writer HOLDING the shard lock across
+    // its page write; it deliberately does NOT add zero-page tolerance to
+    // the read path. So a `page_table` entry pointing at a genuinely
+    // unwritten (all-zero) page with no writer in flight is a real fault
+    // and must still surface as a verify error, not a silent empty
+    // bucket. This guards against anyone "fixing" the race by swallowing
+    // `PageMagicMismatch` (which would also mask true corruption).
+    let (_d, c) = make_index(64);
+    // Allocate a fresh page id but never write a sealed page to it, then
+    // publish it into the page table — mimicking a corrupt/torn state.
+    let dangling = c.page_store.allocate().unwrap();
+    c.inner.lock().page_table[0] = dangling;
+    let err = c.recount().expect_err("unwritten page must not read as empty");
+    assert!(
+        matches!(err, MetaDbError::PageMagicMismatch { .. }),
+        "expected magic mismatch on an unwritten page, got {err:?}"
+    );
+}
+
 #[test]
 fn page_associative_insert_avoids_sub_bucket_false_full() {
     let (_d, c) = make_index(32);

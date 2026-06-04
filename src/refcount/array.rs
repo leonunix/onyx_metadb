@@ -312,7 +312,20 @@ impl PagedRefcountArray {
                 continue;
             }
             let prev = read_entry(&page, slot);
-            let new = super::apply_delta_pure(prev, pending.delta, pending.last_lsn)?;
+            // A decref whose accumulated delta lands past zero is a benign
+            // double-decref split across drainer cycles (the on-disk base
+            // was already taken to 0 by an earlier cycle). Skip it (leave
+            // the entry at its floor) instead of failing the checkpoint.
+            let (new, skipped) =
+                super::apply_delta_or_skip(prev, pending.delta, pending.last_lsn)?;
+            if skipped {
+                super::note_decref_underflow_skip(
+                    pending.delta,
+                    pending.last_lsn,
+                    prev.rc,
+                    "array",
+                );
+            }
             write_entry(&mut page, slot, new);
             if pending.last_lsn > max_lsn {
                 max_lsn = pending.last_lsn;
@@ -449,7 +462,19 @@ impl PagedRefcountArray {
                     continue;
                 }
                 let prev = read_entry(&page, slot);
-                let new = super::apply_delta_pure(prev, pending.delta, pending.last_lsn)?;
+                // Benign double-decref split across drainer cycles — skip
+                // it (leave the entry at its floor) instead of failing the
+                // checkpoint. See the matching site in `apply_to_page`.
+                let (new, skipped) =
+                    super::apply_delta_or_skip(prev, pending.delta, pending.last_lsn)?;
+                if skipped {
+                    super::note_decref_underflow_skip(
+                        pending.delta,
+                        pending.last_lsn,
+                        prev.rc,
+                        "array",
+                    );
+                }
                 write_entry(&mut page, slot, new);
                 if pending.last_lsn > max_lsn {
                     max_lsn = pending.last_lsn;

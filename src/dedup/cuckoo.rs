@@ -380,15 +380,18 @@ impl CuckooHash {
     where
         F: FnMut(Hash8, DedupValue) -> Result<()>,
     {
-        let snapshot = {
-            let inner = self.inner.lock();
-            inner.page_table.clone()
-        };
-        for &pid in &snapshot {
-            if pid == 0 {
+        // `page_table` is fixed-length (entries flip 0 → pid in place,
+        // never resized), so the count is stable; each page is read
+        // under its shard lock so a concurrent grow can't expose a
+        // half-published entry. `for_each` normally runs without
+        // concurrent writers (L0 rebuild at open / offline verifier),
+        // but routing through the shared helper keeps the read-side
+        // invariant uniform.
+        let page_count = { self.inner.lock().page_table.len() };
+        for page_idx in 0..page_count {
+            let Some(page) = self.load_data_page_for_read(page_idx)? else {
                 continue;
-            }
-            let page = self.page_cache.get(pid)?;
+            };
             let bitmap = read_bitmap(&page);
             for slot in 0..SLOTS_PER_PAGE {
                 if bitmap & (1u128 << slot) != 0 {
@@ -423,11 +426,12 @@ impl CuckooHash {
         slot: usize,
         limit: usize,
     ) -> Result<(Vec<(Hash8, DedupValue)>, usize, usize, bool)> {
-        let snapshot = {
-            let inner = self.inner.lock();
-            inner.page_table.clone()
-        };
-        let n = snapshot.len();
+        // `page_table` is fixed-length, so a length read is enough to
+        // bound the walk; each page is then read under its shard lock
+        // via `load_data_page_for_read` so a concurrent grow can't
+        // expose a half-published entry (the box-observed
+        // `PageMagicMismatch` during steady-state orphan reclaim).
+        let n = { self.inner.lock().page_table.len() };
         let mut out = Vec::new();
         if n == 0 || limit == 0 {
             return Ok((out, 0, 0, true));
@@ -436,9 +440,7 @@ impl CuckooHash {
         let mut pi = if page_idx >= n { 0 } else { page_idx };
         let mut sl = if page_idx >= n { 0 } else { slot.min(SLOTS_PER_PAGE) };
         loop {
-            let pid = snapshot[pi];
-            if pid != 0 {
-                let page = self.page_cache.get(pid)?;
+            if let Some(page) = self.load_data_page_for_read(pi)? {
                 let bitmap = read_bitmap(&page);
                 while sl < SLOTS_PER_PAGE {
                     if bitmap & (1u128 << sl) != 0 {
@@ -469,16 +471,11 @@ impl CuckooHash {
     /// Recompute `approx_len` from the current on-disk state. O(N).
     pub fn recount(&self) -> Result<u64> {
         let mut count = 0u64;
-        let snapshot = {
-            let inner = self.inner.lock();
-            inner.page_table.clone()
-        };
-        for &pid in &snapshot {
-            if pid == 0 {
-                continue;
+        let page_count = { self.inner.lock().page_table.len() };
+        for page_idx in 0..page_count {
+            if let Some(page) = self.load_data_page_for_read(page_idx)? {
+                count += read_bitmap(&page).count_ones() as u64;
             }
-            let page = self.page_cache.get(pid)?;
-            count += read_bitmap(&page).count_ones() as u64;
         }
         self.inner.lock().approx_len = count;
         Ok(count)
@@ -552,8 +549,27 @@ impl CuckooHash {
         }
     }
 
-    fn read_bucket_for(&self, hash: &Hash8, bucket_id: u64) -> Result<Option<DedupValue>> {
-        let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
+    /// Load the data page backing `page_idx` for a lookup or scan,
+    /// taking the per-page shard lock so a concurrent writer's lockless
+    /// `page_table[page_idx] = pid` publish is never observed before
+    /// that writer's page write has landed. Returns `None` when no page
+    /// is allocated for `page_idx` yet.
+    ///
+    /// A writer (`with_bucket_mut` / the batch put path) takes this same
+    /// shard lock *first* and holds it across `page_table[page_idx] =
+    /// pid` → `write_page` → `replace_or_insert`. So by the time a
+    /// reader acquires the lock the page is the freshly written content
+    /// in the cache, not the raw zeros (a freshly extended file slot) or
+    /// the stale-but-CRC-valid bytes (a reused free-list page) the
+    /// on-disk slot held before the writer's IO landed — either of which
+    /// a lockless read could surface as a spurious `PageMagicMismatch`
+    /// (zeros) or, worse, a silently mis-parsed bucket (reused page that
+    /// still passes `verify`). Mirrors the guard already in
+    /// [`Self::free_slots_in_page`]. Deliberately keeps `verify`
+    /// strict: a zero/garbage page reached *without* a concurrent writer
+    /// holding the shard lock is a genuine fault and must still error.
+    fn load_data_page_for_read(&self, page_idx: usize) -> Result<Option<Arc<Page>>> {
+        let _shard = self.bucket_locks[page_idx & (BUCKET_LOCK_SHARDS - 1)].lock();
         let pid = {
             let inner = self.inner.lock();
             inner.page_table.get(page_idx).copied().unwrap_or(0)
@@ -561,7 +577,14 @@ impl CuckooHash {
         if pid == 0 {
             return Ok(None);
         }
-        let page = self.page_cache.get(pid)?;
+        self.page_cache.get(pid).map(Some)
+    }
+
+    fn read_bucket_for(&self, hash: &Hash8, bucket_id: u64) -> Result<Option<DedupValue>> {
+        let (page_idx, bucket_in_page) = bucket_offset(bucket_id);
+        let Some(page) = self.load_data_page_for_read(page_idx)? else {
+            return Ok(None);
+        };
         let bitmap = read_bitmap(&page);
         let start = bucket_in_page * ENTRIES_PER_BUCKET;
         for offset in 0..SLOTS_PER_PAGE {

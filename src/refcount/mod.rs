@@ -23,6 +23,8 @@ pub use array::{ENTRIES_PER_PAGE, PagedRefcountArray};
 pub use delta::DeltaMap;
 pub use shard::RcShard;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::error::{MetaDbError, Result};
 use crate::types::Lsn;
 
@@ -88,6 +90,50 @@ pub fn apply_delta_pure(prev: RcEntry, delta: i64, lsn: Lsn) -> Result<RcEntry> 
     }
 }
 
+/// Count of decref-underflows clamped to a benign no-op, across both the
+/// stage merge and the array-apply flush, all shards.
+static UNDERFLOW_CLAMPED: AtomicU64 = AtomicU64::new(0);
+
+/// Total decref-underflows skipped as benign double-decrefs. A non-zero
+/// value means a double-decref of an already-freed PBA was absorbed
+/// rather than poisoning the commit / checkpoint pipeline.
+pub fn underflow_clamped_total() -> u64 {
+    UNDERFLOW_CLAMPED.load(Ordering::Relaxed)
+}
+
+/// Record (and rate-limited-warn) that a decref past zero was skipped.
+/// `site` distinguishes the stage merge ("stage") from the array-apply
+/// flush ("array").
+pub(crate) fn note_decref_underflow_skip(delta: i64, lsn: Lsn, prev_rc: u32, site: &'static str) {
+    let total = UNDERFLOW_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+    // Power-of-two rate limit so a storm of clamps can't flood the log.
+    if total.is_power_of_two() {
+        tracing::warn!(
+            target: "onyx_metadb::refcount::stage_underflow",
+            delta,
+            lsn,
+            prev_rc,
+            site,
+            clamped_total = total,
+            "rc decref past zero skipped (benign double-decref); count left unchanged"
+        );
+    }
+}
+
+/// Like [`apply_delta_pure`] but a decref that would underflow is a
+/// benign no-op: the count is left at `prev` (already its floor) rather
+/// than erroring, so a double-decref of an already-freed PBA cannot
+/// poison the apply / checkpoint pipeline. Overflow still errors. The
+/// returned `bool` is `true` when an underflow was skipped, so the
+/// caller can record it via [`note_decref_underflow_skip`].
+pub(crate) fn apply_delta_or_skip(prev: RcEntry, delta: i64, lsn: Lsn) -> Result<(RcEntry, bool)> {
+    match apply_delta_pure(prev, delta, lsn) {
+        Ok(entry) => Ok((entry, false)),
+        Err(_) if delta < 0 => Ok((prev, true)),
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod apply_delta_tests {
     use super::*;
@@ -146,5 +192,36 @@ mod apply_delta_tests {
             birth_lsn: 0,
         };
         assert!(apply_delta_pure(prev, -1, 42).is_err());
+    }
+
+    #[test]
+    fn apply_delta_or_skip_skips_decref_underflow_but_errors_on_overflow() {
+        // Decref past zero -> benign skip (count left at prev, flagged).
+        let (entry, skipped) = apply_delta_or_skip(RcEntry::ZERO, -1, 5).unwrap();
+        assert_eq!(entry, RcEntry::ZERO);
+        assert!(skipped);
+        let prev = RcEntry {
+            rc: 1,
+            birth_lsn: 7,
+        };
+        let (entry, skipped) = apply_delta_or_skip(prev, -3, 8).unwrap();
+        assert_eq!(entry, prev); // left unchanged (leaked, never negative)
+        assert!(skipped);
+
+        // A decref that does NOT underflow applies normally.
+        let prev = RcEntry {
+            rc: 2,
+            birth_lsn: 7,
+        };
+        let (entry, skipped) = apply_delta_or_skip(prev, -1, 9).unwrap();
+        assert_eq!(entry.rc, 1);
+        assert!(!skipped);
+
+        // Overflow still errors — never silently absorbed.
+        let max = RcEntry {
+            rc: u32::MAX,
+            birth_lsn: 1,
+        };
+        assert!(apply_delta_or_skip(max, 1, 10).is_err());
     }
 }

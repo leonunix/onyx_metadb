@@ -272,6 +272,16 @@ impl RcShard {
         Ok((None, base))
     }
 
+    /// A decref that would take the count below zero. The only way this
+    /// arises is a benign double-decref of an already-freed PBA — two ops
+    /// removing the same last reference (e.g. a recovered dedup-hit remap
+    /// racing a concurrent overwrite of the same LBA). The guard is right
+    /// that the count is already 0; we floor it there (skip the redundant
+    /// decref) so the commit applies cleanly instead of returning an
+    /// `Err` that `poison_commit_waiters` fans out into a cascade of
+    /// unrelated commit failures (the recovered hit is even kept). The
+    /// count stays correct — it was going to 0 anyway.
+    ///
     /// Stage one op into the pending delta. Returns `(prev_rc, new_rc)`.
     pub fn stage(&self, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
         // Fast path when drainer is disabled — verbatim priority-1
@@ -294,10 +304,17 @@ impl RcShard {
                     return Ok((merged_prev.rc, post.rc));
                 }
                 Err(err) => {
-                    // P0 diagnostic: dump every input that fed into the
-                    // failed merge so the caller can correlate the
-                    // underflow with the L2P op that produced it. Filter
-                    // via `RUST_LOG=onyx_metadb::refcount=error`.
+                    // A decref past zero is a benign double-decref — skip
+                    // it instead of poisoning the commit pipeline.
+                    if delta < 0 {
+                        super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, "stage");
+                        return Ok((merged_prev.rc, merged_prev.rc));
+                    }
+                    // Overflow (delta >= 0) is fatal. P0 diagnostic: dump
+                    // every input that fed into the failed merge so the
+                    // caller can correlate it with the L2P op that
+                    // produced it. Filter via
+                    // `RUST_LOG=onyx_metadb::refcount=error`.
                     let page_lsn = self.array.page_lsn(pba).unwrap_or(0);
                     tracing::error!(
                         target: "onyx_metadb::refcount::stage_underflow",
@@ -312,7 +329,7 @@ impl RcShard {
                         merged_prev_rc = merged_prev.rc,
                         merged_prev_birth_lsn = merged_prev.birth_lsn,
                         drainer_mode = false,
-                        "rc.stage failed: refcount underflow / overflow"
+                        "rc.stage failed: refcount overflow"
                     );
                     return Err(err);
                 }
@@ -376,8 +393,16 @@ impl RcShard {
         let post = match apply_delta_pure(merged_prev, delta, lsn) {
             Ok(p) => p,
             Err(err) => {
-                // P0 diagnostic: dump every layer that fed into the
-                // drainer-mode merge. `RUST_LOG=onyx_metadb::refcount=error`.
+                // A decref past zero is a benign double-decref — skip it
+                // instead of poisoning the commit pipeline. Nothing is
+                // merged, so the drainer needs no notify.
+                if delta < 0 {
+                    super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, "stage");
+                    return Ok((merged_prev.rc, merged_prev.rc));
+                }
+                // Overflow (delta >= 0) is fatal. P0 diagnostic: dump
+                // every layer that fed into the drainer-mode merge.
+                // `RUST_LOG=onyx_metadb::refcount=error`.
                 let page_lsn = self.array.page_lsn(pba).unwrap_or(0);
                 let overlay_gen = overlay_entry
                     .as_ref()
@@ -399,7 +424,7 @@ impl RcShard {
                     merged_prev_rc = merged_prev.rc,
                     merged_prev_birth_lsn = merged_prev.birth_lsn,
                     drainer_mode = true,
-                    "rc.stage failed: refcount underflow / overflow"
+                    "rc.stage failed: refcount overflow"
                 );
                 return Err(err);
             }

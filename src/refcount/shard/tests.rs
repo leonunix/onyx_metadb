@@ -41,12 +41,52 @@ fn flush_moves_pending_to_array() {
     );
 }
 
+fn clamped() -> u64 {
+    crate::refcount::underflow_clamped_total()
+}
+
 #[test]
-fn stage_underflow_does_not_corrupt_delta() {
+fn stage_decref_past_zero_is_skipped_not_errored() {
     let (_d, s) = make_shard();
-    s.stage(10, 1, 1).unwrap();
-    assert!(s.stage(10, -2, 2).is_err());
+    let c0 = clamped();
+    s.stage(10, 1, 1).unwrap(); // rc 0 -> 1
+    // Decref by 2 when only 1 ref exists would underflow. Instead of
+    // erroring (which `poison_commit_waiters` fans out into a cascade of
+    // unrelated commit failures) the redundant decref is skipped and the
+    // count is left unchanged.
+    assert_eq!(s.stage(10, -2, 2).unwrap(), (1, 1));
     assert_eq!(s.get(10).unwrap(), 1);
+    assert_eq!(clamped() - c0, 1);
+    // The delta map is not corrupted: a subsequent legitimate decref
+    // still works.
+    assert_eq!(s.stage(10, -1, 3).unwrap(), (1, 0));
+    assert_eq!(s.get(10).unwrap(), 0);
+}
+
+#[test]
+fn stage_double_decref_of_freed_pba_is_benign() {
+    // The production race: two ops remove the same last reference. The
+    // first takes the count to 0; the second finds it already 0 and is
+    // skipped — not an error, never negative.
+    let (_d, s) = make_shard();
+    let c0 = clamped();
+    s.stage(20, 1, 1).unwrap(); // rc 0 -> 1
+    assert_eq!(s.stage(20, -1, 2).unwrap(), (1, 0)); // legit last decref
+    assert_eq!(s.stage(20, -1, 3).unwrap(), (0, 0)); // redundant -> skipped
+    assert_eq!(s.get(20).unwrap(), 0);
+    assert_eq!(clamped() - c0, 1);
+}
+
+#[test]
+fn stage_overflow_still_errors() {
+    // An increment past u32::MAX is genuinely catastrophic and must still
+    // surface as an Err — it is never silently absorbed, and it is not a
+    // clamp.
+    let (_d, s) = make_shard();
+    let c0 = clamped();
+    s.stage(30, i64::from(u32::MAX), 1).unwrap(); // rc -> u32::MAX
+    assert!(s.stage(30, 1, 2).is_err());
+    assert_eq!(clamped() - c0, 0);
 }
 
 #[test]
