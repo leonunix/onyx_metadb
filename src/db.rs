@@ -1162,12 +1162,14 @@ impl Iterator for DbDedupIter {
 }
 
 /// Opaque resume cursor for [`Db::scan_dedup_from`]. `Default` starts a fresh
-/// pass at the beginning of the index. It is a position into the cuckoo page
-/// table (not a key), so it is only meaningful to the same `Db` instance.
+/// pass at the beginning of the index. The fields are private cuckoo page-table
+/// internals — callers only obtain a cursor from `Default` or a returned
+/// [`DedupScanBatch`] and pass it back, so the cuckoo layout can change without
+/// touching client code.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DedupScanCursor {
-    pub page_idx: u64,
-    pub slot: u32,
+    page_idx: u64,
+    slot: u32,
 }
 
 /// One bounded batch from [`Db::scan_dedup_from`].
