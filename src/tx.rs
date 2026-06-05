@@ -137,11 +137,14 @@ pub enum ApplyOutcome {
     /// - **Exclusive PBAs** that arrived with rc=0 and were surfaced
     ///   directly — no rc mutation, no dedup_index delete required.
     ///
-    /// Onyx-side cleanup coalesces sorted PBAs into `retire_one` /
-    /// `retire_extent` calls, mirroring the path that today serves
-    /// `L2pRemap.freed_pba` / `RangeDelete.freed_pbas`. Duplicate
-    /// surfaces (across replays or across cycles) are harmless because
-    /// retire is a set operation.
+    /// Onyx-side cleanup coalesces sorted PBAs into extents and frees
+    /// them directly via `PbaLifecycle::free_lineage_gc_proven` (the
+    /// proof-carrying fast path): it evicts the RAM candidate cache
+    /// first, then frees. Duplicate surfaces (across replays or across
+    /// cycles) are harmless because that path absorbs an already
+    /// free/retired extent idempotently (`is_extent_free`/`is_retired`
+    /// precheck + `gc_lineage_idempotent_frees` counter), NOT because
+    /// retire is set-typed (onyx no longer routes these through retire).
     FreePbas { freed_pbas: Box<[Pba]> },
     /// Outcome of [`LifecycleOp::PromotionChunk`] —
     /// [[no-refcount-hot-path-design]] Phase 4 Step 5 background

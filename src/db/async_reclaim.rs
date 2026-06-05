@@ -417,8 +417,9 @@ pub(super) fn gc_plan_head_advance(
 /// deadlocking against `apply_gate` — `commit_free_pbas` takes
 /// `apply_gate.read()` internally. A crash between FreePbas commit and execute is safe: the chain
 /// is still intact, next GC cycle re-runs both phases and
-/// `apply_free_pbas` re-surfaces the same PBAs (onyx retire is a
-/// set). A crash inside execute (after manifest commit, before
+/// `apply_free_pbas` re-surfaces the same PBAs (onyx absorbs the
+/// duplicate idempotently in `PbaLifecycle::free_lineage_gc_proven`).
+/// A crash inside execute (after manifest commit, before
 /// page_store free) leaks segment pages to recovery's free-list
 /// scan, same as Phase 3.
 pub(super) fn gc_execute_head_advance(

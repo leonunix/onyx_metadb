@@ -1495,8 +1495,14 @@ impl Db {
                 // next GC cycle re-runs the plan against the still-
                 // intact chain and re-emits FreePbas; apply
                 // `apply_free_pbas` re-surfaces the same PBAs (rc
-                // already 0 → exclusive branch) and onyx retire
-                // dedups via set semantics.
+                // already 0 → exclusive branch). Onyx consumes these
+                // via `PbaLifecycle::free_lineage_gc_proven`, which
+                // absorbs a duplicate surface idempotently with an
+                // `is_extent_free`/`is_retired` precheck (NOT a
+                // set-typed retire — onyx now direct-frees lineage
+                // PBAs). Safe because this commit precedes the chain
+                // truncate, so a re-surface cannot name a PBA that was
+                // already freed, reallocated, and made live again.
                 let pbas = plan.dead_pbas.clone().into_boxed_slice();
                 let outcome = self.commit_free_pbas(vol_ord, &pbas)?;
                 self.dispatch_freed_pbas_outcomes(vol_ord, vec![outcome]);

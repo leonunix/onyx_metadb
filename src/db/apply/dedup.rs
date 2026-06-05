@@ -111,8 +111,10 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
 ///
 /// Replay idempotency: re-applying the same `commit_free_pbas` after a
 /// crash sees rc=0 for everything it already drained on the first
-/// pass; those PBAs surface again. Onyx-side retire is a set, so
-/// duplicate surfaces are harmless. The previous Phase 3 defensive
+/// pass; those PBAs surface again. Onyx consumes the surface via
+/// `PbaLifecycle::free_lineage_gc_proven`, which absorbs a duplicate
+/// idempotently (`is_extent_free`/`is_retired` precheck), so duplicate
+/// surfaces are harmless. The previous Phase 3 defensive
 /// `if cur == 0 { continue }` guard collapsed exclusive PBAs with
 /// already-freed shared PBAs into a single "skip" — Phase 4 separates
 /// them because Phase 5 will need the exclusive surface to be the
