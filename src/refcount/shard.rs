@@ -215,10 +215,7 @@ impl RcShard {
         if !drainer_attached {
             let pending = self.delta_active.lock().get(pba);
             let base = self.array.get(pba)?;
-            return match pending {
-                Some(p) => apply_delta_pure(base, p.delta, p.last_lsn),
-                None => Ok(base),
-            };
+            return super::merge_pending_read(base, pending);
         }
 
         // Drainer-mode: hold `delta_active.lock` AND `delta_draining.lock`
@@ -248,14 +245,8 @@ impl RcShard {
         drop(draining_guard);
         drop(active);
 
-        let after_pd = match pd {
-            Some(p) => apply_delta_pure(base, p.delta, p.last_lsn)?,
-            None => base,
-        };
-        match pa {
-            Some(p) => apply_delta_pure(after_pd, p.delta, p.last_lsn),
-            None => Ok(after_pd),
-        }
+        let after_pd = super::merge_pending_read(base, pd)?;
+        super::merge_pending_read(after_pd, pa)
     }
 
     /// Resolve the on-disk-or-overlay base for `pba`. Returns the
@@ -291,10 +282,7 @@ impl RcShard {
             let mut d = self.delta_active.lock();
             let prev_pending = d.get(pba);
             let base = self.array.get(pba)?;
-            let merged_prev = match prev_pending {
-                Some(p) => apply_delta_pure(base, p.delta, p.last_lsn)?,
-                None => base,
-            };
+            let merged_prev = super::merge_pending_read(base, prev_pending)?;
             if prev_pending.is_none() && self.array.page_lsn(pba)? >= lsn {
                 return Ok((base.rc, base.rc));
             }
@@ -352,14 +340,8 @@ impl RcShard {
         let (overlay_entry, base) = self.lookup_base(pba)?;
         drop(draining_guard);
 
-        let after_pd = match pd {
-            Some(p) => apply_delta_pure(base, p.delta, p.last_lsn)?,
-            None => base,
-        };
-        let merged_prev = match pa {
-            Some(p) => apply_delta_pure(after_pd, p.delta, p.last_lsn)?,
-            None => after_pd,
-        };
+        let after_pd = super::merge_pending_read(base, pd)?;
+        let merged_prev = super::merge_pending_read(after_pd, pa)?;
         // Replay-skip in drainer-mode: only when there's no pending
         // delta in either layer AND the effective on-disk-or-overlay
         // LSN STRICTLY exceeds this op's LSN. Use `>` not `>=` because

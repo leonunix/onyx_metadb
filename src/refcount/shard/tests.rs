@@ -77,6 +77,44 @@ fn stage_double_decref_of_freed_pba_is_benign() {
     assert_eq!(clamped() - c0, 1);
 }
 
+fn read_floored() -> u64 {
+    crate::refcount::read_underflow_floored_total()
+}
+
+#[test]
+fn get_and_stage_floor_read_underflow_instead_of_erroring() {
+    // Reproduce the torn/latent `(delta_active, array)` state a concurrent
+    // rc `begin_checkpoint` can leave when the onyx hot path (`stage_ops`)
+    // applies without `apply_gate.read()`: the array base for P has already
+    // folded a pending decref (rc=0), but a stale `-1` pending still sits in
+    // `delta_active` (the reader sampled it pre-drain while the install
+    // raced ahead). The logical rc floor is 0.
+    //
+    // Pre-fix, `lookup_entry` / `stage`'s "current value" computation called
+    // `apply_delta_pure(0, -1)?` and propagated the underflow Err, which
+    // failed an unrelated dedup-hit/promote tx → onyx demoted the batch to a
+    // fresh miss → a self-amplifying `commit_errors` burst on hot
+    // re-overwritten PBAs. `merge_read_or_floor` floors to rc=0 instead.
+    let (_d, s) = make_shard();
+    let p = 4242;
+    let floored0 = read_floored();
+    // array(p) defaults to rc=0 (never written); inject the stale -1 pending.
+    s.delta_active.lock().merge(p, -1, 500);
+
+    // `get` must floor (base 0 + pending -1 -> 0), NOT return Err.
+    assert_eq!(s.get(p).unwrap(), 0);
+    assert!(read_floored() > floored0, "get should record a read floor");
+
+    // `stage`'s merged_prev computation must also floor on the same torn
+    // state: a further decref floors the read to 0, then the existing
+    // final-apply clamp absorbs the redundant decref as a benign no-op —
+    // never an Err.
+    let floored1 = read_floored();
+    assert_eq!(s.stage(p, -1, 501).unwrap(), (0, 0));
+    assert!(read_floored() > floored1, "stage merged_prev should floor too");
+    assert_eq!(s.get(p).unwrap(), 0);
+}
+
 #[test]
 fn stage_overflow_still_errors() {
     // An increment past u32::MAX is genuinely catastrophic and must still

@@ -101,6 +101,75 @@ pub fn underflow_clamped_total() -> u64 {
     UNDERFLOW_CLAMPED.load(Ordering::Relaxed)
 }
 
+/// Count of read-side merge underflows floored to rc=0 (vs propagated as
+/// an Err), across `RcShard::lookup_entry` (`get`) and `stage`'s
+/// "current value" computation, all shards.
+static READ_UNDERFLOW_FLOORED: AtomicU64 = AtomicU64::new(0);
+
+/// Total read-side merge underflows floored to rc=0. A non-zero value
+/// means a read observed a transiently-inconsistent `(delta_active,
+/// array)` sample — the value's logical floor is 0 and the read returned
+/// 0 instead of failing an unrelated commit's apply. See
+/// [`merge_read_or_floor`].
+pub fn read_underflow_floored_total() -> u64 {
+    READ_UNDERFLOW_FLOORED.load(Ordering::Relaxed)
+}
+
+/// Read-side merge: compute `prev ⊕ delta`, flooring a decref-underflow
+/// to rc=0 instead of erroring. Overflow (delta >= 0) still errors —
+/// that is never benign.
+///
+/// Why this exists: `RcShard::lookup_entry` / `stage` sample the pending
+/// delta (`delta_active` / `delta_draining`) and the base
+/// (overlay / on-disk array) without a lock that also excludes the flush
+/// checkpoint. `begin_checkpoint` drains the pending under
+/// `delta_active.lock` but installs the folded result into the array /
+/// overlay **without** that lock, and the onyx hot path (`stage_ops`)
+/// applies its rc ops without holding `apply_gate.read()` — so a reader
+/// can observe a base that already folded a pending decref while it still
+/// holds the pre-drain pending, double-counting the decref and computing
+/// a negative rc. The logical refcount floor is 0, so flooring is
+/// correct; propagating the Err instead fails the dedup-hit / promote tx,
+/// which onyx demotes to a fresh miss — a self-amplifying `commit_errors`
+/// burst on hot re-overwritten PBAs. The actual decref still flows
+/// through [`apply_delta_or_skip`] at stage time, so a genuine
+/// over-decref is still counted, never silently lost.
+#[inline]
+pub(crate) fn merge_read_or_floor(prev: RcEntry, delta: i64, lsn: Lsn) -> Result<RcEntry> {
+    match apply_delta_pure(prev, delta, lsn) {
+        Ok(entry) => Ok(entry),
+        Err(_) if delta < 0 => {
+            let total = READ_UNDERFLOW_FLOORED.fetch_add(1, Ordering::Relaxed) + 1;
+            // Power-of-two rate limit so a burst can't flood the log.
+            if total.is_power_of_two() {
+                tracing::warn!(
+                    target: "onyx_metadb::refcount::read_floor",
+                    delta,
+                    lsn,
+                    prev_rc = prev.rc,
+                    floored_total = total,
+                    "rc read merge underflow floored to 0 (transient checkpoint/apply race); \
+                     value's logical floor is 0"
+                );
+            }
+            Ok(RcEntry::ZERO)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Read-side convenience over [`merge_read_or_floor`]: fold an optional
+/// pending delta onto `base` (`None` leaves `base` unchanged). The shape
+/// `RcShard::lookup_entry` / `stage` use to merge each of `delta_active`
+/// / `delta_draining` onto the on-disk-or-overlay base.
+#[inline]
+pub(crate) fn merge_pending_read(base: RcEntry, pending: Option<delta::Pending>) -> Result<RcEntry> {
+    match pending {
+        Some(p) => merge_read_or_floor(base, p.delta, p.last_lsn),
+        None => Ok(base),
+    }
+}
+
 /// Record (and rate-limited-warn) that a decref past zero was skipped.
 /// `site` distinguishes the stage merge ("stage") from the array-apply
 /// flush ("array").
@@ -223,5 +292,40 @@ mod apply_delta_tests {
             birth_lsn: 1,
         };
         assert!(apply_delta_or_skip(max, 1, 10).is_err());
+    }
+
+    #[test]
+    fn merge_read_or_floor_floors_underflow_to_zero_passes_through_normal() {
+        // Decref past zero on a read merge -> rc=0 floor, counter bumps.
+        let before = read_underflow_floored_total();
+        let entry = merge_read_or_floor(RcEntry::ZERO, -1, 5).unwrap();
+        assert_eq!(entry, RcEntry::ZERO);
+        assert_eq!(read_underflow_floored_total(), before + 1);
+
+        // A net-negative multi-decref also floors to 0 (rc can't be < 0).
+        let prev = RcEntry {
+            rc: 1,
+            birth_lsn: 7,
+        };
+        let entry = merge_read_or_floor(prev, -3, 8).unwrap();
+        assert_eq!(entry, RcEntry::ZERO);
+
+        // A normal (non-underflowing) merge passes through unchanged and
+        // does NOT bump the floor counter.
+        let mid = read_underflow_floored_total();
+        let prev = RcEntry {
+            rc: 2,
+            birth_lsn: 7,
+        };
+        let entry = merge_read_or_floor(prev, -1, 9).unwrap();
+        assert_eq!(entry.rc, 1);
+        assert_eq!(read_underflow_floored_total(), mid);
+
+        // Overflow (delta >= 0) still errors — never floored.
+        let max = RcEntry {
+            rc: u32::MAX,
+            birth_lsn: 1,
+        };
+        assert!(merge_read_or_floor(max, 1, 10).is_err());
     }
 }
