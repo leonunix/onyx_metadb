@@ -152,6 +152,24 @@ impl L2pBuffer {
         self.slots[(txg & TXG_INDEX_MASK) as usize].lock().clone()
     }
 
+    /// Visit every live (non-tombstone) entry across all four slots. The
+    /// caller tolerates duplicates and stale-superseded entries across
+    /// slots — used by the reclaim reference check
+    /// ([`crate::db::Db::scan_l2p_buffer_values`]), which only ORs
+    /// references and conservatively over-retains. Each slot is cloned
+    /// under its lock and iterated unlocked so a concurrent commit isn't
+    /// blocked for the duration of the callback.
+    pub fn for_each_live<F: FnMut(Lba, L2pValue)>(&self, mut f: F) {
+        for slot in &self.slots {
+            let snap = slot.lock().clone();
+            for (lba, entry) in snap {
+                if !entry.tombstone {
+                    f(lba, entry.value);
+                }
+            }
+        }
+    }
+
     /// Drain every slot and merge into a single map. Caller (the
     /// `flush_with_gate` inline path under `apply_gate.write()`) is
     /// the sole writer in this case — no commit can be stamping a TXG
@@ -301,6 +319,26 @@ mod tests {
         b.insert_at_txg(1, 42, val(7), 101);
         b.insert_tombstone_at_txg(2, 42, 202);
         assert_eq!(b.lookup_for_open_txg(2, 42), BufferLookup::Tombstone);
+    }
+
+    #[test]
+    fn for_each_live_yields_non_tombstone_across_slots_skips_tombstones() {
+        // Backs the buffer-aware reclaim reference check: a committed-but-
+        // unfolded remap in ANY slot must be visible, and a tombstone (delete)
+        // must NOT count as a live reference.
+        let b = L2pBuffer::new(0);
+        b.insert_at_txg(0, 1, val(1), 100);
+        b.insert_at_txg(1, 2, val(2), 200);
+        b.insert_at_txg(2, 3, val(3), 300);
+        b.insert_tombstone_at_txg(3, 4, 400);
+        let mut seen: Vec<(Lba, L2pValue)> = Vec::new();
+        b.for_each_live(|lba, value| seen.push((lba, value)));
+        seen.sort_by_key(|(lba, _)| *lba);
+        assert_eq!(seen, vec![(1, val(1)), (2, val(2)), (3, val(3))]);
+        assert!(
+            !seen.iter().any(|(lba, _)| *lba == 4),
+            "tombstoned LBA must not be yielded as a live reference"
+        );
     }
 
     #[test]

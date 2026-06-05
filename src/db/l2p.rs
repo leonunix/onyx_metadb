@@ -357,6 +357,30 @@ impl Db {
         Ok(())
     }
 
+    /// Visit every live l2p_buffer entry (committed but possibly not yet
+    /// folded into the published read view) for `vol_ord`.
+    ///
+    /// Pairs with [`Self::scan_range_unordered_chunked`], which sees only
+    /// the folded read view: a remap that has committed into the
+    /// open/quiescing/syncing buffer slot but whose TXG hasn't folded yet
+    /// is **invisible** to the read-view scan. A reclaim that decides "no
+    /// live mapping references PBA P" on the read-view scan alone can
+    /// therefore free a PBA a committed-but-unfolded remap still points
+    /// at. Callers that authorize frees (onyx `referenced_extents`) must
+    /// OR this buffer view into the read-view scan. Over-counting a
+    /// superseded buffer entry only delays reclaim one cycle (until the
+    /// fold updates the read view); it never frees a live PBA.
+    pub fn scan_l2p_buffer_values<F>(&self, vol_ord: VolumeOrdinal, mut f: F) -> Result<()>
+    where
+        F: FnMut(Lba, L2pValue),
+    {
+        let volume = self.volume(vol_ord)?;
+        for shard in volume.shards.iter() {
+            shard.l2p_buffer.for_each_live(|lba, value| f(lba, value));
+        }
+        Ok(())
+    }
+
     // -------- range delete (SPEC §3.2) ----------------------------------
 
     /// Bulk L2P delete over `[start, end)` for one volume. The
