@@ -406,3 +406,66 @@ fn phase4_lineage_gc_resumes_after_promotion_clears_parent_vol_ord() {
     assert_eq!(head_after, NULL_PAGE);
     assert_eq!(tail_after, NULL_PAGE);
 }
+
+// ── The production trigger: the background LineageGcWorker drives the
+//    FreePbas-emitting GC on its own, with NO manual cycle call. This is
+//    the regression test for the "Phase 5 lineage GC has no production
+//    trigger" bug — on the pre-fix code the head never advances and the
+//    sink never fires, so the poll below times out. ──
+#[test]
+fn background_lineage_gc_worker_drains_without_manual_cycle() {
+    use crate::Config;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.lineage_gc_enabled = true; // off by default for standalone metadb
+    cfg.lineage_gc_interval_ms = 10; // poll fast so the test is quick
+    cfg.lineage_gc_max_cycles_per_wake = 16;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    // Capture FreePbas the worker surfaces.
+    let captured: Arc<Mutex<Vec<crate::types::Pba>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    db.set_freed_pbas_sink(Arc::new(move |_vol_ord, pbas| {
+        captured_clone.lock().unwrap().extend(pbas);
+    }));
+
+    // Build a single dead-list segment (write + overwrite + flush). No
+    // snapshot, so every record is rc==0 and unpinned → fully reclaimable.
+    for i in 0u64..32 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    for i in 0u64..32 {
+        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
+    }
+    db.flush().unwrap();
+    let (head_before, _) = dead_list_anchors(&db, 0);
+    assert_ne!(head_before, NULL_PAGE, "writes should have built a segment");
+
+    // Wait for the BACKGROUND worker to advance the chain. No
+    // `test_run_lineage_gc_cycle()` call — the worker must do it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (head, _) = dead_list_anchors(&db, 0);
+        if head == NULL_PAGE {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "background lineage GC worker did not advance head within 10s \
+                 (head still {head}); the production trigger is not firing"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let (head_after, tail_after) = dead_list_anchors(&db, 0);
+    assert_eq!(head_after, NULL_PAGE);
+    assert_eq!(tail_after, NULL_PAGE);
+    assert!(
+        !captured.lock().unwrap().is_empty(),
+        "worker advanced the chain but surfaced no FreePbas to the sink"
+    );
+}

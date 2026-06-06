@@ -425,6 +425,16 @@ impl Db {
         *self.async_reclaim.lock() = Some(worker);
     }
 
+    /// Start the background Lineage GC driver — the production trigger for
+    /// FreePbas-emitting PBA reclaim. Caller (`Db::create` / `Db::open`)
+    /// checks `cfg.lineage_gc_enabled` first. Takes `self: &Arc<Self>` so
+    /// the worker can hold a `Weak<Db>` (mirrors `start_txg_threads`) and
+    /// never extend `Db`'s lifetime past `Drop`.
+    fn start_lineage_gc_worker(self: &Arc<Self>, params: super::lineage_gc::LineageGcParams) {
+        let worker = super::lineage_gc::LineageGcWorker::start(Arc::downgrade(self), params);
+        *self.lineage_gc_worker.lock() = Some(worker);
+    }
+
     /// Wake the background reclaim worker (if any). Called from
     /// `flush_with_gate` once a flush makes new
     /// `deferred_free` entries safe to reclaim. Idempotent — the

@@ -189,6 +189,7 @@ impl Db {
             flush_cursor: AtomicUsize::new(0),
             flush_select_budget: cfg.flush_select_budget,
             async_reclaim: Mutex::new(None),
+            lineage_gc_worker: Mutex::new(None),
             l2p_buffer_enabled: cfg.l2p_buffer_enabled,
             lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
             freed_pbas_sink: Mutex::new(None),
@@ -251,6 +252,15 @@ impl Db {
         let db = Arc::new(db);
         if db.txg_threads_enabled {
             Self::start_txg_threads(&db, cfg.txg_timeout_ms);
+        }
+        // The sole production trigger for FreePbas-emitting PBA reclaim.
+        // Started after `Arc::new` so it can hold a `Weak<Db>`; Drop joins
+        // it before page_store / refcount / dedup teardown.
+        if cfg.lineage_gc_enabled {
+            db.start_lineage_gc_worker(crate::db::lineage_gc::LineageGcParams {
+                interval_ms: cfg.lineage_gc_interval_ms,
+                max_cycles_per_wake: cfg.lineage_gc_max_cycles_per_wake,
+            });
         }
         Ok(db)
     }
@@ -656,6 +666,7 @@ impl Db {
             flush_cursor: AtomicUsize::new(0),
             flush_select_budget: cfg.flush_select_budget,
             async_reclaim: Mutex::new(None),
+            lineage_gc_worker: Mutex::new(None),
             l2p_buffer_enabled: cfg.l2p_buffer_enabled,
             lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
             freed_pbas_sink: Mutex::new(None),
@@ -743,6 +754,17 @@ impl Db {
         let db = Arc::new(db);
         if db.txg_threads_enabled {
             Self::start_txg_threads(&db, cfg.txg_timeout_ms);
+        }
+        // The sole production trigger for FreePbas-emitting PBA reclaim.
+        // Started after `Arc::new` (so it can hold a `Weak<Db>`) and after
+        // WAL replay + the post-replay flush, so it never observes
+        // mid-replay dead-list state. Drop joins it before page_store /
+        // refcount / dedup teardown.
+        if cfg.lineage_gc_enabled {
+            db.start_lineage_gc_worker(crate::db::lineage_gc::LineageGcParams {
+                interval_ms: cfg.lineage_gc_interval_ms,
+                max_cycles_per_wake: cfg.lineage_gc_max_cycles_per_wake,
+            });
         }
         Ok(db)
     }

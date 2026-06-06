@@ -268,6 +268,12 @@ pub struct Db {
     /// Wrapped in `Mutex` so `Drop` can take + stop the worker
     /// even from a `&self` context.
     async_reclaim: Mutex<Option<async_reclaim::AsyncReclaim>>,
+    /// Background Lineage GC driver — the sole production trigger for
+    /// FreePbas-emitting PBA reclaim. Mirrors `async_reclaim` /
+    /// `txg_sync`: wrapped in `Mutex` so `Drop` can take + stop it from a
+    /// `&self` context. `None` when `cfg.lineage_gc_enabled = false`
+    /// (metadb-standalone default; onyx defaults it on).
+    lineage_gc_worker: Mutex<Option<lineage_gc::LineageGcWorker>>,
     /// Whether the B2 buffered-commit path is active. Read by commit
     /// and read paths to decide whether to consult the L2P buffer or
     /// go straight to the tree. When `true`, the per-shard ring buffer
@@ -1247,6 +1253,7 @@ mod helpers;
 mod indexes;
 mod l2p;
 mod l2p_buffer;
+mod lineage_gc;
 mod lifecycle;
 mod promotion;
 mod snapshot;
@@ -1279,6 +1286,14 @@ impl Drop for Db {
         // `L2pCompactor` retired this is the only background owner of
         // `tree.write()` + `publish_l2p_read_view` per shard.
         self.stop_txg_threads();
+        // Stop the Lineage GC driver before page_store / refcount / dedup
+        // teardown — its cycle calls `run_lineage_gc_cycle_inner` which
+        // touches commit_ops, page_store, the refcount shards and the
+        // manifest. Joining here guarantees no GC cycle is mid-flight when
+        // those fields drop.
+        if let Some(mut worker) = self.lineage_gc_worker.lock().take() {
+            worker.stop();
+        }
         // Phase 4 inline-delivery: nothing parks in the aggregator, so
         // poison_all is a no-op kept only for API parity.
         self.deferred_outcomes
@@ -1436,8 +1451,14 @@ impl Db {
     pub(crate) fn test_run_lineage_gc_cycle(&self) -> Result<usize> {
         self.run_lineage_gc_cycle_inner()
     }
+}
 
-    fn run_lineage_gc_cycle_inner(&self) -> Result<usize> {
+/// Production (non-`cfg(test)`) impl. The FreePbas-emitting Lineage GC
+/// driver must be reachable from [`crate::db::lineage_gc::LineageGcWorker`]
+/// in real builds, so it lives here rather than in the `#[cfg(test)]`
+/// impl block above.
+impl Db {
+    pub(crate) fn run_lineage_gc_cycle_inner(&self) -> Result<usize> {
         let ctx = async_reclaim::LineageGcCtx {
             volumes: self.volumes.clone(),
             manifest_state: self.manifest_state.clone(),

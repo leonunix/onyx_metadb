@@ -472,6 +472,34 @@ pub struct Config {
     /// chain-truncation-only mode is no longer supported; create/open reject
     /// `false` because rc-neutral L2P remaps require FreePbas retire events.
     pub lineage_gc_emit_freepbas: bool,
+
+    /// Run the background Lineage GC driver
+    /// ([`crate::db::lineage_gc::LineageGcWorker`]). When true a worker
+    /// parks on `lineage_gc_interval_ms` and drives
+    /// [`Db::run_lineage_gc_cycle_inner`](crate::db::Db) so dead-list
+    /// segments are surfaced as `FreePbas` and the per-volume dead-list
+    /// chain actually advances. **This is the only production trigger for
+    /// Phase 5 PBA reclaim** — the `async_reclaim` worker deliberately
+    /// holds no `Arc<Db>` and cannot emit FreePbas. Without this thread
+    /// dead-list chains grow without bound and no LV3 PBA is ever
+    /// reclaimed (`gc_lineage_freed_blocks` stays 0).
+    ///
+    /// Defaults OFF in [`Config::new`]: metadb's own lineage_gc unit
+    /// tests and `metadb-soak` drive GC synchronously via
+    /// `test_run_lineage_gc_cycle`, and a background mutator of
+    /// `dead_list_head_pid` would race them. Onyx — the production
+    /// client — overrides it ON.
+    pub lineage_gc_enabled: bool,
+    /// Idle park (ms) between Lineage GC wakes once nothing more can
+    /// advance. A wake also drives more cycles immediately when a backlog
+    /// remains (see `lineage_gc_max_cycles_per_wake`).
+    pub lineage_gc_interval_ms: u64,
+    /// Per-wake budget: how many GC cycles (each advances at most one
+    /// dead-list segment per volume) to drive before parking again.
+    /// Bounds the `apply_gate.write()` pressure one wake puts on the
+    /// foreground commit path while still letting a backlog drain over a
+    /// few wakes.
+    pub lineage_gc_max_cycles_per_wake: usize,
 }
 
 impl Config {
@@ -560,6 +588,14 @@ impl Config {
             // writes are gone — Lineage GC is the sole producer of
             // PBA-free decisions, so FreePbas emission is mandatory.
             lineage_gc_emit_freepbas: true,
+            // Background Lineage GC defaults OFF for standalone metadb:
+            // the lineage_gc unit tests + metadb-soak drive GC via
+            // `test_run_lineage_gc_cycle`, and a background mutator of
+            // `dead_list_head_pid` would race them. Onyx overrides ON —
+            // it is the only production trigger for PBA reclaim.
+            lineage_gc_enabled: false,
+            lineage_gc_interval_ms: 1000,
+            lineage_gc_max_cycles_per_wake: 256,
             rebuild_free_list_on_open: true,
             reclaim_orphans_on_open: true,
             // 1 M buckets × 4 entries = 4 M cuckoo capacity at load
