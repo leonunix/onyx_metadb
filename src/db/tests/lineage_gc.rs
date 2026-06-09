@@ -53,6 +53,74 @@ fn lineage_gc_advances_head_when_rc_zero_and_no_snapshot() {
 }
 
 #[test]
+fn lineage_gc_metrics_attribute_advance_and_rc_bail() {
+    // Instrumentation for Fix B: prove `gc_plan_head_advance` attributes
+    // each head decision and quantifies the rc>0 whole-segment bail's
+    // reclaim debt. Eight LBAs, each its own distinct PBA, written then
+    // overwritten so one head segment forms holding eight dead records
+    // (old PBAs 10..=17).
+    let (_d, db) = mk_db();
+    for i in 0u64..8 {
+        db.insert(0, i, v(10 + i as u8)).unwrap();
+    }
+    for i in 0u64..8 {
+        db.insert(0, i, v(20 + i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Force one dead record (PBA 17) to rc>0 so the whole-segment bail
+    // fires. The other seven are rc==0 — freeable, but stuck behind the
+    // one rc>0 sibling. That stuck count is the reclaim debt Fix B targets.
+    assert_eq!(db.incref_pba(17, 1).unwrap(), 1, "PBA 17 → rc==1");
+
+    let before = db.metrics_snapshot();
+    assert_eq!(
+        db.test_run_lineage_gc_cycle().unwrap(),
+        0,
+        "rc>0 record must block head advance"
+    );
+    let after = db.metrics_snapshot();
+    assert_eq!(
+        after.lineage_gc_head_skipped_rc - before.lineage_gc_head_skipped_rc,
+        1,
+        "bail must be attributed to rc>0"
+    );
+    assert_eq!(
+        after.lineage_gc_head_advanced - before.lineage_gc_head_advanced,
+        0
+    );
+    assert_eq!(
+        after.lineage_gc_head_skipped_snap - before.lineage_gc_head_skipped_snap,
+        0
+    );
+    assert_eq!(
+        after.lineage_gc_head_blocked_rc0_pbas - before.lineage_gc_head_blocked_rc0_pbas,
+        7,
+        "seven rc==0 records stuck behind the one rc>0 sibling"
+    );
+
+    // Release PBA 17 → rc==0; the segment now advances and the advance is
+    // attributed, surfacing all eight dead PBAs.
+    assert_eq!(db.decref_pba(17, 1).unwrap(), 0, "PBA 17 → rc==0");
+    let before2 = db.metrics_snapshot();
+    assert_eq!(
+        db.test_run_lineage_gc_cycle().unwrap(),
+        1,
+        "rc==0 segment must advance"
+    );
+    let after2 = db.metrics_snapshot();
+    assert_eq!(
+        after2.lineage_gc_head_advanced - before2.lineage_gc_head_advanced,
+        1
+    );
+    assert_eq!(
+        after2.lineage_gc_head_dead_pbas - before2.lineage_gc_head_dead_pbas,
+        8,
+        "all eight dead PBAs surfaced once unblocked"
+    );
+}
+
+#[test]
 fn lineage_gc_defers_when_snapshot_pins_record() {
     // Sequence: write, snapshot (pins the original birth_lsn through
     // its created_lsn), overwrite (records the death). The dead
@@ -468,4 +536,126 @@ fn background_lineage_gc_worker_drains_without_manual_cycle() {
         !captured.lock().unwrap().is_empty(),
         "worker advanced the chain but surfaced no FreePbas to the sink"
     );
+}
+
+// ── Fix B: guarded Option 3 (`lineage_gc_drop_dedup_shared`) ──
+
+fn mk_db_with_drop_dedup_shared() -> (tempfile::TempDir, std::sync::Arc<Db>) {
+    use crate::Config;
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.lineage_gc_drop_dedup_shared = true;
+    let db = Db::create_with_config(cfg).unwrap();
+    (dir, db)
+}
+
+// With `lineage_gc_drop_dedup_shared`, a head segment mixing rc==0
+// (exclusive) and rc>0 (dedup-membership) records ADVANCES — surfacing only
+// the rc==0 PBAs and DROPPING the rc>0 ones (no surface, no decref) — instead
+// of the whole-segment bail that stranded the rc==0 siblings (the reclaim-lag
+// bug). The dropped PBA's reclaim is owned by the client's dedup
+// orphan-reclaim path, so its rc must be left untouched.
+#[test]
+fn drop_dedup_shared_advances_surfacing_rc0_and_dropping_shared() {
+    use std::sync::{Arc, Mutex};
+    let (_d, db) = mk_db_with_drop_dedup_shared();
+    // 8 LBAs, distinct old PBAs 10..=17.
+    for i in 0u64..8 {
+        db.insert(0, i, v(10 + i as u8)).unwrap();
+    }
+    for i in 0u64..8 {
+        db.insert(0, i, v(20 + i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Force the last dead record (PBA 17) to rc>0 — a dedup-membership PBA.
+    assert_eq!(db.incref_pba(17, 1).unwrap(), 1, "PBA 17 -> rc==1");
+
+    // Capture surfaced FreePbas.
+    let captured: Arc<Mutex<Vec<crate::types::Pba>>> = Arc::new(Mutex::new(Vec::new()));
+    let cc = captured.clone();
+    db.set_freed_pbas_sink(Arc::new(move |_v, pbas| cc.lock().unwrap().extend(pbas)));
+
+    let before = db.metrics_snapshot();
+    assert_eq!(
+        db.test_run_lineage_gc_cycle().unwrap(),
+        1,
+        "drop mode must advance past the rc>0 record, not bail"
+    );
+    let after = db.metrics_snapshot();
+
+    // Chain fully advanced (the whole segment, including the dropped record).
+    let (head, tail) = dead_list_anchors(&db, 0);
+    assert_eq!(head, NULL_PAGE);
+    assert_eq!(tail, NULL_PAGE);
+
+    // Exactly one rc>0 record dropped; seven rc==0 records surfaced; no
+    // whole-segment rc-bail was recorded.
+    assert_eq!(
+        after.lineage_gc_head_dropped_dedup_shared - before.lineage_gc_head_dropped_dedup_shared,
+        1
+    );
+    assert_eq!(
+        after.lineage_gc_head_skipped_rc - before.lineage_gc_head_skipped_rc,
+        0,
+        "drop mode must not take the whole-segment bail path"
+    );
+    assert_eq!(
+        after.lineage_gc_head_dead_pbas - before.lineage_gc_head_dead_pbas,
+        7,
+        "only the seven rc==0 PBAs surface; the rc>0 one is dropped"
+    );
+
+    // The surfaced set is exactly PBAs 10..=16 — PBA 17 was NOT surfaced.
+    let mut got = captured.lock().unwrap().clone();
+    got.sort_unstable();
+    assert_eq!(got, (10u64..=16).collect::<Vec<crate::types::Pba>>());
+
+    // The dropped PBA's rc was NOT decreffed by lineage (the dedup path owns
+    // it): it is still rc==1, so this decref takes it to 0.
+    assert_eq!(
+        db.decref_pba(17, 1).unwrap(),
+        0,
+        "PBA 17 rc must be untouched by the drop (still 1 before this decref)"
+    );
+}
+
+// Clone-safety guard: even with `lineage_gc_drop_dedup_shared` on, an ACTIVE
+// descendant (clone) pin must still bail the whole volume — a
+// clone-promotion-shared PBA has no dedup_index entry, so dropping its record
+// would permanently leak it. The snap/descendant pin is checked BEFORE the
+// rc>0 drop, so the segment is left intact while the clone references it.
+#[test]
+fn drop_dedup_shared_still_bails_on_active_descendant_pin() {
+    use super::BOOTSTRAP_VOLUME_ORD;
+    let (_d, db) = mk_db_with_drop_dedup_shared();
+    for i in 0u64..16 {
+        db.insert(BOOTSTRAP_VOLUME_ORD, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+    let _clone = db.clone_volume(snap).unwrap();
+    db.drop_snapshot(snap).unwrap();
+    for i in 0u64..16 {
+        db.insert(BOOTSTRAP_VOLUME_ORD, i, v((i as u8).wrapping_add(1)))
+            .unwrap();
+    }
+    db.flush().unwrap();
+    let (head_before, _) = dead_list_anchors(&db, BOOTSTRAP_VOLUME_ORD);
+    assert_ne!(head_before, NULL_PAGE);
+
+    let before = db.metrics_snapshot();
+    let advanced = db.test_run_lineage_gc_cycle().unwrap();
+    let after = db.metrics_snapshot();
+    assert_eq!(
+        advanced, 0,
+        "active descendant pin must bail even in drop mode (clone-shared PBA \
+         has no dedup entry; dropping it would leak)"
+    );
+    assert_eq!(
+        after.lineage_gc_head_dropped_dedup_shared - before.lineage_gc_head_dropped_dedup_shared,
+        0,
+        "nothing may be dropped while a descendant pins the segment"
+    );
+    let (head_after, _) = dead_list_anchors(&db, BOOTSTRAP_VOLUME_ORD);
+    assert_eq!(head_after, head_before, "head must not advance under the pin");
 }

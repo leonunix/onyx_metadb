@@ -288,6 +288,12 @@ pub struct Db {
     /// Phase 3 flag-off mode; this stays as a compatibility field for
     /// config/wire stability.
     lineage_gc_emit_freepbas: bool,
+    /// Cached copy of `Config::lineage_gc_drop_dedup_shared`. When true the
+    /// head-advance planner drops `rc > 0` (dedup-membership) dead-list records
+    /// and surfaces only `rc == 0` ones instead of bailing the whole segment.
+    /// Only safe in a DB that never creates snapshots/clones (see the config
+    /// field doc); onyx sets it, metadb standalone defaults false.
+    lineage_gc_drop_dedup_shared: bool,
     /// [[no-refcount-hot-path-design]] Phase 4 Step 7. Optional sink
     /// invoked when a `commit_free_pbas` apply produces a non-empty
     /// `ApplyOutcome::FreePbas.freed_pbas`. Onyx registers a sink at
@@ -1469,7 +1475,9 @@ impl Db {
                 .map(|shard| shard.rc.clone())
                 .collect(),
             faults: self.faults.clone(),
+            metrics: self.metrics.clone(),
             emit_freepbas: self.lineage_gc_emit_freepbas,
+            drop_dedup_shared: self.lineage_gc_drop_dedup_shared,
         };
         if !self.lineage_gc_emit_freepbas {
             return Err(MetaDbError::InvalidArgument(

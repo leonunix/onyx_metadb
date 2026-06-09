@@ -334,6 +334,50 @@ impl MetaMetrics {
         );
     }
 
+    /// One lineage-GC head-advance plan succeeded: the volume's head
+    /// dead-list segment was fully unpinned + rc==0, so it advances and
+    /// surfaces `dead_pbas` FreePbas.
+    pub(crate) fn record_lineage_gc_head_advanced(&self, dead_pbas: usize) {
+        self.lineage_gc_head_advanced.fetch_add(1, Ordering::Relaxed);
+        self.lineage_gc_head_dead_pbas
+            .fetch_add(dead_pbas as u64, Ordering::Relaxed);
+    }
+
+    /// A head-advance plan bailed because a record is pinned by an active
+    /// snapshot. The whole segment stays intact until the snapshot drops.
+    pub(crate) fn record_lineage_gc_head_skipped_snap(&self) {
+        self.lineage_gc_head_skipped_snap
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A head-advance plan bailed because a record is pinned by a clone
+    /// descendant's branch point.
+    pub(crate) fn record_lineage_gc_head_skipped_descendant(&self) {
+        self.lineage_gc_head_skipped_descendant
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A head-advance plan bailed because a record's PBA still has
+    /// refcount > 0. `blocked_rc0_pbas` is the number of *other* records
+    /// in the same segment that were rc==0 — freeable, but stuck behind
+    /// the rc>0 sibling because the bail leaves the whole segment intact.
+    /// Under dedup this is the dominant reclaim-debt source.
+    pub(crate) fn record_lineage_gc_head_skipped_rc(&self, blocked_rc0_pbas: usize) {
+        self.lineage_gc_head_skipped_rc
+            .fetch_add(1, Ordering::Relaxed);
+        self.lineage_gc_head_blocked_rc0_pbas
+            .fetch_add(blocked_rc0_pbas as u64, Ordering::Relaxed);
+    }
+
+    /// Under `lineage_gc_drop_dedup_shared`, a head-advance dropped one rc>0
+    /// (dedup-membership) record so the head could advance past it instead of
+    /// bailing the whole segment. The dropped PBA's reclaim is owned by the
+    /// client's dedup orphan-reclaim path.
+    pub(crate) fn record_lineage_gc_head_dropped_dedup_shared(&self) {
+        self.lineage_gc_head_dropped_dedup_shared
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One L2P buffer compaction cycle completed. `entries` is the
     /// number of `(lba, value, lsn)` tuples drained from the
     /// `draining` slot into the paged radix tree on this shard cycle.

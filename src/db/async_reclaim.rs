@@ -68,6 +68,10 @@ pub(super) struct LineageGcCtx {
     /// 5 will move the decref into GC and remove this check).
     pub refcount_shards_rc: Vec<Arc<RcShard>>,
     pub faults: Arc<FaultController>,
+    /// Metrics sink so `gc_plan_head_advance` can attribute every
+    /// head-advance decision (advanced / snap-pinned / descendant-pinned
+    /// / rc>0 bail + the rc==0 reclaim debt stuck behind an rc>0 sibling).
+    pub metrics: Arc<MetaMetrics>,
     /// [[no-refcount-hot-path-design]] Phase 4 Step 4. When true, the
     /// FreePbas-emitting GC driver (`Db::run_lineage_gc_cycle_inner`,
     /// reachable from `Db::test_run_lineage_gc_cycle` today and from
@@ -78,6 +82,13 @@ pub(super) struct LineageGcCtx {
     /// so it keeps Phase 3 behavior regardless of this flag — Phase 5
     /// will replace that path with a Weak<Db> bridge.
     pub emit_freepbas: bool,
+    /// When true, head-advance drops `rc > 0` (dedup-membership) records and
+    /// advances past them, surfacing only the `rc == 0` exclusive records,
+    /// instead of bailing the whole segment on the first `rc > 0`. Only sound
+    /// when the DB never creates snapshots/clones (every `rc > 0` is then a
+    /// dedup target owned by the client's orphan-reclaim path). See
+    /// `Config::lineage_gc_drop_dedup_shared`.
+    pub drop_dedup_shared: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -375,18 +386,53 @@ pub(super) fn gc_plan_head_advance(
     let mut dead_pbas: Vec<Pba> = Vec::with_capacity(records.len());
     for rec in &records {
         if snap_pinned(&snap_lsns, rec.birth_lsn, rec.death_lsn) {
+            ctx.metrics.record_lineage_gc_head_skipped_snap();
             return Ok(None);
         }
         if snap_pinned(&descendant_branch_lsns, rec.birth_lsn, rec.death_lsn) {
+            ctx.metrics.record_lineage_gc_head_skipped_descendant();
             return Ok(None);
         }
         let sid = (xxhash_rust::xxh3::xxh3_64(&rec.pba.to_be_bytes()) as usize) % n_shards;
         let rc = ctx.refcount_shards_rc[sid].get(rec.pba)?;
         if rc > 0 {
+            if ctx.drop_dedup_shared {
+                // Guarded Option 3 (`Config::lineage_gc_drop_dedup_shared`):
+                // in a DB that never creates snapshots/clones, every rc>0
+                // dead-list record is a dedup-membership PBA (Phase 5 bumps rc
+                // only via DedupPut/PromotionChunk, and PromotionChunk needs a
+                // clone, which this mode forbids). Its reclaim is owned by the
+                // client's dedup orphan-reclaim path (DedupDelete → rc 0 →
+                // retire → confirm-scan free), so the dead-list record is
+                // redundant: DROP it — do NOT surface, do NOT decref (the
+                // FreePbas rc>0 decref would double-count the dedup ledger) —
+                // and keep scanning. The head then advances past it instead of
+                // the whole-segment bail that stranded the rc==0 siblings (the
+                // reclaim-lag bug). The snap/descendant pins above still bail
+                // the whole volume, so an ACTIVE clone is never reached here.
+                ctx.metrics.record_lineage_gc_head_dropped_dedup_shared();
+                continue;
+            }
+            // Whole-segment bail: this rc>0 record leaves the entire head
+            // segment intact, so every OTHER rc==0 record here is freeable
+            // but stuck. Tally that reclaim debt for diagnosis. Records
+            // before this point are already confirmed rc==0 (in `dead_pbas`);
+            // scan the remainder. Instrumentation-only: a get() error here
+            // is swallowed (the plan decision is already "bail").
+            let mut blocked_rc0 = dead_pbas.len();
+            for later in &records[dead_pbas.len() + 1..] {
+                let lsid =
+                    (xxhash_rust::xxh3::xxh3_64(&later.pba.to_be_bytes()) as usize) % n_shards;
+                if matches!(ctx.refcount_shards_rc[lsid].get(later.pba), Ok(0)) {
+                    blocked_rc0 += 1;
+                }
+            }
+            ctx.metrics.record_lineage_gc_head_skipped_rc(blocked_rc0);
             return Ok(None);
         }
         dead_pbas.push(rec.pba);
     }
+    ctx.metrics.record_lineage_gc_head_advanced(dead_pbas.len());
 
     // 4. Locate the tail anchor up front so the execute phase can
     // walk the chain under the gate. tail being NULL with head set

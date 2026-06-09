@@ -498,6 +498,33 @@ pub struct MetaMetrics {
     async_reclaim_reclaimed_pages: AtomicU64,
     async_reclaim_cycle_us: AtomicU64,
     async_reclaim_cycle_max_us: AtomicU64,
+    // Lineage GC head-advance attribution ([[no-refcount-hot-path-design]]
+    // Phase 5). `gc_plan_head_advance` evaluates a volume's head dead-list
+    // segment and either advances it (every record unpinned + rc==0) or
+    // bails the WHOLE segment on the first pinned/rc>0 record. These
+    // counters attribute each per-volume plan call so we can tell *why*
+    // FreePbas stops being surfaced under sustained overwrite:
+    //   - `*_advanced`        : plan returned, head advanced
+    //   - `*_dead_pbas`       : dead PBAs surfaced by those advances (cumulative)
+    //   - `*_skipped_snap`    : bailed — a record is pinned by an active snapshot
+    //   - `*_skipped_descendant`: bailed — a record is pinned by a clone branch point
+    //   - `*_skipped_rc`      : bailed — a record's PBA still has refcount > 0
+    //   - `*_blocked_rc0_pbas`: on an rc>0 bail, how many OTHER records in the
+    //     same segment were rc==0 (freeable but stuck behind the rc>0 sibling
+    //     because the bail leaves the whole segment intact). This is the
+    //     reclaim debt the whole-segment bail creates under dedup.
+    lineage_gc_head_advanced: AtomicU64,
+    lineage_gc_head_dead_pbas: AtomicU64,
+    lineage_gc_head_skipped_snap: AtomicU64,
+    lineage_gc_head_skipped_descendant: AtomicU64,
+    lineage_gc_head_skipped_rc: AtomicU64,
+    lineage_gc_head_blocked_rc0_pbas: AtomicU64,
+    //   - `*_dropped_dedup_shared`: under `lineage_gc_drop_dedup_shared`, an
+    //     rc>0 (dedup-membership) record was DROPPED so the head could advance
+    //     past it (instead of the whole-segment bail). Reclaim of that PBA is
+    //     left to the client's dedup orphan-reclaim path. Rising together with
+    //     `*_advanced` = the guarded Option-3 reclaim-lag fix is working.
+    lineage_gc_head_dropped_dedup_shared: AtomicU64,
     // B2 L2P buffer (default-off). When enabled, commits insert into
     // an in-memory hashmap and a background compactor periodically
     // folds it into the paged radix tree. These counters are summed

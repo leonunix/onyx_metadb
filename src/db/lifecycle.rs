@@ -413,7 +413,9 @@ impl Db {
                 .map(|shard| shard.rc.clone())
                 .collect(),
             faults: self.faults.clone(),
+            metrics: self.metrics.clone(),
             emit_freepbas: self.lineage_gc_emit_freepbas,
+            drop_dedup_shared: self.lineage_gc_drop_dedup_shared,
         };
         let worker = super::async_reclaim::AsyncReclaim::start_with_lineage_gc(
             self.page_store.clone(),

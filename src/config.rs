@@ -500,6 +500,34 @@ pub struct Config {
     /// foreground commit path while still letting a backlog drain over a
     /// few wakes.
     pub lineage_gc_max_cycles_per_wake: usize,
+
+    /// Lineage GC head-advance: when a head dead-list segment contains a
+    /// record whose PBA still has `rc > 0`, DROP that record (do not surface
+    /// it, do not decref) and advance the head past it, surfacing only the
+    /// `rc == 0` (exclusive) records. When false (the default) the head
+    /// segment is left intact on the first `rc > 0` record — the historical
+    /// whole-segment bail.
+    ///
+    /// ## Why dropping rc>0 is safe — and its hard precondition
+    ///
+    /// Under Phase 5 the only events that bump a PBA's global rc are
+    /// `DedupPut`/`PromotionChunk` (L2P remaps are rc-neutral). So an
+    /// `rc > 0` dead-list record is EITHER (a) a dedup-target PBA whose rc is
+    /// pure dedup_index membership, reclaimed by the client's dedup
+    /// orphan-reclaim path (DedupDelete → rc 0 → retire → confirm-scan free),
+    /// OR (b) a clone/snapshot promotion-shared PBA with no dedup entry, whose
+    /// ONLY reclaim path is the FreePbas shared-decref. Dropping is safe for
+    /// (a) — the dead-list record is redundant; the dedup path owns it — but a
+    /// PERMANENT LEAK for (b), because nothing else decrefs a promotion incref.
+    /// metadb cannot cheaply tell (a) from (b) per-record (no reverse
+    /// PBA→hash index). The snapshot / descendant-branch pin checks still bail
+    /// the whole volume, which covers ACTIVE clones, but a clone that finished
+    /// promotion (parent_vol_ord cleared) is no longer pinned — so this flag is
+    /// only correct when the DB **never** creates snapshots or clones, i.e.
+    /// every `rc > 0` is class (a). Onyx — which exposes no snapshot/clone in
+    /// its CLI or meta layer — sets this true; metadb standalone (and any DB
+    /// that uses snapshot/clone) MUST leave it false.
+    pub lineage_gc_drop_dedup_shared: bool,
 }
 
 impl Config {
@@ -596,6 +624,8 @@ impl Config {
             lineage_gc_enabled: false,
             lineage_gc_interval_ms: 1000,
             lineage_gc_max_cycles_per_wake: 256,
+            // Conservative default: only onyx (no snapshot/clone) flips this on.
+            lineage_gc_drop_dedup_shared: false,
             rebuild_free_list_on_open: true,
             reclaim_orphans_on_open: true,
             // 1 M buckets × 4 entries = 4 M cuckoo capacity at load

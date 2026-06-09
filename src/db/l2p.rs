@@ -381,6 +381,56 @@ impl Db {
         Ok(())
     }
 
+    /// **Fold-consistent** live-L2P scan for reclaim reference checks (onyx
+    /// `referenced_extents`): per shard, hold `tree.read()` across BOTH the
+    /// folded read-view scan AND the `l2p_buffer` scan, so a concurrent TXG
+    /// fold cannot interleave between the two structures and make a migrating
+    /// entry transiently invisible.
+    ///
+    /// **This is load-bearing for premature-free safety** (proven by soak:
+    /// removing it and relying on the reclaim-age grace alone reintroduced the
+    /// CRC). `drain_one_syncing_shard` folds+publishes the syncing slot into the
+    /// tree under `tree.write()`, then clears the slot AFTER dropping it. A
+    /// two-pass reverify (read-view then buffer) without `tree.read` can read
+    /// the read-view before the publish (miss) and the buffer after the clear
+    /// (miss) — a both-absent window for a packed-slot sibling mid-fold, which
+    /// premature-frees a still-referenced PBA → read CRC mismatch.
+    ///
+    /// Holding `tree.read()` for the shard scan blocks the fold at its
+    /// `tree.write()` (so the slot isn't cleared mid-scan) and freezes the
+    /// published read-view. Buffer-mode commits do NOT take `tree.write` (they
+    /// use `read_view.read` + the slot mutex), so this contends ONLY with the
+    /// background flush/fold — never the commit hot path, and only at reclaim
+    /// time. `f` returning `Err` aborts the scan early (all-candidates-marked
+    /// sentinel). See fixb_soak_exposed_referenced_extents_race.
+    pub fn scan_l2p_live_consistent<F>(&self, vol_ord: VolumeOrdinal, mut f: F) -> Result<()>
+    where
+        F: FnMut(Lba, L2pValue) -> Result<()>,
+    {
+        let volume = self.volume(vol_ord)?;
+        for shard in volume.shards.iter() {
+            let _tree_guard = shard.tree.read();
+            let _pin = self.page_store.epoch().pin();
+            let (view, _active_read) = acquire_l2p_read_view(shard);
+            view.for_each_range(.., |lba, value| f(lba, value))?;
+            if shard.use_buffer {
+                let mut err: Option<MetaDbError> = None;
+                shard.l2p_buffer.for_each_live(|lba, value| {
+                    if err.is_some() {
+                        return;
+                    }
+                    if let Err(e) = f(lba, value) {
+                        err = Some(e);
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     // -------- range delete (SPEC §3.2) ----------------------------------
 
     /// Bulk L2P delete over `[start, end)` for one volume. The
