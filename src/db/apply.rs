@@ -8,7 +8,7 @@ mod volume;
 pub(super) use dedup::{apply_dedup_delete_with_rc, apply_dedup_put_with_rc, apply_free_pbas};
 pub(super) use l2p::{
     apply_l2p_range_delete, apply_l2p_remap, apply_l2p_remap_range, record_dead, scan_l2p_range,
-    seq_guard_rejects, stamp_birth_lsn,
+    seq_guard_rejects, stage_delete_rc, stage_remap_rc, stamp_birth_lsn,
 };
 pub(super) use promotion::{apply_promotion_chunk, apply_promotion_complete};
 pub(super) use volume::{
@@ -57,6 +57,7 @@ pub(super) fn publish_l2p_read_view(shard: &L2pShard, tree: &PagedL2p) {
 /// Replaces the legacy `leaf_was_shared` proxy. Callers that don't
 /// have a snap-aware state (unit tests) can pass `&|_| Vec::new()`.
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_op_bare(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
@@ -66,6 +67,14 @@ pub(super) fn apply_op_bare(
     txg: crate::types::Txg,
     op: &WalOp,
     snap_info_for_vol: &dyn Fn(VolumeOrdinal) -> Vec<SnapInfo>,
+    // rc-authoritative (serial / replay path): every applied L2P install does
+    // the traditional inline incref(new)+decref(old) pair with snap-pin decref
+    // suppression (`stage_remap_rc` / `stage_delete_rc`); `record_dead` is NOT
+    // called (the dead-list / lineage GC stays dormant — inline rc is the sole
+    // driver, balanced 1:1). Mirrors the lane path in lanes/l2p.rs. The inline
+    // `rc.stage(±1)` is replay-safe under the same LSN-cutoff idempotency as
+    // the existing dedup rc (see the DedupPut comment below).
+    rc_authoritative: bool,
 ) -> Result<ApplyOutcome> {
     match op {
         WalOp::L2pPut {
@@ -105,7 +114,26 @@ pub(super) fn apply_op_bare(
                 publish_l2p_read_view(&volume.shards[sid], &tree);
                 p
             };
-            record_dead(volume, prev, lsn);
+            // rc-authoritative: incref(new) + decref(old) inline, with
+            // snap-pin decref suppression (`stage_remap_rc`). `L2pPrev` has no
+            // freed-pba slot, so a net rc==0 here is reclaimed by onyx's GC
+            // paths (rc stays authoritative). Phase-5 (flag off): dead-list +
+            // lineage GC.
+            if rc_authoritative {
+                let snap_infos = snap_info_for_vol(*vol_ord);
+                stage_remap_rc(
+                    refcount_shards,
+                    &tree,
+                    sid,
+                    *lba,
+                    stamped,
+                    prev,
+                    &snap_infos,
+                    lsn,
+                )?;
+            } else {
+                record_dead(volume, prev, lsn);
+            }
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::L2pDelete { vol_ord, lba } => {
@@ -130,6 +158,13 @@ pub(super) fn apply_op_bare(
                 publish_l2p_read_view(&volume.shards[sid], &tree);
                 p
             };
+            // rc-authoritative: decref the deleted reference inline, suppressed
+            // when a live snapshot still pins it (`stage_delete_rc`). Phase-5
+            // (flag off): dead-list + lineage GC drives reclaim.
+            if rc_authoritative {
+                let snap_infos = snap_info_for_vol(*vol_ord);
+                stage_delete_rc(refcount_shards, &tree, sid, *lba, prev, &snap_infos, lsn)?;
+            }
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         // [[no-refcount-hot-path-design]] Phase 5: `DedupPut` is now the
@@ -231,6 +266,7 @@ pub(super) fn apply_op_bare(
             *new_value,
             *guard,
             &snap_info_for_vol(*vol_ord),
+            rc_authoritative,
         ),
         WalOp::L2pRemapRange {
             vol_ord,
@@ -245,6 +281,7 @@ pub(super) fn apply_op_bare(
             *start_lba,
             values,
             &snap_info_for_vol(*vol_ord),
+            rc_authoritative,
         ),
     }
 }

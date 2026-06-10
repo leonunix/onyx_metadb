@@ -1,5 +1,250 @@
 use super::*;
 
+// ---- rc-authoritative reclaim (flag on): rc == # live L2P references ----
+
+fn mk_db_rc_auth() -> (TempDir, std::sync::Arc<Db>) {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true; // buffer mode = the box hot path
+    cfg.rc_authoritative_reclaim = true;
+    let db = Db::create_with_config(cfg).unwrap();
+    (dir, db)
+}
+
+/// Single applied remap installs ONE live L2P reference → rc[pba] == 1.
+#[test]
+fn rc_authoritative_remap_increfs_new_pba() {
+    let (_d, db) = mk_db_rc_auth();
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(100, 1), None);
+    tx.commit_with_outcomes().unwrap();
+    db.flush().unwrap(); // final-drain the rc apply lane for a deterministic read
+    assert_eq!(
+        db.get_refcount(100).unwrap(),
+        1,
+        "rc-authoritative: one live L2P reference → rc == 1"
+    );
+}
+
+/// A packed unit's N member LBAs all map to the same base pba → rc == N.
+#[test]
+fn rc_authoritative_packed_unit_increfs_n() {
+    let (_d, db) = mk_db_rc_auth();
+    let base = 500;
+    let n = 8u32;
+    let mut tx = db.begin();
+    for lba in 0..n as u64 {
+        // Distinct tag per LBA so they are distinct L2pValues sharing one
+        // head_pba (the packed-slot contract); each must contribute +1.
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, lba, remap_val(base, lba as u8 + 1), None);
+    }
+    tx.commit_with_outcomes().unwrap();
+    db.flush().unwrap();
+    assert_eq!(
+        db.get_refcount(base).unwrap(),
+        n,
+        "rc-authoritative: N live L2P references to one base pba → rc == N"
+    );
+}
+
+/// Overwriting an LBA does the inline incref(new) + decref(old) pair:
+/// rc[new]==1, rc[old]==0. The decref is traditional/inline (NOT deferred to
+/// the deadlist) — that 1:1 balance is what makes reclaim's rc==0 Gate
+/// authoritative, and the overwrite surfaces `freed_pba == old`.
+#[test]
+fn rc_authoritative_overwrite_increfs_new_decrefs_old() {
+    let (_d, db) = mk_db_rc_auth();
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(100, 1), None);
+    tx.commit_with_outcomes().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get_refcount(100).unwrap(), 1);
+
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(200, 1), None);
+    let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get_refcount(200).unwrap(), 1, "new pba increffed");
+    assert_eq!(
+        db.get_refcount(100).unwrap(),
+        0,
+        "old pba decref'd inline (traditional rc, not deadlist-deferred)"
+    );
+    // The decref that drove rc[100]→0 surfaces freed_pba so onyx retires it.
+    let freed = match &outcomes[0] {
+        ApplyOutcome::L2pRemap { freed_pba, .. } => *freed_pba,
+        other => panic!("expected L2pRemap outcome, got {other:?}"),
+    };
+    assert_eq!(freed, Some(100), "net rc==0 old pba surfaced as freed");
+}
+
+/// Decref-balance invariant: a packed base referenced by N LBAs has rc==N,
+/// and overwriting each LBA away decays rc back to exactly 0 (the last
+/// overwrite surfaces the base as freed). This is the core 1:1 incref/decref
+/// balance the inline decref must guarantee.
+#[test]
+fn rc_authoritative_packed_unit_decays_to_zero() {
+    let (_d, db) = mk_db_rc_auth();
+    let base = 700;
+    let n = 6u64; // mirrors the forensic packed unit_lba_count=6
+    let mut tx = db.begin();
+    for lba in 0..n {
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, lba, remap_val(base, lba as u8 + 1), None);
+    }
+    tx.commit_with_outcomes().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get_refcount(base).unwrap(), n as u32, "rc == N members");
+
+    // Overwrite each member LBA to its own fresh exclusive pba.
+    let mut last_freed = None;
+    for lba in 0..n {
+        let new_pba = 800 + lba;
+        let mut tx = db.begin();
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, lba, remap_val(new_pba, 1), None);
+        let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+        db.flush().unwrap();
+        let before_last = lba < n - 1;
+        let expect_rc = if before_last { (n - 1 - lba) as u32 } else { 0 };
+        assert_eq!(
+            db.get_refcount(base).unwrap(),
+            expect_rc,
+            "rc decays one per overwritten member (lba {lba})"
+        );
+        assert_eq!(db.get_refcount(new_pba).unwrap(), 1, "fresh pba increffed");
+        if let ApplyOutcome::L2pRemap { freed_pba, .. } = &outcomes[0] {
+            last_freed = *freed_pba;
+        }
+    }
+    assert_eq!(db.get_refcount(base).unwrap(), 0, "rc decayed to exactly 0");
+    assert_eq!(
+        last_freed,
+        Some(base),
+        "the overwrite that drove rc→0 surfaced the base as freed"
+    );
+}
+
+/// Snapshot-pin decref suppression (serial path): a snapshot that still maps
+/// the LBA to the old value pins old.head_pba, so a live overwrite must NOT
+/// decref it — otherwise rc could fall to 0 while the snapshot references it
+/// and reclaim (rc==0) would free snapshot-referenced data.
+#[test]
+fn rc_authoritative_snapshot_pins_old_suppresses_decref() {
+    let (_d, db) = mk_db_rc_auth();
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(100, 1), None);
+    tx.commit_with_outcomes().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get_refcount(100).unwrap(), 1);
+
+    // Snapshot captures (lba 10 → pba 100). Now overwrite live to pba 200.
+    db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(200, 1), None);
+    let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get_refcount(200).unwrap(), 1, "new pba increffed");
+    assert_eq!(
+        db.get_refcount(100).unwrap(),
+        1,
+        "snapshot still pins old pba → decref suppressed, rc stays 1"
+    );
+    let freed = match &outcomes[0] {
+        ApplyOutcome::L2pRemap { freed_pba, .. } => *freed_pba,
+        other => panic!("expected L2pRemap outcome, got {other:?}"),
+    };
+    assert_eq!(freed, None, "snapshot-pinned old pba not surfaced as freed");
+}
+
+/// In-place overwrite to the SAME pba (different value bytes) is net-zero —
+/// the per-pba +1/-1 collapse must leave rc unchanged and surface nothing.
+#[test]
+fn rc_authoritative_same_pba_overwrite_net_zero() {
+    let (_d, db) = mk_db_rc_auth();
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(100, 1), None);
+    tx.commit_with_outcomes().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get_refcount(100).unwrap(), 1);
+
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(100, 2), None);
+    let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+    db.flush().unwrap();
+    assert_eq!(
+        db.get_refcount(100).unwrap(),
+        1,
+        "same-pba overwrite: +1/-1 collapse leaves rc unchanged"
+    );
+    let freed = match &outcomes[0] {
+        ApplyOutcome::L2pRemap { freed_pba, .. } => *freed_pba,
+        other => panic!("expected L2pRemap outcome, got {other:?}"),
+    };
+    assert_eq!(freed, None, "net-zero overwrite surfaces no freed pba");
+}
+
+/// THE invariant, randomized: after an arbitrary sequence of overwrites
+/// (heavy LBA reuse + PBA sharing → lots of incref/decref churn), for EVERY
+/// pba `rc[pba] == # live L2P entries pointing to it` (no dedup here, so the
+/// membership term is 0). A single missed or doubled decref anywhere in the
+/// pipeline (the premature-free CRC class) breaks this exact equality.
+#[test]
+fn rc_authoritative_invariant_under_random_overwrites() {
+    use std::collections::HashMap;
+    let (_d, db) = mk_db_rc_auth();
+    // Deterministic LCG (Date/rand are unavailable in this harness; a fixed
+    // seed keeps the test reproducible).
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rng = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state >> 33
+    };
+    let n_lbas: u64 = 64;
+    let pba_lo: Pba = 1000;
+    let pba_hi: Pba = 1032; // 32 pbas → forced sharing + overwrites
+    for _ in 0..3000 {
+        let lba = rng() % n_lbas;
+        let pba = pba_lo + rng() % (pba_hi - pba_lo);
+        let tag = (rng() % 4) as u8 + 1;
+        let mut tx = db.begin();
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, lba, remap_val(pba, tag), None);
+        tx.commit_with_outcomes().unwrap();
+    }
+    db.flush().unwrap();
+
+    // Tally live L2P references per pba by scanning the LBA space.
+    let mut expected: HashMap<Pba, u32> = HashMap::new();
+    for lba in 0..n_lbas {
+        if let Some(v) = db.get(BOOTSTRAP_VOLUME_ORD, lba).unwrap() {
+            *expected.entry(v.head_pba()).or_insert(0) += 1;
+        }
+    }
+    for pba in pba_lo..pba_hi {
+        let want = expected.get(&pba).copied().unwrap_or(0);
+        assert_eq!(
+            db.get_refcount(pba).unwrap(),
+            want,
+            "rc[{pba}] must equal its live L2P reference count after random churn"
+        );
+    }
+}
+
+/// Flag OFF (default): L2pRemap stays rc-neutral (Phase-5 contract).
+#[test]
+fn rc_neutral_when_flag_off() {
+    let (_d, db) = mk_db(); // default config: rc_authoritative_reclaim = false
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(100, 1), None);
+    tx.commit_with_outcomes().unwrap();
+    db.flush().unwrap();
+    assert_eq!(
+        db.get_refcount(100).unwrap(),
+        0,
+        "flag off: L2pRemap is rc-neutral"
+    );
+}
+
 /// Build an `L2pValue` whose head 8 bytes encode `pba` (matches the
 /// `BlockmapValue` contract used by onyx's apply path). The
 /// remaining 20 bytes carry `tag` in byte 8 so tests can

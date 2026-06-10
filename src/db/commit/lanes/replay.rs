@@ -2,6 +2,7 @@ use super::*;
 
 impl Db {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::db) fn apply_replay_batch(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         refcount_shards: &[Shard],
@@ -12,6 +13,7 @@ impl Db {
         txg: crate::types::Txg,
         ops: &[WalOp],
         snap_info_for_vol: &dyn Fn(VolumeOrdinal) -> Vec<SnapInfo>,
+        rc_authoritative: bool,
     ) -> Result<Vec<ApplyOutcome>> {
         const BUCKET_THRESHOLD: usize = 8;
         if ops.len() < BUCKET_THRESHOLD
@@ -28,6 +30,7 @@ impl Db {
                     txg,
                     op,
                     snap_info_for_vol,
+                    rc_authoritative,
                 )?);
             }
             return Ok(outcomes);
@@ -41,9 +44,11 @@ impl Db {
             lsn,
             txg,
             ops,
+            rc_authoritative,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::db::commit) fn apply_ops_grouped_to_lanes(
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
@@ -53,6 +58,7 @@ impl Db {
         lsn: Lsn,
         txg: crate::types::Txg,
         ops: &[WalOp],
+        rc_authoritative: bool,
     ) -> Result<Vec<ApplyOutcome>> {
         let ops = Arc::new(ops.to_vec());
         let mut outcomes: Vec<Option<ApplyOutcome>> = (0..ops.len()).map(|_| None).collect();
@@ -142,6 +148,7 @@ impl Db {
                         apply_ops.as_slice(),
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
+                        rc_authoritative,
                     );
                     let _ = tx.send(result);
                 }),
@@ -265,6 +272,7 @@ impl Db {
         lsn: Lsn,
         txg: crate::types::Txg,
         ops: &[WalOp],
+        rc_authoritative: bool,
     ) -> Result<Vec<ApplyOutcome>> {
         let mut outcomes: Vec<Option<ApplyOutcome>> = (0..ops.len()).map(|_| None).collect();
         let mut l2p_buckets: HashMap<(VolumeOrdinal, usize), Vec<L2pBucketEntry>> = HashMap::new();
@@ -341,6 +349,7 @@ impl Db {
                 ops,
                 &refcount_shards_vec,
                 metrics.as_ref(),
+                rc_authoritative,
             )?;
             for (idx, outcome) in result.outcomes {
                 merge_l2p_outcome(&mut outcomes, idx, outcome);
@@ -418,6 +427,7 @@ impl Db {
             lsn,
             txg,
             ops,
+            self.rc_authoritative_reclaim,
         )
     }
 }

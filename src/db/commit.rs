@@ -883,11 +883,17 @@ impl Db {
                 ops,
                 &refcount_shards_snapshot,
                 &self.metrics,
+                self.rc_authoritative_reclaim,
             )?;
+            // Direct apply is only reached when `plan_is_l2p_direct_eligible`
+            // (no rc-enqueued shards). Under rc-authoritative every
+            // Put/Remap/RemapRange marks rc → such a commit is NOT direct
+            // eligible → routed to the lane path. So the only ops that reach
+            // here are rc-neutral (L2pDelete / empty) → rc_actions stays empty.
             debug_assert!(
                 bucket_result.rc_actions.is_empty(),
                 "apply_l2p_bucket_buffer in direct apply produced non-empty rc_actions; \
-                 buffer mode is supposed to be rc-neutral"
+                 a rc-marking op slipped past plan_is_l2p_direct_eligible"
             );
             if !bucket_result.rc_actions.is_empty() {
                 return Err(MetaDbError::Corruption(
@@ -1130,6 +1136,7 @@ impl Db {
             txg,
             op,
             &snap_lookup,
+            self.rc_authoritative_reclaim,
         )?;
         record_per_op_apply(&self.metrics, op, op_started.elapsed());
         Ok(outcome)

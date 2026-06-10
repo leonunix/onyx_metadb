@@ -388,21 +388,25 @@ impl Db {
     /// entry transiently invisible.
     ///
     /// **This is load-bearing for premature-free safety** (proven by soak:
-    /// removing it and relying on the reclaim-age grace alone reintroduced the
-    /// CRC). `drain_one_syncing_shard` folds+publishes the syncing slot into the
-    /// tree under `tree.write()`, then clears the slot AFTER dropping it. A
-    /// two-pass reverify (read-view then buffer) without `tree.read` can read
-    /// the read-view before the publish (miss) and the buffer after the clear
-    /// (miss) — a both-absent window for a packed-slot sibling mid-fold, which
-    /// premature-frees a still-referenced PBA → read CRC mismatch.
+    /// removing the lock and relying on scan-ORDER + publish-before-clear alone
+    /// REINTRODUCED the read CRC under real fio load — 2026-06-09). The
+    /// publish-before-clear invariant closes the buffer→tree *migration* window,
+    /// but NOT a re-reference that COMMITS INTO THE BUFFER after the buffer pass
+    /// and has not folded by the read-view pass (a concurrent dedup promote /
+    /// remap onto the candidate PBA) → both-absent → premature free → CRC.
+    /// Holding `tree.read()` blocks the fold so the read-view + buffer are a
+    /// single consistent instant.
     ///
-    /// Holding `tree.read()` for the shard scan blocks the fold at its
-    /// `tree.write()` (so the slot isn't cleared mid-scan) and freezes the
-    /// published read-view. Buffer-mode commits do NOT take `tree.write` (they
-    /// use `read_view.read` + the slot mutex), so this contends ONLY with the
-    /// background flush/fold — never the commit hot path, and only at reclaim
-    /// time. `f` returning `Err` aborts the scan early (all-candidates-marked
-    /// sentinel). See fixb_soak_exposed_referenced_extents_race.
+    /// `drain_one_syncing_shard` folds+publishes the syncing slot into the tree
+    /// under `tree.write()`, then clears the slot AFTER dropping it. Buffer-mode
+    /// commits do NOT take `tree.write` (they use `read_view.read` + the slot
+    /// mutex), so this contends ONLY with the background flush/fold — but that
+    /// IS on the commit-drain path, so a full-volume `tree.read()` here stalls
+    /// the fold/checkpoint `tree.write()` and spikes commit latency. ⚠ The
+    /// commit-spike cost is real but the lock is required for correctness; a fix
+    /// must preserve this consistency (e.g. chunk the lock, or a cheaper
+    /// reverify), NOT just drop it. `f` returning `Err` aborts the scan early
+    /// (all-candidates-marked sentinel). See fixb_soak_exposed_referenced_extents_race.
     pub fn scan_l2p_live_consistent<F>(&self, vol_ord: VolumeOrdinal, mut f: F) -> Result<()>
     where
         F: FnMut(Lba, L2pValue) -> Result<()>,
@@ -694,6 +698,7 @@ impl Db {
                 vol_ord,
                 chunk_captured,
                 &snap_lookup(vol_ord),
+                self.rc_authoritative_reclaim,
             );
             match apply_result {
                 Ok(_outcome) => self

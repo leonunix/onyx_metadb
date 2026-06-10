@@ -346,6 +346,10 @@ pub struct Db {
     /// Cached copy of `Config::parallel_l2p_drain_enabled`. Fans the
     /// per-TXG L2P syncing-slot drain out across shards when `true`.
     pub(crate) parallel_l2p_drain_enabled: bool,
+    /// Cached copy of `Config::rc_authoritative_reclaim`. When `true`, every
+    /// L2P remap increfs its new head_pba so refcount is the authoritative
+    /// live-reference count (reclaim = `rc==0`, no full-volume reverify scan).
+    pub(crate) rc_authoritative_reclaim: bool,
     /// Notifier always allocated so `flush_with_gate` can hand a clone
     /// to the (optional) quiesce worker without taking a mutex. Cheap —
     /// just a `Mutex<bool> + Condvar`.
@@ -1331,6 +1335,13 @@ impl Drop for Db {
 }
 
 impl Db {
+    /// Whether refcount is the authoritative live-L2P-reference count (so onyx
+    /// GC reclaim can free on `rc==0` alone and skip the full-volume
+    /// `referenced_extents` reverify scan). Mirrors `Config::rc_authoritative_reclaim`.
+    pub fn rc_authoritative_reclaim(&self) -> bool {
+        self.rc_authoritative_reclaim
+    }
+
     /// Test helper: synchronously drain every L2P shard's TXG ring
     /// buffer into the on-disk tree on the caller thread. Pre-Phase-4
     /// this drove the `L2pCompactor`'s force-pass; after Step 8 the

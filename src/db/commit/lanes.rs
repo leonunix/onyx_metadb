@@ -56,10 +56,23 @@ impl Db {
         let mut mark_rc = |pba: Pba, rc_shards_touched: &mut Vec<bool>| {
             rc_shards_touched[rc_shard_of_pba(pba, num_rc_shards)] = true;
         };
+        // rc-authoritative: every applied L2P install increfs its new
+        // head_pba AND decrefs the OLD head_pba it replaced (traditional,
+        // inline, paired 1:1). The incref's pba is known here (`new_value`),
+        // but the DECREF's pba is the *previous* mapping — discovered only at
+        // apply time (`tree.get`), so the planner cannot name its rc shard.
+        // To keep the dispatch footprint a superset of every rc shard the
+        // commit will stage (a footprint/emit mismatch races the per-shard
+        // apply → underflow), blanket-claim ALL rc shards when rc_auth. This
+        // is the pre-Phase-5 behaviour (`rc_enqueued.fill(true)` on any
+        // remap); it serializes commits on the rc lanes. The inline-rc cost
+        // (this serialization + the per-LBA stages) is the explicit target of
+        // the commit-perf optimization step — correctness first.
+        let rc_auth = self.rc_authoritative_reclaim;
 
         for (idx, op) in ops.iter().enumerate() {
             match op {
-                WalOp::L2pPut { vol_ord, lba, .. } | WalOp::L2pDelete { vol_ord, lba } => {
+                WalOp::L2pPut { vol_ord, lba, .. } => {
                     let volume = volumes.get(vol_ord).ok_or_else(|| {
                         MetaDbError::Corruption(format!("L2P op for unknown volume ord {vol_ord}"))
                     })?;
@@ -68,12 +81,26 @@ impl Db {
                         .entry((*vol_ord, sid))
                         .or_default()
                         .push(L2pBucketEntry::Single(idx));
+                    // rc-authoritative incref+decref rc shards are blanket-
+                    // claimed after this loop (decref pba unknown here).
+                }
+                WalOp::L2pDelete { vol_ord, lba } => {
+                    let volume = volumes.get(vol_ord).ok_or_else(|| {
+                        MetaDbError::Corruption(format!("L2P op for unknown volume ord {vol_ord}"))
+                    })?;
+                    let sid = shard_for_key_l2p(&volume.shards, *lba);
+                    l2p_buckets
+                        .entry((*vol_ord, sid))
+                        .or_default()
+                        .push(L2pBucketEntry::Single(idx));
+                    // Delete removes a reference; the decref rides the deadlist
+                    // (record_dead in apply), NOT this commit's rc lane.
                 }
                 WalOp::L2pRemap {
                     vol_ord,
                     lba,
+                    new_value: _,
                     guard,
-                    ..
                 } => {
                     let volume = volumes.get(vol_ord).ok_or_else(|| {
                         MetaDbError::Corruption(format!(
@@ -87,10 +114,11 @@ impl Db {
                         .push(L2pBucketEntry::Single(idx));
                     // Guarded L2pRemap reads rc[guard.0] inline in
                     // `apply_l2p_bucket` (lanes/l2p.rs:~280, ~540).
-                    // Unguarded remap is rc-neutral (Phase 5).
                     if let Some((gp, _)) = guard {
                         mark_rc(*gp, &mut rc_shards_touched);
                     }
+                    // rc-authoritative incref(new)+decref(old) rc shards are
+                    // blanket-claimed after this loop (decref pba unknown here).
                 }
                 WalOp::L2pRemapRange {
                     vol_ord,
@@ -127,8 +155,8 @@ impl Db {
                             },
                         );
                     }
-                    // L2pRemapRange is always unguarded (tx.rs:250) and
-                    // rc-neutral (Phase 5). No rc shards added.
+                    // rc-authoritative incref+decref rc shards are blanket-
+                    // claimed after this loop (decref pbas unknown here).
                 }
                 WalOp::DedupPut {
                     hash,
@@ -201,6 +229,15 @@ impl Db {
             }
         }
 
+        // rc-authoritative: blanket-claim every rc shard (see the rationale
+        // at `rc_auth` above — the inline decref's pba is unknown at plan
+        // time). Off (Phase-5): the precise per-op marks above stand.
+        if rc_auth {
+            for touched in rc_shards_touched.iter_mut() {
+                *touched = true;
+            }
+        }
+
         let mut l2p_sorted: Vec<_> = l2p_buckets.into_iter().collect();
         l2p_sorted.sort_by_key(|((vol, sid), _)| (*vol, *sid));
 
@@ -236,6 +273,7 @@ impl Db {
         // touching the Db struct from the worker thread.
         let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> =
             Arc::new(self.refcount_shards.iter().map(|s| s.rc.clone()).collect());
+        let rc_authoritative = self.rc_authoritative_reclaim;
         for ((vol_ord, sid), indices) in plan.l2p_sorted {
             let volume = volumes
                 .get(&vol_ord)
@@ -257,6 +295,7 @@ impl Db {
                         apply_ops.as_slice(),
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
+                        rc_authoritative,
                     );
                     let _ = tx.send(result);
                 }),

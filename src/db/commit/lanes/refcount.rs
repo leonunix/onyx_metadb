@@ -20,12 +20,26 @@ impl Db {
         by_pba.sort_by_key(|(pba, _)| *pba);
 
         for (pba, group) in by_pba {
-            let can_coalesce_remap = group.iter().all(|action| !action.standalone_refcount)
-                && (group.iter().all(|action| action.delta > 0)
-                    || group.iter().all(|action| action.delta < 0));
+            // Net-collapse every non-standalone group — including MIXED-sign
+            // (rc-authoritative emits both incref(+1) of a new head_pba and
+            // decref(-1) of an old one, and two LBAs in the same bucket can
+            // hit the same pba with opposite signs, e.g. one LBA dedup-hits P
+            // while another overwrites away from P). Summing the net delta and
+            // staging ONCE is what keeps the freed-pba surfacing honest: a
+            // serial +1 then -1 (or -1 then +1) would transiently cross rc==0
+            // and wrongly surface a still-referenced pba as freed. Pre-Phase-5
+            // `apply_l2p_remap` collapsed per-pba net delta for exactly this
+            // reason. Standalone refcount ops (which need individual
+            // `RefcountNew` outcomes) keep the per-action serial path below.
+            let can_coalesce_remap = group.iter().all(|action| !action.standalone_refcount);
 
             if can_coalesce_remap {
                 let delta: i64 = group.iter().map(|action| action.delta).sum();
+                if delta == 0 {
+                    // Net no-op (e.g. same-pba +1/-1 cancel): do not touch rc,
+                    // do not surface — the pba's live-ref count is unchanged.
+                    continue;
+                }
                 let op_started = std::time::Instant::now();
                 let op_idxs: Vec<usize> = group.iter().map(|a| a.op_idx).collect();
                 // P0 diagnostic: trace every coalesced stage call so we can

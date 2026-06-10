@@ -202,6 +202,7 @@ impl Db {
             txg: Arc::new(crate::txg::TxgStateMachine::new(0)),
             txg_threads_enabled: cfg.txg_threads_enabled,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
+            rc_authoritative_reclaim: cfg.rc_authoritative_reclaim,
             // Phase 4 Step 7: notifiers allocated regardless; the worker
             // threads are spawned conditionally below.
             txg_quiesce_notifier: Arc::new(crate::db::txg_quiesce::QuiesceNotifier::new()),
@@ -441,6 +442,7 @@ impl Db {
                 last_applied,
                 replay_open_txg,
                 cfg.l2p_buffer_enabled,
+                cfg.rc_authoritative_reclaim,
                 from_seq,
             )?;
             lifecycle_max_seq = outcome.max_seq;
@@ -682,6 +684,7 @@ impl Db {
             txg: Arc::new(crate::txg::TxgStateMachine::new(manifest_checkpoint_txg)),
             txg_threads_enabled: cfg.txg_threads_enabled,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
+            rc_authoritative_reclaim: cfg.rc_authoritative_reclaim,
             txg_quiesce_notifier: Arc::new(crate::db::txg_quiesce::QuiesceNotifier::new()),
             txg_sync_notifier: Arc::new(crate::db::txg_sync::SyncNotifier::new()),
             txg_quiesce: Mutex::new(None),
@@ -833,6 +836,7 @@ fn replay_lifecycle_journal_into(
     starting_lsn: Lsn,
     replay_open_txg: crate::types::Txg,
     l2p_buffer_enabled: bool,
+    rc_authoritative: bool,
     from_seq: u64,
 ) -> Result<LifecycleReplayOutcome> {
     use crate::lifecycle_log::{LifecycleJournal, op as lifecycle_op};
@@ -869,6 +873,7 @@ fn replay_lifecycle_journal_into(
             lsn,
             replay_open_txg,
             l2p_buffer_enabled,
+            rc_authoritative,
             &op,
             &mut outcome,
         )?;
@@ -891,6 +896,7 @@ fn apply_lifecycle_record_replay(
     lsn: Lsn,
     replay_open_txg: crate::types::Txg,
     l2p_buffer_enabled: bool,
+    rc_authoritative: bool,
     op: &crate::lifecycle_log::LifecycleOp,
     outcome: &mut LifecycleReplayOutcome,
 ) -> Result<()> {
@@ -1112,6 +1118,7 @@ fn apply_lifecycle_record_replay(
                     *vol_ord,
                     &captured,
                     &snap_lookup(*vol_ord),
+                    rc_authoritative,
                 )?;
             }
         }

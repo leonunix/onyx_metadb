@@ -369,6 +369,19 @@ pub struct Config {
     /// fallback). Mirrors the already-parallel refcount `begin_checkpoint`.
     pub parallel_l2p_drain_enabled: bool,
 
+    /// Make PBA refcount the AUTHORITATIVE count of live L2P references
+    /// (every L2P remap increfs its new head_pba; a packed N-LBA unit → +N),
+    /// so onyx GC reclaim becomes a pure `rc==0` check and the full-volume
+    /// `referenced_extents` reverify scan (which held `tree.read()` across the
+    /// whole volume and stalled the TXG fold/checkpoint → multi-second commit
+    /// spikes) is eliminated. Decrements ride the existing lineage deadlist;
+    /// the increfs ride the existing off-gate refcount drainer. Default
+    /// `false` (Phase-5 rc-neutral behaviour). ⚠ Turning this on requires a
+    /// FRESH metadb: an existing store has `rc==0` for all exclusive PBAs,
+    /// which the authoritative reader would mass-premature-free — `Db::open`
+    /// REFUSES a pre-`RC_AUTHORITATIVE` manifest when this is set.
+    pub rc_authoritative_reclaim: bool,
+
     /// `txg_timeout_ms` mirrors ZFS `zfs_txg_timeout` (default 5 s) —
     /// the quiesce thread rolls a TXG at least this often even with
     /// no force_roll signal. Ignored when `txg_threads_enabled = false`.
@@ -695,6 +708,7 @@ impl Config {
             // pinning + the drain wasn't the healthy-window gate). Kept behind
             // the flag as a documented dead-end. See memory parallel_l2p_drain_impl.
             parallel_l2p_drain_enabled: false,
+            rc_authoritative_reclaim: false,
             txg_timeout_ms: 5_000,
             // Streaming writeback ships default-off in this generic
             // `Config::new` so unit tests that assert on page-allocator

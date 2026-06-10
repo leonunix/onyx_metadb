@@ -1,6 +1,72 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+/// rc-authoritative install (lane path): push incref(new head_pba) +
+/// decref(old head_pba) as paired `RcApplyAction`s. The lane path only runs
+/// for snapshot-free volumes — snapshot-bearing volumes route to the serial
+/// `apply_l2p_remap`, which performs the snap-pin decref suppression — so the
+/// decref is unconditional here. Net-collapsed per-pba in
+/// `apply_refcount_bucket_to_tree`; the decref carries
+/// `remap_freed_candidate` so a net `rc==0` surfaces `freed_pba` (consumed by
+/// onyx's writer cleanup → retire → GcRunner `rc==0` reclaim). A `prev` with
+/// the FLAG_ZERO placeholder bit is not a real mapping → no decref (mirrors
+/// `record_dead`).
+///
+/// `surface`: whether the outcome can carry a freed pba — `true` for
+/// `L2pRemap`/`L2pRemapRange` (the `apply_ops_laned` merger writes `freed_pba`
+/// / `freed_pbas`), `false` for `L2pPut` whose `L2pPrev` outcome has no freed
+/// slot (surfacing it would hit the merge's `unreachable!`). When `false` the
+/// rc is still decref'd correctly; the freed pba is just not surfaced here and
+/// is reclaimed by onyx's GC paths (rc stays authoritative either way).
+#[inline]
+fn push_rc_install(
+    rc_actions: &mut Vec<RcApplyAction>,
+    op_idx: usize,
+    new_value: L2pValue,
+    prev: Option<L2pValue>,
+    range_op: bool,
+    surface: bool,
+) {
+    rc_actions.push(RcApplyAction {
+        op_idx,
+        pba: new_value.head_pba(),
+        delta: 1,
+        standalone_refcount: false,
+        remap_freed_candidate: false,
+        range_op,
+    });
+    if let Some(old) = prev.filter(|p| p.0[27] & 0x02 == 0) {
+        rc_actions.push(RcApplyAction {
+            op_idx,
+            pba: old.head_pba(),
+            delta: -1,
+            standalone_refcount: false,
+            remap_freed_candidate: surface,
+            range_op,
+        });
+    }
+}
+
+/// rc-authoritative delete (lane path): decref(old head_pba) only — a delete
+/// installs no new reference. `remap_freed_candidate` is false: the
+/// `L2pDelete` outcome (`L2pPrev`) has no `freed_pba` slot, so a delete that
+/// drives rc to 0 is retired by onyx's discard / GC-compactor path rather
+/// than surfaced here (rc stays correct either way; GcRunner's `rc==0` Gate-1
+/// gates the actual free).
+#[inline]
+fn push_rc_delete(rc_actions: &mut Vec<RcApplyAction>, op_idx: usize, prev: Option<L2pValue>) {
+    if let Some(old) = prev.filter(|p| p.0[27] & 0x02 == 0) {
+        rc_actions.push(RcApplyAction {
+            op_idx,
+            pba: old.head_pba(),
+            delta: -1,
+            standalone_refcount: false,
+            remap_freed_candidate: false,
+            range_op: false,
+        });
+    }
+}
+
 impl Db {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::db::commit) fn apply_l2p_bucket(
@@ -12,9 +78,15 @@ impl Db {
         ops: &[WalOp],
         refcount_shards: &[Arc<crate::refcount::RcShard>],
         metrics: &MetaMetrics,
+        // rc-authoritative: when true, every applied L2P-value install
+        // (Put/Remap/RemapRange) pushes a +1 `RcApplyAction` for its new
+        // head_pba so refcount counts live L2P references. Must mirror the
+        // planner footprint in `build_lane_dispatch_plan`. Default-off path
+        // (Phase-5) emits nothing — `rc_actions` stays empty.
+        rc_authoritative: bool,
     ) -> Result<L2pBucketApplyResult> {
         let mut outcomes = Vec::with_capacity(indices.len());
-        let rc_actions = Vec::new();
+        let mut rc_actions = Vec::new();
         let shard = &volume.shards[sid];
         if shard.use_buffer {
             return Self::apply_l2p_bucket_buffer(
@@ -26,6 +98,7 @@ impl Db {
                 ops,
                 refcount_shards,
                 metrics,
+                rc_authoritative,
             );
         }
         let tree_lock_started = std::time::Instant::now();
@@ -190,13 +263,17 @@ impl Db {
                     continue;
                 }
                 let prev_values = tree.insert_leaf_run_at_lsn_deferred_finish(&entries, lsn)?;
-                for ((batch_i, (_lba, _new_value)), prev) in accepted_batch_idx
+                for ((batch_i, (_lba, new_value)), prev) in accepted_batch_idx
                     .into_iter()
                     .zip(entries.into_iter())
                     .zip(prev_values.into_iter())
                 {
                     let b = &batch_lbas[batch_i];
-                    super::apply::record_dead(&volume, prev, lsn);
+                    if rc_authoritative {
+                        push_rc_install(&mut rc_actions, b.op_idx, new_value, prev, b.range_offset.is_some(), true);
+                    } else {
+                        super::apply::record_dead(&volume, prev, lsn);
+                    }
                     match b.range_offset {
                         Some(off) => {
                             l2p_remap_range_lba_count += 1;
@@ -255,12 +332,23 @@ impl Db {
                             continue;
                         }
                         let prev = tree.insert_at_lsn_deferred_finish(*lba, *value, lsn)?;
-                        super::apply::record_dead(&volume, prev, lsn);
+                        if rc_authoritative {
+                            push_rc_install(&mut rc_actions, idx, *value, prev, false, false);
+                        } else {
+                            super::apply::record_dead(&volume, prev, lsn);
+                        }
                         l2p_put_count += 1;
                         ApplyOutcome::L2pPrev(prev)
                     }
                     WalOp::L2pDelete { lba, .. } => {
                         let prev = tree.delete_at_lsn_deferred_finish(*lba, lsn)?;
+                        // rc-authoritative: decref the deleted reference's PBA
+                        // inline (paired with the increfs at install). Phase-5
+                        // (flag off): no rc movement; the deleted PBA's reclaim
+                        // rode the now-removed reverify scan.
+                        if rc_authoritative {
+                            push_rc_delete(&mut rc_actions, idx, prev);
+                        }
                         l2p_delete_count += 1;
                         ApplyOutcome::L2pPrev(prev)
                     }
@@ -308,7 +396,14 @@ impl Db {
                             continue;
                         }
                         let prev = tree.insert_at_lsn_deferred_finish(*lba, *new_value, lsn)?;
-                        super::apply::record_dead(&volume, prev, lsn);
+                        // rc-authoritative: incref(new) + decref(old), paired
+                        // (guarded dedup-hit included — its L2P-pointer edge is
+                        // independent of the DedupPut membership edge).
+                        if rc_authoritative {
+                            push_rc_install(&mut rc_actions, idx, *new_value, prev, false, true);
+                        } else {
+                            super::apply::record_dead(&volume, prev, lsn);
+                        }
                         l2p_remap_count += 1;
                         ApplyOutcome::L2pRemap {
                             applied: true,
@@ -435,11 +530,13 @@ impl Db {
         ops: &[WalOp],
         refcount_shards: &[Arc<crate::refcount::RcShard>],
         metrics: &MetaMetrics,
+        // See `apply_l2p_bucket`: rc-authoritative emits +1 per applied install.
+        rc_authoritative: bool,
     ) -> Result<L2pBucketApplyResult> {
         use super::l2p_buffer::BufferLookup;
         let shard = &volume.shards[sid];
         let mut outcomes = Vec::with_capacity(indices.len());
-        let rc_actions = Vec::new();
+        let mut rc_actions = Vec::new();
         // Per-LBA `cur` reads consult [`shard.l2p_buffer`] first and fall
         // through to a freshly-loaded `shard.read_view` on Absent. Re-fetch
         // per fallthrough — capturing the read view once at function entry
@@ -493,7 +590,13 @@ impl Db {
                             continue;
                         }
                         shard.l2p_buffer.insert_at_txg(txg, lba, new_value, lsn);
-                        super::apply::record_dead(&volume, cur, lsn);
+                        // rc-authoritative: incref(new) + decref(old), paired
+                        // (range_op so a net rc==0 surfaces into L2pRemapRange).
+                        if rc_authoritative {
+                            push_rc_install(&mut rc_actions, *op_idx, new_value, cur, true, true);
+                        } else {
+                            super::apply::record_dead(&volume, cur, lsn);
+                        }
                         l2p_remap_range_lba_count += 1;
                         applied_bits[off as usize] = true;
                         prevs_box[off as usize] = cur;
@@ -526,7 +629,11 @@ impl Db {
                             continue;
                         }
                         shard.l2p_buffer.insert_at_txg(txg, *lba, *value, lsn);
-                        super::apply::record_dead(&volume, cur, lsn);
+                        if rc_authoritative {
+                            push_rc_install(&mut rc_actions, idx, *value, cur, false, false);
+                        } else {
+                            super::apply::record_dead(&volume, cur, lsn);
+                        }
                         l2p_put_count += 1;
                         ApplyOutcome::L2pPrev(cur)
                     }
@@ -537,6 +644,11 @@ impl Db {
                             BufferLookup::Absent => load_view().get(*lba)?,
                         };
                         shard.l2p_buffer.insert_tombstone_at_txg(txg, *lba, lsn);
+                        // rc-authoritative: decref the deleted reference inline
+                        // (see tree path). Phase-5 (flag off): no rc movement.
+                        if rc_authoritative {
+                            push_rc_delete(&mut rc_actions, idx, cur);
+                        }
                         l2p_delete_count += 1;
                         ApplyOutcome::L2pPrev(cur)
                     }
@@ -585,7 +697,13 @@ impl Db {
                             continue;
                         }
                         shard.l2p_buffer.insert_at_txg(txg, *lba, *new_value, lsn);
-                        super::apply::record_dead(&volume, cur, lsn);
+                        // rc-authoritative: incref(new) + decref(old), paired
+                        // (guarded dedup-hit included).
+                        if rc_authoritative {
+                            push_rc_install(&mut rc_actions, idx, *new_value, cur, false, true);
+                        } else {
+                            super::apply::record_dead(&volume, cur, lsn);
+                        }
                         l2p_remap_count += 1;
                         ApplyOutcome::L2pRemap {
                             applied: true,
