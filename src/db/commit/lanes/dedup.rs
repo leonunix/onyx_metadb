@@ -9,6 +9,7 @@ impl Db {
         ops: &[WalOp],
         indices: Vec<usize>,
         lsn: Lsn,
+        txg: crate::types::Txg,
     ) -> Result<Vec<(usize, ApplyOutcome)>> {
         let batch_started = std::time::Instant::now();
         let mut outcomes = Vec::with_capacity(indices.len());
@@ -27,7 +28,7 @@ impl Db {
         };
         let stage_rc = |pba: Pba, delta: i64| -> Result<()> {
             let sid = rc_shard_for(pba);
-            refcount_shards[sid].stage(pba, delta, lsn)?;
+            refcount_shards[sid].stage(txg, pba, delta, lsn)?;
             Ok(())
         };
         // Phase 5 stale-entry tolerance: a dedup_index row can point to
@@ -41,7 +42,7 @@ impl Db {
         let stage_rc_decref_if_live = |pba: Pba| -> Result<()> {
             let sid = rc_shard_for(pba);
             if refcount_shards[sid].get(pba)? > 0 {
-                refcount_shards[sid].stage(pba, -1, lsn)?;
+                refcount_shards[sid].stage(txg, pba, -1, lsn)?;
             }
             Ok(())
         };

@@ -123,6 +123,7 @@ pub(super) fn apply_op_bare(
                 let snap_infos = snap_info_for_vol(*vol_ord);
                 stage_remap_rc(
                     refcount_shards,
+                    txg,
                     &tree,
                     sid,
                     *lba,
@@ -163,7 +164,7 @@ pub(super) fn apply_op_bare(
             // (flag off): dead-list + lineage GC drives reclaim.
             if rc_authoritative {
                 let snap_infos = snap_info_for_vol(*vol_ord);
-                stage_delete_rc(refcount_shards, &tree, sid, *lba, prev, &snap_infos, lsn)?;
+                stage_delete_rc(refcount_shards, txg, &tree, sid, *lba, prev, &snap_infos, lsn)?;
             }
             Ok(ApplyOutcome::L2pPrev(prev))
         }
@@ -187,7 +188,15 @@ pub(super) fn apply_op_bare(
             value,
             old_pba,
         } => {
-            apply_dedup_put_with_rc(dedup_index, refcount_shards, lsn, *hash, *value, *old_pba)?;
+            apply_dedup_put_with_rc(
+                dedup_index,
+                refcount_shards,
+                lsn,
+                txg,
+                *hash,
+                *value,
+                *old_pba,
+            )?;
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupPutGuarded {
@@ -203,6 +212,7 @@ pub(super) fn apply_op_bare(
                     dedup_index,
                     refcount_shards,
                     lsn,
+                    txg,
                     *hash,
                     *value,
                     *old_pba,
@@ -211,7 +221,7 @@ pub(super) fn apply_op_bare(
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupDelete { hash, old_pba } => {
-            apply_dedup_delete_with_rc(dedup_index, refcount_shards, lsn, hash, *old_pba)?;
+            apply_dedup_delete_with_rc(dedup_index, refcount_shards, lsn, txg, hash, *old_pba)?;
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupCompareDelete { hash, old_value } => {
@@ -226,6 +236,7 @@ pub(super) fn apply_op_bare(
                     dedup_index,
                     refcount_shards,
                     lsn,
+                    txg,
                     hash,
                     Some(old_value.head_pba()),
                 )?;
@@ -244,6 +255,7 @@ pub(super) fn apply_op_bare(
                     dedup_index,
                     refcount_shards,
                     lsn,
+                    txg,
                     *hash,
                     *new_value,
                     Some(old_value.head_pba()),

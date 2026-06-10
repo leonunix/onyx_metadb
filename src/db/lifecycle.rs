@@ -90,26 +90,6 @@ struct DeadListSegmentPlan {
     old_tail: PageId,
 }
 
-/// Drop guard installed at the top of `Db::flush_with_gate`. Every
-/// per-shard `RcShard::begin_checkpoint` preempts that shard's
-/// priority-3 drainer thread; the drainer is left parked and must be
-/// resumed before the flush returns. We park-everywhere / resume-once
-/// using a guard so every error-return path in flush_with_gate
-/// resumes correctly without each `return Err(...)` having to call
-/// `resume_drainer` explicitly. `resume_drainer` is idempotent — no-op
-/// on shards where the drainer wasn't preempted (or isn't attached).
-struct RcDrainerResumeGuard<'a> {
-    shards: &'a [super::Shard],
-}
-
-impl Drop for RcDrainerResumeGuard<'_> {
-    fn drop(&mut self) {
-        for shard in self.shards {
-            shard.rc.resume_drainer();
-        }
-    }
-}
-
 /// RAII counterpart for the async dedup-index drainers: the flush
 /// checkpoint barrier preempts them + final-drains staging, and this
 /// guard re-arms them on every flush exit path. `resume_drainers` is

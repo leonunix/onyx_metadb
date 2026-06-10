@@ -695,6 +695,7 @@ impl Db {
                 volumes_map,
                 &self.refcount_shards,
                 lsn,
+                txg_guard.txg(),
                 vol_ord,
                 chunk_captured,
                 &snap_lookup(vol_ord),

@@ -1065,3 +1065,99 @@ fn l2p_remap_range_stale_seq_per_lba_rejection() {
     assert_eq!(applied[2], true);
     assert_eq!(applied[3], true);
 }
+
+// ---- TXG-slot rc fold: checkpoint + reopen alignment (the perf/recovery fix) ----
+
+fn rc_auth_cfg(dir: &std::path::Path, txg_threads: bool) -> Config {
+    let mut cfg = Config::new(dir);
+    cfg.l2p_buffer_enabled = true;
+    cfg.rc_authoritative_reclaim = true;
+    cfg.txg_threads_enabled = txg_threads;
+    cfg
+}
+
+/// With the threads-ON per-TXG sync driving the fold, the rc fold folds only
+/// the frozen Syncing slot per cycle. A sequence of overwrite commits, each
+/// flushed (rolling/syncing TXGs), must keep rc EXACT — the cross-TXG
+/// incref(new)/decref(old) pair lands across distinct ring slots that fold
+/// independently. `checkpoint_lsn` monotonicity is asserted; its absolute
+/// advance under threads-on is timing-driven (the latest commit can sit in the
+/// Open slot until it rolls), so threads-OFF checkpoint advance is covered
+/// separately by `checkpoint_advances_on_flush`.
+#[test]
+fn rc_authoritative_txg_threads_rc_exact_across_checkpoints() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::create_with_config(rc_auth_cfg(dir.path(), true)).unwrap();
+
+    let mut prev_ckpt = db.manifest().checkpoint_lsn;
+    for g in 1u64..=6 {
+        let new_pba = 100 + g;
+        let old_pba = 100 + g - 1;
+        let mut tx = db.begin();
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(new_pba, g as u8), None);
+        tx.commit_with_outcomes().unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get_refcount(new_pba).unwrap(), 1, "gen {g}: new rc==1");
+        if g > 1 {
+            assert_eq!(db.get_refcount(old_pba).unwrap(), 0, "gen {g}: old rc==0");
+        }
+        let ckpt = db.manifest().checkpoint_lsn;
+        assert!(
+            ckpt >= prev_ckpt,
+            "checkpoint_lsn must not regress: {ckpt} < {prev_ckpt}"
+        );
+        prev_ckpt = ckpt;
+    }
+    // Final state: exactly one live reference (the last pba); all earlier ones
+    // decref'd to 0 across their respective TXG-slot folds.
+    assert_eq!(db.get_refcount(106).unwrap(), 1);
+    for old in 100u64..=105 {
+        assert_eq!(db.get_refcount(old).unwrap(), 0, "pba {old} fully decref'd");
+    }
+}
+
+/// Checkpoint → durable → reopen preserves rc. metadb has no data-plane WAL,
+/// so after a `flush()` checkpoint the rc must be durable in the array; a
+/// reopen (which only replays the lifecycle journal, not commit_ops) must see
+/// the checkpointed rc unchanged. Exercises the slot-fold → page write →
+/// manifest commit → reopen path for both threads-on and threads-off.
+#[test]
+fn rc_authoritative_checkpoint_then_reopen_preserves_rc() {
+    for txg_threads in [false, true] {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Db::create_with_config(rc_auth_cfg(dir.path(), txg_threads)).unwrap();
+            // Two distinct live references + one overwrite that frees a pba.
+            let mut tx = db.begin();
+            tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(500, 1), None);
+            tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 11, remap_val(501, 1), None);
+            tx.commit_with_outcomes().unwrap();
+            db.flush().unwrap();
+            // Overwrite LBA 10 → 500 freed, 600 live.
+            let mut tx = db.begin();
+            tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(600, 2), None);
+            tx.commit_with_outcomes().unwrap();
+            db.flush().unwrap();
+            assert_eq!(db.get_refcount(500).unwrap(), 0, "pre-reopen: 500 freed");
+            assert_eq!(db.get_refcount(501).unwrap(), 1, "pre-reopen: 501 live");
+            assert_eq!(db.get_refcount(600).unwrap(), 1, "pre-reopen: 600 live");
+        }
+        // Reopen: rc must survive the checkpoint durably (no commit replay).
+        let db = Db::open_with_config(rc_auth_cfg(dir.path(), txg_threads)).unwrap();
+        assert_eq!(
+            db.get_refcount(500).unwrap(),
+            0,
+            "txg_threads={txg_threads}: freed pba stays 0 across reopen"
+        );
+        assert_eq!(
+            db.get_refcount(501).unwrap(),
+            1,
+            "txg_threads={txg_threads}: live pba 501 survives reopen"
+        );
+        assert_eq!(
+            db.get_refcount(600).unwrap(),
+            1,
+            "txg_threads={txg_threads}: live pba 600 survives reopen"
+        );
+    }
+}

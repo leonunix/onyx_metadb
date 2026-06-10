@@ -16,6 +16,7 @@ pub(in crate::db) fn apply_promotion_chunk(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     lsn: Lsn,
+    txg: crate::types::Txg,
     vol_ord: VolumeOrdinal,
     pba_increfs: &[Pba],
     next_cursor: Option<crate::types::Lba>,
@@ -26,7 +27,7 @@ pub(in crate::db) fn apply_promotion_chunk(
     let mut applied = 0usize;
     for &pba in pba_increfs {
         let sid = shard_for_key(refcount_shards, pba);
-        refcount_shards[sid].rc.stage(pba, 1, lsn)?;
+        refcount_shards[sid].rc.stage(txg, pba, 1, lsn)?;
         applied += 1;
     }
     *volume.promotion_cursor.write() = next_cursor;

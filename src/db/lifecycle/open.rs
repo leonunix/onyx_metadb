@@ -117,7 +117,6 @@ impl Db {
         volumes.insert(BOOTSTRAP_VOLUME_ORD, volume_zero);
 
         let drainer_cfg = cfg.clone();
-        let page_store_for_drainers = page_store.clone();
         let metrics_for_drainers = metrics.clone();
         let page_store_for_writeback = page_store.clone();
         let metrics_for_writeback = metrics.clone();
@@ -213,18 +212,8 @@ impl Db {
             lifecycle_applied_watermark: AtomicU64::new(0),
             lifecycle_journal,
         };
-        // Spawn refcount drainers (priority 3) — fresh DB has no
-        // replay to worry about, so we can spawn unconditionally
-        // after construction. No-op when
-        // `cfg.refcount_drainer_enabled = false`.
-        for (idx, shard) in db.refcount_shards.iter().enumerate() {
-            shard.rc.attach_drainer(
-                page_store_for_drainers.clone(),
-                &drainer_cfg,
-                metrics_for_drainers.clone(),
-                idx,
-            );
-        }
+        // The refcount fold is inline + per-TXG-slot (no background rc
+        // drainer to spawn — see `refcount::shard`).
         // Spawn the async dedup-index drainers (no-op when
         // `dedup_drainer_enabled = false`). Fresh DB → no replay.
         db.dedup_index
@@ -596,7 +585,6 @@ impl Db {
         let manifest_dedup_shards = manifest.dedup_shards as usize;
         let manifest_checkpoint_txg = manifest.checkpoint_txg;
         let drainer_cfg = cfg.clone();
-        let page_store_for_drainers = page_store.clone();
         let metrics_for_drainers = metrics.clone();
         let page_store_for_writeback = page_store.clone();
         let metrics_for_writeback = metrics.clone();
@@ -715,19 +703,11 @@ impl Db {
         // even on a clean open with no commits yet.
         db.txg.record_lsn(db.txg.open_txg(), last_applied);
         db.recompute_all_snap_infos();
-        // Spawn refcount drainers AFTER WAL replay finished above so
-        // the drainer never observes mid-replay state.
-        for (idx, shard) in db.refcount_shards.iter().enumerate() {
-            shard.rc.attach_drainer(
-                page_store_for_drainers.clone(),
-                &drainer_cfg,
-                metrics_for_drainers.clone(),
-                idx,
-            );
-        }
+        // The refcount fold is inline + per-TXG-slot (no background rc
+        // drainer — see `refcount::shard`).
         // Spawn the async dedup-index drainers AFTER replay (so they
-        // never observe mid-replay state), mirroring the rc drainers.
-        // No-op when `dedup_drainer_enabled = false`.
+        // never observe mid-replay state). No-op when
+        // `dedup_drainer_enabled = false`.
         db.dedup_index
             .attach_drainers(&drainer_cfg, metrics_for_drainers.clone());
         // Spawn the L2P streaming writeback worker. Same as create:
@@ -1065,6 +1045,7 @@ fn apply_lifecycle_record_replay(
                 volumes,
                 refcount_shards,
                 lsn,
+                replay_open_txg,
                 *vol_ord,
                 pba_increfs,
                 *next_cursor,
@@ -1115,6 +1096,7 @@ fn apply_lifecycle_record_replay(
                     volumes,
                     refcount_shards,
                     lsn,
+                    replay_open_txg,
                     *vol_ord,
                     &captured,
                     &snap_lookup(*vol_ord),

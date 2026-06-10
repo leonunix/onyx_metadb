@@ -6,6 +6,7 @@ impl Db {
         metrics: Arc<MetaMetrics>,
         mut actions: Vec<RcApplyAction>,
         lsn: Lsn,
+        txg: crate::types::Txg,
     ) -> Result<RcBucketApplyResult> {
         let mut result = RcBucketApplyResult::default();
         if actions.is_empty() {
@@ -54,7 +55,7 @@ impl Db {
                     lsn,
                     "apply_refcount_bucket_to_tree: coalesced stage entry"
                 );
-                let (pre, new) = match rc.stage(pba, delta, lsn) {
+                let (pre, new) = match rc.stage(txg, pba, delta, lsn) {
                     Ok(r) => r,
                     Err(err) => {
                         tracing::error!(
@@ -96,7 +97,7 @@ impl Db {
 
             for action in group {
                 let op_started = std::time::Instant::now();
-                let (pre, new) = match rc.stage(action.pba, action.delta, lsn) {
+                let (pre, new) = match rc.stage(txg, action.pba, action.delta, lsn) {
                     Ok(r) => r,
                     Err(err) => {
                         tracing::error!(

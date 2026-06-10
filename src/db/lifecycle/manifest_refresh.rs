@@ -173,6 +173,10 @@ pub(in crate::db::lifecycle) fn refresh_manifest_durable_seq(
     }
     for (s_idx, shard) in refcount_shards.iter().enumerate() {
         let prev = shard.last_flushed_lsn.load(Ordering::Acquire);
+        // The per-TXG-slot rc fold makes a selected rc shard durable to
+        // `wal_checkpoint` (like a non-buffered L2P shard), so no buffer-term
+        // cap is needed — matches `compute_min_last_flushed_lsn_after` so the
+        // `min(durable_seq[]) == checkpoint_lsn` invariant holds.
         let lsn = if selected.rc[s_idx] {
             wal_checkpoint.max(prev)
         } else {

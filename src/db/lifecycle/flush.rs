@@ -398,21 +398,10 @@ impl Db {
         self.metrics
             .record_flush_gate_wait(std::time::Duration::ZERO);
 
-        // RAII guard: every refcount shard's `begin_checkpoint` below
-        // preempts that shard's drainer (priority-3 drainer-mode). The
-        // drainer is left parked and must be resumed before flush
-        // returns — otherwise `delta_active` accumulates indefinitely
-        // across flushes, eventually amplifying into stalls and (after
-        // the prior backpressure-fallback bug was fixed) just slow
-        // commits. The guard runs on every exit path (success and
-        // every `return Err(...)` below) because Rust's `Drop` fires
-        // at scope end. `resume_drainer` is idempotent — safe to call
-        // even on shards whose `begin_checkpoint` failed before
-        // preempting (sample_err mid-loop) or wasn't running a
-        // drainer at all.
-        let _drainer_resume_guard = RcDrainerResumeGuard {
-            shards: &self.refcount_shards,
-        };
+        // The refcount fold is now inline + per-TXG-slot (no background rc
+        // drainer to preempt/resume — see `refcount::shard`), so no RAII
+        // resume guard is needed here. The dedup-index drainer below still
+        // has its own.
 
         // Dedup checkpoint barrier: preempt the async dedup drainers and
         // synchronously final-drain all staged cuckoo mutations BEFORE
@@ -572,13 +561,25 @@ impl Db {
         // shards; unselected slots remain `None`. Failure handling
         // preserves the "first error wins, the rest are individually
         // aborted" semantics from the pre-partial code.
+        // TXG-slot fold: threads-ON folds ONLY this sync's frozen Syncing
+        // slot (`begin_checkpoint(txg, wal_checkpoint)`), so rc durability
+        // is keyed to the same per-TXG `checkpoint_lsn` prefix as L2P's
+        // `drain_syncing_slot_into_trees`. threads-OFF (inline flush is the
+        // sole drainer) folds every slot, mirroring `force_compact_l2p_buffers`.
+        let txg_threads_enabled = self.txg_threads_enabled;
         let rc_drain_started = std::time::Instant::now();
         let rc_results: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> =
             std::thread::scope(|scope| {
                 let mut handles: Vec<(usize, std::thread::ScopedJoinHandle<_>)> = Vec::new();
                 for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
                     if selected.rc[s_idx] {
-                        let h = scope.spawn(move || shard.rc.begin_checkpoint());
+                        let h = scope.spawn(move || {
+                            if txg_threads_enabled {
+                                shard.rc.begin_checkpoint(txg)
+                            } else {
+                                shard.rc.begin_checkpoint_all_slots()
+                            }
+                        });
                         handles.push((s_idx, h));
                     }
                 }
@@ -1436,6 +1437,10 @@ impl Db {
             if candidate < min_lsn {
                 min_lsn = candidate;
             }
+            // No rc buffer-term: the per-TXG-slot fold makes a selected rc
+            // shard durable to `wal_checkpoint` (and an unselected one stays
+            // at `prev`), exactly like a non-buffered L2P shard — so
+            // `candidate` already bounds rc correctly. See `refcount::shard`.
         }
         if min_lsn == Lsn::MAX { 0 } else { min_lsn }
     }

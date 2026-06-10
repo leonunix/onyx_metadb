@@ -197,7 +197,8 @@ impl Db {
             refcount_shards[sid].apply_lane.enqueue_ready(
                 lsn,
                 Box::new(move || {
-                    let result = Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn);
+                    let result =
+                        Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn, txg);
                     let _ = tx.send(result);
                 }),
             );
@@ -253,6 +254,7 @@ impl Db {
             ops.as_slice(),
             dedup_idxs,
             lsn,
+            txg,
         )? {
             outcomes[idx] = Some(outcome);
         }
@@ -369,6 +371,7 @@ impl Db {
                 metrics.clone(),
                 actions,
                 lsn,
+                txg,
             )?;
             for (idx, new) in result.refcount_outcomes {
                 outcomes[idx] = Some(ApplyOutcome::RefcountNew(new));
@@ -398,6 +401,7 @@ impl Db {
             ops,
             dedup_idxs,
             lsn,
+            txg,
         )? {
             outcomes[idx] = Some(outcome);
         }

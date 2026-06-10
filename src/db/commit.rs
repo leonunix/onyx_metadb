@@ -132,6 +132,15 @@ struct LaneDispatchPlan {
 
 struct QueuedLanePlan {
     ops: Arc<Vec<WalOp>>,
+    /// TXG this commit is stamped to. Threaded into the rc/dedup apply
+    /// closures so `rc.stage(txg, …)` lands the derived refcount delta in
+    /// the same TXG ring slot as the commit's L2P buffer insert — the
+    /// refcount fold must be keyed to the same `checkpoint_lsn` prefix as
+    /// L2P or onyx's replay re-derivation double-counts (see
+    /// `refcount::shard`). The commit thread holds its `TxgGuard` across
+    /// `apply_ops_laned` (it awaits every rc/dedup receiver), so the slot
+    /// cannot roll to Syncing while these stages run.
+    txg: crate::types::Txg,
     l2p_receivers: Vec<crossbeam_channel::Receiver<Result<L2pBucketApplyResult>>>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
     /// Per-shard dedup op indices. Drained into the per-shard apply
@@ -1180,7 +1189,7 @@ impl Db {
 
         let _apply_guard = self.acquire_commit_apply_gate(lsn);
         let _active = self.enter_active_apply(lsn);
-        let outcome = apply_free_pbas(&self.refcount_shards, lsn, pbas)?;
+        let outcome = apply_free_pbas(&self.refcount_shards, lsn, _txg_guard.txg(), pbas)?;
         self.finish_global_apply(lsn)?;
         self.advance_dispatch_lsn(lsn);
         Ok(outcome)

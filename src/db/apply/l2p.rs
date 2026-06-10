@@ -203,6 +203,7 @@ pub(in crate::db) fn apply_l2p_remap(
     if rc_authoritative {
         freed_pba = stage_remap_rc(
             refcount_shards,
+            txg,
             &tree,
             l2p_sid,
             lba,
@@ -239,6 +240,7 @@ pub(in crate::db) fn apply_l2p_remap(
 /// `Some(pba)` iff a pba's net rc reached 0.
 fn stage_rc_net(
     refcount_shards: &[Shard],
+    txg: crate::types::Txg,
     new_value: L2pValue,
     prev: Option<L2pValue>,
     snap_pins_old: bool,
@@ -268,7 +270,7 @@ fn stage_rc_net(
     touched.sort_by_key(|(sid, _, _)| *sid);
     let mut freed_pba = None;
     for (sid, pba, delta) in touched {
-        let (pre, new) = refcount_shards[sid].rc.stage(pba, delta, lsn)?;
+        let (pre, new) = refcount_shards[sid].rc.stage(txg, pba, delta, lsn)?;
         if new == 0 && pre > 0 {
             freed_pba = Some(pba);
         }
@@ -285,6 +287,7 @@ fn stage_rc_net(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::db) fn stage_remap_rc(
     refcount_shards: &[Shard],
+    txg: crate::types::Txg,
     tree: &PagedL2p,
     snap_sid: usize,
     lba: Lba,
@@ -308,7 +311,15 @@ pub(in crate::db) fn stage_remap_rc(
     } else {
         any_snap_pins(snap_infos, snap_sid, tree, lba, new_value, new_value.birth_lsn())?
     };
-    stage_rc_net(refcount_shards, new_value, prev, snap_pins_old, snap_pins_new, lsn)
+    stage_rc_net(
+        refcount_shards,
+        txg,
+        new_value,
+        prev,
+        snap_pins_old,
+        snap_pins_new,
+        lsn,
+    )
 }
 
 /// rc-authoritative inline decref for a deleted reference (`L2pDelete` /
@@ -319,6 +330,7 @@ pub(in crate::db) fn stage_remap_rc(
 /// `None` contribute nothing.
 pub(in crate::db) fn stage_delete_rc(
     refcount_shards: &[Shard],
+    txg: crate::types::Txg,
     tree: &PagedL2p,
     snap_sid: usize,
     lba: Lba,
@@ -338,7 +350,9 @@ pub(in crate::db) fn stage_delete_rc(
         return Ok(None);
     }
     let rsid = shard_for_key(refcount_shards, old.head_pba());
-    let (pre, new) = refcount_shards[rsid].rc.stage(old.head_pba(), -1, lsn)?;
+    let (pre, new) = refcount_shards[rsid]
+        .rc
+        .stage(txg, old.head_pba(), -1, lsn)?;
     Ok(if new == 0 && pre > 0 {
         Some(old.head_pba())
     } else {
@@ -451,7 +465,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
                 shard.l2p_buffer.insert_at_txg(txg, lba, new_value, lsn);
                 if rc_authoritative {
                     if let Some(f) =
-                        stage_rc_net(refcount_shards, new_value, cur, false, false, lsn)?
+                        stage_rc_net(refcount_shards, txg, new_value, cur, false, false, lsn)?
                     {
                         freed_pbas.push(f);
                     }
@@ -497,6 +511,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
             if rc_authoritative {
                 if let Some(f) = stage_remap_rc(
                     refcount_shards,
+                    txg,
                     &tree,
                     l2p_sid,
                     lba,
@@ -576,6 +591,7 @@ pub(in crate::db) fn apply_l2p_range_delete(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     lsn: Lsn,
+    txg: crate::types::Txg,
     vol_ord: VolumeOrdinal,
     captured: &[(Lba, L2pValue)],
     snap_infos: &[SnapInfo],
@@ -606,7 +622,7 @@ pub(in crate::db) fn apply_l2p_range_delete(
             let prev = tree.delete_at_lsn(lba, lsn)?;
             if rc_authoritative {
                 if let Some(f) =
-                    stage_delete_rc(refcount_shards, &tree, sid, lba, prev, snap_infos, lsn)?
+                    stage_delete_rc(refcount_shards, txg, &tree, sid, lba, prev, snap_infos, lsn)?
                 {
                     freed_pbas.push(f);
                 }

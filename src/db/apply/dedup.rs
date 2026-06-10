@@ -26,6 +26,7 @@ pub(in crate::db) fn apply_dedup_put_with_rc(
     dedup_index: &crate::dedup::DedupIndex,
     refcount_shards: &[Shard],
     lsn: Lsn,
+    txg: crate::types::Txg,
     hash: Hash8,
     value: DedupValue,
     old_pba: Option<Pba>,
@@ -47,11 +48,11 @@ pub(in crate::db) fn apply_dedup_put_with_rc(
             // — the entry never represented a live shared reference
             // by the time we got here.
             if refcount_shards[sid].rc.get(op)? > 0 {
-                refcount_shards[sid].rc.stage(op, -1, lsn)?;
+                refcount_shards[sid].rc.stage(txg, op, -1, lsn)?;
             }
         }
         let sid = shard_for_key(refcount_shards, new_pba);
-        refcount_shards[sid].rc.stage(new_pba, 1, lsn)?;
+        refcount_shards[sid].rc.stage(txg, new_pba, 1, lsn)?;
     }
     // rc deltas above stay inline (correctness); only the cuckoo write is
     // deferred. `stage_put` is the eager `put` verbatim when the drainer
@@ -69,6 +70,7 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
     dedup_index: &crate::dedup::DedupIndex,
     refcount_shards: &[Shard],
     lsn: Lsn,
+    txg: crate::types::Txg,
     hash: &Hash8,
     old_pba: Option<Pba>,
 ) -> Result<()> {
@@ -79,7 +81,7 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
         // to 0 by lineage GC is stale, and removing it must not
         // underflow the rc table.
         if refcount_shards[sid].rc.get(pba)? > 0 {
-            refcount_shards[sid].rc.stage(pba, -1, lsn)?;
+            refcount_shards[sid].rc.stage(txg, pba, -1, lsn)?;
         }
     }
     dedup_index.stage_delete(hash, lsn)?;
@@ -130,6 +132,7 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
 pub(in crate::db) fn apply_free_pbas(
     refcount_shards: &[Shard],
     lsn: Lsn,
+    txg: crate::types::Txg,
     pbas: &[Pba],
 ) -> Result<ApplyOutcome> {
     let mut freed: Vec<Pba> = Vec::new();
@@ -144,7 +147,7 @@ pub(in crate::db) fn apply_free_pbas(
             freed.push(pba);
             continue;
         }
-        let (_, new) = refcount_shards[sid].rc.stage(pba, -1, lsn)?;
+        let (_, new) = refcount_shards[sid].rc.stage(txg, pba, -1, lsn)?;
         if new == 0 {
             freed.push(pba);
         }

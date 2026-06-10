@@ -1,95 +1,117 @@
-//! Refcount shard: composes [`PagedRefcountArray`] + [`DeltaMap`] + a
-//! priority-3 staging overlay (drainer-mode).
+//! Refcount shard: a [`PagedRefcountArray`] fronted by a 4-slot TXG ring
+//! of [`DeltaMap`]s.
 //!
-//! ## Read path (`stage` / `get`)
+//! ## Why a TXG-slot ring (mirrors L2P)
 //!
-//! Three layers, consulted in order:
+//! Under `rc_authoritative_reclaim` the refcount is *derived* from L2P
+//! remaps (`incref(new) + decref(old)`). L2P buffers its updates in a
+//! 4-slot TXG ring ([`crate::db::l2p_buffer::L2pBuffer`]) and the sync
+//! folds only the frozen Syncing slot, so L2P durability is keyed to a
+//! clean per-TXG `checkpoint_lsn` prefix. refcount must fold on the SAME
+//! boundary: metadb has no data-plane WAL, so on crash onyx re-derives
+//! the data plane by replaying its LV2 buffer and re-issuing the L2P
+//! remaps; rc net-zero idempotency on replay holds ONLY when rc-durable
+//! reflects exactly the same commit set as L2P-durable. A free-running rc
+//! fold (the old drainer) could make rc durable ahead of L2P for
+//! open-TXG commits → replay double-count. Keying rc deltas by TXG and
+//! folding only the Syncing slot closes that, and bounds each fold to one
+//! TXG (killing the unbounded force-drain commit spike).
 //!
-//! 1. `delta_active` — pending ops accumulated since the drainer's
-//!    last cycle.
-//! 2. `delta_draining` — ops the drainer swapped out of `delta_active`
-//!    and is currently building overlay pages from. Visible to readers
-//!    until the drainer atomically replaces them with overlay entries.
-//! 3. `overlay` — sealed pages produced by the drainer; live until
-//!    `begin_checkpoint` harvests them.
-//! 4. `array` — on-disk fallback (priority-1 path).
+//! ## Read path (`get` / `lookup_entry`)
 //!
-//! ## Apply path (`begin_checkpoint`)
+//! refcount is *cumulative*, so the effective rc = on-disk array base +
+//! the SUM of pending deltas across all four slots (unlike L2P's
+//! newest-slot-wins). Underflow is floored to 0 via
+//! [`super::merge_read_or_floor`] (the same transient-checkpoint-race
+//! floor as before).
 //!
-//! Drainer-disabled (priority-1): drains `delta_active`, builds sealed
-//! pages in-gate, returns `RcCheckpoint`.
+//! ## Apply path (`stage`)
 //!
-//! Drainer-enabled (priority-3): preempts the drainer, applies any
-//! `delta_active` + `delta_draining` final-batch to the overlay, then
-//! atomically harvests the overlay into a `RcCheckpoint`. Heavy work
-//! (cache miss, page clone, apply, seal) was already performed by the
-//! drainer outside `apply_gate.write()`.
+//! `stage(txg, …)` merges its delta into `delta_slots[txg & 3]`, after
+//! reading the cumulative prev. It holds only the open slot's lock across
+//! its own read+merge; the other slots are read under brief individual
+//! locks. Concurrent commits on a shard all target the same open slot and
+//! serialise on its lock.
+//!
+//! ## Fold path (`begin_checkpoint`)
+//!
+//! `begin_checkpoint(txg)` folds ONLY `delta_slots[txg & 3]` (the frozen
+//! Syncing slot — `promote_to_syncing` required `inflight == 0`, so it
+//! receives no concurrent inserts). It is **publish-before-clear**: it
+//! folds the slot's entries into the array (via `stage_deltas_in_memory`,
+//! which installs into the page cache + page table) and only THEN clears
+//! the slot. So a concurrent cumulative read can transiently *over*-count
+//! (slot still full + array already folded) but never *under*-count — the
+//! safe direction (no spurious `freed_pba`).
+//!
+//! Because the Syncing slot holds exactly TXG `txg`'s rc deltas, and every
+//! commit with `lsn <= wal_checkpoint(txg)` is stamped to `txg` or an
+//! earlier (already-folded) TXG, folding the slot makes rc durable to
+//! `wal_checkpoint` — the SAME boundary L2P's `drain_syncing_slot_into_trees`
+//! reaches. So the flush's existing per-shard `durable_seq =
+//! wal_checkpoint.max(prev)` (selected) / `prev` (unselected) is already
+//! correct for rc, exactly as for a non-buffered L2P shard; no separate
+//! watermark term is needed (the slot-keying — not a cap — is what keeps rc
+//! durability aligned with L2P's `checkpoint_lsn` prefix).
+//!
+//! `begin_checkpoint_all_slots` folds every slot — used by the threads-OFF
+//! inline flush and by recovery (rc analogue of `L2pBuffer::drain_all_slots`).
 //!
 //! ## Lock order
 //!
-//! `delta_active` → `delta_draining` → `overlay.inner` → `array.inner`.
-//! Drainer never holds `delta_active` during heavy work.
+//! Within a slot: `delta_slots[i]` → `array.inner`. Multi-slot holders
+//! (only `stage`, holding the open slot while briefly reading others)
+//! never hold two slot locks while acquiring a lower-indexed one in a way
+//! that can cycle, because all concurrent stages share the same open slot
+//! and serialise on it.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use parking_lot::Mutex;
 
 use super::RcEntry;
-use super::apply_delta_pure;
-use super::array::{PagedRefcountArray, StagedDeltas, StagedPage};
+use super::array::{PagedRefcountArray, StagedDeltas};
 use super::delta::{DeltaMap, Pending};
-use super::overlay::{DrainerHandle, OverlayEntry, PagePool, StagingOverlay};
 use crate::cache::PageCache;
 use crate::error::Result;
-use crate::metrics::MetaMetrics;
-use crate::page::Page;
 use crate::page_store::PageStore;
-use crate::types::{Lsn, PageId, Pba};
+use crate::types::{Lsn, PageId, Pba, Txg};
+
+/// Number of TXG ring slots. Matches `crate::db::l2p_buffer::TXG_SIZE`.
+const TXG_SLOTS: usize = 4;
+
+#[inline]
+fn slot_index(txg: Txg) -> usize {
+    (txg as usize) & (TXG_SLOTS - 1)
+}
 
 pub struct RcShard {
-    /// Live accumulator. New `stage()` ops always merge here.
-    delta_active: Mutex<DeltaMap>,
-    /// Set by the drainer between swap-out and overlay-publish so
-    /// concurrent readers can still see the swapped-out entries.
-    /// Always `None` when the drainer is disabled, so the priority-1
-    /// path skips the lookup with a single mutex acquire + None peek.
-    delta_draining: Mutex<Option<DeltaMap>>,
-    /// Sealed pages from the drainer. Empty between drainer cycles
-    /// (and always empty when drainer is disabled).
-    overlay: Arc<StagingOverlay>,
+    /// Pending deltas keyed by TXG ring slot (`txg & 3`). A commit
+    /// stamped to TXG `t` merges into `delta_slots[t & 3]`; the sync
+    /// folds only the Syncing slot. Reads sum across all four (refcount
+    /// is cumulative).
+    delta_slots: [Mutex<DeltaMap>; TXG_SLOTS],
     pub(super) array: PagedRefcountArray,
-    /// Per-shard pool the drainer pulls fresh page ids from. Unused
-    /// when drainer is disabled.
-    page_pool: Arc<Mutex<PagePool>>,
-    /// Drainer thread handle (Some when the drainer is running).
-    drainer: Mutex<Option<DrainerHandle>>,
-    /// Metrics handle stamped at `attach_drainer` time so
-    /// `begin_checkpoint` and `abort_checkpoint` can record drainer-
-    /// related counters. None when drainer is disabled.
-    metrics: Mutex<Option<Arc<MetaMetrics>>>,
 }
 
 /// Checkpoint produced by [`RcShard::begin_checkpoint`]. Carries the
 /// sealed pages, the snapshots needed to drive `paged_meta::write_chain`
-/// outside the apply gate, and the rollback state for
-/// [`RcShard::abort_checkpoint`].
+/// outside the apply gate, and the drained deltas for
+/// [`RcShard::abort_checkpoint`] to restore on a failed flush.
 pub struct RcCheckpoint {
     pub(super) staged: StagedDeltas,
-    /// Drained delta entries — restored by `abort_checkpoint` so a
-    /// retry redoes the work. In drainer-mode this is empty (the
-    /// overlay was the source of truth; abort restores the overlay
-    /// instead via `prior_overlay_entries`).
+    /// The slot's drained entries + which slot they came from — restored
+    /// by `abort_checkpoint` so a retry redoes the fold.
     drained_deltas: Vec<(Pba, Pending)>,
-    /// In drainer-mode: entries to put back into the overlay on abort
-    /// (fresh page ids end up back in the page pool; pre-existing
-    /// pages get their pre-stage `OverlayEntry` reinstated).
-    prior_overlay_entries: Vec<OverlayEntry>,
+    /// Slot indices folded by this checkpoint (one for the per-TXG path,
+    /// up to four for `begin_checkpoint_all_slots`). Abort restores
+    /// `drained_deltas` into the first of these (they were merged on the
+    /// way in, so a single restore slot is sufficient and correct — the
+    /// next fold re-spreads them is unnecessary because abort only needs
+    /// the deltas back in *some* live slot to be re-folded).
+    restore_slot: usize,
     snapshot_page_table: Vec<PageId>,
     snapshot_meta_chain: Vec<PageId>,
-    /// True if this checkpoint was produced via the drainer-mode path
-    /// (overlay harvest). Determines abort semantics.
-    drainer_mode: bool,
 }
 
 impl RcCheckpoint {
@@ -101,7 +123,7 @@ impl RcCheckpoint {
     /// Append sealed pages to a shared write-out vec; lifecycle.rs uses
     /// this to fold refcount writes into the same
     /// `page_store.write_sealed_page_runs` + `sync` as L2P.
-    pub fn append_sealed_pages(&self, out: &mut Vec<(PageId, Arc<Page>)>) {
+    pub fn append_sealed_pages(&self, out: &mut Vec<(PageId, Arc<crate::page::Page>)>) {
         self.staged.append_sealed_pages(out);
     }
 
@@ -113,16 +135,9 @@ impl RcCheckpoint {
         &self.snapshot_meta_chain
     }
 
-    /// Number of delta-map entries the sample phase processed.
+    /// Number of delta-map entries the fold processed.
     pub fn drained_deltas_count(&self) -> usize {
-        // In drainer-mode, the deltas were processed across multiple
-        // cycles; here we report the staged-pages count as a proxy
-        // (priority-1 callers used this only for metrics).
-        if self.drainer_mode {
-            self.staged.pages.len()
-        } else {
-            self.drained_deltas.len()
-        }
+        self.drained_deltas.len()
     }
 
     /// Number of freshly-allocated data pages this checkpoint produced.
@@ -152,13 +167,9 @@ impl RcCheckpoint {
 }
 
 impl RcShard {
-    /// Create a fresh shard. The drainer is NOT spawned by this
-    /// constructor; `Db::open` / `Db::create` calls
-    /// [`attach_drainer`](Self::attach_drainer) after WAL replay
-    /// completes (deterministic recovery).
     pub fn create(page_store: Arc<PageStore>, page_cache: Arc<PageCache>) -> Result<Self> {
-        let array = PagedRefcountArray::create(page_store.clone(), page_cache)?;
-        Ok(Self::new_with_array(page_store, array))
+        let array = PagedRefcountArray::create(page_store, page_cache)?;
+        Ok(Self::new_with_array(array))
     }
 
     /// Open an existing shard at `meta_page_id` (read from the manifest).
@@ -167,23 +178,14 @@ impl RcShard {
         page_cache: Arc<PageCache>,
         meta_page_id: PageId,
     ) -> Result<Self> {
-        let array = PagedRefcountArray::open(page_store.clone(), page_cache, meta_page_id)?;
-        Ok(Self::new_with_array(page_store, array))
+        let array = PagedRefcountArray::open(page_store, page_cache, meta_page_id)?;
+        Ok(Self::new_with_array(array))
     }
 
-    fn new_with_array(page_store: Arc<PageStore>, array: PagedRefcountArray) -> Self {
-        // `MetaMetrics::default()` is fine here — `attach_drainer`
-        // re-constructs the pool with the real metrics handle.
-        let pool_metrics = Arc::new(MetaMetrics::default());
-        let pool = PagePool::new(page_store, 1, pool_metrics);
+    fn new_with_array(array: PagedRefcountArray) -> Self {
         Self {
-            delta_active: Mutex::new(DeltaMap::new()),
-            delta_draining: Mutex::new(None),
-            overlay: Arc::new(StagingOverlay::new()),
+            delta_slots: std::array::from_fn(|_| Mutex::new(DeltaMap::new())),
             array,
-            page_pool: Arc::new(Mutex::new(pool)),
-            drainer: Mutex::new(None),
-            metrics: Mutex::new(None),
         }
     }
 
@@ -191,12 +193,10 @@ impl RcShard {
         self.array.meta_page_id()
     }
 
-    /// Logical refcount. ~50 ns hot path: peek `delta_active`, peek
-    /// `delta_draining` if needed, peek `overlay` for the page, fall
-    /// back to on-disk via `array`.
+    /// Logical refcount. Sums pending across all four slots, falls back
+    /// to the on-disk array, floors a transient underflow to 0.
     pub fn get(&self, pba: Pba) -> Result<u32> {
-        let entry = self.lookup_entry(pba)?;
-        Ok(entry.rc)
+        Ok(self.lookup_entry(pba)?.rc)
     }
 
     /// Full entry (rc + birth_lsn). Internal use only — public callers
@@ -205,463 +205,108 @@ impl RcShard {
         self.lookup_entry(pba)
     }
 
-    fn lookup_entry(&self, pba: Pba) -> Result<RcEntry> {
-        // Fast path: drainer disabled (priority-1 semantics). Avoids
-        // the extra mutex acquires on `delta_draining` and `overlay`
-        // — both are guaranteed empty/None when no drainer is
-        // attached. Mirrors the original priority-1 read path
-        // verbatim.
-        let drainer_attached = self.drainer.lock().is_some();
-        if !drainer_attached {
-            let pending = self.delta_active.lock().get(pba);
-            let base = self.array.get(pba)?;
-            return super::merge_pending_read(base, pending);
+    /// Sum the pending deltas for `pba` across all four slots. Returns
+    /// `(net_delta, max_lsn, any)`. Each slot is read under a brief
+    /// individual lock — never holding two at once.
+    fn sum_pending(&self, pba: Pba, skip: Option<usize>) -> (i64, Lsn, bool) {
+        let mut net: i64 = 0;
+        let mut max_lsn: Lsn = 0;
+        let mut any = false;
+        for (i, slot) in self.delta_slots.iter().enumerate() {
+            if Some(i) == skip {
+                continue;
+            }
+            if let Some(p) = slot.lock().get(pba) {
+                net += p.delta;
+                if p.last_lsn > max_lsn {
+                    max_lsn = p.last_lsn;
+                }
+                any = true;
+            }
         }
-
-        // Drainer-mode: hold `delta_active.lock` AND `delta_draining.lock`
-        // across the entire peek so the (pa, pd, overlay_entry) snapshot
-        // is consistent against drainer transitions:
-        //
-        //   - Transition 1 (active → draining): drainer takes both
-        //     locks atomically. Reader holds active first, so drainer
-        //     blocks until reader releases — reader sees full
-        //     pre-state or full post-state.
-        //
-        //   - Transition 2 (draining → overlay): drainer takes
-        //     draining.lock, calls `overlay.bulk_insert`, clears
-        //     draining, then releases. Reader holds draining.lock
-        //     during the overlay peek, so the drainer cannot publish
-        //     the new sealed pages while reader is mid-snapshot. This
-        //     prevents the "pd=Some(drained) + overlay=new-sealed
-        //     (already encodes drained)" double-count bug.
-        //
-        // Lock order: active → draining → overlay → array (matches
-        // both transitions; no deadlock risk).
-        let active = self.delta_active.lock();
-        let pa = active.get(pba);
-        let draining_guard = self.delta_draining.lock();
-        let pd = draining_guard.as_ref().and_then(|m| m.get(pba));
-        let (_overlay_entry, base) = self.lookup_base(pba)?;
-        drop(draining_guard);
-        drop(active);
-
-        let after_pd = super::merge_pending_read(base, pd)?;
-        super::merge_pending_read(after_pd, pa)
+        (net, max_lsn, any)
     }
 
-    /// Resolve the on-disk-or-overlay base for `pba`. Returns the
-    /// matching overlay entry alongside the base so callers that also
-    /// need `effective_page_lsn` can avoid a second mutex acquire.
-    fn lookup_base(&self, pba: Pba) -> Result<(Option<OverlayEntry>, RcEntry)> {
-        let (page_idx, slot) = page_offset(pba);
-        if let Some(entry) = self.overlay.get(page_idx) {
-            // Read the slot from the staged sealed page directly.
-            let rc_entry = read_entry_from_sealed(&entry.sealed, slot);
-            return Ok((Some(entry), rc_entry));
+    fn lookup_entry(&self, pba: Pba) -> Result<RcEntry> {
+        let (net, max_lsn, any) = self.sum_pending(pba, None);
+        let base = self.array.get(pba)?;
+        if !any {
+            return Ok(base);
+        }
+        super::merge_read_or_floor(base, net, max_lsn)
+    }
+
+    /// Stage one op into the pending delta for `txg`'s slot. Returns the
+    /// cumulative `(prev_rc, new_rc)` (callers surface `freed_pba` on
+    /// `new == 0 && prev > 0`).
+    ///
+    /// A decref past zero is a benign double-decref — skipped (count
+    /// left at its floor) rather than poisoning the commit pipeline.
+    /// Overflow (delta >= 0) is fatal.
+    pub fn stage(&self, txg: Txg, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
+        let idx = slot_index(txg);
+        // Read the other three slots first (brief individual locks), then
+        // hold the open slot across read-own + array read + merge so a
+        // concurrent stage targeting the same open slot serialises here.
+        let (mut net, mut max_lsn, mut any) = self.sum_pending(pba, Some(idx));
+        let mut open = self.delta_slots[idx].lock();
+        let pa = open.get(pba);
+        if let Some(p) = pa {
+            net += p.delta;
+            if p.last_lsn > max_lsn {
+                max_lsn = p.last_lsn;
+            }
+            any = true;
         }
         let base = self.array.get(pba)?;
-        Ok((None, base))
-    }
-
-    /// A decref that would take the count below zero. The only way this
-    /// arises is a benign double-decref of an already-freed PBA — two ops
-    /// removing the same last reference (e.g. a recovered dedup-hit remap
-    /// racing a concurrent overwrite of the same LBA). The guard is right
-    /// that the count is already 0; we floor it there (skip the redundant
-    /// decref) so the commit applies cleanly instead of returning an
-    /// `Err` that `poison_commit_waiters` fans out into a cascade of
-    /// unrelated commit failures (the recovered hit is even kept). The
-    /// count stays correct — it was going to 0 anyway.
-    ///
-    /// Stage one op into the pending delta. Returns `(prev_rc, new_rc)`.
-    pub fn stage(&self, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
-        // Fast path when drainer is disabled — verbatim priority-1
-        // semantics, single mutex acquire.
-        let drainer_attached = self.drainer.lock().is_some();
-        if !drainer_attached {
-            let mut d = self.delta_active.lock();
-            let prev_pending = d.get(pba);
-            let base = self.array.get(pba)?;
-            let merged_prev = super::merge_pending_read(base, prev_pending)?;
-            if prev_pending.is_none() && self.array.page_lsn(pba)? >= lsn {
-                return Ok((base.rc, base.rc));
-            }
-            match apply_delta_pure(merged_prev, delta, lsn) {
-                Ok(post) => {
-                    d.merge(pba, delta, lsn);
-                    return Ok((merged_prev.rc, post.rc));
-                }
-                Err(err) => {
-                    // A decref past zero is a benign double-decref — skip
-                    // it instead of poisoning the commit pipeline.
-                    if delta < 0 {
-                        super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, "stage");
-                        return Ok((merged_prev.rc, merged_prev.rc));
-                    }
-                    // Overflow (delta >= 0) is fatal. P0 diagnostic: dump
-                    // every input that fed into the failed merge so the
-                    // caller can correlate it with the L2P op that
-                    // produced it. Filter via
-                    // `RUST_LOG=onyx_metadb::refcount=error`.
-                    let page_lsn = self.array.page_lsn(pba).unwrap_or(0);
-                    tracing::error!(
-                        target: "onyx_metadb::refcount::stage_underflow",
-                        pba,
-                        delta,
-                        lsn,
-                        base_rc = base.rc,
-                        base_birth_lsn = base.birth_lsn,
-                        page_lsn,
-                        pa_delta = prev_pending.map(|p| p.delta).unwrap_or(0),
-                        pa_lsn = prev_pending.map(|p| p.last_lsn).unwrap_or(0),
-                        merged_prev_rc = merged_prev.rc,
-                        merged_prev_birth_lsn = merged_prev.birth_lsn,
-                        drainer_mode = false,
-                        "rc.stage failed: refcount overflow"
-                    );
-                    return Err(err);
-                }
-            }
+        // Replay-skip: with no pending anywhere AND the on-disk page
+        // generation already at/after this LSN, the op was already
+        // applied (recovery same-LSN re-application). `>=` is correct
+        // here — there is no drainer cycle-split hazard in the slot model.
+        if !any && self.array.page_lsn(pba)? >= lsn {
+            return Ok((base.rc, base.rc));
         }
-
-        // Drainer-mode: hold `delta_active.lock` for the entire op
-        // (snapshot → underflow check → merge), and additionally hold
-        // `delta_draining.lock` during the `pd` peek + `lookup_base`
-        // peek so transition 2 cannot publish a new sealed page while
-        // we're mid-snapshot (which would cause `pd=Some(drained) +
-        // overlay=new-sealed-already-includes-drained` double count).
-        //
-        // Lock order: active → draining → overlay → array (matches the
-        // drainer's lock acquisition order; no deadlock).
-        let mut active = self.delta_active.lock();
-        let pa = active.get(pba);
-        let draining_guard = self.delta_draining.lock();
-        let pd = draining_guard.as_ref().and_then(|m| m.get(pba));
-        let (overlay_entry, base) = self.lookup_base(pba)?;
-        drop(draining_guard);
-
-        let after_pd = super::merge_pending_read(base, pd)?;
-        let merged_prev = super::merge_pending_read(after_pd, pa)?;
-        // Replay-skip in drainer-mode: only when there's no pending
-        // delta in either layer AND the effective on-disk-or-overlay
-        // LSN STRICTLY exceeds this op's LSN. Use `>` not `>=` because
-        // `effective_lsn` is the page-wide generation but a single tx
-        // at lsn=N can stage ops on multiple slots in the same page;
-        // if the rc bucket calls `rc.stage` for those slots back-to-
-        // back and the drainer fires its transition-1 swap *between*
-        // the stages, the tx ends up split across two cycles. Cycle K
-        // builds page_gen=N from slot X; cycle K+1 sees overlay_gen=N
-        // when staging slot Y's pending at lsn=N — with `>=` the
-        // pending is silently dropped (real soak repro at lsn=18583
-        // pba=119434, see `nvme-box:.dev/fio-dedupe-compress-soak/
-        // 20260507T-trace-v2/`). The drainer only runs after WAL
-        // replay completes (priority-3 contract), so steady-state
-        // stage calls always see fresh ops with monotonically
-        // increasing LSNs — `effective_lsn == lsn` cannot mean
-        // "already applied", it means "another slot in the same
-        // page+tx beat us by one drainer cycle". Strict `>` is sound.
-        // The drainer-disabled (priority-1) replay-skip above keeps
-        // `>=` because that path runs during WAL replay where same-
-        // LSN re-application is the actual concern.
-        if pa.is_none() && pd.is_none() {
-            let effective_lsn = match overlay_entry.as_ref() {
-                Some(entry) => entry.sealed.header()?.generation,
-                None => self.array.page_lsn(pba)?,
-            };
-            if effective_lsn > lsn {
-                return Ok((base.rc, base.rc));
-            }
+        let merged_prev = super::merge_read_or_floor(base, net, max_lsn)?;
+        let (post, skipped) = super::apply_delta_or_skip(merged_prev, delta, lsn)?;
+        if skipped {
+            super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, "stage");
+            return Ok((merged_prev.rc, merged_prev.rc));
         }
-        let post = match apply_delta_pure(merged_prev, delta, lsn) {
-            Ok(p) => p,
-            Err(err) => {
-                // A decref past zero is a benign double-decref — skip it
-                // instead of poisoning the commit pipeline. Nothing is
-                // merged, so the drainer needs no notify.
-                if delta < 0 {
-                    super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, "stage");
-                    return Ok((merged_prev.rc, merged_prev.rc));
-                }
-                // Overflow (delta >= 0) is fatal. P0 diagnostic: dump
-                // every layer that fed into the drainer-mode merge.
-                // `RUST_LOG=onyx_metadb::refcount=error`.
-                let page_lsn = self.array.page_lsn(pba).unwrap_or(0);
-                let overlay_gen = overlay_entry
-                    .as_ref()
-                    .and_then(|e| e.sealed.header().ok().map(|h| h.generation));
-                tracing::error!(
-                    target: "onyx_metadb::refcount::stage_underflow",
-                    pba,
-                    delta,
-                    lsn,
-                    base_rc = base.rc,
-                    base_birth_lsn = base.birth_lsn,
-                    page_lsn,
-                    pa_delta = pa.map(|p| p.delta).unwrap_or(0),
-                    pa_lsn = pa.map(|p| p.last_lsn).unwrap_or(0),
-                    pd_delta = pd.map(|p| p.delta).unwrap_or(0),
-                    pd_lsn = pd.map(|p| p.last_lsn).unwrap_or(0),
-                    overlay_hit = overlay_entry.is_some(),
-                    overlay_gen,
-                    merged_prev_rc = merged_prev.rc,
-                    merged_prev_birth_lsn = merged_prev.birth_lsn,
-                    drainer_mode = true,
-                    "rc.stage failed: refcount overflow"
-                );
-                return Err(err);
-            }
-        };
-        active.merge(pba, delta, lsn);
-        let len = active.len();
-        drop(active);
-        self.maybe_notify_drainer(len);
+        open.merge(pba, delta, lsn);
         Ok((merged_prev.rc, post.rc))
     }
 
-    fn maybe_notify_drainer(&self, active_len: usize) {
-        let drainer = self.drainer.lock();
-        if let Some(handle) = drainer.as_ref() {
-            // The drainer's threshold is captured in its config; a
-            // simple "non-zero work present" notify is also fine
-            // because the drainer re-checks the threshold itself.
-            let _ = active_len;
-            handle.state().notify();
-        }
+    /// Fold ONLY the Syncing slot (`txg & 3`). Caller has frozen the slot
+    /// by promoting `txg` to Syncing (`inflight == 0`). After the fold rc
+    /// is durable up to that TXG's `wal_checkpoint` (the slot held exactly
+    /// this TXG's deltas), so the flush's `wal_checkpoint.max(prev)`
+    /// durable_seq is correct — no separate watermark to record.
+    pub fn begin_checkpoint(&self, txg: Txg) -> Result<RcCheckpoint> {
+        self.checkpoint_slots(&[slot_index(txg)])
     }
 
-    /// Spawn the per-shard drainer thread. Idempotent (no-op if the
-    /// drainer is already attached or if the cfg has it disabled).
-    /// Caller `Db::open` / `Db::create` invokes this AFTER WAL replay
-    /// completes — guarantees the drainer never observes mid-replay
-    /// state.
-    pub fn attach_drainer(
-        self: &Arc<Self>,
-        page_store: Arc<PageStore>,
-        cfg: &crate::config::Config,
-        metrics: Arc<MetaMetrics>,
-        shard_idx: usize,
-    ) {
-        // Log every entry so an attach failure (config disabled,
-        // already attached, or never called) is visible in engine.log
-        // without having to grep for negative space.
-        if !cfg.refcount_drainer_enabled {
-            tracing::info!(
-                shard = shard_idx,
-                "rc-drainer: attach skipped — refcount_drainer_enabled=false"
-            );
-            return;
-        }
-        if self.drainer.lock().is_some() {
-            tracing::info!(
-                shard = shard_idx,
-                "rc-drainer: attach skipped — already attached"
-            );
-            return;
-        }
-        tracing::info!(
-            shard = shard_idx,
-            interval_ms = cfg.refcount_drainer_interval_ms,
-            threshold = cfg.refcount_drainer_threshold_entries,
-            "rc-drainer: attaching drainer thread"
-        );
-        // Re-construct the pool with the real metrics handle so
-        // `record_rc_drainer_pool_refill` surfaces correctly.
-        {
-            let mut pool = self.page_pool.lock();
-            *pool = PagePool::new(
-                page_store,
-                cfg.refcount_drainer_alloc_run_size,
-                metrics.clone(),
-            );
-        }
-        *self.metrics.lock() = Some(metrics.clone());
-
-        let state = Arc::new(super::overlay::DrainerState::new());
-        let worker = DrainerWorker {
-            shard_idx,
-            shard: self.clone(),
-            interval_ms: cfg.refcount_drainer_interval_ms,
-            threshold_entries: cfg.refcount_drainer_threshold_entries,
-            max_entries_per_cycle: cfg.refcount_drainer_max_entries_per_cycle,
-            state: state.clone(),
-            metrics,
-        };
-        let join = std::thread::Builder::new()
-            .name(format!("rc-drainer-{shard_idx}"))
-            .spawn(move || {
-                crate::affinity::bind_current(
-                    crate::affinity::ThreadRole::RefcountDrainer,
-                    shard_idx,
-                );
-                worker.run();
-            })
-            .expect("failed to spawn refcount drainer thread");
-        let mut slot = self.drainer.lock();
-        *slot = Some(DrainerHandle::new(state, join));
+    /// Fold every slot. Used by the threads-OFF inline flush and by
+    /// recovery's post-replay / cold `flush()` path (rc analogue of
+    /// `force_compact_l2p_buffers`).
+    pub fn begin_checkpoint_all_slots(&self) -> Result<RcCheckpoint> {
+        self.checkpoint_slots(&[0, 1, 2, 3])
     }
 
-    /// Stop the drainer (if any). Idempotent. Called by `Db::drop`.
-    pub fn detach_drainer(&self) {
-        let mut slot = self.drainer.lock();
-        if let Some(mut handle) = slot.take() {
-            handle.shutdown();
-        }
-        // Return any leftover pool pids to the page store's free
-        // list so they aren't leaked. `PageStore::free_many` would
-        // be ideal but isn't exposed here in a freelist-friendly
-        // way; for now we just drop them — `rebuild_free_list_on_open`
-        // recovers them on the next `Db::open`. TODO: explicit return.
-        let _ = self.page_pool.lock().drain();
-    }
-
-    /// `begin_checkpoint` for both drainer-mode and disabled-mode.
-    /// Caller holds `apply_gate.write()`.
-    pub fn begin_checkpoint(&self) -> Result<RcCheckpoint> {
-        let drainer_mode = self.drainer.lock().is_some();
-        if !drainer_mode {
-            return self.begin_checkpoint_priority1();
-        }
-        // Drainer-mode: preempt drainer, final-drain active+draining
-        // onto the overlay, atomically harvest the overlay.
-        //
-        // We deliberately do NOT have a "fall back to priority-1" path
-        // here. The priority-1 path (`stage_deltas_in_memory`) reads
-        // base values from `inner.page_table` + page_cache only — it
-        // doesn't consult the overlay. With drainer-built overlay
-        // entries that are NOT yet installed into `page_table` (the
-        // sealed pages live only in `StagingOverlay` until the next
-        // checkpoint harvest installs them), priority-1 would
-        // (a) allocate a brand-new `pid_B` for the same `page_idx` the
-        // overlay holds with `pid_A`, (b) start from rc=0 (or stale
-        // disk content), losing the drainer's accumulated
-        // contribution, and (c) leave the overlay+page_table referring
-        // to two different pids for the same idx. The next main-path
-        // begin_checkpoint then overwrites `page_table[idx]` back to
-        // `pid_A`, orphaning `pid_B`'s priority-1 contribution and
-        // producing reader-visible "0 - N" decref underflows on PBAs
-        // whose increfs went through pid_B.
-        //
-        // The main path below already handles arbitrary sizes: it
-        // synchronously processes whatever active+draining accrued
-        // since the drainer was preempted, and folds onto the
-        // overlay's sealed pages without losing any contribution.
-        // Large bursts make the in-gate phase longer but never
-        // incorrect.
-        let drainer_handle = self.drainer.lock();
-        let handle = drainer_handle
-            .as_ref()
-            .expect("drainer was Some on the entry check");
-        let wait_started = Instant::now();
-        let _wait = handle.preempt_and_wait();
-        // Drop the drainer handle lock to avoid holding it during the
-        // final-drain heavy work.
-        drop(drainer_handle);
-
-        // Final drain: drain delta_active + delta_draining and apply
-        // them to the overlay synchronously. Bounded by whatever
-        // accrued since the drainer's last cycle.
-        let final_drained: Vec<(Pba, Pending)> = {
-            let mut active = self.delta_active.lock();
-            let mut draining = self.delta_draining.lock();
-            let mut out: Vec<(Pba, Pending)> = active.drain().collect();
-            if let Some(d) = draining.take() {
-                for (pba, pending) in d.iter() {
-                    out.push((*pba, *pending));
-                }
-            }
-            out
-        };
-
-        if !final_drained.is_empty() {
-            let prior = self.overlay.snapshot();
-            let build_result = {
-                let mut pool = self.page_pool.lock();
-                self.array
-                    .build_overlay_pages(final_drained.clone(), &mut pool, &prior)
-            };
-            match build_result {
-                Ok(entries) => {
-                    self.overlay.bulk_insert(entries);
-                }
-                Err(err) => {
-                    // Restore final_drained back into delta_active so
-                    // a retry redoes the work. Without this restore,
-                    // those deltas would be silently dropped (they
-                    // were already taken out of active+draining
-                    // above).
-                    let mut active = self.delta_active.lock();
-                    for (pba, pending) in final_drained {
-                        active.merge_pending(pba, pending);
-                    }
-                    return Err(err);
-                }
+    /// Shared fold body (publish-before-clear).
+    fn checkpoint_slots(&self, slots: &[usize]) -> Result<RcCheckpoint> {
+        // Snapshot (clone) the slot contents — publish-before-clear: we
+        // fold into the array first and clear the slot only after, so a
+        // concurrent cumulative read can transiently over-count but never
+        // under-count.
+        let restore_slot = slots[0];
+        let mut drained: Vec<(Pba, Pending)> = Vec::new();
+        for &i in slots {
+            let slot = self.delta_slots[i].lock();
+            for (pba, pending) in slot.iter() {
+                drained.push((*pba, *pending));
             }
         }
 
-        // Atomic harvest.
-        let harvested = self.overlay.take();
-        let prior_overlay_entries: Vec<OverlayEntry> = harvested.values().cloned().collect();
-        let staged_pages: Vec<StagedPage> = harvested
-            .into_values()
-            .map(|e| StagedPage {
-                page_id: e.page_id,
-                page_idx: e.page_idx,
-                sealed: e.sealed,
-                is_fresh: e.is_fresh,
-            })
-            .collect();
-
-        // Install the harvested page-table mutations into `inner`. This
-        // is the in-gate moment that priority 1 did during sample for
-        // each individual fresh page.
-        let max_lsn = match self
-            .array
-            .install_overlay_into_page_table(prior_overlay_entries.iter())
-        {
-            Ok(lsn) => lsn,
-            Err(err) => {
-                // Roll back the harvest: restore overlay so the next
-                // checkpoint sees the same state we started with.
-                self.overlay.bulk_insert(prior_overlay_entries);
-                return Err(err);
-            }
-        };
-
-        let snapshot_page_table = self.array.page_table_snapshot();
-        let snapshot_meta_chain = self.array.meta_chain_snapshot();
-
-        if let Some(metrics) = self.drainer_metrics() {
-            metrics.record_rc_drainer_checkpoint_wait(wait_started.elapsed());
-        }
-
-        Ok(RcCheckpoint {
-            staged: StagedDeltas {
-                pages: staged_pages,
-                max_lsn,
-            },
-            drained_deltas: Vec::new(),
-            prior_overlay_entries,
-            snapshot_page_table,
-            snapshot_meta_chain,
-            drainer_mode: true,
-        })
-    }
-
-    fn drainer_metrics(&self) -> Option<Arc<MetaMetrics>> {
-        self.metrics.lock().clone()
-    }
-
-    /// Priority-1 in-gate sample path. Only used when the drainer is
-    /// disabled. Drainer-enabled callers always go through the main
-    /// path above which folds the overlay correctly; the backpressure
-    /// fallback that used to call this in drainer-mode was removed
-    /// because it lost overlay contributions (see the comment in
-    /// `begin_checkpoint`).
-    fn begin_checkpoint_priority1(&self) -> Result<RcCheckpoint> {
-        let drained: Vec<(Pba, Pending)> = {
-            let mut d = self.delta_active.lock();
-            d.drain().collect()
-        };
         if drained.is_empty() {
             return Ok(RcCheckpoint {
                 staged: StagedDeltas {
@@ -669,40 +314,39 @@ impl RcShard {
                     max_lsn: 0,
                 },
                 drained_deltas: Vec::new(),
-                prior_overlay_entries: Vec::new(),
+                restore_slot,
                 snapshot_page_table: self.array.page_table_snapshot(),
                 snapshot_meta_chain: self.array.meta_chain_snapshot(),
-                drainer_mode: false,
             });
         }
-        let staged = match self.array.stage_deltas_in_memory(drained.clone()) {
-            Ok(s) => s,
-            Err(err) => {
-                let mut d = self.delta_active.lock();
-                for (pba, pending) in drained {
-                    d.merge(pba, pending.delta, pending.last_lsn);
-                }
-                return Err(err);
-            }
-        };
+
+        // Fold + publish into the array (cache + page_table) WITHOUT
+        // clearing the slots yet.
+        let staged = self.array.stage_deltas_in_memory(drained.clone())?;
+
+        // Publish is visible now; clear the folded slots. They are frozen
+        // (Syncing / threads-off quiesce) so a fresh `DeltaMap` discards
+        // exactly what we folded with no risk of dropping a concurrent
+        // insert.
+        for &i in slots {
+            *self.delta_slots[i].lock() = DeltaMap::new();
+        }
+
         let snapshot_page_table = self.array.page_table_snapshot();
         let snapshot_meta_chain = self.array.meta_chain_snapshot();
         Ok(RcCheckpoint {
             staged,
             drained_deltas: drained,
-            prior_overlay_entries: Vec::new(),
+            restore_slot,
             snapshot_page_table,
             snapshot_meta_chain,
-            drainer_mode: false,
         })
     }
 
-    /// Outside-gate IO: write a fresh meta chain. Same semantics as
-    /// priority 1; drainer-mode and disabled-mode share this path.
-    ///
-    /// Cold-path shim (`RcShard::flush`, snapshot / drop_volume). The
-    /// flush hot path uses [`Self::build_meta_chain`] + folds the
-    /// sealed pages into the global checkpoint batch.
+    /// Outside-gate IO: write a fresh meta chain. Cold-path shim
+    /// (`RcShard::flush`, snapshot / drop_volume). The flush hot path
+    /// uses [`Self::build_meta_chain`] + folds the sealed pages into the
+    /// global checkpoint batch.
     pub fn write_meta_chain(&self, ckpt: &RcCheckpoint, free_lsn: Lsn) -> Result<Vec<PageId>> {
         if ckpt.is_empty() {
             return Ok(ckpt.snapshot_meta_chain.to_vec());
@@ -715,12 +359,11 @@ impl RcShard {
     }
 
     /// Outside-gate, **no-IO** companion of [`Self::write_meta_chain`]:
-    /// builds + seals every page in the new chain entirely in memory
-    /// and returns the chain layout. Callers (currently
-    /// `flush_with_gate`) drive one batched
-    /// [`PageStore::write_sealed_page_runs`] across every shard's
-    /// sealed pages, then walk the per-shard `to_free` lists +
-    /// `install_meta_chain` after the manifest commit is durable.
+    /// builds + seals every page in the new chain in memory and returns
+    /// the chain layout. Callers (`flush_with_gate`) drive one batched
+    /// [`PageStore::write_sealed_page_runs`] across every shard's sealed
+    /// pages, then walk the per-shard `to_free` lists + `install_meta_chain`
+    /// after the manifest commit is durable.
     pub fn build_meta_chain(
         &self,
         ckpt: &RcCheckpoint,
@@ -736,73 +379,44 @@ impl RcShard {
             .build_meta_chain_external(ckpt.snapshot_page_table(), ckpt.snapshot_meta_chain())
     }
 
-    /// Install the new meta chain. Briefly takes the array's inner
-    /// lock. Drainer-mode finishes here too; the post-install resume
-    /// of the drainer is the caller's responsibility (`Db::flush`).
+    /// Install the new meta chain. Briefly takes the array's inner lock.
     pub fn install_meta_chain(&self, new_chain: Vec<PageId>) {
         self.array.install_meta_chain(new_chain);
     }
 
-    /// Resume the drainer after `begin_checkpoint` + IO + install
-    /// have finished. No-op if no drainer is attached.
-    pub fn resume_drainer(&self) {
-        if let Some(handle) = self.drainer.lock().as_ref() {
-            handle.resume();
-        }
-    }
-
-    /// Roll back a checkpoint that failed before install. Restores
-    /// drained deltas (priority-1 path) or overlay entries (drainer
-    /// path) so a retry redoes the work.
+    /// Roll back a checkpoint that failed before install. Frees fresh
+    /// page ids + invalidates touched cache entries, then restores the
+    /// drained deltas into a live slot so a retry redoes the fold.
     pub fn abort_checkpoint(&self, ckpt: RcCheckpoint, free_lsn: Lsn) {
         if ckpt.is_empty() {
             return;
         }
-        if ckpt.drainer_mode {
-            // Restore the harvested entries back into the overlay.
-            // The drainer will publish them again on its next cycle —
-            // OR begin_checkpoint will harvest them on retry. Either
-            // way the work isn't lost. Fresh page ids stay valid (we
-            // already allocated them; install_overlay_into_page_table
-            // wrote them into inner.page_table).
-            for entry in ckpt.prior_overlay_entries {
-                self.overlay.insert(entry);
-            }
-        } else {
-            // Priority-1 abort: restore drained deltas + free fresh
-            // page ids + invalidate touched cache entries.
-            self.array.abort_staged_deltas(&ckpt.staged, free_lsn);
-            let mut d = self.delta_active.lock();
-            for (pba, pending) in ckpt.drained_deltas {
-                d.merge(pba, pending.delta, pending.last_lsn);
-            }
+        self.array.abort_staged_deltas(&ckpt.staged, free_lsn);
+        let mut slot = self.delta_slots[ckpt.restore_slot].lock();
+        for (pba, pending) in ckpt.drained_deltas {
+            slot.merge_pending(pba, pending);
         }
     }
 
-    /// Synchronous flush for non-checkpoint callers. Preempts the
-    /// drainer (no-op if disabled), drains everything to disk, rotates
-    /// the meta chain. Cold path.
+    /// Synchronous flush for non-checkpoint callers (cold path). Folds
+    /// every slot to disk and rotates the meta chain.
     pub fn flush(&self) -> Result<()> {
-        let ckpt = self.begin_checkpoint()?;
+        let ckpt = self.begin_checkpoint_all_slots()?;
         if ckpt.is_empty() {
-            self.resume_drainer();
             return Ok(());
         }
         if let Err(err) = self.array.write_staged_pages(&ckpt.staged) {
             self.abort_checkpoint(ckpt, 0);
-            self.resume_drainer();
             return Err(err);
         }
         let new_chain = match self.write_meta_chain(&ckpt, 0) {
             Ok(c) => c,
             Err(err) => {
                 self.abort_checkpoint(ckpt, 0);
-                self.resume_drainer();
                 return Err(err);
             }
         };
         self.install_meta_chain(new_chain);
-        self.resume_drainer();
         Ok(())
     }
 
@@ -813,8 +427,7 @@ impl RcShard {
     }
 
     /// Iterate every live entry already present in the backing array.
-    /// The caller is responsible for checkpointing or otherwise
-    /// draining pending deltas first.
+    /// The caller is responsible for checkpointing / draining first.
     pub fn iter_live(&self) -> Result<Vec<(Pba, RcEntry)>> {
         self.array.iter_live()
     }
@@ -824,247 +437,15 @@ impl RcShard {
         self.array.allocated_data_pages()
     }
 
-    /// Best-effort count of in-memory rc deltas awaiting a checkpoint
-    /// drain. Used by the watermark thread to threshold-trigger
-    /// `try_flush` so a single sample doesn't accumulate millions of
-    /// deltas (sample_max scales linearly with this count — see
-    /// [[parallel-rc-drain-landed]]).
-    ///
-    /// `try_lock` rather than `lock` so a slow shard doesn't stall
-    /// the diag/watermark path; an undercounted shard just means
-    /// the trigger lags by one tick.
+    /// Best-effort count of in-memory rc deltas awaiting a fold, summed
+    /// across all slots. `try_lock` so a slow shard doesn't stall the
+    /// diag/watermark path.
     pub fn pending_delta_count(&self) -> usize {
-        self.delta_active.try_lock().map(|d| d.len()).unwrap_or(0)
+        self.delta_slots
+            .iter()
+            .map(|s| s.try_lock().map(|d| d.len()).unwrap_or(0))
+            .sum()
     }
-}
-
-impl Drop for RcShard {
-    fn drop(&mut self) {
-        // Best-effort drainer shutdown; idempotent.
-        self.detach_drainer();
-    }
-}
-
-/// Background drainer worker. Owns an `Arc<RcShard>` so it can reach
-/// into per-shard state without duplicating Arc handles for each
-/// field.
-struct DrainerWorker {
-    shard_idx: usize,
-    shard: Arc<RcShard>,
-    interval_ms: u64,
-    threshold_entries: usize,
-    max_entries_per_cycle: usize,
-    state: Arc<super::overlay::DrainerState>,
-    metrics: Arc<MetaMetrics>,
-}
-
-impl DrainerWorker {
-    fn run(self) {
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-        let interval = Duration::from_millis(self.interval_ms);
-        tracing::info!(
-            shard = self.shard_idx,
-            interval_ms = self.interval_ms,
-            threshold = self.threshold_entries,
-            "rc-drainer: worker thread entered run loop"
-        );
-        // Track local cycle count so we can emit a one-shot "first
-        // cycle completed" log per shard (confirms the cycle path
-        // actually fires, not just the wake path).
-        let mut cycle_count: u64 = 0;
-        loop {
-            // Park until tick / threshold / preempt / shutdown.
-            {
-                let mut guard = self.state.mu.lock();
-                loop {
-                    if self.state.shutdown.load(Ordering::Acquire) {
-                        return;
-                    }
-                    if self.state.preempt.load(Ordering::Acquire) {
-                        self.metrics.record_rc_drainer_preempt();
-                        self.state.in_cycle.store(false, Ordering::Release);
-                        // Re-assert `preempt_done=true` on every loop
-                        // iteration. A concurrent `preempt_and_wait`
-                        // resets `preempt_done=false` after the previous
-                        // caller resumed but before the worker exited
-                        // the while-park below; without the per-iteration
-                        // re-store the worker stays parked at line ~885
-                        // and the new caller hangs at `preempt_and_wait`
-                        // line ~269. Both stores now happen under
-                        // `self.state.mu` (caller via the lock-first
-                        // shape in `DrainerHandle::preempt_and_wait`,
-                        // worker via the outer guard), but the linearisation
-                        // can still see the caller's `false` after the
-                        // worker's first `true` — re-affirming on each
-                        // iteration restores the invariant.
-                        while {
-                            self.state.preempt_done.store(true, Ordering::Release);
-                            self.state.cv.notify_all();
-                            self.state.preempt.load(Ordering::Acquire)
-                                && !self.state.shutdown.load(Ordering::Acquire)
-                        } {
-                            self.state.cv.wait(&mut guard);
-                        }
-                        continue;
-                    }
-                    if self.shard.delta_active.lock().len() >= self.threshold_entries {
-                        break;
-                    }
-                    let _ = self.state.cv.wait_for(&mut guard, interval);
-                    if self.state.shutdown.load(Ordering::Acquire) {
-                        return;
-                    }
-                    if self.state.preempt.load(Ordering::Acquire) {
-                        continue;
-                    }
-                    if !self.shard.delta_active.lock().is_empty() {
-                        break;
-                    }
-                }
-            }
-
-            // Exited the park: we are about to attempt a cycle.
-            // Comparing `wakes` to `cycles` discriminates "worker dead"
-            // (wakes=0) vs "spinning, never finds work" (wakes>0,
-            // cycles=0) vs "preempted out" (preempts ≈ wakes).
-            self.metrics.record_rc_drainer_wake();
-
-            // Run one cycle.
-            self.state.in_cycle.store(true, Ordering::Release);
-            let cycle_started = Instant::now();
-
-            // Bounded-drain optimization (max_entries_per_cycle cap)
-            // is deferred — current `DeltaMap` doesn't expose
-            // entry removal; full take is the conservative path. Big
-            // bursts surface as a longer in-gate phase at the next
-            // `begin_checkpoint` (which folds the entire overlay) but
-            // stay correct.
-            let _ = self.max_entries_per_cycle;
-
-            // ── Transition 1: active → draining ───────────────────────
-            // Hold both `delta_active` and `delta_draining` locks at
-            // the same time so concurrent readers (which take
-            // `delta_active` first) cannot witness the in-flight gap
-            // where entries belong to neither layer. From the reader's
-            // perspective this transition is atomic: they observe
-            // either pre-state (active=Some, draining=None) or
-            // post-state (active=None, draining=Some).
-            let drained: DeltaMap;
-            let drained_len: usize;
-            {
-                let mut active = self.shard.delta_active.lock();
-                if active.is_empty() {
-                    drop(active);
-                    self.state.in_cycle.store(false, Ordering::Release);
-                    continue;
-                }
-                let mut draining = self.shard.delta_draining.lock();
-                let d = std::mem::take(&mut *active);
-                drained_len = d.len();
-                let clone: DeltaMap = {
-                    let mut c = DeltaMap::new();
-                    for (pba, pending) in d.iter() {
-                        c.merge(*pba, pending.delta, pending.last_lsn);
-                    }
-                    c
-                };
-                *draining = Some(clone);
-                drained = d;
-                // Both locks drop here.
-            }
-
-            // ── Heavy work: build sealed pages outside any shard lock ─
-            let entries: Vec<(Pba, Pending)> = drained.iter().map(|(p, pp)| (*p, *pp)).collect();
-            let prior = self.shard.overlay.snapshot();
-            let build_result = {
-                let mut pool = self.shard.page_pool.lock();
-                self.shard
-                    .array
-                    .build_overlay_pages(entries, &mut pool, &prior)
-            };
-            let new_pages = match build_result {
-                Ok(p) => p,
-                Err(err) => {
-                    tracing::warn!(
-                        shard = self.shard_idx,
-                        error = %err,
-                        "rc-drainer: build_overlay_pages failed; rolling drained back"
-                    );
-                    // ── Error rollback: atomic restore ──
-                    // Restore drained back into active AND clear
-                    // draining under both locks so readers cannot
-                    // double-count (pa=Some + pd=Some on the same
-                    // entries) or undercount (pa=None + pd=None).
-                    {
-                        let mut active = self.shard.delta_active.lock();
-                        let mut draining = self.shard.delta_draining.lock();
-                        for (pba, pending) in drained.iter() {
-                            active.merge(*pba, pending.delta, pending.last_lsn);
-                        }
-                        *draining = None;
-                    }
-                    self.state.in_cycle.store(false, Ordering::Release);
-                    continue;
-                }
-            };
-            let pages_built = new_pages.len();
-
-            // ── Transition 2: draining → overlay ─────────────────────
-            // Hold `delta_draining.lock` for the entire publish-and-
-            // clear so no reader observes (pd=Some AND overlay_entry
-            // for the same page) — that combination would double-count
-            // because the sealed page already encodes the drained
-            // contributions. `bulk_insert` performs the overlay write
-            // under a single overlay-mutex acquire so the publish is
-            // atomic on its own; the outer `delta_draining` lock makes
-            // the overall pre/post atomic from the reader's view.
-            {
-                let mut draining = self.shard.delta_draining.lock();
-                self.shard.overlay.bulk_insert(new_pages);
-                *draining = None;
-            }
-
-            let elapsed = cycle_started.elapsed();
-            let overlay_size = self.shard.overlay.approx_size();
-            self.metrics
-                .record_rc_drainer_cycle(drained_len, pages_built, elapsed, overlay_size);
-            cycle_count += 1;
-            // One-shot log per shard confirming the cycle path actually
-            // fires (the bare metric counter doesn't distinguish "first
-            // ever cycle" from "ongoing"; this lets us catch a shard
-            // whose worker thread started but never reached a cycle).
-            if cycle_count == 1 {
-                tracing::info!(
-                    shard = self.shard_idx,
-                    drained_len,
-                    pages_built,
-                    elapsed_us = elapsed.as_micros() as u64,
-                    "rc-drainer: first cycle completed"
-                );
-            }
-            self.state.in_cycle.store(false, Ordering::Release);
-            self.state.cv.notify_all();
-        }
-    }
-}
-
-/// Read one slot from a sealed `Arc<Page>` produced by the drainer or
-/// by `stage_deltas_in_memory`. Mirrors `array::read_entry` but takes
-/// a `Page` rather than `&Page` for sealed-from-Arc convenience.
-fn read_entry_from_sealed(page: &Arc<Page>, slot: usize) -> RcEntry {
-    let payload = page.payload();
-    let off = slot * super::array::ENTRY_BYTES;
-    let rc = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
-    let birth_lsn = u64::from_le_bytes(payload[off + 4..off + 12].try_into().unwrap());
-    RcEntry { rc, birth_lsn }
-}
-
-#[inline]
-fn page_offset(pba: Pba) -> (usize, usize) {
-    let pba = pba as usize;
-    let entries = super::array::ENTRIES_PER_PAGE;
-    (pba / entries, pba % entries)
 }
 
 #[cfg(test)]

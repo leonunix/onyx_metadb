@@ -154,6 +154,7 @@ impl Db {
             &self.volumes.read(),
             &self.refcount_shards,
             lsn,
+            _txg_guard.txg(),
             vol_ord,
             &pba_increfs,
             next_cursor,

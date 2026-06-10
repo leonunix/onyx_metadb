@@ -1321,14 +1321,8 @@ impl Drop for Db {
         // never drop and the threads would run forever — the same
         // circular-shutdown shape as the refcount drainers below.
         self.dedup_index.detach_drainers();
-        // Detach refcount drainers (priority 3) BEFORE the
-        // refcount_shards Box drops. Each drainer worker holds an
-        // `Arc<RcShard>` that would otherwise prevent
-        // `RcShard::drop` from running until its own thread joined,
-        // creating a circular shutdown.
-        for shard in self.refcount_shards.iter() {
-            shard.rc.detach_drainer();
-        }
+        // The refcount fold is inline + per-TXG-slot now — no background rc
+        // drainer threads to detach (see `refcount::shard`).
         // ApplyLanes have their own Drop that joins their workers;
         // they fire automatically when the Box goes out of scope.
     }

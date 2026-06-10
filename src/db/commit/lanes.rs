@@ -313,6 +313,7 @@ impl Db {
         }
         QueuedLanePlan {
             ops,
+            txg,
             l2p_receivers,
             rc_buckets: plan.rc_buckets,
             dedup_buckets: plan.dedup_buckets,
@@ -361,6 +362,10 @@ impl Db {
             return Err(err);
         }
 
+        // TXG this commit is stamped to. The rc/dedup `rc.stage(txg, …)`
+        // below must land in this slot (kept frozen-open by the commit's
+        // still-held `TxgGuard`, since we await every receiver here).
+        let txg = plan.txg;
         let mut rc_receivers = Vec::new();
         let rc_enqueue_started = std::time::Instant::now();
         for sid in 0..plan.rc_buckets.len() {
@@ -374,7 +379,8 @@ impl Db {
             self.refcount_shards[sid].apply_lane.enqueue_ready(
                 lsn,
                 Box::new(move || {
-                    let result = Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn);
+                    let result =
+                        Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn, txg);
                     let _ = tx.send(result);
                 }),
             );
@@ -427,41 +433,25 @@ impl Db {
             return Err(err);
         }
 
-        // Fan dedup work out across shards. Each non-empty bucket
-        // gets its own apply closure on its shard's lane.
+        // Fan dedup work out across shards. Each non-empty bucket gets
+        // its own apply closure on its shard's lane; the commit thread
+        // AWAITS every one before returning.
         //
-        // The async path is valid only when:
-        // 1. The commit carries a non-dedup op (L2P / refcount /
-        //    volume lifecycle) whose outcome the caller is already
-        //    blocked on. Pure-dedup commits — `db.put_dedup` /
-        //    `db.delete_dedup` / `tx` with only dedup ops — must
-        //    synchronise so the caller's follow-up `get_dedup`
-        //    observes the put.
-        // 2. No `DedupCompare*` ops are present — their `applied`
-        //    flag is consumed by the caller (e.g. cleanup CAS path).
-        //
-        // When async-safe, hot-path callers only inspect `L2pRemap` /
-        // `RefcountNew` outcome slots earlier in the vec; the
-        // `ApplyOutcome::Dedup` marker for the async dedup ops is a
-        // placeholder so the slot is filled.
-        let has_non_dedup_op = plan.ops.iter().any(|op| {
-            !matches!(
-                op,
-                WalOp::DedupPut { .. }
-                    | WalOp::DedupPutGuarded { .. }
-                    | WalOp::DedupDelete { .. }
-                    | WalOp::DedupCompareDelete { .. }
-                    | WalOp::DedupComparePut { .. }
-            )
-        });
-        let no_sync_required_dedup_ops = plan.ops.iter().all(|op| {
-            !matches!(
-                op,
-                WalOp::DedupCompareDelete { .. } | WalOp::DedupComparePut { .. }
-            )
-        });
-        let dedup_async_safe = has_non_dedup_op && no_sync_required_dedup_ops;
-
+        // The previous async dispatch (fire the dedup closure on its lane
+        // and return without awaiting) is gone under the TXG-slot refcount
+        // model: under `rc_authoritative` the dedup bucket stages derived
+        // refcount deltas (`DedupPut` membership ±1), and those must land
+        // in THIS commit's TXG slot to stay aligned with the dedup_index
+        // entry's durability. If the closure ran after the commit returned
+        // (and its `TxgGuard` dropped), this TXG could roll to Syncing and
+        // its slot fold/clear before the stage landed → a foreign-slot rc
+        // delta and a refcount-vs-dedup_index durability skew on replay.
+        // Awaiting keeps the `TxgGuard` alive across `rc.stage(txg, …)`, so
+        // the slot stays frozen-open. The dedup_index cuckoo write itself
+        // is already moved off the commit critical path by the dedup
+        // drainer; awaiting here costs only the cheap `stage_put` + rc
+        // stage. `DedupCompare*` ops were already on this awaited path
+        // (their `applied` flag feeds the caller).
         let mut dedup_receivers: Vec<
             crossbeam_channel::Receiver<Result<Vec<(usize, ApplyOutcome)>>>,
         > = Vec::new();
@@ -478,72 +468,34 @@ impl Db {
             let dedup_index = self.dedup_index.clone();
             let refcount_shards_arc = refcount_shards_arc.clone();
             let metrics = self.metrics.clone();
-            if dedup_async_safe {
-                pending.set(Box::new(move || {
-                    let ready_queue_wait = ready_at.elapsed();
-                    let exec_started = std::time::Instant::now();
-                    let _outcomes = Self::apply_dedup_indices_to(
-                        dedup_index.as_ref(),
-                        refcount_shards_arc.as_slice(),
-                        metrics.as_ref(),
-                        ops.as_slice(),
-                        bucket,
-                        lsn,
-                    );
-                    metrics.record_dedup_lane_task(
-                        bucket_ops,
-                        ready_queue_wait,
-                        exec_started.elapsed(),
-                    );
-                }));
-            } else {
-                let (tx, rx) = crossbeam_channel::bounded(1);
-                pending.set(Box::new(move || {
-                    let ready_queue_wait = ready_at.elapsed();
-                    let exec_started = std::time::Instant::now();
-                    let outcomes = Self::apply_dedup_indices_to(
-                        dedup_index.as_ref(),
-                        refcount_shards_arc.as_slice(),
-                        metrics.as_ref(),
-                        ops.as_slice(),
-                        bucket,
-                        lsn,
-                    );
-                    metrics.record_dedup_lane_task(
-                        bucket_ops,
-                        ready_queue_wait,
-                        exec_started.elapsed(),
-                    );
-                    let _ = tx.send(outcomes);
-                }));
-                dedup_receivers.push(rx);
-            }
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            pending.set(Box::new(move || {
+                let ready_queue_wait = ready_at.elapsed();
+                let exec_started = std::time::Instant::now();
+                let outcomes = Self::apply_dedup_indices_to(
+                    dedup_index.as_ref(),
+                    refcount_shards_arc.as_slice(),
+                    metrics.as_ref(),
+                    ops.as_slice(),
+                    bucket,
+                    lsn,
+                    txg,
+                );
+                metrics.record_dedup_lane_task(bucket_ops, ready_queue_wait, exec_started.elapsed());
+                let _ = tx.send(outcomes);
+            }));
+            dedup_receivers.push(rx);
         }
         timing.dedup_enqueue = dedup_enqueue_started.elapsed();
         let dedup_wait_started = std::time::Instant::now();
-        if dedup_async_safe {
-            for (idx, op) in plan.ops.iter().enumerate() {
-                if outcomes[idx].is_none()
-                    && matches!(
-                        op,
-                        WalOp::DedupPut { .. }
-                            | WalOp::DedupPutGuarded { .. }
-                            | WalOp::DedupDelete { .. }
-                    )
-                {
-                    outcomes[idx] = Some(ApplyOutcome::Dedup);
-                }
-            }
-        } else {
-            for rx in dedup_receivers {
-                let dedup_outcomes = rx.recv().map_err(|_| {
-                    MetaDbError::Corruption(
-                        "persistent dedup lane worker failed to return a result".into(),
-                    )
-                })??;
-                for (idx, outcome) in dedup_outcomes {
-                    outcomes[idx] = Some(outcome);
-                }
+        for rx in dedup_receivers {
+            let dedup_outcomes = rx.recv().map_err(|_| {
+                MetaDbError::Corruption(
+                    "persistent dedup lane worker failed to return a result".into(),
+                )
+            })??;
+            for (idx, outcome) in dedup_outcomes {
+                outcomes[idx] = Some(outcome);
             }
         }
         timing.dedup_wait = dedup_wait_started.elapsed();
