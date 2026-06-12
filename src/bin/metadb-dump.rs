@@ -45,6 +45,8 @@ fn run() -> Result<ExitCode, String> {
         "lba" => cmd_lba(&rest),
         "l2p" => cmd_l2p(&rest),
         "refcount" => cmd_refcount(&rest),
+        "forensic" => cmd_forensic(&rest),
+        "revscan" => cmd_revscan(&rest),
         "dedup" => cmd_dedup(&rest),
         "snapshots" => cmd_snapshots(&rest),
         _ => {
@@ -65,6 +67,14 @@ subcommands:
   l2p            <path> [--vol ORD] [--from LBA] [--to LBA] [--snapshot ID] [--limit N]
                                                 range scan over L2P
   refcount       <path> <pba>                   point lookup for PBA refcount
+  forensic       <path> --vol ORD --from LBA --to LBA
+                                                one-open batch: L2P entries for the
+                                                LBA range + refcounts of every PBA
+                                                they reference (CRC-debug forensics)
+  revscan        <path> <pba[,pba...]> [--vol ORD]
+                                                one-open full-volume L2P sweep: print
+                                                every live entry referencing the target
+                                                PBAs, then live_refs vs refcount per PBA
   dedup          <path> <hash-hex>              point lookup in dedup_index
   snapshots      <path>                         list registered snapshots"
     );
@@ -329,6 +339,102 @@ fn bounded_range(
 
 // -------- refcount / dedup ----------------------------------------------
 
+/// One-open forensics batch for CRC debugging: dump the L2P entry of
+/// every LBA in `[--from, --to]` and the refcount of every distinct PBA
+/// those entries reference. Opening this size of production metadb takes
+/// tens of minutes (free-list / cuckoo-filter rebuild), so per-query
+/// process invocations are impractical — this folds the whole evidence
+/// sweep into a single open.
+fn cmd_forensic(args: &[String]) -> Result<ExitCode, String> {
+    let Parsed {
+        path,
+        vol,
+        from,
+        to,
+        ..
+    } = parse_flags(
+        args,
+        ParseSpec::path_only().with_vol().with_from_to(),
+    )?;
+    let (Some(from), Some(to)) = (from, to) else {
+        return Err("forensic requires --from and --to".into());
+    };
+    let vol = vol.unwrap_or(0);
+    let db = open_db(&path)?;
+    let mut pbas: Vec<u64> = Vec::new();
+    for lba in from..=to {
+        match db.get(vol, lba).map_err(|e| e.to_string())? {
+            Some(v) => {
+                let raw = v.0;
+                let pba = u64::from_be_bytes(raw[0..8].try_into().unwrap());
+                println!("lba {lba}: pba={pba} raw={}", hex_of(&raw));
+                if !pbas.contains(&pba) {
+                    pbas.push(pba);
+                }
+            }
+            None => println!("lba {lba}: <unmapped>"),
+        }
+    }
+    for pba in pbas {
+        let count = db.get_refcount(pba).map_err(|e| e.to_string())?;
+        println!("refcount pba {pba}: {count}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One-open reverse sweep for CRC forensics: walk the entire live L2P of
+/// a volume and print every entry whose head-8B PBA is in the target set,
+/// then reconcile live reference count vs the refcount table per PBA.
+/// Same one-open rationale as `cmd_forensic` (production open ~30min).
+fn cmd_revscan(args: &[String]) -> Result<ExitCode, String> {
+    let Parsed {
+        path,
+        vol,
+        positional,
+        ..
+    } = parse_flags(args, ParseSpec::one_positional().with_vol())?;
+    let vol = vol.unwrap_or(0);
+    let targets: Vec<u64> = positional[0]
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u64>()
+                .map_err(|e| format!("bad pba `{s}`: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if targets.is_empty() {
+        return Err("revscan requires at least one pba".into());
+    }
+    let db = open_db(&path)?;
+    let mut live_refs: Vec<(u64, u64)> = targets.iter().map(|&p| (p, 0)).collect();
+    let mut scanned: u64 = 0;
+    for row in db
+        .range(vol, bounded_range(None, None))
+        .map_err(|e| e.to_string())?
+    {
+        let (lba, value) = row.map_err(|e| e.to_string())?;
+        scanned += 1;
+        if scanned % 10_000_000 == 0 {
+            eprintln!("revscan: {scanned} live entries scanned...");
+        }
+        let pba = u64::from_be_bytes(value.0[0..8].try_into().unwrap());
+        if let Some(entry) = live_refs.iter_mut().find(|(p, _)| *p == pba) {
+            entry.1 += 1;
+            println!("lba {lba}: pba={pba} raw={}", hex_of(&value.0));
+        }
+    }
+    println!("scanned {scanned} live entries in vol {vol}");
+    for (pba, refs) in &live_refs {
+        let rc = db.get_refcount(*pba).map_err(|e| e.to_string())?;
+        println!("pba {pba}: live_refs={refs} refcount={rc}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_refcount(args: &[String]) -> Result<ExitCode, String> {
     let Parsed {
         path,
@@ -582,7 +688,22 @@ fn parse_hash32(s: &str) -> Result<Hash8, String> {
 // -------- helpers --------------------------------------------------------
 
 fn open_db(path: &Path) -> Result<std::sync::Arc<Db>, String> {
-    Db::open(path).map_err(|e| e.to_string())
+    // dedup_shards / dedup_cuckoo_buckets are part of the on-disk layout
+    // and must match the manifest; the production profiles use non-default
+    // values, so allow env overrides for offline inspection:
+    //   METADB_DUMP_DEDUP_SHARDS=8 METADB_DUMP_CUCKOO_BUCKETS=64000000
+    let mut cfg = onyx_metadb::Config::new(path);
+    if let Ok(v) = env::var("METADB_DUMP_DEDUP_SHARDS") {
+        cfg.dedup_shards = v
+            .parse()
+            .map_err(|e| format!("METADB_DUMP_DEDUP_SHARDS: {e}"))?;
+    }
+    if let Ok(v) = env::var("METADB_DUMP_CUCKOO_BUCKETS") {
+        cfg.dedup_cuckoo_buckets = v
+            .parse()
+            .map_err(|e| format!("METADB_DUMP_CUCKOO_BUCKETS: {e}"))?;
+    }
+    Db::open_with_config(cfg).map_err(|e| e.to_string())
 }
 
 fn fmt_page(id: PageId) -> String {
