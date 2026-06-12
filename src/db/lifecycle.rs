@@ -629,17 +629,19 @@ impl Db {
             let results: Vec<Result<()>> = std::thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for vol in &vols {
-                    for shard in &vol.shards {
+                    for (shard_idx, shard) in vol.shards.iter().enumerate() {
                         if !shard.use_buffer {
                             continue;
                         }
                         handles.push(scope.spawn(move || {
-                            // Clear the single-CPU affinity inherited from the
-                            // pinned `metadb-txg-sync` parent so these workers
-                            // actually spread across cores (ZFS `dp_sync_taskq`
-                            // runs unpinned at normal priority). Without this all
-                            // 16 pile onto one core → slower than serial.
-                            crate::affinity::unbind_current();
+                            // Escape the single-CPU affinity inherited from
+                            // the pinned `metadb-txg-sync` parent. Under NUMA
+                            // partition this binds to the shard's pod (the
+                            // COW fold touches node-local pages); otherwise
+                            // it widens to all CPUs (ZFS `dp_sync_taskq`
+                            // runs unpinned at normal priority) — without
+                            // either, all 16 pile onto one core.
+                            crate::affinity::bind_for_l2p_drain(shard_idx);
                             Self::drain_one_syncing_shard(shard, txg, metrics)
                         }));
                     }

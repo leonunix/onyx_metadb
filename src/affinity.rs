@@ -82,12 +82,69 @@ struct CpuSet {
 }
 
 static LAYOUT: OnceLock<Option<AffinityLayout>> = OnceLock::new();
+static NODE_LAYOUT: OnceLock<NodeAffinityConfig> = OnceLock::new();
+
+/// One NUMA "pod": a data node's engine CPU pool.
+#[derive(Clone, Debug)]
+pub struct NodePod {
+    pub node: usize,
+    pub cpus: Vec<usize>,
+}
+
+/// NUMA-partitioned placement (set by the embedding engine, e.g. onyx
+/// `[numa] mode = "partition"`). Takes precedence over the string-based
+/// `AffinityConfig`: shard-indexed roles bind to their shard's pod CPU SET
+/// (not a single CPU) and set their own memory policy to prefer the pod's
+/// node so per-shard structures first-touch locally; singletons (WAL,
+/// TxgSync, IoSubmitter) bind to the home pod.
+#[derive(Clone, Debug)]
+pub struct NodeAffinityConfig {
+    pub pods: Vec<NodePod>,
+    pub home_pod: usize,
+    /// L2P/refcount shard index → pod index (len = shards_per_partition).
+    pub shard_pods: Vec<usize>,
+    /// Dedup shard index → pod index (len = dedup_shards).
+    pub dedup_shard_pods: Vec<usize>,
+}
 
 pub fn configure(config: AffinityConfig) {
     let _ = LAYOUT.set(AffinityLayout::from_config(config));
 }
 
+pub fn configure_nodes(config: NodeAffinityConfig) {
+    let _ = NODE_LAYOUT.set(config);
+}
+
+impl NodeAffinityConfig {
+    fn pod_for(&self, role: ThreadRole, ordinal: usize) -> &NodePod {
+        let idx = match role {
+            ThreadRole::L2pApply | ThreadRole::RefcountApply | ThreadRole::RefcountDrainer => {
+                self.shard_pods[ordinal % self.shard_pods.len().max(1)]
+            }
+            ThreadRole::DedupApply | ThreadRole::DedupDrainer => {
+                self.dedup_shard_pods[ordinal % self.dedup_shard_pods.len().max(1)]
+            }
+            ThreadRole::Wal | ThreadRole::TxgSync | ThreadRole::IoSubmitter => self.home_pod,
+        };
+        &self.pods[idx.min(self.pods.len() - 1)]
+    }
+}
+
 pub(crate) fn bind_current(role: ThreadRole, ordinal: usize) {
+    if let Some(nodes) = NODE_LAYOUT.get() {
+        if !nodes.pods.is_empty() {
+            let pod = nodes.pod_for(role, ordinal);
+            if let Err(err) = set_thread_preferred_node(pod.node) {
+                tracing::warn!(?role, ordinal, node = pod.node, error = %err,
+                    "failed to set metadb thread memory policy");
+            }
+            if let Err(err) = set_current_cpus(&pod.cpus) {
+                tracing::warn!(?role, ordinal, error = %err,
+                    "failed to set metadb thread CPU affinity");
+            }
+            return;
+        }
+    }
     let Some(Some(layout)) = LAYOUT.get() else {
         return;
     };
@@ -102,6 +159,24 @@ pub(crate) fn bind_current(role: ThreadRole, ordinal: usize) {
             "failed to set metadb thread CPU affinity"
         );
     }
+}
+
+/// Placement for the parallel L2P TXG-drain workers (one per shard,
+/// scope-spawned from the pinned `metadb-txg-sync` thread). Under NUMA
+/// partition each worker binds to its shard's pod so the COW fold touches
+/// node-local pages; otherwise fall back to the legacy "widen to all CPUs"
+/// (the ZFS `dp_sync_taskq` analog) to escape the inherited single-CPU pin.
+pub(crate) fn bind_for_l2p_drain(shard_idx: usize) {
+    if let Some(nodes) = NODE_LAYOUT.get() {
+        if !nodes.pods.is_empty() {
+            let pod = nodes.pod_for(ThreadRole::L2pApply, shard_idx);
+            let _ = set_thread_preferred_node(pod.node);
+            if set_current_cpus(&pod.cpus).is_ok() {
+                return;
+            }
+        }
+    }
+    unbind_current();
 }
 
 impl AffinityLayout {
@@ -206,6 +281,78 @@ fn set_current_cpu(cpu: usize) -> std::io::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn set_current_cpu(_cpu: usize) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_current_cpus(cpus: &[usize]) -> std::io::Result<()> {
+    const CPU_SETSIZE: usize = 1024;
+    const BITS_PER_WORD: usize = 8 * std::mem::size_of::<libc::c_ulong>();
+    if cpus.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty cpu set",
+        ));
+    }
+    let mut set = [0 as libc::c_ulong; CPU_SETSIZE / BITS_PER_WORD];
+    for &cpu in cpus {
+        if cpu >= CPU_SETSIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("cpu {cpu} >= CPU_SETSIZE {CPU_SETSIZE}"),
+            ));
+        }
+        set[cpu / BITS_PER_WORD] |= (1 as libc::c_ulong) << (cpu % BITS_PER_WORD);
+    }
+    let rc = unsafe {
+        libc::sched_setaffinity(
+            0,
+            std::mem::size_of_val(&set),
+            set.as_ptr().cast::<libc::cpu_set_t>(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_current_cpus(_cpus: &[usize]) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Set the calling thread's memory policy to prefer `node` (children
+/// inherit). PREFERRED, not BIND: when the node fills the kernel spills
+/// instead of stalling in local direct reclaim.
+#[cfg(target_os = "linux")]
+fn set_thread_preferred_node(node: usize) -> std::io::Result<()> {
+    const MPOL_PREFERRED: i32 = 1;
+    if node >= 64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("node {node} >= 64 unsupported"),
+        ));
+    }
+    let mask: u64 = 1 << node;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            MPOL_PREFERRED,
+            &mask as *const u64,
+            65usize,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_thread_preferred_node(_node: usize) -> std::io::Result<()> {
     Ok(())
 }
 
