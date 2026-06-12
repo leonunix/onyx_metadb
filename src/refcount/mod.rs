@@ -106,6 +106,37 @@ pub fn underflow_clamped_total() -> u64 {
 /// "current value" computation, all shards.
 static READ_UNDERFLOW_FLOORED: AtomicU64 = AtomicU64::new(0);
 
+/// Count of data-page reads served from the dirty-staged overlay
+/// (staged-but-not-yet-durable checkpoint pages), all shards.
+static STAGED_OVERLAY_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Total rc data-page reads served from the dirty-staged overlay. Each
+/// hit is a read that, pre-overlay, would have raced the checkpoint's
+/// deferred page write: for a fresh page it would have read unwritten
+/// disk zeros (`PageMagicMismatch` → commit error), for a re-staged page
+/// it COULD have read pre-fold content if the LRU had evicted the staged
+/// copy (silent rc under-count). Non-zero under load is expected and
+/// healthy — it proves the overlay is absorbing the race.
+pub fn staged_overlay_hits_total() -> u64 {
+    STAGED_OVERLAY_HITS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub(crate) fn note_staged_overlay_hit() {
+    let total = STAGED_OVERLAY_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Power-of-two rate limit: ~40 lines over a process lifetime, just
+    // enough to confirm in logs that the overlay is absorbing the
+    // checkpoint-window race (each hit was a PageMagicMismatch commit
+    // error or a silent rc under-count pre-overlay).
+    if total.is_power_of_two() {
+        tracing::info!(
+            target: "onyx_metadb::refcount::staged_overlay",
+            hits_total = total,
+            "rc read served from dirty-staged checkpoint overlay"
+        );
+    }
+}
+
 /// Total read-side merge underflows floored to rc=0. A non-zero value
 /// means a read observed a transiently-inconsistent `(delta_active,
 /// array)` sample — the value's logical floor is 0 and the read returned

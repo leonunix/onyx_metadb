@@ -384,6 +384,17 @@ impl RcShard {
         self.array.install_meta_chain(new_chain);
     }
 
+    /// Drop the dirty-staged overlay entries for `ckpt`'s pages. The
+    /// flush hot path MUST call this once `write_sealed_page_runs` +
+    /// `page_store.sync()` have made the staged bytes durable; until
+    /// then the overlay is what protects concurrent rc reads from the
+    /// evictable-LRU / unwritten-disk window (see
+    /// `PagedRefcountArray`'s `staged_overlay` doc). The cold path
+    /// (`RcShard::flush` → `write_staged_pages`) clears internally.
+    pub fn mark_staged_durable(&self, ckpt: &RcCheckpoint) {
+        self.array.clear_staged(&ckpt.staged);
+    }
+
     /// Roll back a checkpoint that failed before install. Frees fresh
     /// page ids + invalidates touched cache entries, then restores the
     /// drained deltas into a live slot so a retry redoes the fold.

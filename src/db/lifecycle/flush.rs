@@ -848,6 +848,19 @@ impl Db {
         self.metrics.record_flush_io_sync(sync_started.elapsed());
         self.metrics
             .record_flush_io(io_started.elapsed(), total_pages_written);
+        // RC staged data pages are durable on disk now — drop the
+        // dirty-staged overlay so rc reads go back to cache/disk. Until
+        // this point the overlay is the ONLY eviction-proof copy of the
+        // staged pages (the LRU insert in `stage_one_page` can be
+        // evicted; a fresh page's disk backing is unwritten zeros). The
+        // abort paths below remain correct after the clear: abort
+        // restores `page_table`/deltas and the now-durable bytes on
+        // disk are simply orphaned, exactly as pre-overlay.
+        for (s_idx, ckpt_opt) in refcount_checkpoints.iter().enumerate() {
+            if let Some(ckpt) = ckpt_opt {
+                self.refcount_shards[s_idx].rc.mark_staged_durable(ckpt);
+            }
+        }
         // Dead-list segment pages are now durable on disk. The
         // manifest still references the OLD tails until the commit
         // below; if it fails we restore drained records to the
