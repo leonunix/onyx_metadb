@@ -347,3 +347,82 @@ fn pending_delta_count_sums_all_slots() {
     s.stage(2, 3, 1, 1).unwrap();
     assert_eq!(s.pending_delta_count(), 3);
 }
+
+/// Regression for the rc_authoritative premature-free CRC (2026-06-12 r2
+/// soak, pba 661307): a fold's publish-before-clear window lets a cumulative
+/// read straddle it and double-count a NET-DECREF slot, flooring a still-live
+/// rc to a spurious 0. Under `rc_authoritative_reclaim` the GC reclaim Gate-1
+/// treats that 0 as proof to irreversibly free the PBA (Gate-2 reverify is
+/// skipped) → reuse → read CRC. `get_consistent` holds `fold_lock` so it can
+/// never observe the torn state.
+///
+/// The writer keeps the TRUE cumulative rc oscillating in {4, 8} — NEVER 0 —
+/// while folding a net `-4` every iteration (the exact tear-prone shape). The
+/// reader asserts `get_consistent` never dips below the true floor of 4.
+/// Flip `get_consistent` → `get` and this fails (the plain read tears to 0).
+#[test]
+fn get_consistent_never_reads_spurious_zero_under_concurrent_fold() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    let (_d, s) = make_shard();
+    let s = Arc::new(s);
+    let pba: Pba = 4242;
+
+    // Durable base rc = 8 (folded). True cumulative rc stays in {4, 8}.
+    s.stage(0, pba, 8, 1).unwrap();
+    s.begin_checkpoint(0).unwrap();
+    assert_eq!(s.get(pba).unwrap(), 8);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // Count how often the PLAIN (racy) read tears below the floor — proves
+    // the window is actually exercised on this run (observational, not an
+    // assertion, so it can't be flaky).
+    let plain_torn = Arc::new(AtomicU32::new(0));
+
+    let writer = {
+        let s = s.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut lsn = 100u64;
+            let mut txg = 1u64;
+            while !stop.load(Ordering::Relaxed) {
+                // decref 4 then fold (array 8 -> 4): net-decref publish.
+                s.stage(txg, pba, -4, lsn).unwrap();
+                lsn += 1;
+                s.begin_checkpoint(txg).unwrap();
+                txg += 1;
+                // incref 4 back then fold (array 4 -> 8).
+                s.stage(txg, pba, 4, lsn).unwrap();
+                lsn += 1;
+                s.begin_checkpoint(txg).unwrap();
+                txg += 1;
+            }
+        })
+    };
+
+    let mut min_consistent = u32::MAX;
+    for _ in 0..200_000 {
+        let rc = s.get_consistent(pba).unwrap();
+        min_consistent = min_consistent.min(rc);
+        assert!(
+            rc >= 4,
+            "get_consistent observed spurious rc={rc} (true rc always in {{4,8}})"
+        );
+        // Observe the plain read's tearing without gating the test on it.
+        if s.get(pba).unwrap() < 4 {
+            plain_torn.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        min_consistent == 4 || min_consistent == 8,
+        "expected to observe both arms; min_consistent={min_consistent}"
+    );
+    eprintln!(
+        "plain (racy) get torn below floor {} / 200000 times",
+        plain_torn.load(Ordering::Relaxed)
+    );
+}

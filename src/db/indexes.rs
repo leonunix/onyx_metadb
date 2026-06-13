@@ -35,6 +35,39 @@ impl Db {
         Ok(out)
     }
 
+    /// Fold-consistent batched refcount lookup. Same shape and order as
+    /// [`multi_get_refcount`], but each shard read goes through
+    /// [`crate::refcount::shard::RcShard::get_consistent`], which holds the
+    /// shard's `fold_lock` so the read cannot straddle a concurrent fold's
+    /// [publish, clear] window and observe a torn (double-counted) delta.
+    ///
+    /// Use this — not `multi_get_refcount` — wherever an rc==0 reading drives
+    /// an IRREVERSIBLE decision (GC reclaim freeing a PBA). The plain read's
+    /// transient floor-to-0 is reversible for the dedup-hit guard but
+    /// catastrophic for reclaim under `rc_authoritative_reclaim` (Gate-2
+    /// blockmap reverify is skipped, so a spurious 0 frees a live PBA).
+    pub fn multi_get_refcount_consistent(&self, pbas: &[Pba]) -> Result<Vec<u32>> {
+        if pbas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let shard_count = self.refcount_shards.len();
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
+        for (idx, pba) in pbas.iter().enumerate() {
+            buckets[self.refcount_shard_for(*pba)].push(idx);
+        }
+        let mut out: Vec<u32> = vec![0; pbas.len()];
+        for (sid, idxs) in buckets.into_iter().enumerate() {
+            if idxs.is_empty() {
+                continue;
+            }
+            let shard = &self.refcount_shards[sid];
+            for idx in idxs {
+                out[idx] = shard.rc.get_consistent(pbas[idx])?;
+            }
+        }
+        Ok(out)
+    }
+
     /// Test-only helper to seed PBA refcount state ahead of FreePbas /
     /// PromotionChunk apply scenarios. Phase 5 removed the per-write
     /// refcount path, so production code no longer needs an incref WAL

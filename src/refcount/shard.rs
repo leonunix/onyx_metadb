@@ -92,6 +92,22 @@ pub struct RcShard {
     /// is cumulative).
     delta_slots: [Mutex<DeltaMap>; TXG_SLOTS],
     pub(super) array: PagedRefcountArray,
+    /// Serialises the fold's [publish, clear] inconsistency window
+    /// against a *consistent* read ([`Self::get_consistent`]). The fold
+    /// (`checkpoint_slots`) installs the folded delta into the array and
+    /// only THEN clears the slot, so between the two a `sum_pending` +
+    /// `array.get` pair can straddle the fold and double-count the folded
+    /// delta — for a net-decref slot that under-counts and `merge_read_or_floor`
+    /// floors it to a SPURIOUS 0. The cheap hot read (`get`) tolerates that
+    /// (a dedup-hit guard just demotes to a fresh miss, fully reversible),
+    /// but the GC reclaim Gate-1 treats rc==0 as proof to IRREVERSIBLY free
+    /// the PBA (Gate-2 blockmap reverify is skipped under
+    /// `rc_authoritative_reclaim`) → premature free → reuse → read CRC.
+    /// The fold takes this in write mode across the in-memory publish+clear
+    /// (microseconds — the page IO is staged and written later); the
+    /// consistent read takes it in read mode across its sample. The hot
+    /// `get`/`stage` paths never touch it.
+    fold_lock: parking_lot::RwLock<()>,
 }
 
 /// Checkpoint produced by [`RcShard::begin_checkpoint`]. Carries the
@@ -186,6 +202,7 @@ impl RcShard {
         Self {
             delta_slots: std::array::from_fn(|_| Mutex::new(DeltaMap::new())),
             array,
+            fold_lock: parking_lot::RwLock::new(()),
         }
     }
 
@@ -203,6 +220,20 @@ impl RcShard {
     /// usually want [`get`].
     pub fn get_entry(&self, pba: Pba) -> Result<RcEntry> {
         self.lookup_entry(pba)
+    }
+
+    /// Fold-consistent refcount read. Unlike [`get`] (which can straddle a
+    /// concurrent fold's [publish, clear] window and transiently double-count
+    /// the folded delta — under-counting a net-decref slot to a spurious 0),
+    /// this takes `fold_lock` in read mode so it never overlaps the fold's
+    /// inconsistency window. The returned rc reflects a coherent
+    /// `array.base ⊕ Σ pending` sample. Used by the GC reclaim path, where an
+    /// rc==0 misread is irreversible (frees a still-referenced PBA). Costlier
+    /// than `get` (a shared lock); keep it on the cold reclaim path, not the
+    /// dedup hot path.
+    pub fn get_consistent(&self, pba: Pba) -> Result<u32> {
+        let _read = self.fold_lock.read();
+        Ok(self.lookup_entry(pba)?.rc)
     }
 
     /// Sum the pending deltas for `pba` across all four slots. Returns
@@ -320,6 +351,15 @@ impl RcShard {
             });
         }
 
+        // The [publish, clear] span below is the only window where the
+        // array and the slots disagree (array folded, slot not yet cleared).
+        // Hold `fold_lock` in write mode across it so a concurrent
+        // `get_consistent` can never observe that torn state (the cheap `get`
+        // still can, by design — see the field doc). This guards only the
+        // in-memory publish+clear; the staged pages' IO happens later in the
+        // flush, outside this lock, so the critical section is microseconds.
+        let _fold = self.fold_lock.write();
+
         // Fold + publish into the array (cache + page_table) WITHOUT
         // clearing the slots yet.
         let staged = self.array.stage_deltas_in_memory(drained.clone())?;
@@ -331,6 +371,7 @@ impl RcShard {
         for &i in slots {
             *self.delta_slots[i].lock() = DeltaMap::new();
         }
+        drop(_fold);
 
         let snapshot_page_table = self.array.page_table_snapshot();
         let snapshot_meta_chain = self.array.meta_chain_snapshot();
