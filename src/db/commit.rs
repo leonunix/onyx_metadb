@@ -3,8 +3,8 @@ use super::*;
 mod lanes;
 pub(crate) mod outcomes;
 
-pub use outcomes::DeferredOutcomeHandle;
 pub(crate) use outcomes::DeferredOutcomeAggregator;
+pub use outcomes::DeferredOutcomeHandle;
 
 #[derive(Clone, Copy, Debug)]
 struct RcApplyAction {
@@ -285,6 +285,13 @@ impl Db {
         *self.last_applied_lsn.lock()
     }
 
+    /// Status-only variant backed by a non-blocking mirror so external
+    /// observation never waits on commit apply.
+    pub fn last_applied_lsn_best_effort(&self) -> Lsn {
+        self.last_applied_lsn_observed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(super) fn enter_active_apply(&self, lsn: Lsn) -> ActiveApplyGuard<'_> {
         self.active_apply_lsns.lock().insert(lsn);
         ActiveApplyGuard { db: self, lsn }
@@ -510,10 +517,7 @@ impl Db {
     /// caller thread or at the next compactor cycle. The on-disk
     /// state observed by readers is identical in both modes — only
     /// outcome *delivery* shifts.
-    pub fn commit_ops_deferred(
-        &self,
-        ops: &[WalOp],
-    ) -> Result<(Lsn, DeferredOutcomeHandle)> {
+    pub fn commit_ops_deferred(&self, ops: &[WalOp]) -> Result<(Lsn, DeferredOutcomeHandle)> {
         // Empty op batch — return the no-work LSN immediately. Matches
         // the `commit_ops` early-out at line ~382 of this file.
         if ops.is_empty() {
@@ -761,8 +765,7 @@ impl Db {
                 return Err(err);
             }
         };
-        self.metrics
-            .record_commit_wal_submit(lsn_started.elapsed());
+        self.metrics.record_commit_wal_submit(lsn_started.elapsed());
         _txg_guard.record_lsn(lsn);
 
         let apply_started = std::time::Instant::now();
@@ -794,8 +797,7 @@ impl Db {
         // applied_set mutexes) folded into the opaque apply bucket.
         self.metrics
             .record_commit_finish_global_wait(finish_started.elapsed());
-        self.metrics
-            .record_commit_success(stage_started.elapsed());
+        self.metrics.record_commit_success(stage_started.elapsed());
         Ok((lsn, outcomes))
     }
 
@@ -868,8 +870,7 @@ impl Db {
         plan: LaneDispatchPlan,
         ops: &[WalOp],
     ) -> Result<Vec<ApplyOutcome>> {
-        let mut outcome_slots: Vec<Option<ApplyOutcome>> =
-            (0..ops.len()).map(|_| None).collect();
+        let mut outcome_slots: Vec<Option<ApplyOutcome>> = (0..ops.len()).map(|_| None).collect();
         // Snapshot rc shard handles once (cheap clones of Arcs).
         // Only the guarded-`L2pRemap` path inside `apply_l2p_bucket_buffer`
         // dereferences this; eligibility filters that case out, but
@@ -1232,8 +1233,7 @@ impl Db {
     ) -> Result<Lsn> {
         let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
             MetaDbError::Corruption(
-                "submit_lifecycle_op_with_dispatch called without an open lifecycle journal"
-                    .into(),
+                "submit_lifecycle_op_with_dispatch called without an open lifecycle journal".into(),
             )
         })?;
         let body = crate::lifecycle_log::op::encode(lifecycle_op);
@@ -1437,7 +1437,7 @@ impl Db {
     /// `commit_cvar`. The notify here only fires when the watermark
     /// actually advances, so out-of-order finishes don't broadcast.
     pub(super) fn finish_global_apply(&self, lsn: Lsn) -> Result<()> {
-        let advanced = {
+        let advanced_to = {
             let mut applied = self.last_applied_lsn.lock();
             let mut set = self.applied_set.lock();
             debug_assert!(
@@ -1455,13 +1455,19 @@ impl Db {
             while set.remove(&(*applied + 1)) {
                 *applied += 1;
             }
-            *applied != before
+            if *applied != before {
+                Some(*applied)
+            } else {
+                None
+            }
         };
         // Only notify on actual watermark advances. Lifecycle ops and
         // serial-apply commits waiting on `commit_cvar` care about the
         // watermark; out-of-order laned finishes that don't move it
         // don't need to wake anyone.
-        if advanced {
+        if let Some(applied) = advanced_to {
+            self.last_applied_lsn_observed
+                .store(applied, std::sync::atomic::Ordering::Relaxed);
             self.commit_cvar.notify_all();
         }
         Ok(())

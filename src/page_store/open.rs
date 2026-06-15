@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 impl PageStore {
     /// Create a brand-new page store at `path` with the default batch
@@ -79,6 +80,9 @@ impl PageStore {
                 committed_file_pages: FIRST_DATA_PAGE,
                 free_list: Vec::new(),
             }),
+            high_water_pages: AtomicU64::new(FIRST_DATA_PAGE),
+            free_list_pages: AtomicUsize::new(0),
+            deferred_free_pages: AtomicUsize::new(0),
             rc_locks: new_rc_locks(),
             grow_chunk,
             epoch: Arc::new(EpochManager::new()),
@@ -148,6 +152,9 @@ impl PageStore {
                 committed_file_pages: file_end_pages,
                 free_list: Vec::new(),
             }),
+            high_water_pages: AtomicU64::new(file_end_pages),
+            free_list_pages: AtomicUsize::new(0),
+            deferred_free_pages: AtomicUsize::new(0),
             rc_locks: new_rc_locks(),
             grow_chunk,
             epoch: Arc::new(EpochManager::new()),
@@ -224,6 +231,7 @@ impl PageStore {
             file.set_len(high_water * PAGE_SIZE as u64)?;
         }
         free_list.retain(|pid| *pid < high_water);
+        let free_list_pages = free_list.len();
         tracing::info!(
             path = %path.display(),
             scanned_pages = file_end_pages.saturating_sub(FIRST_DATA_PAGE),
@@ -246,6 +254,9 @@ impl PageStore {
                 committed_file_pages: high_water,
                 free_list,
             }),
+            high_water_pages: AtomicU64::new(high_water),
+            free_list_pages: AtomicUsize::new(free_list_pages),
+            deferred_free_pages: AtomicUsize::new(0),
             rc_locks: new_rc_locks(),
             grow_chunk,
             epoch: Arc::new(EpochManager::new()),

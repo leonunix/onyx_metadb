@@ -669,6 +669,14 @@ impl DedupIndex {
             l1_entries: self.l1.len(),
         }
     }
+
+    pub fn tier_sizes_best_effort(&self) -> TierSizes {
+        TierSizes {
+            l0_distinct_fps: self.sketch.try_len().unwrap_or(0),
+            l0_approx_bytes: self.sketch.try_approx_bytes().unwrap_or(0),
+            l1_entries: self.l1.try_len().unwrap_or(0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -688,7 +696,8 @@ mod tests {
         let path = dir.path().join("pages");
         let page_store = Arc::new(PageStore::create(&path).unwrap());
         let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
-        let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF, 4, false).unwrap();
+        let idx =
+            DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF, 4, false).unwrap();
         (dir, idx)
     }
 
@@ -699,7 +708,8 @@ mod tests {
         let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
         // drainer_enabled = true: stage_* defer into the staging layer
         // and reads consult it first.
-        let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF, 4, true).unwrap();
+        let idx =
+            DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF, 4, true).unwrap();
         (dir, idx)
     }
 
@@ -892,7 +902,8 @@ mod tests {
         {
             let page_store = Arc::new(PageStore::create(&path).unwrap());
             let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
-            let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF, 4, false).unwrap();
+            let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xDEAD, 0xBEEF, 4, false)
+                .unwrap();
             meta_page_id = idx.meta_page_id();
             for i in 0..30u8 {
                 idx.put(h(i), dv(i), (100 + i as u64) as Lsn).unwrap();

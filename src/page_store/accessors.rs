@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 impl PageStore {
     /// Path the store was opened from.
@@ -58,18 +59,18 @@ impl PageStore {
     /// this — production callers use [`try_reclaim`] which atomically
     /// drains.
     pub fn deferred_free_len(&self) -> usize {
-        self.deferred_free.lock().len()
+        self.deferred_free_pages.load(Ordering::Relaxed)
     }
 
     /// Next page id that will be handed out by `allocate` if the free list
     /// is empty. Also equals the file's length in pages.
     pub fn high_water(&self) -> u64 {
-        self.inner.lock().high_water
+        self.high_water_pages.load(Ordering::Relaxed)
     }
 
     /// Number of pages currently on the free list.
     pub fn free_list_len(&self) -> usize {
-        self.inner.lock().free_list.len()
+        self.free_list_pages.load(Ordering::Relaxed)
     }
 
     pub(super) fn check_in_range(&self, page_id: PageId) -> Result<()> {

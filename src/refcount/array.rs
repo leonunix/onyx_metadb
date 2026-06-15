@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
@@ -70,6 +71,7 @@ pub struct PagedRefcountArray {
     page_cache: Arc<PageCache>,
     meta_page_id: PageId,
     inner: Mutex<Inner>,
+    allocated_data_pages: AtomicUsize,
 }
 
 /// One sealed data page produced by a sample-phase stage. Tracks
@@ -169,6 +171,7 @@ impl PagedRefcountArray {
             page_cache,
             meta_page_id,
             inner: Mutex::new(inner),
+            allocated_data_pages: AtomicUsize::new(0),
         };
         // Persist an empty meta page so `open()` after a clean restart
         // sees a valid header rather than uninitialised bytes.
@@ -192,6 +195,7 @@ impl PagedRefcountArray {
             META_KEY_COUNT_MARKER,
             0,
         )?;
+        let allocated_data_pages = read.page_table.iter().filter(|&&pid| pid != 0).count();
         Ok(Self {
             page_store,
             page_cache,
@@ -202,6 +206,7 @@ impl PagedRefcountArray {
                 meta_dirty: false,
                 staged_overlay: HashMap::new(),
             }),
+            allocated_data_pages: AtomicUsize::new(allocated_data_pages),
         })
     }
 
@@ -330,6 +335,7 @@ impl PagedRefcountArray {
                 let pid = self.page_store.allocate()?;
                 inner.page_table[page_idx] = pid;
                 inner.meta_dirty = true;
+                self.allocated_data_pages.fetch_add(1, Ordering::Relaxed);
                 // A fresh pid's disk backing is unwritten zeros, so the
                 // pid must never be observable without overlay cover:
                 // publish an all-zero placeholder page under the SAME
@@ -385,8 +391,7 @@ impl PagedRefcountArray {
             // double-decref split across drainer cycles (the on-disk base
             // was already taken to 0 by an earlier cycle). Skip it (leave
             // the entry at its floor) instead of failing the checkpoint.
-            let (new, skipped) =
-                super::apply_delta_or_skip(prev, pending.delta, pending.last_lsn)?;
+            let (new, skipped) = super::apply_delta_or_skip(prev, pending.delta, pending.last_lsn)?;
             if skipped {
                 super::note_decref_underflow_skip(
                     pending.delta,
@@ -561,6 +566,7 @@ impl PagedRefcountArray {
                     {
                         inner.page_table[staged_page.page_idx] = 0;
                         inner.meta_dirty = true;
+                        self.allocated_data_pages.fetch_sub(1, Ordering::Relaxed);
                     }
                     // Must precede `page_store.free`: once the pid can
                     // be recycled, a lingering overlay entry would
@@ -668,8 +674,7 @@ impl PagedRefcountArray {
     /// Number of data pages currently allocated (excludes the meta
     /// page and unwritten holes).
     pub fn allocated_data_pages(&self) -> usize {
-        let inner = self.inner.lock();
-        inner.page_table.iter().filter(|&&pid| pid != 0).count()
+        self.allocated_data_pages.load(Ordering::Relaxed)
     }
 }
 

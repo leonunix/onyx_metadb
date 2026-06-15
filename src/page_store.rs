@@ -38,6 +38,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -109,6 +111,9 @@ pub struct PageStore {
     #[cfg(target_os = "linux")]
     write_uring: Mutex<Option<IoUring>>,
     inner: Mutex<Inner>,
+    high_water_pages: AtomicU64,
+    free_list_pages: AtomicUsize,
+    deferred_free_pages: AtomicUsize,
     /// Per-pid sharded mutexes serialising [`atomic_rc_delta`]. Needed
     /// because a page can be shared across multiple [`PagedL2p`]
     /// instances after `clone_volume` — two trees each holding their

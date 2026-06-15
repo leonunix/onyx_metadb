@@ -229,6 +229,10 @@ impl FpSketch {
         self.inner.read().occupancy
     }
 
+    pub fn try_len(&self) -> Option<usize> {
+        self.inner.try_read().map(|inner| inner.occupancy)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.read().occupancy == 0
     }
@@ -238,6 +242,12 @@ impl FpSketch {
     /// report.
     pub fn approx_bytes(&self) -> usize {
         self.inner.read().bucket_count * std::mem::size_of::<u64>()
+    }
+
+    pub fn try_approx_bytes(&self) -> Option<usize> {
+        self.inner
+            .try_read()
+            .map(|inner| inner.bucket_count * std::mem::size_of::<u64>())
     }
 
     /// Reset to empty. Used when a fresh database is created or when

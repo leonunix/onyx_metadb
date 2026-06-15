@@ -97,6 +97,10 @@ impl L1HotCache {
         self.inner.lock().len()
     }
 
+    pub fn try_len(&self) -> Option<usize> {
+        self.inner.try_lock().map(|cache| cache.len())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.lock().is_empty()
     }

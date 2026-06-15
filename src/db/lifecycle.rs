@@ -553,8 +553,7 @@ impl Db {
                 }
                 let count = drained.len();
                 let max_lsn = drained.values().map(|e| e.lsn).max().unwrap_or(0);
-                let apply_result =
-                    super::txg_sync::compact_drain_into_tree(&mut tree, &drained);
+                let apply_result = super::txg_sync::compact_drain_into_tree(&mut tree, &drained);
                 match apply_result {
                     Ok(()) => {
                         super::apply::publish_l2p_read_view(shard, &tree);
@@ -815,6 +814,10 @@ impl Db {
         self.dedup_index.tier_sizes()
     }
 
+    pub fn dedup_tier_sizes_best_effort(&self) -> crate::dedup::TierSizes {
+        self.dedup_index.tier_sizes_best_effort()
+    }
+
     /// Diagnostic snapshot of in-memory bookkeeping that can grow
     /// unbounded if its drain path stalls (deferred reclaim, dispatch
     /// FIFO, per-shard apply lane queues, per-shard COW retired/private
@@ -865,6 +868,69 @@ impl Db {
             // the data-page count as `private_pages` so the operator
             // still sees a "how big is this shard" gauge; the other
             // BTree-specific dials stay zero.
+            rc_private_pages += shard.rc.allocated_data_pages();
+            rc_pending_deltas += shard.rc.pending_delta_count();
+        }
+        PendingState {
+            dispatch_pending,
+            deferred_free,
+            dedup_lane_queue,
+            l2p_apply_queue,
+            l2p_private_pages,
+            l2p_retired_pages,
+            l2p_pagebuf_total,
+            l2p_pagebuf_dirty,
+            rc_apply_queue,
+            rc_private_pages,
+            rc_retired_pages,
+            rc_pagebuf_total,
+            rc_pagebuf_dirty,
+            rc_pending_deltas,
+        }
+    }
+
+    /// Best-effort variant for external status/metrics surfaces. It must
+    /// never wait behind hot-path locks: contended fields are skipped and
+    /// therefore may undercount during heavy apply/checkpoint activity.
+    pub fn pending_state_best_effort(&self) -> PendingState {
+        let dispatch_pending = self
+            .dispatch_state
+            .try_lock()
+            .map(|state| state.pending.len())
+            .unwrap_or(0);
+        let deferred_free = self.page_store.deferred_free_len();
+        let dedup_lane_queue: usize = self
+            .dedup_lanes
+            .iter()
+            .filter_map(|lane| lane.try_queue_len())
+            .sum();
+        let mut l2p_apply_queue = 0usize;
+        let mut l2p_private_pages = 0usize;
+        let mut l2p_retired_pages = 0usize;
+        let mut l2p_pagebuf_total = 0usize;
+        let mut l2p_pagebuf_dirty = 0usize;
+        if let Some(volumes) = self.volumes.try_read() {
+            for volume in volumes.values() {
+                for shard in &volume.shards {
+                    l2p_apply_queue += shard.apply_lane.try_queue_len().unwrap_or(0);
+                    if let Some(tree) = shard.tree.try_read() {
+                        let (priv_p, ret_p, total, dirty) = tree.growth_summary();
+                        l2p_private_pages += priv_p;
+                        l2p_retired_pages += ret_p;
+                        l2p_pagebuf_total += total;
+                        l2p_pagebuf_dirty += dirty;
+                    }
+                }
+            }
+        }
+        let mut rc_apply_queue = 0usize;
+        let mut rc_private_pages = 0usize;
+        let rc_retired_pages = 0usize;
+        let rc_pagebuf_total = 0usize;
+        let rc_pagebuf_dirty = 0usize;
+        let mut rc_pending_deltas = 0usize;
+        for shard in &self.refcount_shards {
+            rc_apply_queue += shard.apply_lane.try_queue_len().unwrap_or(0);
             rc_private_pages += shard.rc.allocated_data_pages();
             rc_pending_deltas += shard.rc.pending_delta_count();
         }

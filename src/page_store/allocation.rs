@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 impl PageStore {
     /// Allocate a fresh page id. If the free list has entries, one is
@@ -10,6 +11,7 @@ impl PageStore {
     pub fn allocate(&self) -> Result<PageId> {
         let mut inner = self.inner.lock();
         if let Some(page_id) = inner.free_list.pop() {
+            self.free_list_pages.fetch_sub(1, Ordering::Relaxed);
             return Ok(page_id);
         }
         let page_id = inner.high_water;
@@ -19,6 +21,7 @@ impl PageStore {
             .ok_or(MetaDbError::OutOfSpace)?;
         self.ensure_file_covers(&mut inner, new_high)?;
         inner.high_water = new_high;
+        self.high_water_pages.store(new_high, Ordering::Relaxed);
         Ok(page_id)
     }
 
@@ -41,6 +44,8 @@ impl PageStore {
             .map_err(|_| MetaDbError::InvalidArgument("page run too large".into()))?;
         let mut inner = self.inner.lock();
         if let Some(start) = take_contiguous_free_run(&mut inner.free_list, count_usize) {
+            self.free_list_pages
+                .fetch_sub(count_usize, Ordering::Relaxed);
             return Ok(start);
         }
         let start = inner.high_water;
@@ -50,6 +55,7 @@ impl PageStore {
             .ok_or(MetaDbError::OutOfSpace)?;
         self.ensure_file_covers(&mut inner, new_high)?;
         inner.high_water = new_high;
+        self.high_water_pages.store(new_high, Ordering::Relaxed);
         Ok(start)
     }
 
@@ -79,6 +85,10 @@ impl PageStore {
                 reused.push(page_id);
             }
         }
+        if !reused.is_empty() {
+            self.free_list_pages
+                .fetch_sub(reused.len(), Ordering::Relaxed);
+        }
 
         let missing = count - reused.len();
         let mut pages = Vec::with_capacity(count);
@@ -92,6 +102,7 @@ impl PageStore {
                 .ok_or(MetaDbError::OutOfSpace)?;
             self.ensure_file_covers(&mut inner, new_high)?;
             inner.high_water = new_high;
+            self.high_water_pages.store(new_high, Ordering::Relaxed);
             // Store new tail pages in reverse so `pop()` yields ascending ids.
             pages.extend((start..new_high).rev());
         }

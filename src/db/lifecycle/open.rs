@@ -104,13 +104,11 @@ impl Db {
         // Open a fresh lifecycle journal. Fresh DB → no segments
         // yet, so `next_seq` is 1 and `LifecycleJournal::open` simply
         // creates the directory and its first segment.
-        let lifecycle_journal = Some(Mutex::new(
-            crate::lifecycle_log::LifecycleJournal::open(
-                &lifecycle_log_dir(&cfg.path),
-                1,
-                cfg.wal_segment_bytes,
-            )?,
-        ));
+        let lifecycle_journal = Some(Mutex::new(crate::lifecycle_log::LifecycleJournal::open(
+            &lifecycle_log_dir(&cfg.path),
+            1,
+            cfg.wal_segment_bytes,
+        )?));
 
         let volume_zero = Arc::new(Volume::new(BOOTSTRAP_VOLUME_ORD, l2p_shards, 0));
         let mut volumes = HashMap::with_capacity(1);
@@ -144,12 +142,10 @@ impl Db {
             ApplyLaneKind::DedupMaintenance,
             metrics.clone(),
         );
-        let deferred_outcomes = Arc::new(
-            crate::db::commit::DeferredOutcomeAggregator::new(
-                metrics.clone(),
-                faults.clone(),
-            ),
-        );
+        let deferred_outcomes = Arc::new(crate::db::commit::DeferredOutcomeAggregator::new(
+            metrics.clone(),
+            faults.clone(),
+        ));
         let db = Self {
             page_store,
             page_cache,
@@ -172,6 +168,7 @@ impl Db {
             commit_direct_apply_enabled: cfg.commit_direct_apply_enabled,
             apply_gate: Arc::new(ApplyGate::new()),
             last_applied_lsn: Mutex::new(0),
+            last_applied_lsn_observed: AtomicU64::new(0),
             commit_cvar: Condvar::new(),
             applied_set: Mutex::new(BTreeSet::new()),
             active_apply_lsns: Mutex::new(BTreeSet::new()),
@@ -274,7 +271,10 @@ impl Db {
 
     /// As [`open_with_config`](Self::open_with_config) but with an
     /// injectable fault controller.
-    pub fn open_with_config_and_faults(cfg: Config, faults: Arc<FaultController>) -> Result<Arc<Self>> {
+    pub fn open_with_config_and_faults(
+        cfg: Config,
+        faults: Arc<FaultController>,
+    ) -> Result<Arc<Self>> {
         validate_phase5_refcount_mode(&cfg)?;
         let pages_path = page_file(&cfg.path);
         let page_store = Arc::new(if cfg.rebuild_free_list_on_open {
@@ -614,12 +614,10 @@ impl Db {
             metrics.clone(),
         );
 
-        let deferred_outcomes = Arc::new(
-            crate::db::commit::DeferredOutcomeAggregator::new(
-                metrics.clone(),
-                faults.clone(),
-            ),
-        );
+        let deferred_outcomes = Arc::new(crate::db::commit::DeferredOutcomeAggregator::new(
+            metrics.clone(),
+            faults.clone(),
+        ));
         let db = Self {
             page_store,
             page_cache,
@@ -642,6 +640,7 @@ impl Db {
             commit_direct_apply_enabled: cfg.commit_direct_apply_enabled,
             apply_gate: Arc::new(ApplyGate::new()),
             last_applied_lsn: Mutex::new(last_applied),
+            last_applied_lsn_observed: AtomicU64::new(last_applied),
             commit_cvar: Condvar::new(),
             applied_set: Mutex::new(BTreeSet::new()),
             active_apply_lsns: Mutex::new(BTreeSet::new()),
@@ -899,8 +898,7 @@ fn apply_lifecycle_record_replay(
                     l2p_buffer_enabled,
                 )?;
                 volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
-                let durable_seqs =
-                    vec![lsn; *shard_count as usize].into_boxed_slice();
+                let durable_seqs = vec![lsn; *shard_count as usize].into_boxed_slice();
                 manifest.volumes.push(VolumeEntry {
                     ord: *ord,
                     shard_count: *shard_count,
@@ -942,8 +940,7 @@ fn apply_lifecycle_record_replay(
                 // Sweep all volumes so a later cow_for_write during
                 // continued replay can't flush a stale rc back over
                 // our disk-direct bump.
-                let all_vols: Vec<Arc<Volume>> =
-                    volumes.values().cloned().collect();
+                let all_vols: Vec<Arc<Volume>> = volumes.values().cloned().collect();
                 for &pid in src_shard_roots {
                     if pid == crate::types::NULL_PAGE {
                         continue;
@@ -989,8 +986,7 @@ fn apply_lifecycle_record_replay(
                         None,
                     )),
                 );
-                let durable_seqs =
-                    vec![lsn; shard_count as usize].into_boxed_slice();
+                let durable_seqs = vec![lsn; shard_count as usize].into_boxed_slice();
                 manifest.volumes.push(VolumeEntry {
                     ord: *new_ord,
                     shard_count,
@@ -1073,14 +1069,12 @@ fn apply_lifecycle_record_replay(
                     "lifecycle replay: Discard for unknown volume ord {vol_ord}"
                 ))
             })?;
-            let end = (*start_lba)
-                .checked_add(*count as u64)
-                .ok_or_else(|| {
-                    MetaDbError::Corruption(format!(
-                        "lifecycle replay: Discard range overflow on vol \
+            let end = (*start_lba).checked_add(*count as u64).ok_or_else(|| {
+                MetaDbError::Corruption(format!(
+                    "lifecycle replay: Discard range overflow on vol \
                          {vol_ord}: start={start_lba} count={count}"
-                    ))
-                })?;
+                ))
+            })?;
             let captured = scan_l2p_range(volume, *start_lba, end)?;
             if !captured.is_empty() {
                 let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {

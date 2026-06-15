@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 impl PageStore {
     /// Free `count` pages starting at `start`, stamping each with
@@ -81,6 +82,7 @@ impl PageStore {
                     idempotent: false,
                 },
             );
+            self.deferred_free_pages.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -128,6 +130,7 @@ impl PageStore {
                 idempotent: true,
             },
         );
+        self.deferred_free_pages.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
 
@@ -170,6 +173,10 @@ impl PageStore {
             .collect();
         for (pid, _) in &selected {
             deferred.remove(pid);
+        }
+        if !selected.is_empty() {
+            self.deferred_free_pages
+                .fetch_sub(selected.len(), Ordering::Relaxed);
         }
         drop(deferred);
 
@@ -281,7 +288,13 @@ impl PageStore {
 
         let mut inner = self.inner.lock();
         inner.free_list.extend(reclaimed.iter().copied());
+        self.free_list_pages
+            .store(inner.free_list.len(), Ordering::Relaxed);
         self.truncate_free_tail_locked(&mut inner)?;
+        self.free_list_pages
+            .store(inner.free_list.len(), Ordering::Relaxed);
+        self.high_water_pages
+            .store(inner.high_water, Ordering::Relaxed);
         Ok(reclaimed)
     }
 

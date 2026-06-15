@@ -12,7 +12,7 @@ use std::ops::{Bound, RangeBounds};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -29,6 +29,7 @@ use crate::manifest::{
     write_snapshot_roots_page,
 };
 use crate::metrics::{MetaMetrics, MetaMetricsSnapshot};
+use crate::op::WalOp;
 use crate::page::PageType;
 use crate::page_store::PageStore;
 use crate::paged::PagedL2p;
@@ -37,7 +38,6 @@ use crate::testing::faults::{FaultController, FaultPoint};
 use crate::tx::{ApplyOutcome, Transaction};
 use crate::types::{FIRST_DATA_PAGE, Lba, Lsn, PageId, Pba, SnapshotId, VolumeOrdinal};
 use crate::verify;
-use crate::op::WalOp;
 
 /// Ordinal of the always-present bootstrap volume. Phase B commit 5 keeps the
 /// surface API single-volume, so every L2P routing decision lands here. Later
@@ -144,6 +144,8 @@ pub struct Db {
     /// trees / SSTs) and bumped on every commit. Paired with
     /// [`commit_cvar`](Self::commit_cvar) to form the apply-order queue.
     last_applied_lsn: Mutex<Lsn>,
+    /// Non-blocking mirror of `last_applied_lsn` for status snapshots.
+    last_applied_lsn_observed: AtomicU64,
     /// Notified whenever `last_applied_lsn` advances. Lifecycle ops
     /// and serial-apply commits wait on this in
     /// `wait_for_global_apply_turn`. Laned commits no longer require
@@ -686,6 +688,13 @@ impl ApplyLane {
     pub(crate) fn queue_len(&self) -> usize {
         let state = self.inner.state.lock();
         state.queue.len() + state.maintenance.len()
+    }
+
+    pub(crate) fn try_queue_len(&self) -> Option<usize> {
+        self.inner
+            .state
+            .try_lock()
+            .map(|state| state.queue.len() + state.maintenance.len())
     }
 
     /// Block until every WAL-tagged task currently enqueued on this
@@ -1267,8 +1276,8 @@ mod helpers;
 mod indexes;
 mod l2p;
 mod l2p_buffer;
-mod lineage_gc;
 mod lifecycle;
+mod lineage_gc;
 mod promotion;
 mod snapshot;
 mod streaming_flush;
@@ -1395,7 +1404,10 @@ impl Db {
         &self,
         vol_ord: VolumeOrdinal,
     ) -> Option<Vec<crate::deadlist::DeadRecord>> {
-        self.volumes.read().get(&vol_ord).map(|v| v.dead_list.drain())
+        self.volumes
+            .read()
+            .get(&vol_ord)
+            .map(|v| v.dead_list.drain())
     }
 
     /// Test helper: snapshot the volume's `(dead_list_head_pid,
@@ -1506,23 +1518,19 @@ impl Db {
         };
         let mut advanced = 0;
         for (vol_ord, vol) in vol_handles {
-            let plan = match async_reclaim::gc_plan_head_advance(
-                &self.page_store,
-                &ctx,
-                &vol,
-                vol_ord,
-            ) {
-                Ok(Some(p)) => p,
-                Ok(None) => continue,
-                Err(err) => {
-                    tracing::warn!(
-                        vol_ord = vol_ord,
-                        error = %err,
-                        "lineage GC: Phase 5 plan failed"
-                    );
-                    continue;
-                }
-            };
+            let plan =
+                match async_reclaim::gc_plan_head_advance(&self.page_store, &ctx, &vol, vol_ord) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        tracing::warn!(
+                            vol_ord = vol_ord,
+                            error = %err,
+                            "lineage GC: Phase 5 plan failed"
+                        );
+                        continue;
+                    }
+                };
             if !plan.dead_pbas.is_empty() {
                 // Order matters: FreePbas must commit BEFORE chain
                 // truncation. If we truncate first and then crash
