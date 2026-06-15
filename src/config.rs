@@ -369,6 +369,18 @@ pub struct Config {
     /// fallback). Mirrors the already-parallel refcount `begin_checkpoint`.
     pub parallel_l2p_drain_enabled: bool,
 
+    /// Bound on buffered entries folded per `tree.write()` acquisition
+    /// in the per-TXG L2P syncing-slot drain. The one-shot fold held the
+    /// shard's tree write lock for the whole slot (100k+ entries under
+    /// sustained load) while `apply_l2p_remap` takes the same lock per
+    /// commit op and dedup/read multi_gets take the read side — a proven
+    /// multi-second commit stall. Chunking releases the lock between
+    /// chunks so commits/reads interleave; correctness is unchanged
+    /// (publish-before-clear keeps the slot authoritative until the
+    /// final chunk publishes). `0` = unbounded (legacy one-shot fold,
+    /// A/B fallback). Applies to both the serial and parallel drain.
+    pub l2p_drain_chunk_entries: usize,
+
     /// Make PBA refcount the AUTHORITATIVE count of live L2P references
     /// (every L2P remap increfs its new head_pba; a packed N-LBA unit → +N),
     /// so onyx GC reclaim becomes a pure `rc==0` check and the full-volume
@@ -708,6 +720,10 @@ impl Config {
             // pinning + the drain wasn't the healthy-window gate). Kept behind
             // the flag as a documented dead-end. See memory parallel_l2p_drain_impl.
             parallel_l2p_drain_enabled: false,
+            // Bounded fold lock-holds default-ON: semantics-preserving
+            // (same lock, same op order, same publish point); 0 restores
+            // the one-shot hold for A/B.
+            l2p_drain_chunk_entries: 4096,
             rc_authoritative_reclaim: false,
             txg_timeout_ms: 5_000,
             // Streaming writeback ships default-off in this generic

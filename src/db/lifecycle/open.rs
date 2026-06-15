@@ -201,6 +201,7 @@ impl Db {
             txg: Arc::new(crate::txg::TxgStateMachine::new(0)),
             txg_threads_enabled: cfg.txg_threads_enabled,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
+            l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
             rc_authoritative_reclaim: cfg.rc_authoritative_reclaim,
             // Phase 4 Step 7: notifiers allocated regardless; the worker
             // threads are spawned conditionally below.
@@ -672,6 +673,7 @@ impl Db {
             txg: Arc::new(crate::txg::TxgStateMachine::new(manifest_checkpoint_txg)),
             txg_threads_enabled: cfg.txg_threads_enabled,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
+            l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
             rc_authoritative_reclaim: cfg.rc_authoritative_reclaim,
             txg_quiesce_notifier: Arc::new(crate::db::txg_quiesce::QuiesceNotifier::new()),
             txg_sync_notifier: Arc::new(crate::db::txg_sync::SyncNotifier::new()),

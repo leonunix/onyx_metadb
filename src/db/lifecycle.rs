@@ -625,6 +625,7 @@ impl Db {
         // `run_sync_cycle_body`). The `parallel_l2p_drain_enabled=false` path
         // preserves the serial fold for A/B and as a fallback.
         let metrics = &self.metrics;
+        let chunk_entries = self.l2p_drain_chunk_entries;
         if self.parallel_l2p_drain_enabled {
             let results: Vec<Result<()>> = std::thread::scope(|scope| {
                 let mut handles = Vec::new();
@@ -642,7 +643,7 @@ impl Db {
                             // runs unpinned at normal priority) — without
                             // either, all 16 pile onto one core.
                             crate::affinity::bind_for_l2p_drain(shard_idx);
-                            Self::drain_one_syncing_shard(shard, txg, metrics)
+                            Self::drain_one_syncing_shard(shard, txg, metrics, chunk_entries)
                         }));
                     }
                 }
@@ -663,7 +664,7 @@ impl Db {
                     if !shard.use_buffer {
                         continue;
                     }
-                    Self::drain_one_syncing_shard(shard, txg, metrics)?;
+                    Self::drain_one_syncing_shard(shard, txg, metrics, chunk_entries)?;
                 }
             }
         }
@@ -675,10 +676,27 @@ impl Db {
     /// `drain_syncing_slot_into_trees`. Each shard is independent (its own
     /// `l2p_buffer`, its own `tree` lock, per-shard `PageBuf` alloc pool), so
     /// this is safe to run concurrently across shards.
+    ///
+    /// The fold holds `tree.write()` in BOUNDED chunks
+    /// (`chunk_entries` buffered entries per acquisition, 0 = one shot)
+    /// instead of one hold for the whole slot. The unbounded hold was a
+    /// proven multi-second commit stall: `apply_l2p_remap` takes the
+    /// same `tree.write()` per op and dedup/read multi_gets take
+    /// `tree.read()`, so every commit worker and reader on the shard
+    /// parked for the fold's full duration. Releasing between chunks is
+    /// safe because the slot stays populated until `take_syncing_slot`
+    /// below (publish-before-clear, see `drain_syncing_slot_into_trees`
+    /// doc): a concurrent `lookup_for_open_txg` hits the live slot
+    /// entries and never observes the partially-folded tree, and every
+    /// chunk ends with `finish_batch_apply` so interleaving lock takers
+    /// see a consistent tree + read overlay. Re-folding after a
+    /// mid-chunk error stays idempotent via `page.generation >= lsn`,
+    /// same as the one-shot retry contract.
     fn drain_one_syncing_shard(
         shard: &super::L2pShard,
         txg: crate::types::Txg,
         metrics: &crate::metrics::MetaMetrics,
+        chunk_entries: usize,
     ) -> Result<()> {
         let started = std::time::Instant::now();
         // Snapshot (clone) the frozen syncing slot WITHOUT the tree lock so the
@@ -689,13 +707,35 @@ impl Db {
         }
         let count = entries.len();
         let max_lsn = entries.values().map(|e| e.lsn).max().unwrap_or(0);
-        let mut tree = shard.tree.write();
-        super::txg_sync::compact_drain_into_tree(&mut tree, &entries)?;
-        // Publish BEFORE clearing the slot (see method doc).
-        super::apply::publish_l2p_read_view(shard, &tree);
-        drop(tree);
-        // Clear the now-folded+published slot. Frozen, so this equals `entries`;
-        // the return value is discarded.
+        // Build the fold plan (leaf grouping + sorting) off-lock: it is
+        // pure CPU over the frozen snapshot, and its transient
+        // allocations live and die outside the lock hold.
+        let plan = super::txg_sync::build_drain_plan(&entries);
+        drop(entries);
+        let mut start = 0;
+        while start < plan.len() {
+            // Chunk boundary: whole leaves only, >= chunk_entries entries.
+            let mut end = start;
+            let mut budget = 0usize;
+            while end < plan.len() {
+                budget += plan[end].entry_count();
+                end += 1;
+                if chunk_entries != 0 && budget >= chunk_entries {
+                    break;
+                }
+            }
+            let mut tree = shard.tree.write();
+            super::txg_sync::apply_drain_ops(&mut tree, &plan[start..end])?;
+            if end == plan.len() {
+                // Publish BEFORE clearing the slot (see method doc), under
+                // the final chunk's hold like the one-shot fold did.
+                super::apply::publish_l2p_read_view(shard, &tree);
+            }
+            drop(tree);
+            start = end;
+        }
+        // Clear the now-folded+published slot. Frozen, so this equals the
+        // snapshot; the return value is discarded.
         let _ = shard.l2p_buffer.take_syncing_slot(txg);
         shard.l2p_buffer.note_compacted(max_lsn);
         metrics.record_l2p_buffer_compaction(count, started.elapsed());

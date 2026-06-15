@@ -43,27 +43,35 @@ use crate::metrics::MetaMetrics;
 use crate::txg::TxgStateMachine;
 use crate::types::Txg;
 
-/// Apply every `draining` entry into `tree`. Groups by leaf so that
-/// inserts touching the same leaf share one CoW (matches the laned
-/// bucket's `insert_leaf_run_at_lsn_deferred_finish` optimisation).
-/// Tombstones go through `delete_at_lsn_deferred_finish` individually
-/// because no leaf-run delete API exists today; deletes are rare on
-/// the L2P hot path so this is acceptable. Finalises deferred RC
-/// deltas in `finish_batch_apply` at the end.
-///
-/// Both the per-TXG syncing-slot drain (sync thread) and the
-/// "merge every slot" inline drain (`force_compact_l2p_buffers`) call
-/// this with their own pre-merged map; the helper itself is agnostic
-/// to slot identity.
-pub(crate) fn compact_drain_into_tree(
-    tree: &mut crate::paged::PagedL2p,
+/// One leaf's worth of fold work, prepared off-lock by
+/// [`build_drain_plan`]. Inserts are pre-sorted by lba and all share
+/// the same leaf, so [`apply_drain_ops`] can hand them straight to
+/// `insert_leaf_run_at_lsn_deferred_finish` (one CoW per leaf).
+pub(crate) struct LeafDrainOp {
+    inserts: Vec<(u64, crate::paged::L2pValue)>,
+    inserts_max_lsn: crate::types::Lsn,
+    tombstones: Vec<(u64, crate::types::Lsn)>,
+}
+
+impl LeafDrainOp {
+    pub(crate) fn entry_count(&self) -> usize {
+        self.inserts.len() + self.tombstones.len()
+    }
+}
+
+/// Group `draining` by leaf and sort, producing the fold plan in
+/// leaf-idx order (determinism / page locality). Pure CPU on the
+/// caller's snapshot — callers fold under `tree.write()`, so doing the
+/// grouping (and freeing its transient maps) here keeps that
+/// allocation churn outside the lock hold.
+pub(crate) fn build_drain_plan(
     draining: &HashMap<u64, super::l2p_buffer::BufferEntry>,
-) -> Result<()> {
+) -> Vec<LeafDrainOp> {
     use crate::paged::format::LEAF_SHIFT;
     if draining.is_empty() {
-        return Ok(());
+        return Vec::new();
     }
-    // (leaf_idx) -> (insert run sorted by lba, tombstone list)
+    // (leaf_idx) -> (insert run, tombstone list)
     let mut by_leaf: HashMap<
         u64,
         (
@@ -80,28 +88,65 @@ pub(crate) fn compact_drain_into_tree(
             bucket.0.push((*lba, entry.value, entry.lsn));
         }
     }
-    // Process in leaf-idx order for determinism / better page locality.
     let mut leaf_indices: Vec<u64> = by_leaf.keys().copied().collect();
     leaf_indices.sort_unstable();
+    let mut plan = Vec::with_capacity(leaf_indices.len());
     for leaf_idx in leaf_indices {
         let (mut inserts, tombstones) = by_leaf.remove(&leaf_idx).expect("leaf present");
-        if !inserts.is_empty() {
-            inserts.sort_unstable_by_key(|(lba, _, _)| *lba);
-            // All inserts in this group share `leaf_idx`. Use max LSN
-            // of the group as the run's stamp so any prior-LSN replay
-            // of these entries is correctly suppressed by
-            // `page.generation >= lsn`.
-            let max_lsn = inserts.iter().map(|(_, _, l)| *l).max().unwrap_or(0);
-            let entries: Vec<(u64, crate::paged::L2pValue)> =
-                inserts.iter().map(|(lba, v, _)| (*lba, *v)).collect();
-            tree.insert_leaf_run_at_lsn_deferred_finish(&entries, max_lsn)?;
+        inserts.sort_unstable_by_key(|(lba, _, _)| *lba);
+        // All inserts in this group share `leaf_idx`. Use max LSN of the
+        // group as the run's stamp so any prior-LSN replay of these
+        // entries is correctly suppressed by `page.generation >= lsn`.
+        let inserts_max_lsn = inserts.iter().map(|(_, _, l)| *l).max().unwrap_or(0);
+        plan.push(LeafDrainOp {
+            inserts: inserts.iter().map(|(lba, v, _)| (*lba, *v)).collect(),
+            inserts_max_lsn,
+            tombstones,
+        });
+    }
+    plan
+}
+
+/// Apply a (sub)slice of a [`build_drain_plan`] plan into `tree`.
+/// Tombstones go through `delete_at_lsn_deferred_finish` individually
+/// because no leaf-run delete API exists today; deletes are rare on
+/// the L2P hot path so this is acceptable. Finalises deferred RC
+/// deltas in `finish_batch_apply` at the end, so every chunk leaves
+/// the tree + read overlay in a consistent state.
+pub(crate) fn apply_drain_ops(
+    tree: &mut crate::paged::PagedL2p,
+    ops: &[LeafDrainOp],
+) -> Result<()> {
+    for op in ops {
+        if !op.inserts.is_empty() {
+            tree.insert_leaf_run_at_lsn_deferred_finish(&op.inserts, op.inserts_max_lsn)?;
         }
-        for (lba, lsn) in tombstones {
+        for &(lba, lsn) in &op.tombstones {
             tree.delete_at_lsn_deferred_finish(lba, lsn)?;
         }
     }
     tree.finish_batch_apply()?;
     Ok(())
+}
+
+/// Apply every `draining` entry into `tree` in one shot. Groups by
+/// leaf so that inserts touching the same leaf share one CoW (matches
+/// the laned bucket's `insert_leaf_run_at_lsn_deferred_finish`
+/// optimisation).
+///
+/// Used by the "merge every slot" inline drain
+/// (`force_compact_l2p_buffers`), whose callers run quiesced (no
+/// tree-lock contention to bound). The per-TXG syncing-slot drain
+/// instead builds the plan off-lock and folds it in bounded chunks —
+/// see `Db::drain_one_syncing_shard`.
+pub(crate) fn compact_drain_into_tree(
+    tree: &mut crate::paged::PagedL2p,
+    draining: &HashMap<u64, super::l2p_buffer::BufferEntry>,
+) -> Result<()> {
+    if draining.is_empty() {
+        return Ok(());
+    }
+    apply_drain_ops(tree, &build_drain_plan(draining))
 }
 
 /// Callback that performs the actual per-TXG sync work for one cycle.

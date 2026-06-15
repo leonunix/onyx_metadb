@@ -208,3 +208,101 @@ fn threads_on_buffer_checkpoint_txg_consistent_across_cycles() {
         );
     }
 }
+
+/// Chunked syncing-slot fold (`l2p_drain_chunk_entries`): with a tiny
+/// odd chunk budget the per-TXG drain re-acquires `tree.write()` many
+/// times per slot, exercising chunk boundaries, the final-chunk
+/// publish-before-clear, and interleaved lookups against the
+/// partially-folded tree (the live slot must keep winning). Mixes
+/// overwrites and tombstones so chunks carry insert runs and deletes.
+#[test]
+fn chunked_fold_tiny_chunks_read_your_writes_and_recovery() {
+    let dir = TempDir::new().unwrap();
+    const BATCHES: u64 = 6;
+    const PER_BATCH: u64 = 50;
+    let ord;
+    {
+        let mut cfg = cfg_threads_and_buffer(&dir, 30);
+        cfg.l2p_drain_chunk_entries = 7;
+        let db = Db::create_with_config(cfg).unwrap();
+        ord = db.create_volume().unwrap();
+        for b in 0..BATCHES {
+            for i in 0..PER_BATCH {
+                let lba = b * PER_BATCH + i;
+                db.insert(ord, lba, v((lba % 250) as u8 + 1)).unwrap();
+            }
+            // Overwrite a stripe of the previous batch and delete every
+            // 10th of it, so later slots fold updates + tombstones over
+            // already-folded leaves.
+            if b > 0 {
+                for i in 0..PER_BATCH {
+                    let lba = (b - 1) * PER_BATCH + i;
+                    if i % 10 == 0 {
+                        db.delete(ord, lba).unwrap();
+                    } else {
+                        db.insert(ord, lba, v((lba % 200) as u8 + 2)).unwrap();
+                    }
+                }
+            }
+            // Let the background threads roll + chunk-fold this batch's
+            // slot while the next batch's inserts run against the lock.
+            thread::sleep(Duration::from_millis(45));
+        }
+        for lba in 0..(BATCHES * PER_BATCH) {
+            let got = db.get(ord, lba).unwrap();
+            let expect = expected_chunked(lba, BATCHES, PER_BATCH);
+            assert_eq!(got, expect, "read-your-writes failed for lba {lba}");
+        }
+        db.flush().unwrap();
+    }
+    let mut cfg = cfg_threads_and_buffer(&dir, 30);
+    cfg.l2p_drain_chunk_entries = 7;
+    let db = Db::open_with_config(cfg).unwrap();
+    for lba in 0..(BATCHES * PER_BATCH) {
+        let got = db.get(ord, lba).unwrap();
+        let expect = expected_chunked(lba, BATCHES, PER_BATCH);
+        assert_eq!(got, expect, "value for lba {lba} wrong across flush+reopen");
+    }
+}
+
+fn expected_chunked(lba: u64, batches: u64, per_batch: u64) -> Option<L2pValue> {
+    let b = lba / per_batch;
+    let i = lba % per_batch;
+    if b == batches - 1 {
+        // Last batch never got the overwrite/delete pass.
+        return Some(v((lba % 250) as u8 + 1));
+    }
+    if i % 10 == 0 {
+        None
+    } else {
+        Some(v((lba % 200) as u8 + 2))
+    }
+}
+
+/// `l2p_drain_chunk_entries = 0` keeps the legacy one-shot fold path
+/// working (A/B fallback).
+#[test]
+fn chunk_entries_zero_one_shot_fold_still_works() {
+    let dir = TempDir::new().unwrap();
+    let ord;
+    {
+        let mut cfg = cfg_threads_and_buffer(&dir, 30);
+        cfg.l2p_drain_chunk_entries = 0;
+        let db = Db::create_with_config(cfg).unwrap();
+        ord = db.create_volume().unwrap();
+        for lba in 0..300u64 {
+            db.insert(ord, lba, v((lba % 250) as u8 + 1)).unwrap();
+        }
+        thread::sleep(Duration::from_millis(90));
+        for lba in 0..300u64 {
+            assert_eq!(db.get(ord, lba).unwrap(), Some(v((lba % 250) as u8 + 1)));
+        }
+        db.flush().unwrap();
+    }
+    let mut cfg = cfg_threads_and_buffer(&dir, 30);
+    cfg.l2p_drain_chunk_entries = 0;
+    let db = Db::open_with_config(cfg).unwrap();
+    for lba in 0..300u64 {
+        assert_eq!(db.get(ord, lba).unwrap(), Some(v((lba % 250) as u8 + 1)));
+    }
+}
