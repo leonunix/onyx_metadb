@@ -54,6 +54,10 @@ impl Db {
             shard_count,
             metrics.clone(),
         )?;
+        // Snapshot-scaling Phase A2: the per-L2P-page refcount store. Same
+        // shard count as refcount; folded on the same TXG-sync boundary.
+        let (l2p_page_rc, l2p_page_rc_roots) =
+            crate::l2p_page_rc::L2pPageRc::create(page_store.clone(), page_cache.clone(), shard_count)?;
         let dedup_index = Arc::new(crate::dedup::DedupIndex::create(
             page_store.clone(),
             page_cache.clone(),
@@ -73,6 +77,11 @@ impl Db {
         // Fresh database: no flush has happened yet, every shard's
         // durable_seq is 0 (matches the empty `checkpoint_lsn`).
         manifest.refcount_durable_seq = vec![0; refcount_count].into_boxed_slice();
+        // v17: L2P-page-rc roots + durable_seq. Same shard count as
+        // refcount; durable_seq starts at 0 like refcount.
+        let l2p_page_rc_count = l2p_page_rc_roots.len();
+        manifest.l2p_page_rc_shard_roots = l2p_page_rc_roots.into_boxed_slice();
+        manifest.l2p_page_rc_durable_seq = vec![0; l2p_page_rc_count].into_boxed_slice();
         manifest.dedup_shards = dedup_shards;
         // dedup_index: cuckoo meta page id stored under the legacy
         // `dedup_index_shard_heads` slot, single-element box for
@@ -156,6 +165,7 @@ impl Db {
             })),
             volumes: Arc::new(RwLock::new(volumes)),
             refcount_shards,
+            l2p_page_rc,
             dedup_index,
             dedup_lanes,
             dedup_maintenance_lanes,
@@ -373,6 +383,15 @@ impl Db {
             &manifest.refcount_durable_seq,
             metrics.clone(),
         )?;
+        // v17: re-open the L2P-page-rc shard group from the manifest roots
+        // + per-shard durable_seq (restored independently of the global
+        // `checkpoint_lsn`, like refcount).
+        let l2p_page_rc = crate::l2p_page_rc::L2pPageRc::open(
+            page_store.clone(),
+            page_cache.clone(),
+            &manifest.l2p_page_rc_shard_roots,
+            &manifest.l2p_page_rc_durable_seq,
+        )?;
         let dedup_index_meta_pid: PageId = manifest
             .dedup_index_shard_heads
             .first()
@@ -496,6 +515,10 @@ impl Db {
             for shard in refcount_shards.iter() {
                 shard.rc.flush()?;
             }
+            // v17: cold-flush the L2P-page-rc shards on the same recovery
+            // boundary (Phase A2 keeps the array empty, so this just
+            // re-confirms each shard's meta chain).
+            l2p_page_rc.flush()?;
 
             // Cuckoo dedup_index + paged-array dedup_reverse both
             // write data pages synchronously per op; only their meta
@@ -518,6 +541,7 @@ impl Db {
                 &sorted,
                 &l2p_guards,
                 &refcount_shards,
+                &l2p_page_rc,
                 Some(last_applied),
             )?;
             manifest.checkpoint_lsn = last_applied;
@@ -628,6 +652,7 @@ impl Db {
             })),
             volumes: Arc::new(RwLock::new(volumes)),
             refcount_shards,
+            l2p_page_rc,
             dedup_index,
             dedup_lanes,
             dedup_maintenance_lanes,

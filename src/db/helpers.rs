@@ -51,6 +51,7 @@ pub(super) fn refresh_manifest_entries(
     volumes: &[Arc<Volume>],
     l2p_guards: &[RwLockWriteGuard<'_, PagedL2p>],
     refcount_shards: &[Shard],
+    l2p_page_rc: &crate::l2p_page_rc::L2pPageRc,
     durable_override: Option<Lsn>,
 ) -> Result<()> {
     manifest.body_version = MANIFEST_BODY_VERSION;
@@ -125,6 +126,18 @@ pub(super) fn refresh_manifest_entries(
                     .load(std::sync::atomic::Ordering::Acquire)
             })
         })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    // v17: L2P-page-rc roots (stable head meta page, like refcount) +
+    // per-shard durable_seq. Same override semantics as refcount: a
+    // `durable_override` caller (drop_volume / take_snapshot /
+    // drop_snapshot / open recovery) has just flushed every shard and is
+    // about to set `manifest.checkpoint_lsn = override`, so the page-rc
+    // durable_seq must move with it to keep the
+    // `min(durable_seq[]) == checkpoint_lsn` invariant.
+    manifest.l2p_page_rc_shard_roots = l2p_page_rc.roots().into_boxed_slice();
+    manifest.l2p_page_rc_durable_seq = (0..l2p_page_rc.shard_count())
+        .map(|idx| durable_override.unwrap_or_else(|| l2p_page_rc.last_flushed_lsn(idx)))
         .collect::<Vec<_>>()
         .into_boxed_slice();
     Ok(())

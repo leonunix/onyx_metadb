@@ -220,6 +220,18 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         // via its on_meta callback, matching walk_cuckoo / walk_dedup_reverse.
         walk_refcount_paged_array(page_store, meta_pid, &mut live, &mut seen_btree)?;
     }
+    // v17 (snapshot-scaling Phase A2): the L2P-page-rc shard group is a
+    // second `RcShard`/`PagedRefcountArray` group with the identical
+    // paged-array layout, so its meta chains + data pages walk through
+    // the same routine. Without this the orphan-reclaim-on-open pass
+    // would treat the page-rc meta pages as unreachable and free them,
+    // corrupting the store on the next reopen.
+    for &meta_pid in manifest.l2p_page_rc_shard_roots.iter() {
+        if meta_pid == NULL_PAGE {
+            continue;
+        }
+        walk_refcount_paged_array(page_store, meta_pid, &mut live, &mut seen_btree)?;
+    }
 
     for snapshot in &manifest.snapshots {
         let l2p_roots = snapshot_roots(

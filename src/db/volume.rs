@@ -814,6 +814,7 @@ impl Db {
             volumes,
             l2p_guards,
             &self.refcount_shards,
+            &self.l2p_page_rc,
             durable_override,
         )
     }

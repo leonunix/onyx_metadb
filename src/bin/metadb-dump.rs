@@ -123,6 +123,13 @@ fn print_manifest_human(path: &Path, m: &Manifest, high_water: u64, last_applied
     for (i, p) in m.refcount_shard_roots.iter().enumerate() {
         println!("  [{i}] {}", fmt_page(*p));
     }
+    println!(
+        "l2p_page_rc_shard_roots ({}):",
+        m.l2p_page_rc_shard_roots.len()
+    );
+    for (i, p) in m.l2p_page_rc_shard_roots.iter().enumerate() {
+        println!("  [{i}] {}", fmt_page(*p));
+    }
     println!("dedup_shards: {}", m.dedup_shards);
     for (s, shard_heads) in m.dedup_index_shard_heads.iter().enumerate() {
         println!("dedup_index_shard[{s}] heads ({}):", shard_heads.len());
@@ -167,6 +174,10 @@ fn print_manifest_json(path: &Path, m: &Manifest, high_water: u64, last_applied:
     println!(
         "  \"refcount_shard_roots\": {},",
         page_array_json(&m.refcount_shard_roots)
+    );
+    println!(
+        "  \"l2p_page_rc_shard_roots\": {},",
+        page_array_json(&m.l2p_page_rc_shard_roots)
     );
     println!("  \"dedup_shards\": {},", m.dedup_shards);
     println!("  \"dedup_index_shard_heads\": [");

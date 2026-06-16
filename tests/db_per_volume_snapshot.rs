@@ -144,15 +144,18 @@ fn drop_volume_while_snapshot_exists_is_refused() {
 /// `shards_per_partition` up to a value that leaves only a handful of
 /// snapshot rows in the manifest payload. v11+ added per-shard
 /// durable_seq (8 B per shard, doubling per-shard overhead from 8 →
-/// 16 B), so the v6-era "240 shards → 4 snapshots" sizing no longer
-/// fits even one volume entry. 100 shards under the current layout
-/// (v12) leaves room for ~20 snapshots — still well under the test's
-/// `taken <= 64` guard, and well above `taken >= 1`.
+/// 16 B), and v17 (snapshot-scaling Phase A2) added the `l2p_page_rc`
+/// shard group's roots + durable_seq (another 16 B per shard at the
+/// manifest top level), so per-shard manifest overhead is now ~48 B
+/// (16 refcount + 16 page-rc + 16 bootstrap-volume). 100 shards no
+/// longer fits even the bootstrap volume + shard arrays; 60 shards
+/// under the v17 layout leaves room for ~30 snapshots — still well
+/// under the test's `taken <= 64` guard, and well above `taken >= 1`.
 #[test]
 fn take_snapshot_capacity_failure_does_not_leak_refcount() {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
-    cfg.shards_per_partition = 100;
+    cfg.shards_per_partition = 60;
     cfg.direct_io = false;
     let db = Db::create_with_config(cfg).unwrap();
 

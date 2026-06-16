@@ -241,8 +241,13 @@ fn deterministic_snapshot_stress() {
             14 | 15 => {
                 // Cap live snapshots well under MAX_SNAPSHOTS_PER_MANIFEST
                 // so we don't accidentally hit the manifest limit while
-                // stress-testing everything else.
-                if snap_ids.len() < 100 {
+                // stress-testing everything else. v17 (snapshot-scaling
+                // Phase A2) added the `l2p_page_rc` shard group's
+                // roots + durable_seq to the manifest top level, shrinking
+                // the snapshot-table capacity at the default 16 shards
+                // from ~106 to ~98 rows — so this cap drops 100 → 64 to
+                // keep its margin.
+                if snap_ids.len() < 64 {
                     let id = db.take_snapshot(0).unwrap();
                     snapshots.insert(id, current.clone());
                     snap_ids.push(id);

@@ -21,19 +21,29 @@
 //! clear, `get_consistent` for any "rc==0 ⇒ free this page" decision.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::cache::PageCache;
-use crate::error::Result;
+use crate::error::{MetaDbError, Result};
 use crate::page_store::PageStore;
 use crate::refcount::RcShard;
 use crate::types::{Lsn, PageId, Txg};
 
 /// Sharded per-page refcount store, keyed by `PageId`. Each shard is an
 /// independent [`RcShard`]; routing mirrors `Db::refcount_shard_for`.
+///
+/// Each shard tracks its own `last_flushed_lsn` (the highest LSN whose
+/// deltas are durable on disk), the exact analogue of the per-shard
+/// atomic on the PBA-refcount `Shard` wrapper. The flush's TXG-sync
+/// cycle folds the page-rc shards on the same boundary as the PBA
+/// refcount shards and bumps these atomics in lock-step, so the
+/// manifest's `l2p_page_rc_durable_seq` array joins the
+/// `min(durable_seq[]) == checkpoint_lsn` invariant.
 pub struct L2pPageRc {
     shards: Vec<Arc<RcShard>>,
+    last_flushed_lsn: Vec<AtomicU64>,
 }
 
 impl L2pPageRc {
@@ -47,29 +57,56 @@ impl L2pPageRc {
         assert!(shard_count > 0, "l2p_page_rc shard_count must be > 0");
         let mut shards = Vec::with_capacity(shard_count);
         let mut roots = Vec::with_capacity(shard_count);
+        let mut last_flushed_lsn = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
             let shard = RcShard::create(page_store.clone(), page_cache.clone())?;
             roots.push(shard.meta_page_id());
             shards.push(Arc::new(shard));
+            // Fresh shard: nothing folded yet, durable_seq == 0 (matches
+            // the empty `checkpoint_lsn`).
+            last_flushed_lsn.push(AtomicU64::new(0));
         }
-        Ok((Self { shards }, roots))
+        Ok((
+            Self {
+                shards,
+                last_flushed_lsn,
+            },
+            roots,
+        ))
     }
 
-    /// Open existing shards from the manifest-recorded meta-page ids.
+    /// Open existing shards from the manifest-recorded meta-page ids and
+    /// per-shard durable_seq. `initial_last_flushed_lsn` mirrors
+    /// `roots` (the manifest's `l2p_page_rc_durable_seq`); recovery
+    /// restores each shard's atomic independently rather than collapsing
+    /// through the global `checkpoint_lsn`.
     pub fn open(
         page_store: Arc<PageStore>,
         page_cache: Arc<PageCache>,
         roots: &[PageId],
+        initial_last_flushed_lsn: &[Lsn],
     ) -> Result<Self> {
+        if initial_last_flushed_lsn.len() != roots.len() {
+            return Err(MetaDbError::Corruption(format!(
+                "l2p_page_rc open: durable_seq length {} != roots length {}",
+                initial_last_flushed_lsn.len(),
+                roots.len(),
+            )));
+        }
         let mut shards = Vec::with_capacity(roots.len());
-        for &meta_page_id in roots {
+        let mut last_flushed_lsn = Vec::with_capacity(roots.len());
+        for (idx, &meta_page_id) in roots.iter().enumerate() {
             shards.push(Arc::new(RcShard::open(
                 page_store.clone(),
                 page_cache.clone(),
                 meta_page_id,
             )?));
+            last_flushed_lsn.push(AtomicU64::new(initial_last_flushed_lsn[idx]));
         }
-        Ok(Self { shards })
+        Ok(Self {
+            shards,
+            last_flushed_lsn,
+        })
     }
 
     /// Shard index for `pid`. Same hash shape as the PBA refcount routing
@@ -96,6 +133,27 @@ impl L2pPageRc {
     /// fold; recorded once in the manifest at create time.
     pub fn roots(&self) -> Vec<PageId> {
         self.shards.iter().map(|s| s.meta_page_id()).collect()
+    }
+
+    /// Highest LSN whose deltas for shard `idx` are durable on disk.
+    pub fn last_flushed_lsn(&self, idx: usize) -> Lsn {
+        self.last_flushed_lsn[idx].load(Ordering::Acquire)
+    }
+
+    /// Bump shard `idx`'s durable watermark to `lsn` if higher. `fetch_max`
+    /// (not `store`) keeps it monotonic when a Syncing slot had no commits
+    /// (`wal_checkpoint == 0`) — matches the PBA-refcount post-manifest store.
+    pub fn fetch_max_last_flushed(&self, idx: usize, lsn: Lsn) {
+        self.last_flushed_lsn[idx].fetch_max(lsn, Ordering::Release);
+    }
+
+    /// Per-shard durable_seq snapshot, in shard order (for the manifest's
+    /// `l2p_page_rc_durable_seq`).
+    pub fn durable_seq(&self) -> Vec<Lsn> {
+        self.last_flushed_lsn
+            .iter()
+            .map(|a| a.load(Ordering::Acquire))
+            .collect()
     }
 
     /// Logical refcount for `pid` (ring-summed + array base). Hot read; may
@@ -180,7 +238,7 @@ mod tests {
         assert_eq!(store.roots(), roots);
         drop(store);
 
-        let reopened = L2pPageRc::open(ps, pc, &roots).unwrap();
+        let reopened = L2pPageRc::open(ps, pc, &roots, &vec![0; roots.len()]).unwrap();
         for pid in [1u64, 2, 3, 50, 99, 1000, 4096] {
             assert_eq!(reopened.get(pid).unwrap(), (pid % 5 + 1) as u32, "pid {pid}");
         }

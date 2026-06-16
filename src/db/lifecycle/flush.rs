@@ -73,6 +73,14 @@ impl Db {
                 min_lsn = lsn;
             }
         }
+        // Phase A2: L2P-page-rc shards fold on the same boundary as
+        // refcount and advance in lock-step, so they join the floor.
+        for s_idx in 0..self.l2p_page_rc.shard_count() {
+            let lsn = self.l2p_page_rc.last_flushed_lsn(s_idx);
+            if lsn < min_lsn {
+                min_lsn = lsn;
+            }
+        }
         if min_lsn == Lsn::MAX { 0 } else { min_lsn }
     }
 
@@ -660,6 +668,66 @@ impl Db {
                 .record_flush_total(kind, flush_started.elapsed());
             return Err(err);
         }
+
+        // Snapshot-scaling Phase A2: fold the L2P-page-rc shards on the
+        // SAME TXG boundary as the PBA refcount shards, reusing
+        // `selected.rc` (the two groups share a shard count). Phase A2
+        // never stages page-rc deltas, so every checkpoint here is the
+        // empty variant: `begin_checkpoint` allocates nothing,
+        // `build_meta_chain` (below) produces no sealed pages / no
+        // frees, and dropping an empty checkpoint leaks nothing. That is
+        // why the downstream IO/manifest error paths do NOT abort these
+        // (unlike refcount) — there is nothing to roll back. **Phase A3
+        // wires real page-rc writes and MUST add abort + fresh-page-free
+        // threading at every error site, exactly like refcount.** The
+        // fold still runs so the path is exercised under soak and each
+        // selected shard's `last_flushed_lsn` advances in lock-step with
+        // refcount (preserving `min(durable_seq[]) == checkpoint_lsn`).
+        debug_assert_eq!(
+            self.l2p_page_rc.shard_count(),
+            self.refcount_shards.len(),
+            "page-rc reuses selected.rc, so the two shard groups must share a count"
+        );
+        let l2p_page_rc_checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>> = {
+            let mut out: Vec<Option<crate::refcount::shard::RcCheckpoint>> =
+                (0..self.l2p_page_rc.shard_count()).map(|_| None).collect();
+            let mut prc_err: Option<MetaDbError> = None;
+            for s_idx in 0..self.l2p_page_rc.shard_count() {
+                if !selected.rc[s_idx] {
+                    continue;
+                }
+                let shard = self.l2p_page_rc.shard(s_idx);
+                let res = if txg_threads_enabled {
+                    shard.begin_checkpoint(txg)
+                } else {
+                    shard.begin_checkpoint_all_slots()
+                };
+                match res {
+                    Ok(ckpt) if prc_err.is_none() => out[s_idx] = Some(ckpt),
+                    // An empty ckpt holds no resources, so a later error
+                    // means earlier folds just drop; abort_checkpoint is a
+                    // no-op on empty but kept for A3-forward symmetry.
+                    Ok(ckpt) => shard.abort_checkpoint(ckpt, wal_checkpoint),
+                    Err(err) if prc_err.is_none() => prc_err = Some(err),
+                    Err(_) => {}
+                }
+            }
+            if let Some(err) = prc_err {
+                for (s_idx, ckpt_opt) in out.into_iter().enumerate() {
+                    if let Some(ckpt) = ckpt_opt {
+                        self.l2p_page_rc
+                            .shard(s_idx)
+                            .abort_checkpoint(ckpt, wal_checkpoint);
+                    }
+                }
+                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+                self.metrics
+                    .record_flush_total(kind, flush_started.elapsed());
+                return Err(err);
+            }
+            out
+        };
         // No sample-phase gate to drop. The IO phase below proceeds
         // straight from the sample: concurrent commits never blocked
         // on us, and the dirty page Arcs we hold in the checkpoints
@@ -767,6 +835,38 @@ impl Db {
                 }
             }
         }
+        // Phase A2: build the L2P-page-rc meta chains into the same
+        // sealed batch + cache-insert / to-free lists. Empty in A2 →
+        // `build_meta_chain` returns the existing chain with no sealed
+        // pages and no frees, so this is a no-op that just confirms each
+        // shard's chain. See the fold comment above for why no abort
+        // threading is needed here (empty checkpoints leak nothing); A3
+        // must add it when page-rc carries data.
+        let mut l2p_page_rc_new_chains: Vec<Option<Vec<PageId>>> =
+            (0..self.l2p_page_rc.shard_count()).map(|_| None).collect();
+        for (s_idx, ckpt_opt) in l2p_page_rc_checkpoints.iter().enumerate() {
+            let Some(ckpt) = ckpt_opt else { continue };
+            let shard = self.l2p_page_rc.shard(s_idx);
+            match shard.build_meta_chain(ckpt) {
+                Ok((chain, chain_sealed, free_pids)) => {
+                    let added = chain_sealed.len();
+                    rc_chain_cache_inserts.extend(chain_sealed.iter().cloned());
+                    sealed_pages.extend(chain_sealed);
+                    total_pages_written += added;
+                    rc_to_free.extend(free_pids);
+                    l2p_page_rc_new_chains[s_idx] = Some(chain);
+                }
+                Err(err) => {
+                    self.metrics
+                        .record_flush_io(io_started.elapsed(), total_pages_written);
+                    self.metrics
+                        .record_flush_total(kind, flush_started.elapsed());
+                    self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                    self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+                    return Err(err);
+                }
+            }
+        }
         // Build per-volume dead-list segments and fold them into the
         // same `sealed_pages` batch as L2P + RC. Allocate contiguous
         // runs per volume (Phase 2 / [[no-refcount-hot-path-design]]).
@@ -859,6 +959,12 @@ impl Db {
         for (s_idx, ckpt_opt) in refcount_checkpoints.iter().enumerate() {
             if let Some(ckpt) = ckpt_opt {
                 self.refcount_shards[s_idx].rc.mark_staged_durable(ckpt);
+            }
+        }
+        // Phase A2: same for the L2P-page-rc shards (no-op on empty).
+        for (s_idx, ckpt_opt) in l2p_page_rc_checkpoints.iter().enumerate() {
+            if let Some(ckpt) = ckpt_opt {
+                self.l2p_page_rc.shard(s_idx).mark_staged_durable(ckpt);
             }
         }
         // Dead-list segment pages are now durable on disk. The
@@ -1043,6 +1149,7 @@ impl Db {
             &mut manifest_state.manifest,
             &volumes,
             &self.refcount_shards,
+            &self.l2p_page_rc,
             &selected,
             wal_checkpoint,
         ) {
@@ -1139,6 +1246,14 @@ impl Db {
                         .fetch_max(wal_checkpoint, Ordering::Release);
                 }
             }
+            // Phase A2: L2P-page-rc shards advance in lock-step with
+            // refcount (same `selected.rc`), so their durable_seq joins
+            // the `min(durable_seq[]) == checkpoint_lsn` invariant.
+            for s_idx in 0..self.l2p_page_rc.shard_count() {
+                if selected.rc[s_idx] {
+                    self.l2p_page_rc.fetch_max_last_flushed(s_idx, wal_checkpoint);
+                }
+            }
         }
         {
             let mut unlogged = self.unlogged_pending_lsn.lock();
@@ -1164,6 +1279,14 @@ impl Db {
                 self.refcount_shards[s_idx].rc.install_meta_chain(new_chain);
             }
         }
+        // Phase A2: install the L2P-page-rc meta chains (re-installs the
+        // same chain in A2 since `build_meta_chain` returned the existing
+        // one for the empty checkpoints — harmless).
+        for (s_idx, chain_opt) in l2p_page_rc_new_chains.into_iter().enumerate() {
+            if let Some(new_chain) = chain_opt {
+                self.l2p_page_rc.shard(s_idx).install_meta_chain(new_chain);
+            }
+        }
         // Trailing continuation pages from the old chains can be
         // released now that the new chains are installed and durable.
         // Free order: invalidate the cache entry first so a concurrent
@@ -1186,6 +1309,7 @@ impl Db {
         // Drop checkpoints to release the snapshot bookkeeping; abort
         // is no longer reachable for these.
         drop(refcount_checkpoints);
+        drop(l2p_page_rc_checkpoints);
 
         let install_started = std::time::Instant::now();
         let mut install_receivers = Vec::new();
@@ -1454,6 +1578,19 @@ impl Db {
             // shard durable to `wal_checkpoint` (and an unselected one stays
             // at `prev`), exactly like a non-buffered L2P shard — so
             // `candidate` already bounds rc correctly. See `refcount::shard`.
+        }
+        // Phase A2: L2P-page-rc shards, selected 1:1 with refcount via
+        // `selected.rc` — same `wal_checkpoint.max(prev)` projection.
+        for s_idx in 0..self.l2p_page_rc.shard_count() {
+            let prev = self.l2p_page_rc.last_flushed_lsn(s_idx);
+            let candidate = if selected.rc[s_idx] {
+                wal_checkpoint.max(prev)
+            } else {
+                prev
+            };
+            if candidate < min_lsn {
+                min_lsn = candidate;
+            }
         }
         if min_lsn == Lsn::MAX { 0 } else { min_lsn }
     }

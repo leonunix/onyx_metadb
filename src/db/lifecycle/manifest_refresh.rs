@@ -120,6 +120,7 @@ pub(in crate::db::lifecycle) fn refresh_manifest_durable_seq(
     manifest: &mut Manifest,
     volumes: &[Arc<Volume>],
     refcount_shards: &[Shard],
+    l2p_page_rc: &crate::l2p_page_rc::L2pPageRc,
     selected: &SelectedShards,
     wal_checkpoint: Lsn,
 ) -> Result<()> {
@@ -183,6 +184,25 @@ pub(in crate::db::lifecycle) fn refresh_manifest_durable_seq(
             prev
         };
         manifest.refcount_durable_seq[s_idx] = lsn;
+    }
+    // Phase A2: L2P-page-rc shards, selected 1:1 with refcount via
+    // `selected.rc`. Same `wal_checkpoint.max(prev)` projection as
+    // refcount, and the post-manifest `fetch_max` advances the atomics
+    // identically — so the page-rc durable_seq array exactly mirrors the
+    // refcount one and the `min(durable_seq[]) == checkpoint_lsn`
+    // invariant is preserved.
+    let prc_count = l2p_page_rc.shard_count();
+    if manifest.l2p_page_rc_durable_seq.len() != prc_count {
+        manifest.l2p_page_rc_durable_seq = vec![0; prc_count].into_boxed_slice();
+    }
+    for s_idx in 0..prc_count {
+        let prev = l2p_page_rc.last_flushed_lsn(s_idx);
+        let lsn = if selected.rc[s_idx] {
+            wal_checkpoint.max(prev)
+        } else {
+            prev
+        };
+        manifest.l2p_page_rc_durable_seq[s_idx] = lsn;
     }
     Ok(())
 }

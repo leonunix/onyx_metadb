@@ -99,7 +99,24 @@ use crate::types::{
 /// hard-rejected on open — no on-disk migration (see plan
 /// `ethereal-exploring-pretzel.md` Phase A; backcompat is explicitly
 /// waived for the WAL-removal track).
-pub const MANIFEST_BODY_VERSION: u32 = 16;
+///
+/// v17 (snapshot-scaling Phase A2: relocate L2P page-rc): added a
+/// second top-level shard group — the per-L2P-page refcount store
+/// (`crate::l2p_page_rc::L2pPageRc`, the eventual replacement for the
+/// page-header `refcount` byte). The fixed-header `OFF_RESERVED_28`
+/// slot now carries `l2p_page_rc_shard_count: u32`, and the variable
+/// region grows two arrays right after the refcount arrays:
+/// `l2p_page_rc_shard_roots [count × 8]` then
+/// `l2p_page_rc_durable_seq [count × 8]`. The page-rc shard count
+/// equals the refcount/L2P shard count (`shards_per_partition`) and
+/// the fold rides the SAME TXG boundary, so its per-shard durable_seq
+/// mirrors the refcount durable_seq and joins the
+/// `min(durable_seq[]) == checkpoint_lsn` invariant. `OFF_VARIABLE_START`
+/// is unchanged (the count reuses the existing reserved header slot).
+/// Old v16 manifests are hard-rejected on open — no on-disk migration
+/// (see plan `peaceful-finding-neumann.md` Phase A; backcompat is
+/// waived pre-release, onyx rebuilds metadb on schema change).
+pub const MANIFEST_BODY_VERSION: u32 = 17;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -107,10 +124,11 @@ pub const MANIFEST_BODY_VERSION: u32 = 16;
 //   - OFF_DEDUP_REVERSE_LEVEL_COUNT becomes reserved/future flags.
 // The variable region begins at `OFF_VARIABLE_START` and holds:
 //   refcount_shard_roots [refcount_shard_count × 8]
+//   refcount_durable_seq [refcount_shard_count × 8]            (v11+)
+//   l2p_page_rc_shard_roots [l2p_page_rc_shard_count × 8]      (v17+)
+//   l2p_page_rc_durable_seq [l2p_page_rc_shard_count × 8]      (v17+)
 //   for each of dedup_shards shards:
 //     level_count u32 + level_count × 8 bytes  (dedup_index)
-//   for each of dedup_shards shards:
-//     level_count u32 + level_count × 8 bytes  (dedup_reverse)
 //   snapshots [snapshot_count × SNAPSHOT_ENTRY_SIZE]
 //   volumes   [per-entry inline, see encode_volume_entry_inline]
 const OFF_BODY_VERSION: usize = 0;
@@ -118,9 +136,11 @@ const OFF_CHECKPOINT_LSN: usize = 4;
 const OFF_FREE_LIST_HEAD: usize = 12;
 const OFF_SHARD_COUNT: usize = 20;
 const OFF_DEDUP_SHARDS: usize = 24;
-// v7 used this slot for `dedup_reverse_level_count`; v8 reserves it
-// (zero-filled). Decoders dispatch on the version field above.
-const OFF_RESERVED_28: usize = 28;
+// v7 used this slot for `dedup_reverse_level_count`; v8..v16 reserved it
+// (zero-filled). v17 repurposes it for `l2p_page_rc_shard_count: u32`
+// (the per-L2P-page refcount shard group). Decoders dispatch on the
+// version field above, so a v16 reader never misreads a v17 count here.
+const OFF_L2P_PAGE_RC_SHARDS: usize = 28;
 const OFF_NEXT_SNAPSHOT_ID: usize = 32;
 const OFF_NEXT_VOLUME_ORD: usize = 40;
 // 42..44 reserved for alignment / future flags
@@ -151,8 +171,8 @@ const _: () = {
     assert!(OFF_CHECKPOINT_LSN + 8 == OFF_FREE_LIST_HEAD);
     assert!(OFF_FREE_LIST_HEAD + 8 == OFF_SHARD_COUNT);
     assert!(OFF_SHARD_COUNT + 4 == OFF_DEDUP_SHARDS);
-    assert!(OFF_DEDUP_SHARDS + 4 == OFF_RESERVED_28);
-    assert!(OFF_RESERVED_28 + 4 == OFF_NEXT_SNAPSHOT_ID);
+    assert!(OFF_DEDUP_SHARDS + 4 == OFF_L2P_PAGE_RC_SHARDS);
+    assert!(OFF_L2P_PAGE_RC_SHARDS + 4 == OFF_NEXT_SNAPSHOT_ID);
     assert!(OFF_NEXT_SNAPSHOT_ID + 8 == OFF_NEXT_VOLUME_ORD);
     assert!(OFF_NEXT_VOLUME_ORD + 4 == OFF_SNAPSHOT_COUNT);
     assert!(OFF_SNAPSHOT_COUNT + 4 == OFF_VOLUME_COUNT);
@@ -173,7 +193,10 @@ const DEDUP_META_HEAD_GROUPS: usize = 1;
 /// Upper bound; real capacity is lower once the volume table / dedup
 /// levels eat into the variable region.
 pub fn max_snapshots_for_shards(refcount_shard_count: usize) -> usize {
-    max_snapshots_for_layout(refcount_shard_count, 0, 0, 0)
+    // The L2P-page-rc shard group has the same count as refcount
+    // (both == `shards_per_partition`); pass it through so the budget
+    // accounts for its two arrays.
+    max_snapshots_for_layout(refcount_shard_count, refcount_shard_count, 0, 0, 0)
 }
 
 /// Snapshot-table capacity given the full manifest layout. All inputs
@@ -186,6 +209,7 @@ pub fn max_snapshots_for_shards(refcount_shard_count: usize) -> usize {
 /// contributes header bytes here.
 pub fn max_snapshots_for_layout(
     refcount_shard_count: usize,
+    l2p_page_rc_shard_count: usize,
     dedup_head_group_count: usize,
     total_dedup_level_count: usize,
     volumes_budget_bytes: usize,
@@ -198,6 +222,15 @@ pub fn max_snapshots_for_layout(
     // `refcount_shard_roots`, written immediately after the roots. Same
     // length (refcount_shard_count), same element size (8 B).
     let refcount_durable_seq_bytes = refcount_bytes;
+    // v17: the L2P-page-rc shard group carries the same two arrays
+    // (roots + durable_seq), each `l2p_page_rc_shard_count × 8`.
+    let l2p_page_rc_bytes = match l2p_page_rc_shard_count
+        .checked_mul(size_of::<PageId>())
+        .and_then(|roots| roots.checked_mul(2))
+    {
+        Some(v) => v,
+        None => return 0,
+    };
     // One index (dedup_index) carries one u32 level-count header per
     // manifest head group.
     let dedup_header_bytes = match dedup_head_group_count.checked_mul(size_of::<u32>()) {
@@ -211,6 +244,7 @@ pub fn max_snapshots_for_layout(
     let used = match OFF_VARIABLE_START
         .checked_add(refcount_bytes)
         .and_then(|v| v.checked_add(refcount_durable_seq_bytes))
+        .and_then(|v| v.checked_add(l2p_page_rc_bytes))
         .and_then(|v| v.checked_add(dedup_header_bytes))
         .and_then(|v| v.checked_add(dedup_bytes))
         .and_then(|v| v.checked_add(volumes_budget_bytes))
@@ -304,6 +338,18 @@ pub struct Manifest {
     /// consumers to per-shard reads so partial sample can re-enable
     /// without pinning the global floor on cold shards.
     pub refcount_durable_seq: Box<[Lsn]>,
+    /// v17 (snapshot-scaling Phase A2): per-shard meta-page ids of the
+    /// L2P-page-refcount store (`crate::l2p_page_rc::L2pPageRc`). Like
+    /// `refcount_shard_roots`, each head meta page is stable across
+    /// folds, so this is stamped at create/open and never rewritten by
+    /// a flush. Same length as `refcount_shard_roots`
+    /// (count == `shards_per_partition`).
+    pub l2p_page_rc_shard_roots: Box<[PageId]>,
+    /// v17: per-L2P-page-rc-shard durable LSN watermark, mirroring
+    /// `refcount_durable_seq`. The page-rc fold rides the same TXG
+    /// boundary as refcount, so `durable_seq[i]` advances in lock-step
+    /// and joins the `min(durable_seq[]) == checkpoint_lsn` invariant.
+    pub l2p_page_rc_durable_seq: Box<[Lsn]>,
     /// Number of dedup apply lanes. Power of two, recorded at create time;
     /// changing it requires recreating the database.
     pub dedup_shards: u32,
@@ -338,6 +384,8 @@ impl Manifest {
             free_list_head: NULL_PAGE,
             refcount_shard_roots: Vec::new().into_boxed_slice(),
             refcount_durable_seq: Vec::new().into_boxed_slice(),
+            l2p_page_rc_shard_roots: Vec::new().into_boxed_slice(),
+            l2p_page_rc_durable_seq: Vec::new().into_boxed_slice(),
             dedup_shards: 1,
             dedup_index_shard_heads: vec![Vec::new().into_boxed_slice()].into_boxed_slice(),
             next_snapshot_id: 1,
@@ -389,6 +437,11 @@ impl Manifest {
         for &v in self.refcount_durable_seq.iter() {
             min_seen = Some(min_seen.map_or(v, |m| m.min(v)));
         }
+        // v17: the L2P-page-rc shard group folds on the same TXG
+        // boundary as refcount, so its durable_seq joins the floor.
+        for &v in self.l2p_page_rc_durable_seq.iter() {
+            min_seen = Some(min_seen.map_or(v, |m| m.min(v)));
+        }
         for vol in &self.volumes {
             for &v in vol.l2p_shard_durable_seq.iter() {
                 min_seen = Some(min_seen.map_or(v, |m| m.min(v)));
@@ -408,6 +461,13 @@ impl Manifest {
                 "manifest refcount_durable_seq length {} != refcount_shard_roots length {}",
                 self.refcount_durable_seq.len(),
                 self.refcount_shard_roots.len(),
+            )));
+        }
+        if self.l2p_page_rc_durable_seq.len() != self.l2p_page_rc_shard_roots.len() {
+            return Err(MetaDbError::Corruption(format!(
+                "manifest l2p_page_rc_durable_seq length {} != l2p_page_rc_shard_roots length {}",
+                self.l2p_page_rc_durable_seq.len(),
+                self.l2p_page_rc_shard_roots.len(),
             )));
         }
         for vol in &self.volumes {
@@ -433,6 +493,13 @@ impl Manifest {
                 refcount_shard_count, MAX_SHARD_ROOTS_PER_PAGE,
             )));
         }
+        let l2p_page_rc_shard_count = self.l2p_page_rc_shard_roots.len();
+        if l2p_page_rc_shard_count > MAX_SHARD_ROOTS_PER_PAGE {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "manifest l2p_page_rc shard count {} exceeds page capacity {}",
+                l2p_page_rc_shard_count, MAX_SHARD_ROOTS_PER_PAGE,
+            )));
+        }
         let dedup_shards = self.dedup_shards as usize;
         if dedup_shards == 0 || !dedup_shards.is_power_of_two() {
             return Err(MetaDbError::InvalidArgument(format!(
@@ -455,6 +522,7 @@ impl Manifest {
 
         let max_snapshots = max_snapshots_for_layout(
             refcount_shard_count,
+            l2p_page_rc_shard_count,
             DEDUP_META_HEAD_GROUPS,
             total_dedup_levels,
             volumes_budget_bytes,
@@ -487,7 +555,10 @@ impl Manifest {
             .copy_from_slice(&(refcount_shard_count as u32).to_le_bytes());
         p[OFF_DEDUP_SHARDS..OFF_DEDUP_SHARDS + 4]
             .copy_from_slice(&(dedup_shards as u32).to_le_bytes());
-        // OFF_RESERVED_28 stays zero-filled; reserved for future flags.
+        // v17: the L2P-page-rc shard count lives in the formerly-reserved
+        // offset-28 slot.
+        p[OFF_L2P_PAGE_RC_SHARDS..OFF_L2P_PAGE_RC_SHARDS + 4]
+            .copy_from_slice(&(l2p_page_rc_shard_count as u32).to_le_bytes());
         p[OFF_NEXT_SNAPSHOT_ID..OFF_NEXT_SNAPSHOT_ID + 8]
             .copy_from_slice(&self.next_snapshot_id.to_le_bytes());
         p[OFF_NEXT_VOLUME_ORD..OFF_NEXT_VOLUME_ORD + 2]
@@ -512,6 +583,16 @@ impl Manifest {
         // v11: per-refcount-shard durable_seq follows the roots array.
         // Length is implied by refcount_shard_count; no header.
         for seq in self.refcount_durable_seq.iter().copied() {
+            p[off..off + 8].copy_from_slice(&seq.to_le_bytes());
+            off += 8;
+        }
+        // v17: L2P-page-rc roots then durable_seq. Length is implied by
+        // the offset-28 count; both arrays mirror the refcount layout.
+        for root in self.l2p_page_rc_shard_roots.iter().copied() {
+            p[off..off + 8].copy_from_slice(&root.to_le_bytes());
+            off += 8;
+        }
+        for seq in self.l2p_page_rc_durable_seq.iter().copied() {
             p[off..off + 8].copy_from_slice(&seq.to_le_bytes());
             off += 8;
         }
@@ -545,24 +626,24 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            16 => Self::decode_v16(page, page_store),
+            17 => Self::decode_v17(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v16 \
-                 (buffer-as-sole-journal Phase A: last_processed_buffer_seq + \
-                 lifecycle_replay_seq) is readable — older databases (v7/v8 \
-                 carried the retired dedup_reverse section; v9 carried compact \
-                 leaf v2 with the 100-unit cap; v10/v11 used compact leaf v3 \
-                 which predates birth_lsn; v12 had birth_lsn but no per-volume \
-                 dead-list anchor; v13 had dead-list but no lineage tracking; \
-                 v14 had lineage tracking but no checkpoint_txg; v15 had \
-                 checkpoint_txg but no buffer-replay watermarks) must be \
-                 rebuilt"
+                "unsupported manifest body version {other}; only v17 \
+                 (snapshot-scaling Phase A2: l2p_page_rc shard group) is \
+                 readable — older databases (v7/v8 carried the retired \
+                 dedup_reverse section; v9 carried compact leaf v2 with the \
+                 100-unit cap; v10/v11 used compact leaf v3 which predates \
+                 birth_lsn; v12 had birth_lsn but no per-volume dead-list \
+                 anchor; v13 had dead-list but no lineage tracking; v14 had \
+                 lineage tracking but no checkpoint_txg; v15 had checkpoint_txg \
+                 but no buffer-replay watermarks; v16 had the buffer-replay \
+                 watermarks but no l2p_page_rc shard group) must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v16(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 16)
+    fn decode_v17(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 17)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {
@@ -600,6 +681,21 @@ impl Manifest {
                 "manifest refcount shard_count {refcount_shard_count} exceeds page capacity {MAX_SHARD_ROOTS_PER_PAGE}",
             )));
         }
+        // v17: the L2P-page-rc shard count is in the offset-28 slot.
+        let l2p_page_rc_shard_count = if version >= 17 {
+            u32::from_le_bytes(
+                p[OFF_L2P_PAGE_RC_SHARDS..OFF_L2P_PAGE_RC_SHARDS + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+        } else {
+            0
+        };
+        if l2p_page_rc_shard_count > MAX_SHARD_ROOTS_PER_PAGE {
+            return Err(MetaDbError::Corruption(format!(
+                "manifest l2p_page_rc shard_count {l2p_page_rc_shard_count} exceeds page capacity {MAX_SHARD_ROOTS_PER_PAGE}",
+            )));
+        }
         let dedup_shards = u32::from_le_bytes(
             p[OFF_DEDUP_SHARDS..OFF_DEDUP_SHARDS + 4]
                 .try_into()
@@ -625,6 +721,12 @@ impl Manifest {
         } else {
             vec![checkpoint_lsn; refcount_shard_count].into_boxed_slice()
         };
+        // v17: L2P-page-rc roots then durable_seq, both
+        // `l2p_page_rc_shard_count` long. Pre-v17 manifests are
+        // hard-rejected at the dispatch above, so the empty fallback
+        // here is only exercised by the (dead) generic decode path.
+        let l2p_page_rc_shard_roots = read_u64_vec(p, &mut off, l2p_page_rc_shard_count);
+        let l2p_page_rc_durable_seq = read_u64_vec(p, &mut off, l2p_page_rc_shard_count);
 
         let mut dedup_index_shard_heads = Vec::with_capacity(DEDUP_META_HEAD_GROUPS);
         let mut total_index_levels = 0usize;
@@ -637,6 +739,7 @@ impl Manifest {
 
         let max_snapshots = max_snapshots_for_layout(
             refcount_shard_count,
+            l2p_page_rc_shard_count,
             DEDUP_META_HEAD_GROUPS,
             total_index_levels,
             0,
@@ -668,6 +771,8 @@ impl Manifest {
             free_list_head,
             refcount_shard_roots,
             refcount_durable_seq,
+            l2p_page_rc_shard_roots,
+            l2p_page_rc_durable_seq,
             dedup_shards,
             dedup_index_shard_heads: dedup_index_shard_heads.into_boxed_slice(),
             next_snapshot_id,
