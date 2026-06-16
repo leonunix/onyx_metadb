@@ -56,14 +56,18 @@ impl Db {
             buckets[self.refcount_shard_for(*pba)].push(idx);
         }
         let mut out: Vec<u32> = vec![0; pbas.len()];
+        // Per shard (ascending index, per the cross-shard lock order), take the
+        // shard's `fold_lock` ONCE and read its whole bucket — vs once per PBA
+        // in `get_consistent`. The per-PBA acquisition made the GC reclaim
+        // recheck contend the TXG fold and grow super-linearly with retired
+        // depth; amortizing per shard bounds the fold-blocking window.
         for (sid, idxs) in buckets.into_iter().enumerate() {
             if idxs.is_empty() {
                 continue;
             }
-            let shard = &self.refcount_shards[sid];
-            for idx in idxs {
-                out[idx] = shard.rc.get_consistent(pbas[idx])?;
-            }
+            self.refcount_shards[sid]
+                .rc
+                .get_consistent_into(pbas, &idxs, &mut out)?;
         }
         Ok(out)
     }

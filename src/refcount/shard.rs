@@ -236,6 +236,24 @@ impl RcShard {
         Ok(self.lookup_entry(pba)?.rc)
     }
 
+    /// Batched fold-consistent read for PBAs that all route to THIS shard.
+    /// Takes `fold_lock` in read mode ONCE for the whole batch and fills
+    /// `out[i] = rc(pbas[idxs[i]])` for each `idxs` entry. Equivalent to
+    /// calling [`get_consistent`] per PBA, but the lock is amortized: the GC
+    /// reclaim gate reads up to a full per-cycle block budget, and a per-PBA
+    /// `fold_lock` acquisition (O(pbas)) contended the TXG fold under sustained
+    /// reclaim, making reclaim cost super-linear in retired depth. One read
+    /// guard per shard bounds the fold-blocking window to this shard's slice.
+    /// Consistency is unchanged — even stronger: every PBA in the batch
+    /// observes one coherent `array.base ⊕ Σ pending` fold state.
+    pub fn get_consistent_into(&self, pbas: &[Pba], idxs: &[usize], out: &mut [u32]) -> Result<()> {
+        let _read = self.fold_lock.read();
+        for &idx in idxs {
+            out[idx] = self.lookup_entry(pbas[idx])?.rc;
+        }
+        Ok(())
+    }
+
     /// Sum the pending deltas for `pba` across all four slots. Returns
     /// `(net_delta, max_lsn, any)`. Each slot is read under a brief
     /// individual lock — never holding two at once.
