@@ -1286,7 +1286,7 @@ mod txg_sync;
 mod volume;
 
 pub use commit::DeferredOutcomeHandle;
-pub use snapshot::{DropReport, SnapshotView};
+pub use snapshot::{DropReport, RestoreReport, SnapshotView};
 
 use apply::*;
 use helpers::*;

@@ -1,5 +1,10 @@
 use super::*;
 
+/// Max rollback ops packed into one restore transaction. Diffs at or below
+/// this size restore atomically in a single WAL record; larger diffs chunk
+/// across transactions (each atomic, the whole restore re-runnable).
+const RESTORE_MAX_OPS_PER_TX: usize = 16_384;
+
 impl Db {
     // -------- snapshot operations -----------------------------------------
 
@@ -238,6 +243,90 @@ impl Db {
         }
         out.sort_unstable_by_key(DiffEntry::key);
         Ok(out)
+    }
+
+    /// Restore the volume owning `snap_id` back to the state captured by that
+    /// snapshot, discarding every change made since. Computes the
+    /// snapshot→current diff and replays the inverse through the normal
+    /// `commit_ops` remap path: each changed LBA is re-pointed at its snapshot
+    /// value, and LBAs that did not exist in the snapshot are deleted. The
+    /// replaced (diverged) PBAs are dead-listed and reclaimed by the usual
+    /// lineage-GC path, exactly like an overwrite — so no physical PBA leaks
+    /// and no new freed-PBA surfacing is needed.
+    ///
+    /// Atomicity: applied as a single transaction (one WAL record + fsync)
+    /// when the diff fits in one chunk, so a crash leaves either the pre- or
+    /// post-restore state. Larger diffs are chunked at `RESTORE_MAX_OPS_PER_TX`
+    /// ops/tx; each chunk is atomic and the whole restore is idempotent — a
+    /// re-run re-diffs and converges.
+    ///
+    /// The caller MUST quiesce the volume (no concurrent writes) for the
+    /// duration; onyx stops the volume and drains its write buffer first.
+    /// Unknown snapshot ids surface as `InvalidArgument`.
+    pub fn restore_volume_to_snapshot(&self, snap_id: SnapshotId) -> Result<RestoreReport> {
+        let vol_ord = {
+            let manifest_state = self.manifest_state.lock();
+            manifest_state
+                .manifest
+                .find_snapshot(snap_id)
+                .ok_or_else(|| {
+                    MetaDbError::InvalidArgument(format!("unknown snapshot id {snap_id}"))
+                })?
+                .vol_ord
+        };
+
+        // Settle everything before diffing: `diff_with_current` reads each
+        // shard's committed `tree.root()`, which excludes both unfolded
+        // l2p_buffer entries AND staged commits (onyx's flusher commits via the
+        // staged path, whose tree fold is deferred to the next TXG sync). A
+        // forced sync applies the staged commits and folds the buffer into the
+        // tree, so the diff sees the volume's full committed state; without it
+        // the very overwrites we must roll back are invisible and the restore
+        // silently no-ops. The caller's quiescence guarantee means no new writes
+        // form between the sync and the diff.
+        self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
+        self.force_compact_l2p_buffers()?;
+
+        // `diff_with_current` returns A=snapshot vs B=current, so:
+        //   Changed/RemovedInB -> set the LBA back to the snapshot value (`old`)
+        //   AddedInB           -> delete the LBA (absent in the snapshot)
+        let diff = self.diff_with_current(snap_id)?;
+
+        let mut lbas_remapped: u64 = 0;
+        let mut lbas_deleted: u64 = 0;
+        let mut last_lsn = self.last_applied_lsn();
+
+        for chunk in diff.chunks(RESTORE_MAX_OPS_PER_TX) {
+            let mut tx = self.begin();
+            for entry in chunk {
+                match entry {
+                    DiffEntry::Changed { key, old, .. }
+                    | DiffEntry::RemovedInB { key, old } => {
+                        // Strip the seq: the snapshot value carries its original
+                        // (low) commit seq, and `seq_guard_rejects` would drop a
+                        // remap whose seq is below the current entry's. Restore is
+                        // a deliberate authoritative rollback, so seq=0 (the
+                        // guard-bypass sentinel) makes it apply unconditionally;
+                        // later real writes get fresh higher seqs and still win.
+                        tx.l2p_remap(vol_ord, *key, old.with_seq(0), None);
+                        lbas_remapped += 1;
+                    }
+                    DiffEntry::AddedInB { key, .. } => {
+                        tx.delete(vol_ord, *key);
+                        lbas_deleted += 1;
+                    }
+                }
+            }
+            last_lsn = tx.commit()?;
+        }
+
+        Ok(RestoreReport {
+            snapshot_id: snap_id,
+            vol_ord,
+            lbas_remapped,
+            lbas_deleted,
+            lsn: last_lsn,
+        })
     }
 
     /// Drop a snapshot. The drop is logged as `LifecycleOp::DropSnapshot`
@@ -536,6 +625,22 @@ impl Db {
             freed_pbas,
         }))
     }
+}
+
+/// Result of [`Db::restore_volume_to_snapshot`].
+#[derive(Clone, Debug)]
+pub struct RestoreReport {
+    /// Snapshot the volume was restored to.
+    pub snapshot_id: SnapshotId,
+    /// Volume that was restored.
+    pub vol_ord: VolumeOrdinal,
+    /// Count of LBAs re-pointed back to their snapshot value.
+    pub lbas_remapped: u64,
+    /// Count of LBAs deleted (live now, absent in the snapshot).
+    pub lbas_deleted: u64,
+    /// LSN of the final rollback commit (equals the prior `last_applied_lsn`
+    /// when the diff was empty / nothing to do).
+    pub lsn: Lsn,
 }
 
 /// Result of [`Db::drop_snapshot`].
