@@ -294,6 +294,215 @@ fn b2_buffer_overwrite_visible_to_get() {
     assert_eq!(db.get(0, 10).unwrap(), Some(v(8)));
 }
 
+// Repro for the A3 page-rc cutover premature-free found by the nvme-box
+// snapshot-churn soak (2026-06-17). In buffer mode the COW increfs of
+// pages that become shared with a live snapshot are staged into the
+// `L2pPageRc` array; if any of those increfs is wrongly dropped (the
+// `RcShard` replay-skip / fold-skip is array-DATA-PAGE granular, not
+// per-pid), the page is under-counted and `drop_snapshot` frees it while
+// the live volume still points at it — surfacing as a lost mapping or a
+// page-type corruption (`page X has level/type ...`). NO test combined
+// buffer mode + snapshots before this, which is exactly why the cutover's
+// unit suite stayed green while the soak corrupted in ~4 minutes.
+#[test]
+fn buffer_mode_snapshot_churn_no_premature_free() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    // Tiny soft trigger → the compactor (and the page-rc fold) runs
+    // constantly, the way the prod drain does, so the array-page
+    // generation keeps racing the COW increfs.
+    cfg.l2p_buffer_soft_entries = 4;
+    cfg.l2p_buffer_max_interval_ms = 50;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    // Span many leaves/index pages so many pids land on one page-rc
+    // array data page. Share values across 32-LBA groups (≤4 distinct
+    // units/leaf, MAX_UNITS_PER_LEAF=100) and shift per round so every
+    // overwrite genuinely COWs.
+    const N: u64 = 4096;
+    let val = |i: u64, round: u64| -> L2pValue { v((((i / 32) + round) % 251) as u8) };
+
+    for i in 0..N {
+        db.insert(0, i, val(i, 0)).unwrap();
+    }
+    db.flush().unwrap();
+
+    for round in 1u64..8 {
+        let snap = db.take_snapshot(0).unwrap();
+        // Overwrite the whole volume while the snapshot is live → COW
+        // clones the touched path and increfs the now-shared siblings.
+        for i in 0..N {
+            db.insert(0, i, val(i, round)).unwrap();
+        }
+        db.flush().unwrap();
+        db.drop_snapshot(snap).unwrap().unwrap();
+        // Every live LBA must still resolve to this round's value. A
+        // premature free shows up as a lost mapping (None), a wrong
+        // value, or an Err from a corrupted page walk.
+        for i in 0..N {
+            assert_eq!(
+                db.get(0, i).unwrap(),
+                Some(val(i, round)),
+                "round {round} lba {i}: live mapping lost (page-rc premature free)"
+            );
+        }
+    }
+
+    db.flush().unwrap();
+    // Reopen so `reclaim_orphan_pages` sweeps the benign post-drop
+    // `SnapshotRoots` pages (drop_snapshot leaves them allocated until
+    // a snapshot-less manifest is persisted + replayed — see the NOTE in
+    // drop_snapshot); without this, strict verify trips on those.
+    drop(db);
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0..N {
+        assert_eq!(db.get(0, i).unwrap(), Some(val(i, 7)), "reopen lba {i}");
+    }
+    let report =
+        crate::verify::verify_path(dir.path(), crate::verify::VerifyOptions { strict: true })
+            .unwrap();
+    assert!(report.is_clean(), "verify issues: {:?}", report.issues);
+}
+
+// Direct repro of the nvme-box premature-free: the soak snapshots a
+// USER volume (create_volume), not the bootstrap volume (ord 0). The box
+// trace showed the fresh user-volume shard roots had page-rc array rc=0
+// (`SNAP_INCREF array_before=0`) — create_volume stages each root's +1 but
+// never `l2p_page_rc.flush()`es it (unlike take/drop/clone/bootstrap), so a
+// separate create-volume process exits before it's durable and `start`
+// reopens with rc=0. The snapshot incref then bumps 0->1 (should be 1->2)
+// and drop's stage(-1) floors it to 0, freeing a still-live root.
+#[test]
+fn create_volume_root_page_rc_survives_reopen() {
+    let dir = TempDir::new().unwrap();
+    let vol;
+    {
+        let mut cfg = Config::new(dir.path());
+        cfg.l2p_buffer_enabled = true;
+        let db = Db::create_with_config(cfg).unwrap();
+        // Mirror the `create-volume` CLI: make the volume, then the
+        // process exits — NO writes, NO explicit page-rc fold.
+        vol = db.create_volume().unwrap();
+        drop(db);
+    }
+    // Mirror `start`: reopen the store.
+    let db = Db::open(dir.path()).unwrap();
+    // Snapshot the fresh user volume immediately (created_lsn=0, exactly
+    // like the soak's first churn), then write + drop. If the root's array
+    // rc was lost at create, drop frees it and the live data is gone.
+    let snap = db.take_snapshot(vol).unwrap();
+    for i in 0..256u64 {
+        db.insert(vol, i, v((i / 32) as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    db.drop_snapshot(snap).unwrap().unwrap();
+    for i in 0..256u64 {
+        assert_eq!(
+            db.get(vol, i).unwrap(),
+            Some(v((i / 32) as u8)),
+            "lba {i}: live mapping lost (shard-root page-rc under-counted at create_volume)"
+        );
+    }
+    db.flush().unwrap();
+    drop(db);
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0..256u64 {
+        assert_eq!(db.get(vol, i).unwrap(), Some(v((i / 32) as u8)), "reopen lba {i}");
+    }
+    let report =
+        crate::verify::verify_path(dir.path(), crate::verify::VerifyOptions { strict: true })
+            .unwrap();
+    assert!(report.is_clean(), "verify issues: {:?}", report.issues);
+}
+
+// Concurrent version — this is the shape the nvme-box soak actually ran
+// (writers hammering the volume while snapshots are taken/dropped). The
+// serial test above proved quiesced A3 is correct; the soak's
+// premature-free needs live COW racing the snapshot force-flush / buffer
+// drain. Writers `.unwrap()` so a corruption-class Err (a freed page
+// reused as the wrong type) fails the test in the writer thread; the
+// final reopen + strict verify catches silent leaks / undercounts.
+#[test]
+fn buffer_mode_concurrent_snapshot_churn_no_corruption() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.l2p_buffer_soft_entries = 4;
+    cfg.l2p_buffer_max_interval_ms = 5;
+    // Mirror the nvme-box soak config: background TXG sync threads make
+    // the page-rc fold/drain run CONCURRENTLY with commits + the
+    // snapshot force-flush — the race the serial path can't hit.
+    cfg.txg_threads_enabled = true;
+    cfg.rc_authoritative_reclaim = true;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    const N: u64 = 4096;
+    const WRITERS: u64 = 4;
+    for i in 0..N {
+        db.insert(0, i, v((i / 32) as u8)).unwrap();
+    }
+    db.flush().unwrap();
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+    for t in 0..WRITERS {
+        let db = db.clone();
+        let stop = stop.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut round = 1u64;
+            while !stop.load(Ordering::Relaxed) {
+                let mut i = t;
+                while i < N {
+                    db.insert(0, i, v((((i / 32) + round) % 251) as u8))
+                        .expect("insert during snapshot churn");
+                    i += WRITERS;
+                }
+                round += 1;
+            }
+        }));
+    }
+
+    // Churn snapshots while the writers run, keeping a ROLLING WINDOW of
+    // up to 4 live snapshots (mirrors the soak's --snapshot-max-live 4).
+    // Multiple overlapping snapshots pinning the same shard roots is the
+    // condition the box repro showed: the first drop under-counted exactly
+    // the 16 shard roots by 1.
+    let mut live = std::collections::VecDeque::new();
+    for _ in 0..400 {
+        let snap = db.take_snapshot(0).expect("take_snapshot");
+        live.push_back(snap);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        if live.len() > 4 {
+            let old = live.pop_front().unwrap();
+            db.drop_snapshot(old).expect("drop_snapshot");
+        }
+    }
+    while let Some(old) = live.pop_front() {
+        db.drop_snapshot(old).expect("drop_snapshot drain");
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    db.flush().unwrap();
+    drop(db);
+    let db = Db::open(dir.path()).unwrap();
+    // Values are nondeterministic across racing writers, so only assert
+    // structural integrity: every LBA still resolves without error and
+    // strict verify finds no leaked/undercounted pages.
+    for i in 0..N {
+        db.get(0, i).expect("get after churn");
+    }
+    let report =
+        crate::verify::verify_path(dir.path(), crate::verify::VerifyOptions { strict: true })
+            .unwrap();
+    assert!(report.is_clean(), "verify issues: {:?}", report.issues);
+}
+
 #[test]
 fn b2_buffer_delete_visible_to_get() {
     let (_d, db) = mk_db_with_buffer();

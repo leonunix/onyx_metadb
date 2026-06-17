@@ -106,6 +106,20 @@ impl Db {
             self.l2p_buffer_enabled,
             lsn,
         )?;
+        // A3 cutover fix (2026-06-17): `apply_create_volume` only STAGES
+        // each shard root's page-rc `+1` into the array slot. Every other
+        // lifecycle op that mutates page rc — take_snapshot, drop_snapshot,
+        // clone_volume, and the bootstrap volume at `Db::create` — force-
+        // folds it durable with `l2p_page_rc.flush()`. create_volume was the
+        // sole exception: if the manifest commit / checkpoint advances past
+        // this CreateVolume LSN before the staged `+1` is folded (e.g. the
+        // standalone `create-volume` CLI process exits, or `created_lsn==0`
+        // makes the hot fold's `page_generation >= last_lsn` skip it), the
+        // root reopens with array rc=0. A later snapshot then drops it 1→0
+        // and frees a still-live shard root → page-type corruption under
+        // snapshot churn (nvme-box soak 2026-06-17). Fold it here, durable,
+        // before the manifest records this volume.
+        self.l2p_page_rc.flush()?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
