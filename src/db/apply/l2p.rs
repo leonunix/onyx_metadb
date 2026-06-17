@@ -152,6 +152,10 @@ pub(in crate::db) fn apply_l2p_remap(
     // this lock prevents commits from racing the compactor's
     // `tree.write()` mid-cycle.
     let mut tree = volume.shards[l2p_sid].tree.write();
+    // A3 cutover: tree-mode COW stages page-rc deltas into this commit's
+    // TXG slot. (Buffer mode COWs later in the drain, which sets its own
+    // sync txg; this set is then a harmless no-op for the buffered path.)
+    tree.set_current_txg(txg);
 
     if let Some((gp, min_rc)) = guard {
         let gp_sid = shard_for_key(refcount_shards, gp);
@@ -484,6 +488,8 @@ pub(in crate::db) fn apply_l2p_remap_range(
         // (rc-authoritative needs the tree for the snap-pin probe). One tree
         // write lock per shard bucket.
         let mut tree = shard.tree.write();
+        // A3 cutover: tree-mode COW stages page-rc deltas into this TXG slot.
+        tree.set_current_txg(txg);
         for &i in indices {
             let lba = start_lba + i as u64;
             let new_value = values[i];
@@ -615,6 +621,8 @@ pub(in crate::db) fn apply_l2p_range_delete(
             continue;
         }
         let mut tree = volume.shards[sid].tree.write();
+        // A3 cutover: tree-mode COW (delete) stages page-rc deltas here.
+        tree.set_current_txg(txg);
         for &idx in indices {
             let (lba, _) = captured[idx];
             // The snap-pin probe inside `stage_delete_rc` reads the snapshot

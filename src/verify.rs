@@ -1,6 +1,6 @@
 //! Offline consistency verifier plus helpers reused by recovery/open.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -79,7 +79,15 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
     };
 
     let mut free_pages = BTreeSet::new();
-    let mut verified_headers = HashMap::new();
+    // A3 cutover: page rc lives in the `L2pPageRc` array, not the page
+    // header. The scan records which pids passed verify, and which are
+    // L2P pages (`PagedLeaf` / `PagedIndex`) — only those carry a page-rc
+    // array entry. Non-L2P live pages (refcount / page-rc / dedup meta
+    // chains, dead-list segments) had a trivial header rc of 1 under the
+    // old scheme and are NOT tracked by the array, so the rc comparison
+    // below skips them.
+    let mut scanned_pids: HashSet<PageId> = HashSet::new();
+    let mut l2p_pids: HashSet<PageId> = HashSet::new();
     for pid in FIRST_DATA_PAGE..page_store.high_water() {
         report.scanned_pages += 1;
         let raw = match page_store.read_page_unchecked(pid) {
@@ -104,7 +112,13 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
                 if header.page_type == PageType::Free {
                     free_pages.insert(pid);
                 }
-                verified_headers.insert(pid, header.refcount);
+                if matches!(
+                    header.page_type,
+                    PageType::PagedLeaf | PageType::PagedIndex
+                ) {
+                    l2p_pids.insert(pid);
+                }
+                scanned_pids.insert(pid);
             }
             Err(err) => report
                 .issues
@@ -112,6 +126,23 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
         }
     }
     report.free_pages = free_pages.len();
+
+    // Open the L2P-page-rc array from the manifest roots so the
+    // parent-pointer counts can be checked against it (the old A4 step,
+    // folded into A3 — verify would otherwise misfire on the now-dead
+    // header rc field). Fold-consistent reads; the store is offline so
+    // there is no concurrent fold, but `get_consistent` is the correct
+    // "free decision"-grade read regardless.
+    let verify_page_cache = Arc::new(crate::cache::PageCache::new(
+        page_store.clone(),
+        16 * 1024 * 1024,
+    ));
+    let page_rc = crate::l2p_page_rc::L2pPageRc::open(
+        page_store.clone(),
+        verify_page_cache,
+        &manifest.manifest.l2p_page_rc_shard_roots,
+        &manifest.manifest.l2p_page_rc_durable_seq,
+    )?;
 
     match collect_live_pages(&page_store, &manifest) {
         Ok(live) => {
@@ -122,14 +153,27 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
                         .issues
                         .push(format!("page {pid} is both live and on the free list"));
                 }
-                match verified_headers.get(pid).copied() {
-                    Some(actual) if actual == *expected => {}
-                    Some(actual) => report.issues.push(format!(
-                        "page {pid} refcount mismatch: header={actual}, expected={expected}"
-                    )),
-                    None => report
+                if !scanned_pids.contains(pid) {
+                    report
                         .issues
-                        .push(format!("live page {pid} did not pass the page scan")),
+                        .push(format!("live page {pid} did not pass the page scan"));
+                    continue;
+                }
+                // Only L2P pages carry a page-rc array entry; the
+                // refcount/page-rc/dedup meta chains + dead-list segments
+                // that `collect_live_pages` also marks are not refcounted
+                // there.
+                if !l2p_pids.contains(pid) {
+                    continue;
+                }
+                match page_rc.get_consistent(*pid) {
+                    Ok(actual) if actual == *expected => {}
+                    Ok(actual) => report.issues.push(format!(
+                        "page {pid} page-rc mismatch: array={actual}, expected={expected}"
+                    )),
+                    Err(err) => report
+                        .issues
+                        .push(format!("page {pid} page-rc read failed: {err}")),
                 }
             }
 

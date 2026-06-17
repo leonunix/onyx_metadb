@@ -553,7 +553,16 @@ impl Db {
                 }
                 let count = drained.len();
                 let max_lsn = drained.values().map(|e| e.lsn).max().unwrap_or(0);
-                let apply_result = super::txg_sync::compact_drain_into_tree(&mut tree, &drained);
+                // A3 cutover: this all-slots drain folds page-rc deltas
+                // into the current Open TXG slot; the lifecycle/recovery
+                // callers fold every page-rc slot afterwards (RcShard
+                // all-slots flush / `begin_checkpoint_all_slots`), so any
+                // live slot is correct here.
+                let apply_result = super::txg_sync::compact_drain_into_tree(
+                    &mut tree,
+                    &drained,
+                    self.txg.open_txg(),
+                );
                 match apply_result {
                     Ok(()) => {
                         super::apply::publish_l2p_read_view(shard, &tree);
@@ -724,7 +733,7 @@ impl Db {
                 }
             }
             let mut tree = shard.tree.write();
-            super::txg_sync::apply_drain_ops(&mut tree, &plan[start..end])?;
+            super::txg_sync::apply_drain_ops(&mut tree, &plan[start..end], txg)?;
             if end == plan.len() {
                 // Publish BEFORE clearing the slot (see method doc), under
                 // the final chunk's hold like the one-shot fold did.

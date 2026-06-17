@@ -305,14 +305,23 @@ pub(super) fn make_l2p_shard(
 pub(super) fn create_l2p_shards(
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
+    page_rc: Arc<crate::l2p_page_rc::L2pPageRc>,
     shard_count: usize,
     metrics: Arc<MetaMetrics>,
     use_buffer: bool,
+    // A3: the volume's `created_lsn` — stamps each shard root's page-rc
+    // `+1` so the fold applies it (≤ the volume's first write op).
+    root_lsn: Lsn,
 ) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
     let mut shards = Vec::with_capacity(shard_count);
     let mut roots = Vec::with_capacity(shard_count);
     for shard_idx in 0..shard_count {
-        let tree = PagedL2p::create_with_cache(page_store.clone(), page_cache.clone())?;
+        let tree = PagedL2p::create_with_cache_rc(
+            page_store.clone(),
+            page_cache.clone(),
+            page_rc.clone(),
+            root_lsn,
+        )?;
         roots.push(tree.root());
         shards.push(make_l2p_shard(
             tree,
@@ -329,6 +338,7 @@ pub(super) fn create_l2p_shards(
 pub(super) fn open_l2p_shards(
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
+    page_rc: Arc<crate::l2p_page_rc::L2pPageRc>,
     roots: &[PageId],
     next_gen: Lsn,
     metrics: Arc<MetaMetrics>,
@@ -345,8 +355,13 @@ pub(super) fn open_l2p_shards(
     }
     let mut shards = Vec::with_capacity(roots.len());
     for (shard_idx, &root) in roots.iter().enumerate() {
-        let tree =
-            PagedL2p::open_with_cache(page_store.clone(), page_cache.clone(), root, next_gen)?;
+        let tree = PagedL2p::open_with_cache_rc(
+            page_store.clone(),
+            page_cache.clone(),
+            page_rc.clone(),
+            root,
+            next_gen,
+        )?;
         shards.push(make_l2p_shard(
             tree,
             &page_cache,

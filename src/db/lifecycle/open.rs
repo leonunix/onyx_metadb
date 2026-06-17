@@ -41,23 +41,39 @@ impl Db {
         page_store.attach_metrics(metrics.clone());
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
+        // Snapshot-scaling A2/A3: the per-L2P-page refcount store. Same
+        // shard count as refcount; folded on the same TXG-sync boundary.
+        // Built BEFORE the L2P shards so its `Arc` can be injected into
+        // every shard's `PageBuf` (A3 plumbing — page-rc routes by global
+        // `PageId`, so all shards share the one store). See plan §0.2.
+        let (l2p_page_rc_raw, l2p_page_rc_roots) =
+            crate::l2p_page_rc::L2pPageRc::create(page_store.clone(), page_cache.clone(), shard_count)?;
+        let l2p_page_rc = Arc::new(l2p_page_rc_raw);
         let (l2p_shards, l2p_roots) = create_l2p_shards(
             page_store.clone(),
             page_cache.clone(),
+            l2p_page_rc.clone(),
             shard_count,
             metrics.clone(),
             cfg.l2p_buffer_enabled,
+            // Bootstrap volume `created_lsn` is 0. Stamp the root page-rc
+            // at lsn 0 and force-fold it immediately (below) so the array
+            // page generation stays 0 — a later op (e.g. the first
+            // `CloneVolume`, which lands at lsn 1 and increfs these same
+            // roots) must not be replay-skipped against the stamp.
+            0,
         )?;
+        // Fold the bootstrap root stamps (staged at lsn 0) into the array
+        // base now, force-applied — the regular hot-path fold would skip a
+        // `last_lsn == 0` delta, and deferring it would let the array page
+        // generation rise to the first op's lsn and replay-skip that op.
+        l2p_page_rc.flush()?;
         let (refcount_shards, refcount_roots) = create_shards(
             page_store.clone(),
             page_cache.clone(),
             shard_count,
             metrics.clone(),
         )?;
-        // Snapshot-scaling Phase A2: the per-L2P-page refcount store. Same
-        // shard count as refcount; folded on the same TXG-sync boundary.
-        let (l2p_page_rc, l2p_page_rc_roots) =
-            crate::l2p_page_rc::L2pPageRc::create(page_store.clone(), page_cache.clone(), shard_count)?;
         let dedup_index = Arc::new(crate::dedup::DedupIndex::create(
             page_store.clone(),
             page_cache.clone(),
@@ -352,10 +368,22 @@ impl Db {
         // real per-shard values.
         let mut volumes: HashMap<VolumeOrdinal, Arc<Volume>> =
             HashMap::with_capacity(manifest.volumes.len());
+        // v17: re-open the L2P-page-rc shard group BEFORE the L2P shards so
+        // its `Arc` can be injected into every shard's `PageBuf` (A3
+        // plumbing — page-rc routes by global `PageId`, so all shards share
+        // the one store). Per-shard durable_seq restored independently of
+        // the global `checkpoint_lsn`, like refcount. See plan §0.2.
+        let l2p_page_rc = Arc::new(crate::l2p_page_rc::L2pPageRc::open(
+            page_store.clone(),
+            page_cache.clone(),
+            &manifest.l2p_page_rc_shard_roots,
+            &manifest.l2p_page_rc_durable_seq,
+        )?);
         for entry in &manifest.volumes {
             let shards = open_l2p_shards(
                 page_store.clone(),
                 page_cache.clone(),
+                l2p_page_rc.clone(),
                 &entry.l2p_shard_roots,
                 next_gen,
                 metrics.clone(),
@@ -382,15 +410,6 @@ impl Db {
             &manifest.refcount_shard_roots,
             &manifest.refcount_durable_seq,
             metrics.clone(),
-        )?;
-        // v17: re-open the L2P-page-rc shard group from the manifest roots
-        // + per-shard durable_seq (restored independently of the global
-        // `checkpoint_lsn`, like refcount).
-        let l2p_page_rc = crate::l2p_page_rc::L2pPageRc::open(
-            page_store.clone(),
-            page_cache.clone(),
-            &manifest.l2p_page_rc_shard_roots,
-            &manifest.l2p_page_rc_durable_seq,
         )?;
         let dedup_index_meta_pid: PageId = manifest
             .dedup_index_shard_heads
@@ -443,6 +462,7 @@ impl Db {
                 &mut manifest,
                 &mut volumes,
                 &refcount_shards,
+                &l2p_page_rc,
                 &dedup_index,
                 &page_store,
                 &page_cache,
@@ -834,6 +854,7 @@ fn replay_lifecycle_journal_into(
     manifest: &mut Manifest,
     volumes: &mut HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
+    l2p_page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     dedup_index: &Arc<crate::dedup::DedupIndex>,
     page_store: &Arc<PageStore>,
     page_cache: &Arc<PageCache>,
@@ -871,6 +892,7 @@ fn replay_lifecycle_journal_into(
             manifest,
             volumes,
             refcount_shards,
+            l2p_page_rc,
             dedup_index,
             page_store,
             page_cache,
@@ -894,6 +916,7 @@ fn apply_lifecycle_record_replay(
     manifest: &mut Manifest,
     volumes: &mut HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
+    l2p_page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     dedup_index: &Arc<crate::dedup::DedupIndex>,
     page_store: &Arc<PageStore>,
     page_cache: &Arc<PageCache>,
@@ -918,9 +941,11 @@ fn apply_lifecycle_record_replay(
                 let (shards, roots) = apply_create_volume(
                     page_store,
                     page_cache,
+                    l2p_page_rc,
                     *shard_count,
                     metrics.clone(),
                     l2p_buffer_enabled,
+                    lsn,
                 )?;
                 volumes.insert(*ord, Arc::new(Volume::new(*ord, shards, lsn)));
                 let durable_seqs = vec![lsn; *shard_count as usize].into_boxed_slice();
@@ -945,7 +970,7 @@ fn apply_lifecycle_record_replay(
         }
         LifecycleOp::DropVolume { ord, pages } => {
             if volumes.contains_key(ord) {
-                apply_drop_volume(page_store, lsn, pages)?;
+                apply_drop_volume(page_store, l2p_page_rc, lsn, replay_open_txg, pages)?;
                 volumes.remove(ord);
                 manifest.volumes.retain(|v| v.ord != *ord);
                 outcome.mutated_volumes = true;
@@ -958,7 +983,7 @@ fn apply_lifecycle_record_replay(
             src_shard_roots,
         } => {
             if !volumes.contains_key(new_ord) {
-                apply_clone_volume_incref(page_store, faults, lsn, src_shard_roots)?;
+                apply_clone_volume_incref(l2p_page_rc, faults, lsn, replay_open_txg, src_shard_roots)?;
                 // Same stale-buffer hazard as the WAL replay arm for
                 // CloneVolume: every PagedL2p opened above may hold
                 // a pre-incref Clean copy of one of these roots.
@@ -981,6 +1006,7 @@ fn apply_lifecycle_record_replay(
                     src_shard_roots,
                     page_store,
                     page_cache,
+                    l2p_page_rc,
                     lsn,
                     metrics.clone(),
                     l2p_buffer_enabled,
@@ -1042,7 +1068,9 @@ fn apply_lifecycle_record_replay(
             apply_drop_snapshot_pages_and_decrefs(
                 page_store,
                 refcount_shards,
+                l2p_page_rc,
                 lsn,
+                replay_open_txg,
                 pages,
                 pba_decrefs,
             )?;

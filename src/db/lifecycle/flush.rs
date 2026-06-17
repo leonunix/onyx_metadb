@@ -585,7 +585,7 @@ impl Db {
                             if txg_threads_enabled {
                                 shard.rc.begin_checkpoint(txg)
                             } else {
-                                shard.rc.begin_checkpoint_all_slots()
+                                shard.rc.begin_checkpoint_all_slots(false)
                             }
                         });
                         handles.push((s_idx, h));
@@ -669,20 +669,18 @@ impl Db {
             return Err(err);
         }
 
-        // Snapshot-scaling Phase A2: fold the L2P-page-rc shards on the
+        // Snapshot-scaling Phase A2/A3: fold the L2P-page-rc shards on the
         // SAME TXG boundary as the PBA refcount shards, reusing
-        // `selected.rc` (the two groups share a shard count). Phase A2
-        // never stages page-rc deltas, so every checkpoint here is the
-        // empty variant: `begin_checkpoint` allocates nothing,
-        // `build_meta_chain` (below) produces no sealed pages / no
-        // frees, and dropping an empty checkpoint leaks nothing. That is
-        // why the downstream IO/manifest error paths do NOT abort these
-        // (unlike refcount) — there is nothing to roll back. **Phase A3
-        // wires real page-rc writes and MUST add abort + fresh-page-free
-        // threading at every error site, exactly like refcount.** The
-        // fold still runs so the path is exercised under soak and each
-        // selected shard's `last_flushed_lsn` advances in lock-step with
-        // refcount (preserving `min(durable_seq[]) == checkpoint_lsn`).
+        // `selected.rc` (the two groups share a shard count). A3 made the
+        // array authoritative, so these checkpoints now carry real staged
+        // deltas: `begin_checkpoint` drains the TXG slot, `build_meta_chain`
+        // (below) seals data pages + allocates fresh meta pages. Every
+        // downstream IO/manifest error site therefore aborts
+        // `l2p_page_rc_checkpoints` too (`abort_prc_checkpoints_sparse`),
+        // exactly like `refcount_checkpoints` — search the
+        // `abort_prc_checkpoints_sparse` call sites. Each selected shard's
+        // `last_flushed_lsn` advances in lock-step with refcount
+        // (preserving `min(durable_seq[]) == checkpoint_lsn`).
         debug_assert_eq!(
             self.l2p_page_rc.shard_count(),
             self.refcount_shards.len(),
@@ -700,13 +698,14 @@ impl Db {
                 let res = if txg_threads_enabled {
                     shard.begin_checkpoint(txg)
                 } else {
-                    shard.begin_checkpoint_all_slots()
+                    shard.begin_checkpoint_all_slots(false)
                 };
                 match res {
                     Ok(ckpt) if prc_err.is_none() => out[s_idx] = Some(ckpt),
-                    // An empty ckpt holds no resources, so a later error
-                    // means earlier folds just drop; abort_checkpoint is a
-                    // no-op on empty but kept for A3-forward symmetry.
+                    // A3: a sibling shard in this round already errored, so
+                    // abort this just-built checkpoint (frees its fresh
+                    // pages + restores its drained deltas). No-op on an
+                    // empty checkpoint.
                     Ok(ckpt) => shard.abort_checkpoint(ckpt, wal_checkpoint),
                     Err(err) if prc_err.is_none() => prc_err = Some(err),
                     Err(_) => {}
@@ -766,6 +765,10 @@ impl Db {
                                     refcount_checkpoints,
                                     wal_checkpoint,
                                 );
+                                self.abort_prc_checkpoints_sparse(
+                                    l2p_page_rc_checkpoints,
+                                    wal_checkpoint,
+                                );
                                 self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                                 return Err(err);
                             }
@@ -782,6 +785,18 @@ impl Db {
         // submission covers L2P + RC data + RC meta. Only selected
         // (= `Some(...)`) RC shards contribute pages this round.
         for ckpt_opt in &refcount_checkpoints {
+            if let Some(ckpt) = ckpt_opt {
+                let before = sealed_pages.len();
+                ckpt.append_sealed_pages(&mut sealed_pages);
+                total_pages_written += sealed_pages.len() - before;
+            }
+        }
+        // A3: the L2P-page-rc fold now stages real data pages too — fold
+        // them into the SAME write batch (in A2 these checkpoints were
+        // always empty, so this loop was a no-op and was omitted; A3 must
+        // write them or the freshly-allocated array data pages are never
+        // persisted → orphan / zeroed on reopen).
+        for ckpt_opt in &l2p_page_rc_checkpoints {
             if let Some(ckpt) = ckpt_opt {
                 let before = sealed_pages.len();
                 ckpt.append_sealed_pages(&mut sealed_pages);
@@ -830,18 +845,17 @@ impl Db {
                     self.metrics
                         .record_flush_total(kind, flush_started.elapsed());
                     self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                    self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
                     self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                     return Err(err);
                 }
             }
         }
-        // Phase A2: build the L2P-page-rc meta chains into the same
-        // sealed batch + cache-insert / to-free lists. Empty in A2 →
-        // `build_meta_chain` returns the existing chain with no sealed
-        // pages and no frees, so this is a no-op that just confirms each
-        // shard's chain. See the fold comment above for why no abort
-        // threading is needed here (empty checkpoints leak nothing); A3
-        // must add it when page-rc carries data.
+        // Phase A2/A3: build the L2P-page-rc meta chains into the same
+        // sealed batch + cache-insert / to-free lists. A3 stages real
+        // deltas, so a non-empty checkpoint seals chain pages + frees old
+        // continuation pages here; the error arm aborts every page-rc
+        // checkpoint (`abort_prc_checkpoints_sparse`), like refcount.
         let mut l2p_page_rc_new_chains: Vec<Option<Vec<PageId>>> =
             (0..self.l2p_page_rc.shard_count()).map(|_| None).collect();
         for (s_idx, ckpt_opt) in l2p_page_rc_checkpoints.iter().enumerate() {
@@ -862,6 +876,7 @@ impl Db {
                     self.metrics
                         .record_flush_total(kind, flush_started.elapsed());
                     self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                    self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
                     self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                     return Err(err);
                 }
@@ -914,6 +929,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -928,6 +944,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -942,6 +959,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -981,6 +999,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1052,6 +1071,7 @@ impl Db {
                     wal_checkpoint,
                 );
                 self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
                 self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                 return Err(err);
             }
@@ -1068,6 +1088,7 @@ impl Db {
             drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1086,6 +1107,7 @@ impl Db {
             drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1161,6 +1183,7 @@ impl Db {
             drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1178,6 +1201,7 @@ impl Db {
             drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1191,6 +1215,7 @@ impl Db {
             drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1511,6 +1536,25 @@ impl Db {
                 self.refcount_shards[s_idx]
                     .rc
                     .abort_checkpoint(ckpt, free_lsn);
+            }
+        }
+    }
+
+    /// A3 handoff (§6): page-rc analogue of
+    /// [`abort_rc_checkpoints_sparse`]. Once A3 stages real page-rc
+    /// deltas, the page-rc fold allocates fresh pages / seals data pages,
+    /// so every flush error site that aborts `refcount_checkpoints` must
+    /// also roll back `l2p_page_rc_checkpoints` (free fresh pages, restore
+    /// drained deltas). Indexes the page-rc shard group instead of the
+    /// PBA-refcount one; otherwise identical to the refcount version.
+    fn abort_prc_checkpoints_sparse(
+        &self,
+        checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>>,
+        free_lsn: Lsn,
+    ) {
+        for (s_idx, ckpt_opt) in checkpoints.into_iter().enumerate() {
+            if let Some(ckpt) = ckpt_opt {
+                self.l2p_page_rc.shard(s_idx).abort_checkpoint(ckpt, free_lsn);
             }
         }
     }

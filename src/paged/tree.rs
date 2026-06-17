@@ -110,6 +110,39 @@ impl PagedL2p {
         let mut buf = PageBuf::with_cache(page_store, page_cache);
         let root = buf.alloc_leaf(1)?;
         buf.flush()?;
+        // A3: commit the root's +1 (staged by alloc_leaf into the op
+        // accumulator) into the private page-rc store. Standalone trees
+        // are not Db-verified, so a fixed `root_lsn = 1` (≤ any test op's
+        // lsn) is sufficient for the fold to apply it. The Db path uses
+        // `create_with_cache_rc`, which threads the volume's `created_lsn`.
+        buf.commit_rc_deltas_unskippable(1)?;
+        Ok(Self {
+            buf,
+            root,
+            root_level: 0,
+            next_gen: 2,
+            private_pages: PageIdSet::default(),
+            retired_pages: PageIdSet::default(),
+            checkpoint_protected: PageIdSet::default(),
+        })
+    }
+
+    /// Db-path create: share the one global `L2pPageRc` (page-rc routes
+    /// by global `PageId`, so every shard's tree must reach the same
+    /// store). Peer of [`create_with_cache`](Self::create_with_cache),
+    /// which builds a private store for standalone/test use.
+    pub fn create_with_cache_rc(
+        page_store: Arc<PageStore>,
+        page_cache: Arc<PageCache>,
+        page_rc: Arc<crate::l2p_page_rc::L2pPageRc>,
+        root_lsn: Lsn,
+    ) -> Result<Self> {
+        let mut buf = PageBuf::with_cache_rc(page_store, page_cache, page_rc);
+        let root = buf.alloc_leaf(1)?;
+        buf.flush()?;
+        // A3: commit the root's +1 to the shared page-rc array (see
+        // `create_with_cache`).
+        buf.commit_rc_deltas_unskippable(root_lsn)?;
         Ok(Self {
             buf,
             root,
@@ -152,6 +185,33 @@ impl PagedL2p {
         })
     }
 
+    /// Db-path open: share the one global `L2pPageRc`. Peer of
+    /// [`open_with_cache`](Self::open_with_cache) (private store).
+    pub fn open_with_cache_rc(
+        page_store: Arc<PageStore>,
+        page_cache: Arc<PageCache>,
+        page_rc: Arc<crate::l2p_page_rc::L2pPageRc>,
+        root: PageId,
+        next_gen: Lsn,
+    ) -> Result<Self> {
+        let mut buf = PageBuf::with_cache_rc(page_store, page_cache, page_rc);
+        let root_level = buf.read_level(root)?;
+        if root_level > MAX_INDEX_LEVEL {
+            return Err(MetaDbError::Corruption(format!(
+                "paged: root {root} has level {root_level} exceeding max {MAX_INDEX_LEVEL}"
+            )));
+        }
+        Ok(Self {
+            buf,
+            root,
+            root_level,
+            next_gen,
+            private_pages: PageIdSet::default(),
+            retired_pages: PageIdSet::default(),
+            checkpoint_protected: PageIdSet::default(),
+        })
+    }
+
     /// Current root page id.
     pub fn root(&self) -> PageId {
         self.root
@@ -176,6 +236,15 @@ impl PagedL2p {
         if lsn >= self.next_gen {
             self.next_gen = lsn + 1;
         }
+    }
+
+    /// Set the current op's TXG, threaded down to `PageBuf` so the
+    /// page-rc array stages (COW `commit_rc_deltas`, snapshot/drop
+    /// incref/decref) land in the right TXG ring slot. Foreground apply
+    /// sets the commit txg; the sync-cycle buffer drain sets the sync
+    /// txg (A3 plan §0).
+    pub fn set_current_txg(&mut self, txg: crate::types::Txg) {
+        self.buf.set_current_txg(txg);
     }
 
     /// Underlying page store handle (shared with `Db` for free-list
@@ -233,6 +302,15 @@ impl PagedL2p {
         let effective_rc = self.buf.effective_rc(pid)?;
         if self.private_pages.contains(&pid) && effective_rc <= 1 {
             if self.checkpoint_protected.contains(&pid) {
+                // A3: `clone_private` stages the clone's +1 into the page-rc
+                // array. `pid` is NOT decref'd here — it is still pinned by
+                // the just-committed on-disk checkpoint (and any snapshot
+                // taken from it), so its array rc must stay until the new
+                // checkpoint actually replaces the old root. The array rc
+                // for a recycled pid is reset at `allocate_local` (clear-
+                // on-alloc), so a retired page that never gets decref'd
+                // simply carries a harmless stale rc until reuse — mirroring
+                // the old in-page header rc that vanished with the page.
                 let new_pid = self.buf.clone_private(pid, lsn)?;
                 self.private_pages.remove(&pid);
                 self.private_pages.insert(new_pid);
@@ -1043,22 +1121,25 @@ impl PagedL2p {
     /// separate reference. Idempotent in the sense that every call adds
     /// exactly one ref — pair it with a `decref` on snapshot drop.
     ///
-    /// Routes through [`PageBuf::atomic_incref`]'s disk-direct
-    /// per-pid-locked RMW so a sibling volume's concurrent
-    /// `cow_for_write` against the same root (post-`clone_volume`)
-    /// can't race and drop the incref.
-    pub fn incref_root_for_snapshot(&mut self) -> Result<()> {
-        self.buf.atomic_incref(self.root)?;
+    /// A3: routes through [`PageBuf::atomic_incref`] into the shared
+    /// [`L2pPageRc`](crate::l2p_page_rc::L2pPageRc) array (`lsn` =
+    /// snapshot `created_lsn`), so a sibling volume's concurrent
+    /// `cow_for_write` against the same root (post-`clone_volume`) reads
+    /// the same shared entry and can't drop the incref.
+    pub fn incref_root_for_snapshot(&mut self, txg: crate::types::Txg, lsn: Lsn) -> Result<()> {
+        self.buf.set_current_txg(txg);
+        self.buf.atomic_incref(self.root, lsn)?;
         self.finish_op(Ok(()))
     }
 
     /// Decref `root` and cascade through any uniquely-owned subtree.
     /// Used by snapshot drop to release a snapshot's grip on a tree.
-    /// Routes through [`PageBuf::atomic_decref`] for the same
-    /// cross-tree safety reason as
+    /// A3: routes through [`PageBuf::atomic_decref`] (page-rc array,
+    /// fold-consistent free decisions) for the same cross-tree reason as
     /// [`incref_root_for_snapshot`](Self::incref_root_for_snapshot).
-    pub fn decref_root(&mut self, root: PageId) -> Result<()> {
-        self.buf.atomic_decref(root)?;
+    pub fn decref_root(&mut self, root: PageId, txg: crate::types::Txg, lsn: Lsn) -> Result<()> {
+        self.buf.set_current_txg(txg);
+        self.buf.atomic_decref(root, lsn)?;
         self.finish_op(Ok(()))
     }
 
@@ -1088,9 +1169,15 @@ impl PagedL2p {
     /// per-pid-locked disk-direct RMW so a sibling volume's concurrent
     /// `cow_for_write` against a shared page can't race. Leaves
     /// `page.generation` untouched — this path is not WAL-replayed.
-    pub fn drop_subtree(&mut self, snap_root: PageId) -> Result<Vec<L2pValue>> {
+    pub fn drop_subtree(
+        &mut self,
+        snap_root: PageId,
+        txg: crate::types::Txg,
+        lsn: Lsn,
+    ) -> Result<Vec<L2pValue>> {
         use crate::page::PageType;
         use crate::paged::cache::DecrefOutcome;
+        self.buf.set_current_txg(txg);
         let mut collected: Vec<L2pValue> = Vec::new();
         let mut worklist: Vec<PageId> = vec![snap_root];
         while let Some(pid) = worklist.pop() {
@@ -1121,7 +1208,7 @@ impl PagedL2p {
                     }
                 }
             };
-            let (outcome, children) = self.buf.atomic_decref_one(pid)?;
+            let (outcome, children) = self.buf.atomic_decref_one(pid, lsn)?;
             if matches!(outcome, DecrefOutcome::Freed) {
                 collected.extend(pending_values);
                 worklist.extend(children);
@@ -1153,7 +1240,12 @@ impl PagedL2p {
         let mut out: Vec<PageId> = Vec::new();
         let mut worklist: Vec<PageId> = vec![snap_root];
         while let Some(pid) = worklist.pop() {
-            let (rc, page_type, children) = {
+            // A3 cutover: rc comes from the page-rc array (fold-consistent
+            // — this drop-plan simulation's cascade decisions gate the
+            // page frees `apply_drop_*_pages` will perform). The page read
+            // supplies only the type + children for the cascade walk.
+            let rc = self.buf.page_rc().get_consistent(pid)?;
+            let (page_type, children) = {
                 let page = self.buf.read(pid)?;
                 let header = page.header()?;
                 let children = match header.page_type {
@@ -1165,7 +1257,7 @@ impl PagedL2p {
                         ))));
                     }
                 };
-                (header.refcount, header.page_type, children)
+                (header.page_type, children)
             };
             if rc == 0 {
                 return self.finish_op(Err(MetaDbError::Corruption(format!(

@@ -140,10 +140,19 @@ impl Db {
         // Pre-check passed; safe to make irreversible changes.
         let l2p_roots_page = write_snapshot_roots_page(&self.page_store, &l2p_roots, created_lsn)?;
         for tree in &mut l2p_guards[target_start..target_end] {
-            tree.incref_root_for_snapshot()?;
+            // A3 cutover: the snapshot root incref now stages into the
+            // page-rc array (non-WAL → `stage_unskippable`, stamped with
+            // `created_lsn` so the fold applies it). `flush()` below folds
+            // it durably before the snapshot's manifest commit.
+            tree.incref_root_for_snapshot(self.txg.open_txg(), created_lsn)?;
         }
         flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_all_refcount_shards()?;
+        // A3: fold the page-rc array so the just-staged root increfs are
+        // durable before the manifest commit below records
+        // `l2p_page_rc_durable_seq = created_lsn`. The snapshot take is
+        // manifest-only (not WAL-replayed), so the incref MUST be on disk.
+        self.l2p_page_rc.flush()?;
 
         manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
         let snap_roots: Box<[PageId]> = l2p_roots.into_boxed_slice();
@@ -443,6 +452,11 @@ impl Db {
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes_snap);
         flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_all_refcount_shards()?;
+        // A3: fold the page-rc array so the manifest committed below
+        // records a durable `l2p_page_rc_durable_seq = checkpoint_lsn`
+        // (the prior commits' page-rc deltas; this drop's own decrefs are
+        // at lsn > checkpoint_lsn and ride the WAL-replayed apply).
+        self.l2p_page_rc.flush()?;
 
         let checkpoint_lsn = *self.last_applied_lsn.lock();
         let dedup_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
@@ -556,7 +570,9 @@ impl Db {
         let outcome = apply_drop_snapshot_pages_and_decrefs(
             &self.page_store,
             &self.refcount_shards,
+            &self.l2p_page_rc,
             lsn,
+            _txg_guard.txg(),
             &pages,
             &pba_decrefs,
         )?;

@@ -173,9 +173,24 @@ impl L2pPageRc {
 
     /// Stage a refcount delta for `pid` into `txg`'s ring slot. Returns the
     /// cumulative `(prev_rc, new_rc)`; callers surface a freed page on
-    /// `new == 0 && prev > 0`.
+    /// `new == 0 && prev > 0`. `lsn` drives the replay-skip guard — use it
+    /// for WAL/lifecycle-replayed deltas (COW commit, clone, drop).
     pub fn stage(&self, txg: Txg, pid: PageId, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
         self.shards[self.shard_for(pid)].stage(txg, pid, delta, lsn)
+    }
+
+    /// Stage a delta WITHOUT the per-op replay-skip early-return, for
+    /// non-WAL callers (snapshot incref / drop decref / create root). The
+    /// `lsn` is recorded so the fold applies + retry-skips it — see
+    /// [`RcShard::stage_unskippable`].
+    pub fn stage_unskippable(
+        &self,
+        txg: Txg,
+        pid: PageId,
+        delta: i64,
+        lsn: Lsn,
+    ) -> Result<(u32, u32)> {
+        self.shards[self.shard_for(pid)].stage_unskippable(txg, pid, delta, lsn)
     }
 
     /// Cold-path flush: fold every shard's pending deltas to disk and rotate

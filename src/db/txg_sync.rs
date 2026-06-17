@@ -116,7 +116,12 @@ pub(crate) fn build_drain_plan(
 pub(crate) fn apply_drain_ops(
     tree: &mut crate::paged::PagedL2p,
     ops: &[LeafDrainOp],
+    txg: Txg,
 ) -> Result<()> {
+    // A3 cutover: the buffer-drain COW stages page-rc deltas into this
+    // sync cycle's TXG slot (so the page-rc fold `begin_checkpoint(txg)`
+    // captures them, on the SAME boundary as the L2P + PBA-rc folds).
+    tree.set_current_txg(txg);
     for op in ops {
         if !op.inserts.is_empty() {
             tree.insert_leaf_run_at_lsn_deferred_finish(&op.inserts, op.inserts_max_lsn)?;
@@ -142,11 +147,12 @@ pub(crate) fn apply_drain_ops(
 pub(crate) fn compact_drain_into_tree(
     tree: &mut crate::paged::PagedL2p,
     draining: &HashMap<u64, super::l2p_buffer::BufferEntry>,
+    txg: Txg,
 ) -> Result<()> {
     if draining.is_empty() {
         return Ok(());
     }
-    apply_drain_ops(tree, &build_drain_plan(draining))
+    apply_drain_ops(tree, &build_drain_plan(draining), txg)
 }
 
 /// Callback that performs the actual per-TXG sync work for one cycle.

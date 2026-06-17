@@ -88,6 +88,9 @@ pub(super) fn apply_op_bare(
             let sid = shard_for_key_l2p(&volume.shards, *lba);
             let use_buffer = volume.shards[sid].use_buffer;
             let mut tree = volume.shards[sid].tree.write();
+            // A3 cutover: tree-mode COW stages page-rc deltas into this
+            // commit's TXG slot (no-op for the buffered path).
+            tree.set_current_txg(txg);
             // L2pPut returns the rejecting `cur` as `L2pPrev(Some(cur))`;
             // caller distinguishes accept vs reject by comparing
             // `value.seq()` against `cur.seq()`.
@@ -144,6 +147,8 @@ pub(super) fn apply_op_bare(
             let sid = shard_for_key_l2p(&volume.shards, *lba);
             let use_buffer = volume.shards[sid].use_buffer;
             let mut tree = volume.shards[sid].tree.write();
+            // A3 cutover: tree-mode COW (delete) stages page-rc deltas here.
+            tree.set_current_txg(txg);
             let prev = if use_buffer {
                 let cur = match volume.shards[sid].l2p_buffer.lookup_for_open_txg(txg, *lba) {
                     crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),

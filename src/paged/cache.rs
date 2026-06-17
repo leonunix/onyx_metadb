@@ -14,14 +14,15 @@ use std::sync::Arc;
 
 use crate::cache::{DEFAULT_PAGE_CACHE_BYTES, PageCache};
 use crate::error::{MetaDbError, Result};
+use crate::l2p_page_rc::L2pPageRc;
 use crate::page::{Page, PageType};
-use crate::page_store::{PageStore, RcDeltaWithGen};
+use crate::page_store::PageStore;
 use crate::paged::format::{
     LEAF_BITMAP_BYTES, index_collect_children, init_index, init_leaf, page_level,
 };
 use crate::paged::leaf_compact;
 use crate::paged::read_view::{PageIdMap, PageIdSet, ReadOverlay, ReadOverlayShard};
-use crate::types::{Lsn, NULL_PAGE, PageId};
+use crate::types::{Lsn, NULL_PAGE, PageId, Txg};
 
 const LOCAL_ALLOC_RUN_PAGES: usize = 256;
 
@@ -137,37 +138,72 @@ pub struct PageBuf {
     clean_pages: PageIdSet,
     /// In-memory rc-delta accumulator for the current op.
     ///
-    /// [`cow_for_write`](Self::cow_for_write) no longer mutates rc on
-    /// disk during the descent — it feeds a `(pid, delta)` entry here
-    /// instead, and a single batch commit at end-of-op
-    /// ([`commit_rc_deltas`](Self::commit_rc_deltas)) routes every
-    /// non-zero net delta through
-    /// [`PageStore::atomic_rc_delta_with_gen`]. This design:
+    /// A3: [`cow_for_write`](Self::cow_for_write) (and `alloc_*` /
+    /// `clone_private` / the clear-on-alloc reset) feed `(pid, delta)`
+    /// entries here; a single end-of-op batch
+    /// ([`commit_rc_deltas`](Self::commit_rc_deltas)) stages every
+    /// non-zero net delta into the shared [`L2pPageRc`] array's current
+    /// TXG ring slot. This design:
     ///
     /// - cancels the `+1` (parent cow's incref) against the matching
     ///   `-1` (child's own cow's decref) on pages the descent cow's
     ///   multiple times in the same op — they net to zero and never
-    ///   hit disk, avoiding a gen-stamp false-skip that would otherwise
-    ///   corrupt rc;
-    /// - keeps cross-tree atomicity (the batch commit uses the
-    ///   disk-direct per-pid-locked RMW so a sibling tree's next op
-    ///   sees a consistent post-commit view);
-    /// - preserves WAL-replay idempotency (the commit's gen-stamp
-    ///   guard skips deltas the crashed prior attempt already landed).
+    ///   reach the array;
+    /// - keeps cross-tree consistency (the array is shared across every
+    ///   L2P shard, so a sibling tree's next op sees the post-commit view);
+    /// - preserves replay idempotency (the slot fold's `page_lsn >= lsn`
+    ///   guard skips deltas a crashed prior attempt already landed).
     pending_rc: PageIdMap<i32>,
-    rc_delta_lsn: Lsn,
-    rc_delta_ordinal: u32,
+    /// Snapshot-scaling A3: the PageId-keyed page-refcount array. The
+    /// Db path injects the one shared store (routing is by global
+    /// `PageId`, so a COW in any L2P shard can touch any page-rc shard);
+    /// standalone ctors build a private single-shard store. **A3
+    /// plumbing landed — not yet authoritative**: header rc is still the
+    /// source of truth; the cutover routes `effective_rc` / `cow_for_write`
+    /// / `commit_rc_deltas` / snapshot+clone+drop rc through this.
+    page_rc: Arc<L2pPageRc>,
+    /// Current op's TXG. Set per mutation at the `PagedL2p` entry points
+    /// (foreground apply uses the commit txg, the sync-cycle buffer drain
+    /// uses the sync txg — see plan §0); consumed by the cutover's
+    /// `commit_rc_deltas` / incref / decref `stage(txg, …)` calls.
+    current_txg: Txg,
 }
 
 impl PageBuf {
-    /// New buffer with a private page cache of default size.
+    /// New standalone buffer: private page cache + private single-shard
+    /// page-rc store. Used by `PagedL2p::create`/`open` and unit tests
+    /// (the only callers of the non-`_rc` ctors — see
+    /// [`with_cache`](Self::with_cache)).
     pub fn new(page_store: Arc<PageStore>) -> Self {
         let page_cache = Arc::new(PageCache::new(page_store.clone(), DEFAULT_PAGE_CACHE_BYTES));
         Self::with_cache(page_store, page_cache)
     }
 
-    /// New buffer sharing an existing `PageCache`.
+    /// Standalone buffer sharing an existing `PageCache` but building its
+    /// own private single-shard page-rc store. Kept at the original
+    /// 2-arg signature so unit tests and the standalone `PagedL2p` ctors
+    /// don't have to thread a page-rc handle; the Db path uses
+    /// [`with_cache_rc`](Self::with_cache_rc) to inject the one shared
+    /// store instead.
     pub fn with_cache(page_store: Arc<PageStore>, page_cache: Arc<PageCache>) -> Self {
+        // Standalone: a private 1-shard page-rc store keyed off the same
+        // page_store. `create` is infallible here in practice (it only
+        // allocates one meta page); surface a panic on the impossible IO
+        // error rather than poison every test ctor with a `Result`.
+        let (page_rc, _roots) =
+            L2pPageRc::create(page_store.clone(), page_cache.clone(), 1)
+                .expect("standalone PageBuf: private page-rc create");
+        Self::with_cache_rc(page_store, page_cache, Arc::new(page_rc))
+    }
+
+    /// Db-path buffer: shares both the `PageCache` AND the one global
+    /// `L2pPageRc` store (page-rc routes by global `PageId`, so every L2P
+    /// shard's COW must reach the same sharded store).
+    pub fn with_cache_rc(
+        page_store: Arc<PageStore>,
+        page_cache: Arc<PageCache>,
+        page_rc: Arc<L2pPageRc>,
+    ) -> Self {
         Self {
             page_store,
             page_cache,
@@ -178,9 +214,26 @@ impl PageBuf {
             exclusive_read_overlay_mutation: false,
             clean_pages: PageIdSet::default(),
             pending_rc: PageIdMap::default(),
-            rc_delta_lsn: 0,
-            rc_delta_ordinal: 0,
+            page_rc,
+            current_txg: 0,
         }
+    }
+
+    /// The page-rc store backing this buffer. Exposed for the cutover's
+    /// read/free-decision paths and for `verify`.
+    pub fn page_rc(&self) -> &Arc<L2pPageRc> {
+        &self.page_rc
+    }
+
+    /// Set the current op's TXG. Called at every `PagedL2p` mutation
+    /// entry point before the op stages page-rc deltas.
+    pub fn set_current_txg(&mut self, txg: Txg) {
+        self.current_txg = txg;
+    }
+
+    /// Current op's TXG (consumed by the cutover's `stage` calls).
+    pub fn current_txg(&self) -> Txg {
+        self.current_txg
     }
 
     /// Insert a slot, keeping `clean_pages` consistent with the
@@ -284,6 +337,25 @@ impl PageBuf {
         // installing the freshly initialized dirty page in this PageBuf.
         self.pages_remove(pid);
         self.page_cache.invalidate(pid);
+        // A3 clear-on-alloc (CRC line): the page-rc array does NOT live in
+        // the page, so freeing a page leaves a stale array rc behind. Reset
+        // it to 0 HERE — the single point that hands out (possibly recycled)
+        // pids — by queuing `-stale` into the op accumulator so it nets
+        // against the fresh page's `+1` and commits under the op's lsn at
+        // `commit_rc_deltas`. (Going through the accumulator, rather than a
+        // direct stage, lets the reset ride the op's real lsn so the fold
+        // applies it; a `lsn = 0` stage would be permanently skipped by the
+        // fold's `page_generation >= last_lsn` guard.) This is the array
+        // analogue of the old in-page header rc vanishing when the page was
+        // returned to the free list. A fold-consistent read drives the
+        // reset so a transient fold window can't leave the recycled page
+        // mis-reading as shared. (A freed-but-not-yet-recycled page's stale
+        // rc is harmless — verify and orphan-reclaim only look at pages
+        // reachable from a live root.)
+        let stale = self.page_rc.get_consistent(pid)?;
+        if stale > 0 {
+            *self.pending_rc.entry(pid).or_insert(0) -= stale as i32;
+        }
         Ok(pid)
     }
 
@@ -386,8 +458,12 @@ impl PageBuf {
             }
         }
         page.set_generation(generation);
-        page.set_refcount(1);
+        // A3 cutover: page rc lives in the `L2pPageRc` array. Write the
+        // reserved header byte 0 (format stability) and stage the clone's
+        // +1 into the op accumulator instead of stamping the header.
+        page.set_refcount(0);
         self.pages_insert(new_pid, Slot::Dirty(Arc::new(page)));
+        *self.pending_rc.entry(new_pid).or_insert(0) += 1;
         Ok(new_pid)
     }
 
@@ -399,6 +475,10 @@ impl PageBuf {
         let mut page = Page::zeroed();
         init_leaf(&mut page, 0);
         self.pages_insert(pid, Slot::Dirty(Arc::new(page)));
+        // A3: a fresh page has one (incoming) reference, mirroring the old
+        // in-page header rc of 1 from `PageHeader::new`. Stage that +1 into
+        // the page-rc array via the op accumulator.
+        *self.pending_rc.entry(pid).or_insert(0) += 1;
         Ok(pid)
     }
 
@@ -410,6 +490,9 @@ impl PageBuf {
         let mut page = Page::zeroed();
         init_index(&mut page, 0, level);
         self.pages_insert(pid, Slot::Dirty(Arc::new(page)));
+        // A3: fresh page → one reference (mirrors header init rc 1). See
+        // [`alloc_leaf`](Self::alloc_leaf).
+        *self.pending_rc.entry(pid).or_insert(0) += 1;
         Ok(pid)
     }
 
@@ -463,29 +546,29 @@ impl PageBuf {
     /// against the same convention.
     pub fn effective_rc(&mut self, pid: PageId) -> Result<i64> {
         let pending = self.pending_rc.get(&pid).copied().unwrap_or(0);
-        let page = self.read(pid)?;
-        let header = page.header()?;
-        Ok(i64::from(header.refcount) + i64::from(pending))
+        // A3 cutover: the page refcount lives in the PageId-keyed
+        // `L2pPageRc` array now, not the page header. `get` sums the TXG
+        // ring slots + array base, so within-txg and cross-txg visibility
+        // matches the old immediate-header semantics. No page read needed.
+        Ok(i64::from(self.page_rc.get(pid)?) + i64::from(pending))
     }
 
-    /// Cross-tree-safe incref via per-pid-locked disk-direct RMW.
-    /// Persists any Dirty copy of `pid` to disk first so
-    /// [`PageStore::atomic_rc_delta`] reads the latest bytes, then
-    /// invalidates both the local buffer and the shared [`PageCache`]
-    /// entry so subsequent reads pull the post-RMW bytes.
+    /// Cross-tree-safe incref for the snapshot-take root pin.
     ///
-    /// Leaves `page.generation` untouched: snapshot take/drop callers
-    /// are not WAL-replayed and must not collide with a future WAL
-    /// op's LSN (using `atomic_rc_delta_with_gen` here with a
-    /// non-WAL stamp would spuriously skip a later op at the same LSN).
-    /// Cross-tree safety comes purely from the per-pid mutex, which
-    /// both `atomic_rc_delta` and `atomic_rc_delta_with_gen` hold.
-    pub fn atomic_incref(&mut self, pid: PageId) -> Result<u32> {
-        self.persist_if_dirty(pid)?;
-        let new_rc = self.page_store.atomic_rc_delta(pid, 1)?;
-        self.pages_remove(pid);
-        self.page_cache.invalidate(pid);
-        Ok(new_rc)
+    /// A3 cutover: page rc lives in the shared `L2pPageRc` array, so the
+    /// incref is a single `stage_unskippable` into the current op's TXG
+    /// slot — no disk-direct RMW, no page persist/evict (the page bytes
+    /// are untouched). `stage_unskippable` merges with `lsn = 0` so this
+    /// non-WAL incref neither carries a replay-skip stamp nor raises the
+    /// array page generation (the faithful analogue of the old
+    /// `atomic_rc_delta` no-gen RMW). Cross-tree safety comes from the
+    /// shared array + the caller's serialisation (`apply_gate.write` /
+    /// `drop_gate.write`). Returns the new rc.
+    pub fn atomic_incref(&mut self, pid: PageId, lsn: Lsn) -> Result<u32> {
+        let (_prev, new) = self
+            .page_rc
+            .stage_unskippable(self.current_txg, pid, 1, lsn)?;
+        Ok(new)
     }
 
     /// Non-cascading single-page cross-tree-safe decref. Decrements
@@ -499,14 +582,18 @@ impl PageBuf {
     /// [`PagedL2p::drop_subtree`](crate::paged::PagedL2p::drop_subtree)
     /// uses this variant so it can collect per-page leaf values before
     /// the free.
-    pub fn atomic_decref_one(&mut self, pid: PageId) -> Result<(DecrefOutcome, Vec<PageId>)> {
+    pub fn atomic_decref_one(
+        &mut self,
+        pid: PageId,
+        lsn: Lsn,
+    ) -> Result<(DecrefOutcome, Vec<PageId>)> {
         // Snapshot children + page type before the RMW — if rc hits
         // zero we need them for cascade. Read via PageBuf so a Dirty
         // copy wins; `persist_if_dirty` then flushes it to disk so
         // the atomic RMW reads fresh bytes.
         let children = self.read_children_for_decref(pid)?;
         self.persist_if_dirty(pid)?;
-        self.finish_decref_after_persist(pid, children)
+        self.finish_decref_after_persist(pid, children, lsn)
     }
 
     /// Identical to [`atomic_decref_one`] but skips the
@@ -517,9 +604,10 @@ impl PageBuf {
     fn atomic_decref_one_already_persisted(
         &mut self,
         pid: PageId,
+        lsn: Lsn,
     ) -> Result<(DecrefOutcome, Vec<PageId>)> {
         let children = self.read_children_for_decref(pid)?;
-        self.finish_decref_after_persist(pid, children)
+        self.finish_decref_after_persist(pid, children, lsn)
     }
 
     fn read_children_for_decref(&mut self, pid: PageId) -> Result<Vec<PageId>> {
@@ -538,11 +626,21 @@ impl PageBuf {
         &mut self,
         pid: PageId,
         children: Vec<PageId>,
+        lsn: Lsn,
     ) -> Result<(DecrefOutcome, Vec<PageId>)> {
-        let new_rc = self.page_store.atomic_rc_delta(pid, -1)?;
-        self.pages_remove(pid);
-        self.page_cache.invalidate(pid);
-        if new_rc == 0 {
+        // A3 cutover: decref the page-rc array (non-WAL drop cascade →
+        // `stage_unskippable`, no replay-skip stamp). The page bytes are
+        // untouched, so on `Decremented` there is no stale-byte copy to
+        // evict (unlike the old disk-direct RMW). On a 1→0 transition
+        // confirm with a fold-consistent read before the IRREVERSIBLE
+        // free (R2): the cheap staged `new` can straddle a concurrent
+        // fold's publish/clear window and floor a live rc to a spurious 0.
+        let (prev, new) = self
+            .page_rc
+            .stage_unskippable(self.current_txg, pid, -1, lsn)?;
+        if new == 0 && prev > 0 && self.page_rc.get_consistent(pid)? == 0 {
+            self.pages_remove(pid);
+            self.page_cache.invalidate(pid);
             // Not `free_idempotent` — this path is not WAL-replayed,
             // so a double-free is a genuine bug, not a re-apply.
             self.page_store.free(pid, 0)?;
@@ -567,7 +665,7 @@ impl PageBuf {
     /// only when a popped child is itself Dirty in the local buf,
     /// keeping the read-after-write invariant the original per-step
     /// `persist_if_dirty` enforced.
-    pub fn atomic_decref(&mut self, pid: PageId) -> Result<DecrefOutcome> {
+    pub fn atomic_decref(&mut self, pid: PageId, lsn: Lsn) -> Result<DecrefOutcome> {
         let mut top: Option<DecrefOutcome> = None;
         let mut worklist: Vec<PageId> = vec![pid];
         while !worklist.is_empty() {
@@ -582,7 +680,7 @@ impl PageBuf {
                 self.persist_dirty_pages(&dirty)?;
             }
             while let Some(p) = worklist.pop() {
-                let (outcome, children) = self.atomic_decref_one_already_persisted(p)?;
+                let (outcome, children) = self.atomic_decref_one_already_persisted(p, lsn)?;
                 if top.is_none() {
                     top = Some(outcome);
                 }
@@ -638,31 +736,33 @@ impl PageBuf {
     /// and bump each of the new copy's children's refcounts so the old
     /// tree is still internally consistent.
     ///
-    /// For the shared-page case (rc > 1), rc mutations on the old
-    /// page and its children go through
-    /// [`PageStore::atomic_rc_delta_with_gen`] — disk-direct
-    /// read-modify-write under a per-pid mutex, gated by
-    /// `page.generation >= lsn` for WAL-replay idempotency. `lsn` is
-    /// the current WAL op's LSN; same stamp protocol as
-    /// [`crate::db::apply_drop_snapshot_pages`] and
-    /// [`crate::db::apply_clone_volume_incref`]. Without the disk-direct
-    /// path, two [`PagedL2p`](crate::paged::PagedL2p) instances sharing
-    /// `pid` post-`clone_volume` would each read the same pre-decrement
-    /// rc into their own `PageBuf` and lose one decrement when both
-    /// flush back.
+    /// A3: rc deltas (old page `-1`, children `+1`, the clone `+1`) are
+    /// queued in `pending_rc` and staged into the shared [`L2pPageRc`]
+    /// array at [`commit_rc_deltas`](Self::commit_rc_deltas); the array's
+    /// `page_lsn >= lsn` slot-fold guard gives WAL-replay idempotency.
+    /// Cross-tree consistency comes from the array being shared across
+    /// every L2P shard — two [`PagedL2p`](crate::paged::PagedL2p)
+    /// instances sharing `pid` post-`clone_volume` read the same array
+    /// entry, not two private header copies. `generation` (still read
+    /// from the page header) drives the `effective_rc <= 1 &&
+    /// generation < lsn` early-return only.
     pub fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
         debug_assert!(pid != NULL_PAGE, "cow_for_write called on NULL_PAGE");
         let pending = self.pending_rc.get(&pid).copied().unwrap_or(0);
+        // A3 cutover: page rc lives in the `L2pPageRc` array, read here
+        // before the `self.read(pid)` borrow. `get` sums the TXG ring
+        // slots + array base.
+        let array_rc = self.page_rc.get(pid)?;
         let (children, _page_type) = {
             let page = self.read(pid)?;
             let header = page.header()?;
-            // Effective rc = disk rc + pending delta. The accumulator
-            // holds rc deltas that haven't been flushed to disk yet
+            // Effective rc = array rc + pending delta. The accumulator
+            // holds rc deltas that haven't been staged to the array yet
             // (batched for end-of-op commit); if an earlier cow in
-            // this op bumped `pid` the disk read wouldn't see it,
+            // this op bumped `pid` the array read wouldn't see it,
             // so we fold the pending delta in before the sharedness
             // check.
-            let effective_rc: i64 = i64::from(header.refcount) + i64::from(pending);
+            let effective_rc: i64 = i64::from(array_rc) + i64::from(pending);
             // Early return only when genuinely unshared. `effective_rc<=1`
             // alone isn't enough under WAL replay: a crashed prior
             // attempt of THIS op may have durably decremented rc on
@@ -700,69 +800,76 @@ impl PageBuf {
             .bytes_mut()
             .copy_from_slice(self.read(pid)?.bytes());
         new_page.set_generation(0);
-        new_page.set_refcount(1);
+        // A3 cutover: write the reserved header rc byte 0 (the source's
+        // copied byte is meaningless now); the clone's rc is staged to
+        // the array via the `pending_rc` accumulator below.
+        new_page.set_refcount(0);
         self.pages_insert(new_pid, Slot::Dirty(Arc::new(new_page)));
 
-        // Queue rc deltas for end-of-op commit instead of hitting disk
-        // per-edge. Within one descent, a child is first incref'd here
-        // (gaining the clone as a second parent) and later decref'd by
-        // its own cow; those `+1` / `-1` entries net to zero in the
-        // accumulator and never touch disk.
+        // Queue rc deltas for end-of-op commit instead of staging the
+        // array per-edge. Within one descent, a child is first incref'd
+        // here (gaining the clone as a second parent) and later decref'd
+        // by its own cow; those `+1` / `-1` entries net to zero in the
+        // accumulator and never reach the array. The clone gets +1
+        // (was `set_refcount(1)`); the original loses the live-tree edge
+        // that moved to the clone (-1).
         for c in &children {
             *self.pending_rc.entry(*c).or_insert(0) += 1;
         }
+        *self.pending_rc.entry(new_pid).or_insert(0) += 1;
         *self.pending_rc.entry(pid).or_insert(0) -= 1;
 
         Ok(new_pid)
     }
 
-    /// Flush this op's accumulated rc deltas to disk, stamping each
-    /// touched page with `lsn` for WAL-replay idempotency. Entries
-    /// whose net delta is zero (e.g. a child that was both incref'd
-    /// by a parent cow and decref'd by its own cow in the same op)
-    /// are skipped without any disk write. Any Dirty in-memory copy
-    /// of a committed page is invalidated so subsequent reads pull
-    /// the post-commit bytes.
+    /// A3: stage this op's accumulated rc deltas into the `L2pPageRc`
+    /// array's current TXG slot, stamping each with `lsn`. Net-zero
+    /// entries (a child both incref'd by a parent cow and decref'd by its
+    /// own cow in the same op) are skipped. The slot merge sums repeated
+    /// deltas, so the old same-lsn/same-pid `ordinal` disambiguation is
+    /// gone (one net delta per pid per op). No page persist/evict — the
+    /// page bytes are untouched by an array stage, so the COW'd pages stay
+    /// dirty in the buffer and flush at the next checkpoint. Replay
+    /// idempotency rides `stage`'s `page_lsn >= lsn` skip.
     ///
     /// Callers: [`crate::paged::PagedL2p`]'s write paths
     /// (`insert_with_lsn`, `delete_with_lsn`) invoke this immediately
     /// before `finish_op`.
     pub fn commit_rc_deltas(&mut self, lsn: Lsn) -> Result<()> {
+        self.commit_pending_rc(lsn, true)
+    }
+
+    /// Like [`commit_rc_deltas`] but WITHOUT the per-op replay-skip, for
+    /// non-WAL structural stages — currently the tree-create root's `+1`,
+    /// where committing through [`commit_rc_deltas`] at `lsn = 0` would be
+    /// swallowed by `stage`'s `page_lsn(fresh) == 0 >= 0` skip. A
+    /// re-created tree on recovery re-allocates a fresh root pid and
+    /// re-stages, so no replay idempotency is needed here.
+    pub fn commit_rc_deltas_unskippable(&mut self, lsn: Lsn) -> Result<()> {
+        self.commit_pending_rc(lsn, false)
+    }
+
+    /// Shared body: drain `pending_rc` into a pid-sorted vec (deterministic
+    /// stage order across replays) and stage each non-zero net delta. `wal`
+    /// selects [`L2pPageRc::stage`] (replay-skip) vs
+    /// [`L2pPageRc::stage_unskippable`].
+    fn commit_pending_rc(&mut self, lsn: Lsn, wal: bool) -> Result<()> {
         if self.pending_rc.is_empty() {
             return Ok(());
         }
-        if self.rc_delta_lsn != lsn {
-            self.rc_delta_lsn = lsn;
-            self.rc_delta_ordinal = 0;
-        }
-        // Drain into a sorted Vec so commit order is deterministic —
-        // reproduces cleanly across WAL replays and makes debugging
-        // easier. Sort by pid.
         let mut entries: Vec<(PageId, i32)> = self.pending_rc.drain().collect();
         entries.sort_unstable_by_key(|(pid, _)| *pid);
-        let mut batch = Vec::new();
-        let mut touched = Vec::new();
+        let txg = self.current_txg;
         for (pid, delta) in entries {
             if delta == 0 {
                 continue;
             }
-            self.rc_delta_ordinal = self.rc_delta_ordinal.checked_add(1).ok_or_else(|| {
-                MetaDbError::Corruption("paged: rc delta ordinal overflow".into())
-            })?;
-            batch.push(RcDeltaWithGen {
-                page_id: pid,
-                delta,
-                lsn,
-                ordinal: self.rc_delta_ordinal,
-            });
-            touched.push(pid);
-        }
-
-        self.persist_dirty_pages(&touched)?;
-        self.page_store.atomic_rc_delta_batch_with_gen(&batch)?;
-        for pid in touched {
-            self.pages_remove(pid);
-            self.page_cache.invalidate(pid);
+            if wal {
+                self.page_rc.stage(txg, pid, i64::from(delta), lsn)?;
+            } else {
+                self.page_rc
+                    .stage_unskippable(txg, pid, i64::from(delta), lsn)?;
+            }
         }
         Ok(())
     }

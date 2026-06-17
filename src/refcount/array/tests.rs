@@ -198,7 +198,7 @@ fn make_array_with_cache() -> (TempDir, Arc<PageCache>, PagedRefcountArray) {
 fn staged_fresh_page_survives_cache_eviction() {
     let (_dir, cache, a) = make_array_with_cache();
     let staged = a
-        .stage_deltas_in_memory(vec![(7, pending(1, 100))])
+        .stage_deltas_in_memory(vec![(7, pending(1, 100))], false)
         .unwrap();
     assert_eq!(staged.pages.len(), 1);
     assert!(staged.pages[0].is_fresh);
@@ -219,7 +219,7 @@ fn staged_existing_page_eviction_reads_post_fold_not_disk_stale() {
     a.apply_deltas(vec![(7, pending(1, 100))]).unwrap();
     // Second fold staged but NOT yet written.
     let staged = a
-        .stage_deltas_in_memory(vec![(7, pending(1, 200))])
+        .stage_deltas_in_memory(vec![(7, pending(1, 200))], false)
         .unwrap();
     assert!(!staged.pages[0].is_fresh);
     cache.invalidate(staged.pages[0].page_id);
@@ -233,7 +233,7 @@ fn staged_existing_page_eviction_reads_post_fold_not_disk_stale() {
 fn clear_staged_after_write_falls_back_to_disk_truth() {
     let (_dir, cache, a) = make_array_with_cache();
     let staged = a
-        .stage_deltas_in_memory(vec![(7, pending(3, 100))])
+        .stage_deltas_in_memory(vec![(7, pending(3, 100))], false)
         .unwrap();
     a.write_staged_pages(&staged).unwrap(); // clears the overlay
     cache.invalidate(staged.pages[0].page_id);
@@ -247,11 +247,11 @@ fn clear_staged_after_write_falls_back_to_disk_truth() {
 fn clear_staged_is_ptr_eq_gated_against_newer_restage() {
     let (_dir, _cache, a) = make_array_with_cache();
     let first = a
-        .stage_deltas_in_memory(vec![(7, pending(1, 100))])
+        .stage_deltas_in_memory(vec![(7, pending(1, 100))], false)
         .unwrap();
     // Re-stage the same page (newer fold) before the first clear runs.
     let second = a
-        .stage_deltas_in_memory(vec![(8, pending(1, 200))])
+        .stage_deltas_in_memory(vec![(8, pending(1, 200))], false)
         .unwrap();
     assert_eq!(first.pages[0].page_id, second.pages[0].page_id);
     // A stale clear for the FIRST fold must not drop the SECOND fold's
@@ -266,7 +266,7 @@ fn clear_staged_is_ptr_eq_gated_against_newer_restage() {
 fn abort_removes_overlay_before_freeing_fresh_pid() {
     let (_dir, cache, a) = make_array_with_cache();
     let staged = a
-        .stage_deltas_in_memory(vec![(7, pending(1, 100))])
+        .stage_deltas_in_memory(vec![(7, pending(1, 100))], false)
         .unwrap();
     let pid = staged.pages[0].page_id;
     a.abort_staged_deltas(&staged, 100);
@@ -282,13 +282,13 @@ fn restage_after_eviction_uses_staged_base_not_disk() {
     let (_dir, cache, a) = make_array_with_cache();
     // Fold 1 staged (slot 7), never written, then evicted from the LRU.
     let first = a
-        .stage_deltas_in_memory(vec![(7, pending(1, 100))])
+        .stage_deltas_in_memory(vec![(7, pending(1, 100))], false)
         .unwrap();
     cache.invalidate(first.pages[0].page_id);
     // Fold 2 on the same page (slot 8) must base itself on fold 1's
     // staged content (overlay), not the unwritten disk page.
     let second = a
-        .stage_deltas_in_memory(vec![(8, pending(1, 200))])
+        .stage_deltas_in_memory(vec![(8, pending(1, 200))], false)
         .unwrap();
     assert_eq!(first.pages[0].page_id, second.pages[0].page_id);
     assert_eq!(a.get(7).unwrap().rc, 1);

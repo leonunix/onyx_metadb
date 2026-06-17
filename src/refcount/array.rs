@@ -275,7 +275,7 @@ impl PagedRefcountArray {
     /// the two halves separately so the disk write happens outside
     /// `apply_gate.write()`.
     pub fn apply_deltas(&self, deltas: Vec<(Pba, Pending)>) -> Result<()> {
-        let staged = self.stage_deltas_in_memory(deltas)?;
+        let staged = self.stage_deltas_in_memory(deltas, false)?;
         self.write_staged_pages(&staged)
     }
 
@@ -289,7 +289,22 @@ impl PagedRefcountArray {
     /// [`Self::write_staged_pages`] (or hand to the global flush
     /// `sealed_pages` runner) and roll back via
     /// [`Self::abort_staged_deltas`].
-    pub fn stage_deltas_in_memory(&self, deltas: Vec<(Pba, Pending)>) -> Result<StagedDeltas> {
+    ///
+    /// `force = true` (the cold-path lifecycle fold,
+    /// [`crate::refcount::RcShard::flush`]) folds every drained delta even
+    /// when `page_generation >= last_lsn` would normally skip it: the
+    /// per-fold replay-skip exists for in-place checkpoint *retries*, but
+    /// the cold path is driven by serialized lifecycle ops that never
+    /// retry in place, and the non-WAL snapshot incref legitimately
+    /// carries `last_lsn == created_lsn ==` the array page's current
+    /// generation (the last pre-snapshot op), so it MUST apply despite the
+    /// `>=`. The hot run_sync_cycle fold passes `false`. See
+    /// [`stage_one_page`].
+    pub fn stage_deltas_in_memory(
+        &self,
+        deltas: Vec<(Pba, Pending)>,
+        force: bool,
+    ) -> Result<StagedDeltas> {
         if deltas.is_empty() {
             return Ok(StagedDeltas {
                 pages: Vec::new(),
@@ -306,7 +321,7 @@ impl PagedRefcountArray {
         let mut pages = Vec::with_capacity(by_page.len());
         let mut max_lsn: Lsn = 0;
         for (page_idx, slot_pendings) in by_page {
-            let staged = self.stage_one_page(page_idx, slot_pendings)?;
+            let staged = self.stage_one_page(page_idx, slot_pendings, force)?;
             let page_gen = staged.sealed.header()?.generation;
             if page_gen > max_lsn {
                 max_lsn = page_gen;
@@ -320,6 +335,7 @@ impl PagedRefcountArray {
         &self,
         page_idx: usize,
         slot_pendings: Vec<(usize, Pending)>,
+        force: bool,
     ) -> Result<StagedPage> {
         // Resolve / allocate the page id under inner; drop inner before
         // touching the cache so concurrent reads on other pages don't
@@ -382,8 +398,11 @@ impl PagedRefcountArray {
             // drained deltas; on retry, the page is re-read from disk
             // with `generation >= pending.last_lsn` for already-applied
             // slots. Skip them — re-applying would double-count.
-            // Mirrors the per-op replay-skip in `RcShard::stage`.
-            if page_generation >= pending.last_lsn {
+            // Mirrors the per-op replay-skip in `RcShard::stage`. The cold
+            // lifecycle fold (`force`) bypasses it — it never retries in
+            // place, and the snapshot incref's `last_lsn` may legitimately
+            // equal the page generation (see `stage_deltas_in_memory_force`).
+            if !force && page_generation >= pending.last_lsn {
                 continue;
             }
             let prev = read_entry(&page, slot);

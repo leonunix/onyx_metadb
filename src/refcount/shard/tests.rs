@@ -177,7 +177,7 @@ fn begin_checkpoint_all_slots_stages_without_overwriting_disk() {
     s.stage(T0, 10, 5, 100).unwrap();
     s.stage(T0, 20, 3, 100).unwrap();
 
-    let ckpt = s.begin_checkpoint_all_slots().unwrap();
+    let ckpt = s.begin_checkpoint_all_slots(false).unwrap();
     assert_eq!(s.get(10).unwrap(), 5, "stage value visible via cache");
     assert_eq!(s.get(20).unwrap(), 3);
     assert!(s.allocated_data_pages() >= 1);
@@ -193,7 +193,7 @@ fn checkpoint_pipeline_round_trips_through_disk() {
     s.stage(T0, 7, 2, 50).unwrap();
     s.stage(T0, 800, 4, 60).unwrap();
 
-    let ckpt = s.begin_checkpoint_all_slots().unwrap();
+    let ckpt = s.begin_checkpoint_all_slots(false).unwrap();
     assert!(!ckpt.is_empty());
     assert_eq!(ckpt.fresh_page_ids().len(), 2);
 
@@ -209,7 +209,7 @@ fn abort_then_retry_does_not_double_apply_via_replay_skip() {
     let (_d, s) = make_shard();
     s.stage(T0, 10, 5, 100).unwrap();
 
-    let ckpt = s.begin_checkpoint_all_slots().unwrap();
+    let ckpt = s.begin_checkpoint_all_slots(false).unwrap();
     s.array.write_staged_pages(&ckpt.staged).unwrap();
     let _ = s.write_meta_chain(&ckpt, 0).unwrap();
     s.abort_checkpoint(ckpt, 0);
@@ -222,11 +222,11 @@ fn abort_then_retry_does_not_double_apply_via_replay_skip() {
 #[test]
 fn empty_checkpoint_is_no_op() {
     let (_d, s) = make_shard();
-    let ckpt = s.begin_checkpoint_all_slots().unwrap();
+    let ckpt = s.begin_checkpoint_all_slots(false).unwrap();
     assert!(ckpt.is_empty());
     let new_chain = s.write_meta_chain(&ckpt, 0).unwrap();
     s.install_meta_chain(new_chain);
-    let ckpt2 = s.begin_checkpoint_all_slots().unwrap();
+    let ckpt2 = s.begin_checkpoint_all_slots(false).unwrap();
     s.abort_checkpoint(ckpt2, 0);
 }
 

@@ -1,8 +1,20 @@
 use super::*;
 
+// A3 DEPRECATION (snapshot-scaling): the L2P page refcount was relocated
+// out of the page header into the PageId-keyed `L2pPageRc` array, so the
+// COW / snapshot / clone / drop paths no longer call any of the
+// disk-direct header-rc RMW helpers below (`atomic_rc_delta`,
+// `atomic_rc_delta_with_gen`, `atomic_rc_delta_batch_with_gen`) or the
+// per-pid `rc_locks` they take. The PBA refcount uses the separate
+// `refcount::RcShard` delta-ring, NOT these helpers. They are kept this
+// commit to keep the A3 diff focused on the cutover; removing them (and
+// `rc_locks`) is a follow-up cleanup once the cutover has soaked.
 impl PageStore {
     /// Atomically mutate the refcount of `page_id` by `delta` (positive
     /// for incref, negative for decref). Returns the post-delta rc.
+    ///
+    /// **A3-deprecated** — see the module-top note; no live caller remains
+    /// after the page-rc array cutover.
     ///
     /// Bypasses [`PageCache`] and [`PageBuf`]: reads the authoritative
     /// on-disk version inside a per-pid sharded mutex, mutates, writes

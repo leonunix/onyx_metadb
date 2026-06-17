@@ -51,17 +51,24 @@ pub(in crate::db) fn collect_paged_refcounts_for_roots(
 pub(in crate::db) fn apply_create_volume(
     page_store: &Arc<PageStore>,
     page_cache: &Arc<PageCache>,
+    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     shard_count: u32,
     metrics: Arc<MetaMetrics>,
     use_buffer: bool,
+    // A3: the volume's `created_lsn` (the CreateVolume op's lsn, strictly
+    // below the volume's first write op) — stamps each shard root's
+    // page-rc +1 so the fold applies it without colliding a later op.
+    created_lsn: Lsn,
 ) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
     let n = validate_shard_count(shard_count)?;
     create_l2p_shards(
         page_store.clone(),
         page_cache.clone(),
+        page_rc.clone(),
         n,
         metrics,
         use_buffer,
+        created_lsn,
     )
 }
 
@@ -72,10 +79,13 @@ pub(in crate::db) fn apply_create_volume(
 /// vec the snapshot path surfaces in its report.
 pub(in crate::db) fn apply_drop_volume(
     page_store: &Arc<PageStore>,
+    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     lsn: Lsn,
+    txg: crate::types::Txg,
     pages: &[PageId],
 ) -> Result<usize> {
-    let (_leaf_values, pages_freed) = apply_drop_snapshot_pages(page_store, lsn, pages)?;
+    let (_leaf_values, pages_freed) =
+        apply_drop_snapshot_pages(page_store, page_rc, lsn, txg, pages)?;
     Ok(pages_freed)
 }
 
@@ -86,40 +96,31 @@ pub(in crate::db) fn apply_drop_volume(
 /// source shards — are ignored because the clone materialises fresh
 /// empty trees for those shards (see [`build_clone_volume_shards`]).
 pub(in crate::db) fn apply_clone_volume_incref(
-    page_store: &Arc<PageStore>,
+    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     faults: &FaultController,
     lsn: Lsn,
+    txg: crate::types::Txg,
     src_shard_roots: &[PageId],
 ) -> Result<()> {
     for (idx, &pid) in src_shard_roots.iter().enumerate() {
         if pid == crate::types::NULL_PAGE {
             continue;
         }
-        let mut page = page_store.read_page_unchecked(pid)?;
-        page.verify(pid)?;
-        let header = page.header()?;
-        if header.generation >= lsn {
-            // Already incref'd by a prior apply of this same CloneVolume
-            // op (replay-after-crash case); skip.
-            continue;
-        }
-        let new_rc = header.refcount.checked_add(1).ok_or_else(|| {
-            MetaDbError::Corruption(format!(
-                "clone_volume: refcount overflow on source root page {pid}"
-            ))
-        })?;
-        page.set_refcount(new_rc);
-        page.set_generation(lsn);
-        page.seal();
-        page_store.write_page(pid, &page)?;
-        // Fault injection window: fires after the first root is durably
-        // incref'd but before subsequent ones. Recovery's generation-stamp
-        // guard skips the pre-fault root and completes the rest.
+        // A3 cutover: incref the page-rc array, not the page header. The
+        // page bytes are untouched (no whole-page rc write to be clobbered
+        // by a concurrent flush — which is the coupling this whole project
+        // removes). `stage`'s `page_lsn >= lsn` replay-skip gives the same
+        // idempotency the old `header.generation >= lsn` guard gave. The
+        // staged delta rides the next checkpoint's TXG fold (clone_volume
+        // commits no manifest itself) or a recovery replay.
+        page_rc.stage(txg, pid, 1, lsn)?;
+        // Fault injection window: fires after the first root's incref is
+        // staged but before subsequent ones. Recovery's replay-skip guard
+        // skips the pre-fault root and completes the rest.
         if idx == 0 {
             faults.inject(FaultPoint::CloneVolumeMidIncref)?;
         }
     }
-    page_store.sync()?;
     Ok(())
 }
 
@@ -132,6 +133,7 @@ pub(in crate::db) fn build_clone_volume_shards(
     src_shard_roots: &[PageId],
     page_store: &Arc<PageStore>,
     page_cache: &Arc<PageCache>,
+    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     created_lsn: Lsn,
     metrics: Arc<MetaMetrics>,
     use_buffer: bool,
@@ -139,12 +141,21 @@ pub(in crate::db) fn build_clone_volume_shards(
     let mut shards = Vec::with_capacity(src_shard_roots.len());
     let mut actual_roots = Vec::with_capacity(src_shard_roots.len());
     for (shard_idx, &root) in src_shard_roots.iter().enumerate() {
+        // Clone shards MUST share the one global page-rc store (not a
+        // private one), so the clone's COW page-rc deltas land in the
+        // same array the source volume uses. Hence the `_rc` ctors.
         let tree = if root == crate::types::NULL_PAGE {
-            PagedL2p::create_with_cache(page_store.clone(), page_cache.clone())?
-        } else {
-            PagedL2p::open_with_cache(
+            PagedL2p::create_with_cache_rc(
                 page_store.clone(),
                 page_cache.clone(),
+                page_rc.clone(),
+                created_lsn,
+            )?
+        } else {
+            PagedL2p::open_with_cache_rc(
+                page_store.clone(),
+                page_cache.clone(),
+                page_rc.clone(),
                 root,
                 created_lsn + 1,
             )?
@@ -180,7 +191,9 @@ pub(in crate::db) fn build_clone_volume_shards(
 /// can reuse the function without unpacking a misnamed variant.
 pub(in crate::db) fn apply_drop_snapshot_pages(
     page_store: &Arc<PageStore>,
+    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     lsn: Lsn,
+    txg: crate::types::Txg,
     pages: &[PageId],
 ) -> Result<(Vec<L2pValue>, usize)> {
     use crate::page::PageType;
@@ -189,68 +202,70 @@ pub(in crate::db) fn apply_drop_snapshot_pages(
     let mut pages_freed: usize = 0;
 
     for &pid in pages {
-        let mut page = match page_store.read_page_unchecked(pid) {
+        // A3 cutover: decref the page-rc array, not the page header.
+        // Replay idempotency comes from `stage`'s `page_lsn >= lsn` skip
+        // (the analogue of the old `header.generation >= lsn` guard): a
+        // replayed decref whose array page is already folded at/after
+        // `lsn` returns `(prev, prev)` with no change, so it neither
+        // double-decrements nor re-frees.
+        let (prev, new) = page_rc.stage(txg, pid, -1, lsn)?;
+        if new != 0 || prev == 0 {
+            // Either still referenced after the decref (new > 0), or the
+            // replay-skip fired (prev == new == 0, already applied). The
+            // page rc lives in the array now, so a non-freeing decref
+            // writes nothing — there is no header to rewrite.
+            continue;
+        }
+        // 1→0 transition. Confirm with a fold-consistent read before the
+        // IRREVERSIBLE free (R2): the cheap staged `new` can straddle a
+        // concurrent fold's [publish, clear] window and floor a live rc to
+        // a spurious 0. L2P page frees are immediate (no GC gate re-check),
+        // so this is the only guard.
+        if page_rc.get_consistent(pid)? != 0 {
+            continue;
+        }
+        // rc==0 confirmed: read the page to harvest leaf values, then
+        // free it idempotently. The page bytes still carry the now-dead
+        // header rc — left untouched; verify reads against the array.
+        let page = match page_store.read_page_unchecked(pid) {
             Ok(page) => page,
             Err(MetaDbError::PageOutOfRange(out_of_range)) if out_of_range == pid => {
                 // A prior replay may already have freed a tail page and
-                // `PageStore::open` may then have truncated that zero/Free
-                // suffix below this pid. Replaying the same DropSnapshot /
-                // DropVolume WAL record is still idempotent: the page is
-                // gone because this very cascade already completed.
+                // `PageStore::open` truncated the zero/Free suffix below
+                // this pid; the page is gone because this cascade already
+                // completed (the replay-skip above did not catch it only
+                // because the array page was not yet folded pre-crash).
                 pages_freed += 1;
                 continue;
             }
             Err(err) => return Err(err),
         };
         if page.bytes().iter().all(|b| *b == 0) {
-            // `free_idempotent` punches freed pages after writing the
-            // Free header. On reopen, a page already processed by a
-            // crashed prior apply can therefore read back as all zeroes
-            // rather than as a decodable Free page.
+            // `free_idempotent` punches freed pages; a page already freed
+            // by a crashed prior apply reads back as all zeroes.
             pages_freed += 1;
             continue;
         }
-        // verify before we do anything; `read_page_unchecked` skipped it
         page.verify(pid)?;
         let header = page.header()?;
-        if header.generation >= lsn {
-            // already processed by a prior apply of this same DropSnapshot
-            // (replay-after-crash case); skip to keep the overall apply
-            // idempotent.
-            if header.page_type == PageType::Free {
-                // count it so the outcome is stable across replays — but
-                // skip the write.
-                pages_freed += 1;
-            }
+        if header.page_type == PageType::Free {
+            // Already freed by a crashed prior apply of this op.
+            pages_freed += 1;
             continue;
         }
-        let rc = header.refcount;
-        if rc == 0 {
-            return Err(MetaDbError::Corruption(format!(
-                "DropSnapshot apply: page {pid} already at refcount 0"
-            )));
-        }
-        let new_rc = rc - 1;
-        if new_rc == 0 {
-            if matches!(header.page_type, PageType::PagedLeaf) {
-                for i in 0..crate::paged::format::LEAF_ENTRY_COUNT {
-                    if crate::paged::format::leaf_bit_set(&page, i) {
-                        if let Some(value) = crate::paged::format::leaf_value_at(&page, i)? {
-                            freed_leaf_values.push(value);
-                        }
+        if matches!(header.page_type, PageType::PagedLeaf) {
+            for i in 0..crate::paged::format::LEAF_ENTRY_COUNT {
+                if crate::paged::format::leaf_bit_set(&page, i) {
+                    if let Some(value) = crate::paged::format::leaf_value_at(&page, i)? {
+                        freed_leaf_values.push(value);
                     }
                 }
             }
-            // free_idempotent stamps generation=lsn via the Free header.
-            let pushed = page_store.free_idempotent(pid, lsn)?;
-            if pushed {
-                pages_freed += 1;
-            }
-        } else {
-            page.set_refcount(new_rc);
-            page.set_generation(lsn);
-            page.seal();
-            page_store.write_page(pid, &page)?;
+        }
+        // free_idempotent stamps generation=lsn via the Free header.
+        let pushed = page_store.free_idempotent(pid, lsn)?;
+        if pushed {
+            pages_freed += 1;
         }
     }
 
@@ -266,11 +281,14 @@ pub(in crate::db) fn apply_drop_snapshot_pages(
 pub(in crate::db) fn apply_drop_snapshot_pages_and_decrefs(
     page_store: &Arc<PageStore>,
     refcount_shards: &[Shard],
+    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     lsn: Lsn,
+    txg: crate::types::Txg,
     pages: &[PageId],
     pba_decrefs: &[Pba],
 ) -> Result<ApplyOutcome> {
-    let (freed_leaf_values, pages_freed) = apply_drop_snapshot_pages(page_store, lsn, pages)?;
+    let (freed_leaf_values, pages_freed) =
+        apply_drop_snapshot_pages(page_store, page_rc, lsn, txg, pages)?;
     let _ = refcount_shards;
     let _ = pba_decrefs;
 

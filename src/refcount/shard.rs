@@ -293,14 +293,52 @@ impl RcShard {
     /// left at its floor) rather than poisoning the commit pipeline.
     /// Overflow (delta >= 0) is fatal.
     pub fn stage(&self, txg: Txg, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
+        self.stage_inner(txg, pba, delta, lsn, true)
+    }
+
+    /// Stage one op into `txg`'s slot WITHOUT the per-op `page_lsn >= lsn`
+    /// replay-skip early-return that [`stage`](Self::stage) applies, for
+    /// NON-WAL callers (the snapshot-take root incref / drop decref /
+    /// tree-create root +1 relocated from the page header in
+    /// `l2p_page_rc`). These ops are not WAL-replayed, so the early-return
+    /// (which would skip a delta whose array page is already folded at
+    /// `lsn`) is wrong for them — they must always merge.
+    ///
+    /// `lsn` is still recorded as the delta's `last_lsn` so the FOLD's own
+    /// replay-skip (`stage_one_page`: `page_generation >= last_lsn`) keeps
+    /// the delta from being double-applied on a checkpoint retry, AND so
+    /// the fold actually applies it (a `last_lsn = 0` delta would be
+    /// permanently skipped by `page_generation >= 0`). Callers pass a real,
+    /// monotone lsn: the snapshot's `created_lsn`, the drop's lsn, or the
+    /// volume's `created_lsn` for the create root. Because these ops sit at
+    /// or below the next durable `checkpoint_lsn`, raising the array page
+    /// generation to `lsn` never poisons a future op (which has a strictly
+    /// higher lsn) or a replayed op (which starts above the checkpoint).
+    /// Returns `(prev_rc, new_rc)`.
+    pub fn stage_unskippable(&self, txg: Txg, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
+        self.stage_inner(txg, pba, delta, lsn, false)
+    }
+
+    /// Shared body for [`stage`] / [`stage_unskippable`]. `replay_skip`
+    /// gates the `!any && page_lsn >= lsn` early-return (on for WAL ops,
+    /// off for the non-WAL structural deltas). Returns the cumulative
+    /// `(prev_rc, new_rc)`; a decref past zero is a benign double-decref
+    /// left at its floor (overflow on `delta >= 0` is fatal).
+    fn stage_inner(
+        &self,
+        txg: Txg,
+        pba: Pba,
+        delta: i64,
+        lsn: Lsn,
+        replay_skip: bool,
+    ) -> Result<(u32, u32)> {
         let idx = slot_index(txg);
         // Read the other three slots first (brief individual locks), then
         // hold the open slot across read-own + array read + merge so a
         // concurrent stage targeting the same open slot serialises here.
         let (mut net, mut max_lsn, mut any) = self.sum_pending(pba, Some(idx));
         let mut open = self.delta_slots[idx].lock();
-        let pa = open.get(pba);
-        if let Some(p) = pa {
+        if let Some(p) = open.get(pba) {
             net += p.delta;
             if p.last_lsn > max_lsn {
                 max_lsn = p.last_lsn;
@@ -312,7 +350,7 @@ impl RcShard {
         // generation already at/after this LSN, the op was already
         // applied (recovery same-LSN re-application). `>=` is correct
         // here — there is no drainer cycle-split hazard in the slot model.
-        if !any && self.array.page_lsn(pba)? >= lsn {
+        if replay_skip && !any && self.array.page_lsn(pba)? >= lsn {
             return Ok((base.rc, base.rc));
         }
         let merged_prev = super::merge_read_or_floor(base, net, max_lsn)?;
@@ -331,18 +369,21 @@ impl RcShard {
     /// this TXG's deltas), so the flush's `wal_checkpoint.max(prev)`
     /// durable_seq is correct — no separate watermark to record.
     pub fn begin_checkpoint(&self, txg: Txg) -> Result<RcCheckpoint> {
-        self.checkpoint_slots(&[slot_index(txg)])
+        self.checkpoint_slots(&[slot_index(txg)], false)
     }
 
     /// Fold every slot. Used by the threads-OFF inline flush and by
-    /// recovery's post-replay / cold `flush()` path (rc analogue of
-    /// `force_compact_l2p_buffers`).
-    pub fn begin_checkpoint_all_slots(&self) -> Result<RcCheckpoint> {
-        self.checkpoint_slots(&[0, 1, 2, 3])
+    /// recovery's post-replay path (rc analogue of
+    /// `force_compact_l2p_buffers`). `force` bypasses the per-fold
+    /// replay-skip — `true` only on the cold `RcShard::flush` lifecycle
+    /// path (see [`PagedRefcountArray::stage_deltas_in_memory_force`]);
+    /// the hot run_sync_cycle drainer passes `false`.
+    pub fn begin_checkpoint_all_slots(&self, force: bool) -> Result<RcCheckpoint> {
+        self.checkpoint_slots(&[0, 1, 2, 3], force)
     }
 
     /// Shared fold body (publish-before-clear).
-    fn checkpoint_slots(&self, slots: &[usize]) -> Result<RcCheckpoint> {
+    fn checkpoint_slots(&self, slots: &[usize], force: bool) -> Result<RcCheckpoint> {
         // Snapshot (clone) the slot contents — publish-before-clear: we
         // fold into the array first and clear the slot only after, so a
         // concurrent cumulative read can transiently over-count but never
@@ -379,8 +420,9 @@ impl RcShard {
         let _fold = self.fold_lock.write();
 
         // Fold + publish into the array (cache + page_table) WITHOUT
-        // clearing the slots yet.
-        let staged = self.array.stage_deltas_in_memory(drained.clone())?;
+        // clearing the slots yet. `force` (cold lifecycle flush) applies
+        // every delta despite the per-page replay-skip generation guard.
+        let staged = self.array.stage_deltas_in_memory(drained.clone(), force)?;
 
         // Publish is visible now; clear the folded slots. They are frozen
         // (Syncing / threads-off quiesce) so a fresh `DeltaMap` discards
@@ -471,7 +513,10 @@ impl RcShard {
     /// Synchronous flush for non-checkpoint callers (cold path). Folds
     /// every slot to disk and rotates the meta chain.
     pub fn flush(&self) -> Result<()> {
-        let ckpt = self.begin_checkpoint_all_slots()?;
+        // Cold path: force-apply (lifecycle-serialized, no in-place retry;
+        // folds the snapshot incref whose `last_lsn == created_lsn` equals
+        // the array page generation).
+        let ckpt = self.begin_checkpoint_all_slots(true)?;
         if ckpt.is_empty() {
             return Ok(());
         }

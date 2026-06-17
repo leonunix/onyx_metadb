@@ -100,9 +100,11 @@ impl Db {
         let (shards, roots) = apply_create_volume(
             &self.page_store,
             &self.page_cache,
+            &self.l2p_page_rc,
             shard_count,
             self.metrics.clone(),
             self.l2p_buffer_enabled,
+            lsn,
         )?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
@@ -258,6 +260,9 @@ impl Db {
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes_snap);
         flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_all_refcount_shards()?;
+        // A3: fold the page-rc array so the refreshed manifest below
+        // records a durable `l2p_page_rc_durable_seq = checkpoint_lsn`.
+        self.l2p_page_rc.flush()?;
 
         // Locate the dying volume's shard range within l2p_guards.
         let mut target_start = 0usize;
@@ -352,7 +357,8 @@ impl Db {
             .inject(FaultPoint::DropVolumePostWalBeforeApply)?;
         self.wait_for_global_apply_turn(lsn)?;
 
-        let pages_freed = apply_drop_volume(&self.page_store, lsn, &pages)?;
+        let pages_freed =
+            apply_drop_volume(&self.page_store, &self.l2p_page_rc, lsn, _txg_guard.txg(), &pages)?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
@@ -511,7 +517,13 @@ impl Db {
         // `create_volume` / `drop_snapshot`.
         self.wait_for_global_apply_turn(lsn)?;
 
-        apply_clone_volume_incref(&self.page_store, &self.faults, lsn, &src_shard_roots)?;
+        apply_clone_volume_incref(
+            &self.l2p_page_rc,
+            &self.faults,
+            lsn,
+            _txg_guard.txg(),
+            &src_shard_roots,
+        )?;
         // `apply_clone_volume_incref` writes through `page_store`, so the
         // shared `page_cache` *and* every in-memory `PageBuf` that holds
         // a stale pre-incref copy of one of these roots need to drop it.
@@ -545,6 +557,7 @@ impl Db {
             &src_shard_roots,
             &self.page_store,
             &self.page_cache,
+            &self.l2p_page_rc,
             lsn,
             self.metrics.clone(),
             self.l2p_buffer_enabled,
