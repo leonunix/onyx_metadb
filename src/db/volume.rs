@@ -432,13 +432,22 @@ impl Db {
     /// Serialisation mirrors [`create_volume`](Self::create_volume):
     /// - `drop_gate.write()` — waits for all in-flight commits to finish
     ///   so our LSN sits right after `last_applied_lsn`.
-    /// - **Forced TXG sync** — drains pre-existing L2P Dirty Arcs so
-    ///   `apply_clone_volume_incref`'s whole-page rc bumps on each
-    ///   source root cannot be clobbered by a concurrent flush IO
-    ///   phase. See [`Db::take_snapshot`] for the rationale.
-    /// - `apply_gate.write()` — taken AFTER the forced sync. Serialises
-    ///   the WAL submit + apply against
+    /// - `apply_gate.write()` — serialises the WAL submit + apply against
     ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
+    ///
+    /// Phase B (A3 follow-up): the **forced TXG sync** that used to run
+    /// at entry is GONE. Its sole job was to drain in-flight flush IO so
+    /// `apply_clone_volume_incref`'s whole-page rc RMW could not be
+    /// clobbered by a concurrent whole-page flush write. A3 relocated the
+    /// page refcount into the [`L2pPageRc`](crate::l2p_page_rc) array, so
+    /// the incref is now a sharded-delta `stage` (concurrency-safe with
+    /// flush, exactly like PBA rc) and the page bytes are never touched —
+    /// there is nothing left to clobber. Removing the forced sync stops
+    /// every clone from driving + waiting on a full sync cycle while
+    /// holding `drop_gate.write` (the snapshot-scaling barrier). Crash
+    /// durability is unchanged: the `CloneVolume` WAL record replays the
+    /// incref (gen-stamped idempotent), and the next natural flush commits
+    /// the manifest.
     ///
     /// Crash semantics:
     /// - Before WAL fsync: no effect observable.
@@ -451,15 +460,17 @@ impl Db {
     /// [`open`](Self::open) — captures the new volumes table.
     pub fn clone_volume(&self, src_snap_id: SnapshotId) -> Result<VolumeOrdinal> {
         let _drop_guard = self.drop_gate.write();
-        // Forced TXG sync before apply_gate.write to avoid the threaded
-        // sync thread's manifest-commit gate deadlocking against us.
-        self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
-        // Phase 4 gate-shrink: record this lifecycle op's WAL LSN into
-        // `slot_max_lsn(open_txg)` so `run_sync_cycle_body`'s
-        // `wal_checkpoint = slot_max_lsn(txg)` watermark reflects it.
-        // Must be entered AFTER `flush_with_gate(Forced)` returns —
-        // that call rolls the current Open TXG; entering before would
-        // race `roll_to_quiescing` waiting for `inflight == 0`.
+        // Phase B (A3 follow-up): no forced TXG sync here. The page-rc
+        // incref is now a `stage` into the array (clobber-free), so the
+        // sync-drain barrier is unnecessary. `txg.enter()` pins the
+        // current Open TXG; `TxgStateMachine`'s `closing_open` flag makes
+        // it wait out (not race) a concurrent background roll, so it is
+        // safe to enter without first rolling the TXG ourselves.
+        //
+        // Phase 4 gate-shrink: `_txg_guard.record_lsn(lsn)` (below)
+        // records this lifecycle op's WAL LSN into `slot_max_lsn(open_txg)`
+        // so `run_sync_cycle_body`'s `wal_checkpoint = slot_max_lsn(txg)`
+        // watermark reflects it and the WAL segment is eventually pruned.
         let _txg_guard = self.txg.enter();
         let _apply_guard = self.apply_gate.write();
 

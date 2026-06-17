@@ -362,16 +362,15 @@ impl Db {
         // runs gateless. The serialisation it used to get from
         // `apply_gate.write()` is now provided by:
         //
-        // - Every lifecycle op (snapshot / drop_snapshot / drop_volume /
-        //   clone_volume / range_delete / create_volume) drives a
-        //   forced TXG sync (`flush_with_gate(Forced)`) at entry while
-        //   holding `drop_gate.write`. After that sync returns, every
-        //   pre-existing L2P Dirty Arc is durable on disk; no flush IO
-        //   phase is in flight that could clobber a subsequent rc
-        //   RMW from `atomic_incref` / `apply_drop_snapshot_pages` /
-        //   `apply_clone_volume_incref` / etc. `drop_gate.write` then
-        //   keeps the syncing slot empty for the rest of the lifecycle
-        //   op, so no new Dirty Arcs form either.
+        // - Lifecycle ops hold `drop_gate.write` for the duration, which
+        //   keeps the syncing slot empty (no new Dirty Arcs form). Post-A3
+        //   their rc mutations (`atomic_incref` / `apply_drop_snapshot_pages`
+        //   / `apply_clone_volume_incref`) `stage` into the `L2pPageRc`
+        //   array rather than RMW-ing a whole page, so a concurrent flush
+        //   IO phase has nothing to clobber — which is why `take_snapshot`
+        //   / `drop_snapshot` / `clone_volume` no longer force-sync at
+        //   entry (Phase B). (`range_delete` / `drop_volume` / `create_volume`
+        //   still force-sync; their removal is a later step.)
         // - Per-shard `tree.write()` held during this flush's
         //   `lock_selected_l2p_shards_for` excludes lifecycle's
         //   `lock_all_l2p_shards_for` from racing the sample.

@@ -348,6 +348,27 @@ impl Db {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Copy the live buffer + lifecycle replay watermarks into a manifest
+    /// about to be committed. [`Db::run_sync_cycle_body`] does this for
+    /// the checkpoint it commits (`flush.rs`); lifecycle ops that commit a
+    /// manifest WITHOUT first driving a forced TXG sync (`take_snapshot` /
+    /// `drop_snapshot` after Phase B) must do the same, or the manifest
+    /// keeps a stale `lifecycle_replay_seq` and recovery re-replays
+    /// already-folded lifecycle ops (e.g. a `PromotionChunk` incref) on
+    /// top of the durable refcount array, double-counting them.
+    ///
+    /// Callers MUST hold `apply_gate.write()` so no concurrent apply
+    /// advances either watermark past the state this manifest's flushed
+    /// pages actually cover. The not-yet-submitted lifecycle op of the
+    /// caller itself (drop_snapshot's `DropSnapshot`) is submitted AFTER
+    /// this commit, so its seq is correctly excluded here and replayed
+    /// on the next open.
+    pub(super) fn stamp_replay_watermarks(&self, manifest: &mut crate::manifest::Manifest) {
+        use std::sync::atomic::Ordering;
+        manifest.last_processed_buffer_seq = self.buffer_applied_watermark.load(Ordering::Acquire);
+        manifest.lifecycle_replay_seq = self.lifecycle_applied_watermark.load(Ordering::Acquire);
+    }
+
     /// Internal helper: pluck `ApplyOutcome::FreePbas` entries out of a
     /// commit-ops result and forward their `freed_pbas` to the
     /// registered sink (if any). Non-`FreePbas` outcomes and
@@ -500,12 +521,14 @@ impl Db {
     ///   holds `apply_gate.write`; serialisation against concurrent
     ///   commits' `cow_for_write` falls on the per-shard `tree.write()`
     ///   this helper takes.
-    /// - The snapshot / `range_delete` / `drop_volume` / `clone_volume`
-    ///   / `drop_snapshot` paths. Those paths now drive a forced TXG
-    ///   sync via `flush_with_gate(Forced)` at entry, so by the time
-    ///   they call this helper the slots are already drained — the
-    ///   call becomes a defensive no-op. `drop_gate.write` held by
-    ///   the lifecycle op then keeps slots empty.
+    /// - The snapshot / `range_delete` / `drop_volume` / `drop_snapshot`
+    ///   paths. `take_snapshot` / `drop_snapshot` (Phase B) no longer
+    ///   force-sync at entry, so this drain is LOAD-BEARING there: it
+    ///   folds every buffered L2P op into the tree so the root sample /
+    ///   refresh observes all applied ops. `drop_gate.write` held by the
+    ///   lifecycle op keeps the slots from refilling. (`range_delete` /
+    ///   `drop_volume` still force-sync at entry, so for those the drain
+    ///   stays a defensive no-op.)
     /// - The post-replay path in `open_with_config_and_faults`,
     ///   before any commit can race the recovered buffer state.
     ///

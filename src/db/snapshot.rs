@@ -18,42 +18,43 @@ impl Db {
     /// outlives subsequent COW writes on the target volume.
     ///
     /// Serialisation:
-    /// - `drop_gate.write()` — blocks `commit_ops` so no new Dirty Arcs
-    ///   form between the forced TXG sync below and our `atomic_incref`.
-    ///   Also freezes `last_applied_lsn` so the `created_lsn` sample
-    ///   below is stable.
-    /// - **Forced TXG sync** ([`Db::flush_with_gate`] with
-    ///   [`crate::metrics::FlushKind::Forced`]) — drains every
-    ///   pre-existing L2P Dirty Arc to disk. Without this, the flush
-    ///   IO phase that captured those Arcs could clobber the on-disk
-    ///   refcount field after our `incref_root_for_snapshot` RMWs it
-    ///   (whole-page writes via `write_sealed_page_runs` bypass the
-    ///   per-pid `rc_locks` that `atomic_rc_delta` takes).
-    /// - `apply_gate.write()` — taken AFTER the forced sync (else the
-    ///   sync thread's own manifest-commit gate would deadlock against
-    ///   us). Serialises our manifest commit against
+    /// - `drop_gate.write()` — blocks `commit_ops` / `stage_ops`, so no
+    ///   new L2P buffer entries or page-rc deltas form while we sample
+    ///   roots and incref them. Combined with `apply_gate.write()` below
+    ///   it also freezes `last_applied_lsn`, so the `created_lsn` sample
+    ///   is stable.
+    /// - `apply_gate.write()` — drains in-flight laned applies and
+    ///   serialises our manifest commit against
     ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
+    ///
+    /// Phase B (A3 follow-up): the **forced TXG sync** that used to run
+    /// before `apply_gate.write()` is GONE. It existed only to drain
+    /// in-flight flush IO so the snapshot-root incref could not be
+    /// clobbered — whole-page flush writes (`write_sealed_page_runs`)
+    /// bypassed the per-pid `rc_locks` that the old header-rc RMW took.
+    /// A3 moved the page refcount into the [`L2pPageRc`](crate::l2p_page_rc)
+    /// array; `incref_root_for_snapshot` now `stage`s a sharded delta
+    /// (clobber-free) and the page bytes are untouched. The snapshot is
+    /// still made durable here by the targeted shard flush +
+    /// `l2p_page_rc.flush()` + manifest commit below — not by the forced
+    /// sync. Dropping it also removes the deadlock the old ordering
+    /// avoided (we no longer wait on the sync thread while holding
+    /// `apply_gate.write`), so `apply_gate.write()` is now taken directly.
     pub fn take_snapshot(&self, vol_ord: VolumeOrdinal) -> Result<SnapshotId> {
-        // Exclude commits so no new Dirty Arcs (or `atomic_rc_delta` RMWs)
-        // form across the forced-sync barrier and our subsequent
-        // `incref_root_for_snapshot` calls.
+        // Exclude commits so no new L2P buffer entries or page-rc deltas
+        // form while we sample roots and `incref_root_for_snapshot` them.
         let _drop_guard = self.drop_gate.write();
-        // Drive the current Open TXG through the full sync pipeline. After
-        // this returns, every pre-existing Dirty Arc on every L2P /
-        // refcount shard is durable on disk, and no flush IO phase is
-        // in-flight. See the module-level comment for why this is the
-        // TXG-aware substitute for the old sample-phase `apply_gate.write`.
-        self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
-        // Now safe to take `apply_gate.write()` — the sync thread (if
-        // running) has already released its manifest-commit gate.
         let _apply_guard = self.apply_gate.write();
         // Resolve the target volume before touching manifest state so an
         // unknown ordinal short-circuits with a clean `InvalidArgument`.
         let target = self.volume(vol_ord)?;
-        // Defensive: the forced sync above already drained every L2P
-        // buffer slot. `drop_gate.write` blocks new commits from
-        // inserting fresh entries. This call is therefore a no-op in
-        // practice; kept to make the post-condition explicit.
+        // Fold every L2P buffer slot into the trees so the root sample
+        // below observes all applied ops. With the forced sync gone this
+        // is now LOAD-BEARING (not the old defensive no-op): in buffer
+        // mode the `stage_ops` hot path defers the tree fold, and only
+        // this drain (under `drop_gate.write`, which keeps the slots from
+        // refilling) brings `tree.root()` up to `last_applied_lsn`. No-op
+        // when the buffer is disabled.
         self.force_compact_l2p_buffers()?;
         let mut manifest_state = self.manifest_state.lock();
         let volumes = self.volumes_snapshot();
@@ -155,6 +156,12 @@ impl Db {
         self.l2p_page_rc.flush()?;
 
         manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
+        // Phase B: with no forced TXG sync ahead of us, this manifest is
+        // the checkpoint that makes the flushes above durable — so it must
+        // also advance the lifecycle/buffer replay watermarks (else
+        // recovery re-replays already-folded lifecycle ops; see
+        // `stamp_replay_watermarks`). Held under `apply_gate.write`.
+        self.stamp_replay_watermarks(&mut manifest_state.manifest);
         let snap_roots: Box<[PageId]> = l2p_roots.into_boxed_slice();
         manifest_state.manifest.snapshots.push(SnapshotEntry {
             id,
@@ -346,19 +353,29 @@ impl Db {
     /// re-drives the work to completion.
     ///
     /// Serialisation:
-    /// - `drop_gate.write()` — excludes every `commit_ops` path. The
-    ///   rc-dependent plan walk relies on no concurrent `cow_for_write`
-    ///   moving rcs out from under us.
-    /// - **Forced TXG sync** — drains pre-existing L2P Dirty Arcs to
-    ///   disk so the subsequent `apply_drop_snapshot_pages` whole-page
-    ///   writes (via `page_store.write_page`, which bypasses
-    ///   `rc_locks`) cannot be clobbered by a concurrent flush IO
-    ///   phase that captured those Arcs before this drop began.
-    /// - `apply_gate.write()` — taken AFTER the forced sync. Serialises
-    ///   our WAL submit + apply + manifest-side bookkeeping against
+    /// - `drop_gate.write()` — excludes every `commit_ops` / `stage_ops`
+    ///   path. The rc-dependent plan walk
+    ///   ([`collect_paged_refcounts_for_roots`]) counts parent pointers
+    ///   over the manifest-visible page graph, so it relies on no
+    ///   concurrent `cow_for_write` moving an edge between the plan and
+    ///   the `apply_drop_snapshot_pages` decref. This gate (NOT the
+    ///   forced sync) is what freezes that graph; it stays.
+    /// - `apply_gate.write()` — serialises our WAL submit + apply +
+    ///   manifest-side bookkeeping against
     ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
     /// - `snapshot_views.write()` — waits for outstanding
     ///   [`SnapshotView`]s to drop before any page is freed.
+    ///
+    /// Phase B (A3 follow-up): the **forced TXG sync** that used to run
+    /// at entry is GONE. It drained in-flight flush IO so the per-page
+    /// decref's whole-page rc write could not be clobbered. A3 moved the
+    /// page refcount into the [`L2pPageRc`](crate::l2p_page_rc) array:
+    /// `apply_drop_snapshot_pages` now `stage`s `-1` deltas and gates the
+    /// irreversible free on a fold-consistent `get_consistent` read (R2),
+    /// so there is no whole-page rc write left to clobber and no need to
+    /// quiesce flush IO. The refreshed-manifest commit below still makes
+    /// the surviving roots durable; the decrefs ride the `DropSnapshot`
+    /// WAL record (gen-stamped idempotent on replay).
     ///
     /// Crash semantics:
     /// - Before WAL fsync: no effect observable.
@@ -370,17 +387,17 @@ impl Db {
     /// natural [`flush`](Self::flush) captures the new snapshot list.
     pub fn drop_snapshot(&self, id: SnapshotId) -> Result<Option<DropReport>> {
         let _drop_guard = self.drop_gate.write();
-        // Drive a forced TXG sync BEFORE acquiring apply_gate.write —
-        // otherwise the sync thread's manifest-commit gate would
-        // deadlock against our outer hold. See `take_snapshot` for the
-        // full rationale.
-        self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
-        // Phase 4 gate-shrink: record this lifecycle op's WAL LSN into
-        // `slot_max_lsn(open_txg)` so `run_sync_cycle_body`'s
-        // `wal_checkpoint = slot_max_lsn(txg)` watermark reflects it.
-        // Must be entered AFTER `flush_with_gate(Forced)` returns —
-        // that call rolls the current Open TXG; entering before would
-        // race `roll_to_quiescing` waiting for `inflight == 0`.
+        // Phase B (A3 follow-up): no forced TXG sync. The page-rc decrefs
+        // now `stage` into the array and free under a fold-consistent
+        // read, so the flush-IO-drain barrier is unnecessary. `txg.enter()`
+        // pins the current Open TXG; `closing_open` makes it wait out (not
+        // race) a concurrent background roll, so entering without first
+        // rolling the TXG ourselves is safe.
+        //
+        // Phase 4 gate-shrink: `_txg_guard.record_lsn(lsn)` (below)
+        // records this lifecycle op's WAL LSN into `slot_max_lsn(open_txg)`
+        // so `run_sync_cycle_body`'s `wal_checkpoint = slot_max_lsn(txg)`
+        // watermark reflects it and the WAL segment is eventually pruned.
         let _txg_guard = self.txg.enter();
         let _apply_guard = self.apply_gate.write();
         let _view_guard = self.snapshot_views.write();
@@ -471,6 +488,13 @@ impl Db {
                 Some(checkpoint_lsn),
             )?;
             mstate.manifest.checkpoint_lsn = checkpoint_lsn;
+            // Phase B: no forced TXG sync ran ahead of this commit, so it
+            // is the checkpoint that makes the flushes above durable and
+            // must advance the lifecycle/buffer replay watermarks. The
+            // `DropSnapshot` op is submitted AFTER this, so its seq is
+            // correctly excluded and replayed on the next open. Held under
+            // `apply_gate.write`. See `stamp_replay_watermarks`.
+            self.stamp_replay_watermarks(&mut mstate.manifest);
             let manifest = mstate.manifest.clone();
             mstate.store.commit(&manifest)?;
             dedup_update
