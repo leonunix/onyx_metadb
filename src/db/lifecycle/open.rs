@@ -235,6 +235,7 @@ impl Db {
             buffer_applied_watermark: AtomicU64::new(0),
             lifecycle_applied_watermark: AtomicU64::new(0),
             lifecycle_journal,
+            pending_sync_tasks: Mutex::new(Vec::new()),
         };
         // The refcount fold is inline + per-TXG-slot (no background rc
         // drainer to spawn — see `refcount::shard`).
@@ -486,7 +487,10 @@ impl Db {
             }
         }
 
-        let lsn_alloc = LsnAllocator::new(last_applied + 1);
+        // `lsn_alloc` is constructed below, AFTER the post-replay commit
+        // + orphan reclaim and AFTER the recovery LSN-frontier bump (those
+        // consume the un-bumped `last_applied`; the allocator must resume at
+        // the bumped frontier). See the bump just before `build_dedup_lanes`.
 
         // Open the lifecycle journal for further append at the seq
         // immediately after whatever replay just folded in.
@@ -626,6 +630,34 @@ impl Db {
             }
         }
 
+        // Recovery LSN frontier bump. `last_applied` so far is the recovery
+        // FLOOR (`checkpoint_lsn = min(durable_seq)`, then advanced by any
+        // lifecycle replay). In buffer mode the floor can sit far below an
+        // active shard's `durable_seq` when buffer shards are uneven /
+        // uncompacted, yet that active shard holds durable array/tree pages
+        // whose `generation == its durable_seq`. If the new-op allocator
+        // resumed at floor+1 it would hand out LSNs BELOW those generations,
+        // and a fresh op's stage-time replay-skip (`page_lsn >= lsn`,
+        // `refcount/shard.rs`) would wrongly drop it (page-rc over-count /
+        // leak). Resume instead above the durable FRONTIER = `max(durable_seq)`
+        // (>= every durable page generation; see `Manifest::max_durable_seq`).
+        //
+        // `checkpoint_lsn` (the recovery/prune floor) is deliberately NOT
+        // touched — recovery still replays from `checkpoint_lsn + 1`; only
+        // the volatile allocator/apply watermark moves up. The bump runs
+        // AFTER the post-replay commit + orphan reclaim (which consume the
+        // un-bumped `last_applied` as a durable_seq override / reclaim
+        // generation) and BEFORE the dedup lanes, `lsn_alloc`,
+        // `last_applied_lsn`, and `txg.record_lsn` (all seeded from the
+        // bumped value). In the replayed path the post-replay commit set
+        // every shard's durable_seq to `last_applied`, so the frontier
+        // equals `last_applied` and the bump is a no-op; it only acts on the
+        // skipped-journal path where the durable manifest already carries
+        // uneven per-shard durable_seq above the floor. Pure function of the
+        // durable manifest ⇒ idempotent across reopens.
+        last_applied = last_applied.max(manifest.max_durable_seq());
+        let lsn_alloc = LsnAllocator::new(last_applied + 1);
+
         // Capture before `manifest` is moved into `ManifestState` below.
         let manifest_dedup_shards = manifest.dedup_shards as usize;
         let manifest_checkpoint_txg = manifest.checkpoint_txg;
@@ -731,6 +763,7 @@ impl Db {
             // rather than regressing it to 0.
             lifecycle_applied_watermark: AtomicU64::new(lifecycle_max_seq),
             lifecycle_journal,
+            pending_sync_tasks: Mutex::new(Vec::new()),
         };
         // Stamp `slot_max_lsn(open_txg)` with the post-replay
         // `last_applied`. `apply_replay_batch` and `apply_op_bare` fold
@@ -1153,14 +1186,16 @@ fn apply_lifecycle_record_replay(
                 )?;
             }
         }
-        // `TakeSnapshot` is still manifest-only in Phase D — no
-        // journal entry today. A record on disk indicates the
-        // on-disk schema has moved ahead of this binary; surface
-        // it as corruption rather than silently misapplying.
+        // `take_snapshot` is manifest-only (ZFS `dsl_sync_task` port folds
+        // the snapshot-root incref INSIDE the take's own sync cycle, atomic
+        // with the manifest commit — no lifecycle-journal record). A
+        // `TakeSnapshot` record on disk therefore indicates the on-disk
+        // schema has moved ahead of this binary; surface it as corruption
+        // rather than silently misapplying.
         LifecycleOp::TakeSnapshot { .. } => {
             return Err(MetaDbError::Corruption(format!(
                 "lifecycle replay: TakeSnapshot (tag 0x{:02x}) is not \
-                 yet routed through the lifecycle journal",
+                 routed through the lifecycle journal",
                 op.tag(),
             )));
         }

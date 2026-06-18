@@ -305,7 +305,31 @@ impl PagedRefcountArray {
         deltas: Vec<(Pba, Pending)>,
         force: bool,
     ) -> Result<StagedDeltas> {
-        if deltas.is_empty() {
+        self.stage_deltas_in_memory_with_force_increfs(deltas, force, &[])
+    }
+
+    /// Like [`Self::stage_deltas_in_memory`] but additionally applies a set
+    /// of **force-increfs** — an unconditional `+1` to each `force_increfs`
+    /// pba that (a) ALWAYS applies (never gated by the per-page replay-skip)
+    /// and (b) contributes NOTHING to the page generation. This is the ZFS
+    /// `dsl_sync_task` snapshot-root incref folded INSIDE the sync cycle
+    /// (the page-rc analogue of lite's out-of-cycle force-fold): it must
+    /// land even when its natural lsn `<=` the page generation (the
+    /// snapshot-take TXG often has no commits of its own), and it must NOT
+    /// raise the generation — bumping it to a value above a future COW
+    /// delta on a SIBLING pid sharing the data page would mis-skip that
+    /// sibling's fold → child premature-free (the "bone"). A force-incref
+    /// is +1 only, so it never underflows; its idempotency across the
+    /// cycle's abort-retry rides the same publish/clear + abort_staged
+    /// machinery as the normal slot deltas (the caller recomputes the
+    /// incref set from the queued snapshot task each cycle attempt).
+    pub fn stage_deltas_in_memory_with_force_increfs(
+        &self,
+        deltas: Vec<(Pba, Pending)>,
+        force: bool,
+        force_increfs: &[Pba],
+    ) -> Result<StagedDeltas> {
+        if deltas.is_empty() && force_increfs.is_empty() {
             return Ok(StagedDeltas {
                 pages: Vec::new(),
                 max_lsn: 0,
@@ -317,11 +341,28 @@ impl PagedRefcountArray {
             let (page_idx, slot) = page_offset(pba);
             by_page.entry(page_idx).or_default().push((slot, pending));
         }
+        // Force-increfs grouped by data page. A page may appear in both maps
+        // (a snapshot root that also took a COW delta this cycle) or only
+        // here (an unmodified shared root) — the union is walked below.
+        let mut force_by_page: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &pba in force_increfs {
+            let (page_idx, slot) = page_offset(pba);
+            force_by_page.entry(page_idx).or_default().push(slot);
+        }
 
-        let mut pages = Vec::with_capacity(by_page.len());
         let mut max_lsn: Lsn = 0;
-        for (page_idx, slot_pendings) in by_page {
-            let staged = self.stage_one_page(page_idx, slot_pendings, force)?;
+        let mut pages = Vec::with_capacity(by_page.len() + force_by_page.len());
+        let mut seen_pages = std::collections::HashSet::new();
+        let page_idxs: Vec<usize> = by_page
+            .keys()
+            .chain(force_by_page.keys())
+            .copied()
+            .filter(|idx| seen_pages.insert(*idx))
+            .collect();
+        for page_idx in page_idxs {
+            let slot_pendings = by_page.remove(&page_idx).unwrap_or_default();
+            let force_slots = force_by_page.remove(&page_idx).unwrap_or_default();
+            let staged = self.stage_one_page(page_idx, slot_pendings, force, &force_slots)?;
             let page_gen = staged.sealed.header()?.generation;
             if page_gen > max_lsn {
                 max_lsn = page_gen;
@@ -336,6 +377,7 @@ impl PagedRefcountArray {
         page_idx: usize,
         slot_pendings: Vec<(usize, Pending)>,
         force: bool,
+        force_incref_slots: &[usize],
     ) -> Result<StagedPage> {
         // Resolve / allocate the page id under inner; drop inner before
         // touching the cache so concurrent reads on other pages don't
@@ -423,6 +465,19 @@ impl PagedRefcountArray {
             if pending.last_lsn > max_lsn {
                 max_lsn = pending.last_lsn;
             }
+        }
+
+        // Force-increfs: unconditional `+1`, applied AFTER the normal slot
+        // deltas (so a root that also took a COW delta this cycle sees both)
+        // and deliberately NOT folded into `max_lsn` — the snapshot-root
+        // incref must not raise this data page's generation (siblings sharing
+        // the page would then mis-skip their own folds; see
+        // `stage_deltas_in_memory_with_force_increfs`). No replay-skip (the
+        // incref always lands) and no underflow possible.
+        for &slot in force_incref_slots {
+            let prev = read_entry(&page, slot);
+            let (new, _) = super::apply_delta_or_skip(prev, 1, prev.birth_lsn)?;
+            write_entry(&mut page, slot, new);
         }
 
         let mut header = page.header()?;

@@ -484,6 +484,39 @@ impl Manifest {
         Ok(())
     }
 
+    /// The durable **frontier**: the MAX of every per-shard `durable_seq`
+    /// (refcount + L2P-page-rc + every volume's L2P shards) — the symmetric
+    /// counterpart of [`Self::assert_durable_seq_invariant`]'s `min` walk
+    /// (which is `checkpoint_lsn`, the recovery floor). Returns 0 for an
+    /// empty manifest.
+    ///
+    /// Recovery uses this to resume the new-op LSN allocator above EVERY
+    /// durable page generation. `checkpoint_lsn = min(durable_seq)` can sit
+    /// far below an active shard's `durable_seq` when buffer shards are
+    /// uneven/uncompacted (buffer mode), yet that active shard holds durable
+    /// array/tree pages whose `generation == its durable_seq`. Resuming the
+    /// allocator at `checkpoint_lsn + 1` would hand out LSNs *below* those
+    /// generations, so a fresh op's stage-time replay-skip (`page_lsn >=
+    /// lsn`) would wrongly drop it. A page is only durable in the same fold
+    /// cycle that advances its shard's `durable_seq` to `wal_checkpoint >=
+    /// page.generation`, so `max(durable_seq) >=` every durable page
+    /// generation: resuming above it is collision-free.
+    pub(crate) fn max_durable_seq(&self) -> Lsn {
+        let mut max_seen: Lsn = 0;
+        for &v in self.refcount_durable_seq.iter() {
+            max_seen = max_seen.max(v);
+        }
+        for &v in self.l2p_page_rc_durable_seq.iter() {
+            max_seen = max_seen.max(v);
+        }
+        for vol in &self.volumes {
+            for &v in vol.l2p_shard_durable_seq.iter() {
+                max_seen = max_seen.max(v);
+            }
+        }
+        max_seen
+    }
+
     fn encode(&self, page: &mut Page) -> Result<()> {
         self.assert_durable_seq_invariant()?;
         let refcount_shard_count = self.refcount_shard_roots.len();

@@ -402,6 +402,54 @@ pub struct Db {
     /// record per fsync. WAL mode leaves the field `None` and the
     /// existing `submit_wal_ops` path is unchanged.
     pub(crate) lifecycle_journal: Option<Mutex<crate::lifecycle_log::LifecycleJournal>>,
+    /// ZFS `dsl_sync_task` port: snapshot-lifecycle ops that ride the TXG
+    /// sync cycle instead of blocking the write path. `take_snapshot`
+    /// pushes a [`PendingSyncTask`] here under a `txg.enter()` guard,
+    /// forces the open TXG to sync, and blocks on `wait_until_synced`;
+    /// [`Db::drain_pending_sync_tasks`] (called from
+    /// [`Db::run_sync_cycle_body`]'s manifest window) does the real work
+    /// in syncing context — durable atomically with that TXG's manifest
+    /// commit — and fills each task's `result` slot. Writers join the
+    /// next open TXG and never block on the snapshot.
+    pub(crate) pending_sync_tasks: Mutex<Vec<PendingSyncTask>>,
+}
+
+/// A snapshot-lifecycle op queued to ride the TXG sync cycle (see
+/// [`Db::pending_sync_tasks`]). Stage 1 carries only `TakeSnapshot`;
+/// Stage 2/3 extend [`SyncTaskOp`] with drop / clone.
+///
+/// The take is **manifest-only**: the sync cycle folds the snapshot-root
+/// incref into its OWN page-rc checkpoint, atomic with the manifest
+/// commit that records the `SnapshotEntry` (no lifecycle-journal record).
+/// The two `Option` fields below make the cycle's in-place abort-retry
+/// idempotent across the cycle's phases.
+pub(crate) struct PendingSyncTask {
+    pub(crate) op: SyncTaskOp,
+    /// Open TXG at enqueue time. The cycle processes the task only when
+    /// it is syncing exactly this TXG, so the forced sync the caller
+    /// triggered is the one that runs it.
+    pub(crate) target_txg: crate::types::Txg,
+    /// Outcome, filled by the cycle. The caller reads it after
+    /// `wait_until_synced` (threads-on) or after driving the inline
+    /// `flush_with_gate(Forced)` (threads-off) returns. No condvar: the
+    /// TXG-sync completion the caller already waits on happens-after the
+    /// cycle fills this.
+    pub(crate) result: Arc<Mutex<Option<Result<SnapshotId>>>>,
+    /// `Some` once the cycle has assigned the id + written the SnapshotRoots
+    /// page + built the `SnapshotEntry` (done once, the first attempt). It
+    /// carries the exact entry to insert into the committed manifest (A4)
+    /// and the stable snapshot-root set the force-incref is recomputed from
+    /// on every cycle attempt. The take is manifest-only; the path-B
+    /// force-incref needs no reserved lsn.
+    pub(crate) committed_entry: Option<SnapshotEntry>,
+}
+
+/// The operation a [`PendingSyncTask`] carries.
+pub(crate) enum SyncTaskOp {
+    /// Take a snapshot of `vol_ord`. The cycle assigns the id (returned
+    /// via the task `result`), captures the volume's just-flushed roots,
+    /// and rides the incref on a `LifecycleOp::TakeSnapshot` record.
+    TakeSnapshot { vol_ord: VolumeOrdinal },
 }
 
 /// Synchronous callback invoked with the freed-PBA set produced by a

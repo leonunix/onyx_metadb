@@ -9,184 +9,94 @@ impl Db {
     // -------- snapshot operations -----------------------------------------
 
     /// Take a snapshot of volume `vol_ord`'s L2P state. Returns the new
-    /// snapshot id. Persisted immediately via a manifest commit. Unknown
-    /// volume ordinals surface as `InvalidArgument`.
+    /// snapshot id. Unknown volume ordinals surface as `InvalidArgument`.
     ///
     /// Refcount state is global (Phase 6.5b retired per-snapshot refcount
     /// roots), so the snapshot only captures the target volume's L2P
-    /// shard roots + an incref on each of them so the snapshot's view
-    /// outlives subsequent COW writes on the target volume.
+    /// shard roots + an incref on each so the snapshot's view outlives
+    /// subsequent COW writes on the target volume.
     ///
-    /// Serialisation:
-    /// - `drop_gate.write()` — blocks `commit_ops` / `stage_ops`, so no
-    ///   new L2P buffer entries or page-rc deltas form while we sample
-    ///   roots and incref them. Combined with `apply_gate.write()` below
-    ///   it also freezes `last_applied_lsn`, so the `created_lsn` sample
-    ///   is stable.
-    /// - `apply_gate.write()` — drains in-flight laned applies and
-    ///   serialises our manifest commit against
-    ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
-    ///
-    /// Phase B (A3 follow-up): the **forced TXG sync** that used to run
-    /// before `apply_gate.write()` is GONE. It existed only to drain
-    /// in-flight flush IO so the snapshot-root incref could not be
-    /// clobbered — whole-page flush writes (`write_sealed_page_runs`)
-    /// bypassed the per-pid `rc_locks` that the old header-rc RMW took.
-    /// A3 moved the page refcount into the [`L2pPageRc`](crate::l2p_page_rc)
-    /// array; `incref_root_for_snapshot` now `stage`s a sharded delta
-    /// (clobber-free) and the page bytes are untouched. The snapshot is
-    /// still made durable here by the targeted shard flush +
-    /// `l2p_page_rc.flush()` + manifest commit below — not by the forced
-    /// sync. Dropping it also removes the deadlock the old ordering
-    /// avoided (we no longer wait on the sync thread while holding
-    /// `apply_gate.write`), so `apply_gate.write()` is now taken directly.
+    /// ZFS `dsl_sync_task` port: this does NOT block the write path. It
+    /// enqueues a [`SyncTaskOp::TakeSnapshot`] task against the current
+    /// open TXG (under a `txg.enter()` guard so the TXG can't promote to
+    /// syncing before the task is queued), forces that TXG to sync, and
+    /// blocks for exactly that one TXG. The sync cycle does the real work
+    /// in syncing context ([`Db::stage_pending_snapshots`]): it captures
+    /// the roots it is flushing this cycle, journals a
+    /// `LifecycleOp::TakeSnapshot` (which mints a strictly-monotone lsn
+    /// for the gen-idempotent root incref + makes the op crash-replayable),
+    /// stages the incref into the open TXG slot, and inserts the
+    /// `SnapshotEntry` — all durable atomically with that TXG's manifest
+    /// commit (= ZFS uberblock). Foreground writers join the next open TXG
+    /// and never block. The outcome (id or error) comes back through the
+    /// task's result slot.
     pub fn take_snapshot(&self, vol_ord: VolumeOrdinal) -> Result<SnapshotId> {
-        // Exclude commits so no new L2P buffer entries or page-rc deltas
-        // form while we sample roots and `incref_root_for_snapshot` them.
-        let _drop_guard = self.drop_gate.write();
-        let _apply_guard = self.apply_gate.write();
-        // Resolve the target volume before touching manifest state so an
-        // unknown ordinal short-circuits with a clean `InvalidArgument`.
-        let target = self.volume(vol_ord)?;
-        // Fold every L2P buffer slot into the trees so the root sample
-        // below observes all applied ops. With the forced sync gone this
-        // is now LOAD-BEARING (not the old defensive no-op): in buffer
-        // mode the `stage_ops` hot path defers the tree fold, and only
-        // this drain (under `drop_gate.write`, which keeps the slots from
-        // refilling) brings `tree.root()` up to `last_applied_lsn`. No-op
-        // when the buffer is disabled.
-        self.force_compact_l2p_buffers()?;
-        let mut manifest_state = self.manifest_state.lock();
-        let volumes = self.volumes_snapshot();
-        let mut l2p_guards = lock_all_l2p_shards_for(&volumes);
+        // Validate the volume up front so an unknown ordinal short-circuits
+        // with a clean `InvalidArgument` before anything is queued.
+        let _ = self.volume(vol_ord)?;
 
-        // Locate the contiguous range of `l2p_guards` that belongs to
-        // `target`. `lock_all_l2p_shards_for` iterates `volumes` in
-        // ordinal order, so we walk preceding volumes and sum their
-        // shard counts.
-        let mut target_start = 0usize;
-        for vol in &volumes {
-            if vol.ord == vol_ord {
-                break;
+        // Enqueue the snapshot as a TXG sync task and force the open TXG to
+        // sync. The actual work — capture the volume's just-flushed roots,
+        // journal a `LifecycleOp::TakeSnapshot`, stage the per-root incref,
+        // and insert the `SnapshotEntry` — runs in syncing context
+        // ([`Db::stage_pending_snapshots`]), durable atomically with that
+        // TXG's manifest commit. Foreground writers join the NEXT open TXG
+        // and never block on us (no `drop_gate.write`, no synchronous
+        // all-shard flush).
+        let result: Arc<Mutex<Option<Result<SnapshotId>>>> = Arc::new(Mutex::new(None));
+        let target = {
+            // Hold `txg.enter()` across the push so the open TXG cannot
+            // promote-to-syncing before our task is queued; otherwise the
+            // cycle that syncs `target` could miss it (the enqueue/roll
+            // race). Dropping the guard before forcing the sync below
+            // avoids the reverse wait (sync waits for the guard).
+            let guard = self.txg.enter();
+            let target = guard.txg();
+            self.pending_sync_tasks.lock().push(PendingSyncTask {
+                op: SyncTaskOp::TakeSnapshot { vol_ord },
+                target_txg: target,
+                result: result.clone(),
+                committed_entry: None,
+            });
+            target
+        };
+
+        // Drive `target` to sync and block until it is durable.
+        if self.txg_threads_enabled {
+            self.txg_quiesce_notifier.signal_force(target);
+            self.txg.wait_until_synced(target);
+        } else if let Err(err) = self.flush_with_gate(crate::metrics::FlushKind::Forced) {
+            // Threads-off: we drove the cycle inline and it failed. Remove
+            // our orphaned task so a later flush doesn't resurrect it, then
+            // surface the error.
+            self.remove_pending_sync_task(&result);
+            return Err(err);
+        }
+
+        // The cycle filled the result before advancing `checkpoint_txg`
+        // (threads-on) / returning (threads-off), so it is set now.
+        match result.lock().take() {
+            Some(outcome) => outcome,
+            None => {
+                // `target` synced without processing our task. The
+                // `txg.enter()` guard makes this unreachable in normal
+                // operation (the task is always queued before `target`
+                // promotes-to-syncing); treat it defensively.
+                self.remove_pending_sync_task(&result);
+                Err(MetaDbError::Corruption(
+                    "take_snapshot: sync cycle completed without processing the queued task".into(),
+                ))
             }
-            target_start += vol.shards.len();
         }
-        let target_end = target_start + target.shards.len();
+    }
 
-        let id = manifest_state.manifest.next_snapshot_id;
-        let next_snapshot_id = id
-            .checked_add(1)
-            .ok_or_else(|| MetaDbError::Corruption("snapshot id overflow".into()))?;
-
-        // Sample roots without incref'ing. The actual incref lands only
-        // after the projected manifest passes a dry-run encode below —
-        // see commit-ordering rationale on the pre-check.
-        //
-        // Phase 6.5b: refcount is a running tally, not point-in-time
-        // state. Snapshots only capture L2P; refcount stays unsampled.
-        let l2p_roots: Vec<PageId> = l2p_guards[target_start..target_end]
-            .iter()
-            .map(|tree| tree.root())
-            .collect();
-        // `created_lsn` is the WAL lsn of the most recently applied op
-        // at snap time. Birth/death LSN suppression compares
-        // `pba.birth_lsn` (also WAL lsn) against this value, so both
-        // sides must live in the same monotonic space. Held under
-        // apply_gate.write so no concurrent commit advances
-        // `last_applied_lsn` mid-sample.
-        let created_lsn = *self.last_applied_lsn.lock();
-
-        // Bring the manifest up to the version we intend to commit,
-        // minus the new snapshot entry. Running prepare/refresh first
-        // means the capacity pre-check below sees the exact dedup /
-        // volume layout `encode()` will see at commit time.
-        let dedup_update =
-            self.prepare_dedup_manifest_update(&mut manifest_state.manifest, created_lsn)?;
-        // Per-shard durable_seq must match the about-to-be-committed
-        // `checkpoint_lsn = last_applied_lsn` (`created_lsn` here) so
-        // the encode-time invariant `min(durable_seq[]) == checkpoint_lsn`
-        // holds for both the probe encode below and the real commit.
-        self.refresh_manifest_from_locked(
-            &mut manifest_state.manifest,
-            &volumes,
-            &l2p_guards,
-            Some(created_lsn),
-        )?;
-
-        // Pre-check: does the projected manifest (with the new snapshot
-        // entry appended) still fit in one page? Failures after this
-        // point would persist shard-root refcount bumps without a
-        // matching snapshot entry — offline verify then reports
-        // orphan rc. Why: `manifest_state.store.commit(...)` below calls
-        // `Manifest::encode`, which rejects a too-full snapshot table
-        // with `InvalidArgument`. Running the same encode against a
-        // probe page here turns that failure into a clean early return
-        // before any irreversible side effect (incref / page write /
-        // shard flush). Use a non-NULL placeholder for `l2p_roots_page`
-        // — encode only rejects `NULL_PAGE`, any other value passes.
-        {
-            let mut probe = manifest_state.manifest.clone();
-            probe.checkpoint_lsn = *self.last_applied_lsn.lock();
-            probe.snapshots.push(SnapshotEntry {
-                id,
-                vol_ord,
-                l2p_roots_page: FIRST_DATA_PAGE,
-                created_lsn,
-                l2p_shard_roots: l2p_roots.clone().into_boxed_slice(),
-            });
-            probe.next_snapshot_id = next_snapshot_id;
-            probe.check_encodable()?;
-        }
-
-        // Pre-check passed; safe to make irreversible changes.
-        let l2p_roots_page = write_snapshot_roots_page(&self.page_store, &l2p_roots, created_lsn)?;
-        for tree in &mut l2p_guards[target_start..target_end] {
-            // A3 cutover: the snapshot root incref now stages into the
-            // page-rc array (non-WAL → `stage_unskippable`, stamped with
-            // `created_lsn` so the fold applies it). `flush()` below folds
-            // it durably before the snapshot's manifest commit.
-            tree.incref_root_for_snapshot(self.txg.open_txg(), created_lsn)?;
-        }
-        flush_locked_l2p_shards(&mut l2p_guards)?;
-        self.flush_all_refcount_shards()?;
-        // A3: fold the page-rc array so the just-staged root increfs are
-        // durable before the manifest commit below records
-        // `l2p_page_rc_durable_seq = created_lsn`. The snapshot take is
-        // manifest-only (not WAL-replayed), so the incref MUST be on disk.
-        self.l2p_page_rc.flush()?;
-
-        manifest_state.manifest.checkpoint_lsn = *self.last_applied_lsn.lock();
-        // Phase B: with no forced TXG sync ahead of us, this manifest is
-        // the checkpoint that makes the flushes above durable — so it must
-        // also advance the lifecycle/buffer replay watermarks (else
-        // recovery re-replays already-folded lifecycle ops; see
-        // `stamp_replay_watermarks`). Held under `apply_gate.write`.
-        self.stamp_replay_watermarks(&mut manifest_state.manifest);
-        let snap_roots: Box<[PageId]> = l2p_roots.into_boxed_slice();
-        manifest_state.manifest.snapshots.push(SnapshotEntry {
-            id,
-            vol_ord,
-            l2p_roots_page,
-            created_lsn,
-            l2p_shard_roots: snap_roots.clone(),
-        });
-        manifest_state.manifest.next_snapshot_id = next_snapshot_id;
-        let manifest = manifest_state.manifest.clone();
-        manifest_state.store.commit(&manifest)?;
-        commit_l2p_checkpoint(&mut l2p_guards, created_lsn)?;
-        commit_refcount_checkpoint(&self.refcount_shards, created_lsn)?;
-        self.finish_dedup_manifest_update(dedup_update, created_lsn)?;
-        // Append the new snap to the per-volume cache. Inline update —
-        // manifest_state is still held above, and `recompute_snap_info`
-        // would re-lock.
-        {
-            let mut cache = self.snap_info_cache.lock();
-            cache.entry(vol_ord).or_default().push(SnapInfo {
-                created_lsn,
-                l2p_shard_roots: snap_roots,
-            });
-        }
-        Ok(id)
+    /// Remove a still-queued sync task (matched by result-`Arc` identity).
+    /// Used by the threads-off `take_snapshot` error path to drop a task
+    /// whose inline cycle failed before processing it.
+    fn remove_pending_sync_task(&self, result: &Arc<Mutex<Option<Result<SnapshotId>>>>) {
+        self.pending_sync_tasks
+            .lock()
+            .retain(|t| !Arc::ptr_eq(&t.result, result));
     }
 
     /// Open a read-only view of the data as it existed when `id` was taken.
@@ -664,6 +574,146 @@ impl Db {
             pages_freed,
             freed_pbas,
         }))
+    }
+
+    /// ZFS `dsl_sync_task` (path B) — called AFTER the L2P `begin_checkpoint`
+    /// loop (tree guards released) and BEFORE the page-rc `begin_checkpoint`.
+    /// For each queued [`SyncTaskOp::TakeSnapshot`] targeting `txg`:
+    /// capacity-probe + assign id + write its SnapshotRoots page + build the
+    /// `SnapshotEntry` (into `committed_entry`) the FIRST time it is seen;
+    /// then, every attempt, collect its root pids grouped by page-rc shard.
+    /// Returns that per-page-rc-shard set of pids to FORCE-incref this cycle
+    /// (see [`crate::refcount::RcShard::begin_checkpoint_with_increfs`]).
+    ///
+    /// The force-incref always applies and never bumps a page generation,
+    /// so it needs NO reserved lsn. Idempotency across the cycle's
+    /// abort-retry rides the page-rc checkpoint rollback: an aborted cycle
+    /// rolls back the fold (nothing durable), and the NEXT attempt
+    /// RECOMPUTES the increfs here — so the pids are collected every call,
+    /// even when `committed_entry` is already set (the entry/probe/roots-page
+    /// are done once; only the fold repeats). The take is manifest-only
+    /// (no lifecycle journal), so a crash before the manifest commit simply
+    /// loses the (never-committed) snapshot.
+    pub(crate) fn stage_pending_snapshot_increfs(
+        &self,
+        txg: crate::types::Txg,
+        snapshot_roots: &std::collections::HashMap<VolumeOrdinal, Vec<PageId>>,
+    ) -> Result<Vec<Vec<Pba>>> {
+        let mut force_increfs: Vec<Vec<Pba>> =
+            (0..self.l2p_page_rc.shard_count()).map(|_| Vec::new()).collect();
+        let mut tasks = self.pending_sync_tasks.lock();
+        for task in tasks.iter_mut().filter(|t| t.target_txg == txg) {
+            // Roots: reuse the already-built entry's on a retry (stable
+            // snapshot definition); otherwise process the task fresh.
+            let roots: Vec<PageId> = if let Some(entry) = &task.committed_entry {
+                entry.l2p_shard_roots.to_vec()
+            } else {
+                let SyncTaskOp::TakeSnapshot { vol_ord } = &task.op;
+                let vol_ord = *vol_ord;
+                let roots = snapshot_roots.get(&vol_ord).cloned().unwrap_or_default();
+                if roots.is_empty() {
+                    // Force-selected volume must have captured roots; empty ⇒
+                    // it vanished / had no shards — reject before side effects.
+                    *task.result.lock() = Some(Err(MetaDbError::InvalidArgument(format!(
+                        "take_snapshot: no roots captured for volume ordinal {vol_ord}"
+                    ))));
+                    continue;
+                }
+                // `created_lsn` = the most recently applied op's lsn (a safe
+                // UPPER bound on the captured roots' content for birth/death
+                // suppression + lineage). Same monotone space as lite's
+                // `*last_applied_lsn.lock()`.
+                let created_lsn = *self.last_applied_lsn.lock();
+                // Assign the id + capacity-probe under `manifest_state`.
+                let id = {
+                    let mut ms = self.manifest_state.lock();
+                    let id = ms.manifest.next_snapshot_id;
+                    let mut probe = ms.manifest.clone();
+                    probe.snapshots.push(SnapshotEntry {
+                        id,
+                        vol_ord,
+                        l2p_roots_page: FIRST_DATA_PAGE,
+                        created_lsn,
+                        l2p_shard_roots: roots.clone().into_boxed_slice(),
+                    });
+                    probe.next_snapshot_id = id.saturating_add(1);
+                    if let Err(e) = probe.check_encodable() {
+                        *task.result.lock() = Some(Err(e));
+                        continue;
+                    }
+                    ms.manifest.next_snapshot_id = id.saturating_add(1);
+                    id
+                };
+                // Roots are durable: this cycle's IO phase writes + syncs the
+                // sealed L2P pages before the manifest commit.
+                let l2p_roots_page =
+                    write_snapshot_roots_page(&self.page_store, &roots, created_lsn)?;
+                task.committed_entry = Some(SnapshotEntry {
+                    id,
+                    vol_ord,
+                    l2p_roots_page,
+                    created_lsn,
+                    l2p_shard_roots: roots.clone().into_boxed_slice(),
+                });
+                roots
+            };
+            // Collect the force-increfs (every attempt — see the doc).
+            for &root in &roots {
+                if root != crate::types::NULL_PAGE {
+                    force_increfs[self.l2p_page_rc.shard_for(root)].push(root);
+                }
+            }
+        }
+        Ok(force_increfs)
+    }
+
+    /// ZFS `dsl_sync_task` — phase A4, called in
+    /// [`Db::run_sync_cycle_body`]'s manifest window (under
+    /// `apply_gate.write()` + `manifest_state.lock()`). Insert each
+    /// processed take's `SnapshotEntry` into the manifest about to be
+    /// committed, so it lands atomically with the page-rc fold (A3) that
+    /// made the incref durable. Id-idempotent on the cycle's abort-retry.
+    pub(crate) fn add_pending_snapshot_entries(
+        &self,
+        manifest: &mut crate::manifest::Manifest,
+        txg: crate::types::Txg,
+    ) {
+        let tasks = self.pending_sync_tasks.lock();
+        for task in tasks.iter().filter(|t| t.target_txg == txg) {
+            if let Some(entry) = &task.committed_entry {
+                if !manifest.snapshots.iter().any(|s| s.id == entry.id) {
+                    let next = entry.id.saturating_add(1);
+                    manifest.snapshots.push(entry.clone());
+                    manifest.next_snapshot_id = manifest.next_snapshot_id.max(next);
+                }
+            }
+        }
+    }
+
+    /// ZFS `dsl_sync_task` — post-commit. The manifest with the
+    /// new `SnapshotEntry`s is durable, so report `Ok(id)` to each queued
+    /// `take_snapshot` caller, warm the per-volume `SnapInfo` cache, and
+    /// dequeue. Capacity-rejected tasks (`result` already `Err`) are
+    /// dequeued too. Needs neither `apply_gate` nor `manifest_state`.
+    pub(crate) fn finish_pending_snapshots(&self, txg: crate::types::Txg) {
+        let mut cache = self.snap_info_cache.lock();
+        let mut tasks = self.pending_sync_tasks.lock();
+        tasks.retain(|t| {
+            if t.target_txg != txg {
+                return true;
+            }
+            if let Some(entry) = &t.committed_entry {
+                cache.entry(entry.vol_ord).or_default().push(SnapInfo {
+                    created_lsn: entry.created_lsn,
+                    l2p_shard_roots: entry.l2p_shard_roots.clone(),
+                });
+                *t.result.lock() = Some(Ok(entry.id));
+                return false;
+            }
+            // Capacity-rejected (result already Err) → dequeue. Anything
+            // else (unprocessed) stays queued for a later cycle.
+            t.result.lock().is_none()
+        });
     }
 }
 

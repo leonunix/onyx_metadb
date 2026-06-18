@@ -416,6 +416,60 @@ fn create_volume_root_page_rc_survives_reopen() {
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
 
+// ZFS `dsl_sync_task` port regression: `take_snapshot` stages the
+// snapshot-root incref into the OPEN TXG, so it folds in a LATER sync
+// cycle — NOT the take's own cycle. If the process closes right after
+// `take_snapshot` (before that fold), the incref is durable ONLY via the
+// journaled `LifecycleOp::TakeSnapshot` record + replay. A reopen MUST
+// re-apply it — and must do so even though the snapshot entry is already
+// in the committed manifest (the take cycle committed the entry before
+// the incref folded). The first cut gated the replay incref on
+// "entry not yet present", so it was skipped: the root page reopened at
+// rc=1 (volume only), the next overwrite's COW treated it as exclusive
+// and FREED it, and a subsequent `write_snapshot_roots_page` reused the
+// pid → "page N has unexpected type SnapshotRoots in paged tree walk".
+#[test]
+fn take_snapshot_incref_survives_close_before_fold() {
+    let dir = TempDir::new().unwrap();
+    {
+        let mut cfg = Config::new(dir.path());
+        cfg.l2p_buffer_enabled = true;
+        let db = Db::create_with_config(cfg).unwrap();
+        for i in 0..256u64 {
+            db.insert(0, i, v((i / 32) as u8)).unwrap();
+        }
+        db.flush().unwrap();
+        let _s = db.take_snapshot(0).unwrap();
+        // Deliberately NO flush after take → the incref is staged in the
+        // open TXG, never folded. Closing here is the crash-equivalent.
+        drop(db);
+    }
+    // Reopen: lifecycle replay must restore the incref BEFORE the writes
+    // below COW the shared root. Take a second snapshot too, so a reused
+    // root pid would be caught as a SnapshotRoots-page aliasing.
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0..256u64 {
+        db.insert(0, i, v((i / 32 + 1) as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let _s2 = db.take_snapshot(0).unwrap();
+    for i in 0..256u64 {
+        db.insert(0, i, v((i / 32 + 2) as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    drop(db);
+
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0..256u64 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v((i / 32 + 2) as u8)), "reopen lba {i}");
+    }
+    drop(db);
+    let report =
+        crate::verify::verify_path(dir.path(), crate::verify::VerifyOptions { strict: true })
+            .unwrap();
+    assert!(report.is_clean(), "verify issues: {:?}", report.issues);
+}
+
 // Concurrent version — this is the shape the nvme-box soak actually ran
 // (writers hammering the volume while snapshots are taken/dropped). The
 // serial test above proved quiesced A3 is correct; the soak's

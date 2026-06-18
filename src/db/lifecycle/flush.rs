@@ -96,7 +96,20 @@ impl Db {
     /// full-sample selection, preserving the pre-partial behaviour.
     /// `force_all = true` (forced flush / snapshot / shutdown drain)
     /// also returns a full selection regardless of budget.
-    fn select_shards_for_flush(&self, volumes: &[Arc<Volume>], force_all: bool) -> SelectedShards {
+    ///
+    /// `force_volume_ords` (ZFS `dsl_sync_task` port, subtlety #2): every
+    /// volume whose ordinal is in this set gets ALL its L2P shards
+    /// selected unconditionally, on every path. A pending `take_snapshot`
+    /// task needs the target volume's roots flushed durable THIS cycle so
+    /// the committed `SnapshotEntry` references on-disk pages — and the
+    /// cycle that drains the task is not guaranteed to be `Forced` (a
+    /// racing `Steady` `try_flush` could roll+sync the task's TXG first).
+    fn select_shards_for_flush(
+        &self,
+        volumes: &[Arc<Volume>],
+        force_all: bool,
+        force_volume_ords: &std::collections::HashSet<VolumeOrdinal>,
+    ) -> SelectedShards {
         use std::sync::atomic::Ordering;
         let mut l2p: Vec<Vec<bool>> = volumes
             .iter()
@@ -115,6 +128,24 @@ impl Db {
             }
             return SelectedShards { l2p, rc };
         }
+
+        // Force-select the L2P shards of every volume with a pending
+        // sync task this round (roots must be flushed durable before the
+        // manifest entry references them). RC shards are NOT forced: the
+        // snapshot incref stages into the OPEN TXG slot and folds in a
+        // future cycle, so it does not need this cycle's rc fold.
+        let force_l2p = |l2p: &mut Vec<Vec<bool>>| {
+            if force_volume_ords.is_empty() {
+                return;
+            }
+            for (v_idx, vol) in volumes.iter().enumerate() {
+                if force_volume_ords.contains(&vol.ord) {
+                    for slot in l2p[v_idx].iter_mut() {
+                        *slot = true;
+                    }
+                }
+            }
+        };
 
         // Build a single flat round-robin order across (kind, volume,
         // shard_idx). Each entry carries the dirty-work estimate so a
@@ -141,6 +172,7 @@ impl Db {
         }
 
         if order.is_empty() {
+            force_l2p(&mut l2p);
             return SelectedShards { l2p, rc };
         }
 
@@ -179,6 +211,7 @@ impl Db {
         // no-op flush (still bumps `last_applied_lsn` checkpoint via
         // the global min, which is a no-op when nothing changed).
 
+        force_l2p(&mut l2p);
         SelectedShards { l2p, rc }
     }
 
@@ -471,13 +504,37 @@ impl Db {
         // (see Cut 2 below). The `compute_min_last_flushed_lsn_after`
         // projection still uses `max(wal_checkpoint, prev)` per shard
         // as defense-in-depth.
+        //
+        // ZFS `dsl_sync_task` (path B): the snapshot-root incref is a
+        // FORCE-incref folded into this cycle's page-rc checkpoint (see the
+        // page-rc loop below) — it always applies and never bumps a page
+        // generation, so it needs NO reserved lsn (no `lsn_alloc` reserve,
+        // no `finish_global_apply` hole, no dependence on `wal_checkpoint`).
         let wal_checkpoint = self.txg.slot_max_lsn(txg);
         let volumes = self.volumes_snapshot();
+        // ZFS `dsl_sync_task`: volumes with a `take_snapshot` task queued
+        // for THIS txg. Their L2P shards are force-selected below so the
+        // roots the snapshot entry will reference are flushed durable this
+        // cycle (the draining cycle is not guaranteed to be `Forced` — a
+        // racing `Steady` `try_flush` could roll+sync this txg first).
+        let snapshot_force_ords: std::collections::HashSet<VolumeOrdinal> = {
+            let tasks = self.pending_sync_tasks.lock();
+            tasks
+                .iter()
+                .filter(|t| t.target_txg == txg)
+                .map(|t| match &t.op {
+                    crate::db::SyncTaskOp::TakeSnapshot { vol_ord } => *vol_ord,
+                })
+                .collect()
+        };
         // Decide which shards this round samples. Forced flushes
         // (`flush()`, snapshot, shutdown) always select everything;
         // steady-state `try_flush()` honours the budget cap.
-        let selected = self
-            .select_shards_for_flush(&volumes, matches!(kind, crate::metrics::FlushKind::Forced));
+        let selected = self.select_shards_for_flush(
+            &volumes,
+            matches!(kind, crate::metrics::FlushKind::Forced),
+            &snapshot_force_ords,
+        );
         // Drain per-volume dead-list buffers. `DeadListState`'s internal
         // `Mutex<Vec<_>>` makes push/drain atomic. No sample-phase gate
         // holds new pushes back, so the `drain_up_to_lsn(wal_checkpoint)`
@@ -525,15 +582,27 @@ impl Db {
         // carries over and their `last_flushed_lsn` is unchanged.
         let mut l2p_checkpoints: Vec<Vec<Option<crate::paged::tree::Checkpoint>>> =
             Vec::with_capacity(volumes.len());
+        // ZFS `dsl_sync_task`: capture the per-shard roots of every
+        // snapshot-target volume, in shard order, under the same
+        // `tree.write()` this loop holds. These are exactly the roots this
+        // cycle flushes durable (the snapshot entry references them). The
+        // volume was force-selected, so every one of its shards yields a
+        // guard here.
+        let mut snapshot_roots: std::collections::HashMap<VolumeOrdinal, Vec<PageId>> =
+            std::collections::HashMap::new();
         let mut guard_iter = l2p_guards.drain(..);
         for (v_idx, volume) in volumes.iter().enumerate() {
             let mut per_volume: Vec<Option<crate::paged::tree::Checkpoint>> =
                 Vec::with_capacity(volume.shards.len());
+            let capture_roots = snapshot_force_ords.contains(&volume.ord);
             for s_idx in 0..volume.shards.len() {
                 if selected.l2p[v_idx][s_idx] {
                     let mut guard = guard_iter.next().expect(
                         "lock_selected_l2p_shards_for must hand out one guard per selected shard",
                     );
+                    if capture_roots {
+                        snapshot_roots.entry(volume.ord).or_default().push(guard.root());
+                    }
                     per_volume.push(Some(guard.begin_checkpoint()));
                 } else {
                     per_volume.push(None);
@@ -668,6 +737,26 @@ impl Db {
             return Err(err);
         }
 
+        // ZFS `dsl_sync_task` phase A3 (path B): process each pending
+        // `take_snapshot` — capacity-probe, write its SnapshotRoots page,
+        // build its `SnapshotEntry` — and return the per-page-rc-shard set
+        // of root pids to FORCE-incref. Runs AFTER the L2P/refcount sample
+        // (tree guards released, so the capacity probe can lock
+        // `manifest_state`) and BEFORE the page-rc `begin_checkpoint` below,
+        // so the increfs fold into THIS cycle's page-rc checkpoint — durable
+        // atomically with the manifest entry (added in A4). On error, roll
+        // back the L2P + refcount checkpoints (nothing page-rc folded yet).
+        let prc_force_increfs = match self.stage_pending_snapshot_increfs(txg, &snapshot_roots) {
+            Ok(v) => v,
+            Err(err) => {
+                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+                self.metrics
+                    .record_flush_total(kind, flush_started.elapsed());
+                return Err(err);
+            }
+        };
+
         // Snapshot-scaling Phase A2/A3: fold the L2P-page-rc shards on the
         // SAME TXG boundary as the PBA refcount shards, reusing
         // `selected.rc` (the two groups share a shard count). A3 made the
@@ -690,14 +779,21 @@ impl Db {
                 (0..self.l2p_page_rc.shard_count()).map(|_| None).collect();
             let mut prc_err: Option<MetaDbError> = None;
             for s_idx in 0..self.l2p_page_rc.shard_count() {
-                if !selected.rc[s_idx] {
+                let force_increfs = &prc_force_increfs[s_idx];
+                // Process a shard if it was selected for the normal fold OR
+                // it holds snapshot-root force-increfs this cycle (the roots
+                // must be incref'd durably even if the shard had no COW
+                // deltas — force-select it here so the incref isn't lost).
+                if !selected.rc[s_idx] && force_increfs.is_empty() {
                     continue;
                 }
                 let shard = self.l2p_page_rc.shard(s_idx);
                 let res = if txg_threads_enabled {
-                    shard.begin_checkpoint(txg)
+                    shard.begin_checkpoint_with_increfs(txg, force_increfs)
                 } else {
-                    shard.begin_checkpoint_all_slots(false)
+                    // threads-off inline flush folds every slot; the
+                    // force-increfs ride the same checkpoint.
+                    shard.begin_checkpoint_all_slots_with_increfs(false, force_increfs)
                 };
                 match res {
                     Ok(ckpt) if prc_err.is_none() => out[s_idx] = Some(ckpt),
@@ -1110,6 +1206,15 @@ impl Db {
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
+        // ZFS `dsl_sync_task` phase A4: insert each processed `take_snapshot`'s
+        // `SnapshotEntry` into the manifest about to be committed. The
+        // matching per-root incref was already staged + folded into THIS
+        // cycle's page-rc checkpoint (phase A3, before the page-rc
+        // `begin_checkpoint`), so the entry lands durable atomically with
+        // the incref + roots. Infallible (a pure push); id-idempotent on
+        // this body's abort-retry. The take is manifest-only — no lifecycle
+        // journal record, so `lifecycle_replay_seq` below is unaffected.
+        self.add_pending_snapshot_entries(&mut manifest_state.manifest, txg);
         // Compute the new global checkpoint_lsn as
         // `min(per-shard last_flushed_lsn)`, treating every shard
         // selected this round as if its atomic were already at
@@ -1290,6 +1395,12 @@ impl Db {
         // via apply lanes, reclaim, WAL prune) takes its own per-shard
         // locks and does not need the global gate.
         drop(apply_guard);
+
+        // ZFS `dsl_sync_task` drain (post-commit): the manifest (with the
+        // new `SnapshotEntry`s) is durable now, so report success to the
+        // queued `take_snapshot` callers, update the per-volume snap cache,
+        // and dequeue the tasks. Does not need `apply_gate` / `manifest_state`.
+        self.finish_pending_snapshots(txg);
 
         // Manifest is durable. Install refcount meta chains in memory
         // so subsequent `begin_checkpoint` sees the new chain when

@@ -369,7 +369,22 @@ impl RcShard {
     /// this TXG's deltas), so the flush's `wal_checkpoint.max(prev)`
     /// durable_seq is correct — no separate watermark to record.
     pub fn begin_checkpoint(&self, txg: Txg) -> Result<RcCheckpoint> {
-        self.checkpoint_slots(&[slot_index(txg)], false)
+        self.checkpoint_slots(&[slot_index(txg)], false, &[])
+    }
+
+    /// Like [`Self::begin_checkpoint`] but additionally force-increfs
+    /// `force_increfs` (an unconditional `+1` that always applies and does
+    /// NOT raise any data page's generation). Used by the L2P-page-rc fold
+    /// in the ZFS `dsl_sync_task` snapshot path: the snapshot-root incref
+    /// rides THIS cycle's page-rc checkpoint, durable atomically with the
+    /// manifest commit that records the `SnapshotEntry`. See
+    /// [`PagedRefcountArray::stage_deltas_in_memory_with_force_increfs`].
+    pub fn begin_checkpoint_with_increfs(
+        &self,
+        txg: Txg,
+        force_increfs: &[Pba],
+    ) -> Result<RcCheckpoint> {
+        self.checkpoint_slots(&[slot_index(txg)], false, force_increfs)
     }
 
     /// Fold every slot. Used by the threads-OFF inline flush and by
@@ -379,11 +394,29 @@ impl RcShard {
     /// path (see [`PagedRefcountArray::stage_deltas_in_memory_force`]);
     /// the hot run_sync_cycle drainer passes `false`.
     pub fn begin_checkpoint_all_slots(&self, force: bool) -> Result<RcCheckpoint> {
-        self.checkpoint_slots(&[0, 1, 2, 3], force)
+        self.checkpoint_slots(&[0, 1, 2, 3], force, &[])
     }
 
-    /// Shared fold body (publish-before-clear).
-    fn checkpoint_slots(&self, slots: &[usize], force: bool) -> Result<RcCheckpoint> {
+    /// All-slot fold (threads-OFF inline flush) that also force-increfs
+    /// `force_increfs` — the threads-off analogue of
+    /// [`Self::begin_checkpoint_with_increfs`].
+    pub fn begin_checkpoint_all_slots_with_increfs(
+        &self,
+        force: bool,
+        force_increfs: &[Pba],
+    ) -> Result<RcCheckpoint> {
+        self.checkpoint_slots(&[0, 1, 2, 3], force, force_increfs)
+    }
+
+    /// Shared fold body (publish-before-clear). `force_increfs` is the
+    /// unconditional-`+1` set (snapshot-root incref) folded alongside the
+    /// drained slot deltas — see [`Self::begin_checkpoint_with_increfs`].
+    fn checkpoint_slots(
+        &self,
+        slots: &[usize],
+        force: bool,
+        force_increfs: &[Pba],
+    ) -> Result<RcCheckpoint> {
         // Snapshot (clone) the slot contents — publish-before-clear: we
         // fold into the array first and clear the slot only after, so a
         // concurrent cumulative read can transiently over-count but never
@@ -397,7 +430,7 @@ impl RcShard {
             }
         }
 
-        if drained.is_empty() {
+        if drained.is_empty() && force_increfs.is_empty() {
             return Ok(RcCheckpoint {
                 staged: StagedDeltas {
                     pages: Vec::new(),
@@ -421,8 +454,11 @@ impl RcShard {
 
         // Fold + publish into the array (cache + page_table) WITHOUT
         // clearing the slots yet. `force` (cold lifecycle flush) applies
-        // every delta despite the per-page replay-skip generation guard.
-        let staged = self.array.stage_deltas_in_memory(drained.clone(), force)?;
+        // every delta despite the per-page replay-skip generation guard;
+        // `force_increfs` is the always-apply / no-gen-bump snapshot incref.
+        let staged =
+            self.array
+                .stage_deltas_in_memory_with_force_increfs(drained.clone(), force, force_increfs)?;
 
         // Publish is visible now; clear the folded slots. They are frozen
         // (Syncing / threads-off quiesce) so a fresh `DeltaMap` discards
