@@ -782,11 +782,10 @@ fn new_empty_data_page() -> Page {
         key_count: DATA_KEY_COUNT_MARKER,
         flags: 0,
         generation: 0,
-        // The shared `verify` path expects every manifest-reachable
-        // page to carry header refcount = 1 (the meta page is the
-        // single owner). Set it here so the very first write of a
-        // freshly allocated data page is already correctly stamped.
-        refcount: 1,
+        // Non-L2P page: birth is meaningless here. The post-A3 header rc
+        // field is gone (rc lives in the PageId-keyed arrays); birth_lsn
+        // is carried only as an incidental value, never read for this type.
+        birth_lsn: 0,
     })
 }
 

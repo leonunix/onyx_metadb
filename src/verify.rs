@@ -16,6 +16,14 @@ use crate::types::{FIRST_DATA_PAGE, Lsn, NULL_PAGE, PageId};
 pub struct VerifyOptions {
     /// Escalate orphaned allocated pages from warnings to hard failures.
     pub strict: bool,
+    /// Run the birth-txg SHADOW invariant (ZFS birth-txg port, Phase 1):
+    /// for every head-reachable L2P page P of each non-clone volume,
+    /// assert `birth_lsn(P) <= youngest_snap(V)` ⟺ P is reachable from
+    /// the youngest snapshot's tree. This proves `birth_lsn` is a reliable
+    /// immutable birth-txg substrate (the COW kill decision Phase 2 will
+    /// use) WITHOUT changing any behavior — page-rc stays authoritative.
+    /// Off by default so existing verify callers are unaffected.
+    pub check_birth_shadow: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -196,7 +204,107 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
         }
     }
 
+    if options.check_birth_shadow {
+        if let Err(err) = check_birth_shadow(&page_store, &manifest.manifest, &mut report) {
+            report
+                .issues
+                .push(format!("birth-shadow check failed: {err}"));
+        }
+    }
+
     Ok(report)
+}
+
+/// Birth-txg SHADOW invariant (ZFS birth-txg port, Phase 1). For each
+/// non-clone volume, prove that the immutable `birth_lsn` faithfully
+/// predicts snapshot-preservation — the exact comparison the COW kill
+/// decision will use in Phase 2 (`COW iff birth(P) <= youngest_snap`):
+///
+///   for every head-reachable L2P page P:
+///     birth_lsn(P) <= youngest_snap(V)  ⟺  P reachable from youngest snapshot
+///
+/// Rationale: a page still reachable from the head was not COW'd since the
+/// youngest snapshot iff `birth_lsn <= youngest_snap`; in that case the
+/// snapshot still pins that exact version (reachable from its tree).
+/// Mismatches are hard `issues` — they pinpoint a wrong `birth_lsn` stamp
+/// before any liveness decision rides on it (resolves R1 empirically).
+///
+/// Clones are skipped: their pages form a cross-volume DAG (R5) whose
+/// sharing a per-volume reachability walk cannot see — that is Phase 3
+/// (livelist) territory. Page-rc remains authoritative throughout.
+fn check_birth_shadow(
+    page_store: &Arc<PageStore>,
+    manifest: &Manifest,
+    report: &mut VerifyReport,
+) -> Result<()> {
+    for volume in &manifest.volumes {
+        if volume.parent_vol_ord.is_some() {
+            continue;
+        }
+        let vol = volume.ord;
+        // The youngest snapshot pins the most recent point-in-time view; a
+        // head page reachable from ANY live snapshot is reachable from this
+        // one (it was not COW'd since), so the youngest suffices.
+        let youngest = manifest
+            .snapshots
+            .iter()
+            .filter(|s| s.vol_ord == vol)
+            .max_by_key(|s| s.created_lsn);
+        let youngest_snap = youngest.map_or(0, |s| s.created_lsn);
+
+        let head_set = reachable_l2p_pages(page_store, &volume.l2p_shard_roots)?;
+        let snap_set = match youngest {
+            None => HashSet::new(),
+            Some(snap) => {
+                let roots =
+                    snapshot_roots(page_store, snap.l2p_roots_page, &snap.l2p_shard_roots)?;
+                reachable_l2p_pages(page_store, &roots)?
+            }
+        };
+
+        for pid in &head_set {
+            let header = match page_store
+                .read_page_unchecked(*pid)
+                .and_then(|p| p.header())
+            {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if !matches!(
+                header.page_type,
+                PageType::PagedLeaf | PageType::PagedIndex
+            ) {
+                continue;
+            }
+            let birth_predicts_preserved = youngest_snap > 0 && header.birth_lsn <= youngest_snap;
+            let reachable_from_youngest_snapshot = snap_set.contains(pid);
+            if birth_predicts_preserved != reachable_from_youngest_snapshot {
+                report.issues.push(format!(
+                    "birth-shadow mismatch vol {vol} page {pid}: birth_lsn={} \
+                     youngest_snap={youngest_snap} \
+                     birth_predicts_preserved={birth_predicts_preserved} \
+                     reachable_from_youngest_snapshot={reachable_from_youngest_snapshot}",
+                    header.birth_lsn
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set of every L2P page reachable from `roots` (roots + all descendants),
+/// reusing [`walk_paged_tree`]. Membership only — no multiplicity.
+fn reachable_l2p_pages(page_store: &Arc<PageStore>, roots: &[PageId]) -> Result<HashSet<PageId>> {
+    let mut live = LivePages::default();
+    let mut seen: HashSet<PageId> = HashSet::new();
+    for &root in roots {
+        if root == NULL_PAGE {
+            continue;
+        }
+        live.mark(root);
+        walk_paged_tree(page_store, root, &mut live, &mut seen)?;
+    }
+    Ok(live.refs.into_keys().collect())
 }
 
 pub(crate) fn reclaim_orphan_pages(

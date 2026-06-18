@@ -8,7 +8,7 @@ fn header_round_trip() {
         key_count: 42,
         flags: 0xDEAD_BEEF,
         generation: 0x1234_5678_9ABC_DEF0,
-        refcount: 7,
+        birth_lsn: 0x0FED_CBA9_8765_4321,
     };
     let mut p = Page::zeroed();
     p.write_header(&h);
@@ -19,7 +19,11 @@ fn header_round_trip() {
     assert_eq!(read.key_count, h.key_count);
     assert_eq!(read.flags, h.flags);
     assert_eq!(read.generation, h.generation);
-    assert_eq!(read.refcount, h.refcount);
+    assert_eq!(read.birth_lsn, h.birth_lsn);
+    // generation and birth_lsn occupy distinct header slots (16 and 24)
+    // and round-trip independently.
+    assert_eq!(p.generation(), h.generation);
+    assert_eq!(p.birth_lsn(), h.birth_lsn);
 }
 
 #[test]

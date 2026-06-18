@@ -1,11 +1,11 @@
 //! Per-L2P-page refcount store: how many tree parents (across every volume
 //! and snapshot) point at each paged-L2P `PageId`.
 //!
-//! This refcount used to live in the L2P page header (`PageHeader.refcount`).
-//! The flush IO path writes whole pages and bypasses the per-pid `rc_locks`,
-//! so an in-flight flush could clobber a concurrent incref's rc field — which
-//! is exactly why `take_snapshot` / `clone_volume` / `drop_snapshot` had to
-//! force a global TXG sync (drain in-flight flushes) before touching root rc.
+//! This refcount used to live in the L2P page header (`PageHeader.refcount`,
+//! since removed). The flush IO path writes whole pages, so an in-flight flush
+//! could clobber a concurrent incref's rc field — which is exactly why
+//! `take_snapshot` / `clone_volume` / `drop_snapshot` had to force a global TXG
+//! sync (drain in-flight flushes) before touching root rc.
 //! Relocating the page rc OUT of the data page removes that coupling: the
 //! flush no longer writes rc, so the lifecycle ops can incref/decref roots
 //! inline, per-volume, with no global barrier.

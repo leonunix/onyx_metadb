@@ -383,9 +383,14 @@ fn dropping_source_snapshot_after_clone_keeps_page_refcounts_balanced() {
         assert_eq!(db.get(clone, i).unwrap(), Some(val(i)));
     }
     db.flush().unwrap();
-    let report =
-        crate::verify::verify_path(dir.path(), crate::verify::VerifyOptions { strict: true })
-            .unwrap();
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+        },
+    )
+    .unwrap();
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
 

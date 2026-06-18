@@ -1244,7 +1244,7 @@ fn new_data_page() -> Page {
         key_count: DATA_KEY_COUNT_MARKER,
         flags: 0,
         generation: 0,
-        refcount: 1,
+        birth_lsn: 0,
     })
 }
 

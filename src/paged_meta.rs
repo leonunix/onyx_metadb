@@ -201,7 +201,7 @@ pub fn build_chain_pages(
             key_count: expected_key_count,
             flags: 0,
             generation: 0,
-            refcount: 1,
+            birth_lsn: 0,
         });
         let is_head = chunk_idx == 0;
         {

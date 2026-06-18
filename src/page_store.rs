@@ -61,7 +61,6 @@ mod page_io;
 mod raw_io;
 mod read_pool;
 mod reclaim;
-mod refcount_ops;
 mod submitter;
 mod sync;
 
@@ -74,7 +73,6 @@ use read_pool::PageReadPool;
 use submitter::make_io_submitters;
 pub use submitter::{DEFAULT_IO_SUBMITTER_POOL_SIZE, IoLaneClass};
 
-const RC_LOCK_SHARDS: usize = 64;
 const MAX_RECLAIM_RUN_PAGES: usize = 1024;
 const MIN_PUNCH_HOLE_RUN_PAGES: usize = 16;
 
@@ -114,13 +112,6 @@ pub struct PageStore {
     high_water_pages: AtomicU64,
     free_list_pages: AtomicUsize,
     deferred_free_pages: AtomicUsize,
-    /// Per-pid sharded mutexes serialising [`atomic_rc_delta`]. Needed
-    /// because a page can be shared across multiple [`PagedL2p`]
-    /// instances after `clone_volume` — two trees each holding their
-    /// own `PageBuf` would otherwise each read the same pre-decrement
-    /// rc and race their writes back to disk (last-writer-wins losing
-    /// one decrement).
-    rc_locks: Box<[Mutex<()>]>,
     /// Batch size for pre-extending the backing file in `allocate` /
     /// `allocate_run`. Frozen at construction; never mutated.
     grow_chunk: u64,
@@ -163,21 +154,6 @@ pub struct ReclaimOutcome {
     pub safe_below: u64,
     pub selected: usize,
     pub reclaimed: Vec<PageId>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RcDeltaWithGen {
-    pub page_id: PageId,
-    pub delta: i32,
-    pub lsn: Lsn,
-    pub ordinal: u32,
-}
-
-fn new_rc_locks() -> Box<[Mutex<()>]> {
-    (0..RC_LOCK_SHARDS)
-        .map(|_| Mutex::new(()))
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
 }
 
 impl std::fmt::Debug for PageStore {

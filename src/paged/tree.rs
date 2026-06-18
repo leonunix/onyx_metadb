@@ -651,7 +651,7 @@ impl PagedL2p {
     /// Variant of [`insert`](Self::insert) that stamps cow rc deltas
     /// with the given WAL LSN. Used by the WAL apply path so a replay
     /// of the same op observes matching gen stamps and skips already-
-    /// applied deltas ([`PageStore::atomic_rc_delta_with_gen`]). The
+    /// applied deltas (the gen-stamped page-rc replay-skip). The
     /// tree's internal `next_gen` is bumped past `lsn` to keep the
     /// manifest's `max_generation` invariant.
     pub fn insert_at_lsn(
@@ -1164,11 +1164,10 @@ impl PagedL2p {
     /// pages that hit rc=0 collects leaf values (or recurses into index
     /// children). Pages still shared after the decrement are left alone.
     ///
-    /// Rc mutations route through
-    /// [`PageStore::atomic_rc_delta`](crate::page_store::PageStore::atomic_rc_delta)'s
-    /// per-pid-locked disk-direct RMW so a sibling volume's concurrent
-    /// `cow_for_write` against a shared page can't race. Leaves
-    /// `page.generation` untouched — this path is not WAL-replayed.
+    /// Rc mutations route through the shared `L2pPageRc` array (A3
+    /// cutover), so a sibling volume's concurrent `cow_for_write` against a
+    /// shared page can't race. Leaves `page.generation` untouched — this
+    /// path is not WAL-replayed.
     pub fn drop_subtree(
         &mut self,
         snap_root: PageId,

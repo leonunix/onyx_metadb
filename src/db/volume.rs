@@ -710,6 +710,23 @@ impl Db {
             .unwrap_or_default()
     }
 
+    /// Youngest live snapshot's `created_lsn` for `vol` (ZFS `prev_snap_txg`
+    /// analogue), or `0` when the volume has no live snapshot. This is the
+    /// birth-txg threshold for the COW kill decision in the birth-txg port:
+    /// a page reachable from the head with `birth_lsn <= youngest_snap` is
+    /// still pinned by that snapshot. Phase 1 reads it only for the
+    /// birth-shadow audit; the COW kill decision stays page-rc-authoritative.
+    // Phase 1 ships the accessor + its unit test ahead of its first runtime
+    // caller (the Phase 2 birth-authoritative kill decision); allow until then.
+    #[allow(dead_code)]
+    pub(crate) fn youngest_snap(&self, vol: VolumeOrdinal) -> Lsn {
+        self.snap_info_cache
+            .lock()
+            .get(&vol)
+            .map(|infos| infos.iter().map(|s| s.created_lsn).max().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
     /// Recompute the cache entry for `vol` from `manifest.snapshots`.
     /// Callers must already hold a manifest lock or be in a state where
     /// the snapshot list is stable for `vol` (typically `apply_gate` or

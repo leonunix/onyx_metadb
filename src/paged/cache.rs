@@ -436,11 +436,11 @@ impl PageBuf {
             let version = payload[LEAF_BITMAP_BYTES + 1];
             if version != leaf_compact::COMPACT_VERSION {
                 return Err(MetaDbError::Corruption(format!(
-                    "paged clone_private source leaf {src} -> {new_pid} lsn {generation}: compact leaf version {version} != {} (key_count={}, page_gen={}, rc={}, payload0={:02x?})",
+                    "paged clone_private source leaf {src} -> {new_pid} lsn {generation}: compact leaf version {version} != {} (key_count={}, page_gen={}, birth={}, payload0={:02x?})",
                     leaf_compact::COMPACT_VERSION,
                     page.key_count(),
                     page.generation(),
-                    page.refcount(),
+                    page.birth_lsn(),
                     &payload[..32],
                 )));
             }
@@ -449,19 +449,19 @@ impl PageBuf {
                 .min(leaf_compact::MAX_UNITS_PER_LEAF);
             if unit_count > cap {
                 return Err(MetaDbError::Corruption(format!(
-                    "paged clone_private source leaf {src} -> {new_pid} lsn {generation}: compact leaf unit_count {unit_count} exceeds payload capacity {cap} (key_count={}, page_gen={}, rc={}, payload0={:02x?})",
+                    "paged clone_private source leaf {src} -> {new_pid} lsn {generation}: compact leaf unit_count {unit_count} exceeds payload capacity {cap} (key_count={}, page_gen={}, birth={}, payload0={:02x?})",
                     page.key_count(),
                     page.generation(),
-                    page.refcount(),
+                    page.birth_lsn(),
                     &payload[..32],
                 )));
             }
         }
         page.set_generation(generation);
-        // A3 cutover: page rc lives in the `L2pPageRc` array. Write the
-        // reserved header byte 0 (format stability) and stage the clone's
-        // +1 into the op accumulator instead of stamping the header.
-        page.set_refcount(0);
+        // A3 cutover: page rc lives in the `L2pPageRc` array; the clone's +1
+        // is staged into the op accumulator below. The clone is a NEW page
+        // version born at this COW lsn — stamp its immutable birth-txg.
+        page.set_birth_lsn(generation);
         self.pages_insert(new_pid, Slot::Dirty(Arc::new(page)));
         *self.pending_rc.entry(new_pid).or_insert(0) += 1;
         Ok(new_pid)
@@ -469,11 +469,15 @@ impl PageBuf {
 
     /// Allocate a fresh leaf, initialize it, cache as dirty. Stamps
     /// `page.generation = 0` so the WAL-apply idempotency guard treats
-    /// newly-allocated tree pages as untouched by any WAL op.
-    pub fn alloc_leaf(&mut self, _generation: Lsn) -> Result<PageId> {
+    /// newly-allocated tree pages as untouched by any WAL op; stamps the
+    /// immutable `birth_lsn = generation` (the creating LSN of this page
+    /// version, ZFS birth-txg analogue — read by the birth-shadow verify
+    /// invariant, never by the hot path in Phase 1).
+    pub fn alloc_leaf(&mut self, generation: Lsn) -> Result<PageId> {
         let pid = self.allocate_local()?;
         let mut page = Page::zeroed();
         init_leaf(&mut page, 0);
+        page.set_birth_lsn(generation);
         self.pages_insert(pid, Slot::Dirty(Arc::new(page)));
         // A3: a fresh page has one (incoming) reference, mirroring the old
         // in-page header rc of 1 from `PageHeader::new`. Stage that +1 into
@@ -484,11 +488,12 @@ impl PageBuf {
 
     /// Allocate a fresh index page at `level`, initialize it (all children
     /// NULL_PAGE), cache as dirty. See [`alloc_leaf`](Self::alloc_leaf)
-    /// for why the generation is stamped as 0.
-    pub fn alloc_index(&mut self, _generation: Lsn, level: u8) -> Result<PageId> {
+    /// for why the generation is stamped as 0 and birth_lsn as `generation`.
+    pub fn alloc_index(&mut self, generation: Lsn, level: u8) -> Result<PageId> {
         let pid = self.allocate_local()?;
         let mut page = Page::zeroed();
         init_index(&mut page, 0, level);
+        page.set_birth_lsn(generation);
         self.pages_insert(pid, Slot::Dirty(Arc::new(page)));
         // A3: fresh page → one reference (mirrors header init rc 1). See
         // [`alloc_leaf`](Self::alloc_leaf).
@@ -700,12 +705,12 @@ impl PageBuf {
     }
 
     /// Seal + write `pid` to disk if it is currently Dirty in this
-    /// buffer, leaving the PageBuf/PageCache entries untouched. Used by
-    /// [`cow_for_write`](Self::cow_for_write) before a disk-direct
-    /// atomic rc RMW so the read inside
-    /// [`PageStore::atomic_rc_delta_with_gen`] sees the latest bytes.
-    /// The RMW then overwrites the page with the post-delta state; the
-    /// caller is expected to drop `pid` from both `pages` and
+    /// buffer, leaving the PageBuf/PageCache entries untouched. Historically
+    /// used by [`cow_for_write`](Self::cow_for_write) before a disk-direct
+    /// atomic rc RMW so the read inside the (now-removed, A3) page-header
+    /// rc RMW saw the latest bytes. The RMW then overwrote the page with
+    /// the post-delta state; the caller is expected to drop `pid` from both
+    /// `pages` and
     /// `page_cache` afterwards so nothing observes the stale pre-RMW
     /// copy.
     fn persist_if_dirty(&mut self, pid: PageId) -> Result<()> {
@@ -800,10 +805,11 @@ impl PageBuf {
             .bytes_mut()
             .copy_from_slice(self.read(pid)?.bytes());
         new_page.set_generation(0);
-        // A3 cutover: write the reserved header rc byte 0 (the source's
-        // copied byte is meaningless now); the clone's rc is staged to
-        // the array via the `pending_rc` accumulator below.
-        new_page.set_refcount(0);
+        // A3 cutover: rc is staged to the `L2pPageRc` array via the
+        // `pending_rc` accumulator below (the source's copied rc byte is
+        // gone). This clone is a NEW page version born at this COW lsn —
+        // stamp its immutable birth-txg, overriding the copied source birth.
+        new_page.set_birth_lsn(lsn);
         self.pages_insert(new_pid, Slot::Dirty(Arc::new(new_page)));
 
         // Queue rc deltas for end-of-op commit instead of staging the

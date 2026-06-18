@@ -215,7 +215,6 @@ impl PageStore {
             let mut run_pages: Vec<Arc<Page>> = Vec::with_capacity(end - idx);
             for (_, entry) in &pages[idx..end] {
                 let mut page = Page::new(PageHeader::new(PageType::Free, entry.generation));
-                page.set_refcount(0);
                 page.seal();
                 run_pages.push(Arc::new(page));
             }

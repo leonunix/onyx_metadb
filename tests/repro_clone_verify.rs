@@ -57,7 +57,14 @@ fn clone_volume_cross_write_keeps_refcounts_clean() {
         db.flush().unwrap();
     }
 
-    let report = verify_path(path, VerifyOptions { strict: true }).unwrap();
+    let report = verify_path(
+        path,
+        VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+        },
+    )
+    .unwrap();
     assert!(
         report.is_clean(),
         "verify_path reported issues: {:?}",

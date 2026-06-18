@@ -361,21 +361,21 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pVal
     let version = page.payload()[LEAF_BITMAP_BYTES + 1];
     if version != leaf_compact::COMPACT_VERSION {
         return Err(MetaDbError::Corruption(format!(
-            "compact leaf version {version} != {} before set slot {i} (key_count={}, page_gen={}, rc={}, payload0={:02x?})",
+            "compact leaf version {version} != {} before set slot {i} (key_count={}, page_gen={}, birth={}, payload0={:02x?})",
             leaf_compact::COMPACT_VERSION,
             page.key_count(),
             page.generation(),
-            page.refcount(),
+            page.birth_lsn(),
             payload_head(page),
         )));
     }
     let key_count = page.key_count() as usize;
     if key_count > LEAF_ENTRY_COUNT {
         return Err(MetaDbError::Corruption(format!(
-            "compact leaf key_count {key_count} exceeds leaf capacity {LEAF_ENTRY_COUNT} before set slot {i} (unit_count={}, page_gen={}, rc={}, payload0={:02x?})",
+            "compact leaf key_count {key_count} exceeds leaf capacity {LEAF_ENTRY_COUNT} before set slot {i} (unit_count={}, page_gen={}, birth={}, payload0={:02x?})",
             page.payload()[LEAF_BITMAP_BYTES],
             page.generation(),
-            page.refcount(),
+            page.birth_lsn(),
             payload_head(page),
         )));
     }
@@ -384,10 +384,10 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pVal
         .min(leaf_compact::MAX_UNITS_PER_LEAF);
     if unit_count > cap {
         return Err(MetaDbError::Corruption(format!(
-            "compact leaf unit_count {unit_count} exceeds payload capacity {cap} before set slot {i} (key_count={}, page_gen={}, rc={}, payload0={:02x?})",
+            "compact leaf unit_count {unit_count} exceeds payload capacity {cap} before set slot {i} (key_count={}, page_gen={}, birth={}, payload0={:02x?})",
             page.key_count(),
             page.generation(),
-            page.refcount(),
+            page.birth_lsn(),
             payload_head(page),
         )));
     }
@@ -508,10 +508,10 @@ pub fn leaf_set(page: &mut Page, i: usize, v: &L2pValue) -> Result<Option<L2pVal
     if !was_set {
         if key_count >= LEAF_ENTRY_COUNT {
             return Err(MetaDbError::Corruption(format!(
-                "compact leaf cannot add slot {i}: key_count {key_count} is already at capacity {LEAF_ENTRY_COUNT} (unit_count={}, page_gen={}, rc={}, payload0={:02x?})",
+                "compact leaf cannot add slot {i}: key_count {key_count} is already at capacity {LEAF_ENTRY_COUNT} (unit_count={}, page_gen={}, birth={}, payload0={:02x?})",
                 page.payload()[LEAF_BITMAP_BYTES],
                 page.generation(),
-                page.refcount(),
+                page.birth_lsn(),
                 payload_head(page),
             )));
         }
@@ -535,11 +535,11 @@ pub fn leaf_clear(page: &mut Page, i: usize) -> Result<Option<L2pValue>> {
     let key_count = page.key_count() as usize;
     if key_count > LEAF_ENTRY_COUNT {
         return Err(MetaDbError::Corruption(format!(
-            "compact leaf key_count {key_count} exceeds leaf capacity {LEAF_ENTRY_COUNT} before clear slot {i} (unit_count={}, version={}, page_gen={}, rc={}, payload0={:02x?})",
+            "compact leaf key_count {key_count} exceeds leaf capacity {LEAF_ENTRY_COUNT} before clear slot {i} (unit_count={}, version={}, page_gen={}, birth={}, payload0={:02x?})",
             page.payload()[LEAF_BITMAP_BYTES],
             page.payload()[LEAF_BITMAP_BYTES + 1],
             page.generation(),
-            page.refcount(),
+            page.birth_lsn(),
             &page.payload()[..32],
         )));
     }

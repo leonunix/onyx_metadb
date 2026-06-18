@@ -360,7 +360,13 @@ fn buffer_mode_snapshot_churn_no_premature_free() {
         assert_eq!(db.get(0, i).unwrap(), Some(val(i, 7)), "reopen lba {i}");
     }
     let report =
-        crate::verify::verify_path(dir.path(), crate::verify::VerifyOptions { strict: true })
+        crate::verify::verify_path(
+            dir.path(),
+            crate::verify::VerifyOptions {
+                strict: true,
+                check_birth_shadow: true,
+            },
+        )
             .unwrap();
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
@@ -411,7 +417,13 @@ fn create_volume_root_page_rc_survives_reopen() {
         assert_eq!(db.get(vol, i).unwrap(), Some(v((i / 32) as u8)), "reopen lba {i}");
     }
     let report =
-        crate::verify::verify_path(dir.path(), crate::verify::VerifyOptions { strict: true })
+        crate::verify::verify_path(
+            dir.path(),
+            crate::verify::VerifyOptions {
+                strict: true,
+                check_birth_shadow: true,
+            },
+        )
             .unwrap();
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
@@ -465,7 +477,13 @@ fn take_snapshot_incref_survives_close_before_fold() {
     }
     drop(db);
     let report =
-        crate::verify::verify_path(dir.path(), crate::verify::VerifyOptions { strict: true })
+        crate::verify::verify_path(
+            dir.path(),
+            crate::verify::VerifyOptions {
+                strict: true,
+                check_birth_shadow: true,
+            },
+        )
             .unwrap();
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
@@ -552,7 +570,13 @@ fn buffer_mode_concurrent_snapshot_churn_no_corruption() {
         db.get(0, i).expect("get after churn");
     }
     let report =
-        crate::verify::verify_path(dir.path(), crate::verify::VerifyOptions { strict: true })
+        crate::verify::verify_path(
+            dir.path(),
+            crate::verify::VerifyOptions {
+                strict: true,
+                check_birth_shadow: true,
+            },
+        )
             .unwrap();
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
@@ -753,6 +777,392 @@ fn b2_buffer_range_delete_drains_buffer() {
     for i in 0u64..50 {
         assert_eq!(db.get_refcount(100 + i).unwrap(), 1);
     }
+}
+
+// =====================================================================
+// REPRO: force-fold double-decref over a buffered page-rc backlog.
+//
+// The existing buffer+snapshot tests above all use a TINY
+// `l2p_buffer_soft_entries` (4), so the L2P buffer drains essentially
+// every commit and the page-rc COW deltas fold into the `L2pPageRc`
+// array immediately — there is never a *backlog* of un-folded page-rc
+// deltas sitting in the `RcShard` slots when a force=true fold runs.
+//
+// The nvme-box soak's trigger was different: a snapshot DELETE
+// (`drop_snapshot` → `L2pPageRc::flush()` → `RcShard::flush()` →
+// `begin_checkpoint_all_slots(force=true)`) firing over a slot holding
+// MANY un-folded buffered COW decrefs (large buffer backlog). The
+// force=true fold bypasses the per-array-DATA-PAGE replay-skip
+// (`!force && page_generation >= pending.last_lsn`, array.rs ~447), so
+// if any of those backlogged decrefs targets an `L2pPageRc` array page
+// whose generation already reflects that decref (the non-monotone-lsn
+// hazard: buffer-mode COW stages page-rc deltas in radix-key order at
+// DRAIN time, so the lsns are not monotone vs the array page
+// generation), the force fold RE-APPLIES the decref the array already
+// reflects → a still-live L2P page's rc is driven to 0 → the page is
+// freed → its PageId is reused (e.g. as dedup CuckooData) → a later
+// L2P tree walk reads the wrong page type
+// (`expected PagedLeaf/PagedIndex, got CuckooData` /
+// `page N has level 1, expected 0`).
+//
+// To reproduce we must BUILD THE BACKLOG: a large `soft_entries` +
+// `txg_threads_enabled = false` so the background compactor does not
+// drain, churn many COW overwrites of pages shared with a live
+// snapshot across several explicit `flush()`es (each flush folds the
+// L2P buffer + advances the page-rc array generation, but leaves later
+// drains' decrefs in fresh slots), then DROP the snapshot to fire the
+// force-fold over that mixed-generation backlog.
+//
+// PASS (today's intent) = no corruption: every live LBA still
+// resolves, reopen + strict verify is clean, and no benign-double-
+// decref underflow drove a live page to 0. On the buggy code this
+// FAILS with a lost mapping / wrong value / corrupted-page Err / a
+// strict-verify leak-or-undercount issue.
+#[test]
+fn drop_snapshot_force_fold_over_buffer_backlog_no_premature_free() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    // LARGE soft trigger + NO background threads: the compactor never
+    // auto-drains, so page-rc COW deltas pile up un-folded in the
+    // RcShard slots until an explicit flush / lifecycle op drains them.
+    // This is the "large buffer backlog" the soak hit, which the
+    // soft_entries=4 tests can never build.
+    cfg.l2p_buffer_soft_entries = 1_000_000;
+    cfg.l2p_buffer_hard_entries = 4_000_000;
+    cfg.l2p_buffer_max_interval_ms = 600_000;
+    cfg.txg_threads_enabled = false;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    // Span many leaves + interior/index pages so many pids land on each
+    // page-rc array DATA page (page-rc is keyed by PageId; one array data
+    // page covers a contiguous PageId run → the force-fold's per-page
+    // generation guard is exactly the granularity that mis-fires).
+    const N: u64 = 8192;
+    let val = |i: u64, round: u64| -> L2pValue { v((((i / 32) + round) % 251) as u8) };
+
+    for i in 0..N {
+        db.insert(0, i, val(i, 0)).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Snapshot: shares every L2P page with the live volume (page-rc 2).
+    let snap = db.take_snapshot(0).unwrap();
+
+    // Heavy overwrite churn of the shared pages, building a backlog of
+    // page-rc decrefs across SEVERAL drains with non-monotone lsns. Each
+    // `flush()` folds one drain into the page-rc array (advancing some
+    // array pages' generation); the NEXT round's decrefs then land in a
+    // fresh slot with lsns that may sit at/below an already-advanced
+    // array-page generation. Interleave overwrites in a non-monotone LBA
+    // order within each round so the drain's radix-key-ordered page-rc
+    // staging produces the non-monotone lsns the force-fold mis-skips.
+    for round in 1u64..=12 {
+        // Walk LBAs in a strided / reversed order so the per-commit lsn
+        // (monotone) does not match the radix-key drain order — the
+        // exact condition that makes the staged page-rc delta lsns
+        // non-monotone relative to the page-rc array page generation.
+        let mut i = if round % 2 == 0 { N - 1 } else { 0 };
+        let mut done = 0u64;
+        while done < N {
+            db.insert(0, i, val(i, round)).unwrap();
+            done += 1;
+            if round % 2 == 0 {
+                if i == 0 {
+                    break;
+                }
+                i -= 1;
+            } else {
+                i += 1;
+                if i >= N {
+                    break;
+                }
+            }
+        }
+        // Fold THIS round's drain into the page-rc array (advances array
+        // page generation) but leave a fresh slot for the next round's
+        // decrefs — building the mixed-generation backlog.
+        db.flush().unwrap();
+    }
+
+    // Now DROP the snapshot. This is the soak trigger:
+    //   force_compact_l2p_buffers (drain remaining buffered COW into the
+    //     open TXG slot → fresh page-rc decrefs)
+    //   then l2p_page_rc.flush() → RcShard::flush()
+    //     → begin_checkpoint_all_slots(force=true)
+    //   which RE-APPLIES every slot delta bypassing the
+    //   `page_generation >= last_lsn` replay-skip.
+    db.drop_snapshot(snap).unwrap().unwrap();
+
+    // Every live LBA must still resolve to round 12's value. A premature
+    // free shows up as a lost mapping (None), a wrong value, or an Err
+    // from a corrupted page walk.
+    for i in 0..N {
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(val(i, 12)),
+            "lba {i}: live mapping lost (force-fold double-decref premature free)"
+        );
+    }
+
+    db.flush().unwrap();
+    drop(db);
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0..N {
+        assert_eq!(db.get(0, i).unwrap(), Some(val(i, 12)), "reopen lba {i}");
+    }
+    let report =
+        crate::verify::verify_path(
+            dir.path(),
+            crate::verify::VerifyOptions {
+                strict: true,
+                check_birth_shadow: true,
+            },
+        )
+            .unwrap();
+    assert!(report.is_clean(), "verify issues: {:?}", report.issues);
+}
+
+// =====================================================================
+// BIRTH-TXG SHADOW (ZFS birth-txg port, Phase 1). These prove R1: the
+// immutable `birth_lsn` is a reliable birth-txg substrate — for every
+// head-reachable L2P page P, `birth_lsn(P) <= youngest_snap(V)` ⟺ P is
+// reachable from the youngest snapshot's tree (the exact COW kill decision
+// Phase 2 will use). The oracle is `verify_path(.., check_birth_shadow)`.
+// Page-rc stays authoritative throughout (zero behavior change).
+//
+// All run the check WITH A LIVE SNAPSHOT and a PARTIAL overwrite, so the
+// tree carries both shared-unmodified leaves (birth <= youngest, in the
+// snapshot) and diverged leaves (birth > youngest, head-only) — the
+// invariant must agree on both. They reopen before verify so birth is also
+// proven to survive recovery (R2).
+
+fn assert_birth_shadow_clean(path: &std::path::Path) {
+    let report = crate::verify::verify_path(
+        path,
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+        },
+    )
+    .unwrap();
+    assert!(
+        report.is_clean(),
+        "birth-shadow verify issues: {:?}",
+        report.issues
+    );
+}
+
+// 32 leaves (128 LBAs each) under an index; value shared across 32-LBA
+// groups so a leaf holds <= 4 distinct units (MAX_UNITS_PER_LEAF=100).
+const BIRTH_N: u64 = 4096;
+fn bval(i: u64, round: u64) -> L2pValue {
+    v((((i / 32) + round) % 251) as u8)
+}
+
+#[test]
+fn birth_shadow_partial_overwrite_live_snapshot_direct() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.shards_per_partition = 1; // one tree → LBA/128 = leaf index, predictable
+    let db = Db::create_with_config(cfg).unwrap();
+
+    for i in 0..BIRTH_N {
+        db.insert(0, i, bval(i, 0)).unwrap();
+    }
+    db.flush().unwrap();
+    let _s = db.take_snapshot(0).unwrap(); // KEEP LIVE
+
+    // Overwrite only the first two leaves (0..256); the other 30 leaves
+    // stay shared with the snapshot (birth <= youngest_snap, in both trees).
+    for i in 0..256 {
+        db.insert(0, i, bval(i, 1)).unwrap();
+    }
+    db.flush().unwrap();
+
+    for i in 0..256 {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 1)));
+    }
+    for i in 256..BIRTH_N {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 0)));
+    }
+    db.flush().unwrap();
+    drop(db);
+
+    // Reopen (recovery replay + frontier) so birth is also proven durable.
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0..256 {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 1)), "reopen lba {i}");
+    }
+    drop(db);
+    assert_birth_shadow_clean(dir.path());
+}
+
+#[test]
+fn birth_shadow_partial_overwrite_live_snapshot_buffer() {
+    // BUFFER mode is the make-or-break for R1: COW (and thus birth
+    // stamping) happens at DRAIN time, in radix-key order with per-entry
+    // (non-monotone) lsns. If birth were stamped from the drain lsn or a
+    // per-leaf-max instead of the page version's creating lsn, a shared
+    // unmodified leaf would mispredict and the shadow check would trip.
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.shards_per_partition = 1;
+    cfg.l2p_buffer_enabled = true;
+    cfg.l2p_buffer_soft_entries = 4;
+    cfg.l2p_buffer_max_interval_ms = 50;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    for i in 0..BIRTH_N {
+        db.insert(0, i, bval(i, 0)).unwrap();
+    }
+    db.flush().unwrap();
+    let _s = db.take_snapshot(0).unwrap();
+    for i in 0..256 {
+        db.insert(0, i, bval(i, 1)).unwrap();
+    }
+    db.flush().unwrap();
+    drop(db);
+
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0..256 {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 1)), "reopen lba {i}");
+    }
+    for i in 256..BIRTH_N {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 0)), "reopen lba {i}");
+    }
+    drop(db);
+    assert_birth_shadow_clean(dir.path());
+}
+
+#[test]
+fn birth_shadow_non_monotone_drain_large_backlog() {
+    // The force-fold P0's exact condition: a large un-folded page-rc
+    // backlog with NON-MONOTONE lsns (strided/reversed writes drained in
+    // radix-key order), under a LIVE snapshot. The birth substrate must
+    // stay correct regardless of drain/fold order.
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.shards_per_partition = 1;
+    cfg.l2p_buffer_enabled = true;
+    cfg.l2p_buffer_soft_entries = 1_000_000; // never auto-drain
+    cfg.l2p_buffer_hard_entries = 4_000_000;
+    cfg.l2p_buffer_max_interval_ms = 600_000;
+    cfg.txg_threads_enabled = false;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    for i in 0..BIRTH_N {
+        db.insert(0, i, bval(i, 0)).unwrap();
+    }
+    db.flush().unwrap();
+    let _s = db.take_snapshot(0).unwrap(); // KEEP LIVE
+
+    // Churn the first half across several rounds in strided/reversed order,
+    // flushing each round (each fold advances some array pages' generation),
+    // leaving the second half shared with the snapshot.
+    for round in 1u64..=8 {
+        let mut i = if round % 2 == 0 { 2047 } else { 0 };
+        let mut done = 0u64;
+        while done < 2048 {
+            db.insert(0, i, bval(i, round)).unwrap();
+            done += 1;
+            if round % 2 == 0 {
+                if i == 0 {
+                    break;
+                }
+                i -= 1;
+            } else {
+                i += 1;
+                if i >= 2048 {
+                    break;
+                }
+            }
+        }
+        db.flush().unwrap();
+    }
+
+    for i in 0..2048 {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 8)));
+    }
+    for i in 2048..BIRTH_N {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 0)));
+    }
+    db.flush().unwrap();
+    drop(db);
+
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0..2048 {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 8)), "reopen lba {i}");
+    }
+    drop(db);
+    assert_birth_shadow_clean(dir.path());
+}
+
+#[test]
+fn birth_shadow_layered_snapshots_youngest_is_threshold() {
+    // Two LIVE snapshots at different times + layered partial overwrites,
+    // so the head carries three page generations (pre-s1, between s1/s2,
+    // post-s2). The invariant must use the YOUNGEST snapshot as the
+    // threshold (a head page in any snapshot is in the youngest).
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.shards_per_partition = 1;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    for i in 0..BIRTH_N {
+        db.insert(0, i, bval(i, 0)).unwrap();
+    }
+    db.flush().unwrap();
+    let _s1 = db.take_snapshot(0).unwrap();
+
+    // Overwrite the first half, snapshot again.
+    for i in 0..2048 {
+        db.insert(0, i, bval(i, 1)).unwrap();
+    }
+    db.flush().unwrap();
+    let _s2 = db.take_snapshot(0).unwrap();
+
+    // Overwrite the first quarter only; s1 and s2 stay live.
+    for i in 0..1024 {
+        db.insert(0, i, bval(i, 2)).unwrap();
+    }
+    db.flush().unwrap();
+    drop(db);
+
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0..1024 {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 2)), "reopen lba {i}");
+    }
+    for i in 1024..2048 {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 1)), "reopen lba {i}");
+    }
+    for i in 2048..BIRTH_N {
+        assert_eq!(db.get(0, i).unwrap(), Some(bval(i, 0)), "reopen lba {i}");
+    }
+    drop(db);
+    assert_birth_shadow_clean(dir.path());
+}
+
+#[test]
+fn youngest_snap_tracks_max_created_lsn() {
+    // `Db::youngest_snap` (ZFS prev_snap_txg analogue) is the COW kill
+    // threshold the birth-txg port (Phase 2) will read. It must return the
+    // max live snapshot `created_lsn`, 0 when none, and never decrease while
+    // snapshots accumulate.
+    let (_d, db) = mk_db();
+    assert_eq!(db.youngest_snap(0), 0, "no snapshot → 0");
+    db.insert(0, 1, v(1)).unwrap();
+    let _s1 = db.take_snapshot(0).unwrap();
+    let y1 = db.youngest_snap(0);
+    assert!(y1 > 0, "after first snapshot youngest_snap > 0");
+    db.insert(0, 2, v(2)).unwrap();
+    let s2 = db.take_snapshot(0).unwrap();
+    let y2 = db.youngest_snap(0);
+    assert!(y2 >= y1, "youngest_snap must not decrease as snapshots accrue");
+    // Dropping the youngest reverts the threshold to the older snapshot.
+    db.drop_snapshot(s2).unwrap().unwrap();
+    let y3 = db.youngest_snap(0);
+    assert!(y3 <= y2 && y3 >= y1, "after dropping the youngest, threshold falls back");
 }
 
 // -------- phase 7 commit 8: volume lifecycle --------

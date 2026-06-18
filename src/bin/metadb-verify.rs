@@ -16,12 +16,14 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode, String> {
     let mut strict = false;
     let mut json = false;
+    let mut check_birth_shadow = false;
     let mut path = None;
 
     for arg in env::args().skip(1) {
         match arg.as_str() {
             "--strict" => strict = true,
             "--json" => json = true,
+            "--birth-shadow" => check_birth_shadow = true,
             "-h" | "--help" => {
                 print_usage();
                 return Ok(ExitCode::SUCCESS);
@@ -39,7 +41,14 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::from(2));
     };
 
-    let report = verify_path(&path, VerifyOptions { strict }).map_err(|e| e.to_string())?;
+    let report = verify_path(
+        &path,
+        VerifyOptions {
+            strict,
+            check_birth_shadow,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     if json {
         print_json(&report);
     } else {
@@ -53,7 +62,7 @@ fn run() -> Result<ExitCode, String> {
 }
 
 fn print_usage() {
-    eprintln!("usage: metadb-verify <path> [--strict] [--json]");
+    eprintln!("usage: metadb-verify <path> [--strict] [--json] [--birth-shadow]");
 }
 
 fn print_human(report: &VerifyReport) {

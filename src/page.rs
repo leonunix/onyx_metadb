@@ -57,9 +57,12 @@ pub(crate) const OFF_KEY_COUNT: usize = 6;
 pub(crate) const OFF_CRC: usize = 8;
 pub(crate) const OFF_FLAGS: usize = 12;
 pub(crate) const OFF_GENERATION: usize = 16;
-pub(crate) const OFF_REFCOUNT: usize = 24;
-#[allow(dead_code)] // documents the 4B reserved span between refcount and type header
-pub(crate) const OFF_RESERVED: usize = 28;
+// `birth_lsn` (8B) occupies the post-A3-dead header `refcount` slot (24..28)
+// plus the formerly-reserved span (28..32). It is the immutable birth-txg of an
+// L2P page version (ZFS birth-txg analogue): stamped once at page-version
+// creation, never mutated. `generation` (offset 16) is left untouched and keeps
+// serving the WAL/COW idempotency guards.
+pub(crate) const OFF_BIRTH: usize = 24;
 pub(crate) const OFF_TYPE_HEADER: usize = 32;
 
 // Compile-time layout guards. If any of these fail, the page header has
@@ -75,9 +78,8 @@ const _: () = {
     assert!(OFF_KEY_COUNT < OFF_CRC);
     assert!(OFF_CRC < OFF_FLAGS);
     assert!(OFF_FLAGS < OFF_GENERATION);
-    assert!(OFF_GENERATION < OFF_REFCOUNT);
-    assert!(OFF_REFCOUNT < OFF_RESERVED);
-    assert!(OFF_RESERVED < OFF_TYPE_HEADER);
+    assert!(OFF_GENERATION < OFF_BIRTH);
+    assert!(OFF_BIRTH + 8 == OFF_TYPE_HEADER);
     assert!(OFF_TYPE_HEADER + TYPE_HEADER_SIZE == PAGE_HEADER_SIZE);
 };
 
@@ -163,13 +165,18 @@ pub struct PageHeader {
     pub key_count: u16,
     pub flags: u32,
     pub generation: Lsn,
-    pub refcount: u32,
+    /// Immutable birth-txg of this page version (ZFS birth-txg analogue):
+    /// the LSN at which this exact version was created. Stamped once and
+    /// never mutated. Meaningful for L2P paged pages; carries an incidental
+    /// value for other page types (ignored). Replaces the post-A3-dead
+    /// header `refcount` field (rc now lives in the `L2pPageRc` array).
+    pub birth_lsn: Lsn,
 }
 
 impl PageHeader {
     /// Header for a freshly-written page of `page_type`, stamped with the
-    /// LSN at which it will become visible. `refcount` defaults to 1 (the
-    /// single parent that's about to link to it).
+    /// LSN at which it will become visible. `birth_lsn` defaults to the same
+    /// `generation` — a freshly built page's birth is its creating LSN.
     pub fn new(page_type: PageType, generation: Lsn) -> Self {
         Self {
             page_type,
@@ -177,7 +184,7 @@ impl PageHeader {
             key_count: 0,
             flags: 0,
             generation,
-            refcount: 1,
+            birth_lsn: generation,
         }
     }
 }
@@ -262,7 +269,7 @@ impl Page {
             key_count: u16_le(b, OFF_KEY_COUNT),
             flags: u32_le(b, OFF_FLAGS),
             generation: u64_le(b, OFF_GENERATION),
-            refcount: u32_le(b, OFF_REFCOUNT),
+            birth_lsn: u64_le(b, OFF_BIRTH),
         })
     }
 
@@ -276,8 +283,8 @@ impl Page {
         put_u16_le(b, OFF_KEY_COUNT, h.key_count);
         put_u32_le(b, OFF_FLAGS, h.flags);
         put_u64_le(b, OFF_GENERATION, h.generation);
-        put_u32_le(b, OFF_REFCOUNT, h.refcount);
-        // OFF_RESERVED zeroed by `zeroed()`; OFF_CRC handled by `seal`.
+        put_u64_le(b, OFF_BIRTH, h.birth_lsn);
+        // OFF_CRC handled by `seal`.
     }
 
     /// Read-only view of the 32-byte page-type-specific sub-header.
@@ -334,14 +341,16 @@ impl Page {
         put_u64_le(&mut *self.bytes, OFF_GENERATION, lsn);
     }
 
-    /// Current `refcount` from the header.
-    pub fn refcount(&self) -> u32 {
-        u32_le(&*self.bytes, OFF_REFCOUNT)
+    /// Current `birth_lsn` (immutable birth-txg) from the header.
+    pub fn birth_lsn(&self) -> Lsn {
+        u64_le(&*self.bytes, OFF_BIRTH)
     }
 
-    /// Overwrite `refcount`. Does not reseal.
-    pub fn set_refcount(&mut self, rc: u32) {
-        put_u32_le(&mut *self.bytes, OFF_REFCOUNT, rc);
+    /// Stamp `birth_lsn`. Must be called exactly once, when the page
+    /// *version* is created (alloc / clone / cow); never on in-place
+    /// modify. Does not reseal.
+    pub fn set_birth_lsn(&mut self, lsn: Lsn) {
+        put_u64_le(&mut *self.bytes, OFF_BIRTH, lsn);
     }
 
     /// Compute the CRC32C over the page buffer with the CRC field zeroed.

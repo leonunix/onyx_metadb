@@ -182,7 +182,15 @@ fn verify_reopened_db(
         }
     }
     drop(db);
-    verify_path(path, VerifyOptions { strict: true })
+    // Birth-txg port Phase 1: the soak is the R1 gate — run the birth-shadow
+    // invariant on every soak-end verify (page-rc stays authoritative).
+    verify_path(
+        path,
+        VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+        },
+    )
 }
 
 fn join_pbas(pbas: &[Pba]) -> String {
