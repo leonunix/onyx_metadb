@@ -348,6 +348,92 @@ fn pending_delta_count_sums_all_slots() {
     assert_eq!(s.pending_delta_count(), 3);
 }
 
+/// REPRO: the cold-path force-fold (`RcShard::flush()` →
+/// `begin_checkpoint_all_slots(force=true)`) RE-APPLIES a decref the array
+/// already reflects, driving a still-live rc below its true floor.
+///
+/// This is the page-rc premature-free the nvme-box buffer-mode snapshot
+/// soak hit. In buffer mode the COW page-rc deltas are staged at DRAIN
+/// time in radix-key order, so their lsns are NON-MONOTONE relative to the
+/// per-array-DATA-PAGE `generation` (= max folded lsn). The fold's only
+/// idempotency is `stage_one_page`'s `!force && page_generation >=
+/// pending.last_lsn` replay-skip — but `flush()` calls
+/// `begin_checkpoint_all_slots(force=true)`, which BYPASSES it. So a decref
+/// that the array has ALREADY folded, if it reappears in a slot with a
+/// `last_lsn <= page_generation` (the non-monotone hazard, or a recovery /
+/// abort-retry residue), is applied a SECOND time by the force fold.
+///
+/// Setup mirrors the array's per-page generation mechanism directly:
+///   1. incref P by 2 at lsn 100, fold → array rc=2, page generation=100.
+///   2. decref P by 1 at lsn 200, fold → array rc=1, page generation=200.
+///      (This is the legitimate, already-durable decref.)
+///   3. re-inject that SAME `-1` decref into a fresh slot at lsn 150
+///      (`last_lsn <= page_generation` of 200 — the non-monotone /
+///      replay-residue shape). A NORMAL fold (`begin_checkpoint(false)`)
+///      MUST replay-skip it (gen 200 >= 150) and leave rc=1.
+///   4. `flush()` force-folds → on the BUGGY path it re-applies the `-1`,
+///      flooring the live rc=1 to 0 — a premature free. The
+///      benign-double-decref clamp (`note_decref_underflow_skip` /
+///      `stage_underflow`) fires when the array base is already 0, which is
+///      exactly the warning flood the soak logged before the corruption.
+///
+/// PASS (today's intent): rc stays at 1 after the force-fold (the fix keeps
+/// the live page referenced). FAIL (buggy force path): rc drops to 0 and
+/// `flush()` would surface P as freed → reuse → page-type corruption.
+#[test]
+fn force_fold_does_not_reapply_decref_array_already_reflects() {
+    let (_d, s) = make_shard();
+    let p: Pba = 4242;
+
+    // 1. incref P by 2 @ lsn 100, fold → array rc=2, page gen=100.
+    s.stage(0, p, 2, 100).unwrap();
+    s.begin_checkpoint(0).unwrap();
+    assert_eq!(s.get(p).unwrap(), 2);
+
+    // 2. legitimate decref -1 @ lsn 200, fold → array rc=1, page gen=200.
+    s.stage(1, p, -1, 200).unwrap();
+    s.begin_checkpoint(1).unwrap();
+    assert_eq!(s.get(p).unwrap(), 1, "live rc after the legitimate decref");
+
+    // 3. The SAME -1 reappears in a fresh slot with a NON-MONOTONE lsn
+    //    (150 <= page generation 200) — the buffer-drain radix-order
+    //    hazard / recovery residue. Inject it straight into the slot so we
+    //    drive the fold directly (a `stage` here would itself clamp on the
+    //    cumulative read; the soak's delta arrives via the COW drain, which
+    //    stages unconditionally into the open TXG slot).
+    s.delta_slots[2].lock().merge(p, -1, 150);
+
+    // A NORMAL (non-force) fold of that slot MUST replay-skip it (page
+    // generation 200 >= 150) and leave the live rc at 1.
+    let c_norm = s.begin_checkpoint(2).unwrap();
+    drop(c_norm);
+    assert_eq!(
+        s.get(p).unwrap(),
+        1,
+        "non-force fold must replay-skip the stale decref (gen 200 >= lsn 150)"
+    );
+
+    // Re-inject the same stale -1 again (the force-fold path the soak takes
+    // is `RcShard::flush()`; recreate the slot residue it would force-fold).
+    s.delta_slots[3].lock().merge(p, -1, 150);
+
+    let clamps_before = crate::refcount::underflow_clamped_total();
+    // 4. The cold-path force-fold (`flush()` →
+    //    begin_checkpoint_all_slots(true)) RE-APPLIES the stale decref,
+    //    bypassing the per-page replay-skip.
+    s.flush().unwrap();
+    let clamps_after = crate::refcount::underflow_clamped_total();
+
+    assert_eq!(
+        s.get(p).unwrap(),
+        1,
+        "force-fold re-applied a decref the array already reflects: live rc \
+         floored to {} (premature page free). underflow clamps fired: {}",
+        s.get(p).unwrap(),
+        clamps_after - clamps_before,
+    );
+}
+
 /// Regression for the rc_authoritative premature-free CRC (2026-06-12 r2
 /// soak, pba 661307): a fold's publish-before-clear window lets a cumulative
 /// read straddle it and double-count a NET-DECREF slot, flooring a still-live
