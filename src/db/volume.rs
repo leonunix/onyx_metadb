@@ -82,6 +82,8 @@ impl Db {
                 parent_vol_ord: None,
                 branched_at_lsn: 0,
                 promotion_cursor: None,
+                page_dead_list_head_pid: crate::types::NULL_PAGE,
+                page_dead_list_tail_pid: crate::types::NULL_PAGE,
             });
             probe.check_encodable()?;
             (ord, shard_count)
@@ -162,6 +164,8 @@ impl Db {
                 parent_vol_ord: None,
                 branched_at_lsn: 0,
                 promotion_cursor: None,
+                page_dead_list_head_pid: crate::types::NULL_PAGE,
+                page_dead_list_tail_pid: crate::types::NULL_PAGE,
             });
             mstate.manifest.next_volume_ord = ord
                 .checked_add(1)
@@ -517,6 +521,8 @@ impl Db {
                 parent_vol_ord: Some(entry.vol_ord),
                 branched_at_lsn: entry.created_lsn,
                 promotion_cursor: None,
+                page_dead_list_head_pid: crate::types::NULL_PAGE,
+                page_dead_list_tail_pid: crate::types::NULL_PAGE,
             });
             probe.check_encodable()?;
             (
@@ -614,6 +620,8 @@ impl Db {
                     Some(src_ord),
                     branched_at_lsn,
                     None,
+                    crate::types::NULL_PAGE,
+                    crate::types::NULL_PAGE,
                 )),
             );
         }
@@ -647,6 +655,8 @@ impl Db {
                 parent_vol_ord: Some(src_ord),
                 branched_at_lsn,
                 promotion_cursor: None,
+                page_dead_list_head_pid: crate::types::NULL_PAGE,
+                page_dead_list_tail_pid: crate::types::NULL_PAGE,
             });
             mstate.manifest.next_volume_ord = new_ord
                 .checked_add(1)
@@ -716,9 +726,8 @@ impl Db {
     /// a page reachable from the head with `birth_lsn <= youngest_snap` is
     /// still pinned by that snapshot. Phase 1 reads it only for the
     /// birth-shadow audit; the COW kill decision stays page-rc-authoritative.
-    // Phase 1 ships the accessor + its unit test ahead of its first runtime
-    // caller (the Phase 2 birth-authoritative kill decision); allow until then.
-    #[allow(dead_code)]
+    /// Phase 2 also reads it on the buffer-fold path to gate which COW'd
+    /// L2P pages enter the HEAD page-deadlist.
     pub(crate) fn youngest_snap(&self, vol: VolumeOrdinal) -> Lsn {
         self.snap_info_cache
             .lock()

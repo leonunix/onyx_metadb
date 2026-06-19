@@ -82,6 +82,115 @@ fn checkpoint_flush_writes_single_page_segment() {
 }
 
 #[test]
+fn page_deadlist_populated_by_snapshot_overwrite() {
+    // ZFS port Phase 2 make-or-break: a live snapshot pins the L2P tree,
+    // so a subsequent overwrite COWs each root→leaf path and the old
+    // (snapshot-pinned) L2P pages "die off the head" and MUST be recorded
+    // into the HEAD page-deadlist. An empty deadlist here would mean the
+    // `effective_rc > 1` COW capture never fires for snapshot-pinned pages
+    // (the whole producing side would be a no-op).
+    let (_d, db) = mk_db();
+    for i in 0u64..300 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let _s1 = db.take_snapshot(0).unwrap();
+    for i in 0u64..300 {
+        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
+    }
+    // Direct mode records at apply; buffer mode at the fold — a flush
+    // forces the fold + drains the head chain to a segment either way.
+    let in_mem = db.test_page_dead_list_len(0).unwrap();
+    db.flush().unwrap();
+    let (head, _tail) = db.test_page_dead_list_anchors(0).unwrap();
+    assert!(
+        in_mem > 0 || head != NULL_PAGE,
+        "snapshot+overwrite recorded NO page deaths (rc>1 COW capture broken): \
+         in_mem={in_mem} head={head}"
+    );
+}
+
+#[test]
+fn page_deadlist_segments_survive_reopen() {
+    // ZFS port Phase 2: the page-deadlist segments live under the new
+    // `page_dead_list_*_pid` anchors (volume) + `page_dead_list_tail_pid`
+    // (snapshots). `collect_live_pages` MUST walk those chains or
+    // `reclaim_orphan_pages` (run on open) frees the segments out from
+    // under the live anchors → page-type corruption on the next walk.
+    let (dir, db) = mk_db();
+    for i in 0u64..300 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let _s1 = db.take_snapshot(0).unwrap();
+    for i in 0u64..300 {
+        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
+    }
+    db.flush().unwrap();
+    let (head_before, tail_before) = db.test_page_dead_list_anchors(0).unwrap();
+    assert_ne!(
+        head_before, NULL_PAGE,
+        "page-deadlist chain should be non-empty after snapshot+overwrite+flush"
+    );
+    drop(db);
+
+    let db = Db::open(dir.path()).unwrap();
+    let (head_after, tail_after) = db.test_page_dead_list_anchors(0).unwrap();
+    assert_eq!(head_after, head_before, "page-deadlist head anchor lost across reopen");
+    assert_eq!(tail_after, tail_before, "page-deadlist tail anchor lost across reopen");
+    let page = db.test_read_page(head_after).unwrap();
+    assert_eq!(
+        page.header().unwrap().page_type,
+        PageType::DeadListSegment,
+        "page-deadlist segment was freed/reused across reopen (orphan-reclaim bug)"
+    );
+    drop(db);
+
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: false,
+            check_birth_shadow: true,
+        },
+    )
+    .unwrap();
+    assert!(report.is_clean(), "verify issues after reopen: {:?}", report.issues);
+}
+
+#[test]
+fn drop_older_snapshot_frees_s_next_deadlist_not_s_own() {
+    // ZFS `process_old_deadlist`: destroying S frees from S_NEXT's
+    // page-deadlist (deaths in `(S, S_next]`), filtered `birth > S_prev`,
+    // NOT S's own (deaths in `(S_prev, S]`, which S never referenced).
+    // The drop shadow assertion HARD-fails (`Corruption`) on a premature
+    // free, so a regression to reading the wrong chain would surface as a
+    // drop error here. We keep two snapshots live and drop the OLDER one
+    // (S_next = the younger snapshot, not HEAD), the exact case the buffer
+    // churn test's rolling window exercises but in fast direct mode.
+    let (_d, db) = mk_db();
+    for i in 0u64..300 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let s1 = db.take_snapshot(0).unwrap();
+    for i in 0u64..300 {
+        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
+    }
+    db.flush().unwrap();
+    let _s2 = db.take_snapshot(0).unwrap();
+    for i in 0u64..300 {
+        db.insert(0, i, v((i as u8).wrapping_add(2))).unwrap();
+    }
+    db.flush().unwrap();
+    // Drop the OLDER snapshot while the younger one is still live.
+    db.drop_snapshot(s1).unwrap().expect("drop older snapshot");
+    // Live data must survive (a premature free would lose a mapping).
+    for i in 0u64..300 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v((i as u8).wrapping_add(2))));
+    }
+}
+
+#[test]
 fn checkpoint_flush_writes_multi_page_segment() {
     let (_d, db) = mk_db();
     // Push past one-page capacity: ~167 records on page 0 + cont

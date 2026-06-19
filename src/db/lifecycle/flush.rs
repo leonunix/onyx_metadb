@@ -560,6 +560,31 @@ impl Db {
                 old_tail: vol
                     .dead_list_tail_pid
                     .load(std::sync::atomic::Ordering::Acquire),
+                kind: DeadListKind::Pba,
+            });
+        }
+        // ZFS port Phase 2: the second, independent chain — L2P page
+        // deaths. Same `drain_up_to_lsn` filter (keeps the chain's
+        // "max_lsn strictly older going backward" invariant); same
+        // segment build / IO / rollback / promotion machinery, just
+        // tagged `Page` so each step touches the page anchors. Bounds
+        // the in-memory `page_dead_list` buffer the same way the PBA
+        // drain bounds `dead_list`.
+        for vol in &volumes {
+            let records = vol.page_dead_list.drain_up_to_lsn(wal_checkpoint);
+            if records.is_empty() {
+                continue;
+            }
+            drained_deadlists.push(DeadListDrainEntry {
+                vol: vol.clone(),
+                records,
+                old_head: vol
+                    .page_dead_list_head_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                old_tail: vol
+                    .page_dead_list_tail_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                kind: DeadListKind::Page,
             });
         }
         if selected.is_empty() && drained_deadlists.is_empty() {
@@ -1009,6 +1034,7 @@ impl Db {
                         page_count: page_count as u32,
                         old_head: entry.old_head,
                         old_tail: entry.old_tail,
+                        kind: entry.kind,
                     });
                 }
                 Err(err) => {
@@ -1112,17 +1138,33 @@ impl Db {
         // manifest commit succeeds — failure paths between here and
         // commit only need `rollback_dead_list_drain` (restore buffer
         // + free pages), they do NOT need to revert atomics.
-        let dead_list_overrides: HashMap<VolumeOrdinal, (PageId, PageId)> = dead_list_plans
-            .iter()
-            .map(|plan| {
-                let new_head = if plan.old_head == crate::types::NULL_PAGE {
-                    plan.start_pid
-                } else {
-                    plan.old_head
-                };
-                (plan.vol.ord, (new_head, plan.start_pid))
-            })
-            .collect();
+        // Split the plans into the two chains' override maps. Each map
+        // is `vol_ord -> (new_head, new_tail)`: a fresh chain (old_head ==
+        // NULL_PAGE) starts its head at the new segment; an existing
+        // chain keeps its head and advances only the tail.
+        let build_overrides = |kind: DeadListKind| -> HashMap<VolumeOrdinal, (PageId, PageId)> {
+            dead_list_plans
+                .iter()
+                .filter(|plan| plan.kind == kind)
+                .map(|plan| {
+                    let new_head = if plan.old_head == crate::types::NULL_PAGE {
+                        plan.start_pid
+                    } else {
+                        plan.old_head
+                    };
+                    (plan.vol.ord, (new_head, plan.start_pid))
+                })
+                .collect()
+        };
+        let dead_list_overrides = build_overrides(DeadListKind::Pba);
+        let mut page_dead_list_overrides = build_overrides(DeadListKind::Page);
+        // ZFS port Phase 2: seal this cycle's pending snapshots' page
+        // deadlists. Each take inherits the head volume's page-deadlist
+        // chain (rewriting its override to (NULL,NULL) so the head resets)
+        // and stamps the inherited tail onto its pending `SnapshotEntry`.
+        // Returns the volumes whose in-memory atomics to reset post-commit.
+        let page_seal_resets =
+            self.seal_pending_snapshot_page_deadlists(txg, &volumes, &mut page_dead_list_overrides);
 
         let manifest_started = std::time::Instant::now();
         // ZFS-TXG-clone Phase 4 gate-shrink: this is the only point in
@@ -1193,6 +1235,7 @@ impl Db {
             &volumes,
             &l2p_checkpoints,
             &dead_list_overrides,
+            &page_dead_list_overrides,
         ) {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
@@ -1334,14 +1377,33 @@ impl Db {
         // of the durable manifest and the next flush would link a
         // new segment to an orphaned tail.
         for plan in &dead_list_plans {
+            let (head_atomic, tail_atomic) = match plan.kind {
+                DeadListKind::Pba => (&plan.vol.dead_list_head_pid, &plan.vol.dead_list_tail_pid),
+                DeadListKind::Page => (
+                    &plan.vol.page_dead_list_head_pid,
+                    &plan.vol.page_dead_list_tail_pid,
+                ),
+            };
             if plan.old_head == crate::types::NULL_PAGE {
-                plan.vol
-                    .dead_list_head_pid
-                    .store(plan.start_pid, std::sync::atomic::Ordering::Release);
+                head_atomic.store(plan.start_pid, std::sync::atomic::Ordering::Release);
             }
-            plan.vol
-                .dead_list_tail_pid
-                .store(plan.start_pid, std::sync::atomic::Ordering::Release);
+            tail_atomic.store(plan.start_pid, std::sync::atomic::Ordering::Release);
+        }
+        // ZFS port Phase 2: snapshots sealed this cycle transferred the
+        // head's page-deadlist chain to themselves, so reset the head's
+        // in-memory page anchors to NULL (the manifest VolumeEntry already
+        // carries NULL via the (NULL,NULL) override). Runs AFTER the
+        // promotion above so a snapshotted volume that also had a fresh
+        // page segment this cycle ends at NULL, not the promoted tail.
+        // Crash before this is recovered: reopen loads the atomics from
+        // the durable (NULL) manifest anchors.
+        for vol_ord in &page_seal_resets {
+            if let Some(vol) = volumes.iter().find(|v| v.ord == *vol_ord) {
+                vol.page_dead_list_head_pid
+                    .store(crate::types::NULL_PAGE, std::sync::atomic::Ordering::Release);
+                vol.page_dead_list_tail_pid
+                    .store(crate::types::NULL_PAGE, std::sync::atomic::Ordering::Release);
+            }
         }
         self.faults
             .inject(FaultPoint::DeadListPostManifestBeforeNextFlush)?;
@@ -1616,7 +1678,10 @@ impl Db {
         for entry in drained.iter_mut() {
             let records = std::mem::take(&mut entry.records);
             if !records.is_empty() {
-                entry.vol.dead_list.restore_front(records);
+                match entry.kind {
+                    DeadListKind::Pba => entry.vol.dead_list.restore_front(records),
+                    DeadListKind::Page => entry.vol.page_dead_list.restore_front(records),
+                }
             }
         }
         for plan in plans {

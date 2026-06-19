@@ -7,8 +7,9 @@ mod volume;
 
 pub(super) use dedup::{apply_dedup_delete_with_rc, apply_dedup_put_with_rc, apply_free_pbas};
 pub(super) use l2p::{
-    apply_l2p_range_delete, apply_l2p_remap, apply_l2p_remap_range, record_dead, scan_l2p_range,
-    seq_guard_rejects, stage_delete_rc, stage_remap_rc, stamp_birth_lsn,
+    apply_l2p_range_delete, apply_l2p_remap, apply_l2p_remap_range, drain_page_deaths_into,
+    record_dead, scan_l2p_range, seq_guard_rejects, stage_delete_rc, stage_remap_rc,
+    stamp_birth_lsn,
 };
 pub(super) use promotion::{apply_promotion_chunk, apply_promotion_complete};
 pub(super) use volume::{
@@ -122,8 +123,8 @@ pub(super) fn apply_op_bare(
             // freed-pba slot, so a net rc==0 here is reclaimed by onyx's GC
             // paths (rc stays authoritative). Phase-5 (flag off): dead-list +
             // lineage GC.
+            let snap_infos = snap_info_for_vol(*vol_ord);
             if rc_authoritative {
-                let snap_infos = snap_info_for_vol(*vol_ord);
                 stage_remap_rc(
                     refcount_shards,
                     txg,
@@ -138,6 +139,10 @@ pub(super) fn apply_op_bare(
             } else {
                 record_dead(volume, prev, lsn);
             }
+            // ZFS port Phase 2: L2pPut COWs the root→leaf path on a direct
+            // (non-buffer) write; record any page it displaced off the
+            // head. Buffer mode COWs in the fold (witness empty here).
+            l2p::drain_page_deaths(volume, &mut tree, &snap_infos);
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::L2pDelete { vol_ord, lba } => {
@@ -167,10 +172,13 @@ pub(super) fn apply_op_bare(
             // rc-authoritative: decref the deleted reference inline, suppressed
             // when a live snapshot still pins it (`stage_delete_rc`). Phase-5
             // (flag off): dead-list + lineage GC drives reclaim.
+            let snap_infos = snap_info_for_vol(*vol_ord);
             if rc_authoritative {
-                let snap_infos = snap_info_for_vol(*vol_ord);
                 stage_delete_rc(refcount_shards, txg, &tree, sid, *lba, prev, &snap_infos, lsn)?;
             }
+            // ZFS port Phase 2: a direct delete COWs the path to the
+            // deleted leaf; record any displaced page.
+            l2p::drain_page_deaths(volume, &mut tree, &snap_infos);
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         // [[no-refcount-hot-path-design]] Phase 5: `DedupPut` is now the

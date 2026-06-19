@@ -76,6 +76,21 @@ struct DeadListDrainEntry {
     records: Vec<crate::deadlist::DeadRecord>,
     old_head: PageId,
     old_tail: PageId,
+    kind: DeadListKind,
+}
+
+/// Which of a volume's two independent dead-list chains a drain
+/// entry / segment plan belongs to. Both reuse the `DeadListSegment`
+/// codec; they differ only in the buffer drained (`vol.dead_list` vs
+/// `vol.page_dead_list`) and the manifest anchors promoted
+/// (`dead_list_*_pid` vs `page_dead_list_*_pid`). The PBA chain
+/// (`Pba`) records data-block deaths for lineage GC; the page chain
+/// (`Page`, ZFS port Phase 2) records L2P-metadata-page deaths for
+/// `drop_snapshot`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadListKind {
+    Pba,
+    Page,
 }
 
 /// One volume's allocated segment in the IO phase: the contiguous page
@@ -88,6 +103,7 @@ struct DeadListSegmentPlan {
     page_count: u32,
     old_head: PageId,
     old_tail: PageId,
+    kind: DeadListKind,
 }
 
 /// RAII counterpart for the async dedup-index drainers: the flush
@@ -552,6 +568,7 @@ impl Db {
             out
         };
         for vol in vols {
+            let youngest_snap = self.youngest_snap(vol.ord);
             for shard in &vol.shards {
                 if !shard.use_buffer {
                     continue;
@@ -588,6 +605,13 @@ impl Db {
                 );
                 match apply_result {
                     Ok(()) => {
+                        // ZFS port Phase 2: harvest page-deaths from this
+                        // all-slots fold before releasing the tree lock.
+                        super::apply::drain_page_deaths_into(
+                            &vol.page_dead_list,
+                            &mut tree,
+                            youngest_snap,
+                        );
                         super::apply::publish_l2p_read_view(shard, &tree);
                         drop(tree);
                         shard.l2p_buffer.note_compacted(max_lsn);
@@ -661,6 +685,12 @@ impl Db {
             let results: Vec<Result<()>> = std::thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for vol in &vols {
+                    // Youngest snapshot pinning this volume's pages (ZFS
+                    // `prev_snap_txg`); computed once per volume, captured
+                    // by the per-shard fold tasks for the page-deadlist
+                    // birth gate.
+                    let youngest_snap = self.youngest_snap(vol.ord);
+                    let page_dead_list = &vol.page_dead_list;
                     for (shard_idx, shard) in vol.shards.iter().enumerate() {
                         if !shard.use_buffer {
                             continue;
@@ -674,7 +704,14 @@ impl Db {
                             // runs unpinned at normal priority) — without
                             // either, all 16 pile onto one core.
                             crate::affinity::bind_for_l2p_drain(shard_idx);
-                            Self::drain_one_syncing_shard(shard, txg, metrics, chunk_entries)
+                            Self::drain_one_syncing_shard(
+                                shard,
+                                txg,
+                                metrics,
+                                chunk_entries,
+                                page_dead_list,
+                                youngest_snap,
+                            )
                         }));
                     }
                 }
@@ -691,11 +728,19 @@ impl Db {
             }
         } else {
             for vol in &vols {
+                let youngest_snap = self.youngest_snap(vol.ord);
                 for shard in &vol.shards {
                     if !shard.use_buffer {
                         continue;
                     }
-                    Self::drain_one_syncing_shard(shard, txg, metrics, chunk_entries)?;
+                    Self::drain_one_syncing_shard(
+                        shard,
+                        txg,
+                        metrics,
+                        chunk_entries,
+                        &vol.page_dead_list,
+                        youngest_snap,
+                    )?;
                 }
             }
         }
@@ -728,6 +773,8 @@ impl Db {
         txg: crate::types::Txg,
         metrics: &crate::metrics::MetaMetrics,
         chunk_entries: usize,
+        page_dead_list: &crate::deadlist::DeadListState,
+        youngest_snap: Lsn,
     ) -> Result<()> {
         let started = std::time::Instant::now();
         // Snapshot (clone) the frozen syncing slot WITHOUT the tree lock so the
@@ -757,6 +804,11 @@ impl Db {
             }
             let mut tree = shard.tree.write();
             super::txg_sync::apply_drain_ops(&mut tree, &plan[start..end], txg)?;
+            // ZFS port Phase 2: this fold COW'd L2P pages off the head;
+            // record the snapshot-pinned ones into the HEAD page-deadlist
+            // (buffer mode's only COW point — the apply-time witness was
+            // empty for buffered writes).
+            super::apply::drain_page_deaths_into(page_dead_list, &mut tree, youngest_snap);
             if end == plan.len() {
                 // Publish BEFORE clearing the slot (see method doc), under
                 // the final chunk's hold like the one-shot fold did.

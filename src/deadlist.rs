@@ -111,6 +111,14 @@ impl DeadListState {
         *guard = records;
     }
 
+    /// Non-destructive snapshot of the buffered records. Used by the
+    /// drop-snapshot page-deadlist shadow check to read the HEAD's live
+    /// deaths (the youngest snapshot's `S_next` is the head) without
+    /// disturbing the accumulator the next flush will drain.
+    pub fn peek(&self) -> Vec<DeadRecord> {
+        self.records.lock().clone()
+    }
+
     pub fn len(&self) -> usize {
         self.records.lock().len()
     }
@@ -323,6 +331,43 @@ fn decode_records(buf: &[u8], count: usize, out: &mut Vec<DeadRecord>) {
         });
         off += DEAD_RECORD_BYTES;
     }
+}
+
+/// Read every [`DeadRecord`] from a chain, walking `tail_pid` backward
+/// through `prev_seg_pid` to `NULL_PAGE`. Used by `drop_snapshot` (ZFS
+/// port Phase 2) to consume a dropped snapshot's immutable page-deadlist.
+/// Order is tail-segment-first; callers that need a set don't care.
+pub fn read_chain_records<F>(tail_pid: PageId, read_page: F) -> Result<Vec<DeadRecord>>
+where
+    F: Fn(PageId) -> Result<Page>,
+{
+    let mut out = Vec::new();
+    if tail_pid == NULL_PAGE {
+        return Ok(out);
+    }
+    let mut cur = tail_pid;
+    loop {
+        let head_page = read_page(cur)?;
+        let h = head_page.header()?;
+        if h.page_type != PageType::DeadListSegment {
+            return Err(MetaDbError::Corruption(format!(
+                "page-deadlist chain page {cur} has wrong page_type {:?}",
+                h.page_type
+            )));
+        }
+        let header = SegmentHeader::decode(head_page.payload())?;
+        let cont_pages: Vec<Page> = (1..header.seg_page_count as u64)
+            .map(|i| read_page(cur + i))
+            .collect::<Result<_>>()?;
+        let cont_payloads: Vec<&[u8]> = cont_pages.iter().map(|p| &p.payload()[..]).collect();
+        let mut recs = read_segment_records(head_page.payload(), &cont_payloads)?;
+        out.append(&mut recs);
+        if header.prev_seg_pid == NULL_PAGE {
+            break;
+        }
+        cur = header.prev_seg_pid;
+    }
+    Ok(out)
 }
 
 /// Walk a volume's segment chain from `tail_pid` backward through

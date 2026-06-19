@@ -46,6 +46,16 @@ pub struct PagedL2p {
     private_pages: PageIdSet,
     retired_pages: PageIdSet,
     checkpoint_protected: PageIdSet,
+    /// ZFS port Phase 2 (page-deadlist) witness: L2P pages displaced off
+    /// the head by a *shared* COW this op — `DeadRecord{pba=old_pid,
+    /// birth_lsn, death_lsn=cow lsn}`, captured at the `effective_rc > 1`
+    /// clone branch. rc>1 means the old page is still pinned by a snapshot
+    /// (Phase-1 invariant: head-reachable `rc>1 ⟺ birth<=youngest_snap`),
+    /// so it "died off the head" but survives for the snapshot — the ZFS
+    /// `dsl_dataset_block_kill` deferred-free case. Drained per op by the
+    /// apply / fold layer via [`take_cow_displaced`](Self::take_cow_displaced);
+    /// cleared on the op error path (mirrors `clear_rc_deltas`).
+    cow_displaced: Vec<crate::deadlist::DeadRecord>,
 }
 
 pub(crate) struct Checkpoint {
@@ -124,6 +134,7 @@ impl PagedL2p {
             private_pages: PageIdSet::default(),
             retired_pages: PageIdSet::default(),
             checkpoint_protected: PageIdSet::default(),
+            cow_displaced: Vec::new(),
         })
     }
 
@@ -151,6 +162,7 @@ impl PagedL2p {
             private_pages: PageIdSet::default(),
             retired_pages: PageIdSet::default(),
             checkpoint_protected: PageIdSet::default(),
+            cow_displaced: Vec::new(),
         })
     }
 
@@ -182,6 +194,7 @@ impl PagedL2p {
             private_pages: PageIdSet::default(),
             retired_pages: PageIdSet::default(),
             checkpoint_protected: PageIdSet::default(),
+            cow_displaced: Vec::new(),
         })
     }
 
@@ -209,6 +222,7 @@ impl PagedL2p {
             private_pages: PageIdSet::default(),
             retired_pages: PageIdSet::default(),
             checkpoint_protected: PageIdSet::default(),
+            cow_displaced: Vec::new(),
         })
     }
 
@@ -335,11 +349,32 @@ impl PagedL2p {
             self.retired_pages.insert(pid);
             return Ok(new_pid);
         }
+        // SHARED COW (`effective_rc > 1`): `pid` is pinned by a snapshot
+        // (Phase-1 invariant), so cloning it leaves the old version alive
+        // for that snapshot — it "dies off the head" here. Capture
+        // `(pid, birth, death=lsn)` BEFORE the COW consumes the slot; the
+        // apply / fold layer drains it into the HEAD page-deadlist. birth
+        // read is cheap (the page is already cache-resident for the COW).
+        let birth = self.buf.read(pid)?.birth_lsn();
         let new_pid = self.buf.cow_for_write(pid, lsn)?;
         if new_pid != pid {
             self.private_pages.insert(new_pid);
+            self.cow_displaced.push(crate::deadlist::DeadRecord {
+                pba: pid,
+                birth_lsn: birth,
+                death_lsn: lsn,
+            });
         }
         Ok(new_pid)
+    }
+
+    /// Drain the page-deadlist witness accumulated by this op's shared
+    /// COWs (ZFS port Phase 2). Called by the apply / compactor-fold layer
+    /// after the op's rc deltas commit; each record whose
+    /// `birth_lsn <= youngest_snap` is appended to the volume's HEAD
+    /// page-deadlist. Records carry the dying `PageId` in `DeadRecord.pba`.
+    pub(crate) fn take_cow_displaced(&mut self) -> Vec<crate::deadlist::DeadRecord> {
+        std::mem::take(&mut self.cow_displaced)
     }
 
     fn free_detached(&mut self, pid: PageId, generation: Lsn) -> Result<()> {
@@ -1021,6 +1056,10 @@ impl PagedL2p {
             }
             Err(e) => {
                 self.buf.clear_rc_deltas();
+                // The op aborted: its COW page-deaths never became durable,
+                // so drop the witness too (mirrors `clear_rc_deltas`). A
+                // successful op leaves it for the apply / fold layer.
+                self.cow_displaced.clear();
                 Err(e)
             }
         }

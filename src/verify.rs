@@ -363,6 +363,18 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
             volume.dead_list_tail_pid,
             &mut live,
         )?;
+        // ZFS port Phase 2: the volume's HEAD page-deadlist chain (L2P
+        // metadata-page deaths) is a SECOND independent chain. Without
+        // marking it, `reclaim_orphan_pages` (run on open) would free its
+        // segments out from under the live manifest anchors → page-type
+        // corruption on the next walk. Same `DeadListSegment` codec, so
+        // the same chain walker applies.
+        walk_dead_list_chain(
+            page_store,
+            volume.page_dead_list_head_pid,
+            volume.page_dead_list_tail_pid,
+            &mut live,
+        )?;
     }
     for &meta_pid in manifest.refcount_shard_roots.iter() {
         if meta_pid == NULL_PAGE {
@@ -405,6 +417,19 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         }
         // v6 dropped per-snapshot refcount state; refcount tree is
         // walked once at the top level above.
+        // ZFS port Phase 2: a snapshot owns the sealed page-deadlist chain
+        // it inherited from the head at take time. Only the tail anchor is
+        // stored (the chain is immutable, head implicit at
+        // `prev_seg_pid == NULL_PAGE`), so walk it to NULL and mark every
+        // segment page live — else orphan reclaim frees it on reopen.
+        if snapshot.page_dead_list_tail_pid != NULL_PAGE {
+            for pid in crate::deadlist::walk_chain_pages(
+                snapshot.page_dead_list_tail_pid,
+                |p| page_store.read_page(p),
+            )? {
+                live.mark(pid);
+            }
+        }
     }
 
     // The legacy `dedup_index_shard_heads` manifest slot now carries

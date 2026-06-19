@@ -63,6 +63,54 @@ pub(in crate::db) fn record_dead(volume: &Volume, prev: Option<L2pValue>, death_
     }
 }
 
+/// Youngest live snapshot's `created_lsn` across `snap_infos`, or `0`
+/// when the volume has no live snapshot (ZFS `prev_snap_txg` analogue).
+#[inline]
+pub(in crate::db) fn youngest_snap_lsn(snap_infos: &[SnapInfo]) -> Lsn {
+    snap_infos.iter().map(|s| s.created_lsn).max().unwrap_or(0)
+}
+
+/// ZFS port Phase 2: drain the tree's page-deadlist witness (L2P pages
+/// displaced off the head by a shared COW this op) and append the
+/// snapshot-pinned survivors (`birth_lsn <= youngest_snap`) to the
+/// volume's HEAD page-deadlist. ALWAYS drains the witness (so it never
+/// leaks into the next op even when no snapshot is live); the
+/// `birth <= youngest` filter naturally records nothing when `youngest`
+/// is 0. Fires from BOTH the direct-apply tree COW and the buffer-fold
+/// COW (the only two `cow_for_write` entry points). The records carry
+/// the dying `PageId` in `DeadRecord.pba` (same 24 B codec as the PBA
+/// dead-list; distinguished only by the owning anchor).
+#[inline]
+pub(in crate::db) fn drain_page_deaths(
+    volume: &Volume,
+    tree: &mut PagedL2p,
+    snap_infos: &[SnapInfo],
+) {
+    drain_page_deaths_into(&volume.page_dead_list, tree, youngest_snap_lsn(snap_infos));
+}
+
+/// Lower-level page-death drainer used by the buffer-fold path, which
+/// has the volume's `page_dead_list` + a precomputed `youngest` but not
+/// the full `snap_infos`. ALWAYS drains the witness (clears it so it
+/// can't leak into the next fold); only records when a snapshot is live
+/// (`youngest > 0`) and the page predates it (`birth_lsn <= youngest`).
+#[inline]
+pub(in crate::db) fn drain_page_deaths_into(
+    page_dead_list: &crate::deadlist::DeadListState,
+    tree: &mut PagedL2p,
+    youngest: Lsn,
+) {
+    let displaced = tree.take_cow_displaced();
+    if youngest == 0 {
+        return;
+    }
+    for rec in displaced {
+        if rec.birth_lsn <= youngest {
+            page_dead_list.push(rec);
+        }
+    }
+}
+
 /// Does any live snapshot in `snap_infos` pin `target` at `lba`? A snapshot
 /// pins it iff its point-in-time L2P maps `lba` to the *exact same* 28-byte
 /// value (audit semantics count distinct `(V, lba, value)` tuples, so two
@@ -227,6 +275,11 @@ pub(in crate::db) fn apply_l2p_remap(
     if !use_buffer {
         publish_l2p_read_view(&volume.shards[l2p_sid], &tree);
     }
+    // ZFS port Phase 2: record any L2P page this remap's COW displaced
+    // off the head into the HEAD page-deadlist. Direct mode COWs at
+    // `tree.insert_at_lsn` above; buffer mode COWs later in the fold (the
+    // witness is empty here, drained by the fold instead).
+    drain_page_deaths(volume, &mut tree, snap_infos);
 
     Ok(ApplyOutcome::L2pRemap {
         applied: true,
@@ -537,6 +590,11 @@ pub(in crate::db) fn apply_l2p_remap_range(
         if !shard.use_buffer {
             publish_l2p_read_view(shard, &tree);
         }
+        // ZFS port Phase 2: drain this bucket's COW page-deaths. Only the
+        // tree-locked path COWs (the lock-light buffer path `continue`d
+        // above without touching the tree); buffer-mode COW happens in
+        // the fold.
+        drain_page_deaths(volume, &mut tree, snap_infos);
     }
 
     Ok(ApplyOutcome::L2pRemapRange {
@@ -637,6 +695,9 @@ pub(in crate::db) fn apply_l2p_range_delete(
             }
         }
         publish_l2p_read_view(&volume.shards[sid], &tree);
+        // ZFS port Phase 2: a range delete COWs the path to each deleted
+        // leaf; record any page displaced off the head.
+        drain_page_deaths(volume, &mut tree, snap_infos);
     }
 
     Ok(ApplyOutcome::RangeDelete { freed_pbas })

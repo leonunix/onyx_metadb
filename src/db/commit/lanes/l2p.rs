@@ -84,6 +84,11 @@ impl Db {
         // planner footprint in `build_lane_dispatch_plan`. Default-off path
         // (Phase-5) emits nothing — `rc_actions` stays empty.
         rc_authoritative: bool,
+        // ZFS port Phase 2: youngest live snapshot's `created_lsn` for this
+        // volume, captured by the dispatcher before the lane runs. Gates
+        // which COW-displaced L2P pages enter the HEAD page-deadlist. `0`
+        // (no live snapshot, or the replay path) records nothing.
+        youngest_snap: Lsn,
     ) -> Result<L2pBucketApplyResult> {
         let mut outcomes = Vec::with_capacity(indices.len());
         let mut rc_actions = Vec::new();
@@ -432,6 +437,12 @@ impl Db {
             } else {
                 super::apply::publish_l2p_read_view(shard, &tree);
             }
+            // ZFS port Phase 2: the laned tree-mode apply COWs each
+            // root→leaf path; drain the page-death witness into the HEAD
+            // page-deadlist. This is the dominant write path (single +
+            // batched L2pPut/L2pDelete/unguarded L2pRemap all land here),
+            // so it MUST drain — otherwise the witness leaks across ops.
+            super::apply::drain_page_deaths_into(&volume.page_dead_list, &mut tree, youngest_snap);
         }
         let publish_elapsed = publish_started.elapsed();
         apply_result?;

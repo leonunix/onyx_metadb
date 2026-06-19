@@ -1101,6 +1101,20 @@ struct Volume {
     /// Loaded from `VolumeEntry.dead_list_tail_pid` on `Db::open`, advanced
     /// on every checkpoint flush that writes a new segment.
     dead_list_tail_pid: AtomicU64,
+    /// v18 (ZFS port Phase 2): in-memory HEAD page-deadlist append buffer.
+    /// Holds `(PageId, birth_lsn, death_lsn)` for L2P metadata pages that
+    /// died off the head during COW while pinned by a snapshot. Separate
+    /// from `dead_list` (PBAs) above; same [`crate::deadlist`] codec.
+    /// Pushed by the apply-layer / compactor-fold emitter, drained at
+    /// checkpoint, sealed into a snapshot on `take_snapshot`.
+    page_dead_list: Arc<crate::deadlist::DeadListState>,
+    /// v18: oldest segment of the HEAD page-deadlist chain. Loaded from
+    /// `VolumeEntry.page_dead_list_head_pid`; reset to `NULL_PAGE` when a
+    /// snapshot seals the chain.
+    page_dead_list_head_pid: AtomicU64,
+    /// v18: newest segment of the HEAD page-deadlist chain (apply-time
+    /// append anchor). Loaded from `VolumeEntry.page_dead_list_tail_pid`.
+    page_dead_list_tail_pid: AtomicU64,
     /// Phase 4 lineage tracking — mirrors
     /// [`VolumeEntry::parent_vol_ord`]. `INVALID_VOLUME` encodes
     /// `Option::None`. Loaded on `Db::open`; mutated only by clone /
@@ -1128,6 +1142,9 @@ impl Volume {
             dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             dead_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
             dead_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            page_dead_list: Arc::new(crate::deadlist::DeadListState::new()),
+            page_dead_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            page_dead_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
             parent_vol_ord: parking_lot::RwLock::new(None),
             branched_at_lsn: 0,
             promotion_cursor: parking_lot::RwLock::new(None),
@@ -1149,6 +1166,9 @@ impl Volume {
             dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             dead_list_head_pid: AtomicU64::new(head_pid),
             dead_list_tail_pid: AtomicU64::new(tail_pid),
+            page_dead_list: Arc::new(crate::deadlist::DeadListState::new()),
+            page_dead_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            page_dead_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
             parent_vol_ord: parking_lot::RwLock::new(None),
             branched_at_lsn: 0,
             promotion_cursor: parking_lot::RwLock::new(None),
@@ -1162,6 +1182,7 @@ impl Volume {
     /// starts. `branched_at_lsn` is immutable for the volume's lifetime
     /// (it pins the slice of parent history the clone shares); the
     /// other two move only on explicit lineage events.
+    #[allow(clippy::too_many_arguments)]
     fn with_lineage(
         ord: VolumeOrdinal,
         shards: Vec<L2pShard>,
@@ -1171,6 +1192,8 @@ impl Volume {
         parent_vol_ord: Option<VolumeOrdinal>,
         branched_at_lsn: Lsn,
         promotion_cursor: Option<crate::types::Lba>,
+        page_dead_list_head_pid: crate::types::PageId,
+        page_dead_list_tail_pid: crate::types::PageId,
     ) -> Self {
         Self {
             ord,
@@ -1180,6 +1203,9 @@ impl Volume {
             dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             dead_list_head_pid: AtomicU64::new(head_pid),
             dead_list_tail_pid: AtomicU64::new(tail_pid),
+            page_dead_list: Arc::new(crate::deadlist::DeadListState::new()),
+            page_dead_list_head_pid: AtomicU64::new(page_dead_list_head_pid),
+            page_dead_list_tail_pid: AtomicU64::new(page_dead_list_tail_pid),
             parent_vol_ord: parking_lot::RwLock::new(parent_vol_ord),
             branched_at_lsn,
             promotion_cursor: parking_lot::RwLock::new(promotion_cursor),
@@ -1483,6 +1509,44 @@ impl Db {
                     .load(std::sync::atomic::Ordering::Acquire),
             )
         })
+    }
+
+    /// ZFS port Phase 2 test helper: number of buffered records in the
+    /// HEAD page-deadlist (L2P-page deaths captured but not yet drained
+    /// to a segment). Used to prove the COW witness actually populates.
+    pub(crate) fn test_page_dead_list_len(&self, vol_ord: VolumeOrdinal) -> Option<usize> {
+        self.volumes
+            .read()
+            .get(&vol_ord)
+            .map(|v| v.page_dead_list.len())
+    }
+
+    /// ZFS port Phase 2 test helper: the volume's HEAD page-deadlist
+    /// `(head_pid, tail_pid)` anchors.
+    pub(crate) fn test_page_dead_list_anchors(
+        &self,
+        vol_ord: VolumeOrdinal,
+    ) -> Option<(PageId, PageId)> {
+        self.volumes.read().get(&vol_ord).map(|v| {
+            (
+                v.page_dead_list_head_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                v.page_dead_list_tail_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        })
+    }
+
+    /// ZFS port Phase 2 test helper: a snapshot's sealed page-deadlist
+    /// tail anchor, by snapshot id.
+    pub(crate) fn test_snapshot_page_dead_list_tail(&self, id: SnapshotId) -> Option<PageId> {
+        self.manifest_state
+            .lock()
+            .manifest
+            .snapshots
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.page_dead_list_tail_pid)
     }
 
     /// Test helper: read a page through the underlying `PageStore` so

@@ -120,6 +120,8 @@ impl Db {
             parent_vol_ord: None,
             branched_at_lsn: 0,
             promotion_cursor: None,
+            page_dead_list_head_pid: crate::types::NULL_PAGE,
+            page_dead_list_tail_pid: crate::types::NULL_PAGE,
         }];
         manifest.next_volume_ord = BOOTSTRAP_VOLUME_ORD + 1;
         manifest_store.commit(&manifest)?;
@@ -402,6 +404,8 @@ impl Db {
                     entry.parent_vol_ord,
                     entry.branched_at_lsn,
                     entry.promotion_cursor,
+                    entry.page_dead_list_head_pid,
+                    entry.page_dead_list_tail_pid,
                 )),
             );
         }
@@ -994,6 +998,8 @@ fn apply_lifecycle_record_replay(
                     parent_vol_ord: None,
                     branched_at_lsn: 0,
                     promotion_cursor: None,
+                    page_dead_list_head_pid: crate::types::NULL_PAGE,
+                    page_dead_list_tail_pid: crate::types::NULL_PAGE,
                 });
                 outcome.mutated_volumes = true;
             }
@@ -1068,6 +1074,8 @@ fn apply_lifecycle_record_replay(
                         Some(*src_ord),
                         branched_at_lsn,
                         None,
+                        crate::types::NULL_PAGE,
+                        crate::types::NULL_PAGE,
                     )),
                 );
                 let durable_seqs = vec![lsn; shard_count as usize].into_boxed_slice();
@@ -1083,6 +1091,8 @@ fn apply_lifecycle_record_replay(
                     parent_vol_ord: Some(*src_ord),
                     branched_at_lsn,
                     promotion_cursor: None,
+                    page_dead_list_head_pid: crate::types::NULL_PAGE,
+                    page_dead_list_tail_pid: crate::types::NULL_PAGE,
                 });
                 outcome.mutated_volumes = true;
             }

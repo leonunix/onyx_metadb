@@ -58,6 +58,16 @@ pub struct VolumeEntry {
     /// volume — both for fresh top-level volumes and for clones whose
     /// promotion has reached the end of the keyspace.
     pub promotion_cursor: Option<Lba>,
+    /// v18 (ZFS port Phase 2): oldest segment of this volume's HEAD
+    /// page-deadlist — the L2P metadata `PageId`s that died off the head
+    /// during COW while pinned by a snapshot. Independent of the PBA
+    /// `dead_list_head_pid` above; same `DeadListSegment` codec, separate
+    /// chain. `NULL_PAGE` while empty. `take_snapshot` seals this chain
+    /// into the new snapshot and resets these anchors to `NULL_PAGE`.
+    pub page_dead_list_head_pid: PageId,
+    /// v18: newest segment of the HEAD page-deadlist (append anchor for
+    /// the next checkpoint flush). `NULL_PAGE` while empty.
+    pub page_dead_list_tail_pid: PageId,
 }
 
 /// Size of a [`VolumeEntry`]'s fixed header when encoded inline. The
@@ -67,6 +77,8 @@ pub struct VolumeEntry {
 /// v14 grew it by another 20 B for Phase 4 lineage tracking:
 /// `parent_vol_ord` (2) + alignment pad (2) + `branched_at_lsn` (8) +
 /// `promotion_cursor` (8).
+/// v18 grew it by another 16 B for the HEAD page-deadlist anchors:
+/// `page_dead_list_head_pid` (8) + `page_dead_list_tail_pid` (8).
 pub const VOLUME_ENTRY_FIXED_SIZE: usize = 2 /* ord */
     + 4 /* shard_count */
     + 8 /* created_lsn */
@@ -77,7 +89,9 @@ pub const VOLUME_ENTRY_FIXED_SIZE: usize = 2 /* ord */
     + 2 /* parent_vol_ord (u16, INVALID_VOLUME = None) */
     + 2 /* reserved / alignment */
     + 8 /* branched_at_lsn */
-    + 8 /* promotion_cursor (Lba, PROMOTION_CURSOR_NONE = None) */;
+    + 8 /* promotion_cursor (Lba, PROMOTION_CURSOR_NONE = None) */
+    + 8 /* page_dead_list_head_pid (v18) */
+    + 8 /* page_dead_list_tail_pid (v18) */;
 
 /// Inline-encoded byte length of a volume entry with the given shard count.
 ///
@@ -138,6 +152,9 @@ pub fn encode_volume_entry_inline(
     buf[*off + 36..*off + 44].copy_from_slice(&entry.branched_at_lsn.to_le_bytes());
     let cursor_raw = entry.promotion_cursor.unwrap_or(PROMOTION_CURSOR_NONE);
     buf[*off + 44..*off + 52].copy_from_slice(&cursor_raw.to_le_bytes());
+    // v18: HEAD page-deadlist anchors.
+    buf[*off + 52..*off + 60].copy_from_slice(&entry.page_dead_list_head_pid.to_le_bytes());
+    buf[*off + 60..*off + 68].copy_from_slice(&entry.page_dead_list_tail_pid.to_le_bytes());
     *off += VOLUME_ENTRY_FIXED_SIZE;
     for root in entry.l2p_shard_roots.iter().copied() {
         buf[*off..*off + 8].copy_from_slice(&root.to_le_bytes());
@@ -191,6 +208,18 @@ pub fn decode_volume_entry_inline(
     } else {
         Some(cursor_raw)
     };
+    // v18 HEAD page-deadlist anchors. v17 (and older) databases are
+    // flag-day rejected at manifest open, so v18 always reads both; the
+    // `NULL_PAGE` fallback is dead code kept for the body_version gate
+    // symmetry with the durable_seq tail below.
+    let (page_dead_list_head_pid, page_dead_list_tail_pid) = if body_version >= 18 {
+        (
+            u64::from_le_bytes(buf[*off + 52..*off + 60].try_into().unwrap()),
+            u64::from_le_bytes(buf[*off + 60..*off + 68].try_into().unwrap()),
+        )
+    } else {
+        (crate::types::NULL_PAGE, crate::types::NULL_PAGE)
+    };
     *off += VOLUME_ENTRY_FIXED_SIZE;
     let needed_roots = shard_count as usize * size_of::<PageId>();
     if buf.len() < *off + needed_roots {
@@ -237,5 +266,7 @@ pub fn decode_volume_entry_inline(
         parent_vol_ord,
         branched_at_lsn,
         promotion_cursor,
+        page_dead_list_head_pid,
+        page_dead_list_tail_pid,
     })
 }

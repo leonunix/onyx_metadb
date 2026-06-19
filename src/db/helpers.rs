@@ -109,6 +109,12 @@ pub(super) fn refresh_manifest_entries(
             parent_vol_ord: *vol.parent_vol_ord.read(),
             branched_at_lsn: vol.branched_at_lsn,
             promotion_cursor: *vol.promotion_cursor.read(),
+            page_dead_list_head_pid: vol
+                .page_dead_list_head_pid
+                .load(std::sync::atomic::Ordering::Acquire),
+            page_dead_list_tail_pid: vol
+                .page_dead_list_tail_pid
+                .load(std::sync::atomic::Ordering::Acquire),
         });
     }
     manifest.volumes = new_entries;

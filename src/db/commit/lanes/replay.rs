@@ -149,6 +149,11 @@ impl Db {
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
                         rc_authoritative,
+                        // ZFS port Phase 2: WAL replay does not re-record
+                        // page deaths (they were recorded + sealed/drained
+                        // pre-crash); `0` drains+discards the witness so it
+                        // cannot leak, without double-recording.
+                        0,
                     );
                     let _ = tx.send(result);
                 }),
@@ -352,6 +357,8 @@ impl Db {
                 &refcount_shards_vec,
                 metrics.as_ref(),
                 rc_authoritative,
+                // ZFS port Phase 2: replay does not re-record page deaths.
+                0,
             )?;
             for (idx, outcome) in result.outcomes {
                 merge_l2p_outcome(&mut outcomes, idx, outcome);

@@ -116,7 +116,23 @@ use crate::types::{
 /// Old v16 manifests are hard-rejected on open — no on-disk migration
 /// (see plan `peaceful-finding-neumann.md` Phase A; backcompat is
 /// waived pre-release, onyx rebuilds metadb on schema change).
-pub const MANIFEST_BODY_VERSION: u32 = 17;
+///
+/// v18 (ZFS birth-txg port Phase 2: per-snapshot page-deadlist): adds a
+/// SECOND, independent dead-list of L2P metadata `PageId`s (the existing
+/// per-volume dead-list tracks data `Pba`s and is untouched). The head
+/// volume accumulates page-deaths during COW into a live chain anchored
+/// by `VolumeEntry.page_dead_list_{head,tail}_pid` (+16 B fixed header);
+/// each snapshot seals its slice into an immutable chain anchored by
+/// `SnapshotEntry.page_dead_list_tail_pid` (grows `SNAPSHOT_ENTRY_SIZE`
+/// 32 → 40). Both reuse the `DeadListSegment` codec; PAGE vs PBA is
+/// distinguished only by which anchor owns the chain, never by format.
+/// The page-deadlist lets `drop_snapshot` free the right L2P pages
+/// without the explicit page-rc (which Phase 4 deletes). Net manifest
+/// cost: +16 B/volume +8 B/snapshot on the single 4 KiB page — tightens
+/// the R7 capacity wall; Phase 5 moves the anchors off the inline
+/// catalog. Old v17 manifests are hard-rejected on open — no on-disk
+/// migration (onyx rebuilds metadb on schema change).
+pub const MANIFEST_BODY_VERSION: u32 = 18;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -159,12 +175,12 @@ const OFF_LIFECYCLE_REPLAY_SEQ: usize = 68;
 const OFF_VARIABLE_START: usize = 76;
 
 /// Per-snapshot row size on disk. v6 packs: id(8) + vol_ord(2) + 6 pad +
-/// l2p_roots_page(8) + created_lsn(8). We keep the row at 32 bytes so
-/// `max_snapshots_for_layout` math stays identical to v5 for callers
-/// that just want "how many fit" — v6 drops the dead `refcount_roots_page`
-/// slot, and the freed 6 bytes are reserved for future per-snapshot flags
-/// without forcing another format bump.
-const SNAPSHOT_ENTRY_SIZE: usize = 32;
+/// l2p_roots_page(8) + created_lsn(8). v18 (ZFS port Phase 2) appends
+/// `page_dead_list_tail_pid(8)` at offset 32, growing the row 32 → 40.
+/// The 6 bytes at 10..16 stay reserved for future per-snapshot flags.
+const SNAPSHOT_ENTRY_SIZE: usize = 40;
+/// Byte offset of `page_dead_list_tail_pid` within a v18 snapshot row.
+const OFF_SNAP_PAGE_DEADLIST_TAIL: usize = 32;
 
 const _: () = {
     assert!(OFF_BODY_VERSION + 4 == OFF_CHECKPOINT_LSN);
@@ -180,7 +196,8 @@ const _: () = {
     assert!(OFF_CHECKPOINT_TXG + 8 == OFF_LAST_PROCESSED_BUFFER_SEQ);
     assert!(OFF_LAST_PROCESSED_BUFFER_SEQ + 8 == OFF_LIFECYCLE_REPLAY_SEQ);
     assert!(OFF_LIFECYCLE_REPLAY_SEQ + 8 == OFF_VARIABLE_START);
-    assert!(SNAPSHOT_ENTRY_SIZE == 32);
+    assert!(SNAPSHOT_ENTRY_SIZE == 40);
+    assert!(OFF_SNAP_PAGE_DEADLIST_TAIL + 8 == SNAPSHOT_ENTRY_SIZE);
 };
 
 /// Maximum number of shard roots that fit in one snapshot-roots page.
@@ -270,6 +287,14 @@ pub struct SnapshotEntry {
     pub l2p_roots_page: PageId,
     pub created_lsn: Lsn,
     pub l2p_shard_roots: Box<[PageId]>,
+    /// v18 (ZFS port Phase 2): tail of this snapshot's immutable
+    /// page-deadlist chain — the L2P metadata `PageId`s that died off the
+    /// head while this snapshot pinned them. `NULL_PAGE` while empty. The
+    /// head is implicit at `prev_seg_pid == NULL_PAGE`; walk it backward
+    /// with [`crate::deadlist::walk_chain_pages`]. `drop_snapshot`
+    /// consumes it (free-or-merge by birth). Not persisted in
+    /// `SnapshotRoots`; lives inline in the snapshot row.
+    pub page_dead_list_tail_pid: PageId,
 }
 
 impl SnapshotEntry {
@@ -643,6 +668,9 @@ impl Manifest {
             // p[off + 10..off + 16] = reserved / zero
             p[off + 16..off + 24].copy_from_slice(&entry.l2p_roots_page.to_le_bytes());
             p[off + 24..off + 32].copy_from_slice(&entry.created_lsn.to_le_bytes());
+            // v18: page-deadlist tail anchor at offset 32.
+            p[off + OFF_SNAP_PAGE_DEADLIST_TAIL..off + OFF_SNAP_PAGE_DEADLIST_TAIL + 8]
+                .copy_from_slice(&entry.page_dead_list_tail_pid.to_le_bytes());
             off += SNAPSHOT_ENTRY_SIZE;
         }
         for entry in &self.volumes {
@@ -659,10 +687,10 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            17 => Self::decode_v17(page, page_store),
+            18 => Self::decode_v18(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v17 \
-                 (snapshot-scaling Phase A2: l2p_page_rc shard group) is \
+                "unsupported manifest body version {other}; only v18 \
+                 (ZFS birth-txg port Phase 2: per-snapshot page-deadlist) is \
                  readable — older databases (v7/v8 carried the retired \
                  dedup_reverse section; v9 carried compact leaf v2 with the \
                  100-unit cap; v10/v11 used compact leaf v3 which predates \
@@ -670,13 +698,15 @@ impl Manifest {
                  anchor; v13 had dead-list but no lineage tracking; v14 had \
                  lineage tracking but no checkpoint_txg; v15 had checkpoint_txg \
                  but no buffer-replay watermarks; v16 had the buffer-replay \
-                 watermarks but no l2p_page_rc shard group) must be rebuilt"
+                 watermarks but no l2p_page_rc shard group; v17 had the \
+                 l2p_page_rc shard group but no page-deadlist anchors) must \
+                 be rebuilt"
             ))),
         }
     }
 
-    fn decode_v17(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 17)
+    fn decode_v18(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 18)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {
@@ -783,7 +813,7 @@ impl Manifest {
             )));
         }
 
-        let snapshots = decode_snapshots(p, &mut off, snapshot_count, page_store)?;
+        let snapshots = decode_snapshots(p, &mut off, snapshot_count, version, page_store)?;
         let mut volumes = decode_volumes(p, &mut off, volume_count, version)?;
         if version < 11 {
             // v10 upgrade: backfill every volume's per-L2P-shard
@@ -849,6 +879,7 @@ fn decode_snapshots(
     p: &[u8],
     off: &mut usize,
     snapshot_count: usize,
+    version: u32,
     page_store: &PageStore,
 ) -> Result<Vec<SnapshotEntry>> {
     let mut snapshots = Vec::with_capacity(snapshot_count);
@@ -857,6 +888,18 @@ fn decode_snapshots(
         let vol_ord = u16::from_le_bytes(p[*off + 8..*off + 10].try_into().unwrap());
         let l2p_roots_page = u64::from_le_bytes(p[*off + 16..*off + 24].try_into().unwrap());
         let created_lsn = u64::from_le_bytes(p[*off + 24..*off + 32].try_into().unwrap());
+        // v18: page-deadlist tail anchor at offset 32. Pre-v18 manifests
+        // are hard-rejected at dispatch, so the `NULL_PAGE` fallback is
+        // only reached by the (dead) generic decode path.
+        let page_dead_list_tail_pid = if version >= 18 {
+            u64::from_le_bytes(
+                p[*off + OFF_SNAP_PAGE_DEADLIST_TAIL..*off + OFF_SNAP_PAGE_DEADLIST_TAIL + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        } else {
+            NULL_PAGE
+        };
         let l2p_shard_roots = load_snapshot_roots(page_store, l2p_roots_page)?;
         snapshots.push(SnapshotEntry {
             id,
@@ -864,6 +907,7 @@ fn decode_snapshots(
             l2p_roots_page,
             created_lsn,
             l2p_shard_roots,
+            page_dead_list_tail_pid,
         });
         *off += SNAPSHOT_ENTRY_SIZE;
     }

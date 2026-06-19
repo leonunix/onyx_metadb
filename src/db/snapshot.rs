@@ -466,6 +466,10 @@ impl Db {
                 }
             }
         }
+        // ZFS port Phase 2 (2a): cross-check the page-deadlist model against
+        // the page-rc structural truth before the real (page-rc) free below.
+        self.check_page_deadlist_shadow(id, &entry, &pages, &after_refs, &other_snapshots, &source_volume)?;
+
         // NOTE on `entry.l2p_roots_page`: this SnapshotRoots page is
         // referenced only by the manifest's snapshot entry, so it
         // *logically* becomes unreferenced when we apply the drop.
@@ -576,6 +580,120 @@ impl Db {
         }))
     }
 
+    /// ZFS port Phase 2 (2a, SHADOW): cross-check the page-deadlist model
+    /// against the structural ground truth that page-rc still drives the
+    /// real free from. `structural_to_free` = the L2P pages this drop
+    /// releases (lose their last incoming edge: in `pages` with
+    /// `after_refs == 0`). The deadlist side follows ZFS
+    /// `process_old_deadlist` (dsl_destroy.c): destroying S frees from
+    /// **S_next's** deadlist (deaths in `(S, S_next]`) the entries born
+    /// after S_prev — NOT S's own chain (deaths in `(S_prev, S]`, which S
+    /// never referenced). An entry is freed iff `birth > S_prev.created`
+    /// (born after the previous surviving snapshot, so only S pinned it);
+    /// else it is still pinned by S_prev and merges forward. `S_next` is the
+    /// youngest surviving snapshot of this volume newer than S, or the live
+    /// HEAD when S is the youngest (its deaths sit in the volume's drained
+    /// segment chain + the not-yet-drained in-memory accumulator).
+    ///
+    /// Scoped to non-clone volumes (clone DAGs add cross-volume sharing the
+    /// single-vol invariant doesn't model — R5/Phase 3). The premature
+    /// direction (a deadlist entry mapping to a still-referenced page) is
+    /// the PREMATURE-FREE guard, HARD `Corruption`. Full equality also needs
+    /// the not-yet-implemented deadlist MERGE across drops, so a
+    /// completeness shortfall is only logged; the offline
+    /// `metadb-verify --birth-shadow` pass is the exact gate.
+    fn check_page_deadlist_shadow(
+        &self,
+        id: SnapshotId,
+        entry: &SnapshotEntry,
+        pages: &[PageId],
+        after_refs: &std::collections::BTreeMap<PageId, u32>,
+        other_snapshots: &[SnapshotEntry],
+        source_volume: &Volume,
+    ) -> Result<()> {
+        let vol = entry.vol_ord;
+        let is_clone = source_volume.parent_vol_ord.read().is_some();
+        let has_clone_child = self
+            .volumes
+            .read()
+            .values()
+            .any(|v| *v.parent_vol_ord.read() == Some(vol));
+        if is_clone || has_clone_child {
+            return Ok(());
+        }
+        let structural_to_free: std::collections::HashSet<PageId> = pages
+            .iter()
+            .copied()
+            .filter(|pid| after_refs.get(pid).copied().unwrap_or(0) == 0)
+            .collect();
+        let s_prev_created: Lsn = other_snapshots
+            .iter()
+            .filter(|s| s.vol_ord == vol && s.created_lsn < entry.created_lsn)
+            .map(|s| s.created_lsn)
+            .max()
+            .unwrap_or(0);
+        let s_next = other_snapshots
+            .iter()
+            .filter(|s| s.vol_ord == vol && s.created_lsn > entry.created_lsn)
+            .min_by_key(|s| s.created_lsn);
+        let mut next_records = match s_next {
+            Some(sn) => crate::deadlist::read_chain_records(sn.page_dead_list_tail_pid, |p| {
+                self.page_store.read_page(p)
+            })?,
+            None => {
+                let mut recs = crate::deadlist::read_chain_records(
+                    source_volume
+                        .page_dead_list_tail_pid
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    |p| self.page_store.read_page(p),
+                )?;
+                recs.extend(source_volume.page_dead_list.peek());
+                recs
+            }
+        };
+        next_records.retain(|r| r.birth_lsn > s_prev_created);
+        let deadlist_to_free: std::collections::HashSet<PageId> =
+            next_records.iter().map(|r| r.pba).collect();
+        // PREMATURE-FREE (P0) direction: a deadlist entry that maps to a
+        // page the structural graph still references. The page-deadlist read
+        // above is ZFS-faithful, so this set must be empty — a non-empty
+        // premature set is a real soundness bug (the exact class the whole
+        // port exists to kill), so it is a HARD `Corruption`.
+        let mut premature: Vec<PageId> =
+            deadlist_to_free.difference(&structural_to_free).copied().collect();
+        if !premature.is_empty() {
+            premature.sort();
+            return Err(MetaDbError::Corruption(format!(
+                "drop_snapshot {id} (vol {vol}): page-deadlist would free {} page(s) \
+                 the structural graph still references (PREMATURE FREE): {premature:?} \
+                 (s_prev={s_prev_created} deadlist_to_free={} structural_to_free={})",
+                premature.len(),
+                deadlist_to_free.len(),
+                structural_to_free.len(),
+            )));
+        }
+        // MISSING (completeness) direction: a structurally-freed page the
+        // deadlist did not predict. This can lag until the cross-drop
+        // deadlist MERGE lands (an earlier drop's kept entries must move into
+        // S_next's chain), so it is a soft warning; the offline
+        // `metadb-verify --birth-shadow` completeness pass is the exact gate.
+        let mut missing: Vec<PageId> =
+            structural_to_free.difference(&deadlist_to_free).copied().collect();
+        if !missing.is_empty() {
+            missing.sort();
+            tracing::warn!(
+                snapshot = id,
+                vol_ord = vol,
+                missing = missing.len(),
+                deadlist_to_free = deadlist_to_free.len(),
+                structural_to_free = structural_to_free.len(),
+                ?missing,
+                "page-deadlist completeness shortfall (pending cross-drop MERGE)"
+            );
+        }
+        Ok(())
+    }
+
     /// ZFS `dsl_sync_task` (path B) — called AFTER the L2P `begin_checkpoint`
     /// loop (tree guards released) and BEFORE the page-rc `begin_checkpoint`.
     /// For each queued [`SyncTaskOp::TakeSnapshot`] targeting `txg`:
@@ -635,6 +753,11 @@ impl Db {
                         l2p_roots_page: FIRST_DATA_PAGE,
                         created_lsn,
                         l2p_shard_roots: roots.clone().into_boxed_slice(),
+                        // Worst-case probe: a non-NULL tail makes the row
+                        // the same size as a sealed one (the field is
+                        // fixed-width, so this is cosmetic, but keep it
+                        // honest).
+                        page_dead_list_tail_pid: crate::types::NULL_PAGE,
                     });
                     probe.next_snapshot_id = id.saturating_add(1);
                     if let Err(e) = probe.check_encodable() {
@@ -654,6 +777,9 @@ impl Db {
                     l2p_roots_page,
                     created_lsn,
                     l2p_shard_roots: roots.clone().into_boxed_slice(),
+                    // v18: filled by the page-deadlist seal step; an empty
+                    // chain (no page-deaths yet) stays `NULL_PAGE`.
+                    page_dead_list_tail_pid: crate::types::NULL_PAGE,
                 });
                 roots
             };
@@ -688,6 +814,56 @@ impl Db {
                 }
             }
         }
+    }
+
+    /// ZFS port Phase 2 — seal each pending take's page-deadlist. Called
+    /// in `run_sync_cycle_body`'s manifest window AFTER the page dead-list
+    /// override map is built and BEFORE `refresh_manifest_from_checkpoints`.
+    ///
+    /// The new snapshot inherits the head volume's page-deadlist chain as
+    /// it stands after this cycle's drain — the chain tail is the override
+    /// tail when a segment was written this round, else the pre-existing
+    /// durable anchor. The head then resets to a fresh empty chain (so
+    /// deaths after this snapshot accumulate into the NEXT snapshot's
+    /// deadlist), mirroring ZFS handing the head's `ds_deadlist` to the
+    /// new snapshot. The reset is split across the commit boundary like
+    /// the normal anchor promotion: this writes `(NULL,NULL)` into the
+    /// override map so `refresh` stamps NULL manifest anchors, and returns
+    /// the volume ordinals whose in-memory atomics the caller must reset
+    /// to `NULL_PAGE` post-commit. The inherited tail is stamped onto the
+    /// pending `SnapshotEntry` (committed atomically by
+    /// `add_pending_snapshot_entries`).
+    pub(crate) fn seal_pending_snapshot_page_deadlists(
+        &self,
+        txg: crate::types::Txg,
+        volumes: &[Arc<Volume>],
+        page_dead_list_overrides: &mut std::collections::HashMap<VolumeOrdinal, (PageId, PageId)>,
+    ) -> Vec<VolumeOrdinal> {
+        use std::sync::atomic::Ordering;
+        let mut resets: Vec<VolumeOrdinal> = Vec::new();
+        let mut tasks = self.pending_sync_tasks.lock();
+        for task in tasks.iter_mut().filter(|t| t.target_txg == txg) {
+            let Some(entry) = task.committed_entry.as_mut() else {
+                continue;
+            };
+            let SyncTaskOp::TakeSnapshot { vol_ord } = &task.op;
+            let vol_ord = *vol_ord;
+            let inherited_tail = page_dead_list_overrides
+                .get(&vol_ord)
+                .map(|(_, t)| *t)
+                .unwrap_or_else(|| {
+                    volumes
+                        .iter()
+                        .find(|v| v.ord == vol_ord)
+                        .map(|v| v.page_dead_list_tail_pid.load(Ordering::Acquire))
+                        .unwrap_or(crate::types::NULL_PAGE)
+                });
+            entry.page_dead_list_tail_pid = inherited_tail;
+            page_dead_list_overrides
+                .insert(vol_ord, (crate::types::NULL_PAGE, crate::types::NULL_PAGE));
+            resets.push(vol_ord);
+        }
+        resets
     }
 
     /// ZFS `dsl_sync_task` — post-commit. The manifest with the

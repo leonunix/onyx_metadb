@@ -282,6 +282,9 @@ impl Db {
             let apply_ops = ops.clone();
             let metrics = self.metrics.clone();
             let refcount_shards_arc = refcount_shards_arc.clone();
+            // ZFS port Phase 2: capture the volume's youngest-snapshot lsn
+            // for the page-deadlist birth gate before the lane runs.
+            let youngest_snap = self.youngest_snap(vol_ord);
             let (tx, rx) = crossbeam_channel::bounded(1);
             volume.shards[sid].apply_lane.enqueue_ready(
                 lsn,
@@ -296,6 +299,7 @@ impl Db {
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
                         rc_authoritative,
+                        youngest_snap,
                     );
                     let _ = tx.send(result);
                 }),
