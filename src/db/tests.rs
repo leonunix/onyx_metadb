@@ -173,6 +173,7 @@ pub(super) fn dedup_val(n: u8) -> DedupValue {
     DedupValue(v)
 }
 
+mod clone_livelist_shadow;
 mod core;
 mod dead_list;
 mod free_pbas;

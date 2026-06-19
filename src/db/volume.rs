@@ -292,14 +292,21 @@ impl Db {
         }
         let target_end = target_start + volume.shards.len();
 
-        let mut pages: Vec<PageId> = Vec::new();
+        // ZFS port Phase 3a: collect each dropped L2P page with its immutable
+        // birth + plan-time page-rc, so the clone-drop livelist shadow below
+        // can recover the freed subset (rc == 1) and the origin/clone-private
+        // partition. `clone_roots` feeds the shadow's reachability RHS.
+        let mut pages_with_birth: Vec<(PageId, Lsn, u32)> = Vec::new();
+        let mut clone_roots: Vec<PageId> = Vec::new();
         for tree in &mut l2p_guards[target_start..target_end] {
             let root = tree.root();
             if root == crate::types::NULL_PAGE {
                 continue;
             }
-            pages.extend(tree.collect_drop_pages(root)?);
+            clone_roots.push(root);
+            pages_with_birth.extend(tree.collect_drop_pages_with_birth(root)?);
         }
+        let mut pages: Vec<PageId> = pages_with_birth.iter().map(|(p, _, _)| *p).collect();
         // Phase 2 dead-list: walk the volume's segment chain backward
         // from its tail and add every chain page id to the drop
         // payload, so `apply_drop_volume` releases them via the same
@@ -320,6 +327,66 @@ impl Db {
         // describes overwrites that targeted this volume's own LBAs,
         // which are about to disappear.
         let _ = volume.dead_list.drain();
+
+        // ZFS port Phase 3a (SHADOW): for a CLONE, cross-check the page-rc
+        // free-set against an independent C-exclusive reachability walk
+        // BEFORE the irreversible cascade. Surviving roots = every OTHER
+        // volume's live shard roots (read from the locked, just-flushed trees
+        // in `l2p_guards`, NOT the on-disk manifest — other volumes' COW'd
+        // roots are only refreshed into it at the commit below, so a stale
+        // manifest root would manufacture a false premature) plus every
+        // snapshot's roots. The drop+apply+snapshot_views write gates and the
+        // force-flush above keep the graph + page-rc quiescent and
+        // fold-consistent; running before the WAL submit / manifest commit
+        // means a Corruption abort leaves no half-applied drop. Page-rc stays
+        // authoritative — this is a shadow assertion, NOT the free decision.
+        // Deliberately gated on the clone (`parent_vol_ord.is_some()`) only:
+        // a non-clone parent drop with a promoted clone child stays page-rc-
+        // authoritative and is not in the livelist model's scope here.
+        // ⚠ Coverage caveat for Phase 4: a *promoted* ex-clone has its
+        // `parent_vol_ord` cleared by `PromotionComplete` (promotion bumps
+        // only the global PBA refcount, NOT the L2P page-rc, and does not
+        // COW-divide the page tree), so it skips this shadow even though it
+        // may still share L2P pages. Safe while page-rc is authoritative
+        // (the shadow is observational), but before Phase 4 deletes page-rc
+        // the exclusivity model must also cover promoted ex-clones (gate on
+        // "has clone lineage" rather than a live `parent_vol_ord`) or prove
+        // promotion fully privatises the page tree.
+        if volume.parent_vol_ord.read().is_some() {
+            let mut surviving_roots: Vec<PageId> = Vec::new();
+            for (i, tree) in l2p_guards.iter().enumerate() {
+                if i >= target_start && i < target_end {
+                    continue;
+                }
+                let r = tree.root();
+                if r != crate::types::NULL_PAGE {
+                    surviving_roots.push(r);
+                }
+            }
+            {
+                let mstate = self.manifest_state.lock();
+                for snap in &mstate.manifest.snapshots {
+                    let roots = crate::verify::snapshot_roots(
+                        &self.page_store,
+                        snap.l2p_roots_page,
+                        &snap.l2p_shard_roots,
+                    )?;
+                    surviving_roots.extend(
+                        roots
+                            .iter()
+                            .copied()
+                            .filter(|&r| r != crate::types::NULL_PAGE),
+                    );
+                }
+            }
+            self.check_clone_livelist_shadow(
+                vol_ord,
+                volume.branched_at_lsn,
+                &pages_with_birth,
+                &clone_roots,
+                &surviving_roots,
+            )?;
+        }
 
         // Commit a manifest that:
         //   (a) reflects current roots for every surviving volume
@@ -419,6 +486,141 @@ impl Db {
             vol_ord,
             pages_freed,
         }))
+    }
+
+    /// ZFS port Phase 3a (SHADOW): cross-check the per-clone page-livelist
+    /// free model against the structural ground truth `drop_volume` still
+    /// frees from — the page-rc `collect_drop_pages` cascade. Page-rc stays
+    /// AUTHORITATIVE; this only observes and aborts on a soundness divergence,
+    /// so a clone-churn soak can prove the livelist model equals page-rc
+    /// before Phase 4 deletes page-rc and makes the livelist the sole free
+    /// source.
+    ///
+    /// For a clone C with `B = branched_at_lsn`, the set of L2P pages this
+    /// drop releases — `freed_with_birth` entries with `rc == 1`, the pages
+    /// whose `-1` decref reaches zero (`rc > 1` are the decref-only shared
+    /// boundary, kept) — must equal the set of pages reachable from C's roots
+    /// that are **C-exclusive**: reachable from no *surviving* manifest root
+    /// (any other volume head or any snapshot, including snapshots/clones of
+    /// C). `birth_lsn` does NOT gate the free for clones — cross-volume DAG
+    /// sharing makes the single-vol `birth > B` predicate unsound in both
+    /// directions (the Phase 3 audit found premature-free and leak
+    /// counterexamples, both at a *legal* drop after `PromotionComplete`
+    /// clears `parent_vol_ord` while leaving page-rc sharing intact). Birth is
+    /// carried only to partition the freed set into origin (`birth <= B`) vs
+    /// clone-private (`birth > B`) for diagnostics and the Phase 3b livelist
+    /// substrate.
+    ///
+    /// The RHS is computed by an INDEPENDENT reachability walk
+    /// ([`crate::verify::reachable_l2p_pages`], a set-difference), a different
+    /// code path from the page-rc cascade so the assertion is
+    /// non-tautological. Posture mirrors the `drop_snapshot` page-deadlist
+    /// shadow before its Phase 2b escalation:
+    ///   - **premature** (page-rc would free a page still reachable from a
+    ///     surviving root — the premature-free P0 the port exists to kill) →
+    ///     HARD [`MetaDbError::Corruption`]. Only fires on a real page-rc
+    ///     under-count: a reachability-walk error can only shrink this set
+    ///     (an omitted survivor edge enlarges `exclusive`, never the
+    ///     premature difference), so the HARD direction can't false-fire.
+    ///   - **missing** (the exclusivity walk frees a page page-rc keeps live)
+    ///     → soft `tracing::warn`. Escalates to HARD in Phase 3b once a
+    ///     clone-churn soak proves full equality (as 2b did for snapshots).
+    fn check_clone_livelist_shadow(
+        &self,
+        vol_ord: VolumeOrdinal,
+        branched_at_lsn: Lsn,
+        freed_with_birth: &[(PageId, Lsn, u32)],
+        clone_roots: &[PageId],
+        surviving_roots: &[PageId],
+    ) -> Result<()> {
+        use std::collections::HashSet;
+
+        // LHS — page-rc structural FREE set (authoritative): pages whose -1
+        // decref reaches zero (rc == 1 at plan time). rc > 1 entries are the
+        // decref-only shared boundary, kept, so excluded here.
+        let structural_free: HashSet<PageId> = freed_with_birth
+            .iter()
+            .filter(|(_, _, rc)| *rc == 1)
+            .map(|(pid, _, _)| *pid)
+            .collect();
+
+        // RHS — independent "C-exclusive reachable" set: reachable from C's
+        // roots and from NO surviving root.
+        let survivor_reachable =
+            crate::verify::reachable_l2p_pages(&self.page_store, surviving_roots)?;
+        let clone_reachable = crate::verify::reachable_l2p_pages(&self.page_store, clone_roots)?;
+        let exclusive: HashSet<PageId> = clone_reachable
+            .difference(&survivor_reachable)
+            .copied()
+            .collect();
+
+        // origin vs clone-private partition of the freed set (diagnostics
+        // only; does not gate the free).
+        let (origin, clone_private) = freed_with_birth
+            .iter()
+            .filter(|(_, _, rc)| *rc == 1)
+            .fold((0usize, 0usize), |(o, c), (_, birth, _)| {
+                if *birth <= branched_at_lsn {
+                    (o + 1, c)
+                } else {
+                    (o, c + 1)
+                }
+            });
+
+        let mut premature: Vec<PageId> =
+            structural_free.difference(&exclusive).copied().collect();
+        if !premature.is_empty() {
+            premature.sort_unstable();
+            return Err(MetaDbError::Corruption(format!(
+                "drop_volume {vol_ord} (clone, B={branched_at_lsn}): page-rc would free {} \
+                 page(s) still reachable from a surviving root (PREMATURE FREE): {premature:?} \
+                 (free={} exclusive={} origin={origin} clone_private={clone_private})",
+                premature.len(),
+                structural_free.len(),
+                exclusive.len(),
+            )));
+        }
+        let mut missing: Vec<PageId> =
+            exclusive.difference(&structural_free).copied().collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            tracing::warn!(
+                vol_ord,
+                branched_at_lsn,
+                missing = ?missing,
+                free = structural_free.len(),
+                exclusive = exclusive.len(),
+                origin,
+                clone_private,
+                "metadb: clone-drop livelist shadow MISSING (completeness hole) — C-exclusive \
+                 reachability frees page(s) page-rc keeps live; soft until Phase 3b soak proves \
+                 equality",
+            );
+        }
+        Ok(())
+    }
+
+    /// Test shim: drive [`Db::check_clone_livelist_shadow`] with
+    /// caller-crafted inputs so the divergence detectors can be exercised
+    /// directly (the production call site only ever passes a self-consistent
+    /// free-set). `db::tests` is a sibling module and cannot reach the
+    /// private method otherwise.
+    #[cfg(test)]
+    pub(in crate::db) fn test_check_clone_livelist_shadow(
+        &self,
+        vol_ord: VolumeOrdinal,
+        branched_at_lsn: Lsn,
+        freed_with_birth: &[(PageId, Lsn, u32)],
+        clone_roots: &[PageId],
+        surviving_roots: &[PageId],
+    ) -> Result<()> {
+        self.check_clone_livelist_shadow(
+            vol_ord,
+            branched_at_lsn,
+            freed_with_birth,
+            clone_roots,
+            surviving_roots,
+        )
     }
 
     /// VDO-style writable clone of snapshot `src_snap_id`. The new volume's

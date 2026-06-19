@@ -386,8 +386,14 @@ fn check_page_deadlist(
 }
 
 /// Set of every L2P page reachable from `roots` (roots + all descendants),
-/// reusing [`walk_paged_tree`]. Membership only — no multiplicity.
-fn reachable_l2p_pages(page_store: &Arc<PageStore>, roots: &[PageId]) -> Result<HashSet<PageId>> {
+/// reusing [`walk_paged_tree`]. Membership only — no multiplicity. Exposed
+/// `pub(crate)` so the ZFS port Phase 3a clone-drop livelist shadow
+/// (`Db::check_clone_livelist_shadow`) can build its independent
+/// C-exclusive reachability oracle from the same walk verify uses.
+pub(crate) fn reachable_l2p_pages(
+    page_store: &Arc<PageStore>,
+    roots: &[PageId],
+) -> Result<HashSet<PageId>> {
     let mut live = LivePages::default();
     let mut seen: HashSet<PageId> = HashSet::new();
     for &root in roots {
@@ -539,7 +545,7 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
     Ok(live)
 }
 
-fn snapshot_roots<'a>(
+pub(crate) fn snapshot_roots<'a>(
     page_store: &PageStore,
     roots_page: PageId,
     inline_roots: &'a [PageId],

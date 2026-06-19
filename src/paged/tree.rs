@@ -1271,19 +1271,43 @@ impl PagedL2p {
     ///
     /// `NULL_PAGE` input returns an empty vec (empty shard).
     pub fn collect_drop_pages(&mut self, snap_root: PageId) -> Result<Vec<PageId>> {
+        Ok(self
+            .collect_drop_pages_with_birth(snap_root)?
+            .into_iter()
+            .map(|(pid, _, _)| pid)
+            .collect())
+    }
+
+    /// `collect_drop_pages`, but also returning each visited page's immutable
+    /// `birth_lsn` and its fold-consistent page-rc at plan time. The birth
+    /// rides the page read the cascade already performs (no extra IO); the rc
+    /// lets the caller recover the *freed* subset — pages with `rc == 1` whose
+    /// `-1` decref reaches zero are freed by `apply_drop_*_pages`, while
+    /// `rc > 1` entries are the decref-only shared boundary (a page still
+    /// pinned by another root, decremented but kept). ZFS port Phase 3a: the
+    /// clone-drop livelist shadow (`Db::check_clone_livelist_shadow`) consumes
+    /// this to compare the page-rc free-set against an independent
+    /// C-exclusive reachability walk; the birth is carried as the
+    /// origin-vs-clone-private partition key for diagnostics and the Phase 3b
+    /// livelist substrate.
+    pub fn collect_drop_pages_with_birth(
+        &mut self,
+        snap_root: PageId,
+    ) -> Result<Vec<(PageId, Lsn, u32)>> {
         use crate::page::PageType;
         if snap_root == NULL_PAGE {
             return self.finish_op(Ok(Vec::new()));
         }
-        let mut out: Vec<PageId> = Vec::new();
+        let mut out: Vec<(PageId, Lsn, u32)> = Vec::new();
         let mut worklist: Vec<PageId> = vec![snap_root];
         while let Some(pid) = worklist.pop() {
             // A3 cutover: rc comes from the page-rc array (fold-consistent
             // — this drop-plan simulation's cascade decisions gate the
             // page frees `apply_drop_*_pages` will perform). The page read
-            // supplies only the type + children for the cascade walk.
+            // supplies the type + children for the cascade walk and the
+            // immutable birth_lsn for the livelist shadow partition.
             let rc = self.buf.page_rc().get_consistent(pid)?;
-            let (page_type, children) = {
+            let (page_type, birth, children) = {
                 let page = self.buf.read(pid)?;
                 let header = page.header()?;
                 let children = match header.page_type {
@@ -1295,14 +1319,14 @@ impl PagedL2p {
                         ))));
                     }
                 };
-                (header.page_type, children)
+                (header.page_type, header.birth_lsn, children)
             };
             if rc == 0 {
                 return self.finish_op(Err(MetaDbError::Corruption(format!(
                     "paged::collect_drop_pages: page {pid} already at refcount 0"
                 ))));
             }
-            out.push(pid);
+            out.push((pid, birth, rc));
             // Only recurse into children if the decrement would free
             // this page — matches `drop_subtree`'s cascade.
             if rc == 1 && matches!(page_type, PageType::PagedIndex) {
