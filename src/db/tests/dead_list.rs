@@ -191,6 +191,44 @@ fn drop_older_snapshot_frees_s_next_deadlist_not_s_own() {
 }
 
 #[test]
+fn page_deadlist_disjoint_across_live_snapshot_chains() {
+    // ZFS port Phase 2a verify (E.2): with several live snapshots each
+    // owning a sealed page-deadlist chain, every dying page version is
+    // recorded into exactly one chain (the head accumulator at death time,
+    // sealed into one snapshot). `metadb-verify --birth-shadow` runs
+    // `check_page_deadlist`, which flags birth>=death and cross-chain
+    // double-records; a clean report proves disjointness holds.
+    let (dir, db) = mk_db();
+    for i in 0u64..300 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    // Three live snapshots, each followed by a full-volume overwrite so
+    // every snapshot pins a distinct set of now-dead L2P pages.
+    for round in 1u8..=3 {
+        let _s = db.take_snapshot(0).unwrap();
+        for i in 0u64..300 {
+            db.insert(0, i, v((i as u8).wrapping_add(round))).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    drop(db);
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+        },
+    )
+    .unwrap();
+    assert!(
+        report.is_clean(),
+        "page-deadlist verify issues across live snapshot chains: {:?}",
+        report.issues
+    );
+}
+
+#[test]
 fn checkpoint_flush_writes_multi_page_segment() {
     let (_d, db) = mk_db();
     // Push past one-page capacity: ~167 records on page 0 + cont

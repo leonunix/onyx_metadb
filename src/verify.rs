@@ -210,6 +210,11 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
                 .issues
                 .push(format!("birth-shadow check failed: {err}"));
         }
+        if let Err(err) = check_page_deadlist(&page_store, &manifest.manifest, &mut report) {
+            report
+                .issues
+                .push(format!("page-deadlist check failed: {err}"));
+        }
     }
 
     Ok(report)
@@ -286,6 +291,71 @@ fn check_birth_shadow(
                      reachable_from_youngest_snapshot={reachable_from_youngest_snapshot}",
                     header.birth_lsn
                 ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Page-deadlist record audit (ZFS birth-txg port, Phase 2a). For each
+/// non-clone volume, read every [`DeadRecord`] across its page-deadlist
+/// chains — the live HEAD chain plus each snapshot's sealed chain — and
+/// check the two model invariants the `drop_snapshot` free decision rides
+/// on:
+///
+///   1. **birth < death** per record (a page is born strictly before the
+///      COW that displaces it; `birth >= death` would corrupt the
+///      `snap_pinned` / `birth > S_prev` partition).
+///   2. **Disjointness**: each dying page version `(pid, birth, death)` is
+///      recorded exactly once across all of the volume's chains. A death
+///      flows into the head accumulator once and is sealed into exactly one
+///      snapshot, so a duplicate means a double-record (which would
+///      double-free at the 2b cutover).
+///
+/// Both are merge-independent (they hold before and after the not-yet-
+/// implemented cross-drop deadlist MERGE). The completeness/coverage check
+/// (every snapshot-pinned page lands in exactly one live chain) is deferred
+/// until MERGE lands, since an un-merged chain is legitimately incomplete.
+/// `walk_dead_list_chain` (in `collect_live_pages`) already covers head-chain
+/// structural integrity; the snapshot chains are walked here.
+fn check_page_deadlist(
+    page_store: &Arc<PageStore>,
+    manifest: &Manifest,
+    report: &mut VerifyReport,
+) -> Result<()> {
+    for volume in &manifest.volumes {
+        if volume.parent_vol_ord.is_some() {
+            continue;
+        }
+        let vol = volume.ord;
+        // (chain label, tail pid) for the HEAD chain + every snapshot chain.
+        let mut chains: Vec<(String, PageId)> =
+            vec![("head".to_string(), volume.page_dead_list_tail_pid)];
+        for snap in manifest.snapshots.iter().filter(|s| s.vol_ord == vol) {
+            chains.push((format!("snap#{}", snap.id), snap.page_dead_list_tail_pid));
+        }
+        // (pid, birth, death) -> chain that first recorded it.
+        let mut seen: std::collections::HashMap<(PageId, Lsn, Lsn), String> =
+            std::collections::HashMap::new();
+        for (label, tail) in &chains {
+            let records =
+                crate::deadlist::read_chain_records(*tail, |p| page_store.read_page(p))?;
+            for r in records {
+                if r.birth_lsn >= r.death_lsn {
+                    report.issues.push(format!(
+                        "page-deadlist vol {vol} {label}: record pid={} has birth_lsn={} \
+                         >= death_lsn={} (birth must precede death)",
+                        r.pba, r.birth_lsn, r.death_lsn
+                    ));
+                }
+                let key = (r.pba, r.birth_lsn, r.death_lsn);
+                if let Some(first) = seen.insert(key, label.clone()) {
+                    report.issues.push(format!(
+                        "page-deadlist vol {vol}: page version pid={} (birth={} death={}) \
+                         recorded in both {first} and {label} (double-record)",
+                        r.pba, r.birth_lsn, r.death_lsn
+                    ));
+                }
             }
         }
     }
