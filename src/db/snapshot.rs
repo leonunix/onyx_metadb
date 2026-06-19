@@ -732,12 +732,12 @@ impl Db {
     /// segment chain + the not-yet-drained in-memory accumulator).
     ///
     /// Scoped to non-clone volumes (clone DAGs add cross-volume sharing the
-    /// single-vol invariant doesn't model — R5/Phase 3). The premature
-    /// direction (a deadlist entry mapping to a still-referenced page) is
-    /// the PREMATURE-FREE guard, HARD `Corruption`. Full equality also needs
-    /// the not-yet-implemented deadlist MERGE across drops, so a
-    /// completeness shortfall is only logged; the offline
-    /// `metadb-verify --birth-shadow` pass is the exact gate.
+    /// single-vol invariant doesn't model — R5/Phase 3). Phase 2b: BOTH
+    /// directions are HARD `Corruption` — premature (a deadlist entry mapping
+    /// to a still-referenced page) and missing (a structurally-freed page the
+    /// deadlist did not predict). With the MERGE maintaining the inheritor
+    /// chains the two sets are provably equal at every drop, the invariant
+    /// Phase 4 needs to make the deadlist the sole free source.
     fn check_page_deadlist_shadow(
         &self,
         id: SnapshotId,
@@ -780,26 +780,25 @@ impl Db {
             )));
         }
         // MISSING (completeness) direction: a structurally-freed page the
-        // deadlist did not predict. With the cross-drop MERGE in place this
-        // set is empty in every tested churn/drop scenario (the model
-        // reaches full equality with the page-rc free-set). It stays a SOFT
-        // warning rather than a hard error until the nvme soak confirms it
-        // holds at scale — at the 2b cutover (deadlist drives the free) it
-        // becomes the load-bearing completeness guard.
+        // deadlist did not predict. With the cross-drop MERGE maintaining
+        // every inheritor chain, this set is empty across all churn/drop
+        // tests (panic-probe verified) and the snapshot-churn soak's verify
+        // cycles. Phase 2b makes it a HARD `Corruption` alongside premature:
+        // the deadlist now PROVABLY equals the page-rc free-set at every
+        // drop, which is the invariant Phase 4 relies on when it deletes
+        // page-rc and the deadlist becomes the sole free source.
         let mut missing: Vec<PageId> =
             structural_to_free.difference(&deadlist_to_free).copied().collect();
         if !missing.is_empty() {
             missing.sort();
-            tracing::warn!(
-                snapshot = id,
-                vol_ord = vol,
-                missing = missing.len(),
-                deadlist_to_free = deadlist_to_free.len(),
-                structural_to_free = structural_to_free.len(),
-                ?missing,
-                "page-deadlist completeness shortfall (unexpected post-MERGE; \
-                 hard at the 2b cutover)"
-            );
+            return Err(MetaDbError::Corruption(format!(
+                "drop_snapshot {id} (vol {vol}): page-deadlist MISSED {} page(s) the \
+                 structural graph frees (COMPLETENESS HOLE): {missing:?} \
+                 (s_prev={s_prev_created} deadlist_to_free={} structural_to_free={})",
+                missing.len(),
+                deadlist_to_free.len(),
+                structural_to_free.len(),
+            )));
         }
         Ok(())
     }
