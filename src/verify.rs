@@ -337,6 +337,7 @@ fn check_page_deadlist(
         // (pid, birth, death) -> chain that first recorded it.
         let mut seen: std::collections::HashMap<(PageId, Lsn, Lsn), String> =
             std::collections::HashMap::new();
+        let mut chain_pids: HashSet<PageId> = HashSet::new();
         for (label, tail) in &chains {
             let records =
                 crate::deadlist::read_chain_records(*tail, |p| page_store.read_page(p))?;
@@ -348,6 +349,7 @@ fn check_page_deadlist(
                         r.pba, r.birth_lsn, r.death_lsn
                     ));
                 }
+                chain_pids.insert(r.pba);
                 let key = (r.pba, r.birth_lsn, r.death_lsn);
                 if let Some(first) = seen.insert(key, label.clone()) {
                     report.issues.push(format!(
@@ -356,6 +358,27 @@ fn check_page_deadlist(
                         r.pba, r.birth_lsn, r.death_lsn
                     ));
                 }
+            }
+        }
+        // COVERAGE: every L2P page a snapshot still pins but the head has
+        // COW'd away (reachable from some snapshot tree, NOT from the head)
+        // died off the head while that snapshot pinned it, so it MUST appear
+        // in some live page-deadlist chain. A pinned-off-head page missing
+        // from `chain_pids` is a completeness hole — exactly what the 2b
+        // cutover (deadlist drives the free) would leak. Index + leaf pages
+        // both COW, so both are in scope.
+        let head_set = reachable_l2p_pages(page_store, &volume.l2p_shard_roots)?;
+        let mut pinned: HashSet<PageId> = HashSet::new();
+        for snap in manifest.snapshots.iter().filter(|s| s.vol_ord == vol) {
+            let roots = snapshot_roots(page_store, snap.l2p_roots_page, &snap.l2p_shard_roots)?;
+            pinned.extend(reachable_l2p_pages(page_store, &roots)?);
+        }
+        for pid in pinned.difference(&head_set) {
+            if !chain_pids.contains(pid) {
+                report.issues.push(format!(
+                    "page-deadlist vol {vol}: page {pid} is snapshot-pinned and off the head \
+                     but absent from every deadlist chain (completeness hole)"
+                ));
             }
         }
     }
