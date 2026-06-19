@@ -5,6 +5,22 @@ use super::*;
 /// across transactions (each atomic, the whole restore re-runnable).
 const RESTORE_MAX_OPS_PER_TX: usize = 16_384;
 
+/// Which surviving entity inherits a dropped snapshot's page-deadlist
+/// (ZFS port Phase 2a MERGE). The youngest snapshot's `S_next` is the live
+/// HEAD; otherwise the next-younger surviving snapshot.
+enum MergeTarget {
+    Head,
+    Snapshot(SnapshotId),
+}
+
+/// Planned page-deadlist MERGE result: the inheritor and its new
+/// single-segment chain anchors (`NULL_PAGE` when nothing carries forward).
+struct PageDeadlistMerge {
+    target: MergeTarget,
+    new_head: PageId,
+    new_tail: PageId,
+}
+
 impl Db {
     // -------- snapshot operations -----------------------------------------
 
@@ -533,8 +549,44 @@ impl Db {
             }
         }
 
+        // ZFS port Phase 2a MERGE (ZFS process_old_deadlist swap): build the
+        // inheritor's new page-deadlist chain before re-anchoring it. Pure IO
+        // (chain reads + one durable segment write); we still hold
+        // apply_gate.write + drop_gate.write, so the page-rc apply above froze
+        // the deadlist chains and no concurrent COW can push into the HEAD
+        // accumulator we read. The page-rc free set is L2P pages only, never
+        // deadlist segments, so the chains read here are intact.
+        let merge_plan =
+            self.plan_page_deadlist_merge(&entry, &other_snapshots, &source_volume, lsn)?;
+
         {
             let mut mstate = self.manifest_state.lock();
+            // Apply the merge anchors atomically with S's removal so reopen
+            // sees either {S present, old chains} or {S gone, merged chain}.
+            if let Some(merge) = &merge_plan {
+                match merge.target {
+                    MergeTarget::Head => {
+                        use std::sync::atomic::Ordering;
+                        source_volume
+                            .page_dead_list_head_pid
+                            .store(merge.new_head, Ordering::Release);
+                        source_volume
+                            .page_dead_list_tail_pid
+                            .store(merge.new_tail, Ordering::Release);
+                        // The HEAD's pending deaths were folded into the merge
+                        // segment; clear the accumulator so they are not
+                        // re-sealed (duplicated) at the next flush.
+                        let _ = source_volume.page_dead_list.drain();
+                    }
+                    MergeTarget::Snapshot(sid) => {
+                        if let Some(sn) =
+                            mstate.manifest.snapshots.iter_mut().find(|s| s.id == sid)
+                        {
+                            sn.page_dead_list_tail_pid = merge.new_tail;
+                        }
+                    }
+                }
+            }
             mstate.manifest.snapshots.retain(|s| s.id != id);
         }
         // Source volume just lost a snap; recompute its oldest-snap-lsn
@@ -673,10 +725,12 @@ impl Db {
             )));
         }
         // MISSING (completeness) direction: a structurally-freed page the
-        // deadlist did not predict. This can lag until the cross-drop
-        // deadlist MERGE lands (an earlier drop's kept entries must move into
-        // S_next's chain), so it is a soft warning; the offline
-        // `metadb-verify --birth-shadow` completeness pass is the exact gate.
+        // deadlist did not predict. With the cross-drop MERGE in place this
+        // set is empty in every tested churn/drop scenario (the model
+        // reaches full equality with the page-rc free-set). It stays a SOFT
+        // warning rather than a hard error until the nvme soak confirms it
+        // holds at scale — at the 2b cutover (deadlist drives the free) it
+        // becomes the load-bearing completeness guard.
         let mut missing: Vec<PageId> =
             structural_to_free.difference(&deadlist_to_free).copied().collect();
         if !missing.is_empty() {
@@ -688,10 +742,113 @@ impl Db {
                 deadlist_to_free = deadlist_to_free.len(),
                 structural_to_free = structural_to_free.len(),
                 ?missing,
-                "page-deadlist completeness shortfall (pending cross-drop MERGE)"
+                "page-deadlist completeness shortfall (unexpected post-MERGE; \
+                 hard at the 2b cutover)"
             );
         }
         Ok(())
+    }
+
+    /// ZFS port Phase 2a — plan the page-deadlist MERGE for dropping
+    /// snapshot S, following ZFS `process_old_deadlist` (dsl_destroy.c).
+    /// Returns the new single-segment chain for the entity that inherits
+    /// S's deaths (S_next, or the live HEAD when S is youngest), or `None`
+    /// for clone-involved volumes (out of the single-vol invariant).
+    ///
+    /// `carried = DL_S ∪ {r ∈ DL_next : birth <= S_prev.created}`: S's own
+    /// chain (all still pinned by S_prev) plus the S_next entries S_prev
+    /// still pins. The freed entries (`birth > S_prev`) are dropped — in 2a
+    /// page-rc already released those pages; the records simply vanish.
+    /// The carried set is written to ONE fresh durable segment (head==tail,
+    /// `prev=NULL`), so the inheritor's chain collapses to a single segment.
+    /// All IO (chain reads + segment write + sync) happens here, outside the
+    /// `manifest_state` lock; the caller applies the returned anchors in the
+    /// same critical section that removes S. The old S_next / S segment
+    /// chains become orphans once that (next-flush) manifest commit lands and
+    /// are swept by `reclaim_orphan_pages` on the following open — the same
+    /// deferral the dropped snapshot's `l2p_roots_page` already rides.
+    fn plan_page_deadlist_merge(
+        &self,
+        entry: &SnapshotEntry,
+        other_snapshots: &[SnapshotEntry],
+        source_volume: &Volume,
+        flush_lsn: Lsn,
+    ) -> Result<Option<PageDeadlistMerge>> {
+        use std::sync::atomic::Ordering;
+        let vol = entry.vol_ord;
+        if source_volume.parent_vol_ord.read().is_some() {
+            return Ok(None);
+        }
+        if self
+            .volumes
+            .read()
+            .values()
+            .any(|v| *v.parent_vol_ord.read() == Some(vol))
+        {
+            return Ok(None);
+        }
+        let s_prev_created: Lsn = other_snapshots
+            .iter()
+            .filter(|s| s.vol_ord == vol && s.created_lsn < entry.created_lsn)
+            .map(|s| s.created_lsn)
+            .max()
+            .unwrap_or(0);
+        let s_next = other_snapshots
+            .iter()
+            .filter(|s| s.vol_ord == vol && s.created_lsn > entry.created_lsn)
+            .min_by_key(|s| s.created_lsn);
+        let (target, dl_next) = match s_next {
+            Some(sn) => (
+                MergeTarget::Snapshot(sn.id),
+                crate::deadlist::read_chain_records(sn.page_dead_list_tail_pid, |p| {
+                    self.page_store.read_page(p)
+                })?,
+            ),
+            None => {
+                let mut recs = crate::deadlist::read_chain_records(
+                    source_volume
+                        .page_dead_list_tail_pid
+                        .load(Ordering::Acquire),
+                    |p| self.page_store.read_page(p),
+                )?;
+                recs.extend(source_volume.page_dead_list.peek());
+                (MergeTarget::Head, recs)
+            }
+        };
+        // carried = DL_S ++ KEEP(DL_next). DL_S deaths all fall in
+        // (S_prev, S]; KEEP deaths in (S, S_next] — disjoint ranges, so no
+        // dedup is needed. Sort by death_lsn for a deterministic segment.
+        let mut carried = crate::deadlist::read_chain_records(entry.page_dead_list_tail_pid, |p| {
+            self.page_store.read_page(p)
+        })?;
+        carried.extend(dl_next.into_iter().filter(|r| r.birth_lsn <= s_prev_created));
+        carried.sort_by_key(|r| (r.death_lsn, r.pba, r.birth_lsn));
+
+        let (new_head, new_tail) = if carried.is_empty() {
+            (crate::types::NULL_PAGE, crate::types::NULL_PAGE)
+        } else {
+            let page_count = crate::deadlist::segment_pages_for(carried.len());
+            let start = self.page_store.allocate_run(page_count)?;
+            let pages = crate::deadlist::build_segment_pages(
+                start,
+                &carried,
+                crate::types::NULL_PAGE,
+                flush_lsn,
+            );
+            let sealed: Vec<(PageId, Arc<crate::page::Page>)> =
+                pages.into_iter().map(|(p, pg)| (p, Arc::new(pg))).collect();
+            self.page_store.write_sealed_page_runs(sealed)?;
+            // Durable now so the not-yet-committed anchor (persisted by the
+            // next flush) can never reference an unsynced segment.
+            self.page_store.sync()?;
+            // Single segment: its first page is both head and tail.
+            (start, start)
+        };
+        Ok(Some(PageDeadlistMerge {
+            target,
+            new_head,
+            new_tail,
+        }))
     }
 
     /// ZFS `dsl_sync_task` (path B) — called AFTER the L2P `begin_checkpoint`

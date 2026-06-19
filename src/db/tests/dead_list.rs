@@ -191,6 +191,74 @@ fn drop_older_snapshot_frees_s_next_deadlist_not_s_own() {
 }
 
 #[test]
+fn drop_middle_snapshot_merges_keep_into_s_next() {
+    // ZFS port Phase 2a MERGE (process_old_deadlist): dropping a MIDDLE
+    // snapshot S2 (S1 < S2 < S3 all live) is the only case with a
+    // non-trivial KEEP/FREE partition — S3's deadlist entries born <= S1
+    // are KEPT (still pinned by S1) and merged into S3, the rest are freed.
+    // With S_prev = S1 > 0 this exercises the partition the oldest-drop
+    // churn (S_prev = 0, KEEP empty) never reaches. Data must survive and
+    // the merged chains must stay disjoint + clean under verify.
+    let (dir, db) = mk_db();
+    for i in 0u64..300 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let s1 = db.take_snapshot(0).unwrap();
+    // Overwrite only the FIRST half so some pages stay born<=S1 across S2/S3
+    // (KEEP) while others are reborn in (S1,S2] (FREE on the S2 drop).
+    for i in 0u64..150 {
+        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
+    }
+    db.flush().unwrap();
+    let s2 = db.take_snapshot(0).unwrap();
+    for i in 0u64..300 {
+        db.insert(0, i, v((i as u8).wrapping_add(2))).unwrap();
+    }
+    db.flush().unwrap();
+    let _s3 = db.take_snapshot(0).unwrap();
+    for i in 0u64..300 {
+        db.insert(0, i, v((i as u8).wrapping_add(3))).unwrap();
+    }
+    db.flush().unwrap();
+    let _ = s1;
+    db.drop_snapshot(s2).unwrap().expect("drop middle snapshot");
+    for i in 0u64..300 {
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v((i as u8).wrapping_add(3))),
+            "lba {i}: live mapping lost after middle-snapshot drop+merge"
+        );
+    }
+    // Persist the snapshot removal + merged anchors before reopen (the
+    // drop contract: the WAL'd page frees are only consistent with a
+    // snapshot-less manifest once a flush commits it).
+    db.flush().unwrap();
+    drop(db);
+    // Reopen so `reclaim_orphan_pages` sweeps the old S2/S3 deadlist
+    // segments the MERGE superseded (deferred-free, like the post-drop
+    // SnapshotRoots pages); strict verify trips on them otherwise.
+    let db = crate::Db::open(dir.path()).unwrap();
+    for i in 0u64..300 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v((i as u8).wrapping_add(3))), "reopen lba {i}");
+    }
+    drop(db);
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+        },
+    )
+    .unwrap();
+    assert!(
+        report.is_clean(),
+        "verify issues after middle-snapshot drop+merge: {:?}",
+        report.issues
+    );
+}
+
+#[test]
 fn page_deadlist_disjoint_across_live_snapshot_chains() {
     // ZFS port Phase 2a verify (E.2): with several live snapshots each
     // owning a sealed page-deadlist chain, every dying page version is
