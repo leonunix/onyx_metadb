@@ -923,19 +923,19 @@ impl Db {
     }
 
     /// Youngest live snapshot's `created_lsn` for `vol` (ZFS `prev_snap_txg`
-    /// analogue), or `0` when the volume has no live snapshot. This is the
-    /// birth-txg threshold for the COW kill decision in the birth-txg port:
-    /// a page reachable from the head with `birth_lsn <= youngest_snap` is
-    /// still pinned by that snapshot. Phase 1 reads it only for the
-    /// birth-shadow audit; the COW kill decision stays page-rc-authoritative.
-    /// Phase 2 also reads it on the buffer-fold path to gate which COW'd
-    /// L2P pages enter the HEAD page-deadlist.
-    pub(crate) fn youngest_snap(&self, vol: VolumeOrdinal) -> Lsn {
+    /// analogue), or `None` when the volume has no live snapshot. This is
+    /// the birth-txg threshold for the COW kill decision in the birth-txg
+    /// port: a page reachable from the head with `birth_lsn <= youngest_snap`
+    /// is still pinned by that snapshot. Phase 2 reads it on the buffer-fold
+    /// path to gate which COW'd L2P pages enter the HEAD page-deadlist.
+    /// `Some(0)` (a snapshot taken before the first op on the bootstrap
+    /// volume) is distinct from `None` (no snapshot) — the former still
+    /// pins genesis pages born at lsn 0.
+    pub(crate) fn youngest_snap(&self, vol: VolumeOrdinal) -> Option<Lsn> {
         self.snap_info_cache
             .lock()
             .get(&vol)
-            .map(|infos| infos.iter().map(|s| s.created_lsn).max().unwrap_or(0))
-            .unwrap_or(0)
+            .and_then(|infos| infos.iter().map(|s| s.created_lsn).max())
     }
 
     /// Recompute the cache entry for `vol` from `manifest.snapshots`.

@@ -210,6 +210,85 @@ proptest! {
     }
 }
 
+// Regression: dropping a `created_lsn == 0` snapshot (one taken before the
+// first committed op on the bootstrap volume) must not leave a page-deadlist
+// completeness hole. The genesis L2P roots are born at lsn 0 and pinned by
+// such a snapshot; a shared COW of one must record its death (the
+// `youngest == Some(0)` recording case), not drop it as "no live snapshot".
+// Minimal prefix of a db_matches_reference shrink that hit a MISSING here.
+#[test]
+fn drop_created0_snapshot_no_completeness_hole() {
+    let dir = TempDir::new().unwrap();
+    let db = onyx_metadb::Db::create(dir.path()).unwrap();
+    let s1 = db.take_snapshot(0).unwrap(); // created=0
+    let s2 = db.take_snapshot(0).unwrap(); // created=0 (tie)
+    db.insert(0, 61, v_of(23)).unwrap(); // lsn 1 — COWs a genesis root
+    let _s3 = db.take_snapshot(0).unwrap();
+    let _s4 = db.take_snapshot(0).unwrap();
+    let _s5 = db.take_snapshot(0).unwrap();
+    let _s6 = db.take_snapshot(0).unwrap();
+    let _s7 = db.take_snapshot(0).unwrap();
+    db.drop_snapshot(s2).unwrap();
+    db.insert(0, 21, v_of(80)).unwrap();
+    db.drop_snapshot(_s3).unwrap();
+    db.insert(0, 22, v_of(249)).unwrap();
+    db.insert(0, 30, v_of(242)).unwrap();
+    let _s8 = db.take_snapshot(0).unwrap();
+    let _s9 = db.take_snapshot(0).unwrap();
+    db.insert(0, 31, v_of(254)).unwrap();
+    let _s10 = db.take_snapshot(0).unwrap();
+    db.delete(0, 37).unwrap();
+    db.insert(0, 57, v_of(106)).unwrap();
+    // Dropping snapshot 1 (created=0) used to abort with a page-deadlist
+    // COMPLETENESS HOLE; with the genesis-birth + Some(0)-recording fix the
+    // shadow check passes.
+    db.drop_snapshot(s1).unwrap();
+}
+
+// Regression for the `created_lsn`-tie drop family (Bug 1a/1b): two snapshots
+// taken with no committed op between them share a `created_lsn` and capture
+// identical roots. Dropping the OLDER one used to (a) abort with a PREMATURE
+// FREE — the sibling still pins pages born after `s_prev` — and (b) hang
+// (the earlier `has_sibling` HEAD-merge fix). With S_prev/S_next picked on
+// the total order `(created_lsn, id)` and the exact "no other surviving snap
+// pins `[birth, death)`" free predicate, the drop is a clean no-op (the
+// sibling pins everything) and the snapshots still read correctly.
+#[test]
+fn drop_tied_snapshot_no_premature_no_hang() {
+    let dir = TempDir::new().unwrap();
+    let db = onyx_metadb::Db::create(dir.path()).unwrap();
+    // Seed a few mappings, then snapshot twice with no op between (tie).
+    for k in 0..64u64 {
+        db.insert(0, k, v_of(k as u8)).unwrap();
+    }
+    let a = db.take_snapshot(0).unwrap();
+    let b = db.take_snapshot(0).unwrap(); // tie with `a`, identical roots
+    // Diverge HEAD so the snapshots' shared pages start dying off the head.
+    for k in 0..64u64 {
+        db.insert(0, k, v_of((k as u8).wrapping_add(100))).unwrap();
+    }
+    let snap_a: Vec<_> = db
+        .snapshot_view(a)
+        .unwrap()
+        .range(..)
+        .unwrap()
+        .collect::<onyx_metadb::Result<Vec<_>>>()
+        .unwrap();
+    // Drop the OLDER tied snapshot (was premature/hang); `b` still pins all.
+    db.drop_snapshot(a).unwrap();
+    // `b` must still read exactly what `a` did (identical capture point).
+    let snap_b: Vec<_> = db
+        .snapshot_view(b)
+        .unwrap()
+        .range(..)
+        .unwrap()
+        .collect::<onyx_metadb::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(snap_a, snap_b, "tied snapshot must read identically to its sibling");
+    // Dropping the survivor frees the now-unpinned pages cleanly.
+    db.drop_snapshot(b).unwrap();
+}
+
 #[test]
 fn deterministic_snapshot_stress() {
     use rand::seq::SliceRandom;

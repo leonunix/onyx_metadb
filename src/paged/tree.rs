@@ -149,7 +149,20 @@ impl PagedL2p {
         root_lsn: Lsn,
     ) -> Result<Self> {
         let mut buf = PageBuf::with_cache_rc(page_store, page_cache, page_rc);
-        let root = buf.alloc_leaf(1)?;
+        // Birth the empty root at `root_lsn` (the volume's `created_lsn`),
+        // NOT a hardcoded 1. The page-rc +1 below already folds at
+        // `root_lsn`; birthing the page header at the same lsn keeps the
+        // "a snapshot's created_lsn >= birth_lsn of every page it captures"
+        // invariant the page-deadlist recording filter relies on
+        // (`drain_page_deaths_into`: record a page death iff
+        // `birth <= youngest_snapshot.created`). The bootstrap volume has
+        // `created_lsn == 0`, so the old `alloc_leaf(1)` birthed its roots
+        // at lsn 1 — above any snapshot taken before the first op
+        // (`created_lsn == 0`) — so a shared COW of such a root dropped the
+        // death record (`1 <= 0` is false) even though those created=0
+        // snapshots pin it, producing a page-deadlist completeness hole at
+        // their drop.
+        let root = buf.alloc_leaf(root_lsn)?;
         buf.flush()?;
         // A3: commit the root's +1 to the shared page-rc array (see
         // `create_with_cache`).
@@ -158,7 +171,10 @@ impl PagedL2p {
             buf,
             root,
             root_level: 0,
-            next_gen: 2,
+            // Keep the generation watermark strictly above the root's
+            // birth so later stamps stay monotonic (matches the old
+            // `birth 1 -> next_gen 2`).
+            next_gen: root_lsn + 1,
             private_pages: PageIdSet::default(),
             retired_pages: PageIdSet::default(),
             checkpoint_protected: PageIdSet::default(),

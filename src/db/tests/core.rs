@@ -1147,21 +1147,20 @@ fn birth_shadow_layered_snapshots_youngest_is_threshold() {
 fn youngest_snap_tracks_max_created_lsn() {
     // `Db::youngest_snap` (ZFS prev_snap_txg analogue) is the COW kill
     // threshold the birth-txg port (Phase 2) will read. It must return the
-    // max live snapshot `created_lsn`, 0 when none, and never decrease while
-    // snapshots accumulate.
+    // max live snapshot `created_lsn`, `None` when none, and never decrease
+    // while snapshots accumulate.
     let (_d, db) = mk_db();
-    assert_eq!(db.youngest_snap(0), 0, "no snapshot → 0");
+    assert_eq!(db.youngest_snap(0), None, "no snapshot → None");
     db.insert(0, 1, v(1)).unwrap();
     let _s1 = db.take_snapshot(0).unwrap();
-    let y1 = db.youngest_snap(0);
-    assert!(y1 > 0, "after first snapshot youngest_snap > 0");
+    let y1 = db.youngest_snap(0).expect("after first snapshot youngest_snap is Some");
     db.insert(0, 2, v(2)).unwrap();
     let s2 = db.take_snapshot(0).unwrap();
-    let y2 = db.youngest_snap(0);
+    let y2 = db.youngest_snap(0).expect("Some after second snapshot");
     assert!(y2 >= y1, "youngest_snap must not decrease as snapshots accrue");
     // Dropping the youngest reverts the threshold to the older snapshot.
     db.drop_snapshot(s2).unwrap().unwrap();
-    let y3 = db.youngest_snap(0);
+    let y3 = db.youngest_snap(0).expect("Some after dropping the youngest");
     assert!(y3 <= y2 && y3 >= y1, "after dropping the youngest, threshold falls back");
 }
 

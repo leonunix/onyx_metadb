@@ -63,11 +63,15 @@ pub(in crate::db) fn record_dead(volume: &Volume, prev: Option<L2pValue>, death_
     }
 }
 
-/// Youngest live snapshot's `created_lsn` across `snap_infos`, or `0`
-/// when the volume has no live snapshot (ZFS `prev_snap_txg` analogue).
+/// Youngest live snapshot's `created_lsn` across `snap_infos` (ZFS
+/// `prev_snap_txg` analogue), or `None` when the volume has no live
+/// snapshot. `Some(0)` is a real value — a snapshot taken before the
+/// first committed op on the bootstrap volume has `created_lsn == 0` and
+/// still pins the genesis (lsn-0-born) pages — so it must be
+/// distinguished from `None` (which records nothing).
 #[inline]
-pub(in crate::db) fn youngest_snap_lsn(snap_infos: &[SnapInfo]) -> Lsn {
-    snap_infos.iter().map(|s| s.created_lsn).max().unwrap_or(0)
+pub(in crate::db) fn youngest_snap_lsn(snap_infos: &[SnapInfo]) -> Option<Lsn> {
+    snap_infos.iter().map(|s| s.created_lsn).max()
 }
 
 /// ZFS port Phase 2: drain the tree's page-deadlist witness (L2P pages
@@ -92,18 +96,21 @@ pub(in crate::db) fn drain_page_deaths(
 /// Lower-level page-death drainer used by the buffer-fold path, which
 /// has the volume's `page_dead_list` + a precomputed `youngest` but not
 /// the full `snap_infos`. ALWAYS drains the witness (clears it so it
-/// can't leak into the next fold); only records when a snapshot is live
-/// (`youngest > 0`) and the page predates it (`birth_lsn <= youngest`).
+/// can't leak into the next fold); records a death only when a snapshot
+/// is live (`youngest` is `Some`) and the page predates it
+/// (`birth_lsn <= youngest`). `None` (no live snapshot, or the replay
+/// path) records nothing — note `Some(0)` is NOT `None`: a created-0
+/// snapshot pins genesis (lsn-0-born) pages, so their deaths must record.
 #[inline]
 pub(in crate::db) fn drain_page_deaths_into(
     page_dead_list: &crate::deadlist::DeadListState,
     tree: &mut PagedL2p,
-    youngest: Lsn,
+    youngest: Option<Lsn>,
 ) {
     let displaced = tree.take_cow_displaced();
-    if youngest == 0 {
+    let Some(youngest) = youngest else {
         return;
-    }
+    };
     for rec in displaced {
         if rec.birth_lsn <= youngest {
             page_dead_list.push(rec);

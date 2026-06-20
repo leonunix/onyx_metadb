@@ -25,6 +25,16 @@ struct InheritorContext {
     s_prev_created: Lsn,
     target: MergeTarget,
     dl_next: Vec<crate::deadlist::DeadRecord>,
+    /// `created_lsn`s of every OTHER surviving snapshot of this volume
+    /// (excludes S, the snapshot being dropped), sorted ascending. The
+    /// free decision for a `dl_next` record `(birth, death)` is exact:
+    /// dropping S frees the record iff NO surviving snapshot still pins
+    /// the page, i.e. no `created_lsn` here lies in `[birth, death)`.
+    /// This subsumes the older `birth > s_prev` proxy, which missed
+    /// same-`created_lsn` siblings (a page born after `s_prev` can still
+    /// be pinned by a sibling captured at the exact same lsn) and could
+    /// drop chain records a later-dropped sibling/snapshot still needs.
+    other_created_sorted: Vec<Lsn>,
 }
 
 /// Planned page-deadlist MERGE result: the inheritor and its new chain
@@ -681,16 +691,29 @@ impl Db {
         if is_clone || has_clone_child {
             return Ok(None);
         }
+        // Order snapshots by the TOTAL order `(created_lsn, id)`, not
+        // `created_lsn` alone. `id` is monotonic with creation, so this
+        // breaks `created_lsn` ties (two snapshots taken with no committed
+        // op between them share a `created_lsn`) in creation order. Using
+        // the total order makes S_prev/S_next the true chain neighbours:
+        // a tie-sibling is a neighbour, not excluded by a strict `<`/`>`.
+        // Excluding it (the old code) sent a dropped tie-sibling's deaths
+        // to the live HEAD instead of its sibling, where a later snapshot
+        // re-sealed them — the completeness hole — and made the sibling's
+        // own pinned pages look free (premature). The free DECISION is the
+        // exact `dl_record_freed` predicate below; this only picks the
+        // inheritor whose chain absorbs S's deaths.
+        let key = (entry.created_lsn, entry.id);
         let s_prev_created: Lsn = other_snapshots
             .iter()
-            .filter(|s| s.vol_ord == vol && s.created_lsn < entry.created_lsn)
+            .filter(|s| s.vol_ord == vol && (s.created_lsn, s.id) < key)
             .map(|s| s.created_lsn)
             .max()
             .unwrap_or(0);
         let s_next = other_snapshots
             .iter()
-            .filter(|s| s.vol_ord == vol && s.created_lsn > entry.created_lsn)
-            .min_by_key(|s| s.created_lsn);
+            .filter(|s| s.vol_ord == vol && (s.created_lsn, s.id) > key)
+            .min_by_key(|s| (s.created_lsn, s.id));
         let (target, dl_next) = match s_next {
             Some(sn) => (
                 MergeTarget::Snapshot(sn.id),
@@ -709,11 +732,33 @@ impl Db {
                 (MergeTarget::Head, recs)
             }
         };
+        let mut other_created_sorted: Vec<Lsn> = other_snapshots
+            .iter()
+            .filter(|s| s.vol_ord == vol)
+            .map(|s| s.created_lsn)
+            .collect();
+        other_created_sorted.sort_unstable();
         Ok(Some(InheritorContext {
             s_prev_created,
             target,
             dl_next,
+            other_created_sorted,
         }))
+    }
+
+    /// Exact free predicate for a `dl_next` death record when dropping S:
+    /// the page is freed iff NO surviving snapshot of this volume still
+    /// pins it. A snapshot with `created_lsn == c` pins a page that was
+    /// live over `[birth, death)` iff `birth <= c < death`. So the record
+    /// is freed iff `other_created_sorted` has no entry in `[birth, death)`.
+    /// (S itself is excluded from that list, and a record in S_next's
+    /// deadlist always satisfies `birth <= S.created < death`, so S always
+    /// pinned it — this predicate answers "does anyone ELSE pin it".)
+    fn dl_record_freed(other_created_sorted: &[Lsn], birth: Lsn, death: Lsn) -> bool {
+        // First created_lsn >= birth.
+        let i = other_created_sorted.partition_point(|&c| c < birth);
+        // Pinned iff that entry exists and is strictly below death.
+        !(i < other_created_sorted.len() && other_created_sorted[i] < death)
     }
 
     /// ZFS port Phase 2 (2a, SHADOW): cross-check the page-deadlist model
@@ -753,12 +798,14 @@ impl Db {
             .copied()
             .filter(|pid| after_refs.get(pid).copied().unwrap_or(0) == 0)
             .collect();
-        // FREE partition of the inheritor's records: `birth > S_prev` (born
-        // after the previous surviving snapshot, so only S pinned them).
+        // FREE partition of the inheritor's records: exact — a record is
+        // freed iff no OTHER surviving snapshot of this volume still pins
+        // its page over `[birth, death)`. See `dl_record_freed` /
+        // `InheritorContext::other_created_sorted`.
         let deadlist_to_free: std::collections::HashSet<PageId> = ctx
             .dl_next
             .iter()
-            .filter(|r| r.birth_lsn > s_prev_created)
+            .filter(|r| Self::dl_record_freed(&ctx.other_created_sorted, r.birth_lsn, r.death_lsn))
             .map(|r| r.pba)
             .collect();
         // PREMATURE-FREE (P0) direction: a deadlist entry that maps to a
@@ -808,10 +855,16 @@ impl Db {
     /// Builds the new single-segment chain for the entity that inherits S's
     /// deaths (`ctx.target` — S_next, or the live HEAD when S is youngest).
     ///
-    /// `carried = DL_S ∪ {r ∈ DL_next : birth <= S_prev.created}`: S's own
-    /// chain (all still pinned by S_prev) plus the S_next entries S_prev
-    /// still pins. The freed entries (`birth > S_prev`) are dropped — in 2a
-    /// page-rc already released those pages; the records simply vanish.
+    /// `carried = DL_S ∪ {r ∈ DL_next : still pinned by a surviving snap}`:
+    /// S's own chain (deaths in `(S_prev, S]`, all still pinned by S_prev or
+    /// an older snap) plus the S_next entries some surviving snapshot still
+    /// pins (exact `dl_record_freed` predicate — kept iff a surviving
+    /// `created_lsn` lies in `[birth, death)`). The freed entries are dropped
+    /// — page-rc already released those pages; the records simply vanish.
+    /// Keeping by the exact predicate (not the old `birth <= S_prev` proxy)
+    /// is what preserves records a same-`created_lsn` sibling, or a snapshot
+    /// only reachable through the chain, still needs — the omission that
+    /// produced both premature frees (tie) and completeness holes (chain).
     /// The carried set is written to ONE fresh durable segment (head==tail,
     /// `prev=NULL`), so the inheritor's chain collapses to a single segment.
     /// All IO (chain reads + segment write + sync) happens here, outside the
@@ -836,7 +889,7 @@ impl Db {
             ctx.dl_next
                 .iter()
                 .copied()
-                .filter(|r| r.birth_lsn <= ctx.s_prev_created),
+                .filter(|r| !Self::dl_record_freed(&ctx.other_created_sorted, r.birth_lsn, r.death_lsn)),
         );
         carried.sort_by_key(|r| (r.death_lsn, r.pba, r.birth_lsn));
 

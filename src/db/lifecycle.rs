@@ -774,7 +774,7 @@ impl Db {
         metrics: &crate::metrics::MetaMetrics,
         chunk_entries: usize,
         page_dead_list: &crate::deadlist::DeadListState,
-        youngest_snap: Lsn,
+        youngest_snap: Option<Lsn>,
     ) -> Result<()> {
         let started = std::time::Instant::now();
         // Snapshot (clone) the frozen syncing slot WITHOUT the tree lock so the

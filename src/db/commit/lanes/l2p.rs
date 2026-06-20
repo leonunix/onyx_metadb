@@ -86,9 +86,10 @@ impl Db {
         rc_authoritative: bool,
         // ZFS port Phase 2: youngest live snapshot's `created_lsn` for this
         // volume, captured by the dispatcher before the lane runs. Gates
-        // which COW-displaced L2P pages enter the HEAD page-deadlist. `0`
-        // (no live snapshot, or the replay path) records nothing.
-        youngest_snap: Lsn,
+        // which COW-displaced L2P pages enter the HEAD page-deadlist. `None`
+        // (no live snapshot, or the replay path) records nothing; `Some(0)`
+        // is a real created-0 snapshot that still pins genesis pages.
+        youngest_snap: Option<Lsn>,
     ) -> Result<L2pBucketApplyResult> {
         let mut outcomes = Vec::with_capacity(indices.len());
         let mut rc_actions = Vec::new();
