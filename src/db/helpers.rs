@@ -115,6 +115,12 @@ pub(super) fn refresh_manifest_entries(
             page_dead_list_tail_pid: vol
                 .page_dead_list_tail_pid
                 .load(std::sync::atomic::Ordering::Acquire),
+            page_live_list_head_pid: vol
+                .page_live_list_head_pid
+                .load(std::sync::atomic::Ordering::Acquire),
+            page_live_list_tail_pid: vol
+                .page_live_list_tail_pid
+                .load(std::sync::atomic::Ordering::Acquire),
         });
     }
     manifest.volumes = new_entries;

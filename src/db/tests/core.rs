@@ -365,6 +365,7 @@ fn buffer_mode_snapshot_churn_no_premature_free() {
             crate::verify::VerifyOptions {
                 strict: true,
                 check_birth_shadow: true,
+                check_clone_livelist: false,
             },
         )
             .unwrap();
@@ -422,6 +423,7 @@ fn create_volume_root_page_rc_survives_reopen() {
             crate::verify::VerifyOptions {
                 strict: true,
                 check_birth_shadow: true,
+                check_clone_livelist: false,
             },
         )
             .unwrap();
@@ -482,6 +484,7 @@ fn take_snapshot_incref_survives_close_before_fold() {
             crate::verify::VerifyOptions {
                 strict: true,
                 check_birth_shadow: true,
+                check_clone_livelist: false,
             },
         )
             .unwrap();
@@ -575,6 +578,7 @@ fn buffer_mode_concurrent_snapshot_churn_no_corruption() {
             crate::verify::VerifyOptions {
                 strict: true,
                 check_birth_shadow: true,
+                check_clone_livelist: false,
             },
         )
             .unwrap();
@@ -917,6 +921,7 @@ fn drop_snapshot_force_fold_over_buffer_backlog_no_premature_free() {
             crate::verify::VerifyOptions {
                 strict: true,
                 check_birth_shadow: true,
+                check_clone_livelist: false,
             },
         )
             .unwrap();
@@ -943,6 +948,7 @@ fn assert_birth_shadow_clean(path: &std::path::Path) {
         crate::verify::VerifyOptions {
             strict: true,
             check_birth_shadow: true,
+            check_clone_livelist: false,
         },
     )
     .unwrap();

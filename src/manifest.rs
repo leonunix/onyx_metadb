@@ -132,7 +132,18 @@ use crate::types::{
 /// the R7 capacity wall; Phase 5 moves the anchors off the inline
 /// catalog. Old v17 manifests are hard-rejected on open — no on-disk
 /// migration (onyx rebuilds metadb on schema change).
-pub const MANIFEST_BODY_VERSION: u32 = 18;
+///
+/// v19 (ZFS birth-txg port Phase 3b: per-clone page-livelist): adds a
+/// THIRD, independent chain — the per-clone page-livelist (ALLOC/FREE log
+/// of a clone's clone-private L2P pages) anchored by
+/// `VolumeEntry.page_live_list_{head,tail}_pid` (+16 B fixed header), plus
+/// the sticky `VOLUME_FLAG_CLONE_LINEAGE` flag (reuses a spare `flags`
+/// bit, no row growth). Uses the new `LiveListSegment` codec (own "LIVS"
+/// magic + an ALLOC/FREE kind byte). The livelist is the ZFS `dd_livelist`
+/// analogue Phase 4 reads to free a dropped clone's private subtree without
+/// the explicit page-rc; Phase 3b only populates + verifies it in SHADOW.
+/// Net manifest cost: +16 B/volume; old v18 manifests are hard-rejected.
+pub const MANIFEST_BODY_VERSION: u32 = 19;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -318,8 +329,8 @@ mod volume;
 pub(crate) use snapshot_roots::{load_snapshot_roots, write_snapshot_roots_page};
 pub use store::{LoadedManifest, ManifestStore};
 pub use volume::{
-    VOLUME_ENTRY_FIXED_SIZE, VOLUME_FLAG_DROP_PENDING, VolumeEntry, decode_volume_entry_inline,
-    encode_volume_entry_inline, volume_entry_inline_size,
+    VOLUME_ENTRY_FIXED_SIZE, VOLUME_FLAG_CLONE_LINEAGE, VOLUME_FLAG_DROP_PENDING, VolumeEntry,
+    decode_volume_entry_inline, encode_volume_entry_inline, volume_entry_inline_size,
 };
 
 /// Decoded manifest body (v16).
@@ -687,10 +698,10 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            18 => Self::decode_v18(page, page_store),
+            19 => Self::decode_v19(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v18 \
-                 (ZFS birth-txg port Phase 2: per-snapshot page-deadlist) is \
+                "unsupported manifest body version {other}; only v19 \
+                 (ZFS birth-txg port Phase 3b: per-clone page-livelist) is \
                  readable — older databases (v7/v8 carried the retired \
                  dedup_reverse section; v9 carried compact leaf v2 with the \
                  100-unit cap; v10/v11 used compact leaf v3 which predates \
@@ -699,14 +710,15 @@ impl Manifest {
                  lineage tracking but no checkpoint_txg; v15 had checkpoint_txg \
                  but no buffer-replay watermarks; v16 had the buffer-replay \
                  watermarks but no l2p_page_rc shard group; v17 had the \
-                 l2p_page_rc shard group but no page-deadlist anchors) must \
-                 be rebuilt"
+                 l2p_page_rc shard group but no page-deadlist anchors; v18 had \
+                 the page-deadlist anchors but no per-clone page-livelist \
+                 anchors) must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v18(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 18)
+    fn decode_v19(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 19)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {

@@ -73,24 +73,46 @@ struct CheckpointInstallReceiver {
 /// [`crate::deadlist::DeadListState::restore_front`]).
 struct DeadListDrainEntry {
     vol: Arc<Volume>,
-    records: Vec<crate::deadlist::DeadRecord>,
+    records: DrainRecords,
     old_head: PageId,
     old_tail: PageId,
     kind: DeadListKind,
 }
 
-/// Which of a volume's two independent dead-list chains a drain
-/// entry / segment plan belongs to. Both reuse the `DeadListSegment`
-/// codec; they differ only in the buffer drained (`vol.dead_list` vs
-/// `vol.page_dead_list`) and the manifest anchors promoted
-/// (`dead_list_*_pid` vs `page_dead_list_*_pid`). The PBA chain
-/// (`Pba`) records data-block deaths for lineage GC; the page chain
-/// (`Page`, ZFS port Phase 2) records L2P-metadata-page deaths for
-/// `drop_snapshot`.
+/// Drained records for one chain. PBA / page deadlists carry
+/// [`crate::deadlist::DeadRecord`]s; the per-clone page-livelist (ZFS port
+/// Phase 3b) carries [`crate::livelist::LiveRecord`]s (ALLOC/FREE + kind
+/// byte). Kept as one enum so the shared flush drain→build→write→
+/// rollback→promote machinery dispatches on it rather than duplicating
+/// ~10 rollback call sites.
+enum DrainRecords {
+    Dead(Vec<crate::deadlist::DeadRecord>),
+    Live(Vec<crate::livelist::LiveRecord>),
+}
+
+impl DrainRecords {
+    fn is_empty(&self) -> bool {
+        match self {
+            DrainRecords::Dead(r) => r.is_empty(),
+            DrainRecords::Live(r) => r.is_empty(),
+        }
+    }
+}
+
+/// Which of a volume's independent dead/live-list chains a drain
+/// entry / segment plan belongs to. The PBA chain (`Pba`) records
+/// data-block deaths for lineage GC; the page chain (`Page`, ZFS port
+/// Phase 2) records L2P-metadata-page deaths for `drop_snapshot`; both
+/// reuse the `DeadListSegment` codec and differ only in the buffer
+/// drained + the manifest anchors promoted. The `Live` chain (ZFS port
+/// Phase 3b) is the per-clone page-livelist (ALLOC/FREE of clone-private
+/// pages) using the separate `LiveListSegment` codec + the
+/// `page_live_list_*_pid` anchors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeadListKind {
     Pba,
     Page,
+    Live,
 }
 
 /// One volume's allocated segment in the IO phase: the contiguous page
@@ -612,6 +634,9 @@ impl Db {
                             &mut tree,
                             youngest_snap,
                         );
+                        // ZFS port Phase 3b: same fold site for the per-clone
+                        // page-livelist witness (empty for non-clones).
+                        super::apply::drain_live_events_into(&vol.page_live_list, &mut tree);
                         super::apply::publish_l2p_read_view(shard, &tree);
                         drop(tree);
                         shard.l2p_buffer.note_compacted(max_lsn);
@@ -691,6 +716,7 @@ impl Db {
                     // birth gate.
                     let youngest_snap = self.youngest_snap(vol.ord);
                     let page_dead_list = &vol.page_dead_list;
+                    let page_live_list = &vol.page_live_list;
                     for (shard_idx, shard) in vol.shards.iter().enumerate() {
                         if !shard.use_buffer {
                             continue;
@@ -710,6 +736,7 @@ impl Db {
                                 metrics,
                                 chunk_entries,
                                 page_dead_list,
+                                page_live_list,
                                 youngest_snap,
                             )
                         }));
@@ -739,6 +766,7 @@ impl Db {
                         metrics,
                         chunk_entries,
                         &vol.page_dead_list,
+                        &vol.page_live_list,
                         youngest_snap,
                     )?;
                 }
@@ -774,6 +802,7 @@ impl Db {
         metrics: &crate::metrics::MetaMetrics,
         chunk_entries: usize,
         page_dead_list: &crate::deadlist::DeadListState,
+        page_live_list: &crate::livelist::LiveListState,
         youngest_snap: Option<Lsn>,
     ) -> Result<()> {
         let started = std::time::Instant::now();
@@ -809,6 +838,9 @@ impl Db {
             // (buffer mode's only COW point — the apply-time witness was
             // empty for buffered writes).
             super::apply::drain_page_deaths_into(page_dead_list, &mut tree, youngest_snap);
+            // ZFS port Phase 3b: per-clone page-livelist witness (empty for
+            // non-clones).
+            super::apply::drain_live_events_into(page_live_list, &mut tree);
             if end == plan.len() {
                 // Publish BEFORE clearing the slot (see method doc), under
                 // the final chunk's hold like the one-shot fold did.

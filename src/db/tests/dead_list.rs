@@ -151,6 +151,7 @@ fn page_deadlist_segments_survive_reopen() {
         crate::verify::VerifyOptions {
             strict: false,
             check_birth_shadow: true,
+            check_clone_livelist: false,
         },
     )
     .unwrap();
@@ -248,6 +249,7 @@ fn drop_middle_snapshot_merges_keep_into_s_next() {
         crate::verify::VerifyOptions {
             strict: true,
             check_birth_shadow: true,
+            check_clone_livelist: false,
         },
     )
     .unwrap();
@@ -286,6 +288,7 @@ fn page_deadlist_disjoint_across_live_snapshot_chains() {
         crate::verify::VerifyOptions {
             strict: true,
             check_birth_shadow: true,
+            check_clone_livelist: false,
         },
     )
     .unwrap();

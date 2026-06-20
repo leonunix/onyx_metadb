@@ -27,6 +27,7 @@ pub mod fuzz;
 pub(crate) mod io_submitter;
 pub mod l2p_page_rc;
 pub mod lifecycle_log;
+pub mod livelist;
 pub mod manifest;
 pub mod metrics;
 pub mod op;
@@ -52,8 +53,8 @@ pub use dedup_types::{DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash8, LsmStats};
 pub use error::{MetaDbError, Result};
 pub use manifest::{
     MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry, VOLUME_ENTRY_FIXED_SIZE,
-    VOLUME_FLAG_DROP_PENDING, VolumeEntry, decode_volume_entry_inline, encode_volume_entry_inline,
-    max_snapshots_for_shards, volume_entry_inline_size,
+    VOLUME_FLAG_CLONE_LINEAGE, VOLUME_FLAG_DROP_PENDING, VolumeEntry, decode_volume_entry_inline,
+    encode_volume_entry_inline, max_snapshots_for_shards, volume_entry_inline_size,
 };
 pub use metrics::{FlushKind, MetaMetrics, MetaMetricsSnapshot};
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};

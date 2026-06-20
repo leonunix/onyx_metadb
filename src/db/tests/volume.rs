@@ -388,6 +388,7 @@ fn dropping_source_snapshot_after_clone_keeps_page_refcounts_balanced() {
         crate::verify::VerifyOptions {
             strict: true,
             check_birth_shadow: true,
+            check_clone_livelist: false,
         },
     )
     .unwrap();

@@ -553,7 +553,7 @@ impl Db {
             }
             drained_deadlists.push(DeadListDrainEntry {
                 vol: vol.clone(),
-                records,
+                records: DrainRecords::Dead(records),
                 old_head: vol
                     .dead_list_head_pid
                     .load(std::sync::atomic::Ordering::Acquire),
@@ -577,7 +577,7 @@ impl Db {
             }
             drained_deadlists.push(DeadListDrainEntry {
                 vol: vol.clone(),
-                records,
+                records: DrainRecords::Dead(records),
                 old_head: vol
                     .page_dead_list_head_pid
                     .load(std::sync::atomic::Ordering::Acquire),
@@ -585,6 +585,30 @@ impl Db {
                     .page_dead_list_tail_pid
                     .load(std::sync::atomic::Ordering::Acquire),
                 kind: DeadListKind::Page,
+            });
+        }
+        // ZFS port Phase 3b: the THIRD, independent chain — the per-clone
+        // page-livelist (ALLOC/FREE of clone-private L2P pages). Same
+        // `drain_up_to_lsn` filter + segment build / IO / rollback /
+        // promotion machinery, tagged `Live` so it routes to the
+        // `LiveListSegment` codec + the `page_live_list_*_pid` anchors.
+        // Only clones ever accumulate records here (non-clone trees have
+        // `clone_birth_lsn == None`), so this loop is a no-op for them.
+        for vol in &volumes {
+            let records = vol.page_live_list.drain_up_to_lsn(wal_checkpoint);
+            if records.is_empty() {
+                continue;
+            }
+            drained_deadlists.push(DeadListDrainEntry {
+                vol: vol.clone(),
+                records: DrainRecords::Live(records),
+                old_head: vol
+                    .page_live_list_head_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                old_tail: vol
+                    .page_live_list_tail_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                kind: DeadListKind::Live,
             });
         }
         if selected.is_empty() && drained_deadlists.is_empty() {
@@ -1012,18 +1036,31 @@ impl Db {
             Vec::with_capacity(drained_deadlists.len());
         let mut dead_list_alloc_err: Option<MetaDbError> = None;
         for entry in &drained_deadlists {
-            let page_count = crate::deadlist::segment_pages_for(entry.records.len());
+            // Dead (PBA/page) and Live (per-clone livelist) records use
+            // separate codecs but the same allocate-run → build → seal flow.
+            let page_count = match &entry.records {
+                DrainRecords::Dead(recs) => crate::deadlist::segment_pages_for(recs.len()),
+                DrainRecords::Live(recs) => crate::livelist::segment_pages_for(recs.len()),
+            };
             if page_count == 0 {
                 continue;
             }
             match self.page_store.allocate_run(page_count) {
                 Ok(start_pid) => {
-                    let pages = crate::deadlist::build_segment_pages(
-                        start_pid,
-                        &entry.records,
-                        entry.old_tail,
-                        wal_checkpoint,
-                    );
+                    let pages = match &entry.records {
+                        DrainRecords::Dead(recs) => crate::deadlist::build_segment_pages(
+                            start_pid,
+                            recs,
+                            entry.old_tail,
+                            wal_checkpoint,
+                        ),
+                        DrainRecords::Live(recs) => crate::livelist::build_segment_pages(
+                            start_pid,
+                            recs,
+                            entry.old_tail,
+                            wal_checkpoint,
+                        ),
+                    };
                     for (pid, page) in pages {
                         sealed_pages.push((pid, Arc::new(page)));
                     }
@@ -1158,6 +1195,8 @@ impl Db {
         };
         let dead_list_overrides = build_overrides(DeadListKind::Pba);
         let mut page_dead_list_overrides = build_overrides(DeadListKind::Page);
+        // ZFS port Phase 3b: per-clone page-livelist anchor overrides.
+        let page_live_list_overrides = build_overrides(DeadListKind::Live);
         // ZFS port Phase 2: seal this cycle's pending snapshots' page
         // deadlists. Each take inherits the head volume's page-deadlist
         // chain (rewriting its override to (NULL,NULL) so the head resets)
@@ -1236,6 +1275,7 @@ impl Db {
             &l2p_checkpoints,
             &dead_list_overrides,
             &page_dead_list_overrides,
+            &page_live_list_overrides,
         ) {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
@@ -1382,6 +1422,10 @@ impl Db {
                 DeadListKind::Page => (
                     &plan.vol.page_dead_list_head_pid,
                     &plan.vol.page_dead_list_tail_pid,
+                ),
+                DeadListKind::Live => (
+                    &plan.vol.page_live_list_head_pid,
+                    &plan.vol.page_live_list_tail_pid,
                 ),
             };
             if plan.old_head == crate::types::NULL_PAGE {
@@ -1676,11 +1720,27 @@ impl Db {
         free_lsn: Lsn,
     ) {
         for entry in drained.iter_mut() {
-            let records = std::mem::take(&mut entry.records);
-            if !records.is_empty() {
-                match entry.kind {
-                    DeadListKind::Pba => entry.vol.dead_list.restore_front(records),
-                    DeadListKind::Page => entry.vol.page_dead_list.restore_front(records),
+            // Restore each drained chain's records back into its buffer so a
+            // later flush re-attempts them. Empty placeholder preserves the
+            // enum variant (so `kind` and the restore target stay aligned).
+            match &mut entry.records {
+                DrainRecords::Dead(recs) => {
+                    let records = std::mem::take(recs);
+                    if !records.is_empty() {
+                        match entry.kind {
+                            DeadListKind::Pba => entry.vol.dead_list.restore_front(records),
+                            DeadListKind::Page => entry.vol.page_dead_list.restore_front(records),
+                            DeadListKind::Live => unreachable!(
+                                "DrainRecords::Dead never carries DeadListKind::Live"
+                            ),
+                        }
+                    }
+                }
+                DrainRecords::Live(recs) => {
+                    let records = std::mem::take(recs);
+                    if !records.is_empty() {
+                        entry.vol.page_live_list.restore_front(records);
+                    }
                 }
             }
         }

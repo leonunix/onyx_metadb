@@ -1115,6 +1115,18 @@ struct Volume {
     /// v18: newest segment of the HEAD page-deadlist chain (apply-time
     /// append anchor). Loaded from `VolumeEntry.page_dead_list_tail_pid`.
     page_dead_list_tail_pid: AtomicU64,
+    /// v19 (ZFS port Phase 3b): in-memory per-clone page-livelist append
+    /// buffer. Holds ALLOC/FREE `LiveRecord`s for this clone's clone-private
+    /// L2P pages (`birth > branched_at_lsn`). Empty / unused for non-clone
+    /// volumes (their shard trees have `clone_birth_lsn == None`, so nothing
+    /// is captured). Drained at checkpoint into the livelist chain.
+    page_live_list: Arc<crate::livelist::LiveListState>,
+    /// v19: oldest segment of the per-clone page-livelist chain. Loaded from
+    /// `VolumeEntry.page_live_list_head_pid`; advanced by condense.
+    page_live_list_head_pid: AtomicU64,
+    /// v19: newest segment of the page-livelist chain (apply-time append
+    /// anchor). Loaded from `VolumeEntry.page_live_list_tail_pid`.
+    page_live_list_tail_pid: AtomicU64,
     /// Phase 4 lineage tracking — mirrors
     /// [`VolumeEntry::parent_vol_ord`]. `INVALID_VOLUME` encodes
     /// `Option::None`. Loaded on `Db::open`; mutated only by clone /
@@ -1145,6 +1157,9 @@ impl Volume {
             page_dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             page_dead_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
             page_dead_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            page_live_list: Arc::new(crate::livelist::LiveListState::new()),
+            page_live_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            page_live_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
             parent_vol_ord: parking_lot::RwLock::new(None),
             branched_at_lsn: 0,
             promotion_cursor: parking_lot::RwLock::new(None),
@@ -1169,6 +1184,9 @@ impl Volume {
             page_dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             page_dead_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
             page_dead_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            page_live_list: Arc::new(crate::livelist::LiveListState::new()),
+            page_live_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            page_live_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
             parent_vol_ord: parking_lot::RwLock::new(None),
             branched_at_lsn: 0,
             promotion_cursor: parking_lot::RwLock::new(None),
@@ -1182,11 +1200,20 @@ impl Volume {
     /// starts. `branched_at_lsn` is immutable for the volume's lifetime
     /// (it pins the slice of parent history the clone shares); the
     /// other two move only on explicit lineage events.
+    ///
+    /// v19 (ZFS port Phase 3b): also carries the persisted `flags` (so the
+    /// sticky `VOLUME_FLAG_CLONE_LINEAGE` survives reopen — `refresh_manifest_*`
+    /// writes `flags.load()` back, so a hardcoded 0 would wipe it), the
+    /// per-clone page-livelist anchors, and `clone_birth_lsn` — the sticky
+    /// capture threshold (`Some(branched_at_lsn)` for clones, including
+    /// promoted ex-clones; `None` otherwise) which is armed on every shard
+    /// tree here so the COW witness logs ALLOC/FREE for `birth > B` pages.
     #[allow(clippy::too_many_arguments)]
     fn with_lineage(
         ord: VolumeOrdinal,
         shards: Vec<L2pShard>,
         created_lsn: Lsn,
+        flags: u8,
         head_pid: crate::types::PageId,
         tail_pid: crate::types::PageId,
         parent_vol_ord: Option<VolumeOrdinal>,
@@ -1194,18 +1221,33 @@ impl Volume {
         promotion_cursor: Option<crate::types::Lba>,
         page_dead_list_head_pid: crate::types::PageId,
         page_dead_list_tail_pid: crate::types::PageId,
+        page_live_list_head_pid: crate::types::PageId,
+        page_live_list_tail_pid: crate::types::PageId,
+        clone_birth_lsn: Option<Lsn>,
     ) -> Self {
+        // Arm the per-shard livelist capture threshold. Non-clones pass
+        // `None` (zero overhead); clones (and promoted ex-clones) pass
+        // `Some(branched_at_lsn)` so every shard tree records ALLOC/FREE
+        // for its clone-private (`birth > B`) pages.
+        if let Some(b) = clone_birth_lsn {
+            for shard in &shards {
+                shard.tree.write().set_clone_birth_lsn(Some(b));
+            }
+        }
         Self {
             ord,
             shards,
             created_lsn,
-            flags: AtomicU8::new(0),
+            flags: AtomicU8::new(flags),
             dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             dead_list_head_pid: AtomicU64::new(head_pid),
             dead_list_tail_pid: AtomicU64::new(tail_pid),
             page_dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             page_dead_list_head_pid: AtomicU64::new(page_dead_list_head_pid),
             page_dead_list_tail_pid: AtomicU64::new(page_dead_list_tail_pid),
+            page_live_list: Arc::new(crate::livelist::LiveListState::new()),
+            page_live_list_head_pid: AtomicU64::new(page_live_list_head_pid),
+            page_live_list_tail_pid: AtomicU64::new(page_live_list_tail_pid),
             parent_vol_ord: parking_lot::RwLock::new(parent_vol_ord),
             branched_at_lsn,
             promotion_cursor: parking_lot::RwLock::new(promotion_cursor),
@@ -1535,6 +1577,55 @@ impl Db {
                     .load(std::sync::atomic::Ordering::Acquire),
             )
         })
+    }
+
+    /// ZFS port Phase 3b test helper: number of buffered records in the
+    /// per-clone page-livelist (ALLOC/FREE captured but not yet drained to
+    /// a segment). `None` for an unknown volume; `Some(0)` for a non-clone
+    /// (its trees never capture).
+    pub(crate) fn test_page_live_list_len(&self, vol_ord: VolumeOrdinal) -> Option<usize> {
+        self.volumes
+            .read()
+            .get(&vol_ord)
+            .map(|v| v.page_live_list.len())
+    }
+
+    /// ZFS port Phase 3b test helper: the volume's page-livelist
+    /// `(head_pid, tail_pid)` anchors.
+    pub(crate) fn test_page_live_list_anchors(
+        &self,
+        vol_ord: VolumeOrdinal,
+    ) -> Option<(PageId, PageId)> {
+        self.volumes.read().get(&vol_ord).map(|v| {
+            (
+                v.page_live_list_head_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                v.page_live_list_tail_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        })
+    }
+
+    /// ZFS port Phase 3b test helper: drain + reconstruct the live-ALLOC set
+    /// (ALLOC minus matched FREE) from a volume's page-livelist — both the
+    /// durable chain and the not-yet-drained in-memory buffer — as a set of
+    /// `(pid, birth)` pairs. Lets a test assert the substrate equals the
+    /// clone-private reachable subtree without going through `verify_path`.
+    pub(crate) fn test_clone_live_allocs(
+        &self,
+        vol_ord: VolumeOrdinal,
+    ) -> Result<std::collections::HashSet<(PageId, Lsn)>> {
+        let vol = self.volume(vol_ord)?;
+        let mut records = crate::livelist::read_chain_records(
+            vol.page_live_list_tail_pid
+                .load(std::sync::atomic::Ordering::Acquire),
+            |p| self.page_store.read_page(p),
+        )?;
+        records.extend(vol.page_live_list.peek());
+        Ok(crate::livelist::live_allocs(records)?
+            .into_iter()
+            .map(|r| (r.pid, r.birth_lsn))
+            .collect())
     }
 
     /// ZFS port Phase 2 test helper: a snapshot's sealed page-deadlist

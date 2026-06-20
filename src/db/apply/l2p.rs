@@ -118,6 +118,33 @@ pub(in crate::db) fn drain_page_deaths_into(
     }
 }
 
+/// ZFS port Phase 3b: drain the tree's page-livelist witness (ALLOC/FREE
+/// events for this clone's clone-private L2P pages this op) into the clone's
+/// `page_live_list`. Peer of [`drain_page_deaths`]; called at every same
+/// site. ALWAYS drains the witness (clears it so it can't leak into the next
+/// op — the witness is empty for non-clones, whose trees never capture). No
+/// `youngest`-style gate and no replay suppression: the tree already gates
+/// capture by `clone_birth_lsn` + `birth > B`, and the `checkpoint_lsn`
+/// cutoff makes persisted events (`event_lsn <= checkpoint_lsn`) disjoint
+/// from any replayed op's events (`event_lsn > checkpoint_lsn`), so
+/// re-recording on replay/buffer-fold cannot double up the durable chain.
+#[inline]
+pub(in crate::db) fn drain_live_events(volume: &Volume, tree: &mut PagedL2p) {
+    drain_live_events_into(&volume.page_live_list, tree);
+}
+
+/// Lower-level peer of [`drain_live_events`] for the buffer-fold path, which
+/// holds the volume's `page_live_list` but not the full `Volume`.
+#[inline]
+pub(in crate::db) fn drain_live_events_into(
+    page_live_list: &crate::livelist::LiveListState,
+    tree: &mut PagedL2p,
+) {
+    for rec in tree.take_live_events() {
+        page_live_list.push(rec);
+    }
+}
+
 /// Does any live snapshot in `snap_infos` pin `target` at `lba`? A snapshot
 /// pins it iff its point-in-time L2P maps `lba` to the *exact same* 28-byte
 /// value (audit semantics count distinct `(V, lba, value)` tuples, so two
@@ -287,6 +314,7 @@ pub(in crate::db) fn apply_l2p_remap(
     // `tree.insert_at_lsn` above; buffer mode COWs later in the fold (the
     // witness is empty here, drained by the fold instead).
     drain_page_deaths(volume, &mut tree, snap_infos);
+    drain_live_events(volume, &mut tree);
 
     Ok(ApplyOutcome::L2pRemap {
         applied: true,
@@ -602,6 +630,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
         // above without touching the tree); buffer-mode COW happens in
         // the fold.
         drain_page_deaths(volume, &mut tree, snap_infos);
+        drain_live_events(volume, &mut tree);
     }
 
     Ok(ApplyOutcome::L2pRemapRange {
@@ -705,6 +734,7 @@ pub(in crate::db) fn apply_l2p_range_delete(
         // ZFS port Phase 2: a range delete COWs the path to each deleted
         // leaf; record any page displaced off the head.
         drain_page_deaths(volume, &mut tree, snap_infos);
+        drain_live_events(volume, &mut tree);
     }
 
     Ok(ApplyOutcome::RangeDelete { freed_pbas })

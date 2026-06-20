@@ -189,6 +189,7 @@ fn verify_reopened_db(
         VerifyOptions {
             strict: true,
             check_birth_shadow: true,
+            check_clone_livelist: true,
         },
     )
 }

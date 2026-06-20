@@ -24,6 +24,13 @@ pub struct VerifyOptions {
     /// use) WITHOUT changing any behavior — page-rc stays authoritative.
     /// Off by default so existing verify callers are unaffected.
     pub check_birth_shadow: bool,
+    /// Run the per-clone page-livelist audit (ZFS port Phase 3b): for every
+    /// clone (volume with `VOLUME_FLAG_CLONE_LINEAGE`), reconstruct the
+    /// live-ALLOC set from its livelist chain (ALLOC minus matched FREE) and
+    /// assert it equals `reachable(clone) ∩ {birth > branched_at_lsn}` — the
+    /// clone-private subtree the substrate must faithfully record before
+    /// Phase 4 reads it instead of page-rc. Off by default.
+    pub check_clone_livelist: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -217,7 +224,119 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
         }
     }
 
+    if options.check_clone_livelist
+        && let Err(err) = check_clone_livelist(&page_store, &manifest.manifest, &mut report)
+    {
+        report
+            .issues
+            .push(format!("clone-livelist check failed: {err}"));
+    }
+
     Ok(report)
+}
+
+/// Per-clone page-livelist audit (ZFS port Phase 3b). For every clone (a
+/// volume carrying `VOLUME_FLAG_CLONE_LINEAGE`, set at clone creation and
+/// sticky past promotion), reconstruct the live-ALLOC set from its livelist
+/// chain — ALLOC records not cancelled by a matching `(pid, birth)` FREE —
+/// and prove it equals the clone's clone-private subtree:
+///
+///   live-ALLOC(C)  ==  reachable_l2p_pages(C roots) ∩ { birth_lsn > B }
+///
+/// where `B = branched_at_lsn`. This is the substrate invariant Phase 4
+/// relies on to free a dropped clone's private pages from the livelist
+/// instead of walking the tree / consulting page-rc. Both directions are
+/// hard `issues`: a logged page no longer reachable (`extra`) is a stale /
+/// over-logged record (a leak at the Phase-4 cutover); a reachable
+/// clone-private page absent from the live-ALLOC set (`missing`) is an
+/// under-log (a premature-free at the cutover). Structural checks: every
+/// record has `birth > B`, and `live_allocs` rejects a FREE without a prior
+/// matching ALLOC.
+fn check_clone_livelist(
+    page_store: &Arc<PageStore>,
+    manifest: &Manifest,
+    report: &mut VerifyReport,
+) -> Result<()> {
+    for volume in &manifest.volumes {
+        if volume.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE == 0 {
+            continue;
+        }
+        let vol = volume.ord;
+        let b = volume.branched_at_lsn;
+
+        let records = crate::livelist::read_chain_records(volume.page_live_list_tail_pid, |p| {
+            page_store.read_page(p)
+        })?;
+        for r in &records {
+            if r.birth_lsn <= b {
+                report.issues.push(format!(
+                    "clone-livelist vol {vol}: record pid={} has birth_lsn={} <= branched_at_lsn={b} \
+                     (a livelist member must be clone-private, born after the branch)",
+                    r.pid, r.birth_lsn
+                ));
+            }
+        }
+        let live = match crate::livelist::live_allocs(records) {
+            Ok(live) => live,
+            Err(err) => {
+                report
+                    .issues
+                    .push(format!("clone-livelist vol {vol}: {err}"));
+                continue;
+            }
+        };
+        let live_set: HashSet<(PageId, Lsn)> =
+            live.iter().map(|r| (r.pid, r.birth_lsn)).collect();
+
+        // Ground truth: the clone's clone-private subtree — pages reachable
+        // from its current roots whose immutable birth is after the branch.
+        let reachable = reachable_l2p_pages(page_store, &volume.l2p_shard_roots)?;
+        let mut clone_private: HashSet<(PageId, Lsn)> = HashSet::new();
+        for pid in &reachable {
+            let header = match page_store
+                .read_page_unchecked(*pid)
+                .and_then(|p| p.header())
+            {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if matches!(
+                header.page_type,
+                PageType::PagedLeaf | PageType::PagedIndex
+            ) && header.birth_lsn > b
+            {
+                clone_private.insert((*pid, header.birth_lsn));
+            }
+        }
+
+        let mut extra: Vec<(PageId, Lsn)> =
+            live_set.difference(&clone_private).copied().collect();
+        if !extra.is_empty() {
+            extra.sort_unstable();
+            report.issues.push(format!(
+                "clone-livelist vol {vol} (B={b}): {} live-ALLOC record(s) name pages that are NOT \
+                 clone-private-reachable (stale / over-logged): {extra:?} \
+                 (live={} clone_private={})",
+                extra.len(),
+                live_set.len(),
+                clone_private.len(),
+            ));
+        }
+        let mut missing: Vec<(PageId, Lsn)> =
+            clone_private.difference(&live_set).copied().collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            report.issues.push(format!(
+                "clone-livelist vol {vol} (B={b}): {} clone-private-reachable page(s) absent from the \
+                 live-ALLOC set (under-logged): {missing:?} \
+                 (live={} clone_private={})",
+                missing.len(),
+                live_set.len(),
+                clone_private.len(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Birth-txg SHADOW invariant (ZFS birth-txg port, Phase 1). For each
@@ -474,6 +593,18 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
             volume.page_dead_list_tail_pid,
             &mut live,
         )?;
+        // ZFS port Phase 3b: the per-clone page-livelist chain (clone-private
+        // page ALLOC/FREE log) is a THIRD independent chain. Mark its segment
+        // pages live so `reclaim_orphan_pages`-on-open does not free them out
+        // from under the manifest anchors → page-type corruption. Walk by tail
+        // (like the snapshot deadlist marking below); `LiveListSegment` codec.
+        if volume.page_live_list_tail_pid != NULL_PAGE {
+            for pid in crate::livelist::walk_chain_pages(volume.page_live_list_tail_pid, |p| {
+                page_store.read_page(p)
+            })? {
+                live.mark(pid);
+            }
+        }
     }
     for &meta_pid in manifest.refcount_shard_roots.iter() {
         if meta_pid == NULL_PAGE {

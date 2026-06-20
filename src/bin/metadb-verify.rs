@@ -17,6 +17,7 @@ fn run() -> Result<ExitCode, String> {
     let mut strict = false;
     let mut json = false;
     let mut check_birth_shadow = false;
+    let mut check_clone_livelist = false;
     let mut path = None;
 
     for arg in env::args().skip(1) {
@@ -24,6 +25,7 @@ fn run() -> Result<ExitCode, String> {
             "--strict" => strict = true,
             "--json" => json = true,
             "--birth-shadow" => check_birth_shadow = true,
+            "--clone-livelist" => check_clone_livelist = true,
             "-h" | "--help" => {
                 print_usage();
                 return Ok(ExitCode::SUCCESS);
@@ -46,6 +48,7 @@ fn run() -> Result<ExitCode, String> {
         VerifyOptions {
             strict,
             check_birth_shadow,
+            check_clone_livelist,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -62,7 +65,9 @@ fn run() -> Result<ExitCode, String> {
 }
 
 fn print_usage() {
-    eprintln!("usage: metadb-verify <path> [--strict] [--json] [--birth-shadow]");
+    eprintln!(
+        "usage: metadb-verify <path> [--strict] [--json] [--birth-shadow] [--clone-livelist]"
+    );
 }
 
 fn print_human(report: &VerifyReport) {

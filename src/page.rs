@@ -133,6 +133,13 @@ pub enum PageType {
     /// continuation pages within the same segment-run are all records.
     /// Layout owned by [`crate::deadlist`].
     DeadListSegment = 13,
+    /// Per-clone page-livelist segment (ZFS port Phase 3b): append-only
+    /// chain of `(pid, birth_lsn, event_lsn, kind: ALLOC|FREE)` records
+    /// logging the lifecycle of a clone's clone-private L2P pages
+    /// (`birth_lsn > branched_at_lsn`). Same segment shape as
+    /// [`DeadListSegment`] but a distinct magic ("LIVS") + an ALLOC/FREE
+    /// kind byte per record. Layout owned by [`crate::livelist`].
+    LiveListSegment = 14,
 }
 
 impl PageType {
@@ -152,6 +159,7 @@ impl PageType {
             10 => Self::RefcountArray,
             12 => Self::CuckooData,
             13 => Self::DeadListSegment,
+            14 => Self::LiveListSegment,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }

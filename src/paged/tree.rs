@@ -56,6 +56,19 @@ pub struct PagedL2p {
     /// apply / fold layer via [`take_cow_displaced`](Self::take_cow_displaced);
     /// cleared on the op error path (mirrors `clear_rc_deltas`).
     cow_displaced: Vec<crate::deadlist::DeadRecord>,
+    /// ZFS port Phase 3b sticky per-clone capture threshold. `Some(B)` =
+    /// this shard belongs to a clone branched at `B = branched_at_lsn`, so
+    /// COW/alloc/free of its clone-private pages (`birth > B`) emit
+    /// `LiveRecord`s into `live_events`; `None` = non-clone, zero overhead.
+    /// Set at clone build / reopen and **never cleared** (survives promotion
+    /// — promoted ex-clones keep recording, which Phase 4 needs).
+    clone_birth_lsn: Option<Lsn>,
+    /// ZFS port Phase 3b page-livelist witness: ALLOC/FREE events for this
+    /// clone's clone-private L2P pages, accumulated per op and drained by
+    /// the apply / fold layer via [`take_live_events`](Self::take_live_events);
+    /// cleared on the op error path (mirrors `cow_displaced`). Empty unless
+    /// `clone_birth_lsn` is set.
+    live_events: Vec<crate::livelist::LiveRecord>,
 }
 
 pub(crate) struct Checkpoint {
@@ -135,6 +148,8 @@ impl PagedL2p {
             retired_pages: PageIdSet::default(),
             checkpoint_protected: PageIdSet::default(),
             cow_displaced: Vec::new(),
+            clone_birth_lsn: None,
+            live_events: Vec::new(),
         })
     }
 
@@ -179,6 +194,8 @@ impl PagedL2p {
             retired_pages: PageIdSet::default(),
             checkpoint_protected: PageIdSet::default(),
             cow_displaced: Vec::new(),
+            clone_birth_lsn: None,
+            live_events: Vec::new(),
         })
     }
 
@@ -211,6 +228,8 @@ impl PagedL2p {
             retired_pages: PageIdSet::default(),
             checkpoint_protected: PageIdSet::default(),
             cow_displaced: Vec::new(),
+            clone_birth_lsn: None,
+            live_events: Vec::new(),
         })
     }
 
@@ -239,6 +258,8 @@ impl PagedL2p {
             retired_pages: PageIdSet::default(),
             checkpoint_protected: PageIdSet::default(),
             cow_displaced: Vec::new(),
+            clone_birth_lsn: None,
+            live_events: Vec::new(),
         })
     }
 
@@ -319,17 +340,30 @@ impl PagedL2p {
     fn alloc_leaf_private(&mut self, generation: Lsn) -> Result<PageId> {
         let pid = self.buf.alloc_leaf(generation)?;
         self.private_pages.insert(pid);
+        // v19 livelist: a fresh clone-private leaf is born at `generation`.
+        self.push_live_alloc(pid, generation);
         Ok(pid)
     }
 
     fn alloc_index_private(&mut self, generation: Lsn, level: u8) -> Result<PageId> {
         let pid = self.buf.alloc_index(generation, level)?;
         self.private_pages.insert(pid);
+        // v19 livelist: a fresh clone-private index page is born at `generation`.
+        self.push_live_alloc(pid, generation);
         Ok(pid)
     }
 
     fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
         let effective_rc = self.buf.effective_rc(pid)?;
+        // v19 livelist: pre-read the old page's immutable birth (clones only)
+        // so a replacement can classify the dying version's FREE before any
+        // buf mutation. Non-clones (`clone_birth_lsn == None`) skip the read,
+        // keeping the hot path untouched.
+        let old_birth = if self.clone_birth_lsn.is_some() {
+            Some(self.buf.read(pid)?.birth_lsn())
+        } else {
+            None
+        };
         if self.private_pages.contains(&pid) && effective_rc <= 1 {
             if self.checkpoint_protected.contains(&pid) {
                 // A3: `clone_private` stages the clone's +1 into the page-rc
@@ -345,6 +379,10 @@ impl PagedL2p {
                 self.private_pages.remove(&pid);
                 self.private_pages.insert(new_pid);
                 self.retired_pages.insert(pid);
+                if let Some(ob) = old_birth {
+                    self.push_live_free(pid, ob, lsn);
+                }
+                self.push_live_alloc(new_pid, lsn);
                 return Ok(new_pid);
             }
             return Ok(pid);
@@ -356,6 +394,10 @@ impl PagedL2p {
                 if new_pid != pid {
                     self.private_pages.remove(&pid);
                     self.private_pages.insert(new_pid);
+                    if let Some(ob) = old_birth {
+                        self.push_live_free(pid, ob, lsn);
+                    }
+                    self.push_live_alloc(new_pid, lsn);
                 }
                 return Ok(new_pid);
             }
@@ -363,15 +405,23 @@ impl PagedL2p {
             self.private_pages.remove(&pid);
             self.private_pages.insert(new_pid);
             self.retired_pages.insert(pid);
+            if let Some(ob) = old_birth {
+                self.push_live_free(pid, ob, lsn);
+            }
+            self.push_live_alloc(new_pid, lsn);
             return Ok(new_pid);
         }
         // SHARED COW (`effective_rc > 1`): `pid` is pinned by a snapshot
         // (Phase-1 invariant), so cloning it leaves the old version alive
         // for that snapshot — it "dies off the head" here. Capture
         // `(pid, birth, death=lsn)` BEFORE the COW consumes the slot; the
-        // apply / fold layer drains it into the HEAD page-deadlist. birth
-        // read is cheap (the page is already cache-resident for the COW).
-        let birth = self.buf.read(pid)?.birth_lsn();
+        // apply / fold layer drains it into the HEAD page-deadlist. Reuse the
+        // clone pre-read (`old_birth`) when present; otherwise read once (the
+        // page is cache-resident for the COW). Same immutable `birth_lsn`.
+        let birth = match old_birth {
+            Some(b) => b,
+            None => self.buf.read(pid)?.birth_lsn(),
+        };
         let new_pid = self.buf.cow_for_write(pid, lsn)?;
         if new_pid != pid {
             self.private_pages.insert(new_pid);
@@ -380,6 +430,14 @@ impl PagedL2p {
                 birth_lsn: birth,
                 death_lsn: lsn,
             });
+            // v19 livelist: if the OLD shared page was itself clone-private
+            // (`birth > B` — e.g. a snapshot-of-clone pins a page the clone
+            // allocated), it just left the clone's live tree → FREE. Origin
+            // pages (`birth <= B`) are not livelist members (they ride the
+            // snapshot deadlist via `cow_displaced`). The new copy is born
+            // at `lsn > B` → ALLOC.
+            self.push_live_free(pid, birth, lsn);
+            self.push_live_alloc(new_pid, lsn);
         }
         Ok(new_pid)
     }
@@ -393,7 +451,61 @@ impl PagedL2p {
         std::mem::take(&mut self.cow_displaced)
     }
 
+    /// ZFS port Phase 3b: arm (or disarm) this shard's per-clone livelist
+    /// capture threshold. `Some(B)` makes alloc/COW/free of its clone-private
+    /// pages (`birth > B`) emit `LiveRecord`s. Sticky: set once at clone build
+    /// / reopen, never cleared (covers promoted ex-clones). Idempotent.
+    pub(crate) fn set_clone_birth_lsn(&mut self, threshold: Option<Lsn>) {
+        self.clone_birth_lsn = threshold;
+    }
+
+    /// Drain the page-livelist witness accumulated by this op's clone-private
+    /// allocs / COWs / frees (ZFS port Phase 3b). Called by the apply / fold
+    /// layer after the op's rc deltas commit; each record is appended to the
+    /// clone's in-memory `page_live_list`. Always empty for non-clones.
+    pub(crate) fn take_live_events(&mut self) -> Vec<crate::livelist::LiveRecord> {
+        std::mem::take(&mut self.live_events)
+    }
+
+    /// Record the birth of a clone-private page (`birth = lsn > B`). No-op for
+    /// non-clones (`clone_birth_lsn == None`).
+    fn push_live_alloc(&mut self, new_pid: PageId, lsn: Lsn) {
+        if let Some(b) = self.clone_birth_lsn
+            && lsn > b
+        {
+            self.live_events.push(crate::livelist::LiveRecord {
+                pid: new_pid,
+                birth_lsn: lsn,
+                event_lsn: lsn,
+                kind: crate::livelist::LiveKind::Alloc,
+            });
+        }
+    }
+
+    /// Record the death of a page version iff it was itself clone-private
+    /// (`old_birth > B`); origin pages (`birth <= B`) are not in the livelist
+    /// (they ride the snapshot deadlist). No-op for non-clones.
+    fn push_live_free(&mut self, old_pid: PageId, old_birth: Lsn, event_lsn: Lsn) {
+        if let Some(b) = self.clone_birth_lsn
+            && old_birth > b
+        {
+            self.live_events.push(crate::livelist::LiveRecord {
+                pid: old_pid,
+                birth_lsn: old_birth,
+                event_lsn,
+                kind: crate::livelist::LiveKind::Free,
+            });
+        }
+    }
+
     fn free_detached(&mut self, pid: PageId, generation: Lsn) -> Result<()> {
+        // v19 livelist: a page being detached/freed (delete emptied it) leaves
+        // the clone's live tree. If it was clone-private (`birth > B`) emit a
+        // FREE. Read birth before any forget; clones only (zero overhead else).
+        if self.clone_birth_lsn.is_some() {
+            let birth = self.buf.read(pid)?.birth_lsn();
+            self.push_live_free(pid, birth, generation);
+        }
         if self.checkpoint_protected.contains(&pid) {
             self.private_pages.remove(&pid);
             self.retired_pages.insert(pid);
@@ -1076,6 +1188,9 @@ impl PagedL2p {
                 // so drop the witness too (mirrors `clear_rc_deltas`). A
                 // successful op leaves it for the apply / fold layer.
                 self.cow_displaced.clear();
+                // v19: same for the page-livelist witness — an aborted op's
+                // clone-private allocs/frees never landed.
+                self.live_events.clear();
                 Err(e)
             }
         }

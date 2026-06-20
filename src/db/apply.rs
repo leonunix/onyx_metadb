@@ -7,9 +7,9 @@ mod volume;
 
 pub(super) use dedup::{apply_dedup_delete_with_rc, apply_dedup_put_with_rc, apply_free_pbas};
 pub(super) use l2p::{
-    apply_l2p_range_delete, apply_l2p_remap, apply_l2p_remap_range, drain_page_deaths_into,
-    record_dead, scan_l2p_range, seq_guard_rejects, stage_delete_rc, stage_remap_rc,
-    stamp_birth_lsn,
+    apply_l2p_range_delete, apply_l2p_remap, apply_l2p_remap_range, drain_live_events,
+    drain_live_events_into, drain_page_deaths_into, record_dead, scan_l2p_range, seq_guard_rejects,
+    stage_delete_rc, stage_remap_rc, stamp_birth_lsn,
 };
 pub(super) use promotion::{apply_promotion_chunk, apply_promotion_complete};
 pub(super) use volume::{
@@ -143,6 +143,7 @@ pub(super) fn apply_op_bare(
             // (non-buffer) write; record any page it displaced off the
             // head. Buffer mode COWs in the fold (witness empty here).
             l2p::drain_page_deaths(volume, &mut tree, &snap_infos);
+            l2p::drain_live_events(volume, &mut tree);
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         WalOp::L2pDelete { vol_ord, lba } => {
@@ -179,6 +180,7 @@ pub(super) fn apply_op_bare(
             // ZFS port Phase 2: a direct delete COWs the path to the
             // deleted leaf; record any displaced page.
             l2p::drain_page_deaths(volume, &mut tree, &snap_infos);
+            l2p::drain_live_events(volume, &mut tree);
             Ok(ApplyOutcome::L2pPrev(prev))
         }
         // [[no-refcount-hot-path-design]] Phase 5: `DedupPut` is now the

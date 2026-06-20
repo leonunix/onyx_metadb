@@ -4,6 +4,15 @@ use crate::types::{INVALID_VOLUME, Lba};
 /// Flag bits on a [`VolumeEntry`].
 pub const VOLUME_FLAG_DROP_PENDING: u8 = 0x01;
 
+/// Sticky "this volume has clone lineage" flag (ZFS port Phase 3b). Set by
+/// `clone_volume` when the volume is branched off a snapshot; **never
+/// cleared** — survives `PromotionComplete` (which clears `parent_vol_ord`)
+/// so the per-clone page-livelist keeps recording for promoted ex-clones,
+/// which Phase 4's authoritative free path must still cover. On reopen this
+/// (together with `branched_at_lsn`) is what arms the shard trees'
+/// `clone_birth_lsn` capture threshold.
+pub const VOLUME_FLAG_CLONE_LINEAGE: u8 = 0x02;
+
 /// Sentinel for `VolumeEntry::promotion_cursor` meaning "no promotion
 /// walker active for this volume" — used both for top-level volumes that
 /// have no parent to promote from and for clones whose background
@@ -68,6 +77,15 @@ pub struct VolumeEntry {
     /// v18: newest segment of the HEAD page-deadlist (append anchor for
     /// the next checkpoint flush). `NULL_PAGE` while empty.
     pub page_dead_list_tail_pid: PageId,
+    /// v19 (ZFS port Phase 3b): oldest segment of this clone's per-clone
+    /// page-livelist — the ALLOC/FREE log of its clone-private L2P pages
+    /// (`birth > branched_at_lsn`). `NULL_PAGE` for non-clone volumes and
+    /// while the chain is empty. Same `LiveListSegment` codec, separate
+    /// chain from both PBA and page deadlists. Condense consumes from here.
+    pub page_live_list_head_pid: PageId,
+    /// v19: newest segment of the page-livelist (append anchor for the next
+    /// checkpoint flush). `NULL_PAGE` while empty.
+    pub page_live_list_tail_pid: PageId,
 }
 
 /// Size of a [`VolumeEntry`]'s fixed header when encoded inline. The
@@ -79,6 +97,8 @@ pub struct VolumeEntry {
 /// `promotion_cursor` (8).
 /// v18 grew it by another 16 B for the HEAD page-deadlist anchors:
 /// `page_dead_list_head_pid` (8) + `page_dead_list_tail_pid` (8).
+/// v19 grew it by another 16 B for the per-clone page-livelist anchors:
+/// `page_live_list_head_pid` (8) + `page_live_list_tail_pid` (8).
 pub const VOLUME_ENTRY_FIXED_SIZE: usize = 2 /* ord */
     + 4 /* shard_count */
     + 8 /* created_lsn */
@@ -91,7 +111,9 @@ pub const VOLUME_ENTRY_FIXED_SIZE: usize = 2 /* ord */
     + 8 /* branched_at_lsn */
     + 8 /* promotion_cursor (Lba, PROMOTION_CURSOR_NONE = None) */
     + 8 /* page_dead_list_head_pid (v18) */
-    + 8 /* page_dead_list_tail_pid (v18) */;
+    + 8 /* page_dead_list_tail_pid (v18) */
+    + 8 /* page_live_list_head_pid (v19) */
+    + 8 /* page_live_list_tail_pid (v19) */;
 
 /// Inline-encoded byte length of a volume entry with the given shard count.
 ///
@@ -155,6 +177,9 @@ pub fn encode_volume_entry_inline(
     // v18: HEAD page-deadlist anchors.
     buf[*off + 52..*off + 60].copy_from_slice(&entry.page_dead_list_head_pid.to_le_bytes());
     buf[*off + 60..*off + 68].copy_from_slice(&entry.page_dead_list_tail_pid.to_le_bytes());
+    // v19: per-clone page-livelist anchors.
+    buf[*off + 68..*off + 76].copy_from_slice(&entry.page_live_list_head_pid.to_le_bytes());
+    buf[*off + 76..*off + 84].copy_from_slice(&entry.page_live_list_tail_pid.to_le_bytes());
     *off += VOLUME_ENTRY_FIXED_SIZE;
     for root in entry.l2p_shard_roots.iter().copied() {
         buf[*off..*off + 8].copy_from_slice(&root.to_le_bytes());
@@ -220,6 +245,18 @@ pub fn decode_volume_entry_inline(
     } else {
         (crate::types::NULL_PAGE, crate::types::NULL_PAGE)
     };
+    // v19 per-clone page-livelist anchors. v18 (and older) databases are
+    // flag-day rejected at manifest open, so v19 always reads both; the
+    // `NULL_PAGE` fallback is dead code kept for the body_version gate
+    // symmetry with the older anchors above.
+    let (page_live_list_head_pid, page_live_list_tail_pid) = if body_version >= 19 {
+        (
+            u64::from_le_bytes(buf[*off + 68..*off + 76].try_into().unwrap()),
+            u64::from_le_bytes(buf[*off + 76..*off + 84].try_into().unwrap()),
+        )
+    } else {
+        (crate::types::NULL_PAGE, crate::types::NULL_PAGE)
+    };
     *off += VOLUME_ENTRY_FIXED_SIZE;
     let needed_roots = shard_count as usize * size_of::<PageId>();
     if buf.len() < *off + needed_roots {
@@ -268,5 +305,7 @@ pub fn decode_volume_entry_inline(
         promotion_cursor,
         page_dead_list_head_pid,
         page_dead_list_tail_pid,
+        page_live_list_head_pid,
+        page_live_list_tail_pid,
     })
 }

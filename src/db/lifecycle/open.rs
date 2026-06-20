@@ -122,6 +122,8 @@ impl Db {
             promotion_cursor: None,
             page_dead_list_head_pid: crate::types::NULL_PAGE,
             page_dead_list_tail_pid: crate::types::NULL_PAGE,
+            page_live_list_head_pid: crate::types::NULL_PAGE,
+            page_live_list_tail_pid: crate::types::NULL_PAGE,
         }];
         manifest.next_volume_ord = BOOTSTRAP_VOLUME_ORD + 1;
         manifest_store.commit(&manifest)?;
@@ -399,6 +401,7 @@ impl Db {
                     entry.ord,
                     shards,
                     entry.created_lsn,
+                    entry.flags,
                     entry.dead_list_head_pid,
                     entry.dead_list_tail_pid,
                     entry.parent_vol_ord,
@@ -406,6 +409,13 @@ impl Db {
                     entry.promotion_cursor,
                     entry.page_dead_list_head_pid,
                     entry.page_dead_list_tail_pid,
+                    entry.page_live_list_head_pid,
+                    entry.page_live_list_tail_pid,
+                    // v19: sticky clone-lineage flag arms the livelist
+                    // capture threshold — covers promoted ex-clones too
+                    // (flag persists past `PromotionComplete`).
+                    (entry.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0)
+                        .then_some(entry.branched_at_lsn),
                 )),
             );
         }
@@ -1000,6 +1010,8 @@ fn apply_lifecycle_record_replay(
                     promotion_cursor: None,
                     page_dead_list_head_pid: crate::types::NULL_PAGE,
                     page_dead_list_tail_pid: crate::types::NULL_PAGE,
+                    page_live_list_head_pid: crate::types::NULL_PAGE,
+                    page_live_list_tail_pid: crate::types::NULL_PAGE,
                 });
                 outcome.mutated_volumes = true;
             }
@@ -1069,6 +1081,7 @@ fn apply_lifecycle_record_replay(
                         *new_ord,
                         shards,
                         lsn,
+                        crate::manifest::VOLUME_FLAG_CLONE_LINEAGE,
                         crate::types::NULL_PAGE,
                         crate::types::NULL_PAGE,
                         Some(*src_ord),
@@ -1076,6 +1089,9 @@ fn apply_lifecycle_record_replay(
                         None,
                         crate::types::NULL_PAGE,
                         crate::types::NULL_PAGE,
+                        crate::types::NULL_PAGE,
+                        crate::types::NULL_PAGE,
+                        Some(branched_at_lsn),
                     )),
                 );
                 let durable_seqs = vec![lsn; shard_count as usize].into_boxed_slice();
@@ -1085,7 +1101,8 @@ fn apply_lifecycle_record_replay(
                     l2p_shard_roots: actual_roots,
                     l2p_shard_durable_seq: durable_seqs,
                     created_lsn: lsn,
-                    flags: 0,
+                    // v19: sticky clone-lineage flag (ZFS port Phase 3b).
+                    flags: crate::manifest::VOLUME_FLAG_CLONE_LINEAGE,
                     dead_list_head_pid: crate::types::NULL_PAGE,
                     dead_list_tail_pid: crate::types::NULL_PAGE,
                     parent_vol_ord: Some(*src_ord),
@@ -1093,6 +1110,8 @@ fn apply_lifecycle_record_replay(
                     promotion_cursor: None,
                     page_dead_list_head_pid: crate::types::NULL_PAGE,
                     page_dead_list_tail_pid: crate::types::NULL_PAGE,
+                    page_live_list_head_pid: crate::types::NULL_PAGE,
+                    page_live_list_tail_pid: crate::types::NULL_PAGE,
                 });
                 outcome.mutated_volumes = true;
             }

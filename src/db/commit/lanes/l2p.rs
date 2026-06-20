@@ -444,6 +444,9 @@ impl Db {
             // batched L2pPut/L2pDelete/unguarded L2pRemap all land here),
             // so it MUST drain — otherwise the witness leaks across ops.
             super::apply::drain_page_deaths_into(&volume.page_dead_list, &mut tree, youngest_snap);
+            // ZFS port Phase 3b: same site for the per-clone page-livelist
+            // witness (empty for non-clones).
+            super::apply::drain_live_events_into(&volume.page_live_list, &mut tree);
         }
         let publish_elapsed = publish_started.elapsed();
         apply_result?;

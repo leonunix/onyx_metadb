@@ -84,6 +84,8 @@ impl Db {
                 promotion_cursor: None,
                 page_dead_list_head_pid: crate::types::NULL_PAGE,
                 page_dead_list_tail_pid: crate::types::NULL_PAGE,
+                page_live_list_head_pid: crate::types::NULL_PAGE,
+                page_live_list_tail_pid: crate::types::NULL_PAGE,
             });
             probe.check_encodable()?;
             (ord, shard_count)
@@ -166,6 +168,8 @@ impl Db {
                 promotion_cursor: None,
                 page_dead_list_head_pid: crate::types::NULL_PAGE,
                 page_dead_list_tail_pid: crate::types::NULL_PAGE,
+                page_live_list_head_pid: crate::types::NULL_PAGE,
+                page_live_list_tail_pid: crate::types::NULL_PAGE,
             });
             mstate.manifest.next_volume_ord = ord
                 .checked_add(1)
@@ -327,6 +331,14 @@ impl Db {
         // describes overwrites that targeted this volume's own LBAs,
         // which are about to disappear.
         let _ = volume.dead_list.drain();
+        // Note: the volume's page-deadlist (v18) and page-livelist (v19,
+        // clones) segment chains are NOT added to the drop payload here.
+        // Like `apply_drop_volume`'s tree pages, once this volume's
+        // `VolumeEntry` is removed from the manifest those segments become
+        // unreferenced and are swept by `reclaim_orphan_pages` on the next
+        // open (verify's `collect_live_pages` marks them live only while the
+        // entry exists). Eager drop-time freeing + condense are a Phase-3b
+        // follow-up; the in-memory livelist buffer is dropped with `volume`.
 
         // ZFS port Phase 3a (SHADOW): for a CLONE, cross-check the page-rc
         // free-set against an independent C-exclusive reachability walk
@@ -717,7 +729,11 @@ impl Db {
                 l2p_shard_roots: vec![crate::types::NULL_PAGE; shard_count].into_boxed_slice(),
                 l2p_shard_durable_seq: vec![probe_lsn; shard_count].into_boxed_slice(),
                 created_lsn: 0,
-                flags: 0,
+                // v19: sticky clone-lineage flag — this volume is a clone, so
+                // it owns a per-clone page-livelist. Set in the probe too so
+                // the capacity check sizes the real (flagged) row (cosmetic —
+                // the flag does not change the row width, but keep it honest).
+                flags: crate::manifest::VOLUME_FLAG_CLONE_LINEAGE,
                 dead_list_head_pid: crate::types::NULL_PAGE,
                 dead_list_tail_pid: crate::types::NULL_PAGE,
                 parent_vol_ord: Some(entry.vol_ord),
@@ -725,6 +741,8 @@ impl Db {
                 promotion_cursor: None,
                 page_dead_list_head_pid: crate::types::NULL_PAGE,
                 page_dead_list_tail_pid: crate::types::NULL_PAGE,
+                page_live_list_head_pid: crate::types::NULL_PAGE,
+                page_live_list_tail_pid: crate::types::NULL_PAGE,
             });
             probe.check_encodable()?;
             (
@@ -817,6 +835,7 @@ impl Db {
                     new_ord,
                     shards,
                     lsn,
+                    crate::manifest::VOLUME_FLAG_CLONE_LINEAGE,
                     crate::types::NULL_PAGE,
                     crate::types::NULL_PAGE,
                     Some(src_ord),
@@ -824,6 +843,9 @@ impl Db {
                     None,
                     crate::types::NULL_PAGE,
                     crate::types::NULL_PAGE,
+                    crate::types::NULL_PAGE,
+                    crate::types::NULL_PAGE,
+                    Some(branched_at_lsn),
                 )),
             );
         }
@@ -840,7 +862,10 @@ impl Db {
                 // durable. Future flushes advance per-shard.
                 l2p_shard_durable_seq: durable_seqs,
                 created_lsn: lsn,
-                flags: 0,
+                // v19: sticky clone-lineage flag (ZFS port Phase 3b). Never
+                // cleared by promotion, so the per-clone page-livelist keeps
+                // recording for promoted ex-clones too.
+                flags: crate::manifest::VOLUME_FLAG_CLONE_LINEAGE,
                 // Clones start with an empty dead-list. The parent's
                 // chain still correctly describes the parent's overwrite
                 // history; the clone's L2P starts fresh so its first
@@ -859,6 +884,8 @@ impl Db {
                 promotion_cursor: None,
                 page_dead_list_head_pid: crate::types::NULL_PAGE,
                 page_dead_list_tail_pid: crate::types::NULL_PAGE,
+                page_live_list_head_pid: crate::types::NULL_PAGE,
+                page_live_list_tail_pid: crate::types::NULL_PAGE,
             });
             mstate.manifest.next_volume_ord = new_ord
                 .checked_add(1)

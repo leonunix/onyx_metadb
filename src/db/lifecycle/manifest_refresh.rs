@@ -6,6 +6,7 @@ pub(in crate::db::lifecycle) fn refresh_manifest_from_checkpoints(
     l2p_checkpoints: &[Vec<Option<crate::paged::tree::Checkpoint>>],
     dead_list_overrides: &HashMap<VolumeOrdinal, (PageId, PageId)>,
     page_dead_list_overrides: &HashMap<VolumeOrdinal, (PageId, PageId)>,
+    page_live_list_overrides: &HashMap<VolumeOrdinal, (PageId, PageId)>,
 ) -> Result<()> {
     manifest.body_version = MANIFEST_BODY_VERSION;
     if volumes.len() != l2p_checkpoints.len() {
@@ -101,6 +102,20 @@ pub(in crate::db::lifecycle) fn refresh_manifest_from_checkpoints(
                         .load(std::sync::atomic::Ordering::Acquire),
                 ),
             };
+        // v19 per-clone page-livelist anchors (ZFS port Phase 3b), same
+        // override-or-atomics fallback as the page-deadlist above.
+        let (page_live_list_head_pid, page_live_list_tail_pid) =
+            match page_live_list_overrides.get(&volume.ord) {
+                Some((h, t)) => (*h, *t),
+                None => (
+                    volume
+                        .page_live_list_head_pid
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    volume
+                        .page_live_list_tail_pid
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+            };
         new_entries.push(VolumeEntry {
             ord: volume.ord,
             shard_count: volume.shards.len() as u32,
@@ -115,6 +130,8 @@ pub(in crate::db::lifecycle) fn refresh_manifest_from_checkpoints(
             promotion_cursor: *volume.promotion_cursor.read(),
             page_dead_list_head_pid,
             page_dead_list_tail_pid,
+            page_live_list_head_pid,
+            page_live_list_tail_pid,
         });
     }
     manifest.volumes = new_entries;
