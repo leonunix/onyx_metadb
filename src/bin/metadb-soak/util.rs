@@ -2,9 +2,19 @@ fn open_or_create_with_faults(
     path: &Path,
     faults: Arc<FaultController>,
 ) -> onyx_metadb::Result<Arc<Db>> {
-    match Db::open_with_faults(path, faults.clone()) {
+    // ZFS port Phase 3b: let the soak drive the background livelist-condense
+    // worker at a low segment threshold so a short run actually exercises it
+    // concurrently with flush/drop/promote (the default is 16; a short soak
+    // rarely grows a single clone chain that far). Unset = engine default.
+    let mut cfg = onyx_metadb::Config::new(path);
+    if let Ok(raw) = std::env::var("METADB_SOAK_LIVELIST_CONDENSE_MIN_SEGMENTS") {
+        if let Ok(n) = raw.parse::<usize>() {
+            cfg.livelist_condense_min_segments = n;
+        }
+    }
+    match Db::open_with_config_and_faults(cfg.clone(), faults.clone()) {
         Ok(db) => Ok(db),
-        Err(_) => Db::create_with_faults(path, faults),
+        Err(_) => Db::create_with_config_and_faults(cfg, faults),
     }
 }
 
@@ -127,10 +137,12 @@ fn l2p_key(tid: usize, slot: u64) -> u64 {
 }
 
 fn dedup_hash(tid: usize, slot: u64) -> Hash8 {
-    let mut hash = [0u8; 8];
-    hash[..8].copy_from_slice(&(tid as u64).to_be_bytes());
-    hash[8..16].copy_from_slice(&slot.to_be_bytes());
-    hash
+    // `Hash8` is 8 bytes; the prior tid(8) || slot(8) 16-byte layout predates
+    // the Hash8 shrink and panicked (`hash[8..16]` out of range), which is why
+    // the legacy workload had gone unused. Pack tid into the high bits + slot
+    // into the low 40 so each (tid, slot) stays a distinct dedup model key.
+    let mixed = ((tid as u64) << 40) ^ (slot & 0x00FF_FFFF_FFFF);
+    mixed.to_be_bytes()
 }
 
 fn refcount_pba(tid: usize, slot: u64) -> u64 {
