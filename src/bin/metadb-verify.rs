@@ -1,7 +1,7 @@
 use std::env;
 use std::process::ExitCode;
 
-use onyx_metadb::{VerifyOptions, VerifyReport, verify_path};
+use onyx_metadb::{VerifyOptions, VerifyReport, audit_clone_birth_shadow, verify_path};
 
 fn main() -> ExitCode {
     match run() {
@@ -18,6 +18,7 @@ fn run() -> Result<ExitCode, String> {
     let mut json = false;
     let mut check_birth_shadow = false;
     let mut check_clone_livelist = false;
+    let mut clone_birth_shadow = false;
     let mut path = None;
 
     for arg in env::args().skip(1) {
@@ -26,6 +27,7 @@ fn run() -> Result<ExitCode, String> {
             "--json" => json = true,
             "--birth-shadow" => check_birth_shadow = true,
             "--clone-livelist" => check_clone_livelist = true,
+            "--clone-birth-shadow" => clone_birth_shadow = true,
             "-h" | "--help" => {
                 print_usage();
                 return Ok(ExitCode::SUCCESS);
@@ -57,6 +59,22 @@ fn run() -> Result<ExitCode, String> {
     } else {
         print_human(&report);
     }
+    // ZFS port Phase 4 Step 4 (S1c): read-only characterization of the
+    // candidate clone COW-kill birth operand. Findings are EXPECTED on some
+    // legitimate DAG shapes (where the pure-birth operand is insufficient and
+    // S1c must use reachability), so they are reported separately and do NOT
+    // affect the exit code — this is a measurement, not a pass/fail invariant.
+    if clone_birth_shadow {
+        match audit_clone_birth_shadow(&path) {
+            Ok(findings) => {
+                println!("clone_birth_shadow_findings: {}", findings.len());
+                for f in &findings {
+                    println!("  - {f}");
+                }
+            }
+            Err(e) => eprintln!("clone-birth-shadow: {e}"),
+        }
+    }
     Ok(if report.is_clean() {
         ExitCode::SUCCESS
     } else {
@@ -66,7 +84,7 @@ fn run() -> Result<ExitCode, String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: metadb-verify <path> [--strict] [--json] [--birth-shadow] [--clone-livelist]"
+        "usage: metadb-verify <path> [--strict] [--json] [--birth-shadow] [--clone-livelist] [--clone-birth-shadow]"
     );
 }
 

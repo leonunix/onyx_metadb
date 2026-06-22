@@ -1642,6 +1642,19 @@ impl Db {
             .collect())
     }
 
+    /// ZFS port Phase 4 Step 4 (S1c) test helper: run the read-only clone
+    /// COW-kill birth-operand shadow over the current in-memory manifest +
+    /// page store, returning the safety-direction findings (empty == the
+    /// pure-birth clone operand is safe for the current state). Flush first so
+    /// the manifest reflects committed roots.
+    #[cfg(test)]
+    pub(crate) fn test_clone_birth_shadow_findings(&self) -> Result<Vec<String>> {
+        crate::verify::clone_birth_shadow_findings(
+            &self.page_store,
+            &self.manifest_state.lock().manifest,
+        )
+    }
+
     /// ZFS port Phase 2 test helper: a snapshot's sealed page-deadlist
     /// tail anchor, by snapshot id.
     pub(crate) fn test_snapshot_page_dead_list_tail(&self, id: SnapshotId) -> Option<PageId> {

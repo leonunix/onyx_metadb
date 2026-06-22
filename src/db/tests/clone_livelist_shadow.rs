@@ -866,3 +866,70 @@ fn teeth_still_fire_through_widened_gate() {
         "expected premature Corruption on promoted-ex-clone inputs, got {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4 Step 4 (S1c): READ-ONLY clone COW-kill birth-operand shadow. page-rc
+// stays authoritative; these characterize where the candidate post-page-rc
+// clone COW-kill operand `birth(P) <= max(branched_at_lsn, youngest_snap(C))`
+// is safe vs insufficient (it cannot see cross-volume DAG sharing).
+// ---------------------------------------------------------------------------
+
+/// A simple clone (diverged, source snapshot alive, no descendants) has a SAFE
+/// pure-birth operand: shared origin pages (born<=B) are pinned by the snapshot
+/// and born<=B_eff (COW'd); clone-private pages (born>B) are unpinned (benign
+/// over-COW). The safety direction must be clean.
+#[test]
+fn clone_birth_shadow_clean_on_simple_clone() {
+    let (_d, db) = mk_db();
+    let p = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(p, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(p).unwrap();
+    let c = db.clone_volume(snap).unwrap();
+    db.insert(c, 0, v(0xC0)).unwrap(); // diverge lba0 only; lba1..7 stay shared
+    db.flush().unwrap();
+
+    let findings = db.test_clone_birth_shadow_findings().unwrap();
+    assert!(
+        findings.is_empty(),
+        "pure-birth clone COW-kill operand must be safe for a simple clone: {findings:?}"
+    );
+}
+
+/// KEY FINDING (S1c): the pure-birth clone COW-kill operand is INSUFFICIENT for
+/// the DAG. C's born>B1 pages are still shared with a survivor descendant D, but
+/// after C's own snapshot s2 is dropped, B_eff(C) falls back to B1 (< their
+/// birth) — so the operand would write them in place, clobbering pages D reads.
+/// page-rc prevents this today (rc>1); the birth model alone cannot. The shadow
+/// must FLAG it, proving S1c's clone COW-kill must consult reachability, not
+/// birth. (Read-only — page-rc authoritative; nothing is actually clobbered.)
+#[test]
+fn clone_birth_shadow_flags_descendant_pinned_born_after_branch() {
+    let (_d, db) = mk_db();
+    let p = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(p, i, v(i as u8)).unwrap();
+    }
+    let s1 = db.take_snapshot(p).unwrap();
+    let c = db.clone_volume(s1).unwrap();
+    for i in 0u64..8 {
+        db.insert(c, i, v(0xC0 | i as u8)).unwrap(); // C born > B1
+    }
+    let s2 = db.take_snapshot(c).unwrap();
+    let d = db.clone_volume(s2).unwrap(); // D shares C's born>B1 pages
+    for i in 0u64..8 {
+        assert_eq!(db.get(d, i).unwrap(), Some(v(0xC0 | i as u8)));
+    }
+    // Drop C's own snapshot -> youngest_snap(C) falls below C's born>B1 page
+    // births -> B_eff(C) == B1, yet D still pins those pages.
+    let _ = db.drop_snapshot(s2).unwrap().unwrap();
+    db.flush().unwrap();
+
+    let findings = db.test_clone_birth_shadow_findings().unwrap();
+    assert!(
+        findings.iter().any(|f| f.contains(&format!("vol {c} "))),
+        "pure-birth clone operand is insufficient here (C's born>B1 pages pinned by survivor D, \
+         B_eff(C) fell below their birth) — S1c must use reachability, not birth. findings={findings:?}"
+    );
+}

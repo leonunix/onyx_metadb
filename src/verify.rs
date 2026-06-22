@@ -416,6 +416,117 @@ fn check_birth_shadow(
     Ok(())
 }
 
+/// Clone COW-kill birth-operand SHADOW (ZFS port Phase 4 Step 4 / S1c —
+/// READ-ONLY characterization, page-rc stays authoritative). `check_birth_shadow`
+/// skips clones because a per-volume birth comparison cannot see cross-volume
+/// DAG sharing; this audit measures exactly that gap for the candidate
+/// post-page-rc clone COW-kill operand.
+///
+/// For each clone C (`VOLUME_FLAG_CLONE_LINEAGE`) the candidate operand is
+/// `COW iff birth(P) <= B_eff`, `B_eff = max(branched_at_lsn, youngest_snap(C))`.
+/// The page-rc-INDEPENDENT ground truth "P is pinned" = P reachable from any
+/// OTHER live volume head or any snapshot tree (a pinned page MUST be COW'd or a
+/// clone write clobbers a shared page).
+///
+/// Only the SAFETY direction is a finding: `pinned(P) && birth(P) > B_eff` — the
+/// operand would write in place over a shared page (the parent/sibling
+/// corruption hazard). The reverse (`birth(P) <= B_eff` but unpinned — e.g. a G8
+/// sole-owned origin page) is a benign conservative over-COW and is NOT flagged.
+///
+/// An EMPTY result proves the pure-birth clone operand is safe for the audited
+/// manifest. A NON-empty result pinpoints a DAG shape (e.g. a descendant clone
+/// pinning an ancestor's born>B page after the ancestor's own snapshot was
+/// dropped, so `B_eff` falls below the page's birth) where the operand is
+/// insufficient and S1c must consult cross-volume reachability, not birth alone.
+pub(crate) fn clone_birth_shadow_findings(
+    page_store: &Arc<PageStore>,
+    manifest: &Manifest,
+) -> Result<Vec<String>> {
+    let mut findings = Vec::new();
+    for volume in &manifest.volumes {
+        if volume.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE == 0 {
+            continue;
+        }
+        let vol = volume.ord;
+        let b = volume.branched_at_lsn;
+        let youngest_snap_clone = manifest
+            .snapshots
+            .iter()
+            .filter(|s| s.vol_ord == vol)
+            .map(|s| s.created_lsn)
+            .max()
+            .unwrap_or(0);
+        let b_eff = b.max(youngest_snap_clone);
+
+        let head_set = reachable_l2p_pages(page_store, &volume.l2p_shard_roots)?;
+
+        // page-rc-INDEPENDENT pinner set: every OTHER live volume head + every
+        // snapshot tree (incl. this clone's own snapshots and any descendant's).
+        let mut pinner_roots: Vec<PageId> = Vec::new();
+        for other in &manifest.volumes {
+            if other.ord == vol {
+                continue;
+            }
+            pinner_roots.extend(
+                other
+                    .l2p_shard_roots
+                    .iter()
+                    .copied()
+                    .filter(|&r| r != NULL_PAGE),
+            );
+        }
+        for snap in &manifest.snapshots {
+            let roots = snapshot_roots(page_store, snap.l2p_roots_page, &snap.l2p_shard_roots)?;
+            pinner_roots.extend(roots.into_iter().filter(|&r| r != NULL_PAGE));
+        }
+        let pinner_set = reachable_l2p_pages(page_store, &pinner_roots)?;
+
+        for pid in &head_set {
+            // Skip unreadable/undecodable pages (mirrors `check_birth_shadow`):
+            // acceptable here because this is a read-only characterization, not
+            // an `is_clean()` gate — a marginally-corrupt page is a verify-scan
+            // concern, not a clone-COW-operand data point.
+            let header = match page_store
+                .read_page_unchecked(*pid)
+                .and_then(|p| p.header())
+            {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if !matches!(
+                header.page_type,
+                PageType::PagedLeaf | PageType::PagedIndex
+            ) {
+                continue;
+            }
+            let operand_cows = header.birth_lsn <= b_eff;
+            let pinned = pinner_set.contains(pid);
+            if pinned && !operand_cows {
+                findings.push(format!(
+                    "clone-birth-shadow vol {vol} (B={b} youngest_snap={youngest_snap_clone} \
+                     B_eff={b_eff}) page {pid}: birth_lsn={} > B_eff but page is reachable from a \
+                     surviving pinner (pure-birth clone COW-kill would clobber a shared page)",
+                    header.birth_lsn
+                ));
+            }
+        }
+    }
+    Ok(findings)
+}
+
+/// CLI/offline entry for [`clone_birth_shadow_findings`]: open the latest
+/// manifest at `path` and return the safety-direction findings (empty == the
+/// pure-birth clone COW-kill operand is safe for this metadb).
+pub fn audit_clone_birth_shadow(path: impl AsRef<Path>) -> Result<Vec<String>> {
+    let page_store = Arc::new(PageStore::open(path.as_ref().join("pages.onyx_meta"))?);
+    match ManifestStore::load_latest(&page_store)? {
+        Some(loaded) => clone_birth_shadow_findings(&page_store, &loaded.manifest),
+        None => Err(MetaDbError::Corruption(
+            "no valid manifest slot could be decoded".into(),
+        )),
+    }
+}
+
 /// Page-deadlist record audit (ZFS birth-txg port, Phase 2a). For each
 /// non-clone volume, read every [`DeadRecord`] across its page-deadlist
 /// chains — the live HEAD chain plus each snapshot's sealed chain — and

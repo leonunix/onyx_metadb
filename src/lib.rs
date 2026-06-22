@@ -65,4 +65,4 @@ pub use types::{
     FIRST_DATA_PAGE, INVALID_VOLUME, Lba, Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId,
     PartitionId, Pba, SnapshotId, VolumeOrdinal,
 };
-pub use verify::{VerifyOptions, VerifyReport, verify_path};
+pub use verify::{VerifyOptions, VerifyReport, audit_clone_birth_shadow, verify_path};
