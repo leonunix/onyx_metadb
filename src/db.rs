@@ -279,6 +279,12 @@ pub struct Db {
     /// Wrapped in `Mutex` so `Drop` can take + stop the worker
     /// even from a `&self` context.
     async_reclaim: Mutex<Option<async_reclaim::AsyncReclaim>>,
+    /// ZFS port Phase 3b: background per-clone page-livelist condense
+    /// worker. Bounds livelist chain growth under clone-overwrite churn.
+    /// `None` when `cfg.livelist_condense_min_segments == 0`. Mirrors
+    /// `async_reclaim`'s `Mutex<Option<…>>` so `Drop` can take + stop it
+    /// from a `&self` context. Independent of `async_reclaim_enabled`.
+    livelist_condense: Mutex<Option<livelist_condense::LivelistCondenser>>,
     /// Background Lineage GC driver — the sole production trigger for
     /// FreePbas-emitting PBA reclaim. Mirrors `async_reclaim` /
     /// `txg_sync`: wrapped in `Mutex` so `Drop` can take + stop it from a
@@ -1403,6 +1409,7 @@ mod l2p;
 mod l2p_buffer;
 mod lifecycle;
 mod lineage_gc;
+mod livelist_condense;
 mod promotion;
 mod snapshot;
 mod streaming_flush;
@@ -1451,6 +1458,13 @@ impl Drop for Db {
         // `Arc<PageCache>` clones; join it here so the page-store
         // teardown doesn't race against in-flight reclaim writes.
         if let Some(mut worker) = self.async_reclaim.lock().take() {
+            worker.stop();
+        }
+        // ZFS port Phase 3b: stop the livelist-condense worker before
+        // page_store / page_cache go away — it holds clones of both and may
+        // be mid-rewrite. Joining here serializes its teardown ahead of the
+        // page-store drop.
+        if let Some(mut worker) = self.livelist_condense.lock().take() {
             worker.stop();
         }
         // Detach the async dedup-index drainers. Each worker holds an
@@ -1675,6 +1689,26 @@ impl Db {
         vol_ord: VolumeOrdinal,
     ) -> Result<promotion::PromotionStep> {
         self.run_promotion_chunk(vol_ord)
+    }
+
+    /// ZFS port Phase 3b test helper: synchronously run one livelist
+    /// condense scan with the given segment threshold, so tests assert
+    /// chain shrinkage deterministically without racing the background
+    /// worker. Mirrors [`Db::test_run_lineage_gc_cycle`].
+    #[cfg(test)]
+    pub(crate) fn test_run_livelist_condense(&self, min_segments: usize) -> Result<()> {
+        livelist_condense::run_condense_scan_once(
+            self.page_store.clone(),
+            self.page_cache.clone(),
+            self.manifest_state.clone(),
+            self.apply_gate.clone(),
+            self.volumes.clone(),
+            self.faults.clone(),
+            livelist_condense::LivelistCondenseParams {
+                min_segments,
+                idle_interval_ms: 0,
+            },
+        )
     }
 
     /// Test helper: synchronously drive one Lineage GC cycle and

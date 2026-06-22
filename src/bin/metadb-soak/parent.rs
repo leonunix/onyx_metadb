@@ -511,6 +511,9 @@ fn run_volume_admin(
         match recv_ack(child)? {
             Ack::Volume(id, ord) if id == next_id => {
                 model.l2p.insert(ord, src.l2p.clone());
+                // ZFS port Phase 3b: track the new clone so a later cycle can
+                // PROMOTE it (and then drop its parent / itself).
+                model.clones.insert(ord);
                 events.write(
                     "clone_volume_ok",
                     &format!("cycle={} src_snap={} ord={}", cycle, src.id, ord),
@@ -532,6 +535,30 @@ fn run_volume_admin(
         next_id += 1;
     }
 
+    // PROMOTE: drive a clone's promotion walker to completion. This is the
+    // ZFS port Phase 3b interleave the runtime clone-drop livelist shadow
+    // needs — a promoted ex-clone clears its `parent_vol_ord`, unpinning the
+    // parent for the DROP roll below (promote→drop-parent / drop-promoted).
+    let promote_candidates = model.promote_candidates();
+    if !promote_candidates.is_empty() && rng.gen_bool(0.3) {
+        let pick = promote_candidates[rng.gen_range(0..promote_candidates.len())];
+        send_admin(child, next_id, &format!("PROMOTE {pick}"))?;
+        match recv_ack(child)? {
+            Ack::Ok(id) if id == next_id => {
+                model.clones.remove(&pick);
+                events.write("promote_volume_ok", &format!("cycle={} ord={}", cycle, pick))?;
+            }
+            Ack::Error(id, err) if id == next_id => {
+                events.write(
+                    "promote_volume_err",
+                    &format!("cycle={} ord={} err={}", cycle, pick, escape_json(&err)),
+                )?;
+            }
+            other => return Err(format!("unexpected promote-volume ack: {other:?}")),
+        }
+        next_id += 1;
+    }
+
     // DROP: only non-bootstrap, non-pinned volumes.
     let candidates = model.drop_candidates(&pinned);
     if !candidates.is_empty() && rng.gen_bool(0.35) {
@@ -540,6 +567,8 @@ fn run_volume_admin(
         match recv_ack(child)? {
             Ack::Ok(id) if id == next_id => {
                 model.l2p.remove(&pick);
+                // ZFS port Phase 3b: a dropped clone leaves the un-promoted set.
+                model.clones.remove(&pick);
                 events.write("drop_volume_ok", &format!("cycle={} ord={}", cycle, pick))?;
             }
             Ack::Error(id, err) if id == next_id => {

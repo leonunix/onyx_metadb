@@ -131,6 +131,29 @@ impl Db {
         }
     }
 
+    /// Drive `vol_ord`'s clone-promotion walker to completion: commit every
+    /// [`LifecycleOp::PromotionChunk`] and the trailing
+    /// [`LifecycleOp::PromotionComplete`] that clears `parent_vol_ord`.
+    /// Returns `true` if `vol_ord` was an un-promoted clone now made
+    /// independent, `false` if it was not a clone / already promoted.
+    ///
+    /// Public so the `metadb-soak` harness (a separate binary crate that can
+    /// only reach `pub` API) can drive the promote→drop interleave the
+    /// runtime clone-drop livelist shadow needs (without it the soak issues
+    /// zero promotions, so the shadow only ever sees non-promoted clone
+    /// drops). Each chunk is its own WAL record + fsync; for a clone with
+    /// `K` live mappings this is `O(K / MAX_PROMOTION_CHUNK_PBAS)` commits.
+    pub fn promote_volume(&self, vol_ord: VolumeOrdinal) -> Result<bool> {
+        let mut promoted = false;
+        loop {
+            match self.run_promotion_chunk(vol_ord)? {
+                PromotionStep::NotApplicable => return Ok(promoted),
+                PromotionStep::ChunkApplied { .. } => promoted = true,
+                PromotionStep::Completed => return Ok(true),
+            }
+        }
+    }
+
     pub(crate) fn commit_promotion_chunk(
         &self,
         vol_ord: VolumeOrdinal,

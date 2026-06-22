@@ -491,6 +491,13 @@ pub struct Config {
     /// via a condvar, so under load the worker stays hot and only
     /// hits this on truly idle systems.
     pub async_reclaim_idle_interval_ms: u64,
+    /// ZFS port Phase 3b: a clone's persisted page-livelist chain is
+    /// condensed to a single segment once it reaches at least this many
+    /// segments. `0` disables the background condense worker entirely
+    /// (it is never started). Independent of `async_reclaim_enabled`.
+    pub livelist_condense_min_segments: usize,
+    /// Max milliseconds the livelist-condense worker parks between scans.
+    pub livelist_condense_idle_interval_ms: u64,
     /// [[no-refcount-hot-path-design]] Phase 5: Lineage GC emits a
     /// `FreePbas` lifecycle/dispatch record for every dead-list record it
     /// retires before truncating the chain. The historical Phase 3
@@ -637,6 +644,13 @@ impl Config {
             // last flush even if `notify()` was missed; long
             // enough not to busy-loop on otherwise-idle pages.
             async_reclaim_idle_interval_ms: 50,
+            // ZFS port Phase 3b: condense a clone's livelist chain once it
+            // reaches 16 segments. Independent of `async_reclaim_enabled`
+            // (condense only rewrites the SHADOW livelist; it changes no
+            // page-rc free decision). Lazy threshold + 1 s idle scan keep
+            // the worker near-free for non-clone / low-churn workloads.
+            livelist_condense_min_segments: 16,
+            livelist_condense_idle_interval_ms: 1000,
             // [[no-refcount-hot-path-design]] Phase 5: hot-path RC
             // writes are gone — Lineage GC is the sole producer of
             // PBA-free decisions, so FreePbas emission is mandatory.

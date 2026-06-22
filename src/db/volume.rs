@@ -331,14 +331,30 @@ impl Db {
         // describes overwrites that targeted this volume's own LBAs,
         // which are about to disappear.
         let _ = volume.dead_list.drain();
-        // Note: the volume's page-deadlist (v18) and page-livelist (v19,
-        // clones) segment chains are NOT added to the drop payload here.
-        // Like `apply_drop_volume`'s tree pages, once this volume's
-        // `VolumeEntry` is removed from the manifest those segments become
-        // unreferenced and are swept by `reclaim_orphan_pages` on the next
-        // open (verify's `collect_live_pages` marks them live only while the
-        // entry exists). Eager drop-time freeing + condense are a Phase-3b
-        // follow-up; the in-memory livelist buffer is dropped with `volume`.
+        // ZFS port Phase 3b: collect this clone's page-livelist (v19) segment
+        // chain so it can be EAGERLY freed once the manifest commit below
+        // drops the entry. Segment pages are allocated via `allocate_run` and
+        // are never page-rc-tracked, so routing them through `pages` / the
+        // page-rc decref cascade is a no-op (`apply_drop_snapshot_pages` floors
+        // a 0→-1 decref and skips at `prev == 0`). They must be freed DIRECTLY
+        // — the same `free_idempotent` path condense and lineage GC use for
+        // their old segments. Read the tail atomic NOW, before the commit
+        // clears the entry; a crash between the commit and the free leaves the
+        // segments as orphans `reclaim_orphan_pages` sweeps on the next open
+        // (the same backstop the tree pages ride). The page-deadlist (v18)
+        // chain is intentionally left on its existing path. The in-memory
+        // livelist buffer is dropped with `volume`.
+        let livelist_chain_pids: Vec<PageId> = {
+            let tail = volume
+                .page_live_list_tail_pid
+                .load(std::sync::atomic::Ordering::Acquire);
+            if tail == crate::types::NULL_PAGE {
+                Vec::new()
+            } else {
+                let page_store = self.page_store.clone();
+                crate::livelist::walk_chain_pages(tail, |pid| page_store.read_page(pid))?
+            }
+        };
 
         // ZFS port Phase 3a (SHADOW): for a CLONE, cross-check the page-rc
         // free-set against an independent C-exclusive reachability walk
@@ -467,6 +483,17 @@ impl Db {
             for shard in &volume.shards {
                 shard.tree.write().forget_page(pid);
             }
+        }
+        // ZFS port Phase 3b: eagerly free the clone's page-livelist segment
+        // chain (collected above, before the manifest commit dropped the
+        // entry). `free_idempotent` is crash-safe + idempotent — an already-
+        // freed pid (crash mid-loop) returns `Ok(false)`, and any pid not yet
+        // freed on a crash is an orphan `reclaim_orphan_pages` sweeps on open.
+        // Invalidate the cache so a stale segment byte can't shadow a recycled
+        // allocation. The freed pages drain via `reclaim_freed_pages` below.
+        for &pid in &livelist_chain_pids {
+            self.page_store.free_idempotent(pid, lsn)?;
+            self.page_cache.invalidate(pid);
         }
         drop(volume);
 

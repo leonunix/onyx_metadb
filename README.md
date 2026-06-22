@@ -67,6 +67,7 @@ let db = Db::create(path)?;                  // or Db::open
 // Volume lifecycle (L2P is per-volume; refcount and dedup are global)
 let vol = db.create_volume()?;               // returns VolumeOrdinal
 let cloned = db.clone_volume(snap_id)?;      // O(1) snapshot-based clone
+let promoted = db.promote_volume(cloned)?;   // drive clone promotion to completion (lineage independence)
 let report = db.drop_volume(vol)?;           // batched decref + dedup_reverse cleanup
 
 // Atomic batch via Transaction: one WAL record + one fsync

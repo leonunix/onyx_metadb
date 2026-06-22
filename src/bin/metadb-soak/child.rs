@@ -111,6 +111,14 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
                         let src_snap_id = parse_part_u64(parts.next(), "clone src_snap_id")?;
                         db.clone_volume(src_snap_id).map(|ord| Ack::Volume(id, ord))
                     }
+                    // ZFS port Phase 3b: drive a clone's promotion walker to
+                    // completion so the soak exercises the promote→drop
+                    // interleave the runtime clone-drop livelist shadow needs.
+                    "PROMOTE" => {
+                        let vol_ord =
+                            parse_part_u64(parts.next(), "promote vol_ord")? as VolumeOrdinal;
+                        db.promote_volume(vol_ord).map(|_| Ack::Ok(id))
+                    }
                     "QUIT" => {
                         for tx in &worker_txs {
                             let _ = tx.send(WorkerJob::Stop);

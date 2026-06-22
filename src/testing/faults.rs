@@ -117,6 +117,20 @@ pub enum FaultPoint {
     /// or the worker was killed). No side effect — the GC pass
     /// hadn't yet mutated anything.
     LineageGcMidSegmentRead,
+    /// ZFS port Phase 3b livelist-condense fault: the condensed single
+    /// segment has been written + synced, but the manifest re-anchor
+    /// commit hasn't fired yet. A crash here leaves the committed anchor
+    /// pointing at the OLD chain (intact) + the new segment as an
+    /// unreferenced orphan that `reclaim_orphan_pages` sweeps on the next
+    /// open. Mirrors [`Self::LineageGcPostFreePbasBeforeManifest`].
+    LivelistCondensePostSegWriteBeforeManifest,
+    /// ZFS port Phase 3b livelist-condense fault: the re-anchor manifest
+    /// commit landed and the atomics were promoted to the condensed
+    /// segment, but the OLD chain pages haven't been `free_idempotent`-ed
+    /// yet. A crash here leaves them allocated-but-unreferenced (orphans);
+    /// the next open reclaims them. Mirrors
+    /// [`Self::LineageGcPostHeadAdvanceBeforeFree`].
+    LivelistCondensePostManifestBeforeFree,
     /// ZFS-TXG-clone Phase 2 fault: inside the L2P compactor's
     /// step-7 drain of [`crate::db::commit::DeferredOutcomeAggregator`],
     /// after the staged outcomes have been popped from the pending
@@ -191,6 +205,12 @@ impl FaultPoint {
             Self::LineageGcPostFreePbasBeforeManifest => "lineage_gc.post_free_pbas.before_manifest",
             Self::LineageGcPostHeadAdvanceBeforeFree => "lineage_gc.post_head_advance.before_free",
             Self::LineageGcMidSegmentRead => "lineage_gc.mid_segment_read",
+            Self::LivelistCondensePostSegWriteBeforeManifest => {
+                "livelist_condense.post_seg_write.before_manifest"
+            }
+            Self::LivelistCondensePostManifestBeforeFree => {
+                "livelist_condense.post_manifest.before_free"
+            }
             Self::DeferredOutcomeDrainMidway => "deferred_outcomes.drain.midway",
             Self::TxgSyncMidway => "flush.txg_sync.midway",
             Self::TxgQuiesceMidway => "txg.quiesce.midway",

@@ -2,6 +2,12 @@ struct Model {
     l2p: BTreeMap<VolumeOrdinal, BTreeMap<u64, L2pValue>>,
     dedup: BTreeMap<Hash8, DedupValue>,
     refcount: BTreeMap<u64, u32>,
+    /// ZFS port Phase 3b: ords of clones not yet promoted to independence.
+    /// A clone enters on `CLONE_VOLUME`, leaves on `PROMOTE` (now
+    /// independent) or `DROP_VOLUME`. Promotion is metadb-internal lite
+    /// bookkeeping (bumps global PBA rc + clears `parent_vol_ord`) and does
+    /// NOT change L2P content, so it never touches the `l2p` reference model.
+    clones: BTreeSet<VolumeOrdinal>,
 }
 
 impl Default for Model {
@@ -12,6 +18,7 @@ impl Default for Model {
             l2p,
             dedup: BTreeMap::new(),
             refcount: BTreeMap::new(),
+            clones: BTreeSet::new(),
         }
     }
 }
@@ -26,6 +33,15 @@ impl Model {
             .keys()
             .copied()
             .filter(|ord| *ord != BOOTSTRAP_VOL && !pinned.contains(ord))
+            .collect()
+    }
+
+    /// Un-promoted clones still present in the model — promotion candidates.
+    fn promote_candidates(&self) -> Vec<VolumeOrdinal> {
+        self.clones
+            .iter()
+            .copied()
+            .filter(|ord| self.l2p.contains_key(ord))
             .collect()
     }
 }

@@ -159,6 +159,11 @@ impl Db {
             max_pages_per_cycle: cfg.async_reclaim_max_pages_per_cycle,
             idle_interval_ms: cfg.async_reclaim_idle_interval_ms,
         };
+        let livelist_condense_min_segments = cfg.livelist_condense_min_segments;
+        let livelist_condense_params = super::livelist_condense::LivelistCondenseParams {
+            min_segments: cfg.livelist_condense_min_segments,
+            idle_interval_ms: cfg.livelist_condense_idle_interval_ms,
+        };
         let dedup_lanes = build_dedup_lanes(
             0,
             dedup_shards as usize,
@@ -215,6 +220,7 @@ impl Db {
             flush_cursor: AtomicUsize::new(0),
             flush_select_budget: cfg.flush_select_budget,
             async_reclaim: Mutex::new(None),
+            livelist_condense: Mutex::new(None),
             lineage_gc_worker: Mutex::new(None),
             l2p_buffer_enabled: cfg.l2p_buffer_enabled,
             lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
@@ -263,6 +269,12 @@ impl Db {
         // `page_store` / `page_cache` are torn down.
         if async_reclaim_enabled {
             db.start_async_reclaim(async_reclaim_params);
+        }
+        // ZFS port Phase 3b: spawn the background livelist-condense worker
+        // (independent of async_reclaim). Drop stops it before page_store /
+        // page_cache teardown.
+        if livelist_condense_min_segments > 0 {
+            db.start_livelist_condense(livelist_condense_params);
         }
         // ZFS-TXG-clone Phase 4 Step 8: the background L2P drainer
         // is now the `TxgSyncThread`, spawned below when
@@ -691,6 +703,11 @@ impl Db {
             max_pages_per_cycle: cfg.async_reclaim_max_pages_per_cycle,
             idle_interval_ms: cfg.async_reclaim_idle_interval_ms,
         };
+        let livelist_condense_min_segments = cfg.livelist_condense_min_segments;
+        let livelist_condense_params = super::livelist_condense::LivelistCondenseParams {
+            min_segments: cfg.livelist_condense_min_segments,
+            idle_interval_ms: cfg.livelist_condense_idle_interval_ms,
+        };
         let dedup_lanes = build_dedup_lanes(
             last_applied,
             manifest_dedup_shards,
@@ -748,6 +765,7 @@ impl Db {
             flush_cursor: AtomicUsize::new(0),
             flush_select_budget: cfg.flush_select_budget,
             async_reclaim: Mutex::new(None),
+            livelist_condense: Mutex::new(None),
             lineage_gc_worker: Mutex::new(None),
             l2p_buffer_enabled: cfg.l2p_buffer_enabled,
             lineage_gc_emit_freepbas: cfg.lineage_gc_emit_freepbas,
@@ -820,6 +838,12 @@ impl Db {
         // visibility. Drop joins it before page_store teardown.
         if async_reclaim_enabled {
             db.start_async_reclaim(async_reclaim_params);
+        }
+        // ZFS port Phase 3b: spawn the background livelist-condense worker
+        // (independent of async_reclaim). Drop stops it before page_store /
+        // page_cache teardown.
+        if livelist_condense_min_segments > 0 {
+            db.start_livelist_condense(livelist_condense_params);
         }
         // ZFS-TXG-clone Phase 4 Step 8: the background L2P drainer
         // is now the `TxgSyncThread`, spawned below when

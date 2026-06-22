@@ -466,6 +466,24 @@ impl Db {
         *self.async_reclaim.lock() = Some(worker);
     }
 
+    /// ZFS port Phase 3b: start the background per-clone page-livelist
+    /// condense worker. Caller (`Db::create` / `Db::open`) checks
+    /// `cfg.livelist_condense_min_segments > 0` first. Independent of
+    /// `async_reclaim_enabled` — condense only rewrites the SHADOW livelist
+    /// and changes no page-rc free decision.
+    fn start_livelist_condense(&self, params: super::livelist_condense::LivelistCondenseParams) {
+        let worker = super::livelist_condense::LivelistCondenser::start(
+            self.page_store.clone(),
+            self.page_cache.clone(),
+            self.manifest_state.clone(),
+            self.apply_gate.clone(),
+            self.volumes.clone(),
+            self.faults.clone(),
+            params,
+        );
+        *self.livelist_condense.lock() = Some(worker);
+    }
+
     /// Start the background Lineage GC driver — the production trigger for
     /// FreePbas-emitting PBA reclaim. Caller (`Db::create` / `Db::open`)
     /// checks `cfg.lineage_gc_enabled` first. Takes `self: &Arc<Self>` so

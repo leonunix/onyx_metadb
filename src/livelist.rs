@@ -436,6 +436,44 @@ where
     Ok(pids)
 }
 
+/// Walk the chain backward from `tail_pid` reading only each segment's
+/// head page (for `prev_seg_pid` + the type check) and return whether it
+/// holds at least `threshold` segments. Stops the moment the count reaches
+/// `threshold`, so it reads at most `threshold` head pages — the cheap gate
+/// the background condense worker uses to skip chains not worth rewriting
+/// without decoding every record. `threshold == 0` is trivially true.
+pub fn chain_has_at_least_segments<F>(
+    tail_pid: PageId,
+    threshold: usize,
+    read_page: F,
+) -> Result<bool>
+where
+    F: Fn(PageId) -> Result<Page>,
+{
+    if threshold == 0 {
+        return Ok(true);
+    }
+    let mut cur = tail_pid;
+    let mut count = 0usize;
+    while cur != NULL_PAGE {
+        let page = read_page(cur)?;
+        let h = page.header()?;
+        if h.page_type != PageType::LiveListSegment {
+            return Err(MetaDbError::Corruption(format!(
+                "page-livelist chain page {cur} has wrong page_type {:?}",
+                h.page_type
+            )));
+        }
+        let header = SegmentHeader::decode(page.payload())?;
+        count += 1;
+        if count >= threshold {
+            return Ok(true);
+        }
+        cur = header.prev_seg_pid;
+    }
+    Ok(false)
+}
+
 /// Cancel matched `(pid, birth)` ALLOC/FREE pairs from a chain's records,
 /// returning the surviving live-ALLOC records. A FREE cancels the most
 /// recent un-cancelled ALLOC of the same `(pid, birth)`. Records arrive
@@ -605,6 +643,29 @@ mod tests {
         assert!(surviving.contains(&(12, 3)));
         assert!(!surviving.contains(&(10, 1)));
         assert_eq!(live.len(), 2);
+    }
+
+    #[test]
+    fn live_allocs_idempotent_on_own_output() {
+        // Condense writes `live_allocs(chain)` as the new segment; verify then
+        // recomputes `live_allocs` over that segment and must get the same set.
+        // An all-ALLOC input (every FREE already cancelled) must pass through
+        // unchanged — otherwise condense would drift the live-ALLOC set.
+        let records = vec![
+            alloc(10, 1, 100),
+            free(10, 1, 105),
+            alloc(11, 2, 101),
+            alloc(12, 3, 102),
+        ];
+        let once = live_allocs(records).unwrap();
+        let key = |recs: &[LiveRecord]| {
+            recs.iter()
+                .map(|r| (r.pid, r.birth_lsn))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let twice = live_allocs(once.clone()).unwrap();
+        assert_eq!(key(&once), key(&twice));
+        assert_eq!(once.len(), 2); // pid 11 + pid 12 survive; pid 10 cancelled.
     }
 
     #[test]
