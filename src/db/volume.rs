@@ -191,12 +191,16 @@ impl Db {
     /// - `drop_gate.write()` — excludes every `commit_ops` path. The
     ///   rc-dependent drop plan relies on no concurrent `cow_for_write`
     ///   moving rcs out from under us.
-    /// - **Forced TXG sync** — drains pre-existing L2P Dirty Arcs to
-    ///   disk so `apply_drop_volume`'s page-decref whole-page writes
-    ///   cannot be clobbered by a concurrent flush IO phase. See
-    ///   [`Db::take_snapshot`] for the full rationale.
-    /// - `apply_gate.write()` — taken AFTER the forced sync. Serialises
-    ///   the WAL submit + apply against
+    /// - Phase B (A3 follow-up): **no forced TXG sync** at entry. The
+    ///   page-rc decrefs `stage` into the [`L2pPageRc`](crate::l2p_page_rc)
+    ///   array and free under a fold-consistent read, so there is no
+    ///   whole-page rc write left for a concurrent flush IO phase to
+    ///   clobber. The `force_compact_l2p_buffers` + `flush_locked_l2p_shards`
+    ///   below are the only drain this path needs (mirrors
+    ///   `drop_snapshot` / `range_delete`). Holding `drop_gate.write` across
+    ///   a full forced sync (which waits on the background quiesce/sync
+    ///   pipeline) was the range_delete-class pipeline stall.
+    /// - `apply_gate.write()` — serialises the WAL submit + apply against
     ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
     /// - `snapshot_views.write()` — waits for outstanding
     ///   [`SnapshotView`]s to drop before any page is freed.
@@ -216,16 +220,17 @@ impl Db {
             ));
         }
         let _drop_guard = self.drop_gate.write();
-        // Drive a forced TXG sync BEFORE acquiring apply_gate.write —
-        // otherwise the sync thread's manifest-commit gate would
-        // deadlock against our outer hold.
-        self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
-        // Phase 4 gate-shrink: record this lifecycle op's WAL LSN into
-        // `slot_max_lsn(open_txg)` so `run_sync_cycle_body`'s
-        // `wal_checkpoint = slot_max_lsn(txg)` watermark reflects it.
-        // Must be entered AFTER `flush_with_gate(Forced)` returns —
-        // that call rolls the current Open TXG; entering before would
-        // race `roll_to_quiescing` waiting for `inflight == 0`.
+        // Phase B (A3 follow-up): no forced TXG sync at entry (mirrors
+        // take_snapshot / drop_snapshot / clone_volume / range_delete). The
+        // page-rc decrefs stage into the L2pPageRc array and free under a
+        // fold-consistent read, so a concurrent flush IO phase has nothing
+        // to clobber; the targeted `force_compact_l2p_buffers` +
+        // `flush_locked_l2p_shards` below are the only drain this path needs.
+        // `txg.enter()` pins the current Open TXG; `closing_open` makes it
+        // wait out (not race) a concurrent background roll, so entering the
+        // current Open TXG without rolling it ourselves is safe.
+        // `_txg_guard.record_lsn(lsn)` (after the WAL submit below) records
+        // this op's LSN into `slot_max_lsn(open_txg)` so WAL prune sees it.
         let _txg_guard = self.txg.enter();
         let _apply_guard = self.apply_gate.write();
         let _view_guard = self.snapshot_views.write();
@@ -277,7 +282,13 @@ impl Db {
         };
 
         // Lock ALL volumes' shards + refcount shards so we can flush
-        // them and later commit a refreshed manifest.
+        // them and later commit a refreshed manifest. With the entry forced
+        // sync removed (Phase B), drain the L2P buffer into the trees first
+        // so `collect_drop_pages_with_birth` / the root sample observe every
+        // applied op and `checkpoint_lsn` stays safe (mirrors drop_snapshot).
+        // All volumes (not scoped): the manifest refresh below covers every
+        // surviving volume's roots. `drop_gate.write` keeps slots from refilling.
+        self.force_compact_l2p_buffers()?;
         let volumes_snap = self.volumes_snapshot();
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes_snap);
         flush_locked_l2p_shards(&mut l2p_guards)?;
@@ -363,9 +374,11 @@ impl Db {
         // in `l2p_guards`, NOT the on-disk manifest — other volumes' COW'd
         // roots are only refreshed into it at the commit below, so a stale
         // manifest root would manufacture a false premature) plus every
-        // snapshot's roots. The drop+apply+snapshot_views write gates and the
-        // force-flush above keep the graph + page-rc quiescent and
-        // fold-consistent; running before the WAL submit / manifest commit
+        // snapshot's roots. The drop+apply+snapshot_views write gates plus the
+        // `force_compact_l2p_buffers` + `l2p_page_rc.flush()` above keep the
+        // graph + page-rc quiescent and fold-consistent (the entry forced sync
+        // is gone, Phase B; the page-rc `get_consistent` read carries the
+        // fold-consistency); running before the WAL submit / manifest commit
         // means a Corruption abort leaves no half-applied drop. Page-rc stays
         // authoritative — this is a shadow assertion, NOT the free decision.
         // Deliberately gated on the clone (`parent_vol_ord.is_some()`) only:
