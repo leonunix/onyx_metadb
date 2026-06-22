@@ -32,6 +32,11 @@ pub struct OnyxRefModel {
     shared_leaves: BTreeSet<(VolumeOrdinal, u64)>,
     pending_dead_pbas: BTreeSet<Pba>,
     next_snapshot_id: SnapshotId,
+    /// Volumes minted via `clone_volume` that have not yet been promoted
+    /// or dropped. Drives the soak's PROMOTE op selection (the concurrent
+    /// clone-churn the ZFS port Phase 3b livelist shadow needs). A sticky
+    /// set, mirroring the Legacy `Model.clones`.
+    clones: BTreeSet<VolumeOrdinal>,
 }
 
 impl Default for OnyxRefModel {
@@ -48,6 +53,7 @@ impl Default for OnyxRefModel {
             shared_leaves: BTreeSet::new(),
             pending_dead_pbas: BTreeSet::new(),
             next_snapshot_id: 1,
+            clones: BTreeSet::new(),
         }
     }
 }
@@ -122,10 +128,43 @@ impl OnyxRefModel {
         self.live_volumes.insert(ord)
     }
 
+    /// Record a freshly minted clone so a later cycle can PROMOTE it.
+    /// Sticky until the clone is promoted or dropped. The clone's L2P
+    /// content is intentionally NOT mirrored here — the concurrent
+    /// (`OnyxConcurrent`) soak verifies structure only (`verify_path` /
+    /// `--clone-livelist`), not per-volume content, so the driver just
+    /// needs the volume live + the promote-candidate bookkeeping.
+    pub fn note_clone(&mut self, ord: VolumeOrdinal) {
+        self.live_volumes.insert(ord);
+        self.clones.insert(ord);
+    }
+
+    /// Clear a volume's clone status (it was promoted). `live_volumes`
+    /// is unchanged — a promoted ex-clone stays a normal live volume.
+    pub fn promote_volume(&mut self, ord: VolumeOrdinal) -> bool {
+        self.clones.remove(&ord)
+    }
+
+    /// Volumes eligible for PROMOTE (un-promoted, un-dropped clones).
+    pub fn promote_candidates(&self) -> Vec<VolumeOrdinal> {
+        self.clones.iter().copied().collect()
+    }
+
+    /// Live, non-bootstrap, non-snapshot-pinned volumes eligible for
+    /// DROP_VOLUME.
+    pub fn drop_candidates(&self, pinned: &BTreeSet<VolumeOrdinal>) -> Vec<VolumeOrdinal> {
+        self.live_volumes
+            .iter()
+            .copied()
+            .filter(|ord| *ord != BOOTSTRAP_VOL && !pinned.contains(ord))
+            .collect()
+    }
+
     pub fn drop_volume(&mut self, ord: VolumeOrdinal) -> bool {
         if ord == BOOTSTRAP_VOL || !self.live_volumes.remove(&ord) {
             return false;
         }
+        self.clones.remove(&ord);
         let keys: Vec<_> = self
             .l2p
             .keys()

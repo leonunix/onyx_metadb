@@ -133,7 +133,18 @@ fn parse_duration_arg(raw: String) -> Result<u64, String> {
 }
 
 fn l2p_key(tid: usize, slot: u64) -> u64 {
-    ((tid as u64) << 32) | slot
+    // Dense per-thread band: each thread owns
+    // [tid*KEY_SLOTS_PER_THREAD, (tid+1)*KEY_SLOTS_PER_THREAD), so the
+    // reference model stays collision-free per (tid, slot) while the L2P
+    // key space stays CONTIGUOUS. The old `(tid<<32)|slot` scattered keys
+    // across a ~4-billion-LBA-per-thread space, which deterministically
+    // trips the L2P leaf compaction codec ("compact leaf unit_count
+    // exceeds payload capacity" → bogus multi-PB allocation → abort).
+    // onyx's real LBAs are dense `0..size/4K`, so the sparse scheme was a
+    // soak-tooling artifact, not a metadb bug. `slot < KEY_SLOTS_PER_THREAD`
+    // by construction (generators use `gen_range(0..KEY_SLOTS_PER_THREAD)`),
+    // so the bands never overlap.
+    (tid as u64) * KEY_SLOTS_PER_THREAD + slot
 }
 
 fn dedup_hash(tid: usize, slot: u64) -> Hash8 {
@@ -149,17 +160,41 @@ fn refcount_pba(tid: usize, slot: u64) -> u64 {
     ((tid as u64) << 24) | slot
 }
 
+// head_pba bands for the value helpers. PBAs must be DENSE (within a few
+// hundred of each other so the L2P leaf codec's u32 `pba_delta` and the
+// PBA-indexed flush arrays stay small) AND must NOT collide with the
+// `refcount_pba(tid, slot) = (tid<<24)|slot` keyspace the Legacy verify
+// audits — that audit expects 0 for every `(tid<<24)|slot` (the Legacy
+// model tracks no refcount), and dedup-put DOES incref a value's head_pba
+// in the DB. `(tid<<24)|slot` always has bits [8..24) == 0, so any band
+// that sets a bit in [8..24) is provably disjoint from it. The old scheme
+// hid this by scattering head_pbas to byte·2^56 (outside the audit window
+// but huge → codec/alloc blowups, the actual event-A crashes).
+const L2P_PBA_BAND: u64 = 1 << 9; // 512..767  (bit 9 set)
+const DEDUP_PBA_BAND: u64 = 1 << 8; // 256..511 (bit 8 set)
+
 fn l2p_value(byte: u8) -> L2pValue {
     let mut value = [0u8; onyx_metadb::paged::format::LEAF_VALUE_SIZE];
-    value[0] = byte;
-    value[1] = byte.wrapping_mul(3);
+    // PBA = head 8 bytes (big-endian). Dense band (512 + byte), disjoint
+    // from both the refcount-audit window and the dedup band.
+    value[0..8].copy_from_slice(&(L2P_PBA_BAND + byte as u64).to_be_bytes());
+    // Pin the birth_lsn trailer non-zero so the apply-time birth stamp
+    // (which only replaces the 0 sentinel) leaves the value bytes intact
+    // for the reference-model round-trip compare.
+    value[onyx_metadb::paged::format::LEAF_VALUE_SIZE - 1] = 1;
     L2pValue(value)
 }
 
 fn dedup_value(byte: u8) -> DedupValue {
     let mut value = [0u8; 28];
-    value[0] = byte;
-    value[1] = byte.wrapping_mul(7);
+    // head_pba = first 8 bytes (big-endian). Dense band (256 + byte),
+    // disjoint from the refcount-audit window and the L2P band. The old
+    // `value[0]=byte` put the byte in the HIGH byte → head_pba ≈ byte·2^56,
+    // which blew up a PBA-indexed structure during flush ("memory
+    // allocation of N bytes failed").
+    value[0..8].copy_from_slice(&(DEDUP_PBA_BAND + byte as u64).to_be_bytes());
+    // Non-PBA entropy for value distinctness.
+    value[8] = byte.wrapping_mul(7);
     DedupValue(value)
 }
 

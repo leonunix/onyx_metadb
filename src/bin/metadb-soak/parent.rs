@@ -220,9 +220,15 @@ fn run_cycle(
     };
     let cycle_start_recorded_sum = onyx_stats.refcount_sum;
 
-    // Phase 1: pre-worker volume admin (create / drop / clone).
+    // Phase 1: pre-worker volume admin (create / drop / clone / promote).
     if cfg.workload == Workload::Legacy {
         next_id = run_volume_admin(child, cycle, model, admin_rng, snapshots, events, next_id)?;
+    } else if cfg.workload == Workload::OnyxConcurrent {
+        // ZFS port Phase 3b: drive clone/promote/drop concurrently with the
+        // high-pipeline-depth onyx write/range_delete/dedup mix — the
+        // realistic clone-churn the in-process tests can't reproduce.
+        next_id =
+            run_onyx_volume_admin(child, cycle, onyx_model, admin_rng, snapshots, events, next_id)?;
     }
 
     // Phase 2: workers pounding across the live volume set.
@@ -569,6 +575,121 @@ fn run_volume_admin(
                 model.l2p.remove(&pick);
                 // ZFS port Phase 3b: a dropped clone leaves the un-promoted set.
                 model.clones.remove(&pick);
+                events.write("drop_volume_ok", &format!("cycle={} ord={}", cycle, pick))?;
+            }
+            Ack::Error(id, err) if id == next_id => {
+                events.write(
+                    "drop_volume_err",
+                    &format!("cycle={} ord={} err={}", cycle, pick, escape_json(&err)),
+                )?;
+            }
+            other => return Err(format!("unexpected drop-volume ack: {other:?}")),
+        }
+        next_id += 1;
+    }
+
+    Ok(next_id)
+}
+
+/// `OnyxConcurrent` counterpart of [`run_volume_admin`]: drive
+/// create / clone / promote / drop_volume against `onyx_model` so the
+/// concurrent onyx workload actually exercises the clone livelist path.
+/// Clones source from the shared `snapshots` list (DB snapshots taken in
+/// Phase 3). The `OnyxConcurrent` verify is structure-only
+/// (`verify_path` / `--clone-livelist`), so the model only needs coherent
+/// `live_volumes` / `clones` bookkeeping — not per-volume content.
+fn run_onyx_volume_admin(
+    child: &mut ChildHandle,
+    cycle: u64,
+    onyx_model: &mut OnyxRefModel,
+    rng: &mut ChaCha8Rng,
+    snapshots: &[ModelSnapshot],
+    events: &mut EventLog,
+    mut next_id: u64,
+) -> Result<u64, String> {
+    let pinned: BTreeSet<VolumeOrdinal> = snapshots.iter().map(|s| s.vol_ord).collect();
+
+    // CREATE: cap total live volumes so ords don't explode.
+    if onyx_model.live_volumes().len() < MAX_LIVE_VOLUMES && rng.gen_bool(0.5) {
+        send_admin(child, next_id, "CREATE_VOLUME")?;
+        match recv_ack(child)? {
+            Ack::Volume(id, ord) if id == next_id => {
+                onyx_model.create_volume(ord);
+                events.write("create_volume_ok", &format!("cycle={cycle} ord={ord}"))?;
+            }
+            Ack::Error(id, err) if id == next_id => {
+                events.write(
+                    "create_volume_err",
+                    &format!("cycle={} err={}", cycle, escape_json(&err)),
+                )?;
+            }
+            other => return Err(format!("unexpected create-volume ack: {other:?}")),
+        }
+        next_id += 1;
+    }
+
+    // CLONE: roll a snapshot if we have any.
+    if onyx_model.live_volumes().len() < MAX_LIVE_VOLUMES
+        && !snapshots.is_empty()
+        && rng.gen_bool(0.4)
+    {
+        let pick = rng.gen_range(0..snapshots.len());
+        let src = snapshots[pick].clone();
+        send_admin(child, next_id, &format!("CLONE_VOLUME {}", src.id))?;
+        match recv_ack(child)? {
+            Ack::Volume(id, ord) if id == next_id => {
+                onyx_model.note_clone(ord);
+                events.write(
+                    "clone_volume_ok",
+                    &format!("cycle={} src_snap={} ord={}", cycle, src.id, ord),
+                )?;
+            }
+            Ack::Error(id, err) if id == next_id => {
+                events.write(
+                    "clone_volume_err",
+                    &format!(
+                        "cycle={} src_snap={} err={}",
+                        cycle,
+                        src.id,
+                        escape_json(&err)
+                    ),
+                )?;
+            }
+            other => return Err(format!("unexpected clone-volume ack: {other:?}")),
+        }
+        next_id += 1;
+    }
+
+    // PROMOTE: drive a clone's promotion walker to completion (clears its
+    // parent_vol_ord, the interleave the clone-drop livelist shadow needs).
+    let promote_candidates = onyx_model.promote_candidates();
+    if !promote_candidates.is_empty() && rng.gen_bool(0.3) {
+        let pick = promote_candidates[rng.gen_range(0..promote_candidates.len())];
+        send_admin(child, next_id, &format!("PROMOTE {pick}"))?;
+        match recv_ack(child)? {
+            Ack::Ok(id) if id == next_id => {
+                onyx_model.promote_volume(pick);
+                events.write("promote_volume_ok", &format!("cycle={} ord={}", cycle, pick))?;
+            }
+            Ack::Error(id, err) if id == next_id => {
+                events.write(
+                    "promote_volume_err",
+                    &format!("cycle={} ord={} err={}", cycle, pick, escape_json(&err)),
+                )?;
+            }
+            other => return Err(format!("unexpected promote-volume ack: {other:?}")),
+        }
+        next_id += 1;
+    }
+
+    // DROP: only non-bootstrap, non-snapshot-pinned volumes.
+    let candidates = onyx_model.drop_candidates(&pinned);
+    if !candidates.is_empty() && rng.gen_bool(0.35) {
+        let pick = candidates[rng.gen_range(0..candidates.len())];
+        send_admin(child, next_id, &format!("DROP_VOLUME {pick}"))?;
+        match recv_ack(child)? {
+            Ack::Ok(id) if id == next_id => {
+                onyx_model.drop_volume(pick);
                 events.write("drop_volume_ok", &format!("cycle={} ord={}", cycle, pick))?;
             }
             Ack::Error(id, err) if id == next_id => {
