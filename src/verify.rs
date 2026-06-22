@@ -716,6 +716,17 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
                 live.mark(pid);
             }
         }
+        // ZFS port Phase 4 Step 4 (S0): the promoted-PBA log is a FOURTH
+        // independent per-volume chain (raw PBAs the promotion walker incref'd,
+        // `LiveListSegment` codec). Mark its segment pages live so orphan-reclaim
+        // does not free the chain on reopen.
+        if volume.promoted_log_tail_pid != NULL_PAGE {
+            for pid in crate::livelist::walk_chain_pages(volume.promoted_log_tail_pid, |p| {
+                page_store.read_page(p)
+            })? {
+                live.mark(pid);
+            }
+        }
     }
     for &meta_pid in manifest.refcount_shard_roots.iter() {
         if meta_pid == NULL_PAGE {

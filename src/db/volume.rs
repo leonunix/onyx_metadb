@@ -86,6 +86,8 @@ impl Db {
                 page_dead_list_tail_pid: crate::types::NULL_PAGE,
                 page_live_list_head_pid: crate::types::NULL_PAGE,
                 page_live_list_tail_pid: crate::types::NULL_PAGE,
+                promoted_log_head_pid: crate::types::NULL_PAGE,
+                promoted_log_tail_pid: crate::types::NULL_PAGE,
             });
             probe.check_encodable()?;
             (ord, shard_count)
@@ -170,6 +172,8 @@ impl Db {
                 page_dead_list_tail_pid: crate::types::NULL_PAGE,
                 page_live_list_head_pid: crate::types::NULL_PAGE,
                 page_live_list_tail_pid: crate::types::NULL_PAGE,
+                promoted_log_head_pid: crate::types::NULL_PAGE,
+                promoted_log_tail_pid: crate::types::NULL_PAGE,
             });
             mstate.manifest.next_volume_ord = ord
                 .checked_add(1)
@@ -882,6 +886,8 @@ impl Db {
                 page_dead_list_tail_pid: crate::types::NULL_PAGE,
                 page_live_list_head_pid: crate::types::NULL_PAGE,
                 page_live_list_tail_pid: crate::types::NULL_PAGE,
+                promoted_log_head_pid: crate::types::NULL_PAGE,
+                promoted_log_tail_pid: crate::types::NULL_PAGE,
             });
             probe.check_encodable()?;
             (
@@ -984,6 +990,10 @@ impl Db {
                     crate::types::NULL_PAGE,
                     crate::types::NULL_PAGE,
                     crate::types::NULL_PAGE,
+                    // v20 promoted-PBA log anchors (NULL until a promotion
+                    // walker emits — fresh clone has none).
+                    crate::types::NULL_PAGE,
+                    crate::types::NULL_PAGE,
                     Some(branched_at_lsn),
                 )),
             );
@@ -1025,6 +1035,8 @@ impl Db {
                 page_dead_list_tail_pid: crate::types::NULL_PAGE,
                 page_live_list_head_pid: crate::types::NULL_PAGE,
                 page_live_list_tail_pid: crate::types::NULL_PAGE,
+                promoted_log_head_pid: crate::types::NULL_PAGE,
+                promoted_log_tail_pid: crate::types::NULL_PAGE,
             });
             mstate.manifest.next_volume_ord = new_ord
                 .checked_add(1)

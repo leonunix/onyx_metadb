@@ -86,6 +86,17 @@ pub struct VolumeEntry {
     /// v19: newest segment of the page-livelist (append anchor for the next
     /// checkpoint flush). `NULL_PAGE` while empty.
     pub page_live_list_tail_pid: PageId,
+    /// v20 (ZFS port Phase 4 Step 4 / S0): oldest segment of this volume's
+    /// promoted-PBA log — the global-PBA-rc edges the promotion walker
+    /// incref'd (`apply_promotion_chunk`), recorded durably so `drop_volume`
+    /// can later decref them survivor-gated (closing the promotion rc leak).
+    /// `NULL_PAGE` for volumes that never ran a promotion walker and while the
+    /// chain is empty. Stores raw `Pba`s; same `LiveListSegment` codec, a
+    /// separate chain from the page-livelist (distinct anchor).
+    pub promoted_log_head_pid: PageId,
+    /// v20: newest segment of the promoted-PBA log (append anchor). `NULL_PAGE`
+    /// while empty.
+    pub promoted_log_tail_pid: PageId,
 }
 
 /// Size of a [`VolumeEntry`]'s fixed header when encoded inline. The
@@ -99,6 +110,8 @@ pub struct VolumeEntry {
 /// `page_dead_list_head_pid` (8) + `page_dead_list_tail_pid` (8).
 /// v19 grew it by another 16 B for the per-clone page-livelist anchors:
 /// `page_live_list_head_pid` (8) + `page_live_list_tail_pid` (8).
+/// v20 grew it by another 16 B for the promoted-PBA log anchors:
+/// `promoted_log_head_pid` (8) + `promoted_log_tail_pid` (8).
 pub const VOLUME_ENTRY_FIXED_SIZE: usize = 2 /* ord */
     + 4 /* shard_count */
     + 8 /* created_lsn */
@@ -113,7 +126,9 @@ pub const VOLUME_ENTRY_FIXED_SIZE: usize = 2 /* ord */
     + 8 /* page_dead_list_head_pid (v18) */
     + 8 /* page_dead_list_tail_pid (v18) */
     + 8 /* page_live_list_head_pid (v19) */
-    + 8 /* page_live_list_tail_pid (v19) */;
+    + 8 /* page_live_list_tail_pid (v19) */
+    + 8 /* promoted_log_head_pid (v20) */
+    + 8 /* promoted_log_tail_pid (v20) */;
 
 /// Inline-encoded byte length of a volume entry with the given shard count.
 ///
@@ -180,6 +195,9 @@ pub fn encode_volume_entry_inline(
     // v19: per-clone page-livelist anchors.
     buf[*off + 68..*off + 76].copy_from_slice(&entry.page_live_list_head_pid.to_le_bytes());
     buf[*off + 76..*off + 84].copy_from_slice(&entry.page_live_list_tail_pid.to_le_bytes());
+    // v20: promoted-PBA log anchors.
+    buf[*off + 84..*off + 92].copy_from_slice(&entry.promoted_log_head_pid.to_le_bytes());
+    buf[*off + 92..*off + 100].copy_from_slice(&entry.promoted_log_tail_pid.to_le_bytes());
     *off += VOLUME_ENTRY_FIXED_SIZE;
     for root in entry.l2p_shard_roots.iter().copied() {
         buf[*off..*off + 8].copy_from_slice(&root.to_le_bytes());
@@ -257,6 +275,17 @@ pub fn decode_volume_entry_inline(
     } else {
         (crate::types::NULL_PAGE, crate::types::NULL_PAGE)
     };
+    // v20 promoted-PBA log anchors. v19 (and older) databases are flag-day
+    // rejected at manifest open, so v20 always reads both; the `NULL_PAGE`
+    // fallback keeps the body_version gate symmetric with the older anchors.
+    let (promoted_log_head_pid, promoted_log_tail_pid) = if body_version >= 20 {
+        (
+            u64::from_le_bytes(buf[*off + 84..*off + 92].try_into().unwrap()),
+            u64::from_le_bytes(buf[*off + 92..*off + 100].try_into().unwrap()),
+        )
+    } else {
+        (crate::types::NULL_PAGE, crate::types::NULL_PAGE)
+    };
     *off += VOLUME_ENTRY_FIXED_SIZE;
     let needed_roots = shard_count as usize * size_of::<PageId>();
     if buf.len() < *off + needed_roots {
@@ -307,5 +336,7 @@ pub fn decode_volume_entry_inline(
         page_dead_list_tail_pid,
         page_live_list_head_pid,
         page_live_list_tail_pid,
+        promoted_log_head_pid,
+        promoted_log_tail_pid,
     })
 }

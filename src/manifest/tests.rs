@@ -62,6 +62,8 @@ fn boot_vol_at(shard_count: u32, roots: &[PageId], checkpoint_lsn: Lsn) -> Volum
         page_dead_list_tail_pid: NULL_PAGE,
         page_live_list_head_pid: NULL_PAGE,
         page_live_list_tail_pid: NULL_PAGE,
+        promoted_log_head_pid: NULL_PAGE,
+        promoted_log_tail_pid: NULL_PAGE,
     }
 }
 
@@ -387,6 +389,8 @@ fn v6_volumes_table_round_trip() {
                 page_dead_list_tail_pid: NULL_PAGE,
                 page_live_list_head_pid: NULL_PAGE,
                 page_live_list_tail_pid: NULL_PAGE,
+                promoted_log_head_pid: NULL_PAGE,
+                promoted_log_tail_pid: NULL_PAGE,
             },
         ],
     };
@@ -521,6 +525,8 @@ fn volume_entry_inline_round_trip() {
         page_dead_list_tail_pid: NULL_PAGE,
         page_live_list_head_pid: NULL_PAGE,
         page_live_list_tail_pid: NULL_PAGE,
+        promoted_log_head_pid: NULL_PAGE,
+        promoted_log_tail_pid: NULL_PAGE,
     };
     let mut buf = vec![0u8; volume_entry_inline_size(entry.shard_count as usize)];
     let mut off = 0;
@@ -550,6 +556,8 @@ fn volume_entry_inline_rejects_shard_count_mismatch() {
         page_dead_list_tail_pid: NULL_PAGE,
         page_live_list_head_pid: NULL_PAGE,
         page_live_list_tail_pid: NULL_PAGE,
+        promoted_log_head_pid: NULL_PAGE,
+        promoted_log_tail_pid: NULL_PAGE,
     };
     let mut buf = vec![0u8; 256];
     let mut off = 0;
@@ -577,6 +585,8 @@ fn volume_entry_inline_rejects_buffer_too_small() {
         page_dead_list_tail_pid: NULL_PAGE,
         page_live_list_head_pid: NULL_PAGE,
         page_live_list_tail_pid: NULL_PAGE,
+        promoted_log_head_pid: NULL_PAGE,
+        promoted_log_tail_pid: NULL_PAGE,
     };
     let mut buf = vec![0u8; VOLUME_ENTRY_FIXED_SIZE + 8]; // one root worth
     let mut off = 0;
@@ -605,6 +615,8 @@ fn volume_entry_decode_rejects_truncated_roots() {
         page_dead_list_tail_pid: NULL_PAGE,
         page_live_list_head_pid: NULL_PAGE,
         page_live_list_tail_pid: NULL_PAGE,
+        promoted_log_head_pid: NULL_PAGE,
+        promoted_log_tail_pid: NULL_PAGE,
     };
     let mut buf = vec![0u8; volume_entry_inline_size(3)];
     let mut off = 0;
@@ -638,6 +650,8 @@ fn volume_entry_many_back_to_back() {
             page_dead_list_tail_pid: NULL_PAGE,
             page_live_list_head_pid: NULL_PAGE,
             page_live_list_tail_pid: NULL_PAGE,
+            promoted_log_head_pid: NULL_PAGE,
+            promoted_log_tail_pid: NULL_PAGE,
         },
         VolumeEntry {
             ord: 1,
@@ -655,6 +669,8 @@ fn volume_entry_many_back_to_back() {
             page_dead_list_tail_pid: NULL_PAGE,
             page_live_list_head_pid: NULL_PAGE,
             page_live_list_tail_pid: NULL_PAGE,
+            promoted_log_head_pid: NULL_PAGE,
+            promoted_log_tail_pid: NULL_PAGE,
         },
         VolumeEntry {
             ord: 65534,
@@ -672,6 +688,8 @@ fn volume_entry_many_back_to_back() {
             page_dead_list_tail_pid: NULL_PAGE,
             page_live_list_head_pid: NULL_PAGE,
             page_live_list_tail_pid: NULL_PAGE,
+            promoted_log_head_pid: NULL_PAGE,
+            promoted_log_tail_pid: NULL_PAGE,
         },
     ];
     let total: usize = entries
@@ -735,6 +753,8 @@ fn v11_per_shard_durable_seq_round_trip() {
             page_dead_list_tail_pid: NULL_PAGE,
             page_live_list_head_pid: NULL_PAGE,
             page_live_list_tail_pid: NULL_PAGE,
+            promoted_log_head_pid: NULL_PAGE,
+            promoted_log_tail_pid: NULL_PAGE,
         }],
     };
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
@@ -926,6 +946,8 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
             page_dead_list_tail_pid: NULL_PAGE,
             page_live_list_head_pid: NULL_PAGE,
             page_live_list_tail_pid: NULL_PAGE,
+            promoted_log_head_pid: NULL_PAGE,
+            promoted_log_tail_pid: NULL_PAGE,
         }],
     };
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
@@ -967,6 +989,8 @@ fn v14_volume_entry_round_trip_carries_lineage_fields() {
         page_dead_list_tail_pid: 0xDDDD_EEEE_FFFF_0001,
         page_live_list_head_pid: 0x0102_0304_0506_0708,
         page_live_list_tail_pid: 0x1112_1314_1516_1718,
+        promoted_log_head_pid: 0x2122_2324_2526_2728,
+        promoted_log_tail_pid: 0x3132_3334_3536_3738,
     };
     let size = volume_entry_inline_size(entry.shard_count as usize);
     let mut buf = vec![0u8; size];
@@ -996,6 +1020,8 @@ fn v14_volume_entry_round_trip_carries_lineage_fields() {
         page_dead_list_tail_pid: NULL_PAGE,
         page_live_list_head_pid: NULL_PAGE,
         page_live_list_tail_pid: NULL_PAGE,
+        promoted_log_head_pid: NULL_PAGE,
+        promoted_log_tail_pid: NULL_PAGE,
     };
     let size = volume_entry_inline_size(bare.shard_count as usize);
     let mut buf = vec![0u8; size];

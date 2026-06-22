@@ -124,6 +124,8 @@ impl Db {
             page_dead_list_tail_pid: crate::types::NULL_PAGE,
             page_live_list_head_pid: crate::types::NULL_PAGE,
             page_live_list_tail_pid: crate::types::NULL_PAGE,
+            promoted_log_head_pid: crate::types::NULL_PAGE,
+            promoted_log_tail_pid: crate::types::NULL_PAGE,
         }];
         manifest.next_volume_ord = BOOTSTRAP_VOLUME_ORD + 1;
         manifest_store.commit(&manifest)?;
@@ -423,6 +425,8 @@ impl Db {
                     entry.page_dead_list_tail_pid,
                     entry.page_live_list_head_pid,
                     entry.page_live_list_tail_pid,
+                    entry.promoted_log_head_pid,
+                    entry.promoted_log_tail_pid,
                     // v19: sticky clone-lineage flag arms the livelist
                     // capture threshold — covers promoted ex-clones too
                     // (flag persists past `PromotionComplete`).
@@ -1036,6 +1040,8 @@ fn apply_lifecycle_record_replay(
                     page_dead_list_tail_pid: crate::types::NULL_PAGE,
                     page_live_list_head_pid: crate::types::NULL_PAGE,
                     page_live_list_tail_pid: crate::types::NULL_PAGE,
+                    promoted_log_head_pid: crate::types::NULL_PAGE,
+                    promoted_log_tail_pid: crate::types::NULL_PAGE,
                 });
                 outcome.mutated_volumes = true;
             }
@@ -1115,6 +1121,9 @@ fn apply_lifecycle_record_replay(
                         crate::types::NULL_PAGE,
                         crate::types::NULL_PAGE,
                         crate::types::NULL_PAGE,
+                        // v20 promoted-PBA log anchors (NULL at clone replay).
+                        crate::types::NULL_PAGE,
+                        crate::types::NULL_PAGE,
                         Some(branched_at_lsn),
                     )),
                 );
@@ -1136,6 +1145,8 @@ fn apply_lifecycle_record_replay(
                     page_dead_list_tail_pid: crate::types::NULL_PAGE,
                     page_live_list_head_pid: crate::types::NULL_PAGE,
                     page_live_list_tail_pid: crate::types::NULL_PAGE,
+                    promoted_log_head_pid: crate::types::NULL_PAGE,
+                    promoted_log_tail_pid: crate::types::NULL_PAGE,
                 });
                 outcome.mutated_volumes = true;
             }

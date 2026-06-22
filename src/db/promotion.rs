@@ -183,6 +183,40 @@ impl Db {
             next_cursor,
         )?;
 
+        // v20 (S0): durably record the PBAs this chunk incref'd into the
+        // volume's promoted-PBA log so `drop_volume` can later decref them
+        // survivor-gated (closing the promotion over-pin leak). Synchronous
+        // append (promotion is an admin op, not the hot path); the segment
+        // page is fsync'd here, the anchor persists at the next manifest flush.
+        //
+        // NON-FATAL by design: the increfs are already applied + WAL-durable
+        // (`apply_promotion_chunk` above) and `finish_global_apply` MUST still
+        // run, so an emit IO failure (ENOSPC/EIO) must NOT `?`-return here — that
+        // would leave `last_applied_lsn` stuck at `lsn-1` (never advanced, never
+        // poisoned) and hang every later lifecycle commit. A failed/dropped log
+        // segment only means this chunk's edges are not yet decref-able at drop
+        // = a residual over-pin leak (data-safe, == today's behaviour), never a
+        // free of a live PBA.
+        //
+        // ⚠ Faithfulness window (deferred): the log is emitted only on the live
+        // commit path, NOT on WAL replay (`open.rs` replays `apply_promotion_chunk`
+        // = re-increfs rc, but does not re-emit the segment). So a promote that
+        // is never sealed by a manifest flush before a restart loses this
+        // chunk's records while the rc increfs persist via replay → residual
+        // over-pin for those edges. The full fix is a buffered-seal-at-flush
+        // (atomic with the manifest, like the page-livelist) or a replay
+        // re-emit; both deferred — the leak is data-safe and strictly smaller
+        // than the pre-S0 behaviour where NO promoted PBA was ever reclaimable.
+        if let Err(e) = self.emit_promoted_pba_log(vol_ord, &pba_increfs, lsn) {
+            tracing::warn!(
+                vol_ord,
+                lsn,
+                error = %e,
+                "promoted-PBA log emit failed; promotion increfs applied, this chunk's \
+                 log segment skipped (residual over-pin leak for these edges, data-safe)"
+            );
+        }
+
         {
             let mut mstate = self.manifest_state.lock();
             if let Some(entry) = mstate
@@ -192,11 +226,75 @@ impl Db {
                 .find(|e| e.ord == vol_ord)
             {
                 entry.promotion_cursor = next_cursor;
+                // Mirror the promoted-log anchors the emit just advanced, so
+                // the in-memory manifest stays consistent between flushes (the
+                // flush's `refresh_manifest_*` re-reads them from the volume
+                // atomics regardless).
+                if let Some(vol) = self.volumes.read().get(&vol_ord) {
+                    entry.promoted_log_head_pid = vol
+                        .promoted_log_head_pid
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    entry.promoted_log_tail_pid = vol
+                        .promoted_log_tail_pid
+                        .load(std::sync::atomic::Ordering::Acquire);
+                }
             }
         }
 
         self.finish_global_apply(lsn)?;
         self.advance_dispatch_lsn(lsn);
+        Ok(())
+    }
+
+    /// v20 (ZFS port Phase 4 Step 4 / S0): append `pbas` as one segment to the
+    /// volume's promoted-PBA log chain (reusing the `LiveListSegment` codec with
+    /// the raw `Pba` stored in the record's `pid` slot). Writes + fsyncs the
+    /// segment page(s) and advances the in-memory `promoted_log_{head,tail}_pid`
+    /// anchors; the durable anchor rides the next manifest flush. No-op for an
+    /// empty chunk.
+    fn emit_promoted_pba_log(
+        &self,
+        vol_ord: VolumeOrdinal,
+        pbas: &[Pba],
+        lsn: crate::types::Lsn,
+    ) -> Result<()> {
+        if pbas.is_empty() {
+            return Ok(());
+        }
+        let vol = match self.volumes.read().get(&vol_ord) {
+            Some(v) => v.clone(),
+            None => return Ok(()),
+        };
+        let records: Vec<crate::livelist::LiveRecord> = pbas
+            .iter()
+            .map(|&pba| crate::livelist::LiveRecord {
+                pid: pba,
+                birth_lsn: 0,
+                event_lsn: lsn,
+                kind: crate::livelist::LiveKind::Alloc,
+            })
+            .collect();
+        let page_count = crate::livelist::segment_pages_for(records.len());
+        if page_count == 0 {
+            return Ok(());
+        }
+        let prev_tail = vol
+            .promoted_log_tail_pid
+            .load(std::sync::atomic::Ordering::Acquire);
+        let start_pid = self.page_store.allocate_run(page_count)?;
+        let pages = crate::livelist::build_segment_pages(start_pid, &records, prev_tail, lsn);
+        let sealed: Vec<(crate::types::PageId, std::sync::Arc<crate::page::Page>)> = pages
+            .into_iter()
+            .map(|(pid, page)| (pid, std::sync::Arc::new(page)))
+            .collect();
+        self.page_store.write_sealed_page_runs(sealed)?;
+        self.page_store.sync()?;
+        if prev_tail == crate::types::NULL_PAGE {
+            vol.promoted_log_head_pid
+                .store(start_pid, std::sync::atomic::Ordering::Release);
+        }
+        vol.promoted_log_tail_pid
+            .store(start_pid, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 

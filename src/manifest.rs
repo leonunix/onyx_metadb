@@ -143,7 +143,17 @@ use crate::types::{
 /// analogue Phase 4 reads to free a dropped clone's private subtree without
 /// the explicit page-rc; Phase 3b only populates + verifies it in SHADOW.
 /// Net manifest cost: +16 B/volume; old v18 manifests are hard-rejected.
-pub const MANIFEST_BODY_VERSION: u32 = 19;
+///
+/// v20 (ZFS birth-txg port Phase 4 Step 4 / S0: promotion-rc-leak fix): adds a
+/// FOURTH, independent per-volume chain — the promoted-PBA log (raw `Pba`s the
+/// promotion walker incref'd into the global refcount) anchored by
+/// `VolumeEntry.promoted_log_{head,tail}_pid` (+16 B fixed header). Reuses the
+/// `LiveListSegment` codec (pba stored in the record's pid slot), a distinct
+/// chain from the page-livelist. `drop_volume` of a clone-lineage volume reads
+/// it to decref those PBAs survivor-gated, closing the permanent promotion
+/// over-pin leak. Net manifest cost: +16 B/volume; old v19 manifests are
+/// hard-rejected (fresh rebuild, no migration).
+pub const MANIFEST_BODY_VERSION: u32 = 20;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -698,10 +708,10 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            19 => Self::decode_v19(page, page_store),
+            20 => Self::decode_v20(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v19 \
-                 (ZFS birth-txg port Phase 3b: per-clone page-livelist) is \
+                "unsupported manifest body version {other}; only v20 \
+                 (ZFS birth-txg port Phase 4 Step 4: promoted-PBA log) is \
                  readable — older databases (v7/v8 carried the retired \
                  dedup_reverse section; v9 carried compact leaf v2 with the \
                  100-unit cap; v10/v11 used compact leaf v3 which predates \
@@ -712,13 +722,14 @@ impl Manifest {
                  watermarks but no l2p_page_rc shard group; v17 had the \
                  l2p_page_rc shard group but no page-deadlist anchors; v18 had \
                  the page-deadlist anchors but no per-clone page-livelist \
+                 anchors; v19 had the page-livelist but no promoted-PBA log \
                  anchors) must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v19(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 19)
+    fn decode_v20(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 20)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {

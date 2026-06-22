@@ -1133,6 +1133,12 @@ struct Volume {
     /// v19: newest segment of the page-livelist chain (apply-time append
     /// anchor). Loaded from `VolumeEntry.page_live_list_tail_pid`.
     page_live_list_tail_pid: AtomicU64,
+    /// v20 (ZFS port Phase 4 Step 4 / S0): oldest segment of this volume's
+    /// promoted-PBA log chain. Loaded from `VolumeEntry.promoted_log_head_pid`.
+    promoted_log_head_pid: AtomicU64,
+    /// v20: newest segment of the promoted-PBA log (append anchor for the
+    /// promotion walker). Loaded from `VolumeEntry.promoted_log_tail_pid`.
+    promoted_log_tail_pid: AtomicU64,
     /// Phase 4 lineage tracking — mirrors
     /// [`VolumeEntry::parent_vol_ord`]. `INVALID_VOLUME` encodes
     /// `Option::None`. Loaded on `Db::open`; mutated only by clone /
@@ -1166,6 +1172,8 @@ impl Volume {
             page_live_list: Arc::new(crate::livelist::LiveListState::new()),
             page_live_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
             page_live_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            promoted_log_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            promoted_log_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
             parent_vol_ord: parking_lot::RwLock::new(None),
             branched_at_lsn: 0,
             promotion_cursor: parking_lot::RwLock::new(None),
@@ -1193,6 +1201,8 @@ impl Volume {
             page_live_list: Arc::new(crate::livelist::LiveListState::new()),
             page_live_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
             page_live_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            promoted_log_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
+            promoted_log_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
             parent_vol_ord: parking_lot::RwLock::new(None),
             branched_at_lsn: 0,
             promotion_cursor: parking_lot::RwLock::new(None),
@@ -1229,6 +1239,8 @@ impl Volume {
         page_dead_list_tail_pid: crate::types::PageId,
         page_live_list_head_pid: crate::types::PageId,
         page_live_list_tail_pid: crate::types::PageId,
+        promoted_log_head_pid: crate::types::PageId,
+        promoted_log_tail_pid: crate::types::PageId,
         clone_birth_lsn: Option<Lsn>,
     ) -> Self {
         // Arm the per-shard livelist capture threshold. Non-clones pass
@@ -1254,6 +1266,8 @@ impl Volume {
             page_live_list: Arc::new(crate::livelist::LiveListState::new()),
             page_live_list_head_pid: AtomicU64::new(page_live_list_head_pid),
             page_live_list_tail_pid: AtomicU64::new(page_live_list_tail_pid),
+            promoted_log_head_pid: AtomicU64::new(promoted_log_head_pid),
+            promoted_log_tail_pid: AtomicU64::new(promoted_log_tail_pid),
             parent_vol_ord: parking_lot::RwLock::new(parent_vol_ord),
             branched_at_lsn,
             promotion_cursor: parking_lot::RwLock::new(promotion_cursor),
@@ -1640,6 +1654,39 @@ impl Db {
             .into_iter()
             .map(|r| (r.pid, r.birth_lsn))
             .collect())
+    }
+
+    /// ZFS port Phase 4 Step 4 (S0) test helper: the raw PBAs recorded in a
+    /// volume's promoted-PBA log chain (the global-rc edges promotion incref'd),
+    /// most-recent segment first. Reads the durable chain via the in-memory tail
+    /// anchor.
+    #[cfg(test)]
+    pub(crate) fn test_promoted_log_pbas(&self, vol_ord: VolumeOrdinal) -> Result<Vec<Pba>> {
+        let vol = self.volume(vol_ord)?;
+        let tail = vol
+            .promoted_log_tail_pid
+            .load(std::sync::atomic::Ordering::Acquire);
+        let records = crate::livelist::read_chain_records(tail, |p| self.page_store.read_page(p))?;
+        // The promoted-PBA log reuses the LiveListSegment codec with the raw
+        // `Pba` stored in the record's `pid` slot.
+        Ok(records.into_iter().map(|r| r.pid).collect())
+    }
+
+    /// ZFS port Phase 4 Step 4 (S0) test helper: the volume's promoted-PBA log
+    /// `(head, tail)` anchors.
+    #[cfg(test)]
+    pub(crate) fn test_promoted_log_anchors(
+        &self,
+        vol_ord: VolumeOrdinal,
+    ) -> Option<(PageId, PageId)> {
+        self.volumes.read().get(&vol_ord).map(|v| {
+            (
+                v.promoted_log_head_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+                v.promoted_log_tail_pid
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        })
     }
 
     /// ZFS port Phase 4 Step 4 (S1c) test helper: run the read-only clone

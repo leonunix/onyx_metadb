@@ -540,3 +540,59 @@ fn clone_promote_condense_drop_churn() {
     }
     assert_livelist_clean(dir.path());
 }
+
+/// ZFS port Phase 4 Step 4 (S0) substrate: promoting a clone records every
+/// PBA the promotion walker increfs into the per-volume promoted-PBA log; the
+/// chain + anchors survive a reopen, and verify keeps the segment pages live
+/// (no orphan-reclaim corruption). `drop_volume` (S0 actuator, next step) will
+/// read this log to decref those PBAs survivor-gated, closing the promotion
+/// over-pin leak.
+#[test]
+fn promoted_pba_log_records_promotion_and_survives_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let clone_ord;
+    let logged;
+    {
+        let db = Db::create(dir.path()).unwrap();
+        let base = db.create_volume().unwrap();
+        for i in 0u64..16 {
+            db.insert(base, i, v(i as u8)).unwrap();
+        }
+        let snap = db.take_snapshot(base).unwrap();
+        let clone = db.clone_volume(snap).unwrap();
+        for i in 0u64..16 {
+            db.insert(clone, i, v(0xC0 | i as u8)).unwrap();
+        }
+        // Before promotion the log is empty.
+        assert_eq!(
+            db.test_promoted_log_anchors(clone),
+            Some((crate::types::NULL_PAGE, crate::types::NULL_PAGE)),
+            "no promoted-PBA log before a promotion walker runs"
+        );
+        // Promote: the walker increfs + logs the head_pba of every live mapping.
+        db.promote_volume(clone).unwrap();
+        let pbas = db.test_promoted_log_pbas(clone).unwrap();
+        assert_eq!(
+            pbas.len(),
+            16,
+            "promotion must record one PBA per live clone mapping, got {}",
+            pbas.len()
+        );
+        let (head, tail) = db.test_promoted_log_anchors(clone).unwrap();
+        assert_ne!(head, crate::types::NULL_PAGE);
+        assert_ne!(tail, crate::types::NULL_PAGE);
+        db.flush().unwrap();
+        clone_ord = clone;
+        logged = pbas;
+    }
+    // Reopen: the durable chain survives + verify did not orphan-reclaim it.
+    let db = Db::open(dir.path()).unwrap();
+    let pbas = db.test_promoted_log_pbas(clone_ord).unwrap();
+    assert_eq!(
+        pbas, logged,
+        "promoted-PBA log must survive reopen byte-for-byte"
+    );
+    // Offline verify (incl. orphan check) stays clean — the chain pages are
+    // marked live by collect_live_pages.
+    assert_livelist_clean(dir.path());
+}

@@ -132,6 +132,12 @@ pub(in crate::db::lifecycle) fn refresh_manifest_from_checkpoints(
             page_dead_list_tail_pid,
             page_live_list_head_pid,
             page_live_list_tail_pid,
+            promoted_log_head_pid: volume
+                .promoted_log_head_pid
+                .load(std::sync::atomic::Ordering::Acquire),
+            promoted_log_tail_pid: volume
+                .promoted_log_tail_pid
+                .load(std::sync::atomic::Ordering::Acquire),
         });
     }
     manifest.volumes = new_entries;
