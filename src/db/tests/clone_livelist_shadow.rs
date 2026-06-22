@@ -579,3 +579,290 @@ fn clone_churn_shadow_stress() {
             .unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4 Step 3 (DAG correctness): the clone-drop shadow gate widened from
+// `parent_vol_ord.is_some()` (still-clones) to the sticky
+// `VOLUME_FLAG_CLONE_LINEAGE` flag, so dropping a PROMOTED ex-clone also runs
+// the 3-arm cross-check. Promotion is lite (clears parent_vol_ord, bumps only
+// global PBA rc, never restructures the page tree), so a promoted ex-clone may
+// still page-rc-SHARE L2P pages with its lineage. These tests prove the widened
+// gate fires for promoted ex-clones and that the birth-agnostic reachability
+// arms handle the DAG hazards (G6 descendant-share, G8 origin-fallthrough)
+// without false-firing. page-rc stays authoritative — shadow only.
+// ---------------------------------------------------------------------------
+
+/// Drive the promotion walker to completion for a clone. Panics if the volume
+/// is not a clone (NotApplicable) or does not complete in a bounded number of
+/// chunks.
+fn promote_to_completion(db: &Db, vol: crate::types::VolumeOrdinal) {
+    for _ in 0..256 {
+        match db.test_run_promotion_chunk(vol).unwrap() {
+            PromotionStep::Completed => return,
+            PromotionStep::NotApplicable => panic!("vol {vol} is not a clone (NotApplicable)"),
+            _ => {}
+        }
+    }
+    panic!("promotion of vol {vol} did not complete in 256 chunks");
+}
+
+/// The widened gate fires for a promoted ex-clone (sticky flag set,
+/// parent_vol_ord cleared) and the 3-arm shadow stays green on a legal drop.
+/// C diverges only lba0, so lba1..7 stay page-rc-shared with the survivor
+/// parent — exercising the rc>1-shared-kept path through the widened gate.
+#[test]
+fn promoted_exclone_drop_shadow_runs_and_stays_green() {
+    let (_d, db) = mk_db();
+    let p = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(p, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(p).unwrap();
+    let c = db.clone_volume(snap).unwrap();
+    db.insert(c, 0, v(0xC0)).unwrap(); // diverge only lba0; lba1..7 shared with P/snap
+    promote_to_completion(&db, c);
+
+    // We are genuinely in the newly-covered category: the Step-1 gate
+    // (parent_vol_ord.is_some()) would SKIP this; the Step-3 flag gate runs it.
+    let entry = db
+        .manifest()
+        .volumes
+        .iter()
+        .find(|e| e.ord == c)
+        .cloned()
+        .unwrap();
+    assert!(
+        entry.parent_vol_ord.is_none(),
+        "C must be a promoted ex-clone (parent_vol_ord cleared)"
+    );
+    assert!(
+        entry.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0,
+        "CLONE_LINEAGE flag must stay sticky so the widened gate fires"
+    );
+
+    assert!(
+        db.drop_volume(c).unwrap().is_some(),
+        "promoted-ex-clone drop must run the shadow and stay green"
+    );
+    // Shared origin pages kept: parent + snapshot survive intact.
+    for i in 0u64..8 {
+        assert_eq!(db.get(p, i).unwrap(), Some(v(i as u8)));
+    }
+    let view = db.snapshot_view(snap).unwrap();
+    for i in 0u64..8 {
+        assert_eq!(view.get(i).unwrap(), Some(v(i as u8)));
+    }
+}
+
+/// G6 for a PROMOTED ex-clone: C's born>B1 pages are still shared with a
+/// promoted descendant D. Dropping the promoted ex-clone C must NOT premature —
+/// those pages are reachable from survivor D, so `exclusive` excludes them and
+/// page-rc keeps them (rc>1). Extends the still-clone middle-drop test to
+/// dropping a PROMOTED ancestor.
+#[test]
+fn promoted_exclone_g6_descendant_share_no_premature() {
+    let (_d, db) = mk_db();
+    let p = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(p, i, v(i as u8)).unwrap();
+    }
+    let s1 = db.take_snapshot(p).unwrap();
+    let c = db.clone_volume(s1).unwrap();
+    for i in 0u64..8 {
+        db.insert(c, i, v(0xC0 | i as u8)).unwrap(); // C born > B1
+    }
+    let s2 = db.take_snapshot(c).unwrap();
+    let d = db.clone_volume(s2).unwrap(); // D shares C's born>B1 pages via s2
+    for i in 0u64..8 {
+        assert_eq!(db.get(d, i).unwrap(), Some(v(0xC0 | i as u8)));
+    }
+    // Legalize C's drop AND promote C into an ex-clone while D still shares.
+    let _ = db.drop_snapshot(s2).unwrap().unwrap();
+    promote_to_completion(&db, d); // clears D.parent_vol_ord == C
+    promote_to_completion(&db, c); // C becomes a promoted ex-clone
+
+    assert!(
+        db.drop_volume(c).unwrap().is_some(),
+        "promoted-ex-clone drop must not abort premature (pages shared with survivor D)"
+    );
+    for i in 0u64..8 {
+        assert_eq!(db.get(d, i).unwrap(), Some(v(0xC0 | i as u8)));
+    }
+}
+
+/// G8 for a PROMOTED ex-clone: a born<=B origin page falls sole-owned to C
+/// after the parent diverges + the source snapshot is dropped. Dropping the
+/// promoted ex-clone must NOT abort missing — the page is in both
+/// `structural_free` (rc==1) and `exclusive` (no survivor), and being born<=B it
+/// drops out of both livelist sides. Extends the still-clone G8 test to the
+/// promoted case (now that missing is HARD).
+#[test]
+fn promoted_exclone_g8_origin_fallthrough_no_missing() {
+    let (_d, db) = mk_db();
+    let p = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(p, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(p).unwrap();
+    let c = db.clone_volume(snap).unwrap();
+    db.insert(p, 0, v(0xF0)).unwrap(); // parent diverges over lba0
+    db.insert(c, 7, v(0xC7)).unwrap(); // C private page (born > B)
+    let _ = db.drop_snapshot(snap).unwrap().unwrap(); // old origin pages fall to C
+    promote_to_completion(&db, c);
+
+    assert!(
+        db.drop_volume(c).unwrap().is_some(),
+        "promoted-ex-clone G8 drop must not abort missing"
+    );
+    assert_eq!(db.get(p, 0).unwrap(), Some(v(0xF0)));
+    for i in 1u64..8 {
+        assert_eq!(db.get(p, i).unwrap(), Some(v(i as u8)));
+    }
+}
+
+/// Two promoted sibling ex-clones of the same snapshot, dropped in both orders.
+/// Shared origin pages are kept while the sibling lives (it is a survivor) and
+/// freed when sole-owned — order-independent through the widened gate.
+#[test]
+fn promoted_sibling_exclones_drop_both_orders() {
+    for drop_a_first in [true, false] {
+        let (_d, db) = mk_db();
+        let src = db.create_volume().unwrap();
+        for i in 0u64..8 {
+            db.insert(src, i, v(i as u8)).unwrap();
+        }
+        let snap = db.take_snapshot(src).unwrap();
+        let a = db.clone_volume(snap).unwrap();
+        let b = db.clone_volume(snap).unwrap();
+        db.insert(a, 0, v(0xAA)).unwrap();
+        db.insert(b, 0, v(0xBB)).unwrap();
+        promote_to_completion(&db, a);
+        promote_to_completion(&db, b);
+
+        let (first, second) = if drop_a_first { (a, b) } else { (b, a) };
+        assert!(db.drop_volume(first).unwrap().is_some());
+        assert!(db.drop_volume(second).unwrap().is_some());
+        for i in 0u64..8 {
+            assert_eq!(db.get(src, i).unwrap(), Some(v(i as u8)));
+        }
+    }
+}
+
+/// Surviving_roots completeness re-proof in test form: promote D (clearing
+/// D.parent_vol_ord so the former parent P becomes droppable), then drop P.
+/// Pages P shares with the survivor promoted ex-clone D must NOT be freed
+/// (page-rc keeps them rc>1). D diverges only lba0, so lba1..7 stay shared.
+#[test]
+fn drop_promoted_exclones_former_parent() {
+    let (_d, db) = mk_db();
+    let p = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(p, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(p).unwrap();
+    let d = db.clone_volume(snap).unwrap();
+    db.insert(d, 0, v(0xD0)).unwrap(); // D diverges only lba0; lba1..7 shared with P
+    promote_to_completion(&db, d); // clears D.parent_vol_ord -> P droppable
+    let _ = db.drop_snapshot(snap).unwrap().unwrap(); // P has no live snapshot now
+
+    assert!(
+        db.drop_volume(p).unwrap().is_some(),
+        "former parent drop must succeed; survivor D keeps the shared pages"
+    );
+    assert_eq!(db.get(d, 0).unwrap(), Some(v(0xD0)));
+    for i in 1u64..8 {
+        assert_eq!(db.get(d, i).unwrap(), Some(v(i as u8)));
+    }
+}
+
+/// A promoted ex-clone survives close + reopen: the sticky flag is rehydrated
+/// (so the widened gate still fires) and `clone_birth_lsn` re-arms, and the
+/// post-reopen drop stays green.
+#[test]
+fn promoted_exclone_reopen_then_drop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (src, clone) = {
+        let db = Db::create(dir.path()).unwrap();
+        let src = db.create_volume().unwrap();
+        for i in 0u64..8 {
+            db.insert(src, i, v(i as u8)).unwrap();
+        }
+        let snap = db.take_snapshot(src).unwrap();
+        let clone = db.clone_volume(snap).unwrap();
+        for i in 0u64..8 {
+            db.insert(clone, i, v(0xC0 | i as u8)).unwrap();
+        }
+        let _ = db.drop_snapshot(snap).unwrap().unwrap();
+        promote_to_completion(&db, clone);
+        db.flush().unwrap();
+        (src, clone)
+    };
+    let db = Db::open(dir.path()).unwrap();
+    let entry = db
+        .manifest()
+        .volumes
+        .iter()
+        .find(|e| e.ord == clone)
+        .cloned()
+        .unwrap();
+    assert!(entry.parent_vol_ord.is_none(), "still a promoted ex-clone after reopen");
+    assert!(
+        entry.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0,
+        "sticky flag must survive reopen so the widened gate fires"
+    );
+    assert!(db.drop_volume(clone).unwrap().is_some());
+    for i in 0u64..8 {
+        assert_eq!(db.get(src, i).unwrap(), Some(v(i as u8)));
+    }
+}
+
+/// Negative control: the HARD detectors still fire on a promoted ex-clone's
+/// inputs (the widened gate did not silently disable them). Driven via the
+/// shim so a divergence can be crafted; uses a genuinely-promoted ex-clone's
+/// roots/branch.
+#[test]
+fn teeth_still_fire_through_widened_gate() {
+    let (_d, db) = mk_db_with_shards(1);
+    let src = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(src, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(src).unwrap();
+    let clone = db.clone_volume(snap).unwrap();
+    for i in 0u64..8 {
+        db.insert(clone, i, v(0xC0 | i as u8)).unwrap();
+    }
+    promote_to_completion(&db, clone);
+    db.flush().unwrap();
+
+    let m = db.manifest();
+    let src_root = m
+        .volumes
+        .iter()
+        .find(|e| e.ord == src)
+        .unwrap()
+        .l2p_shard_roots[0];
+    let clone_entry = m.volumes.iter().find(|e| e.ord == clone).unwrap();
+    let clone_root = clone_entry.l2p_shard_roots[0];
+    let b = clone_entry.branched_at_lsn;
+    assert!(
+        clone_entry.parent_vol_ord.is_none(),
+        "must exercise a promoted ex-clone"
+    );
+
+    // Premature still fires: claim a survivor-reachable page (src root) freed.
+    let err = db
+        .test_check_clone_livelist_shadow(
+            clone,
+            b,
+            &[(src_root, 0, 1)],
+            &[clone_root],
+            &[src_root],
+            &[],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, MetaDbError::Corruption(_)),
+        "expected premature Corruption on promoted-ex-clone inputs, got {err:?}"
+    );
+}

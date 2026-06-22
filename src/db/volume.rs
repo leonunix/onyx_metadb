@@ -381,19 +381,27 @@ impl Db {
         // fold-consistency); running before the WAL submit / manifest commit
         // means a Corruption abort leaves no half-applied drop. Page-rc stays
         // authoritative — this is a shadow assertion, NOT the free decision.
-        // Deliberately gated on the clone (`parent_vol_ord.is_some()`) only:
-        // a non-clone parent drop with a promoted clone child stays page-rc-
-        // authoritative and is not in the livelist model's scope here.
-        // ⚠ Coverage caveat for Phase 4: a *promoted* ex-clone has its
-        // `parent_vol_ord` cleared by `PromotionComplete` (promotion bumps
-        // only the global PBA refcount, NOT the L2P page-rc, and does not
-        // COW-divide the page tree), so it skips this shadow even though it
-        // may still share L2P pages. Safe while page-rc is authoritative
-        // (the shadow is observational), but before Phase 4 deletes page-rc
-        // the exclusivity model must also cover promoted ex-clones (gate on
-        // "has clone lineage" rather than a live `parent_vol_ord`) or prove
-        // promotion fully privatises the page tree.
-        if volume.parent_vol_ord.read().is_some() {
+        // Phase 4 Step 3 (DAG correctness): gated on the sticky
+        // `VOLUME_FLAG_CLONE_LINEAGE` flag — set once at clone creation, never
+        // cleared, surviving `PromotionComplete` (which clears `parent_vol_ord`)
+        // — so a *promoted* ex-clone is ALSO covered. Promotion is lite (bumps
+        // only the global PBA refcount + clears `parent_vol_ord`, does NOT
+        // COW-divide the page tree or touch the L2P page-rc), so a promoted
+        // ex-clone may still page-rc-SHARE L2P pages with its lineage; Step 1's
+        // narrower `parent_vol_ord.is_some()` gate skipped it. Widening is
+        // strictly additive (the flag is 0 on plain volumes, sticky on clones)
+        // and SOUND: the reachability `exclusive` set below is birth-agnostic
+        // C-exclusivity, so it handles the DAG hazards natively — G6 (a born>B
+        // page shared with a promoted descendant E stays reachable from E, a
+        // survivor → kept) and G8 (a born≤B origin page sole-owned to this
+        // volume → freed, and drops out of both livelist sides by birth). The
+        // `missing→HARD` precondition (surviving_roots complete) is re-proven
+        // for the promoted case on `check_clone_livelist_shadow` below. Page-rc
+        // stays authoritative — still a shadow assertion, NOT the free decision.
+        if (volume.flags.load(std::sync::atomic::Ordering::Relaxed)
+            & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE)
+            != 0
+        {
             let mut surviving_roots: Vec<PageId> = Vec::new();
             for (i, tree) in l2p_guards.iter().enumerate() {
                 if i >= target_start && i < target_end {
@@ -603,17 +611,22 @@ impl Db {
     ///     premature difference), so the HARD direction can't false-fire.
     ///   - **missing** (the exclusivity walk frees a page page-rc keeps live)
     ///     → HARD [`MetaDbError::Corruption`] (Phase 4 Step 1 escalation, was a
-    ///     soft warn). **Soundness precondition**: this direction can only be
-    ///     made HARD because `surviving_roots` is COMPLETE for a legal drop of a
-    ///     *still*-clone — every other live volume's just-flushed root (incl.
-    ///     promoted ex-clone survivors, still live `Volume`s in `l2p_guards`)
-    ///     plus every snapshot root; clone-of-C and live-snapshots-of-C are
-    ///     rejected at `drop_volume` entry. An incomplete `surviving_roots`
-    ///     would over-enlarge `exclusive` and manufacture a false `missing`, so
-    ///     do NOT widen the gate (e.g. to promoted ex-clones being *dropped*,
-    ///     whose own survivor set differs) without re-proving completeness.
-    ///     Checked AFTER premature so `structural_free == exclusive` holds for
-    ///     the livelist reduction below.
+    ///     soft warn). **Soundness precondition**: `surviving_roots` is COMPLETE
+    ///     for a legal drop of any `VOLUME_FLAG_CLONE_LINEAGE` volume — every
+    ///     OTHER live volume's just-flushed root + every snapshot root, frozen
+    ///     under drop_gate.write + apply_gate.write + snapshot_views.write. An
+    ///     incomplete `surviving_roots` would over-enlarge `exclusive` and
+    ///     manufacture a false `missing`. **Phase 4 Step 3 re-proof for the
+    ///     widened (promoted-ex-clone) gate**: promotion (`apply/promotion.rs`)
+    ///     edits only the `parent_vol_ord`/`promotion_cursor` RwLocks and NEVER
+    ///     removes a volume from `self.volumes`, so a promoted ex-clone's
+    ///     descendants AND its former parent are all still in
+    ///     `volumes_snapshot()` → their roots are in `surviving_roots` →
+    ///     correctly subtracted. A promoted descendant escaping the
+    ///     `parent_vol_ord == Some(self)` entry-rejection is harmless (it is
+    ///     still a survivor). reachability is transitive, so arbitrary DAG depth
+    ///     is covered. Checked AFTER premature so `structural_free == exclusive`
+    ///     holds for the livelist reduction below.
     ///   - **livelist cross-check** (Phase 4 Step 1, NEW) → HARD. With the two
     ///     checks above passing, `structural_free == exclusive`, so the
     ///     clone-private part of the free-set is `exclusive ∩ {birth > B}`.
