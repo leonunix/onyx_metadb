@@ -181,5 +181,6 @@ mod free_pbas;
 mod indexes;
 mod lineage_gc;
 mod promotion;
+mod range_delete_stress;
 mod remap_range;
 mod volume;

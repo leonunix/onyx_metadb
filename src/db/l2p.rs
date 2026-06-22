@@ -472,29 +472,36 @@ impl Db {
         self.metrics
             .record_range_delete_drop_gate_wait(drop_gate_started.elapsed());
 
-        // Forced TXG sync before apply_gate.write to avoid the threaded
-        // sync thread's manifest-commit gate deadlocking against our
-        // outer apply guard. Drains pre-existing L2P Dirty Arcs so
-        // `apply_l2p_range_delete`'s rc-mutating apply cannot be
-        // clobbered by a concurrent flush IO phase. See
-        // [`Db::take_snapshot`] for the full rationale.
-        if let Err(err) = self.flush_with_gate(crate::metrics::FlushKind::Forced) {
-            self.metrics
-                .record_range_delete_error(total_started.elapsed());
-            return Err(err);
-        }
-
-        // Phase 4 gate-shrink: record this lifecycle op's WAL LSNs into
-        // `slot_max_lsn(open_txg)` so `run_sync_cycle_body`'s
-        // `wal_checkpoint = slot_max_lsn(txg)` watermark reflects them.
-        // Must be entered AFTER `flush_with_gate(Forced)` returns —
-        // that call rolls the current Open TXG; entering before would
-        // race `roll_to_quiescing` waiting for `inflight == 0`.
-        // Range delete submits one WAL record per chunk; the guard is
+        // Phase B (A3 follow-up): NO forced TXG sync at entry. This path
+        // used to run `flush_with_gate(Forced)` here to drain in-flight
+        // flush IO so `apply_l2p_range_delete`'s rc mutation could not be
+        // clobbered by a concurrent flush IO phase. A3 moved the page
+        // refcount into the `L2pPageRc` array: the apply now `stage`s its
+        // decrefs into the OPEN TXG slot while flush writes the FROZEN
+        // syncing slot, so there is nothing left to clobber. This mirrors
+        // the same removal already done for `take_snapshot` /
+        // `drop_snapshot` / `clone_volume`.
+        //
+        // The removed force-sync was the root of the "range_delete stalls
+        // the whole commit pipeline" stall: it held `drop_gate.write`
+        // across a FULL forced TXG sync, parking every `commit_ops` writer
+        // at `drop_gate.read` for that entire duration (multi-second at
+        // high pipeline depth / large dirty set — the "22-94s stall /
+        // buffer head stuck" class). The `force_compact_l2p_buffers()`
+        // below now does the only drain range_delete actually needs (so the
+        // scan sees buffer-only entries); decref durability rides the
+        // Discard lifecycle journal record (gen-stamped idempotent on
+        // replay) and is captured by the next natural background sync.
+        //
+        // Phase 4 gate-shrink: `_txg_guard.record_lsn(lsn)` (per chunk
+        // below) records this op's WAL LSNs into `slot_max_lsn(open_txg)`
+        // so `run_sync_cycle_body`'s `wal_checkpoint` watermark reflects
+        // them and the WAL segment is eventually pruned. `closing_open`
+        // makes `enter()` wait out (not race) a concurrent background roll,
+        // so entering the current Open TXG without rolling it ourselves is
+        // safe. Range delete submits one WAL record per chunk; the guard is
         // entered once and `record_lsn` is called per chunk inside the
-        // submit loop. Only the final lsn actually matters
-        // (slot_max_lsn is max-monotonic), but stamping per chunk keeps
-        // the metric tight and costs nothing.
+        // submit loop.
         let _txg_guard = self.txg.enter();
 
         let apply_gate_started = std::time::Instant::now();
@@ -502,12 +509,17 @@ impl Db {
         self.metrics
             .record_range_delete_apply_gate_wait(apply_gate_started.elapsed());
 
-        // B2: drain L2P buffer into tree so the per-shard `tree.range`
-        // scan below sees buffer-only entries. The forced sync above
-        // already did this; `drop_gate.write` keeps the slots empty.
-        // The call below is defensive — no-op in the steady case, and
-        // also a no-op when the buffer is disabled.
-        if let Err(err) = self.force_compact_l2p_buffers() {
+        // Drain THIS volume's L2P buffer into its tree so the per-shard
+        // `tree.range` scan below sees buffer-only entries. With the entry
+        // force-sync removed (Phase B above), this drain is LOAD-BEARING
+        // (it was a defensive no-op while the forced sync drained first).
+        // Scoped to `vol_ord` — range_delete reads/mutates only this
+        // volume, so folding every volume's buffer here (the old full
+        // `force_compact_l2p_buffers`) would inflate the `drop_gate.write`
+        // hold by the OTHER volumes' buffers and stall their writers for
+        // no reason. `drop_gate.write` keeps the slots from refilling;
+        // no-op when the buffer is disabled.
+        if let Err(err) = self.force_compact_l2p_buffers_for_volume(vol_ord) {
             self.metrics
                 .record_range_delete_error(total_started.elapsed());
             return Err(err);

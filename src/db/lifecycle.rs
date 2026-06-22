@@ -578,13 +578,13 @@ impl Db {
     ///   commits' `cow_for_write` falls on the per-shard `tree.write()`
     ///   this helper takes.
     /// - The snapshot / `range_delete` / `drop_volume` / `drop_snapshot`
-    ///   paths. `take_snapshot` / `drop_snapshot` (Phase B) no longer
-    ///   force-sync at entry, so this drain is LOAD-BEARING there: it
-    ///   folds every buffered L2P op into the tree so the root sample /
-    ///   refresh observes all applied ops. `drop_gate.write` held by the
-    ///   lifecycle op keeps the slots from refilling. (`range_delete` /
-    ///   `drop_volume` still force-sync at entry, so for those the drain
-    ///   stays a defensive no-op.)
+    ///   paths. `take_snapshot` / `drop_snapshot` / `range_delete`
+    ///   (Phase B) no longer force-sync at entry, so this drain is
+    ///   LOAD-BEARING there: it folds every buffered L2P op into the tree
+    ///   so the root sample / refresh / range scan observes all applied
+    ///   ops. `drop_gate.write` held by the lifecycle op keeps the slots
+    ///   from refilling. (`drop_volume` still force-syncs at entry, so for
+    ///   it the drain stays a defensive no-op.)
     /// - The post-replay path in `open_with_config_and_faults`,
     ///   before any commit can race the recovered buffer state.
     ///
@@ -608,63 +608,98 @@ impl Db {
             out
         };
         for vol in vols {
-            let youngest_snap = self.youngest_snap(vol.ord);
-            for shard in &vol.shards {
-                if !shard.use_buffer {
-                    continue;
-                }
-                let started = Instant::now();
-                let mut tree = shard.tree.write();
-                // Drain ALL four TXG slots in one shot. Used only by
-                // paths that need every slot folded NOW: lifecycle ops
-                // (which hold `drop_gate.write`, so the slots are
-                // quiesced), the post-replay open, and the threads-OFF
-                // inline flush. The regular threads-ON per-TXG sync uses
-                // `drain_syncing_slot_into_trees` instead (drains only
-                // the frozen syncing slot, publish-before-clear). Note:
-                // this drain is NOT publish-before-clear, so on the
-                // threads-OFF inline-flush path a concurrent commit can
-                // still hit the (rare) stale-`prev` race — acceptable
-                // there because that path is being retired.
-                let drained = shard.l2p_buffer.drain_all_slots();
-                if drained.is_empty() {
+            self.compact_volume_buffers(&vol)?;
+        }
+        Ok(())
+    }
+
+    /// Volume-scoped variant of [`force_compact_l2p_buffers`]: fold only
+    /// `vol_ord`'s L2P shard buffers into its tree. Used by `range_delete`,
+    /// which only reads + mutates a single volume's range and so must not
+    /// pay (and hold `drop_gate.write` / `apply_gate.write` across) the
+    /// fold of EVERY volume's buffer. Folding all volumes there was an
+    /// N-volume inflation of the lifecycle op's pipeline-blocking window
+    /// (`drop_gate.write` parks every `commit_ops` writer for the hold).
+    /// Correctness is identical to the full drain — volumes are
+    /// independent, and range_delete touches only `vol_ord`. No-op when
+    /// the buffer is disabled or the volume is gone.
+    pub(super) fn force_compact_l2p_buffers_for_volume(&self, vol_ord: VolumeOrdinal) -> Result<()> {
+        if !self.l2p_buffer_enabled {
+            return Ok(());
+        }
+        let vol = {
+            let map = self.volumes.read();
+            map.get(&vol_ord).cloned()
+        };
+        if let Some(vol) = vol {
+            self.compact_volume_buffers(&vol)?;
+        }
+        Ok(())
+    }
+
+    /// Fold every TXG slot of one volume's L2P shard buffers into its
+    /// tree. Shared body of [`force_compact_l2p_buffers`] (all volumes)
+    /// and [`force_compact_l2p_buffers_for_volume`] (one volume). Callers
+    /// hold `drop_gate.write` (lifecycle ops) or run pre-commit
+    /// (recovery / threads-off inline flush), so the slots are quiesced.
+    fn compact_volume_buffers(&self, vol: &Arc<Volume>) -> Result<()> {
+        use std::time::Instant;
+        let youngest_snap = self.youngest_snap(vol.ord);
+        for shard in &vol.shards {
+            if !shard.use_buffer {
+                continue;
+            }
+            let started = Instant::now();
+            let mut tree = shard.tree.write();
+            // Drain ALL four TXG slots in one shot. Used only by
+            // paths that need every slot folded NOW: lifecycle ops
+            // (which hold `drop_gate.write`, so the slots are
+            // quiesced), the post-replay open, and the threads-OFF
+            // inline flush. The regular threads-ON per-TXG sync uses
+            // `drain_syncing_slot_into_trees` instead (drains only
+            // the frozen syncing slot, publish-before-clear). Note:
+            // this drain is NOT publish-before-clear, so on the
+            // threads-OFF inline-flush path a concurrent commit can
+            // still hit the (rare) stale-`prev` race — acceptable
+            // there because that path is being retired.
+            let drained = shard.l2p_buffer.drain_all_slots();
+            if drained.is_empty() {
+                drop(tree);
+                continue;
+            }
+            let count = drained.len();
+            let max_lsn = drained.values().map(|e| e.lsn).max().unwrap_or(0);
+            // A3 cutover: this all-slots drain folds page-rc deltas
+            // into the current Open TXG slot; the lifecycle/recovery
+            // callers fold every page-rc slot afterwards (RcShard
+            // all-slots flush / `begin_checkpoint_all_slots`), so any
+            // live slot is correct here.
+            let apply_result = super::txg_sync::compact_drain_into_tree(
+                &mut tree,
+                &drained,
+                self.txg.open_txg(),
+            );
+            match apply_result {
+                Ok(()) => {
+                    // ZFS port Phase 2: harvest page-deaths from this
+                    // all-slots fold before releasing the tree lock.
+                    super::apply::drain_page_deaths_into(
+                        &vol.page_dead_list,
+                        &mut tree,
+                        youngest_snap,
+                    );
+                    // ZFS port Phase 3b: same fold site for the per-clone
+                    // page-livelist witness (empty for non-clones).
+                    super::apply::drain_live_events_into(&vol.page_live_list, &mut tree);
+                    super::apply::publish_l2p_read_view(shard, &tree);
                     drop(tree);
-                    continue;
+                    shard.l2p_buffer.note_compacted(max_lsn);
+                    self.metrics
+                        .record_l2p_buffer_compaction(count, started.elapsed());
                 }
-                let count = drained.len();
-                let max_lsn = drained.values().map(|e| e.lsn).max().unwrap_or(0);
-                // A3 cutover: this all-slots drain folds page-rc deltas
-                // into the current Open TXG slot; the lifecycle/recovery
-                // callers fold every page-rc slot afterwards (RcShard
-                // all-slots flush / `begin_checkpoint_all_slots`), so any
-                // live slot is correct here.
-                let apply_result = super::txg_sync::compact_drain_into_tree(
-                    &mut tree,
-                    &drained,
-                    self.txg.open_txg(),
-                );
-                match apply_result {
-                    Ok(()) => {
-                        // ZFS port Phase 2: harvest page-deaths from this
-                        // all-slots fold before releasing the tree lock.
-                        super::apply::drain_page_deaths_into(
-                            &vol.page_dead_list,
-                            &mut tree,
-                            youngest_snap,
-                        );
-                        // ZFS port Phase 3b: same fold site for the per-clone
-                        // page-livelist witness (empty for non-clones).
-                        super::apply::drain_live_events_into(&vol.page_live_list, &mut tree);
-                        super::apply::publish_l2p_read_view(shard, &tree);
-                        drop(tree);
-                        shard.l2p_buffer.note_compacted(max_lsn);
-                        self.metrics
-                            .record_l2p_buffer_compaction(count, started.elapsed());
-                    }
-                    Err(err) => {
-                        drop(tree);
-                        return Err(err);
-                    }
+                Err(err) => {
+                    drop(tree);
+                    return Err(err);
                 }
             }
         }
