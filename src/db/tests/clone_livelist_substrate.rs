@@ -596,3 +596,177 @@ fn promoted_pba_log_records_promotion_and_survives_reopen() {
     // marked live by collect_live_pages.
     assert_livelist_clean(dir.path());
 }
+
+/// ZFS port Phase 4 Step 4 (S0) ACTUATOR: dropping a promoted clone decrefs
+/// every promotion +1 edge survivor-GATED. A PBA the parent (a survivor) still
+/// maps is decref'd but NEVER surfaced (no premature free); a clone-private PBA
+/// no survivor maps is decref'd to 0 and surfaced to onyx.
+#[test]
+fn drop_clone_decrefs_promotion_edges_survivor_gated() {
+    let (dir, db) = mk_db_with_shards(1);
+    let base = db.create_volume().unwrap();
+    // Base maps lba i -> PBA i (i in 1..=8). Exclusive ⇒ rc-neutral ⇒ rc 0.
+    for i in 1u64..=8 {
+        db.insert(base, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(base).unwrap();
+    let clone = db.clone_volume(snap).unwrap();
+    // Clone keeps the shared lba 1..=8 -> PBA 1..=8 mappings AND adds
+    // clone-private lba 100..=107 -> PBA 192..=199 (no survivor maps these).
+    for i in 0u64..8 {
+        db.insert(clone, 100 + i, v(0xC0u8 + i as u8)).unwrap();
+    }
+    db.promote_volume(clone).unwrap();
+    // Promotion incref'd every clone-mapped PBA by 1 (shared + private).
+    for i in 1u64..=8 {
+        assert_eq!(db.get_refcount(i).unwrap(), 1, "shared PBA {i} not promoted");
+    }
+    for i in 0u64..8 {
+        assert_eq!(
+            db.get_refcount(192 + i).unwrap(),
+            1,
+            "private PBA {} not promoted",
+            192 + i
+        );
+    }
+
+    let report = db.drop_volume(clone).unwrap().expect("clone dropped");
+    let freed: std::collections::HashSet<u64> = report.freed_pbas.iter().copied().collect();
+
+    // Clone-private PBAs surfaced (decref -> 0, no survivor); shared NOT.
+    let expect_private: std::collections::HashSet<u64> = (0u64..8).map(|i| 192 + i).collect();
+    assert_eq!(freed, expect_private, "surfaced set != clone-private PBAs");
+    for i in 1u64..=8 {
+        assert!(!freed.contains(&i), "shared PBA {i} prematurely surfaced");
+    }
+    // rc bookkeeping: every promotion edge undone (back to 0).
+    for i in 1u64..=8 {
+        assert_eq!(db.get_refcount(i).unwrap(), 0, "shared PBA {i} rc not restored");
+    }
+    for i in 0u64..8 {
+        assert_eq!(db.get_refcount(192 + i).unwrap(), 0, "private PBA {} rc not 0", 192 + i);
+    }
+    // The parent still maps the shared PBAs — NO premature free.
+    for i in 1u64..=8 {
+        let val = db.get(base, i).unwrap().expect("base mapping lost");
+        assert_eq!(val.head_pba(), i, "base mapping for lba {i} corrupted");
+    }
+    drop(db);
+    assert_livelist_clean(dir.path());
+}
+
+/// A clone-private promoted PBA that ALSO carries an independent rc edge (e.g.
+/// dedup membership, simulated via `incref_pba`) is decref'd to that floor and
+/// NOT surfaced (the dedup_index still references it).
+#[test]
+fn drop_clone_promoted_pba_decrefs_to_floor_no_surface() {
+    let (dir, db) = mk_db_with_shards(1);
+    let base = db.create_volume().unwrap();
+    db.insert(base, 1, v(1)).unwrap();
+    let snap = db.take_snapshot(base).unwrap();
+    let clone = db.clone_volume(snap).unwrap();
+    // Clone-private mapping lba 100 -> PBA 192.
+    db.insert(clone, 100, v(0xC0)).unwrap();
+    // Seed an extra rc edge on 192 (stands in for a dedup_index membership).
+    db.incref_pba(192, 1).unwrap();
+    db.promote_volume(clone).unwrap();
+    assert_eq!(db.get_refcount(192).unwrap(), 2, "expected seed + promotion edge");
+
+    let report = db.drop_volume(clone).unwrap().expect("clone dropped");
+    assert!(
+        !report.freed_pbas.contains(&192),
+        "PBA with a surviving dedup edge must not be surfaced"
+    );
+    assert_eq!(
+        db.get_refcount(192).unwrap(),
+        1,
+        "decref should land on the dedup floor, not 0"
+    );
+    drop(db);
+    assert_livelist_clean(dir.path());
+}
+
+/// CRASH-SAFETY (the `stamp_replay_watermarks` P0): after a promote-then-drop
+/// with NO intervening checkpoint, a reopen must NOT re-replay the promotion
+/// increfs on top of the now-durable post-decref refcount array. The drop's
+/// manifest commit advances `lifecycle_replay_seq` past the PromotionChunks, so
+/// reopen leaves rc at exactly one net decref (0), not a decref-then-re-incref.
+#[test]
+fn drop_clone_promotion_decref_survives_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    {
+        let mut cfg = crate::config::Config::new(dir.path());
+        cfg.shards_per_partition = 1;
+        let db = Db::create_with_config(cfg).unwrap();
+        let base = db.create_volume().unwrap();
+        for i in 1u64..=4 {
+            db.insert(base, i, v(i as u8)).unwrap();
+        }
+        let snap = db.take_snapshot(base).unwrap();
+        let clone = db.clone_volume(snap).unwrap();
+        db.insert(clone, 100, v(0xC0)).unwrap(); // clone-private PBA 192
+        // NO flush between promote and drop — exercises the stale-
+        // lifecycle_replay_seq path the P0 lives on.
+        db.promote_volume(clone).unwrap();
+        let report = db.drop_volume(clone).unwrap().expect("clone dropped");
+        assert!(report.freed_pbas.contains(&192), "private PBA should surface");
+        assert_eq!(db.get_refcount(192).unwrap(), 0);
+        for i in 1u64..=4 {
+            assert_eq!(db.get_refcount(i).unwrap(), 0, "shared PBA {i} rc not restored");
+        }
+        drop(db);
+    }
+    // Reopen: promotion increfs must NOT be re-replayed onto the durable
+    // post-decref array. If `stamp_replay_watermarks` were missing here, the
+    // PromotionChunk increfs would re-apply (synthetic lsn > the decref's page
+    // generation) and rc would read back 1 instead of 0.
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(
+        db.get_refcount(192).unwrap(),
+        0,
+        "promotion incref re-replayed after drop (stamp_replay_watermarks missing?)"
+    );
+    for i in 1u64..=4 {
+        assert_eq!(
+            db.get_refcount(i).unwrap(),
+            0,
+            "shared PBA {i} rc resurrected on reopen"
+        );
+    }
+    drop(db);
+    assert_livelist_clean(dir.path());
+}
+
+/// Under rc-authoritative reclaim the S0 actuator is OFF: the hot path already
+/// increfs per mapping (and onyx's `range_delete` decrefs them at delete), so a
+/// promotion-edge decref here would double-decref a still-parent-mapped PBA.
+/// The drop must surface nothing and leave the promotion edges intact.
+#[test]
+fn drop_clone_rc_authoritative_skips_promotion_decref() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.shards_per_partition = 1;
+    cfg.rc_authoritative_reclaim = true;
+    let db = Db::create_with_config(cfg).unwrap();
+    let base = db.create_volume().unwrap();
+    db.insert(base, 1, v(1)).unwrap();
+    let snap = db.take_snapshot(base).unwrap();
+    let clone = db.clone_volume(snap).unwrap();
+    db.insert(clone, 100, v(0xC0)).unwrap(); // clone-private PBA 192
+    db.promote_volume(clone).unwrap();
+    let rc_before = db.get_refcount(192).unwrap();
+    assert!(rc_before > 0, "promotion should have pinned the private PBA");
+
+    let report = db.drop_volume(clone).unwrap().expect("clone dropped");
+    assert!(
+        report.freed_pbas.is_empty(),
+        "S0 must surface nothing under rc-authoritative reclaim"
+    );
+    // S0 did not touch PBA-rc (drop frees only metadb pages via page-rc here).
+    assert_eq!(
+        db.get_refcount(192).unwrap(),
+        rc_before,
+        "S0 must not decref under rc-authoritative reclaim"
+    );
+    drop(db);
+}

@@ -10,7 +10,7 @@ use crate::manifest::{LoadedManifest, Manifest, ManifestStore, load_snapshot_roo
 use crate::page::PageType;
 use crate::page_store::PageStore;
 use crate::paged::format::{INDEX_FANOUT, index_child_at};
-use crate::types::{FIRST_DATA_PAGE, Lsn, NULL_PAGE, PageId};
+use crate::types::{FIRST_DATA_PAGE, Lsn, NULL_PAGE, Pba, PageId};
 
 #[derive(Clone, Debug, Default)]
 pub struct VerifyOptions {
@@ -634,6 +634,37 @@ pub(crate) fn reachable_l2p_pages(
         walk_paged_tree(page_store, root, &mut live, &mut seen)?;
     }
     Ok(live.refs.into_keys().collect())
+}
+
+/// ZFS port Phase 4 Step 4 (S0): the set of data-PBA `head_pba`s mapped by any
+/// of `roots` — each a per-shard L2P root, either a surviving volume's current
+/// root or a snapshot root. `drop_volume`'s promoted-PBA decref uses this to
+/// gate the surface decision: a promoted PBA still reachable from a surviving
+/// root MUST NOT be surfaced as freed (a survivor still maps it → PBA-level
+/// premature free). Walks the durable pages via `page_store` (callers flush the
+/// trees and hold the drop/apply/snapshot_views gates first), so it is
+/// consistent with the locked trees WITHOUT indexing a per-shard guard — every
+/// `PagedL2p` reads the shared `page_store`, so any root walks correctly (the
+/// same property `collect_range_for_roots` / `collect_live_pages` rely on).
+/// Reuses the caller's shared `page_cache` (scan-resistant) across all roots so
+/// the survivor scan does not allocate a fresh per-root cache.
+pub(crate) fn reachable_l2p_head_pbas(
+    page_store: &Arc<PageStore>,
+    page_cache: &Arc<crate::cache::PageCache>,
+    roots: &[PageId],
+) -> Result<HashSet<Pba>> {
+    let mut pbas: HashSet<Pba> = HashSet::new();
+    for &root in roots {
+        if root == NULL_PAGE {
+            continue;
+        }
+        let mut tree = PagedL2p::open_with_cache(page_store.clone(), page_cache.clone(), root, 1)?;
+        for item in tree.range_at(root, ..)? {
+            let (_lba, value) = item?;
+            pbas.insert(value.head_pba());
+        }
+    }
+    Ok(pbas)
 }
 
 pub(crate) fn reclaim_orphan_pages(

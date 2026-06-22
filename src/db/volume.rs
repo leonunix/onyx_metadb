@@ -402,6 +402,23 @@ impl Db {
         // `missing→HARD` precondition (surviving_roots complete) is re-proven
         // for the promoted case on `check_clone_livelist_shadow` below. Page-rc
         // stays authoritative — still a shadow assertion, NOT the free decision.
+        // The promoted-PBA decref (S0) and the manifest commit both stamp this
+        // LSN; read it once here — stable under the held `apply_gate.write` (no
+        // commit advances `last_applied_lsn` while we hold it).
+        let checkpoint_lsn = *self.last_applied_lsn.lock();
+        // S0: clone promotion-edge PBAs whose rc reached 0 and that no survivor
+        // maps, surfaced to onyx. Declared here so it is in scope at the return
+        // (stays empty for non-clones / rc-authoritative).
+        let mut surfaced_freed: Vec<Pba> = Vec::new();
+        // S0: the promoted-PBA edges to decref + the survivor data-PBA set are
+        // COMPUTED here (read-only, under the held gates) but APPLIED post-commit
+        // (see the post-commit decref block) — the refcount array writes data
+        // pages in place, so a pre-commit decref-flush would make the decref
+        // durable while the clone is still in the not-yet-committed manifest, and
+        // a crash there is an rc undercount = premature free. Stays empty for
+        // non-clones / rc-authoritative / no-promotion.
+        let mut s0_promoted: Vec<Pba> = Vec::new();
+        let mut s0_survivor_pbas: std::collections::HashSet<Pba> = std::collections::HashSet::new();
         if (volume.flags.load(std::sync::atomic::Ordering::Relaxed)
             & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE)
             != 0
@@ -466,6 +483,72 @@ impl Db {
                 &surviving_roots,
                 &live_records,
             )?;
+
+            // ZFS port Phase 4 Step 4 (S0): close the clone-promotion global
+            // PBA-rc over-pin. The promotion walker incref'd +1 per clone-
+            // referenced head_pba (incl. parent-COW-shared PBAs); under Phase 5
+            // rc-neutral writes nothing ever decref'd them, so onyx's
+            // delete-time "free iff rc==0" never reclaims the LV3 block. We undo
+            // each logged +1, SURVIVOR-GATED: a promoted PBA still reachable from
+            // a surviving root (any other volume's current L2P or any snapshot's
+            // L2P — exactly `surviving_roots`) is decref'd but NEVER surfaced (a
+            // survivor still maps it; surfacing it = PBA-level premature free,
+            // the CRC class this port exists to kill).
+            //
+            // Excluded under rc-authoritative reclaim: there the hot path already
+            // increfs per mapping, so onyx's `delete_blockmap_range` (run BEFORE
+            // this drop) already decrefs the clone's mapping edges via
+            // `range_delete`; a second promotion-edge decref here would drive a
+            // still-parent-mapped PBA to 0 → premature free under the
+            // rc-authoritative GC authority. The over-pin this actuator fixes
+            // exists ONLY in the rc-neutral (Phase 5) regime.
+            //
+            // This block only READS (under the held gates, after the shadow
+            // `?`): the promoted-PBA log → the multiset of edges to decref, and
+            // `survivor_pbas` → the surface gate. The actual rc DECREF is applied
+            // post-commit (the refcount array writes data pages in place, so a
+            // pre-commit decref-flush would be durable while the clone is still
+            // in the un-committed manifest — an rc undercount = premature free on
+            // a crash there). See the post-commit decref block below.
+            if !self.rc_authoritative_reclaim {
+                let promoted: Vec<Pba> = {
+                    let tail = volume
+                        .promoted_log_tail_pid
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    if tail == crate::types::NULL_PAGE {
+                        Vec::new()
+                    } else {
+                        // Multiplicity preserved: `promotion.rs` emits one Alloc
+                        // record per +1 edge (1:1), so a PBA logged K times is
+                        // decref'd K times. The log is fsync'd synchronously on
+                        // the live commit path (no un-sealed buffer to union,
+                        // unlike the livelist) but is NOT re-emitted on WAL replay
+                        // (`promotion.rs` faithfulness note), so a
+                        // promote-then-crash-without-flush leaves a subset of
+                        // edges un-logged → still over-pinned: a data-safe
+                        // residual strictly smaller than the pre-S0 leak.
+                        let page_store = self.page_store.clone();
+                        crate::livelist::read_chain_records(tail, |p| page_store.read_page(p))?
+                            .into_iter()
+                            .filter(|r| r.kind == crate::livelist::LiveKind::Alloc)
+                            .map(|r| r.pid) // the `pid` slot carries the raw Pba
+                            .collect()
+                    }
+                };
+                if !promoted.is_empty() {
+                    // Survivor data-PBA set: head_pbas reachable from every
+                    // surviving root (other volumes' current roots + every
+                    // snapshot root — `surviving_roots`, frozen under the held
+                    // gates). Reuses the warm shared page_cache (no per-root cache
+                    // allocation) and the page_store walk — no l2p_guards index.
+                    s0_survivor_pbas = crate::verify::reachable_l2p_head_pbas(
+                        &self.page_store,
+                        &self.page_cache,
+                        &surviving_roots,
+                    )?;
+                    s0_promoted = promoted;
+                }
+            }
         }
 
         // Commit a manifest that:
@@ -485,7 +568,6 @@ impl Db {
         // a crash between cascade and a *later* commit would leave
         // the on-disk manifest pointing at Free pages, and
         // `open_l2p_shards` would fail at the next open.
-        let checkpoint_lsn = *self.last_applied_lsn.lock();
         let dedup_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
         let dedup_update = {
             let mut mstate = self.manifest_state.lock();
@@ -499,6 +581,20 @@ impl Db {
             )?;
             mstate.manifest.volumes.retain(|v| v.ord != vol_ord);
             mstate.manifest.checkpoint_lsn = checkpoint_lsn;
+            // Phase B: no forced TXG sync ran ahead of this commit, so it is the
+            // checkpoint that makes the flushes above durable and must advance
+            // the lifecycle/buffer replay watermarks. CRITICAL for clone drops:
+            // the `flush_all_refcount_shards()` above force-folded the clone's
+            // PromotionChunk increfs into the durable refcount array — without
+            // bumping `lifecycle_replay_seq` here, reopen would re-replay those
+            // increfs on top of the now-durable array and double-count them. (The
+            // S0 promotion-edge DECREFS are applied post-commit and are NOT
+            // lifecycle ops, so they are never replayed either way.) The
+            // `DropVolume` op is submitted AFTER this commit, so its seq is
+            // correctly excluded here and replayed on the next open. Held under
+            // `apply_gate.write`. See `stamp_replay_watermarks` (its doc names
+            // this exact PromotionChunk hazard).
+            self.stamp_replay_watermarks(&mut mstate.manifest);
             let manifest = mstate.manifest.clone();
             mstate.store.commit(&manifest)?;
             dedup_update
@@ -547,6 +643,67 @@ impl Db {
             self.page_store.free_idempotent(pid, lsn)?;
             self.page_cache.invalidate(pid);
         }
+
+        // ZFS port Phase 4 Step 4 (S0): APPLY the promoted-PBA decrefs now —
+        // POST-commit. The refcount array writes data pages IN PLACE (only
+        // previously-hole `page_idx` slots get fresh pids), so staging the decref
+        // + flushing it BEFORE the manifest commit would make it durable while
+        // the clone is still listed in the not-yet-committed manifest; a crash
+        // there is an rc undercount for a live clone = premature free (the CRC
+        // class this port kills). Applying it after `store.commit` removed the
+        // clone makes the dangerous "decref durable + clone present" state
+        // unreachable: the only crash states are (clone present, no decref)
+        // [before the commit] and (clone gone, decref maybe-durable) [here]. A
+        // crash mid-flush loses the decref = data-safe over-pin (never
+        // corruption), strictly smaller than the pre-S0 always-leak. On the
+        // no-crash path the committed manifest's refcount roots point at the
+        // in-place-updated data pages, so a completed flush is durable + correct
+        // (the decref is non-WAL and not replay-reconstructed). The drop/apply/
+        // snapshot_views write gates are still held (function scope), so the
+        // survivor state is unchanged since the pre-commit `s0_survivor_pbas`
+        // walk. `checkpoint_lsn` matches the committed manifest's
+        // `refcount_durable_seq`, so the folded page generation stays consistent
+        // with the manifest watermark.
+        if !s0_promoted.is_empty() {
+            for &pba in &s0_promoted {
+                let sid = crate::db::apply::shard_for_key(&self.refcount_shards, pba);
+                let (prev, new) =
+                    self.refcount_shards[sid]
+                        .rc
+                        .stage_unskippable(_txg_guard.txg(), pba, -1, checkpoint_lsn)?;
+                // Surface iff this decref reached 0 from a positive count AND no
+                // survivor maps it. `prev > 0` matches `stage`'s documented
+                // `freed_pba` contract and guards against a floored decref-past-0
+                // (which returns new==0 with prev==0) being surfaced as a
+                // spurious free. `new==0` ⇒ no other rc edge survives (a sibling
+                // clone's promotion edge or a dedup membership would keep rc>0);
+                // a survivor mapping it via an rc-neutral exclusive write is
+                // caught by `s0_survivor_pbas` → never surfaced.
+                if new == 0 && prev > 0 && !s0_survivor_pbas.contains(&pba) {
+                    surfaced_freed.push(pba);
+                }
+            }
+            self.flush_all_refcount_shards()?;
+        }
+        // Free the clone's promoted-PBA log segment chain. Like the page-livelist
+        // chain above, these segments are page-rc-UNtracked and not in `pages`,
+        // so they must be freed DIRECTLY (else they leak until the next open's
+        // `reclaim_orphan_pages`). `free_idempotent` is crash-safe (a crash mid-
+        // loop leaves the rest as orphans reclaimed on open). Read the tail off
+        // `volume` before the `drop(volume)` below.
+        {
+            let tail = volume
+                .promoted_log_tail_pid
+                .load(std::sync::atomic::Ordering::Acquire);
+            if tail != crate::types::NULL_PAGE {
+                let page_store = self.page_store.clone();
+                let chain = crate::livelist::walk_chain_pages(tail, |p| page_store.read_page(p))?;
+                for pid in chain {
+                    self.page_store.free_idempotent(pid, lsn)?;
+                    self.page_cache.invalidate(pid);
+                }
+            }
+        }
         drop(volume);
 
         {
@@ -576,6 +733,7 @@ impl Db {
         Ok(Some(DropVolumeReport {
             vol_ord,
             pages_freed,
+            freed_pbas: surfaced_freed,
         }))
     }
 
@@ -1329,4 +1487,10 @@ pub struct DropVolumeReport {
     pub vol_ord: VolumeOrdinal,
     /// Number of metadb pages released back to the page store.
     pub pages_freed: usize,
+    /// ZFS port Phase 4 Step 4 (S0): clone promotion-edge PBAs whose global
+    /// PBA-rc reached 0 during the survivor-gated decref AND that no surviving
+    /// root still maps. Surfaced to onyx as `pba_freed` cleanups so the LV3
+    /// block is reclaimed (closing the clone-promotion over-pin leak). Empty
+    /// for non-clone volumes and under rc-authoritative reclaim.
+    pub freed_pbas: Vec<Pba>,
 }
