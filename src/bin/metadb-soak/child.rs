@@ -475,89 +475,73 @@ fn db_refcount_sum(db: &Db) -> onyx_metadb::Result<u64> {
 }
 
 fn audit_pba_refcounts(db: &Db) -> onyx_metadb::Result<()> {
-    let mut versions: BTreeMap<
-        (VolumeOrdinal, u64),
-        BTreeSet<[u8; onyx_metadb::paged::format::LEAF_VALUE_SIZE]>,
-    > = BTreeMap::new();
-    let mut evidence: BTreeMap<Pba, Vec<String>> = BTreeMap::new();
-    for vol in db.volumes() {
-        for item in db.range(vol, ..)? {
-            let (lba, value) = item?;
-            if versions.entry((vol, lba)).or_default().insert(value.0) {
-                evidence
-                    .entry(value.head_pba())
-                    .or_default()
-                    .push(format!("live vol={vol} lba={lba}"));
-            }
-        }
-    }
-    for snapshot in db.snapshots() {
-        let Some(view) = db.snapshot_view(snapshot.id) else {
-            return Err(onyx_metadb::MetaDbError::Corruption(format!(
-                "snapshot {} disappeared during audit",
-                snapshot.id
-            )));
-        };
-        for item in view.range(..)? {
-            let (lba, value) = item?;
-            if versions
-                .entry((snapshot.vol_ord, lba))
-                .or_default()
-                .insert(value.0)
-            {
-                evidence.entry(value.head_pba()).or_default().push(format!(
-                    "snapshot={} vol={} lba={lba}",
-                    snapshot.id, snapshot.vol_ord
-                ));
-            }
-        }
-    }
+    // Drain every apply lane so the dedup / refcount reads below are a
+    // consistent snapshot (no commit's rc delta or dedup put still in flight).
+    db.wait_apply_idle();
 
+    // Phase-5 PBA refcount model: exclusive L2P writes are rc-NEUTRAL — a
+    // block's liveness is determined by L2P reachability, not by refcount
+    // (the structural `metadb-verify` pass below covers reachability). So the
+    // ONLY sources of a nonzero PBA refcount are:
+    //   (a) dedup-membership — each LIVE dedup_index entry holds exactly +1
+    //       on its head_pba (`apply_dedup_put_with_rc`; decref on
+    //       replace/delete). Fully reconstructible from the durable index.
+    //   (b) clone PROMOTION lineage — `apply_promotion_chunk` increfs the
+    //       global PBA rc for the promoted clone's PBAs; NOT tracked per-PBA
+    //       by this harness.
+    // The pre-Phase-5 audit modelled rc as one-per-live-L2P-value, so it
+    // mismatched on every exclusive block (rc=0) AND every deduped block
+    // (rc=1, no L2P witness) — which is why it had to be downgraded to a
+    // noisy non-fatal warning. Rebuild `expected` from dedup membership and
+    // restore the safety direction to FATAL.
     let mut expected: BTreeMap<Pba, u32> = BTreeMap::new();
-    for values in versions.values() {
-        for value in values {
-            *expected.entry(L2pValue(*value).head_pba()).or_insert(0) += 1;
-        }
+    for item in db.iter_dedup()? {
+        let (_hash, value) = item?;
+        *expected.entry(value.head_pba()).or_insert(0) += 1;
     }
     let actual: BTreeMap<Pba, u32> = db
         .iter_refcounts()?
         .collect::<onyx_metadb::Result<Vec<_>>>()?
         .into_iter()
         .collect();
-    if actual != expected {
-        let mut diff = Vec::new();
-        let mut mismatches = 0usize;
-        let mut keys: BTreeSet<Pba> = actual.keys().copied().collect();
-        keys.extend(expected.keys().copied());
-        for pba in keys {
-            let actual_rc = actual.get(&pba).copied().unwrap_or(0);
-            let expected_rc = expected.get(&pba).copied().unwrap_or(0);
-            if actual_rc != expected_rc {
-                mismatches += 1;
-                if diff.len() < 8 {
-                    let why = evidence
-                        .get(&pba)
-                        .map(|items| items.join("; "))
-                        .unwrap_or_else(|| "<no live/snapshot witness>".into());
-                    diff.push(format!(
-                        "pba={pba} actual={actual_rc} expected={expected_rc} witnesses=[{why}]"
-                    ));
-                }
+
+    // Two-sided invariant:
+    //  - actual < expected: a LIVE dedup entry's incref was lost, so its
+    //    deduped block can be prematurely freed = corruption → FATAL.
+    //  - actual > expected: rc above what dedup membership accounts for.
+    //    Promotion lineage (b) legitimately produces this on clone-churn
+    //    runs; it can never mask an under-count (every reconstructible source
+    //    only increfs), so keep it non-fatal but counted so a stuck/leaked rc
+    //    is still visible.
+    let mut undercounts: Vec<String> = Vec::new();
+    let mut undercount_pbas = 0usize;
+    let mut overcount_pbas = 0usize;
+    let mut keys: BTreeSet<Pba> = actual.keys().copied().collect();
+    keys.extend(expected.keys().copied());
+    for pba in keys {
+        let actual_rc = actual.get(&pba).copied().unwrap_or(0);
+        let expected_rc = expected.get(&pba).copied().unwrap_or(0);
+        if actual_rc < expected_rc {
+            undercount_pbas += 1;
+            if undercounts.len() < 16 {
+                undercounts.push(format!(
+                    "pba={pba} actual={actual_rc} dedup_refs={expected_rc}"
+                ));
             }
+        } else if actual_rc > expected_rc {
+            overcount_pbas += 1;
         }
-        // NON-FATAL (downgraded from Corruption): `expected` above is a
-        // PER-LIVE-LBA reference model (one count per live/snapshot L2pValue
-        // head_pba). That stopped matching metadb's PBA refcount once Phase 5
-        // made exclusive writes rc-neutral and let dedup-membership / lineage
-        // events own rc — so a deduped PBA legitimately carries rc=1 with "no
-        // live/snapshot witness". This audit's model is stale for that
-        // semantics (a separate soak-harness task to teach it dedup/lineage
-        // rc); it is unrelated to the snapshot page-deadlist work the verify
-        // pass below validates. Keep it LOUD (logged + counted) so a genuine
-        // PBA-rc leak still surfaces, but do not abort the run.
+    }
+    if undercount_pbas > 0 {
+        return Err(onyx_metadb::MetaDbError::Corruption(format!(
+            "PBA refcount UNDER-count ({undercount_pbas} pbas: a live dedup entry lost its rc = \
+             premature-free of a deduped block): e.g. {undercounts:?}"
+        )));
+    }
+    if overcount_pbas > 0 {
         eprintln!(
-            "WARN soak: PBA refcount audit mismatch ({mismatches} pbas; stale per-LBA model \
-             vs Phase-5 dedup/lineage rc, NON-FATAL): e.g. {diff:?}"
+            "soak: {overcount_pbas} pbas carry rc above dedup membership \
+             (clone-promotion lineage; non-fatal)"
         );
     }
     Ok(())
