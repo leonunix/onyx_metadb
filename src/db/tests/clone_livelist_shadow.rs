@@ -16,6 +16,23 @@ use super::{mk_db, mk_db_with_shards, v};
 use crate::Db;
 use crate::db::promotion::PromotionStep;
 use crate::error::MetaDbError;
+use crate::livelist::{LiveKind, LiveRecord};
+
+/// Build synthetic ALLOC `LiveRecord`s from a `(pid, birth)` set so the
+/// livelist-cross-check teeth can feed a crafted live-ALLOC set into the
+/// shim. `event_lsn` only affects `live_allocs`' sort, not the resulting
+/// `(pid, birth)` keys, so `birth` doubles as the event.
+fn allocs(pairs: &[(crate::types::PageId, crate::types::Lsn)]) -> Vec<LiveRecord> {
+    pairs
+        .iter()
+        .map(|&(pid, birth)| LiveRecord {
+            pid,
+            birth_lsn: birth,
+            event_lsn: birth,
+            kind: LiveKind::Alloc,
+        })
+        .collect()
+}
 
 /// G2/G3/G4: sibling clones share the snapshot's pages, each writes a private
 /// page, then both are dropped in each order. The shadow must stay green
@@ -102,9 +119,12 @@ fn clone_of_clone_drop_middle_after_promote_shadow_stays_green() {
 
 /// G8-shape: the parent diverges over a shared LBA and the source snapshot is
 /// dropped, so some origin pages (`birth <= B`) fall sole-owned to the clone.
-/// Dropping the clone must not abort premature (it may warn "missing" if a
-/// stale page-rc keeps an exclusive page; that is a soft signal, not a
-/// failure). The clone-private write and the parent both stay intact.
+/// Dropping the clone must stay GREEN under all three detectors: those origin
+/// pages are freed by page-rc (rc==1) AND C-exclusive by reachability (no
+/// survivor references them), so they sit in both sets — no premature, no
+/// missing (now HARD). Being born ≤ B they are not in the livelist and drop
+/// out of both sides of the livelist cross-check. The clone-private write and
+/// the parent both stay intact.
 #[test]
 fn clone_drop_after_parent_diverges_and_snapshot_dropped_no_premature() {
     let (_d, db) = mk_db();
@@ -160,13 +180,13 @@ fn clone_reopen_then_drop_shadow_stays_green() {
     }
 }
 
-/// TEETH (R2a): prove the premature detector actually fires. Feed
+/// TEETH (premature): prove the premature detector actually fires. Feed
 /// `check_clone_livelist_shadow` a free-set that wrongly claims a
 /// survivor-reachable page (the source volume's live root) is freed — the
 /// independent exclusivity walk sees it reachable from the surviving root, so
-/// it is NOT C-exclusive, and the shadow must return HARD `Corruption`. The
-/// same inputs with that page omitted from the free-set must pass (a soft
-/// "missing" warn returns Ok).
+/// it is NOT C-exclusive, and the shadow must return HARD `Corruption`. A
+/// self-consistent call on the same clone (real clone-private free-set + its
+/// real live-ALLOC set) must pass.
 #[test]
 fn clone_drop_shadow_fires_on_premature_divergence() {
     let (_d, db) = mk_db_with_shards(1);
@@ -194,19 +214,198 @@ fn clone_drop_shadow_fires_on_premature_divergence() {
     let b = clone_entry.branched_at_lsn;
 
     // Premature: src_root is reachable from the surviving src root, so a
-    // free-set claiming it (rc==1) must abort HARD.
+    // free-set claiming it (rc==1) must abort HARD (checked before the
+    // livelist cross-check, so an empty live-ALLOC set is fine).
     let err = db
-        .test_check_clone_livelist_shadow(clone, b, &[(src_root, 0, 1)], &[clone_root], &[src_root])
+        .test_check_clone_livelist_shadow(
+            clone,
+            b,
+            &[(src_root, 0, 1)],
+            &[clone_root],
+            &[src_root],
+            &[],
+        )
         .unwrap_err();
     assert!(
         matches!(err, MetaDbError::Corruption(_)),
         "expected premature Corruption, got {err:?}"
     );
 
-    // No premature when nothing survivor-reachable is claimed freed; the
-    // exclusive clone pages it does NOT free only warn "missing" (Ok).
-    db.test_check_clone_livelist_shadow(clone, b, &[], &[clone_root], &[src_root])
-        .unwrap();
+    // Self-consistent: the clone's real clone-private free-set (page-rc rc==1,
+    // birth > B) cross-checked against its real live-ALLOC set must pass all
+    // three detectors. `la` = reachable(C) ∩ {birth > B}; with src the only
+    // survivor those are exactly the C-exclusive freed pages.
+    let la: Vec<(crate::types::PageId, crate::types::Lsn)> =
+        db.test_clone_live_allocs(clone).unwrap().into_iter().collect();
+    let freed: Vec<(crate::types::PageId, crate::types::Lsn, u32)> =
+        la.iter().map(|&(pid, birth)| (pid, birth, 1)).collect();
+    db.test_check_clone_livelist_shadow(
+        clone,
+        b,
+        &freed,
+        &[clone_root],
+        &[src_root],
+        &allocs(&la),
+    )
+    .unwrap();
+}
+
+/// TEETH (missing → HARD): a free-set that frees NOTHING while the clone has
+/// C-exclusive reachable pages is a page-rc leak — the C-exclusive reachability
+/// walk frees pages page-rc keeps live. Phase 4 Step 1 escalates this from a
+/// soft warn to HARD `Corruption` (its soundness rests on `surviving_roots`
+/// being complete, which it is for a still-clone drop).
+#[test]
+fn clone_drop_shadow_fires_on_missing_completeness_hole() {
+    let (_d, db) = mk_db_with_shards(1);
+    let src = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(src, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(src).unwrap();
+    let clone = db.clone_volume(snap).unwrap();
+    for i in 0u64..8 {
+        db.insert(clone, i, v(0xC0 | i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+
+    let m = db.manifest();
+    let src_root = m
+        .volumes
+        .iter()
+        .find(|e| e.ord == src)
+        .unwrap()
+        .l2p_shard_roots[0];
+    let clone_entry = m.volumes.iter().find(|e| e.ord == clone).unwrap();
+    let clone_root = clone_entry.l2p_shard_roots[0];
+    let b = clone_entry.branched_at_lsn;
+
+    // Empty free-set + a diverged clone with exclusive private pages → missing.
+    let err = db
+        .test_check_clone_livelist_shadow(clone, b, &[], &[clone_root], &[src_root], &[])
+        .unwrap_err();
+    assert!(
+        matches!(err, MetaDbError::Corruption(ref m) if m.contains("COMPLETENESS HOLE")),
+        "expected missing/completeness Corruption, got {err:?}"
+    );
+}
+
+/// TEETH (livelist cross-check → HARD): with premature + missing both clean
+/// (free-set == C-exclusive reachable), the persistent livelist's live-ALLOC
+/// set must reproduce the clone-private free-set exactly. Perturbing ONLY the
+/// live-ALLOC input — dropping a record (under-log) or adding a spurious one
+/// (over-log) — must abort HARD, in both directions.
+#[test]
+fn clone_drop_shadow_fires_on_livelist_disagreement() {
+    let (_d, db) = mk_db_with_shards(1);
+    let src = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(src, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(src).unwrap();
+    let clone = db.clone_volume(snap).unwrap();
+    for i in 0u64..8 {
+        db.insert(clone, i, v(0xC0 | i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+
+    let m = db.manifest();
+    let src_root = m
+        .volumes
+        .iter()
+        .find(|e| e.ord == src)
+        .unwrap()
+        .l2p_shard_roots[0];
+    let clone_entry = m.volumes.iter().find(|e| e.ord == clone).unwrap();
+    let clone_root = clone_entry.l2p_shard_roots[0];
+    let b = clone_entry.branched_at_lsn;
+
+    // Real, self-consistent baseline: free-set == live-ALLOC == clone-private.
+    let la: Vec<(crate::types::PageId, crate::types::Lsn)> =
+        db.test_clone_live_allocs(clone).unwrap().into_iter().collect();
+    assert!(!la.is_empty(), "diverged clone must have clone-private pages");
+    let freed: Vec<(crate::types::PageId, crate::types::Lsn, u32)> =
+        la.iter().map(|&(pid, birth)| (pid, birth, 1)).collect();
+
+    // Under-log: live-ALLOC omits a page page-rc frees → HARD.
+    let short: Vec<_> = la[1..].to_vec();
+    let err = db
+        .test_check_clone_livelist_shadow(
+            clone,
+            b,
+            &freed,
+            &[clone_root],
+            &[src_root],
+            &allocs(&short),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, MetaDbError::Corruption(ref m) if m.contains("under-logged")),
+        "expected under-log Corruption, got {err:?}"
+    );
+
+    // Over-log: live-ALLOC names an extra C-exclusive page page-rc does NOT
+    // free → HARD. The sentinel pid is unreachable from the src survivor and
+    // born after the branch, so it lands in `la_exclusive` only.
+    let mut over = la.clone();
+    over.push((u64::MAX / 2, b + 1000));
+    let err = db
+        .test_check_clone_livelist_shadow(
+            clone,
+            b,
+            &freed,
+            &[clone_root],
+            &[src_root],
+            &allocs(&over),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, MetaDbError::Corruption(ref m) if m.contains("over-logged")),
+        "expected over-log Corruption, got {err:?}"
+    );
+}
+
+/// D regression (make-or-break): a clone written then dropped with NO
+/// intervening `flush()` has live-ALLOC records ONLY in the in-memory buffer —
+/// nothing is sealed to the segment chain. `drop_volume` must union the chain
+/// with `page_live_list.peek()`; reading the chain alone would under-count and
+/// the livelist cross-check would false-HARD on a legal drop. The asserts pin
+/// that the chain really is empty + the buffer really is non-empty at drop
+/// time, so the union is load-bearing, not decorative.
+#[test]
+fn clone_drop_without_flush_unions_unsealed_livelist_buffer() {
+    let (_d, db) = mk_db_with_shards(1);
+    let src = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(src, i, v(i as u8)).unwrap();
+    }
+    let snap = db.take_snapshot(src).unwrap();
+    let clone = db.clone_volume(snap).unwrap();
+    // Diverge the clone but DO NOT flush — records stay in the buffer.
+    for i in 0u64..8 {
+        db.insert(clone, i, v(0xC0 | i as u8)).unwrap();
+    }
+
+    // Chain is empty (nothing sealed), buffer is non-empty: chain-only LA would
+    // be a strict subset of the true LA → assertion #3 would false-HARD.
+    let (head, tail) = db.test_page_live_list_anchors(clone).unwrap();
+    assert_eq!(head, crate::types::NULL_PAGE, "no segment sealed without flush");
+    assert_eq!(tail, crate::types::NULL_PAGE, "no segment sealed without flush");
+    assert!(
+        db.test_page_live_list_len(clone).unwrap() > 0,
+        "un-sealed records must be sitting in the buffer"
+    );
+
+    // The real drop reconstructs LA from chain ∪ buffer and must succeed.
+    assert!(
+        db.drop_volume(clone).unwrap().is_some(),
+        "legal drop must not abort; the buffer union is required"
+    );
+
+    // Source survives untouched.
+    for i in 0u64..8 {
+        assert_eq!(db.get(src, i).unwrap(), Some(v(i as u8)));
+    }
 }
 
 /// Deterministic clone-churn STRESS: hammers create / write / snapshot /

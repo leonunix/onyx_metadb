@@ -420,12 +420,39 @@ impl Db {
                     );
                 }
             }
+            // Phase 4 Step 1: reconstruct this clone's persistent page-livelist
+            // (v19) ALLOC/FREE log as the THIRD independent ground truth the
+            // shadow cross-checks (alongside the page-rc cascade and the
+            // reachability walk). The on-disk segment chain alone UNDER-counts:
+            // `force_compact_l2p_buffers` above drained the tree's `live_events`
+            // witness into the in-memory `LiveListState` buffer but did NOT seal
+            // it to the chain, and `drop_volume` never seals (the volume dies),
+            // so records written since the last checkpoint flush live only in
+            // the buffer. Union the sealed chain with a non-destructive `peek()`
+            // of that buffer — exactly as `drop_snapshot` unions the source
+            // volume's `page_dead_list.peek()` for its inheritor merge. The
+            // drop+apply+snapshot_views write gates are held, so no concurrent
+            // apply pushes records: `peek()` is a stable snapshot here.
+            let live_records: Vec<crate::livelist::LiveRecord> = {
+                let tail = volume
+                    .page_live_list_tail_pid
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let mut recs = if tail == crate::types::NULL_PAGE {
+                    Vec::new()
+                } else {
+                    let page_store = self.page_store.clone();
+                    crate::livelist::read_chain_records(tail, |p| page_store.read_page(p))?
+                };
+                recs.extend(volume.page_live_list.peek());
+                recs
+            };
             self.check_clone_livelist_shadow(
                 vol_ord,
                 volume.branched_at_lsn,
                 &pages_with_birth,
                 &clone_roots,
                 &surviving_roots,
+                &live_records,
             )?;
         }
 
@@ -575,8 +602,30 @@ impl Db {
     ///     (an omitted survivor edge enlarges `exclusive`, never the
     ///     premature difference), so the HARD direction can't false-fire.
     ///   - **missing** (the exclusivity walk frees a page page-rc keeps live)
-    ///     → soft `tracing::warn`. Escalates to HARD in Phase 3b once a
-    ///     clone-churn soak proves full equality (as 2b did for snapshots).
+    ///     → HARD [`MetaDbError::Corruption`] (Phase 4 Step 1 escalation, was a
+    ///     soft warn). **Soundness precondition**: this direction can only be
+    ///     made HARD because `surviving_roots` is COMPLETE for a legal drop of a
+    ///     *still*-clone — every other live volume's just-flushed root (incl.
+    ///     promoted ex-clone survivors, still live `Volume`s in `l2p_guards`)
+    ///     plus every snapshot root; clone-of-C and live-snapshots-of-C are
+    ///     rejected at `drop_volume` entry. An incomplete `surviving_roots`
+    ///     would over-enlarge `exclusive` and manufacture a false `missing`, so
+    ///     do NOT widen the gate (e.g. to promoted ex-clones being *dropped*,
+    ///     whose own survivor set differs) without re-proving completeness.
+    ///     Checked AFTER premature so `structural_free == exclusive` holds for
+    ///     the livelist reduction below.
+    ///   - **livelist cross-check** (Phase 4 Step 1, NEW) → HARD. With the two
+    ///     checks above passing, `structural_free == exclusive`, so the
+    ///     clone-private part of the free-set is `exclusive ∩ {birth > B}`.
+    ///     The persistent v19 livelist's live-ALLOC set (`LA`, an INDEPENDENT
+    ///     on-disk source) must reproduce exactly that: `LA \ surviving_roots
+    ///     == { (pid,birth) ∈ structural_free : birth > B }`. Keyed on
+    ///     `(pid, birth)` (a pid can recur across births). This re-validates
+    ///     the substrate invariant `LA == reachable(C) ∩ {birth > B}` through
+    ///     the persistent chain at drop time — disk vs reachability vs page-rc,
+    ///     three independent ground truths. The born≤B origin-fallthrough
+    ///     pages page-rc frees are NOT in the livelist by construction and drop
+    ///     out of both sides.
     fn check_clone_livelist_shadow(
         &self,
         vol_ord: VolumeOrdinal,
@@ -584,6 +633,7 @@ impl Db {
         freed_with_birth: &[(PageId, Lsn, u32)],
         clone_roots: &[PageId],
         surviving_roots: &[PageId],
+        live_records: &[crate::livelist::LiveRecord],
     ) -> Result<()> {
         use std::collections::HashSet;
 
@@ -636,18 +686,52 @@ impl Db {
             exclusive.difference(&structural_free).copied().collect();
         if !missing.is_empty() {
             missing.sort_unstable();
-            tracing::warn!(
-                vol_ord,
-                branched_at_lsn,
-                missing = ?missing,
-                free = structural_free.len(),
-                exclusive = exclusive.len(),
-                origin,
-                clone_private,
-                "metadb: clone-drop livelist shadow MISSING (completeness hole) — C-exclusive \
-                 reachability frees page(s) page-rc keeps live; soft until Phase 3b soak proves \
-                 equality",
-            );
+            return Err(MetaDbError::Corruption(format!(
+                "drop_volume {vol_ord} (clone, B={branched_at_lsn}): C-exclusive reachability \
+                 frees {} page(s) page-rc keeps live (COMPLETENESS HOLE / page-rc leak): \
+                 {missing:?} (free={} exclusive={} origin={origin} clone_private={clone_private})",
+                missing.len(),
+                structural_free.len(),
+                exclusive.len(),
+            )));
+        }
+
+        // Livelist cross-check (Phase 4 Step 1). `LA` = the persistent v19
+        // live-ALLOC set, keyed on (pid, birth) to match the substrate
+        // invariant (`live_allocs` can legitimately carry one pid twice across
+        // births — a pid-only projection would mask a real (pid,birth)
+        // divergence). `live_allocs` also HARD-errors on a FREE with no prior
+        // ALLOC (chain corruption).
+        let la = crate::livelist::live_allocs(live_records.to_vec())?;
+        let la_exclusive: HashSet<(PageId, Lsn)> = la
+            .iter()
+            .filter(|r| !survivor_reachable.contains(&r.pid))
+            .map(|r| (r.pid, r.birth_lsn))
+            .collect();
+        let clone_private_freed: HashSet<(PageId, Lsn)> = freed_with_birth
+            .iter()
+            .filter(|(_, birth, rc)| *rc == 1 && *birth > branched_at_lsn)
+            .map(|(pid, birth, _)| (*pid, *birth))
+            .collect();
+        if la_exclusive != clone_private_freed {
+            let mut over: Vec<(PageId, Lsn)> = la_exclusive
+                .difference(&clone_private_freed)
+                .copied()
+                .collect();
+            let mut under: Vec<(PageId, Lsn)> = clone_private_freed
+                .difference(&la_exclusive)
+                .copied()
+                .collect();
+            over.sort_unstable();
+            under.sort_unstable();
+            return Err(MetaDbError::Corruption(format!(
+                "drop_volume {vol_ord} (clone, B={branched_at_lsn}): page-livelist disagrees with \
+                 the page-rc clone-private free-set. over-logged (livelist names, page-rc keeps): \
+                 {over:?}; under-logged (page-rc frees, livelist omits): {under:?} \
+                 (la_exclusive={} clone_private_freed={})",
+                la_exclusive.len(),
+                clone_private_freed.len(),
+            )));
         }
         Ok(())
     }
@@ -665,6 +749,7 @@ impl Db {
         freed_with_birth: &[(PageId, Lsn, u32)],
         clone_roots: &[PageId],
         surviving_roots: &[PageId],
+        live_records: &[crate::livelist::LiveRecord],
     ) -> Result<()> {
         self.check_clone_livelist_shadow(
             vol_ord,
@@ -672,6 +757,7 @@ impl Db {
             freed_with_birth,
             clone_roots,
             surviving_roots,
+            live_records,
         )
     }
 
