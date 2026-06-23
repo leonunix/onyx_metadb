@@ -36,6 +36,19 @@ use helpers::*;
 use types::OwnedRange;
 pub use types::{DeleteOutcome, DiffEntry, InsertOutcome, PagedRangeIter, WarmupStats};
 
+/// ZFS port Phase 4 Step 4 (S1): process-global count of non-clone COW-kill
+/// decisions where the birth-txg said "recycle" (page NOT snapshot-pinned) but
+/// the retained page-rc still read `effective_rc > 1` ("shared"). Under a
+/// correct `birth_lsn` stamp (enforced HARD by the offline
+/// `verify::check_birth_shadow`) the page is genuinely unpinned and the page-rc
+/// read is a force-fold-transient / stale artifact — birth is authoritative.
+/// This counter + a `warn!` are the page-rc soft-warn inverted shadow: hot-path
+/// observability only, NEVER a HARD assert (page-rc is force-fold-prone; a HARD
+/// assert would crash mid-soak). Read by tests / soak to confirm the flip's
+/// divergence profile.
+pub static BIRTH_SHADOW_DANGEROUS_DIVERGENCES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// One paged L2P index tree. Not `Send` across threads without external
 /// synchronisation — `Db` wraps it in `Mutex`.
 pub struct PagedL2p {
@@ -69,6 +82,20 @@ pub struct PagedL2p {
     /// cleared on the op error path (mirrors `cow_displaced`). Empty unless
     /// `clone_birth_lsn` is set.
     live_events: Vec<crate::livelist::LiveRecord>,
+    /// ZFS port Phase 4 Step 4 (S1): the `capture_watermark`s of the live
+    /// snapshots of the NON-CLONE volume owning this shard, SORTED ascending.
+    /// The birth-authoritative COW-kill decision in
+    /// [`cow_for_write`](Self::cow_for_write) treats a page COW'd (dying) at lsn
+    /// `D` as snapshot-pinned iff some snapshot captured it, i.e.
+    /// `birth_lsn(P) <= youngest_snap_below(D)` where `youngest_snap_below(D) =
+    /// max{wm : wm < D}` (snapshots with `wm >= D` were captured AFTER the page
+    /// died, so they cannot reference it — critical when a death is folded LATE,
+    /// e.g. by `force_compact`, after newer snapshots exist). Set per-op by the
+    /// apply / fold layer (mirrors [`set_current_txg`]) from the durable
+    /// `SnapshotEntry::capture_watermark`s so the decision is identical live and
+    /// on replay. Ignored for clones (`clone_birth_lsn.is_some()` keeps page-rc
+    /// until S1c). Defaults to empty.
+    snapshot_wms: Vec<Lsn>,
 }
 
 pub(crate) struct Checkpoint {
@@ -150,6 +177,7 @@ impl PagedL2p {
             cow_displaced: Vec::new(),
             clone_birth_lsn: None,
             live_events: Vec::new(),
+            snapshot_wms: Vec::new(),
         })
     }
 
@@ -196,6 +224,7 @@ impl PagedL2p {
             cow_displaced: Vec::new(),
             clone_birth_lsn: None,
             live_events: Vec::new(),
+            snapshot_wms: Vec::new(),
         })
     }
 
@@ -230,6 +259,7 @@ impl PagedL2p {
             cow_displaced: Vec::new(),
             clone_birth_lsn: None,
             live_events: Vec::new(),
+            snapshot_wms: Vec::new(),
         })
     }
 
@@ -260,6 +290,7 @@ impl PagedL2p {
             cow_displaced: Vec::new(),
             clone_birth_lsn: None,
             live_events: Vec::new(),
+            snapshot_wms: Vec::new(),
         })
     }
 
@@ -278,6 +309,20 @@ impl PagedL2p {
     /// manifest commits.
     pub fn next_generation(&self) -> Lsn {
         self.next_gen
+    }
+
+    /// `birth_lsn` of the current root page = the highest lsn folded into this
+    /// shard's tree (the root is re-COW'd with the op's lsn on every fold), i.e.
+    /// the exact fold-watermark of the captured root. The snapshot capture uses
+    /// `max` over the shard roots as the durable `SnapshotEntry::capture_watermark`
+    /// (the birth COW-kill oracle's operand — NOT `last_applied_lsn`, which races
+    /// ahead of the fold under concurrency). `NULL_PAGE` root (empty shard) → 0.
+    /// Read-only (`buf.read` needs `&mut self` for cache bookkeeping only).
+    pub(crate) fn root_birth_lsn(&mut self) -> Result<Lsn> {
+        if self.root == NULL_PAGE {
+            return Ok(0);
+        }
+        Ok(self.buf.read(self.root)?.birth_lsn())
     }
 
     /// Bump `next_gen` if the caller's LSN watermark has advanced past
@@ -355,42 +400,118 @@ impl PagedL2p {
 
     fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
         let effective_rc = self.buf.effective_rc(pid)?;
-        // v19 livelist: pre-read the old page's immutable birth (clones only)
-        // so a replacement can classify the dying version's FREE before any
-        // buf mutation. Non-clones (`clone_birth_lsn == None`) skip the read,
-        // keeping the hot path untouched.
+        // Read the page's immutable `birth_lsn` ONCE, only when needed: clones
+        // need it for the livelist FREE classification; non-clones with a live
+        // snapshot need it for the S1 birth COW-kill decision. A non-clone with
+        // no snapshot needs neither (its pages are never snapshot-pinned), so
+        // the hot path stays read-free there.
+        let need_birth = self.clone_birth_lsn.is_some() || !self.snapshot_wms.is_empty();
+        let birth = if need_birth {
+            self.buf.read(pid)?.birth_lsn()
+        } else {
+            0
+        };
         let old_birth = if self.clone_birth_lsn.is_some() {
-            Some(self.buf.read(pid)?.birth_lsn())
+            Some(birth)
         } else {
             None
         };
-        if self.private_pages.contains(&pid) && effective_rc <= 1 {
-            if self.checkpoint_protected.contains(&pid) {
-                // A3: `clone_private` stages the clone's +1 into the page-rc
-                // array. `pid` is NOT decref'd here — it is still pinned by
-                // the just-committed on-disk checkpoint (and any snapshot
-                // taken from it), so its array rc must stay until the new
-                // checkpoint actually replaces the old root. The array rc
-                // for a recycled pid is reset at `allocate_local` (clear-
-                // on-alloc), so a retired page that never gets decref'd
-                // simply carries a harmless stale rc until reuse — mirroring
-                // the old in-page header rc that vanished with the page.
-                let new_pid = self.buf.clone_private(pid, lsn)?;
-                self.private_pages.remove(&pid);
-                self.private_pages.insert(new_pid);
-                self.retired_pages.insert(pid);
-                if let Some(ob) = old_birth {
-                    self.push_live_free(pid, ob, lsn);
-                }
-                self.push_live_alloc(new_pid, lsn);
-                return Ok(new_pid);
+
+        // ZFS port Phase 4 Step 4 (S1): the COW-kill decision. A page is
+        // "snapshot-pinned" — its old version must be PRESERVED on overwrite
+        // (it "dies off the head" and stays alive for a snapshot) — vs PRIVATE
+        // to the live volume (recyclable in place).
+        //   * CLONE (`clone_birth_lsn.is_some()`): page-rc as before (S1c flips
+        //     this to a clone-aware birth operand). Reproduces the legacy
+        //     `effective_rc > 1` gate exactly.
+        //   * NON-CLONE: birth-authoritative. A page COW'd (dying) at `lsn` is
+        //     snapshot-pinned iff some snapshot captured it, i.e.
+        //     `birth_lsn(P) <= youngest_snap_below(lsn)` where
+        //     `youngest_snap_below(lsn) = max{wm : wm < lsn}` over the live
+        //     snapshots' `capture_watermark`s. Filtering by `wm < lsn` is
+        //     LOAD-BEARING: a snapshot with `wm >= lsn` was CAPTURED AFTER this
+        //     page died (its roots fold past the page's death), so it cannot
+        //     reference the old page — including it over-pins a HEAD-only
+        //     transient whose death is folded LATE (e.g. `force_compact` after
+        //     newer snapshots exist), leaking a deadlist orphan the drop shadow
+        //     rejects. `None` (no snapshot with wm<lsn) = never pinned; `wm==0`
+        //     is a real genesis snapshot.
+        //
+        //     `!private_pages.contains(pid)` is LOAD-BEARING and the birth-model
+        //     equal of legacy `effective_rc > 1` for the lazy-incref case: a page
+        //     PRIVATE to the current (uncommitted) batch was COW'd/alloc'd this
+        //     cycle, so no committed snapshot can reference it — a snapshot only
+        //     ever captures the committed root. Without this gate an intra-fold
+        //     INTERMEDIATE page trips a false pin: when one fold cycle folds two
+        //     leaf ops that share an index page, op#1 COWs the index → a private
+        //     pid stamped `birth = op#1.inserts_max_lsn` (an OLD write lsn), then
+        //     op#2 re-COWs it. That intermediate pid is born+retired entirely
+        //     within a fold cycle LATER than the youngest snapshot's capture, so
+        //     it is reachable from NO snapshot — yet its stale `birth <= youngest`
+        //     would send it to the SHARED (preserve+deadlist) arm instead of
+        //     RECYCLE, leaking an orphan the drop-time page-deadlist later tries
+        //     to free (the premature-free the structural shadow rejects). page-rc
+        //     never hit this: a private page has `effective_rc == 1`.
+        // S1 COW-kill (non-clone): `effective_rc > 1 OR birth-pin`.
+        //   * `effective_rc > 1` is the page-rc FLOOR — the proven-safe legacy
+        //     gate. It pins any page page-rc still counts as shared, which
+        //     prevents an under-pin (premature free) when the birth operand is
+        //     momentarily incomplete: under concurrency the per-volume snapshot
+        //     `capture_watermark` cache (`snapshot_wms`) can LAG a just-created
+        //     snapshot, so `youngest_snap_below(lsn)` may miss a snapshot that
+        //     genuinely captured this page (`birth > all cached wms` yet
+        //     `rc == 2`). Keeping the rc floor makes that case preserve, not
+        //     free.
+        //   * `birth <= youngest_snap_below(lsn) && !private` is the ADDITIONAL
+        //     pin that catches the force-fold P0 the port exists to kill: when a
+        //     force-fold transiently floors a captured page's rc LOW (`rc <= 1`),
+        //     the rc floor misses it, but its birth predates a snapshot
+        //     (`birth <= some wm < lsn`) so birth pins it. `youngest_snap_below`
+        //     excludes snapshots captured AFTER the page died (`wm >= lsn`); the
+        //     `!private` gate excludes intra-batch transients (`rc == 1`,
+        //     uncommitted) so they recycle. (See `youngest_snap_below`.)
+        // Strictly >= the legacy `rc > 1` pinning, so it can never premature-free
+        // a page legacy preserved; the birth term only adds preservation.
+        let youngest_below = self.youngest_snap_below(lsn);
+        let snapshot_pinned = match self.clone_birth_lsn {
+            Some(_) => effective_rc > 1,
+            None => {
+                effective_rc > 1
+                    || match youngest_below {
+                        None => false,
+                        Some(s) => birth <= s && !self.private_pages.contains(&pid),
+                    }
             }
-            return Ok(pid);
-        }
-        if effective_rc <= 1 {
+        };
+
+        if !snapshot_pinned {
+            // RECYCLE arm: the page is private to the live volume. The sub-case
+            // is chosen by `private_pages` / `checkpoint_protected` /
+            // `already_touched_by_lsn` — NOT by rc — so these are unchanged from
+            // the legacy `effective_rc <= 1` arms; only the top gate moved to
+            // `snapshot_pinned`.
+            if self.private_pages.contains(&pid) {
+                // `checkpoint_protected` is a DURABILITY pin orthogonal to BOTH
+                // snapshots and page-rc: the just-committed on-disk checkpoint
+                // still points at this exact `pid`, so clobbering its bytes in
+                // place would corrupt the tree a crash would replay from. Copy
+                // + retire UNCONDITIONALLY — must never be gated on birth/rc.
+                if self.checkpoint_protected.contains(&pid) {
+                    let new_pid = self.buf.clone_private(pid, lsn)?;
+                    self.private_pages.remove(&pid);
+                    self.private_pages.insert(new_pid);
+                    self.retired_pages.insert(pid);
+                    if let Some(ob) = old_birth {
+                        self.push_live_free(pid, ob, lsn);
+                    }
+                    self.push_live_alloc(new_pid, lsn);
+                    return Ok(new_pid);
+                }
+                return Ok(pid);
+            }
             let already_touched_by_lsn = self.buf.read(pid)?.generation() >= lsn;
             if already_touched_by_lsn {
-                let new_pid = self.buf.cow_for_write(pid, lsn)?;
+                let new_pid = self.buf.cow_for_write(pid, lsn, false)?;
                 if new_pid != pid {
                     self.private_pages.remove(&pid);
                     self.private_pages.insert(new_pid);
@@ -411,18 +532,18 @@ impl PagedL2p {
             self.push_live_alloc(new_pid, lsn);
             return Ok(new_pid);
         }
-        // SHARED COW (`effective_rc > 1`): `pid` is pinned by a snapshot
-        // (Phase-1 invariant), so cloning it leaves the old version alive
-        // for that snapshot — it "dies off the head" here. Capture
-        // `(pid, birth, death=lsn)` BEFORE the COW consumes the slot; the
-        // apply / fold layer drains it into the HEAD page-deadlist. Reuse the
-        // clone pre-read (`old_birth`) when present; otherwise read once (the
-        // page is cache-resident for the COW). Same immutable `birth_lsn`.
-        let birth = match old_birth {
-            Some(b) => b,
-            None => self.buf.read(pid)?.birth_lsn(),
-        };
-        let new_pid = self.buf.cow_for_write(pid, lsn)?;
+
+        // SHARED (snapshot_pinned): `pid` is pinned by a snapshot, so cloning it
+        // leaves the old version alive for that snapshot — it "dies off the
+        // head" here. Capture `(pid, birth, death=lsn)` BEFORE the COW consumes
+        // the slot; the apply / fold layer drains it into the HEAD page-deadlist.
+        // FORCE the copy (`force_copy = true`): the birth decision is
+        // authoritative, so `PageBuf::cow_for_write` must NOT fall back to its
+        // own `effective_rc <= 1` early-return and clobber `pid` in place under a
+        // force-fold-transient low rc — that would premature-free a snapshot-
+        // pinned page AND (via `new_pid == pid`) silently drop the `cow_displaced`
+        // record, tripping a HARD `missing` at the next `drop_snapshot`.
+        let new_pid = self.buf.cow_for_write(pid, lsn, true)?;
         if new_pid != pid {
             self.private_pages.insert(new_pid);
             self.cow_displaced.push(crate::deadlist::DeadRecord {
@@ -431,11 +552,10 @@ impl PagedL2p {
                 death_lsn: lsn,
             });
             // v19 livelist: if the OLD shared page was itself clone-private
-            // (`birth > B` — e.g. a snapshot-of-clone pins a page the clone
-            // allocated), it just left the clone's live tree → FREE. Origin
+            // (`birth > B`) it just left the clone's live tree → FREE. Origin
             // pages (`birth <= B`) are not livelist members (they ride the
-            // snapshot deadlist via `cow_displaced`). The new copy is born
-            // at `lsn > B` → ALLOC.
+            // snapshot deadlist via `cow_displaced`). The new copy is born at
+            // `lsn > B` → ALLOC. (Both no-ops for non-clones.)
             self.push_live_free(pid, birth, lsn);
             self.push_live_alloc(new_pid, lsn);
         }
@@ -457,6 +577,43 @@ impl PagedL2p {
     /// / reopen, never cleared (covers promoted ex-clones). Idempotent.
     pub(crate) fn set_clone_birth_lsn(&mut self, threshold: Option<Lsn>) {
         self.clone_birth_lsn = threshold;
+    }
+
+    /// True iff this shard belongs to a clone-lineage volume (the COW-kill keeps
+    /// page-rc; the page-deadlist drain must separate snapshot deaths from
+    /// clone-private deaths by birth).
+    #[inline]
+    pub(crate) fn is_clone(&self) -> bool {
+        self.clone_birth_lsn.is_some()
+    }
+
+    /// ZFS port Phase 4 Step 4 (S1): set this shard's live-snapshot
+    /// `capture_watermark`s (the operand of the birth-authoritative non-clone
+    /// COW-kill decision in [`cow_for_write`](Self::cow_for_write)). Caller
+    /// passes the watermarks in any order; stored SORTED ascending for
+    /// [`youngest_snap_below`](Self::youngest_snap_below). Set per-op by the
+    /// apply / fold layer (alongside [`set_current_txg`]) from the durable
+    /// `SnapshotEntry::capture_watermark`s so the COW decision is identical live
+    /// and on replay. No-op effect for clones (the COW path keeps page-rc when
+    /// `clone_birth_lsn.is_some()`).
+    pub(crate) fn set_snapshot_wms(&mut self, mut wms: Vec<Lsn>) {
+        wms.sort_unstable();
+        self.snapshot_wms = wms;
+    }
+
+    /// `max{wm : wm < lsn}` over the live snapshot watermarks, or `None`. This
+    /// is the youngest snapshot that was CAPTURED before a page dying at `lsn`
+    /// died — the only ones that could reference the old page (see
+    /// [`cow_for_write`](Self::cow_for_write)). `snapshot_wms` is sorted, so the
+    /// answer is the entry just below the `partition_point`.
+    #[inline]
+    pub(crate) fn youngest_snap_below(&self, lsn: Lsn) -> Option<Lsn> {
+        let i = self.snapshot_wms.partition_point(|&w| w < lsn);
+        if i == 0 {
+            None
+        } else {
+            Some(self.snapshot_wms[i - 1])
+        }
     }
 
     /// Drain the page-livelist witness accumulated by this op's clone-private

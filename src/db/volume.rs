@@ -1274,6 +1274,18 @@ impl Db {
             .and_then(|infos| infos.iter().map(|s| s.created_lsn).max())
     }
 
+    /// v21 (Phase 4 S1): the live snapshots' `capture_watermark`s for `vol`, the
+    /// operand of the birth COW-kill (`tree.set_snapshot_wms`). The fold path
+    /// passes this in; the COW-kill filters it per dying-page lsn
+    /// (`youngest_snap_below`). Empty when the volume has no live snapshot.
+    pub(crate) fn snapshot_wms(&self, vol: VolumeOrdinal) -> Vec<Lsn> {
+        self.snap_info_cache
+            .lock()
+            .get(&vol)
+            .map(|infos| infos.iter().map(|s| s.capture_watermark).collect())
+            .unwrap_or_default()
+    }
+
     /// Recompute the cache entry for `vol` from `manifest.snapshots`.
     /// Callers must already hold a manifest lock or be in a state where
     /// the snapshot list is stable for `vol` (typically `apply_gate` or
@@ -1288,6 +1300,7 @@ impl Db {
             .filter(|s| s.vol_ord == vol)
             .map(|s| SnapInfo {
                 created_lsn: s.created_lsn,
+                capture_watermark: s.capture_watermark,
                 l2p_shard_roots: s.l2p_shard_roots.clone(),
             })
             .collect();
@@ -1306,6 +1319,7 @@ impl Db {
         for snap in &self.manifest_state.lock().manifest.snapshots {
             by_vol.entry(snap.vol_ord).or_default().push(SnapInfo {
                 created_lsn: snap.created_lsn,
+                capture_watermark: snap.capture_watermark,
                 l2p_shard_roots: snap.l2p_shard_roots.clone(),
             });
         }

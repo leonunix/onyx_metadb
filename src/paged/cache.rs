@@ -751,7 +751,17 @@ impl PageBuf {
     /// entry, not two private header copies. `generation` (still read
     /// from the page header) drives the `effective_rc <= 1 &&
     /// generation < lsn` early-return only.
-    pub fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
+    /// `force_copy`: when true, suppress the `effective_rc <= 1` early-return
+    /// and ALWAYS copy. ZFS port Phase 4 Step 4 (S1): the caller
+    /// ([`PagedL2p::cow_for_write`]) decided this page is snapshot-pinned by
+    /// the birth-txg (`birth_lsn <= youngest_snap`), which is the authoritative
+    /// "shared" test for non-clones. page-rc (`effective_rc`) is force-fold-prone
+    /// and can read transiently low; without `force_copy` the early-return below
+    /// would clobber a snapshot-pinned page in place — a premature free, and the
+    /// caller's `cow_displaced` deadlist record (gated on `new_pid != pid`) would
+    /// be silently dropped. `force_copy` makes the birth decision authoritative
+    /// over the copy here too.
+    pub fn cow_for_write(&mut self, pid: PageId, lsn: Lsn, force_copy: bool) -> Result<PageId> {
         debug_assert!(pid != NULL_PAGE, "cow_for_write called on NULL_PAGE");
         let pending = self.pending_rc.get(&pid).copied().unwrap_or(0);
         // A3 cutover: page rc lives in the `L2pPageRc` array, read here
@@ -776,7 +786,7 @@ impl PageBuf {
             // The commit-time gen-stamp guard makes the re-run's rc
             // deltas idempotent, so we proceed with cow any time this
             // page's disk header already carries `lsn`.
-            if effective_rc <= 1 && header.generation < lsn {
+            if !force_copy && effective_rc <= 1 && header.generation < lsn {
                 return Ok(pid);
             }
             let children = match header.page_type {

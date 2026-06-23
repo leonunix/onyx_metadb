@@ -468,3 +468,123 @@ fn segment_record_size_matches_spec() {
         "DeadRecord struct layout drift would break replay round-trip"
     );
 }
+
+// ── ZFS port Phase 4 Step 4 (S1): birth-authoritative non-clone COW-kill ──
+// The COW-kill decision (preserve-on-overwrite vs recycle) now keys on
+// `birth_lsn(P) <= youngest_snap` for non-clones instead of the page-rc
+// `effective_rc > 1`. These assert the observable consequences; the existing
+// page-deadlist suite above (snapshot-overwrite records, the HARD drop shadow,
+// reopen + `check_birth_shadow`) is the broader regression net for the flip.
+
+/// No snapshot ⇒ `youngest_snap == None` ⇒ no page is snapshot-pinned ⇒ every
+/// overwrite recycles in place. The page-deadlist stays empty and the birth /
+/// page-rc soft-warn never fires (no divergence without sharing).
+#[test]
+fn s1_no_snapshot_overwrite_records_no_page_deaths() {
+    use std::sync::atomic::Ordering;
+    let before = crate::paged::tree::BIRTH_SHADOW_DANGEROUS_DIVERGENCES.load(Ordering::Relaxed);
+    let (dir, db) = mk_db();
+    for i in 0u64..300 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    // Many overwrites, NO snapshot anywhere.
+    for round in 1u8..6 {
+        for i in 0u64..300 {
+            db.insert(0, i, v((i as u8).wrapping_add(round))).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    assert_eq!(
+        db.test_page_dead_list_len(0).unwrap(),
+        0,
+        "non-clone with no snapshot must record zero page deaths (birth recycles in place)"
+    );
+    assert_eq!(
+        db.test_page_dead_list_anchors(0).unwrap(),
+        (NULL_PAGE, NULL_PAGE),
+        "no snapshot ⇒ no page-deadlist chain"
+    );
+    let after = crate::paged::tree::BIRTH_SHADOW_DANGEROUS_DIVERGENCES.load(Ordering::Relaxed);
+    assert_eq!(
+        after, before,
+        "birth/page-rc soft-warn fired without any sharing (spurious divergence)"
+    );
+    drop(db);
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+        },
+    )
+    .unwrap();
+    assert!(report.is_clean(), "verify issues: {:?}", report.issues);
+}
+
+/// A live snapshot pins the pre-overwrite pages by birth. Overwriting the head
+/// must PRESERVE those pages (record them into the page-deadlist) so the
+/// snapshot can still be read — proven by cloning the snapshot and reading the
+/// OLD values back. In this clean steady state birth == page-rc, so the
+/// dangerous-divergence soft-warn must NOT fire, and `check_birth_shadow` (the
+/// HARD offline oracle) stays clean.
+#[test]
+fn s1_snapshot_overwrite_preserves_old_via_birth_no_divergence() {
+    use std::sync::atomic::Ordering;
+    let before = crate::paged::tree::BIRTH_SHADOW_DANGEROUS_DIVERGENCES.load(Ordering::Relaxed);
+    let (dir, db) = mk_db();
+    // Leaf-spaced LBAs so each mapping lands in a distinct leaf → an overwrite
+    // COWs a distinct root→leaf path (a snapshot-pinned page dies off the head).
+    for i in 0u64..8 {
+        db.insert(0, i * 256, v(0x10 | i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let snap = db.take_snapshot(0).unwrap();
+    for i in 0u64..8 {
+        db.insert(0, i * 256, v(0xA0 | i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Preserve recorded: the snapshot-pinned pages died off the head.
+    let (head, _tail) = db.test_page_dead_list_anchors(0).unwrap();
+    assert_ne!(
+        head, NULL_PAGE,
+        "snapshot+overwrite recorded NO page deaths — birth COW-kill failed to preserve"
+    );
+
+    // Preserve correctness: clone the snapshot (shares its pages) and read the
+    // OLD values back. A wrong recycle would have clobbered them in place.
+    let clone = db.clone_volume(snap).unwrap();
+    for i in 0u64..8 {
+        let val = db.get(clone, i * 256).unwrap().expect("snapshot mapping lost");
+        assert_eq!(
+            val.head_pba(),
+            (0x10 | i as u8) as u64,
+            "snapshot page for lba {} was not preserved (premature recycle)",
+            i * 256
+        );
+    }
+    // The live head still reads the NEW values.
+    for i in 0u64..8 {
+        let val = db.get(0, i * 256).unwrap().expect("head mapping lost");
+        assert_eq!(val.head_pba(), (0xA0 | i as u8) as u64);
+    }
+
+    let after = crate::paged::tree::BIRTH_SHADOW_DANGEROUS_DIVERGENCES.load(Ordering::Relaxed);
+    assert_eq!(
+        after, before,
+        "steady-state birth/page-rc divergence (birth and page-rc should agree once folded)"
+    );
+    drop(db);
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+        },
+    )
+    .unwrap();
+    assert!(report.is_clean(), "verify issues: {:?}", report.issues);
+}

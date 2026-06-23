@@ -533,6 +533,12 @@ struct DispatchEntry {
 #[derive(Clone, Debug)]
 struct SnapInfo {
     created_lsn: Lsn,
+    /// v21 (ZFS port Phase 4 S1): the snapshot's fold-watermark
+    /// (`max(root.birth_lsn)` over its captured roots). The birth COW-kill
+    /// oracle (`youngest_snap_lsn`) feeds on `max(capture_watermark)`, NOT
+    /// `created_lsn` — see `SnapshotEntry::capture_watermark`. Rebuilt from the
+    /// durable `SnapshotEntry` on reopen so replay reproduces the same gate.
+    capture_watermark: Lsn,
     /// Per-shard root page ids. Indexed by `shard_for_key_l2p(...)`,
     /// matching the volume's live shard layout (snapshot's roots are
     /// captured from the same shard group at take time, so the indices

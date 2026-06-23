@@ -63,56 +63,67 @@ pub(in crate::db) fn record_dead(volume: &Volume, prev: Option<L2pValue>, death_
     }
 }
 
-/// Youngest live snapshot's `created_lsn` across `snap_infos` (ZFS
-/// `prev_snap_txg` analogue), or `None` when the volume has no live
-/// snapshot. `Some(0)` is a real value — a snapshot taken before the
-/// first committed op on the bootstrap volume has `created_lsn == 0` and
-/// still pins the genesis (lsn-0-born) pages — so it must be
-/// distinguished from `None` (which records nothing).
+/// The live snapshots' `capture_watermark`s across `snap_infos`, the operand of
+/// the birth COW-kill decision (fed to `tree.set_snapshot_wms`).
+///
+/// v21 (Phase 4 S1): MUST be the fold-watermarks (`max(root.birth_lsn)`), NOT
+/// `created_lsn`. `created_lsn` (= last_applied) races ahead of the fold under
+/// concurrent writers + background TXG threads, so a page with
+/// `birth <= created_lsn` need NOT be in any snapshot's roots — using it
+/// over-pins HEAD-only transients into the page-deadlist, surfacing as
+/// premature-frees the drop shadow rejects. `capture_watermark` is exactly what
+/// the roots contain. The COW-kill further filters by the dying page's lsn
+/// (`youngest_snap_below`), so the full list (not just the max) is needed.
 #[inline]
-pub(in crate::db) fn youngest_snap_lsn(snap_infos: &[SnapInfo]) -> Option<Lsn> {
-    snap_infos.iter().map(|s| s.created_lsn).max()
+pub(in crate::db) fn snapshot_wms_of(snap_infos: &[SnapInfo]) -> Vec<Lsn> {
+    snap_infos.iter().map(|s| s.capture_watermark).collect()
 }
 
 /// ZFS port Phase 2: drain the tree's page-deadlist witness (L2P pages
 /// displaced off the head by a shared COW this op) and append the
-/// snapshot-pinned survivors (`birth_lsn <= youngest_snap`) to the
-/// volume's HEAD page-deadlist. ALWAYS drains the witness (so it never
-/// leaks into the next op even when no snapshot is live); the
-/// `birth <= youngest` filter naturally records nothing when `youngest`
-/// is 0. Fires from BOTH the direct-apply tree COW and the buffer-fold
-/// COW (the only two `cow_for_write` entry points). The records carry
-/// the dying `PageId` in `DeadRecord.pba` (same 24 B codec as the PBA
-/// dead-list; distinguished only by the owning anchor).
+/// snapshot-pinned survivors to the volume's HEAD page-deadlist. ALWAYS drains
+/// the witness (so it never leaks into the next op even when no snapshot is
+/// live). Fires from BOTH the direct-apply tree COW and the buffer-fold COW (the
+/// only two `cow_for_write` entry points). The records carry the dying `PageId`
+/// in `DeadRecord.pba`.
 #[inline]
 pub(in crate::db) fn drain_page_deaths(
     volume: &Volume,
     tree: &mut PagedL2p,
-    snap_infos: &[SnapInfo],
+    _snap_infos: &[SnapInfo],
 ) {
-    drain_page_deaths_into(&volume.page_dead_list, tree, youngest_snap_lsn(snap_infos));
+    drain_page_deaths_into(&volume.page_dead_list, tree);
 }
 
-/// Lower-level page-death drainer used by the buffer-fold path, which
-/// has the volume's `page_dead_list` + a precomputed `youngest` but not
-/// the full `snap_infos`. ALWAYS drains the witness (clears it so it
-/// can't leak into the next fold); records a death only when a snapshot
-/// is live (`youngest` is `Some`) and the page predates it
-/// (`birth_lsn <= youngest`). `None` (no live snapshot, or the replay
-/// path) records nothing — note `Some(0)` is NOT `None`: a created-0
-/// snapshot pins genesis (lsn-0-born) pages, so their deaths must record.
+/// Lower-level page-death drainer. ALWAYS drains the witness (clears it so it
+/// can't leak into the next fold).
+///
+/// NON-CLONE: records EVERY `cow_displaced` record. `cow_for_write` only pushes
+/// in its SHARED (snapshot-pinned) arm (`rc>1 OR birth`), so every record is
+/// already a gated snapshot death — re-filtering by birth here would DROP the
+/// `rc>1`-pinned ones (whose `birth > youngest_snap_below`, the snapshot-cache
+/// lag case), leaving the drop-time page-deadlist MISSING a page the structural
+/// graph frees (a completeness hole).
+///
+/// CLONE: the SHARED arm fires on `rc>1` (clone-private sharing OR snapshot), so
+/// filter by `birth <= youngest_snap_below(death_lsn)` to keep only the
+/// snapshot-captured deaths for the page-deadlist; the clone-private ones
+/// (`birth` past every clone-snapshot watermark) are owned by the livelist.
 #[inline]
 pub(in crate::db) fn drain_page_deaths_into(
     page_dead_list: &crate::deadlist::DeadListState,
     tree: &mut PagedL2p,
-    youngest: Option<Lsn>,
 ) {
+    let is_clone = tree.is_clone();
     let displaced = tree.take_cow_displaced();
-    let Some(youngest) = youngest else {
-        return;
-    };
     for rec in displaced {
-        if rec.birth_lsn <= youngest {
+        let keep = if is_clone {
+            tree.youngest_snap_below(rec.death_lsn)
+                .is_some_and(|y| rec.birth_lsn <= y)
+        } else {
+            true
+        };
+        if keep {
             page_dead_list.push(rec);
         }
     }
@@ -238,6 +249,10 @@ pub(in crate::db) fn apply_l2p_remap(
     // TXG slot. (Buffer mode COWs later in the drain, which sets its own
     // sync txg; this set is then a harmless no-op for the buffered path.)
     tree.set_current_txg(txg);
+    // ZFS port Phase 4 Step 4 (S1): arm the birth-authoritative non-clone
+    // COW-kill decision with this op's youngest-snapshot lsn (same source the
+    // `drain_page_deaths` below uses; identical live and on replay).
+    tree.set_snapshot_wms(snapshot_wms_of(snap_infos));
 
     if let Some((gp, min_rc)) = guard {
         let gp_sid = shard_for_key(refcount_shards, gp);
@@ -578,6 +593,8 @@ pub(in crate::db) fn apply_l2p_remap_range(
         let mut tree = shard.tree.write();
         // A3 cutover: tree-mode COW stages page-rc deltas into this TXG slot.
         tree.set_current_txg(txg);
+        // ZFS port Phase 4 Step 4 (S1): birth-authoritative non-clone COW-kill.
+        tree.set_snapshot_wms(snapshot_wms_of(snap_infos));
         for &i in indices {
             let lba = start_lba + i as u64;
             let new_value = values[i];
@@ -717,6 +734,10 @@ pub(in crate::db) fn apply_l2p_range_delete(
         let mut tree = volume.shards[sid].tree.write();
         // A3 cutover: tree-mode COW (delete) stages page-rc deltas here.
         tree.set_current_txg(txg);
+        // ZFS port Phase 4 Step 4 (S1): birth-authoritative non-clone COW-kill.
+        // This is also the Discard REPLAY COW site; `snap_infos` is rebuilt from
+        // the in-memory manifest at the replay point, so youngest is consistent.
+        tree.set_snapshot_wms(snapshot_wms_of(snap_infos));
         for &idx in indices {
             let (lba, _) = captured[idx];
             // The snap-pin probe inside `stage_delete_rc` reads the snapshot

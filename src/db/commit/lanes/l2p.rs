@@ -84,12 +84,12 @@ impl Db {
         // planner footprint in `build_lane_dispatch_plan`. Default-off path
         // (Phase-5) emits nothing — `rc_actions` stays empty.
         rc_authoritative: bool,
-        // ZFS port Phase 2: youngest live snapshot's `created_lsn` for this
-        // volume, captured by the dispatcher before the lane runs. Gates
-        // which COW-displaced L2P pages enter the HEAD page-deadlist. `None`
-        // (no live snapshot, or the replay path) records nothing; `Some(0)`
-        // is a real created-0 snapshot that still pins genesis pages.
-        youngest_snap: Option<Lsn>,
+        // ZFS port Phase 4 S1: this volume's live snapshot `capture_watermark`s,
+        // captured by the dispatcher before the lane runs. Arms the birth COW-kill
+        // (filtered per dying-page lsn via `youngest_snap_below`) and gates which
+        // COW-displaced L2P pages enter the HEAD page-deadlist. Empty (no live
+        // snapshot, or the replay path) records nothing.
+        snapshot_wms: Vec<Lsn>,
     ) -> Result<L2pBucketApplyResult> {
         let mut outcomes = Vec::with_capacity(indices.len());
         let mut rc_actions = Vec::new();
@@ -109,6 +109,12 @@ impl Db {
         }
         let tree_lock_started = std::time::Instant::now();
         let mut tree = shard.tree.write();
+        // ZFS port Phase 4 Step 4 (S1): arm the birth-authoritative non-clone
+        // COW-kill decision with this commit's youngest-snapshot lsn (captured
+        // by the dispatcher, same value the matching `drain_page_deaths_into`
+        // uses below). The buffered shards returned early above; this is the
+        // tree-locked laned COW path.
+        tree.set_snapshot_wms(snapshot_wms);
         let tree_lock_wait = tree_lock_started.elapsed();
         let read_view_prepare_started = std::time::Instant::now();
         let mut read_view_guard = if shard.active_readers.load(Ordering::Acquire) == 0
@@ -443,7 +449,7 @@ impl Db {
             // page-deadlist. This is the dominant write path (single +
             // batched L2pPut/L2pDelete/unguarded L2pRemap all land here),
             // so it MUST drain — otherwise the witness leaks across ops.
-            super::apply::drain_page_deaths_into(&volume.page_dead_list, &mut tree, youngest_snap);
+            super::apply::drain_page_deaths_into(&volume.page_dead_list, &mut tree);
             // ZFS port Phase 3b: same site for the per-clone page-livelist
             // witness (empty for non-clones).
             super::apply::drain_live_events_into(&volume.page_live_list, &mut tree);

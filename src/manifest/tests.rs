@@ -35,6 +35,7 @@ fn snap(
         created_lsn: lsn,
         l2p_shard_roots: bx(l2p),
         page_dead_list_tail_pid: NULL_PAGE,
+        capture_watermark: lsn,
     }
 }
 

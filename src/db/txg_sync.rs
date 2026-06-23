@@ -117,11 +117,21 @@ pub(crate) fn apply_drain_ops(
     tree: &mut crate::paged::PagedL2p,
     ops: &[LeafDrainOp],
     txg: Txg,
+    snapshot_wms: Vec<crate::types::Lsn>,
 ) -> Result<()> {
     // A3 cutover: the buffer-drain COW stages page-rc deltas into this
     // sync cycle's TXG slot (so the page-rc fold `begin_checkpoint(txg)`
     // captures them, on the SAME boundary as the L2P + PBA-rc folds).
     tree.set_current_txg(txg);
+    // ZFS port Phase 4 Step 4 (S1): this is the ONLY COW point for buffered
+    // writes, so the birth-authoritative non-clone COW-kill decision needs the
+    // volume's live snapshot `capture_watermark`s here. The COW-kill filters
+    // them per dying-page lsn (`youngest_snap_below`), so a death folded LATE
+    // here is not pinned by a snapshot captured after it died. Fed by the caller
+    // from the SAME `self.snapshot_wms(vol)` the matching `drain_page_deaths_into`
+    // reads via the tree, so COW-time and deadlist-drain agree (and replay
+    // reproduces it from the durable `capture_watermark`s).
+    tree.set_snapshot_wms(snapshot_wms);
     for op in ops {
         if !op.inserts.is_empty() {
             tree.insert_leaf_run_at_lsn_deferred_finish(&op.inserts, op.inserts_max_lsn)?;
@@ -148,11 +158,12 @@ pub(crate) fn compact_drain_into_tree(
     tree: &mut crate::paged::PagedL2p,
     draining: &HashMap<u64, super::l2p_buffer::BufferEntry>,
     txg: Txg,
+    snapshot_wms: Vec<crate::types::Lsn>,
 ) -> Result<()> {
     if draining.is_empty() {
         return Ok(());
     }
-    apply_drain_ops(tree, &build_drain_plan(draining), txg)
+    apply_drain_ops(tree, &build_drain_plan(draining), txg, snapshot_wms)
 }
 
 /// Callback that performs the actual per-TXG sync work for one cycle.

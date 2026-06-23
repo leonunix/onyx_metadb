@@ -267,7 +267,7 @@ fn cow_on_shared_index_bumps_children() {
     buf.flush().unwrap();
     buf.commit_rc_deltas(1).unwrap(); // commit alloc'd +1s into the array
     buf.atomic_incref(idx, 1).unwrap(); // rc(idx) = 2, rc(leaf) = 1
-    let new_idx = buf.cow_for_write(idx, 2).unwrap();
+    let new_idx = buf.cow_for_write(idx, 2, false).unwrap();
     // rc deltas are batched; apply them like the tree write path
     // would so the assertions below see the post-commit state.
     buf.commit_rc_deltas(2).unwrap();
@@ -303,7 +303,7 @@ fn cow_clone_invalidates_reused_pinned_index_page() {
     ps.free(stale_idx, 2).unwrap();
     ps.try_reclaim().unwrap();
 
-    let new_leaf = buf.cow_for_write(live_leaf, 3).unwrap();
+    let new_leaf = buf.cow_for_write(live_leaf, 3, false).unwrap();
     assert_eq!(new_leaf, stale_idx);
     assert_eq!(
         page_cache.pinned_pages(),
@@ -323,7 +323,7 @@ fn cow_on_unique_page_is_noop() {
     let (_d, ps) = mk_store();
     let mut buf = PageBuf::new(ps);
     let pid = buf.alloc_leaf(1).unwrap();
-    let out = buf.cow_for_write(pid, 2).unwrap();
+    let out = buf.cow_for_write(pid, 2, false).unwrap();
     assert_eq!(out, pid);
     // A3: the alloc'd page's +1 is in the op accumulator (uncommitted),
     // so the effective rc (array + pending) is 1.

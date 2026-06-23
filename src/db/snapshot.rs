@@ -941,6 +941,7 @@ impl Db {
         &self,
         txg: crate::types::Txg,
         snapshot_roots: &std::collections::HashMap<VolumeOrdinal, Vec<PageId>>,
+        snapshot_watermarks: &std::collections::HashMap<VolumeOrdinal, Lsn>,
     ) -> Result<Vec<Vec<Pba>>> {
         let mut force_increfs: Vec<Vec<Pba>> =
             (0..self.l2p_page_rc.shard_count()).map(|_| Vec::new()).collect();
@@ -967,6 +968,13 @@ impl Db {
                 // suppression + lineage). Same monotone space as lite's
                 // `*last_applied_lsn.lock()`.
                 let created_lsn = *self.last_applied_lsn.lock();
+                // v21 (S1): the EXACT fold-watermark of the captured roots
+                // (`max(root.birth_lsn)`), computed under each shard's
+                // `tree.write()` in `run_sync_cycle_body` and passed in here.
+                // Feeds the birth COW-kill oracle (NOT `created_lsn`). See
+                // `SnapshotEntry::capture_watermark` / `youngest_snap_lsn`.
+                let capture_watermark =
+                    snapshot_watermarks.get(&vol_ord).copied().unwrap_or(created_lsn);
                 // Assign the id + capacity-probe under `manifest_state`.
                 let id = {
                     let mut ms = self.manifest_state.lock();
@@ -983,6 +991,8 @@ impl Db {
                         // fixed-width, so this is cosmetic, but keep it
                         // honest).
                         page_dead_list_tail_pid: crate::types::NULL_PAGE,
+                        // Fixed-width field; value cosmetic for the probe.
+                        capture_watermark,
                     });
                     probe.next_snapshot_id = id.saturating_add(1);
                     if let Err(e) = probe.check_encodable() {
@@ -1005,6 +1015,8 @@ impl Db {
                     // v18: filled by the page-deadlist seal step; an empty
                     // chain (no page-deaths yet) stays `NULL_PAGE`.
                     page_dead_list_tail_pid: crate::types::NULL_PAGE,
+                    // v21 (S1): fold-watermark of these captured roots.
+                    capture_watermark,
                 });
                 roots
             };
@@ -1106,6 +1118,7 @@ impl Db {
             if let Some(entry) = &t.committed_entry {
                 cache.entry(entry.vol_ord).or_default().push(SnapInfo {
                     created_lsn: entry.created_lsn,
+                    capture_watermark: entry.capture_watermark,
                     l2p_shard_roots: entry.l2p_shard_roots.clone(),
                 });
                 *t.result.lock() = Some(Ok(entry.id));

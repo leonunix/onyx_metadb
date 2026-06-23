@@ -1234,6 +1234,7 @@ fn apply_lifecycle_record_replay(
                         .filter(|s| s.vol_ord == vol)
                         .map(|s| SnapInfo {
                             created_lsn: s.created_lsn,
+                            capture_watermark: s.capture_watermark,
                             l2p_shard_roots: s.l2p_shard_roots.clone(),
                         })
                         .collect()

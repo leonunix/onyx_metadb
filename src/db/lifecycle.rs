@@ -644,7 +644,7 @@ impl Db {
     /// (recovery / threads-off inline flush), so the slots are quiesced.
     fn compact_volume_buffers(&self, vol: &Arc<Volume>) -> Result<()> {
         use std::time::Instant;
-        let youngest_snap = self.youngest_snap(vol.ord);
+        let snapshot_wms = self.snapshot_wms(vol.ord);
         for shard in &vol.shards {
             if !shard.use_buffer {
                 continue;
@@ -678,6 +678,7 @@ impl Db {
                 &mut tree,
                 &drained,
                 self.txg.open_txg(),
+                snapshot_wms.clone(),
             );
             match apply_result {
                 Ok(()) => {
@@ -686,7 +687,6 @@ impl Db {
                     super::apply::drain_page_deaths_into(
                         &vol.page_dead_list,
                         &mut tree,
-                        youngest_snap,
                     );
                     // ZFS port Phase 3b: same fold site for the per-clone
                     // page-livelist witness (empty for non-clones).
@@ -767,13 +767,14 @@ impl Db {
                     // `prev_snap_txg`); computed once per volume, captured
                     // by the per-shard fold tasks for the page-deadlist
                     // birth gate.
-                    let youngest_snap = self.youngest_snap(vol.ord);
+                    let snapshot_wms = self.snapshot_wms(vol.ord);
                     let page_dead_list = &vol.page_dead_list;
                     let page_live_list = &vol.page_live_list;
                     for (shard_idx, shard) in vol.shards.iter().enumerate() {
                         if !shard.use_buffer {
                             continue;
                         }
+                        let snapshot_wms = snapshot_wms.clone();
                         handles.push(scope.spawn(move || {
                             // Escape the single-CPU affinity inherited from
                             // the pinned `metadb-txg-sync` parent. Under NUMA
@@ -790,7 +791,7 @@ impl Db {
                                 chunk_entries,
                                 page_dead_list,
                                 page_live_list,
-                                youngest_snap,
+                                snapshot_wms,
                             )
                         }));
                     }
@@ -808,7 +809,7 @@ impl Db {
             }
         } else {
             for vol in &vols {
-                let youngest_snap = self.youngest_snap(vol.ord);
+                let snapshot_wms = self.snapshot_wms(vol.ord);
                 for shard in &vol.shards {
                     if !shard.use_buffer {
                         continue;
@@ -820,7 +821,7 @@ impl Db {
                         chunk_entries,
                         &vol.page_dead_list,
                         &vol.page_live_list,
-                        youngest_snap,
+                        snapshot_wms.clone(),
                     )?;
                 }
             }
@@ -856,7 +857,7 @@ impl Db {
         chunk_entries: usize,
         page_dead_list: &crate::deadlist::DeadListState,
         page_live_list: &crate::livelist::LiveListState,
-        youngest_snap: Option<Lsn>,
+        snapshot_wms: Vec<Lsn>,
     ) -> Result<()> {
         let started = std::time::Instant::now();
         // Snapshot (clone) the frozen syncing slot WITHOUT the tree lock so the
@@ -885,12 +886,12 @@ impl Db {
                 }
             }
             let mut tree = shard.tree.write();
-            super::txg_sync::apply_drain_ops(&mut tree, &plan[start..end], txg)?;
+            super::txg_sync::apply_drain_ops(&mut tree, &plan[start..end], txg, snapshot_wms.clone())?;
             // ZFS port Phase 2: this fold COW'd L2P pages off the head;
             // record the snapshot-pinned ones into the HEAD page-deadlist
             // (buffer mode's only COW point — the apply-time witness was
             // empty for buffered writes).
-            super::apply::drain_page_deaths_into(page_dead_list, &mut tree, youngest_snap);
+            super::apply::drain_page_deaths_into(page_dead_list, &mut tree);
             // ZFS port Phase 3b: per-clone page-livelist witness (empty for
             // non-clones).
             super::apply::drain_live_events_into(page_live_list, &mut tree);

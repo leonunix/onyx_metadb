@@ -149,11 +149,13 @@ impl Db {
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
                         rc_authoritative,
-                        // ZFS port Phase 2: WAL replay does not re-record
-                        // page deaths (they were recorded + sealed/drained
-                        // pre-crash); `None` drains+discards the witness so
-                        // it cannot leak, without double-recording.
-                        None,
+                        // ZFS port Phase 2/4: WAL replay does not re-record page
+                        // deaths (recorded + sealed/drained pre-crash); empty wms
+                        // drains+discards the witness (no pin, no record) so it
+                        // cannot leak or double-record. Durable snapshot pages are
+                        // `checkpoint_protected`, so the recycle path still copies
+                        // (never clobbers) them.
+                        Vec::new(),
                     );
                     let _ = tx.send(result);
                 }),
@@ -357,8 +359,8 @@ impl Db {
                 &refcount_shards_vec,
                 metrics.as_ref(),
                 rc_authoritative,
-                // ZFS port Phase 2: replay does not re-record page deaths.
-                None,
+                // ZFS port Phase 2/4: replay does not re-record page deaths.
+                Vec::new(),
             )?;
             for (idx, outcome) in result.outcomes {
                 merge_l2p_outcome(&mut outcomes, idx, outcome);

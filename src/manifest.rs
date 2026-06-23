@@ -153,7 +153,20 @@ use crate::types::{
 /// it to decref those PBAs survivor-gated, closing the permanent promotion
 /// over-pin leak. Net manifest cost: +16 B/volume; old v19 manifests are
 /// hard-rejected (fresh rebuild, no migration).
-pub const MANIFEST_BODY_VERSION: u32 = 20;
+///
+/// v21 (ZFS birth-txg port Phase 4 Step 4 / S1: snapshot capture-watermark):
+/// appends `SnapshotEntry.capture_watermark: Lsn` at offset 40 (grows
+/// `SNAPSHOT_ENTRY_SIZE` 40 → 48). It is the EXACT highest lsn folded into the
+/// snapshot's captured roots (`max(root.birth_lsn)`), NOT `created_lsn`
+/// (=last_applied, an UPPER bound that races ahead of the fold under concurrent
+/// writers + background TXG threads). The birth COW-kill oracle
+/// (`tree.set_youngest_snap`) feeds on `max(capture_watermark)` so
+/// `birth_lsn(P) <= youngest ⟺ P ∈ a snapshot's roots` stays exact —
+/// `created_lsn` keeps its `last_applied` value for its other consumers
+/// (dedup `any_snap_pins` rc-suppression, lineage, drop ordering). Durable so
+/// replay reproduces the same gate (SnapInfo rebuilt from this on reopen). Net
+/// cost: +8 B/snapshot; old v20 manifests are hard-rejected (fresh rebuild).
+pub const MANIFEST_BODY_VERSION: u32 = 21;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -199,9 +212,11 @@ const OFF_VARIABLE_START: usize = 76;
 /// l2p_roots_page(8) + created_lsn(8). v18 (ZFS port Phase 2) appends
 /// `page_dead_list_tail_pid(8)` at offset 32, growing the row 32 → 40.
 /// The 6 bytes at 10..16 stay reserved for future per-snapshot flags.
-const SNAPSHOT_ENTRY_SIZE: usize = 40;
+const SNAPSHOT_ENTRY_SIZE: usize = 48;
 /// Byte offset of `page_dead_list_tail_pid` within a v18 snapshot row.
 const OFF_SNAP_PAGE_DEADLIST_TAIL: usize = 32;
+/// v21: byte offset of `capture_watermark` within the snapshot row.
+const OFF_SNAP_CAPTURE_WATERMARK: usize = 40;
 
 const _: () = {
     assert!(OFF_BODY_VERSION + 4 == OFF_CHECKPOINT_LSN);
@@ -217,8 +232,9 @@ const _: () = {
     assert!(OFF_CHECKPOINT_TXG + 8 == OFF_LAST_PROCESSED_BUFFER_SEQ);
     assert!(OFF_LAST_PROCESSED_BUFFER_SEQ + 8 == OFF_LIFECYCLE_REPLAY_SEQ);
     assert!(OFF_LIFECYCLE_REPLAY_SEQ + 8 == OFF_VARIABLE_START);
-    assert!(SNAPSHOT_ENTRY_SIZE == 40);
-    assert!(OFF_SNAP_PAGE_DEADLIST_TAIL + 8 == SNAPSHOT_ENTRY_SIZE);
+    assert!(SNAPSHOT_ENTRY_SIZE == 48);
+    assert!(OFF_SNAP_PAGE_DEADLIST_TAIL + 8 == OFF_SNAP_CAPTURE_WATERMARK);
+    assert!(OFF_SNAP_CAPTURE_WATERMARK + 8 == SNAPSHOT_ENTRY_SIZE);
 };
 
 /// Maximum number of shard roots that fit in one snapshot-roots page.
@@ -316,6 +332,13 @@ pub struct SnapshotEntry {
     /// consumes it (free-or-merge by birth). Not persisted in
     /// `SnapshotRoots`; lives inline in the snapshot row.
     pub page_dead_list_tail_pid: PageId,
+    /// v21 (ZFS port Phase 4 S1): the EXACT fold-watermark of this snapshot's
+    /// captured roots = `max(root.birth_lsn)` over its shard roots. The
+    /// birth-authoritative COW-kill oracle uses `max(capture_watermark)` (NOT
+    /// `created_lsn`, an upper bound that races ahead of the fold under
+    /// concurrency) so `birth_lsn(P) <= youngest ⟺ P captured` stays exact.
+    /// `created_lsn` keeps its `last_applied` value for dedup/lineage/ordering.
+    pub capture_watermark: Lsn,
 }
 
 impl SnapshotEntry {
@@ -692,6 +715,9 @@ impl Manifest {
             // v18: page-deadlist tail anchor at offset 32.
             p[off + OFF_SNAP_PAGE_DEADLIST_TAIL..off + OFF_SNAP_PAGE_DEADLIST_TAIL + 8]
                 .copy_from_slice(&entry.page_dead_list_tail_pid.to_le_bytes());
+            // v21: snapshot capture-watermark at offset 40.
+            p[off + OFF_SNAP_CAPTURE_WATERMARK..off + OFF_SNAP_CAPTURE_WATERMARK + 8]
+                .copy_from_slice(&entry.capture_watermark.to_le_bytes());
             off += SNAPSHOT_ENTRY_SIZE;
         }
         for entry in &self.volumes {
@@ -708,10 +734,10 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            20 => Self::decode_v20(page, page_store),
+            21 => Self::decode_v21(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v20 \
-                 (ZFS birth-txg port Phase 4 Step 4: promoted-PBA log) is \
+                "unsupported manifest body version {other}; only v21 \
+                 (ZFS birth-txg port Phase 4 Step 4 S1: snapshot capture-watermark) is \
                  readable — older databases (v7/v8 carried the retired \
                  dedup_reverse section; v9 carried compact leaf v2 with the \
                  100-unit cap; v10/v11 used compact leaf v3 which predates \
@@ -723,13 +749,14 @@ impl Manifest {
                  l2p_page_rc shard group but no page-deadlist anchors; v18 had \
                  the page-deadlist anchors but no per-clone page-livelist \
                  anchors; v19 had the page-livelist but no promoted-PBA log \
-                 anchors) must be rebuilt"
+                 anchors; v20 had the promoted-PBA log but no snapshot \
+                 capture-watermark) must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v20(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 20)
+    fn decode_v21(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 21)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {
@@ -923,6 +950,18 @@ fn decode_snapshots(
         } else {
             NULL_PAGE
         };
+        // v21: snapshot capture-watermark at offset 40. Pre-v21 manifests are
+        // hard-rejected at dispatch; the `created_lsn` fallback (a safe upper
+        // bound) is only reachable via the dead generic decode path.
+        let capture_watermark = if version >= 21 {
+            u64::from_le_bytes(
+                p[*off + OFF_SNAP_CAPTURE_WATERMARK..*off + OFF_SNAP_CAPTURE_WATERMARK + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        } else {
+            created_lsn
+        };
         let l2p_shard_roots = load_snapshot_roots(page_store, l2p_roots_page)?;
         snapshots.push(SnapshotEntry {
             id,
@@ -931,6 +970,7 @@ fn decode_snapshots(
             created_lsn,
             l2p_shard_roots,
             page_dead_list_tail_pid,
+            capture_watermark,
         });
         *off += SNAPSHOT_ENTRY_SIZE;
     }

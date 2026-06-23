@@ -639,6 +639,14 @@ impl Db {
         // guard here.
         let mut snapshot_roots: std::collections::HashMap<VolumeOrdinal, Vec<PageId>> =
             std::collections::HashMap::new();
+        // ZFS port Phase 4 (S1): per-snapshot-target-volume fold watermark =
+        // max root `birth_lsn` over its captured shards = the exact highest lsn
+        // folded into the captured roots. Stamped as the snapshot's durable
+        // `capture_watermark` (the birth COW-kill oracle's operand, NOT
+        // `last_applied_lsn`). Captured under the same `tree.write()` the roots
+        // are sampled from, so it is consistent with the roots.
+        let mut snapshot_watermarks: std::collections::HashMap<VolumeOrdinal, Lsn> =
+            std::collections::HashMap::new();
         let mut guard_iter = l2p_guards.drain(..);
         for (v_idx, volume) in volumes.iter().enumerate() {
             let mut per_volume: Vec<Option<crate::paged::tree::Checkpoint>> =
@@ -651,6 +659,11 @@ impl Db {
                     );
                     if capture_roots {
                         snapshot_roots.entry(volume.ord).or_default().push(guard.root());
+                        let wm = guard.root_birth_lsn()?;
+                        let e = snapshot_watermarks.entry(volume.ord).or_insert(0);
+                        if wm > *e {
+                            *e = wm;
+                        }
                     }
                     per_volume.push(Some(guard.begin_checkpoint()));
                 } else {
@@ -795,7 +808,11 @@ impl Db {
         // so the increfs fold into THIS cycle's page-rc checkpoint — durable
         // atomically with the manifest entry (added in A4). On error, roll
         // back the L2P + refcount checkpoints (nothing page-rc folded yet).
-        let prc_force_increfs = match self.stage_pending_snapshot_increfs(txg, &snapshot_roots) {
+        let prc_force_increfs = match self.stage_pending_snapshot_increfs(
+            txg,
+            &snapshot_roots,
+            &snapshot_watermarks,
+        ) {
             Ok(v) => v,
             Err(err) => {
                 self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
