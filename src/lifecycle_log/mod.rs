@@ -44,4 +44,4 @@ pub mod record;
 mod tests;
 
 pub use journal::{LifecycleJournal, LifecycleRecord};
-pub use op::LifecycleOp;
+pub use op::{DropMergeTarget, LifecycleOp};

@@ -426,6 +426,31 @@ impl Db {
         self.l2p_page_rc.flush()?;
 
         let checkpoint_lsn = *self.last_applied_lsn.lock();
+        // Crash-recovery completeness (G1): this commit advances
+        // `checkpoint_lsn` to `last_applied_lsn` and makes the
+        // `force_compact`-folded roots durable. Seal every volume's pending
+        // page-deadlist accumulator into its HEAD chain FIRST so no death the
+        // committed roots imply free is left only in volatile RAM. The bumped
+        // HEAD anchors fold into this commit via `refresh_manifest_from_locked`.
+        // (Empty accumulators are a no-op; clone volumes accumulate few/none.)
+        for vol in &volumes_snap {
+            self.seal_page_dead_list_accumulator(vol, checkpoint_lsn)?;
+        }
+        // Tripwire (Step E): after the G1 seal, no volume may still hold a
+        // page-death at or below the checkpoint this commit advances to —
+        // that exact state (durable roots imply a free the deadlist never
+        // sealed) is the crash-recovery completeness bug this fixes.
+        #[cfg(debug_assertions)]
+        for vol in &volumes_snap {
+            debug_assert!(
+                vol.page_dead_list
+                    .peek()
+                    .iter()
+                    .all(|r| r.death_lsn > checkpoint_lsn),
+                "drop_snapshot G1: volume {} retains a page-death <= checkpoint_lsn {checkpoint_lsn} after seal",
+                vol.ord,
+            );
+        }
         let dedup_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
         let dedup_update = {
             let mut mstate = self.manifest_state.lock();
@@ -525,6 +550,34 @@ impl Db {
             None => None,
         };
 
+        // Crash-recovery completeness (G2): plan the page-deadlist MERGE
+        // (write the durable carried segment) BEFORE the WAL submit, and carry
+        // the resulting re-anchor in the `DropSnapshot` op. Applying the
+        // re-anchor from the op (live AND replay) makes it ATOMIC with the
+        // snapshot removal + the page frees — closing the window where a crash
+        // after the op was durable but before the next flush lost the
+        // (previously in-memory-only) merge, orphaning S's carried deaths. The
+        // carried segment is synced here, so it is durable before the op's
+        // fsync. `checkpoint_lsn` (== last_applied) stamps the segment: it is
+        // >= every carried `death_lsn` and < any post-drop death, preserving
+        // the chain-ordering invariant. `None` for clone-involved drops.
+        let merge_plan = match &inheritor_ctx {
+            Some(ctx) => Some(self.plan_page_deadlist_merge(&entry, ctx, checkpoint_lsn)?),
+            None => None,
+        };
+        let merge: Option<(crate::lifecycle_log::DropMergeTarget, PageId)> =
+            merge_plan.as_ref().map(|m| {
+                let target = match m.target {
+                    MergeTarget::Head => crate::lifecycle_log::DropMergeTarget::Head {
+                        vol_ord: entry.vol_ord,
+                    },
+                    MergeTarget::Snapshot(sid) => {
+                        crate::lifecycle_log::DropMergeTarget::Snapshot { id: sid }
+                    }
+                };
+                (target, m.anchor)
+            });
+
         // NOTE on `entry.l2p_roots_page`: this SnapshotRoots page is
         // referenced only by the manifest's snapshot entry, so it
         // *logically* becomes unreferenced when we apply the drop.
@@ -549,6 +602,7 @@ impl Db {
             pages: pages.clone(),
             pba_decrefs: pba_decrefs.clone(),
             free_pages: free_pages.clone(),
+            merge,
         };
         let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
@@ -590,34 +644,30 @@ impl Db {
             }
         }
 
-        // ZFS port Phase 2a MERGE (ZFS process_old_deadlist swap): build the
-        // inheritor's new page-deadlist chain before re-anchoring it. Pure IO
-        // (chain reads + one durable segment write) reusing the context read
-        // above.
-        let merge_plan = match &inheritor_ctx {
-            Some(ctx) => Some(self.plan_page_deadlist_merge(&entry, ctx, lsn)?),
-            None => None,
-        };
-
+        // Crash-recovery completeness (G2): apply the page-deadlist MERGE
+        // re-anchor (planned + sealed durably BEFORE the WAL submit above)
+        // atomically with S's removal. This is the LIVE application of the
+        // exact re-anchor the `DropSnapshot` op carries; WAL replay re-applies
+        // it from the op (see open.rs), so a crash on either side leaves
+        // {S present, old chains} or {S gone, merged chain} — never a
+        // half-applied merge lost before the next flush. The carried set is
+        // one segment, so head == tail == anchor.
         {
             let mut mstate = self.manifest_state.lock();
-            // Apply the merge anchor atomically with S's removal so reopen
-            // sees either {S present, old chains} or {S gone, merged chain}.
-            // The carried set is one segment, so head == tail == anchor.
             if let Some(merge) = &merge_plan {
                 match merge.target {
                     MergeTarget::Head => {
                         use std::sync::atomic::Ordering;
+                        // The carried segment already absorbed the HEAD's deaths
+                        // (the G1 seal drained the accumulator at the commit
+                        // above; `plan_page_deadlist_merge` then read the
+                        // G1-extended HEAD chain). Just re-anchor.
                         source_volume
                             .page_dead_list_head_pid
                             .store(merge.anchor, Ordering::Release);
                         source_volume
                             .page_dead_list_tail_pid
                             .store(merge.anchor, Ordering::Release);
-                        // The HEAD's pending deaths were folded into the merge
-                        // segment; clear the accumulator so they are not
-                        // re-sealed (duplicated) at the next flush.
-                        let _ = source_volume.page_dead_list.drain();
                     }
                     MergeTarget::Snapshot(sid) => {
                         if let Some(sn) =
@@ -865,6 +915,61 @@ impl Db {
         let mut free_pages: Vec<PageId> = deadlist_to_free.into_iter().collect();
         free_pages.sort_unstable();
         Ok(free_pages)
+    }
+
+    /// Crash-recovery completeness (S2 cutover prerequisite, "G1"): seal a
+    /// volume's in-memory page-deadlist accumulator (COW deaths drained into
+    /// it by `force_compact_l2p_buffers`, all with `death_lsn <= cut`) into a
+    /// durable segment EXTENDING the HEAD chain, and bump the volume's HEAD
+    /// anchors. `drop_snapshot` calls this for every volume BEFORE the commit
+    /// that advances `checkpoint_lsn` — otherwise that commit makes the
+    /// post-`force_compact` roots durable (which structurally imply those
+    /// pages free) while their death records sit only in volatile RAM, lost on
+    /// a hard crash and un-re-recordable on replay (the durable root already
+    /// folded the COW → the replayed op generation-skips → no witness). Setting
+    /// the atomics here lets `refresh_manifest_from_locked` fold the new
+    /// anchors into the SAME commit (it reads them, see `refresh_manifest_entries`).
+    /// Mirrors the flush seal (`drain_up_to_lsn` + `build_segment_pages` +
+    /// anchor bump). Restores the accumulator on IO failure so the aborted
+    /// drop is retryable.
+    fn seal_page_dead_list_accumulator(&self, vol: &Volume, cut: Lsn) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let records = vol.page_dead_list.drain_up_to_lsn(cut);
+        if records.is_empty() {
+            return Ok(());
+        }
+        let old_tail = vol.page_dead_list_tail_pid.load(Ordering::Acquire);
+        let old_head = vol.page_dead_list_head_pid.load(Ordering::Acquire);
+        let sealed = (|| -> Result<PageId> {
+            let page_count = crate::deadlist::segment_pages_for(records.len());
+            let start = self.page_store.allocate_run(page_count)?;
+            let pages = crate::deadlist::build_segment_pages(start, &records, old_tail, cut);
+            let sealed_pages: Vec<(PageId, Arc<crate::page::Page>)> =
+                pages.into_iter().map(|(p, pg)| (p, Arc::new(pg))).collect();
+            self.page_store.write_sealed_page_runs(sealed_pages)?;
+            // Durable before the anchor bump so the about-to-be-committed
+            // anchor can never reference an unsynced segment.
+            self.page_store.sync()?;
+            Ok(start)
+        })();
+        match sealed {
+            Ok(start) => {
+                let new_head = if old_head == crate::types::NULL_PAGE {
+                    start
+                } else {
+                    old_head
+                };
+                vol.page_dead_list_head_pid.store(new_head, Ordering::Release);
+                vol.page_dead_list_tail_pid.store(start, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                // Restore the drained records at the head so the aborted drop
+                // can be retried without losing them.
+                vol.page_dead_list.restore_front(records);
+                Err(e)
+            }
+        }
     }
 
     /// ZFS port Phase 2a — plan the page-deadlist MERGE for dropping

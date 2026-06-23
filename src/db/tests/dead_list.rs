@@ -311,6 +311,79 @@ fn s2_drop_snapshot_nonclone_frees_via_free_pages() {
 }
 
 #[test]
+fn s2_drop_snapshot_crash_recovery_completeness() {
+    // Crash-recovery completeness (S2 cutover prerequisite). COW deaths sitting
+    // in the in-memory page-deadlist accumulator must be sealed DURABLY,
+    // atomically with the drop_snapshot commit that advances checkpoint_lsn
+    // (G1), and the MERGE re-anchor must survive a hard crash via the WAL op
+    // (G2). Pre-fix, a Snapshot-inheritor drop left the source volume's HEAD
+    // accumulator unsealed while advancing checkpoint past it; a hard kill +
+    // reopen lost those deaths and a later drop fired MISSING/COMPLETENESS HOLE.
+    let (dir, db) = mk_db();
+    for i in 0u64..64 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let s1 = db.take_snapshot(0).unwrap();
+    for i in 0u64..64 {
+        db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
+    }
+    db.flush().unwrap();
+    let s2 = db.take_snapshot(0).unwrap();
+    // Overwrite AFTER S2 so the deaths are pinned by S2 and sit in the HEAD
+    // accumulator; NO flush, so the normal flush seal never runs for them.
+    for i in 0u64..64 {
+        db.insert(0, i, v((i as u8).wrapping_add(2))).unwrap();
+    }
+    assert!(
+        db.test_page_dead_list_len(0).unwrap_or(0) > 0,
+        "setup: post-S2 overwrite must leave deaths in the HEAD accumulator"
+    );
+
+    // Drop the OLDEST snapshot S1 → inheritor is S2 (Snapshot-inheritor): the
+    // case that pre-fix left the HEAD accumulator unsealed. G1 must seal it
+    // into the durable HEAD chain as part of the drop commit.
+    db.drop_snapshot(s1).unwrap().expect("drop s1");
+    assert_eq!(
+        db.test_page_dead_list_len(0),
+        Some(0),
+        "G1: drop_snapshot must seal the HEAD accumulator (pre-fix the Snapshot-inheritor \
+         path retained the post-S2 deaths only in volatile RAM)"
+    );
+
+    // Hard crash: drop the Db WITHOUT a final flush — the volatile accumulator
+    // is gone. Reopen replays the lifecycle journal.
+    drop(db);
+    let db = crate::Db::open(dir.path()).unwrap();
+
+    // Drop S2 (now youngest → HEAD-inheritor). Pre-fix the post-S2 deaths were
+    // lost across the crash, so the inheritor's dl_next under-counted →
+    // check_page_deadlist_shadow MISSING Corruption. Post-fix they are durable
+    // in the HEAD chain (G1) → the drop succeeds.
+    db.drop_snapshot(s2).unwrap().expect("drop s2 after crash + reopen (no MISSING)");
+    for i in 0u64..64 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v((i as u8).wrapping_add(2))), "lba {i} live");
+    }
+    db.flush().unwrap();
+    drop(db);
+    let db = crate::Db::open(dir.path()).unwrap();
+    for i in 0u64..64 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v((i as u8).wrapping_add(2))), "lba {i} reopen");
+    }
+    drop(db);
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+        },
+    )
+    .unwrap();
+    assert!(report.is_clean(), "verify after crash-recovery drop: {:?}", report.issues);
+}
+
+#[test]
 fn page_deadlist_disjoint_across_live_snapshot_chains() {
     // ZFS port Phase 2a verify (E.2): with several live snapshots each
     // owning a sealed page-deadlist chain, every dying page version is

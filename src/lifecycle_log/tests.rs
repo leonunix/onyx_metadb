@@ -39,6 +39,8 @@ fn sample_ops() -> Vec<LifecycleOp> {
             pages: vec![10, 11, 12, 13],
             pba_decrefs: vec![1000, 2000],
             free_pages: Some(vec![11, 13]),
+            // Snapshot-inheritor merge re-anchor (crash-recovery completeness).
+            merge: Some((crate::lifecycle_log::DropMergeTarget::Snapshot { id: 99 }, 4242)),
         },
         LifecycleOp::DropVolume {
             ord: 8,

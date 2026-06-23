@@ -1175,6 +1175,7 @@ fn apply_lifecycle_record_replay(
             pages,
             pba_decrefs,
             free_pages,
+            merge,
         } => {
             // Drive the same page-free + per-pba decref the live
             // `Db::drop_snapshot` path uses. Page generations + the page-rc
@@ -1192,6 +1193,34 @@ fn apply_lifecycle_record_replay(
                 pba_decrefs,
                 free_pages.as_deref(),
             )?;
+            // Crash-recovery completeness (G2): re-apply the page-deadlist
+            // MERGE re-anchor from the op ATOMICALLY with the snapshot removal
+            // below — mirrors the live `drop_snapshot`. The carried segment is
+            // durable (synced before the op). Head → bump the source volume's
+            // HEAD anchors (+ its manifest entry; the post-replay
+            // `refresh_manifest_entries` also folds the atomics); Snapshot →
+            // set the inheritor snapshot's tail. (G1's accumulator seal rode
+            // the pre-WAL commit, so it is already durable.)
+            if let Some((target, anchor)) = merge {
+                use std::sync::atomic::Ordering;
+                match target {
+                    crate::lifecycle_log::DropMergeTarget::Head { vol_ord } => {
+                        if let Some(v) = volumes.get(vol_ord) {
+                            v.page_dead_list_head_pid.store(*anchor, Ordering::Release);
+                            v.page_dead_list_tail_pid.store(*anchor, Ordering::Release);
+                        }
+                        if let Some(e) = manifest.volumes.iter_mut().find(|e| e.ord == *vol_ord) {
+                            e.page_dead_list_head_pid = *anchor;
+                            e.page_dead_list_tail_pid = *anchor;
+                        }
+                    }
+                    crate::lifecycle_log::DropMergeTarget::Snapshot { id: sid } => {
+                        if let Some(sn) = manifest.snapshots.iter_mut().find(|s| s.id == *sid) {
+                            sn.page_dead_list_tail_pid = *anchor;
+                        }
+                    }
+                }
+            }
             manifest.snapshots.retain(|s| s.id != *id);
             outcome.replayed_drop_snapshot = true;
         }

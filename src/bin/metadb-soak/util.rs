@@ -12,6 +12,21 @@ fn open_or_create_with_faults(
             cfg.livelist_condense_min_segments = n;
         }
     }
+    // ZFS port Phase 4 S2 gate: the soak defaults to direct-fold
+    // (l2p_buffer_enabled=false), but every onyx/production config runs BUFFER
+    // mode (l2p_buffer_enabled=true; nvme-detailed.toml etc.). Setting
+    // METADB_SOAK_L2P_BUFFER=1 makes the soak match production so the S2
+    // deadlist/reachability flip is validated in the mode it actually ships in.
+    // A short max-interval keeps the compactor folding periodically so deaths
+    // are sealed (and crash windows exercised) even at low write rates.
+    if matches!(std::env::var("METADB_SOAK_L2P_BUFFER").as_deref(), Ok("1") | Ok("true")) {
+        cfg.l2p_buffer_enabled = true;
+        if let Ok(raw) = std::env::var("METADB_SOAK_L2P_BUFFER_MAX_INTERVAL_MS") {
+            if let Ok(n) = raw.parse::<u64>() {
+                cfg.l2p_buffer_max_interval_ms = n;
+            }
+        }
+    }
     match Db::open_with_config_and_faults(cfg.clone(), faults.clone()) {
         Ok(db) => Ok(db),
         Err(_) => Db::create_with_config_and_faults(cfg, faults),

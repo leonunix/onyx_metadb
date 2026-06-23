@@ -47,6 +47,20 @@ pub const TAG_DISCARD: u8 = 0x50;
 /// Bumped on incompatible body changes the same way the WAL does it.
 pub const LIFECYCLE_BODY_SCHEMA_VERSION: u8 = 0xC0;
 
+/// Page-deadlist MERGE re-anchor target carried in a `DropSnapshot` op
+/// (crash-recovery completeness): the entity whose page-deadlist chain
+/// inherits the dropped snapshot's surviving deaths. Carried in the WAL op
+/// so the re-anchor is replayed ATOMICALLY with the snapshot's removal +
+/// the page frees — closing the window where a crash after the op was
+/// durable but before the next flush lost the (in-memory-only) merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropMergeTarget {
+    /// The live HEAD of the source volume (dropped snapshot was youngest).
+    Head { vol_ord: VolumeOrdinal },
+    /// The next-younger surviving snapshot's chain.
+    Snapshot { id: SnapshotId },
+}
+
 /// All op variants the lifecycle journal carries. Each variant
 /// captures everything `apply` needs to redo the op idempotently —
 /// frozen plan lists, page generations, etc.
@@ -75,6 +89,15 @@ pub enum LifecycleOp {
         pages: Vec<PageId>,
         pba_decrefs: Vec<Pba>,
         free_pages: Option<Vec<PageId>>,
+        /// Page-deadlist MERGE re-anchor (crash-recovery completeness).
+        /// `Some((target, anchor))` re-anchors `target`'s page-deadlist
+        /// chain to the durable carried segment `anchor` (`NULL_PAGE` ⇒ the
+        /// carried set was empty) — applied on both the live and replay
+        /// paths so it is atomic with the snapshot removal. `None` for
+        /// clone-involved drops (no deadlist MERGE). The source volume's
+        /// HEAD-accumulator seal is committed separately (atomic with the
+        /// pre-cascade roots-refresh commit), so it is NOT carried here.
+        merge: Option<(DropMergeTarget, PageId)>,
     },
     /// Register a fresh volume with `shard_count` empty L2P shard
     /// roots. Apply allocates per-shard paged-tree roots; the
@@ -172,6 +195,7 @@ pub fn encode(op: &LifecycleOp) -> Vec<u8> {
             pages,
             pba_decrefs,
             free_pages,
+            merge,
         } => {
             out.extend_from_slice(&id.to_le_bytes());
             put_u32(&mut out, pages.len() as u32);
@@ -183,6 +207,24 @@ pub fn encode(op: &LifecycleOp) -> Vec<u8> {
                 out.extend_from_slice(&pba.to_le_bytes());
             }
             put_opt_u64_vec(&mut out, free_pages.as_deref());
+            // merge: presence byte, then target tag + key + anchor.
+            match merge {
+                Some((target, anchor)) => {
+                    out.push(1);
+                    match target {
+                        DropMergeTarget::Head { vol_ord } => {
+                            out.push(0);
+                            out.extend_from_slice(&vol_ord.to_le_bytes());
+                        }
+                        DropMergeTarget::Snapshot { id } => {
+                            out.push(1);
+                            out.extend_from_slice(&id.to_le_bytes());
+                        }
+                    }
+                    out.extend_from_slice(&anchor.to_le_bytes());
+                }
+                None => out.push(0),
+            }
         }
         LifecycleOp::CreateVolume { ord, shard_count } => {
             out.extend_from_slice(&ord.to_le_bytes());
@@ -254,13 +296,15 @@ pub fn encode(op: &LifecycleOp) -> Vec<u8> {
 /// final segment's last record, or as a torn-tail truncation if at the
 /// final position (mirrors the WAL convention).
 ///
-/// ⚠ Body-format change (ZFS port S2): `DropSnapshot`/`DropVolume` gained a
-/// trailing `free_pages` Option. The decode is sequential + `is_at_end`-strict,
-/// so a PRE-S2 drop record (no trailing presence byte) fails CLOSED here
-/// (`opt_u64_vec` short-reads → `Corruption`) — never a silent misparse. An
-/// existing metadb must therefore be rebuilt fresh across the S2 upgrade (the
-/// soak blkdiscards). The unused `LIFECYCLE_BODY_SCHEMA_VERSION` would gate this
-/// gracefully if it were ever wired; the campaign uses fresh-rebuild instead.
+/// ⚠ Body-format change (ZFS port S2 + the deadlist crash-recovery fix):
+/// `DropSnapshot`/`DropVolume` gained a trailing `free_pages` Option, and
+/// `DropSnapshot` additionally gained a trailing `merge` Option. The decode is
+/// sequential + `is_at_end`-strict, so an OLDER drop record (missing a trailing
+/// presence byte) fails CLOSED here (`opt_u64_vec`/`u8` short-reads →
+/// `Corruption`) — never a silent misparse. An existing metadb must therefore
+/// be rebuilt fresh across the upgrade (the soak blkdiscards). The unused
+/// `LIFECYCLE_BODY_SCHEMA_VERSION` would gate this gracefully if it were ever
+/// wired; the campaign uses fresh-rebuild instead.
 pub fn decode(body: &[u8]) -> Result<LifecycleOp> {
     let mut c = Cursor::new(body);
     let tag = c.u8()?;
@@ -275,6 +319,26 @@ pub fn decode(body: &[u8]) -> Result<LifecycleOp> {
             pages: c.u64_vec()?,
             pba_decrefs: c.u64_vec()?,
             free_pages: c.opt_u64_vec()?,
+            merge: match c.u8()? {
+                0 => None,
+                1 => {
+                    let target = match c.u8()? {
+                        0 => DropMergeTarget::Head { vol_ord: c.u16()? },
+                        1 => DropMergeTarget::Snapshot { id: c.u64()? },
+                        other => {
+                            return Err(MetaDbError::Corruption(format!(
+                                "DropSnapshot: bad merge target tag {other}"
+                            )));
+                        }
+                    };
+                    Some((target, c.u64()?))
+                }
+                other => {
+                    return Err(MetaDbError::Corruption(format!(
+                        "DropSnapshot: bad merge presence byte {other}"
+                    )));
+                }
+            },
         },
         TAG_CREATE_VOLUME => LifecycleOp::CreateVolume {
             ord: c.u16()?,
