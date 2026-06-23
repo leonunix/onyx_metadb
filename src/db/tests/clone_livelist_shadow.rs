@@ -775,6 +775,64 @@ fn drop_promoted_exclones_former_parent() {
     }
 }
 
+/// ZFS port Phase 4 S2: a CLONE drop frees the reachability `exclusive` set
+/// via `DropVolume.free_pages = Some(...)` (the flip), NOT the implicit page-rc
+/// rc→0 cascade. End-to-end durable read-back: the clone's C-exclusive pages
+/// are freed, the surviving source keeps every shared page, and reopen + strict
+/// verify (incl. the page-rc array audit + clone-livelist) is clean — proving
+/// the flip frees exactly the right set with no leak or premature free.
+///
+/// NB the clone's exclusive pages are freed on the LIVE path; the DropVolume
+/// *replay* arm is a no-op (the volume-removed manifest commits before the WAL
+/// submit, so `volumes.contains_key` is false on reopen) and the crash backstop
+/// is `reclaim_orphan_pages`. We flush after the drop so the page-rc decref of
+/// the kept boundary pages folds durably (a no-flush volume drop leaves that
+/// decref unfolded — a pre-existing, data-safe over-count, out of S2 scope and
+/// removed by S3).
+#[test]
+fn s2_drop_clone_frees_exclusive_reachability_set() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let src = {
+        let db = Db::create(dir.path()).unwrap();
+        let src = db.create_volume().unwrap();
+        for i in 0u64..8 {
+            db.insert(src, i, v(i as u8)).unwrap();
+        }
+        let snap = db.take_snapshot(src).unwrap();
+        let clone = db.clone_volume(snap).unwrap();
+        // C diverges every lba so it owns clone-private (C-exclusive) pages.
+        for i in 0u64..8 {
+            db.insert(clone, i, v(0xC0 | i as u8)).unwrap();
+        }
+        // Drop the source snapshot (so it is not a survivor pinning the shared
+        // pages), then drop the clone — the flip frees C's exclusive set.
+        let _ = db.drop_snapshot(snap).unwrap().unwrap();
+        let report = db.drop_volume(clone).unwrap().expect("drop clone");
+        assert!(report.pages_freed > 0, "S2 reachability free_pages must free C-exclusive pages");
+        db.flush().unwrap();
+        assert!(!db.volumes().contains(&clone), "clone gone after drop");
+        for i in 0u64..8 {
+            assert_eq!(db.get(src, i).unwrap(), Some(v(i as u8)), "source lba {i} kept");
+        }
+        src
+    };
+    let db = Db::open(dir.path()).unwrap();
+    for i in 0u64..8 {
+        assert_eq!(db.get(src, i).unwrap(), Some(v(i as u8)), "source lba {i} after reopen");
+    }
+    drop(db);
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: true,
+        },
+    )
+    .unwrap();
+    assert!(report.is_clean(), "verify issues after clone flip drop: {:?}", report.issues);
+}
+
 /// A promoted ex-clone survives close + reopen: the sticky flag is rehydrated
 /// (so the widened gate still fires) and `clone_birth_lsn` re-arms, and the
 /// post-reopen drop stays green.

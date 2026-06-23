@@ -72,20 +72,21 @@ pub(in crate::db) fn apply_create_volume(
     )
 }
 
-/// Apply a `DropVolume` op's page-decref cascade. Reuses
-/// [`apply_drop_snapshot_pages`]; `DropVolume` has the same
-/// per-page semantics (decref, free at rc=0, idempotent via
-/// `page.generation >= lsn`) and just doesn't need the freed-leaf-values
-/// vec the snapshot path surfaces in its report.
+/// Apply a `DropVolume` op's page free. Reuses [`apply_drop_snapshot_pages`];
+/// `DropVolume` has the same per-page semantics and just doesn't need the
+/// freed-leaf-values vec the snapshot path surfaces in its report. `free_pages`
+/// is the S2 explicit free-set (`Some` for CLONE_LINEAGE drops, `None` for
+/// unflagged drops → legacy page-rc cascade); see the core for the contract.
 pub(in crate::db) fn apply_drop_volume(
     page_store: &Arc<PageStore>,
     page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     lsn: Lsn,
     txg: crate::types::Txg,
     pages: &[PageId],
+    free_pages: Option<&[PageId]>,
 ) -> Result<usize> {
     let (_leaf_values, pages_freed) =
-        apply_drop_snapshot_pages(page_store, page_rc, lsn, txg, pages)?;
+        apply_drop_snapshot_pages(page_store, page_rc, lsn, txg, pages, free_pages)?;
     Ok(pages_freed)
 }
 
@@ -181,91 +182,154 @@ pub(in crate::db) fn build_clone_volume_shards(
     Ok((shards, actual_roots.into_boxed_slice()))
 }
 
-/// Core of the `DropSnapshot` / `DropVolume` page-refcount cascade.
-/// Iterates `pages`, decrements each page's refcount by 1, stamps
-/// `generation = lsn`, and frees any page that hits rc=0. Idempotent
-/// on replay via the generation check.
+/// Read page `pid`, harvest its leaf values (if a `PagedLeaf`), and free
+/// it idempotently. Shared by both `apply_drop_snapshot_pages` branches.
+/// Crash/replay-safe: an already-freed page (truncated tail, all-zeroes,
+/// or `PageType::Free` header) counts toward `pages_freed` without a
+/// second free. `free_idempotent` stamps `generation = lsn`.
+fn harvest_and_free(
+    page_store: &Arc<PageStore>,
+    pid: PageId,
+    lsn: Lsn,
+    freed_leaf_values: &mut Vec<L2pValue>,
+    pages_freed: &mut usize,
+) -> Result<()> {
+    use crate::page::PageType;
+    // The page bytes still carry the now-dead header rc — left untouched;
+    // verify reads against the array.
+    let page = match page_store.read_page_unchecked(pid) {
+        Ok(page) => page,
+        Err(MetaDbError::PageOutOfRange(out_of_range)) if out_of_range == pid => {
+            // A prior replay may already have freed a tail page and
+            // `PageStore::open` truncated the zero/Free suffix below this
+            // pid; the page is gone because this drop already completed.
+            *pages_freed += 1;
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    if page.bytes().iter().all(|b| *b == 0) {
+        // `free_idempotent` punches freed pages; a page already freed by a
+        // crashed prior apply reads back as all zeroes.
+        *pages_freed += 1;
+        return Ok(());
+    }
+    page.verify(pid)?;
+    let header = page.header()?;
+    if header.page_type == PageType::Free {
+        // Already freed by a crashed prior apply of this op.
+        *pages_freed += 1;
+        return Ok(());
+    }
+    if matches!(header.page_type, PageType::PagedLeaf) {
+        for i in 0..crate::paged::format::LEAF_ENTRY_COUNT {
+            if crate::paged::format::leaf_bit_set(&page, i) {
+                if let Some(value) = crate::paged::format::leaf_value_at(&page, i)? {
+                    freed_leaf_values.push(value);
+                }
+            }
+        }
+    }
+    // free_idempotent stamps generation=lsn via the Free header.
+    if page_store.free_idempotent(pid, lsn)? {
+        *pages_freed += 1;
+    }
+    Ok(())
+}
+
+/// Core of the `DropSnapshot` / `DropVolume` page free.
 ///
-/// Returns `(freed_leaf_values, pages_freed)` rather than a full
-/// `ApplyOutcome` so `DropVolume` (which doesn't care about leaf values)
-/// can reuse the function without unpacking a misnamed variant.
+/// Always decrements every page in `pages` by 1 in the page-rc array
+/// (stamping `generation = lsn`, replay-idempotent via `stage`'s
+/// `page_lsn >= lsn` skip). The free decision is `free_pages`:
+///
+/// * `None` (legacy / deferred clone-involved-snapshot + unflagged-volume
+///   paths) — page-rc-AUTHORITATIVE cascade: free a page iff its decref
+///   reaches 0, confirmed with a fold-consistent `get_consistent` read.
+///   That R2 guard is LOAD-BEARING: a background page-rc fold can race
+///   this apply (the fold runs in `run_sync_cycle_body`'s gateless sample
+///   phase, serialized only by `fold_lock` — `apply_gate.write` does NOT
+///   exclude it), and the cheap staged `new` can straddle the fold's
+///   [publish, clear] window and floor a live rc to a spurious 0.
+///
+/// * `Some(set)` (ZFS port Phase 4 S2 flip) — the explicit, page-rc-
+///   INDEPENDENT free-set frozen pre-commit (deadlist for non-clone
+///   snapshots, reachability `exclusive` for CLONE_LINEAGE volumes; the
+///   HARD shadow proved `set == the page-rc free-set` before the WAL
+///   submit). Here the `pages` decref is page-rc bookkeeping ONLY (keeps
+///   the array accurate as the inverted shadow for a sibling's later
+///   drop), and we free exactly `set`. NO `get_consistent` is needed —
+///   not because the fold can't race, but because the free decision NEVER
+///   reads page-rc; it frees the structurally-frozen set. (Do not "fix"
+///   this into reading rc, and do not strip the None-path's guard.)
+///
+/// Returns `(freed_leaf_values, pages_freed)`.
 pub(in crate::db) fn apply_drop_snapshot_pages(
     page_store: &Arc<PageStore>,
     page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     lsn: Lsn,
     txg: crate::types::Txg,
     pages: &[PageId],
+    free_pages: Option<&[PageId]>,
 ) -> Result<(Vec<L2pValue>, usize)> {
-    use crate::page::PageType;
-
     let mut freed_leaf_values: Vec<L2pValue> = Vec::new();
     let mut pages_freed: usize = 0;
 
-    for &pid in pages {
-        // A3 cutover: decref the page-rc array, not the page header.
-        // Replay idempotency comes from `stage`'s `page_lsn >= lsn` skip
-        // (the analogue of the old `header.generation >= lsn` guard): a
-        // replayed decref whose array page is already folded at/after
-        // `lsn` returns `(prev, prev)` with no change, so it neither
-        // double-decrements nor re-frees.
-        let (prev, new) = page_rc.stage(txg, pid, -1, lsn)?;
-        if new != 0 || prev == 0 {
-            // Either still referenced after the decref (new > 0), or the
-            // replay-skip fired (prev == new == 0, already applied). The
-            // page rc lives in the array now, so a non-freeing decref
-            // writes nothing — there is no header to rewrite.
-            continue;
-        }
-        // 1→0 transition. Confirm with a fold-consistent read before the
-        // IRREVERSIBLE free (R2): the cheap staged `new` can straddle a
-        // concurrent fold's [publish, clear] window and floor a live rc to
-        // a spurious 0. L2P page frees are immediate (no GC gate re-check),
-        // so this is the only guard.
-        if page_rc.get_consistent(pid)? != 0 {
-            continue;
-        }
-        // rc==0 confirmed: read the page to harvest leaf values, then
-        // free it idempotently. The page bytes still carry the now-dead
-        // header rc — left untouched; verify reads against the array.
-        let page = match page_store.read_page_unchecked(pid) {
-            Ok(page) => page,
-            Err(MetaDbError::PageOutOfRange(out_of_range)) if out_of_range == pid => {
-                // A prior replay may already have freed a tail page and
-                // `PageStore::open` truncated the zero/Free suffix below
-                // this pid; the page is gone because this cascade already
-                // completed (the replay-skip above did not catch it only
-                // because the array page was not yet folded pre-crash).
-                pages_freed += 1;
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-        if page.bytes().iter().all(|b| *b == 0) {
-            // `free_idempotent` punches freed pages; a page already freed
-            // by a crashed prior apply reads back as all zeroes.
-            pages_freed += 1;
-            continue;
-        }
-        page.verify(pid)?;
-        let header = page.header()?;
-        if header.page_type == PageType::Free {
-            // Already freed by a crashed prior apply of this op.
-            pages_freed += 1;
-            continue;
-        }
-        if matches!(header.page_type, PageType::PagedLeaf) {
-            for i in 0..crate::paged::format::LEAF_ENTRY_COUNT {
-                if crate::paged::format::leaf_bit_set(&page, i) {
-                    if let Some(value) = crate::paged::format::leaf_value_at(&page, i)? {
-                        freed_leaf_values.push(value);
-                    }
+    match free_pages {
+        None => {
+            for &pid in pages {
+                // A3 cutover: decref the page-rc array, not the page header.
+                let (prev, new) = page_rc.stage(txg, pid, -1, lsn)?;
+                if new != 0 || prev == 0 {
+                    // Still referenced (new > 0), or the replay-skip fired
+                    // (prev == new == 0). A non-freeing decref writes
+                    // nothing — the rc lives in the array, no header.
+                    continue;
                 }
+                // 1→0 transition. Confirm with a fold-consistent read
+                // before the IRREVERSIBLE free (R2 guard — see fn doc).
+                if page_rc.get_consistent(pid)? != 0 {
+                    continue;
+                }
+                harvest_and_free(
+                    page_store,
+                    pid,
+                    lsn,
+                    &mut freed_leaf_values,
+                    &mut pages_freed,
+                )?;
             }
         }
-        // free_idempotent stamps generation=lsn via the Free header.
-        let pushed = page_store.free_idempotent(pid, lsn)?;
-        if pushed {
-            pages_freed += 1;
+        Some(set) => {
+            // Invariant: the frozen free-set is a subset of the decref
+            // `pages` (the shadows prove `set == structural_free`, and
+            // structural_free is filtered from `pages`). A `set` page absent
+            // from `pages` would be freed with no page-rc decref, leaving a
+            // permanent stale +1 in the array (an inverted-shadow lie). The
+            // call sites guarantee it; assert at the apply boundary (which
+            // replay also re-enters) so a future producer bug trips in test.
+            debug_assert!(
+                {
+                    let decref: std::collections::HashSet<PageId> = pages.iter().copied().collect();
+                    set.iter().all(|p| decref.contains(p))
+                },
+                "S2 free_pages must be a subset of the decref `pages`"
+            );
+            // Page-rc bookkeeping only (inverted shadow): decref every
+            // cascade-frontier page. The free is `set`, decided without
+            // reading rc.
+            for &pid in pages {
+                page_rc.stage(txg, pid, -1, lsn)?;
+            }
+            for &pid in set {
+                harvest_and_free(
+                    page_store,
+                    pid,
+                    lsn,
+                    &mut freed_leaf_values,
+                    &mut pages_freed,
+                )?;
+            }
         }
     }
 
@@ -286,9 +350,10 @@ pub(in crate::db) fn apply_drop_snapshot_pages_and_decrefs(
     txg: crate::types::Txg,
     pages: &[PageId],
     pba_decrefs: &[Pba],
+    free_pages: Option<&[PageId]>,
 ) -> Result<ApplyOutcome> {
     let (freed_leaf_values, pages_freed) =
-        apply_drop_snapshot_pages(page_store, page_rc, lsn, txg, pages)?;
+        apply_drop_snapshot_pages(page_store, page_rc, lsn, txg, pages, free_pages)?;
     let _ = refcount_shards;
     let _ = pba_decrefs;
 

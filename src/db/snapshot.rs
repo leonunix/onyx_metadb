@@ -515,9 +515,15 @@ impl Db {
         // both consumers.
         let inheritor_ctx =
             self.page_deadlist_inheritor_context(&entry, &other_snapshots, &source_volume)?;
-        if let Some(ctx) = &inheritor_ctx {
-            self.check_page_deadlist_shadow(id, &entry, &pages, &after_refs, ctx)?;
-        }
+        // ZFS port Phase 4 S2: for a NON-clone drop the deadlist is the
+        // authoritative, page-rc-independent free-set — the shadow returns it
+        // (== structural_to_free on Ok) and we freeze it into the WAL op. A
+        // clone-involved drop (inheritor_ctx None, R5/S2c) keeps the legacy
+        // page-rc cascade (`free_pages = None`).
+        let free_pages: Option<Vec<PageId>> = match &inheritor_ctx {
+            Some(ctx) => Some(self.check_page_deadlist_shadow(id, &entry, &pages, &after_refs, ctx)?),
+            None => None,
+        };
 
         // NOTE on `entry.l2p_roots_page`: this SnapshotRoots page is
         // referenced only by the manifest's snapshot entry, so it
@@ -542,6 +548,7 @@ impl Db {
             id,
             pages: pages.clone(),
             pba_decrefs: pba_decrefs.clone(),
+            free_pages: free_pages.clone(),
         };
         let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
@@ -562,6 +569,7 @@ impl Db {
             _txg_guard.txg(),
             &pages,
             &pba_decrefs,
+            free_pages.as_deref(),
         )?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
@@ -783,6 +791,10 @@ impl Db {
     /// deadlist did not predict). With the MERGE maintaining the inheritor
     /// chains the two sets are provably equal at every drop, the invariant
     /// Phase 4 needs to make the deadlist the sole free source.
+    /// Returns the deadlist-derived free-set (`deadlist_to_free`). With both
+    /// shadow directions HARD, on `Ok` it equals `structural_to_free`, so the
+    /// ZFS port Phase 4 S2 flip inlines it as the `DropSnapshot.free_pages`
+    /// authoritative, page-rc-independent free-set.
     fn check_page_deadlist_shadow(
         &self,
         id: SnapshotId,
@@ -790,7 +802,7 @@ impl Db {
         pages: &[PageId],
         after_refs: &std::collections::BTreeMap<PageId, u32>,
         ctx: &InheritorContext,
-    ) -> Result<()> {
+    ) -> Result<Vec<PageId>> {
         let vol = entry.vol_ord;
         let s_prev_created = ctx.s_prev_created;
         let structural_to_free: std::collections::HashSet<PageId> = pages
@@ -847,7 +859,12 @@ impl Db {
                 structural_to_free.len(),
             )));
         }
-        Ok(())
+        // Both directions clean ⇒ deadlist_to_free == structural_to_free.
+        // Hand it back sorted (deterministic WAL `free_pages`) as the S2
+        // authoritative free-set.
+        let mut free_pages: Vec<PageId> = deadlist_to_free.into_iter().collect();
+        free_pages.sort_unstable();
+        Ok(free_pages)
     }
 
     /// ZFS port Phase 2a — plan the page-deadlist MERGE for dropping

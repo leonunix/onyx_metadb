@@ -410,6 +410,13 @@ impl Db {
         // maps, surfaced to onyx. Declared here so it is in scope at the return
         // (stays empty for non-clones / rc-authoritative).
         let mut surfaced_freed: Vec<Pba> = Vec::new();
+        // ZFS port Phase 4 S2: the authoritative, page-rc-independent free-set
+        // frozen into the WAL op. `Some(exclusive)` for a CLONE_LINEAGE drop
+        // (the shadow returns it == structural_free); `None` for an unflagged
+        // volume (deferred to S3 — keeps the legacy page-rc cascade, which is
+        // correct because an unflagged clone *source* still shares its pages at
+        // rc>1 with a promoted ex-clone and the cascade keeps them at 2→1).
+        let mut free_pages: Option<Vec<PageId>> = None;
         // S0: the promoted-PBA edges to decref + the survivor data-PBA set are
         // COMPUTED here (read-only, under the held gates) but APPLIED post-commit
         // (see the post-commit decref block) — the refcount array writes data
@@ -475,14 +482,14 @@ impl Db {
                 recs.extend(volume.page_live_list.peek());
                 recs
             };
-            self.check_clone_livelist_shadow(
+            free_pages = Some(self.check_clone_livelist_shadow(
                 vol_ord,
                 volume.branched_at_lsn,
                 &pages_with_birth,
                 &clone_roots,
                 &surviving_roots,
                 &live_records,
-            )?;
+            )?);
 
             // ZFS port Phase 4 Step 4 (S0): close the clone-promotion global
             // PBA-rc over-pin. The promotion walker incref'd +1 per clone-
@@ -607,6 +614,7 @@ impl Db {
         let lifecycle_op = crate::lifecycle_log::LifecycleOp::DropVolume {
             ord: vol_ord,
             pages: pages.clone(),
+            free_pages: free_pages.clone(),
         };
         let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
@@ -618,8 +626,14 @@ impl Db {
             .inject(FaultPoint::DropVolumePostWalBeforeApply)?;
         self.wait_for_global_apply_turn(lsn)?;
 
-        let pages_freed =
-            apply_drop_volume(&self.page_store, &self.l2p_page_rc, lsn, _txg_guard.txg(), &pages)?;
+        let pages_freed = apply_drop_volume(
+            &self.page_store,
+            &self.l2p_page_rc,
+            lsn,
+            _txg_guard.txg(),
+            &pages,
+            free_pages.as_deref(),
+        )?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
@@ -801,6 +815,10 @@ impl Db {
     ///     three independent ground truths. The born≤B origin-fallthrough
     ///     pages page-rc frees are NOT in the livelist by construction and drop
     ///     out of both sides.
+    /// Returns the reachability `exclusive` set (sorted). With premature +
+    /// missing both HARD, on `Ok` it equals `structural_free`, so the ZFS
+    /// port Phase 4 S2 flip inlines it as the `DropVolume.free_pages`
+    /// authoritative, page-rc-independent free-set for CLONE_LINEAGE drops.
     fn check_clone_livelist_shadow(
         &self,
         vol_ord: VolumeOrdinal,
@@ -809,7 +827,7 @@ impl Db {
         clone_roots: &[PageId],
         surviving_roots: &[PageId],
         live_records: &[crate::livelist::LiveRecord],
-    ) -> Result<()> {
+    ) -> Result<Vec<PageId>> {
         use std::collections::HashSet;
 
         // LHS — page-rc structural FREE set (authoritative): pages whose -1
@@ -908,7 +926,12 @@ impl Db {
                 clone_private_freed.len(),
             )));
         }
-        Ok(())
+        // All checks clean ⇒ exclusive == structural_free. Hand it back
+        // sorted (deterministic WAL `free_pages`) as the S2 authoritative
+        // free-set.
+        let mut free_pages: Vec<PageId> = exclusive.into_iter().collect();
+        free_pages.sort_unstable();
+        Ok(free_pages)
     }
 
     /// Test shim: drive [`Db::check_clone_livelist_shadow`] with
@@ -934,6 +957,7 @@ impl Db {
             surviving_roots,
             live_records,
         )
+        .map(|_| ())
     }
 
     /// VDO-style writable clone of snapshot `src_snap_id`. The new volume's

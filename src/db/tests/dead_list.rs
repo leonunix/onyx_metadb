@@ -261,6 +261,56 @@ fn drop_middle_snapshot_merges_keep_into_s_next() {
 }
 
 #[test]
+fn s2_drop_snapshot_nonclone_frees_via_free_pages() {
+    // ZFS port Phase 4 S2: a NON-clone snapshot drop now frees the explicit,
+    // page-rc-independent deadlist set (`DropSnapshot.free_pages = Some(...)`),
+    // NOT the implicit "rc→0" cascade. The HARD `check_page_deadlist_shadow`
+    // proves the set equals the structural free-set before the WAL submit, so
+    // behaviour is unchanged: pages are actually freed, the live mapping
+    // survives, and reopen + strict verify is clean. Here S is the youngest
+    // (and only) snapshot, so the inheritor is the live HEAD.
+    let (dir, db) = mk_db();
+    for i in 0u64..200 {
+        db.insert(0, i, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let s = db.take_snapshot(0).unwrap();
+    for i in 0u64..200 {
+        db.insert(0, i, v((i as u8).wrapping_add(9))).unwrap();
+    }
+    db.flush().unwrap();
+    let report = db.drop_snapshot(s).unwrap().expect("drop youngest snapshot");
+    assert!(
+        report.pages_freed > 0,
+        "S2 deadlist free_pages must actually free the snapshot-exclusive pages"
+    );
+    for i in 0u64..200 {
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v((i as u8).wrapping_add(9))),
+            "lba {i}: live mapping lost after non-clone snapshot drop"
+        );
+    }
+    db.flush().unwrap();
+    drop(db);
+    let db = crate::Db::open(dir.path()).unwrap();
+    for i in 0u64..200 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v((i as u8).wrapping_add(9))), "reopen lba {i}");
+    }
+    drop(db);
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+        },
+    )
+    .unwrap();
+    assert!(report.is_clean(), "verify issues after S2 snapshot free: {:?}", report.issues);
+}
+
+#[test]
 fn page_deadlist_disjoint_across_live_snapshot_chains() {
     // ZFS port Phase 2a verify (E.2): with several live snapshots each
     // owning a sealed page-deadlist chain, every dying page version is

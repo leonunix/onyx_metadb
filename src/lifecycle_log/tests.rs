@@ -30,14 +30,20 @@ fn sample_ops() -> Vec<LifecycleOp> {
             start_lba: 512,
             count: 64,
         },
+        // S2: cover both `free_pages` presence-byte arms across the two ops
+        // (Some = the flip's frozen authoritative set; None = legacy page-rc
+        // cascade). Kept at exactly two ops so the replay-seq tests that
+        // hardcode `sample_ops().len()` stay valid.
         LifecycleOp::DropSnapshot {
             id: 100,
             pages: vec![10, 11, 12, 13],
             pba_decrefs: vec![1000, 2000],
+            free_pages: Some(vec![11, 13]),
         },
         LifecycleOp::DropVolume {
             ord: 8,
             pages: vec![40, 41, 42],
+            free_pages: None,
         },
     ]
 }

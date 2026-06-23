@@ -63,10 +63,18 @@ pub enum LifecycleOp {
     /// Decref every page in `pages` (already frozen at plan time) and
     /// retire the snapshot entry. Replay-idempotent via the
     /// `page.generation >= lsn` check in `apply_op`.
+    ///
+    /// ZFS port Phase 4 (S2): `free_pages` is the explicit, page-rc-
+    /// INDEPENDENT free-set frozen pre-commit. `Some(set)` (non-clone
+    /// drops) ⇒ apply frees exactly `set` (the deadlist-derived set)
+    /// and the `pages` decref is page-rc bookkeeping only. `None`
+    /// (clone-involved drops, R5/S2c) ⇒ apply keeps the legacy page-rc
+    /// cascade (free at rc→0). See `apply_drop_snapshot_pages`.
     DropSnapshot {
         id: SnapshotId,
         pages: Vec<PageId>,
         pba_decrefs: Vec<Pba>,
+        free_pages: Option<Vec<PageId>>,
     },
     /// Register a fresh volume with `shard_count` empty L2P shard
     /// roots. Apply allocates per-shard paged-tree roots; the
@@ -77,9 +85,18 @@ pub enum LifecycleOp {
     },
     /// Drop volume `ord`, decref every page in `pages`. Same
     /// idempotency protocol as `DropSnapshot`.
+    ///
+    /// ZFS port Phase 4 (S2): `free_pages` mirrors `DropSnapshot` —
+    /// `Some(set)` (CLONE_LINEAGE drops) ⇒ free the reachability
+    /// `exclusive` set; `None` (unflagged drops) ⇒ legacy page-rc
+    /// cascade. NB the `DropVolume` recovery replay arm is a no-op
+    /// (`volumes.contains_key` is false post-commit), so `free_pages`
+    /// only drives the live path; the crash backstop stays
+    /// `reclaim_orphan_pages`.
     DropVolume {
         ord: VolumeOrdinal,
         pages: Vec<PageId>,
+        free_pages: Option<Vec<PageId>>,
     },
     /// VDO-style writable clone: create `new_ord` whose initial shard
     /// roots are the inlined `src_shard_roots`. Inlining keeps replay
@@ -154,6 +171,7 @@ pub fn encode(op: &LifecycleOp) -> Vec<u8> {
             id,
             pages,
             pba_decrefs,
+            free_pages,
         } => {
             out.extend_from_slice(&id.to_le_bytes());
             put_u32(&mut out, pages.len() as u32);
@@ -164,17 +182,23 @@ pub fn encode(op: &LifecycleOp) -> Vec<u8> {
             for pba in pba_decrefs {
                 out.extend_from_slice(&pba.to_le_bytes());
             }
+            put_opt_u64_vec(&mut out, free_pages.as_deref());
         }
         LifecycleOp::CreateVolume { ord, shard_count } => {
             out.extend_from_slice(&ord.to_le_bytes());
             out.extend_from_slice(&shard_count.to_le_bytes());
         }
-        LifecycleOp::DropVolume { ord, pages } => {
+        LifecycleOp::DropVolume {
+            ord,
+            pages,
+            free_pages,
+        } => {
             out.extend_from_slice(&ord.to_le_bytes());
             put_u32(&mut out, pages.len() as u32);
             for pid in pages {
                 out.extend_from_slice(&pid.to_le_bytes());
             }
+            put_opt_u64_vec(&mut out, free_pages.as_deref());
         }
         LifecycleOp::CloneVolume {
             src_ord,
@@ -229,6 +253,14 @@ pub fn encode(op: &LifecycleOp) -> Vec<u8> {
 /// bodies. Recovery surfaces these as fatal if they appear before the
 /// final segment's last record, or as a torn-tail truncation if at the
 /// final position (mirrors the WAL convention).
+///
+/// ⚠ Body-format change (ZFS port S2): `DropSnapshot`/`DropVolume` gained a
+/// trailing `free_pages` Option. The decode is sequential + `is_at_end`-strict,
+/// so a PRE-S2 drop record (no trailing presence byte) fails CLOSED here
+/// (`opt_u64_vec` short-reads → `Corruption`) — never a silent misparse. An
+/// existing metadb must therefore be rebuilt fresh across the S2 upgrade (the
+/// soak blkdiscards). The unused `LIFECYCLE_BODY_SCHEMA_VERSION` would gate this
+/// gracefully if it were ever wired; the campaign uses fresh-rebuild instead.
 pub fn decode(body: &[u8]) -> Result<LifecycleOp> {
     let mut c = Cursor::new(body);
     let tag = c.u8()?;
@@ -242,6 +274,7 @@ pub fn decode(body: &[u8]) -> Result<LifecycleOp> {
             id: c.u64()?,
             pages: c.u64_vec()?,
             pba_decrefs: c.u64_vec()?,
+            free_pages: c.opt_u64_vec()?,
         },
         TAG_CREATE_VOLUME => LifecycleOp::CreateVolume {
             ord: c.u16()?,
@@ -250,6 +283,7 @@ pub fn decode(body: &[u8]) -> Result<LifecycleOp> {
         TAG_DROP_VOLUME => LifecycleOp::DropVolume {
             ord: c.u16()?,
             pages: c.u64_vec()?,
+            free_pages: c.opt_u64_vec()?,
         },
         TAG_CLONE_VOLUME => LifecycleOp::CloneVolume {
             src_ord: c.u16()?,
@@ -302,6 +336,22 @@ fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+/// Encode an `Option<&[u64]>` as a presence byte (0/1) followed by a
+/// length-prefixed u64 vec when present (mirrors the `next_cursor`
+/// Option pattern). `None` is a single `0` byte.
+fn put_opt_u64_vec(out: &mut Vec<u8>, v: Option<&[u64]>) {
+    match v {
+        Some(items) => {
+            out.push(1);
+            put_u32(out, items.len() as u32);
+            for x in items {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        None => out.push(0),
+    }
+}
+
 struct Cursor<'a> {
     buf: &'a [u8],
     off: usize,
@@ -351,5 +401,14 @@ impl<'a> Cursor<'a> {
             out.push(self.u64()?);
         }
         Ok(out)
+    }
+    fn opt_u64_vec(&mut self) -> Result<Option<Vec<u64>>> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.u64_vec()?)),
+            other => Err(MetaDbError::Corruption(format!(
+                "lifecycle op: bad Option<vec> presence byte {other}"
+            ))),
+        }
     }
 }

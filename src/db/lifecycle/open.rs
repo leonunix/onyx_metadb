@@ -1049,9 +1049,25 @@ fn apply_lifecycle_record_replay(
                 .next_volume_ord
                 .max(ord.checked_add(1).unwrap_or(u16::MAX));
         }
-        LifecycleOp::DropVolume { ord, pages } => {
+        LifecycleOp::DropVolume {
+            ord,
+            pages,
+            free_pages,
+        } => {
+            // NB: this arm is normally a no-op on replay — `drop_volume`
+            // commits the volume-removed manifest BEFORE the WAL submit, so
+            // `volumes.contains_key(ord)` is false here and the crash backstop
+            // is `reclaim_orphan_pages`. The S2 `free_pages` only ever drives
+            // the live path; it is threaded through for completeness.
             if volumes.contains_key(ord) {
-                apply_drop_volume(page_store, l2p_page_rc, lsn, replay_open_txg, pages)?;
+                apply_drop_volume(
+                    page_store,
+                    l2p_page_rc,
+                    lsn,
+                    replay_open_txg,
+                    pages,
+                    free_pages.as_deref(),
+                )?;
                 volumes.remove(ord);
                 manifest.volumes.retain(|v| v.ord != *ord);
                 outcome.mutated_volumes = true;
@@ -1158,10 +1174,14 @@ fn apply_lifecycle_record_replay(
             id,
             pages,
             pba_decrefs,
+            free_pages,
         } => {
-            // Drive the same page-free + per-pba decref cascade the
-            // live `Db::drop_snapshot` path uses. Page generations
-            // gate idempotency across re-applies.
+            // Drive the same page-free + per-pba decref the live
+            // `Db::drop_snapshot` path uses. Page generations + the page-rc
+            // `stage` replay-skip gate idempotency across re-applies. S2:
+            // `free_pages` carries the frozen authoritative free-set (Some
+            // for non-clone drops, None for clone-involved); the apply core
+            // honours it exactly as on the live path.
             apply_drop_snapshot_pages_and_decrefs(
                 page_store,
                 refcount_shards,
@@ -1170,6 +1190,7 @@ fn apply_lifecycle_record_replay(
                 replay_open_txg,
                 pages,
                 pba_decrefs,
+                free_pages.as_deref(),
             )?;
             manifest.snapshots.retain(|s| s.id != *id);
             outcome.replayed_drop_snapshot = true;
