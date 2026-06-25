@@ -25,6 +25,12 @@ fn spawn_child(cfg: &ParentConfig, fault: Option<FaultSpec>) -> std::io::Result<
             .arg(match fault.action {
                 FaultAction::Error => "error",
                 FaultAction::Panic => "panic",
+                // `Block` is an in-process rendezvous for two-thread interleave
+                // unit tests; it has no meaning across the soak harness's
+                // process boundary (a blocked child would just hang).
+                FaultAction::Block => {
+                    unreachable!("FaultAction::Block is not a cross-process soak fault")
+                }
             });
     }
     let mut child = cmd.spawn()?;

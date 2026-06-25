@@ -384,6 +384,108 @@ fn s2_drop_snapshot_crash_recovery_completeness() {
 }
 
 #[test]
+fn s1_promoted_exclone_buffer_fold_capture_watermark_no_hole() {
+    // ZFS port Phase 4 S1 — Bug 2 regression: a snapshot's `capture_watermark`
+    // must be the shard's true FOLD watermark (`next_generation()-1`), NOT
+    // `root_birth_lsn()`.
+    //
+    // Once a shard root forks private off a prior snapshot it is mutated IN
+    // PLACE (the RECYCLE arm returns the same pid; `PageBuf::modify` never
+    // re-stamps birth), so under a BUFFERED multi-write fold `root.birth` is the
+    // FORK lsn while leaves reachable from that root are born LATER in the same
+    // batch. A `root_birth_lsn` capture_watermark therefore UNDER-covers them.
+    //
+    // On a PROMOTED ex-clone (`clone_birth_lsn` sticky ⇒ `is_clone()` stays
+    // true ⇒ the CLONE branch of `drain_page_deaths_into` keeps a death only if
+    // `birth <= youngest_snap_below(death)`), an undercover watermark drops a
+    // snapshot-pinned death — yet the drop shadow, seeing `parent_vol_ord=None`,
+    // treats the volume as a plain one and EXPECTS that death → the HARD
+    // `check_page_deadlist_shadow` fires MISSING / COMPLETENESS HOLE. The
+    // fold-watermark covers the births, so the death is kept and the drop
+    // succeeds.
+    let dir = TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.shards_per_partition = 1;
+    cfg.l2p_buffer_enabled = true;
+    // Huge thresholds + threads-off: a batch of writes accumulates and folds in
+    // ONE pass on the explicit flush, so the clone's root forks ONCE per batch
+    // and mutates in place for the rest — the exact in-place-root shape the bug
+    // needs (a tiny soft trigger would fold each write separately, re-stamping
+    // the root birth each time and hiding the undercover).
+    cfg.l2p_buffer_soft_entries = 1_000_000;
+    cfg.l2p_buffer_hard_entries = 4_000_000;
+    cfg.l2p_buffer_max_interval_ms = 10_000_000;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    let base = db.create_volume().unwrap();
+    for i in 0u64..32 {
+        db.insert(base, i * 256, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let base_snap = db.take_snapshot(base).unwrap();
+    let clone = db.clone_volume(base_snap).unwrap();
+    assert!(db.promote_volume(clone).unwrap(), "clone should promote to independence");
+
+    // Diverge the promoted clone in ONE folded batch: the root forks once;
+    // leaves are born across the batch's lsn span (above the fork lsn).
+    for i in 0u64..32 {
+        db.insert(clone, i * 256, v((0xC0u8).wrapping_add(i as u8))).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Snapshot the promoted clone — `capture_watermark` is sampled here.
+    let s = db.take_snapshot(clone).unwrap();
+
+    // Overwrite the snapshot-pinned leaves in another folded batch → their
+    // deaths (birth = a post-fork batch lsn) are recorded against S.
+    for i in 0u64..32 {
+        db.insert(clone, i * 256, v((0x40u8).wrapping_add(i as u8))).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Pre-fix: the clone filter drops the snapshot-pinned deaths
+    // (`youngest_snap_below(death) = fork lsn < birth`) → drop_snapshot returns
+    // Err (MISSING / COMPLETENESS HOLE). Post-fix the fold watermark covers the
+    // births, so the deadlist is complete and the drop succeeds.
+    db.drop_snapshot(s)
+        .unwrap()
+        .expect("drop must not fire MISSING (Bug 2 capture_watermark undercover)");
+
+    for i in 0u64..32 {
+        assert_eq!(
+            db.get(clone, i * 256).unwrap(),
+            Some(v((0x40u8).wrapping_add(i as u8))),
+            "lba {i}: live mapping lost after promoted-ex-clone snapshot drop"
+        );
+    }
+    db.flush().unwrap();
+    drop(db);
+    let db = crate::Db::open(dir.path()).unwrap();
+    for i in 0u64..32 {
+        assert_eq!(
+            db.get(clone, i * 256).unwrap(),
+            Some(v((0x40u8).wrapping_add(i as u8))),
+            "reopen lba {i}"
+        );
+    }
+    drop(db);
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: true,
+        },
+    )
+    .unwrap();
+    assert!(
+        report.is_clean(),
+        "verify issues after promoted-ex-clone drop: {:?}",
+        report.issues
+    );
+}
+
+#[test]
 fn h1_steady_flush_seals_all_folded_page_deaths() {
     // H1 (steady-flush crash completeness). A steady flush must seal EVERY
     // page-death folded into the roots it makes durable — not just those with

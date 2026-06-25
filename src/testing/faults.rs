@@ -27,8 +27,8 @@
 //!   process kill. Used by recovery tests in combination with
 //!   `catch_unwind`.
 
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use parking_lot::{Condvar, Mutex};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -226,6 +226,15 @@ pub enum FaultAction {
     Error,
     /// Unwind with a panic, simulating a crash.
     Panic,
+    /// Block the calling thread inside `inject` until a test calls
+    /// [`FaultController::release_block`] for the same point. Lets a test
+    /// pin one thread at a precise mid-operation site and drive a second
+    /// thread through a window that would otherwise be a non-deterministic
+    /// race (e.g. flush's gateless livelist sample ↔ the background
+    /// `LivelistCondenser` re-anchor). `inject` returns `Ok(())` once
+    /// released — the blocked code path then continues normally, unlike
+    /// `Error`/`Panic`.
+    Block,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -240,11 +249,17 @@ struct FaultEntry {
 pub struct FaultController {
     enabled: AtomicBool,
     inner: Mutex<Inner>,
+    /// Wakes threads parked by a [`FaultAction::Block`] trigger when a test
+    /// calls [`FaultController::release_block`].
+    block_cvar: Condvar,
 }
 
 struct Inner {
     triggers: HashMap<FaultPoint, FaultEntry>,
     counts: HashMap<FaultPoint, u64>,
+    /// Points a test has released; a `Block`ed `inject` returns once its
+    /// point is in this set.
+    released: HashSet<FaultPoint>,
 }
 
 impl FaultController {
@@ -255,7 +270,9 @@ impl FaultController {
             inner: Mutex::new(Inner {
                 triggers: HashMap::new(),
                 counts: HashMap::new(),
+                released: HashSet::new(),
             }),
+            block_cvar: Condvar::new(),
         })
     }
 
@@ -294,7 +311,23 @@ impl FaultController {
         let mut inner = self.inner.lock();
         inner.triggers.clear();
         inner.counts.clear();
+        inner.released.clear();
         self.enabled.store(false, Ordering::Release);
+        // Wake any thread still parked on a Block trigger so `clear` can't
+        // leave it stuck forever (the trigger is gone, so it would never be
+        // released through the normal path).
+        self.block_cvar.notify_all();
+    }
+
+    /// Release every thread parked by a [`FaultAction::Block`] trigger for
+    /// `point` (and any that block on it afterward). Idempotent. Pairs with
+    /// [`FaultAction::Block`] to build deterministic two-thread interleave
+    /// tests: install `Block`, wait until [`hits`](Self::hits) shows the
+    /// blocked thread arrived, drive the second thread, then `release_block`.
+    pub fn release_block(&self, point: FaultPoint) {
+        let mut inner = self.inner.lock();
+        inner.released.insert(point);
+        self.block_cvar.notify_all();
     }
 
     /// Total number of times `point` has been seen by [`inject`] since
@@ -346,6 +379,19 @@ impl FaultController {
         match fire_action {
             Some(FaultAction::Error) => Err(MetaDbError::InjectedFault(point.name())),
             Some(FaultAction::Panic) => panic!("fault injected at {}", point.name()),
+            Some(FaultAction::Block) => {
+                // The `fire_action` scope above already dropped the lock, so we
+                // re-acquire it fresh and park on the cvar; `Condvar::wait`
+                // atomically releases it while parked, letting `release_block`
+                // (or `clear`) take the lock and wake us. Exit when the point is
+                // released OR its trigger was cleared — without the latter,
+                // `clear()` (which empties `released`) would re-park us forever.
+                let mut inner = self.inner.lock();
+                while !inner.released.contains(&point) && inner.triggers.contains_key(&point) {
+                    self.block_cvar.wait(&mut inner);
+                }
+                Ok(())
+            }
             None => Ok(()),
         }
     }
@@ -504,5 +550,43 @@ mod tests {
     fn install_with_zero_hit_panics() {
         let c = FaultController::new();
         c.install(FaultPoint::WalFsyncBefore, 0, FaultAction::Error);
+    }
+
+    #[test]
+    fn block_action_parks_until_released() {
+        let c = FaultController::new();
+        c.install(FaultPoint::PageWriteBefore, 1, FaultAction::Block);
+        let c2 = c.clone();
+        let handle = std::thread::spawn(move || c2.inject(FaultPoint::PageWriteBefore));
+        // Reaching the block bumps the hit counter; spin until the worker parks.
+        while c.hits(FaultPoint::PageWriteBefore) < 1 {
+            std::thread::yield_now();
+        }
+        // Release it and confirm the parked inject returns Ok (not Error/Panic).
+        c.release_block(FaultPoint::PageWriteBefore);
+        assert!(
+            handle.join().unwrap().is_ok(),
+            "a released Block inject must return Ok and continue"
+        );
+        // A later hit on the same (already-fired) point does not block again.
+        assert!(c.inject(FaultPoint::PageWriteBefore).is_ok());
+    }
+
+    #[test]
+    fn clear_wakes_blocked_thread() {
+        let c = FaultController::new();
+        c.install(FaultPoint::PageWriteBefore, 1, FaultAction::Block);
+        let c2 = c.clone();
+        let handle = std::thread::spawn(move || c2.inject(FaultPoint::PageWriteBefore));
+        while c.hits(FaultPoint::PageWriteBefore) < 1 {
+            std::thread::yield_now();
+        }
+        // `clear` removes the trigger; the parked thread's wait predicate sees
+        // the trigger gone and returns Ok rather than re-parking forever.
+        c.clear();
+        assert!(
+            handle.join().unwrap().is_ok(),
+            "clear() must wake a thread parked on a Block trigger"
+        );
     }
 }

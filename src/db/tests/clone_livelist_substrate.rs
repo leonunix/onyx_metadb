@@ -427,6 +427,100 @@ fn livelist_condense_fault_post_manifest_is_recoverable() {
     assert_livelist_clean(dir.path());
 }
 
+/// ZFS port Phase 3b — Bug 3 regression: the flush-seal ↔ `LivelistCondenser`
+/// re-anchor LOST-UPDATE race. Flush samples the live tail GATELESS, builds its
+/// new segment off it, then commits under `apply_gate.write()`. The condenser
+/// samples the SAME tail gatelessly, then under the SAME gate re-anchors the
+/// chain to one condensed segment and frees the OLD chain — including the tail
+/// the flush captured as its new segment's `prev`. Without the fix, whichever
+/// commits second wins: if the condenser wins the gate first, the flush then
+/// links `S_flush.prev = old_tail (now freed)` and overwrites the condenser's
+/// anchor → on the next chain walk `read_chain_records` hits a `Free` page
+/// (`wrong page_type Free`) and the condensed segment is orphaned.
+///
+/// Deterministic interleave: pin the flush at
+/// `DeadListPostSegWriteBeforeManifest` (new segment written + synced, gate not
+/// yet taken) with a `Block` trigger, run the condenser to completion while it
+/// is pinned, then release. The fix's gate-window re-validation
+/// (`bail_condenser_raced_live_lists`) must DETECT the moved tail and back the
+/// livelist append out — keeping the condenser's anchor, restoring the records
+/// for a later flush, and still committing the flush's L2P/RC work.
+#[test]
+fn livelist_flush_bails_on_condenser_reanchor_race() {
+    let (dir, db, faults, clone) = multi_segment_clone();
+    // A multi-segment chain so the condenser has something to collapse, and the
+    // tail the next flush will sample.
+    let (head0, tail0) = db.test_page_live_list_anchors(clone).unwrap();
+    assert_ne!(head0, tail0, "fixture must leave a multi-segment chain to condense");
+
+    // Dirty the clone again so the pinned flush drains FRESH livelist records
+    // and builds a new segment off `tail0`.
+    for i in 0u64..16 {
+        db.insert(clone, i * 256, v(0xE0u8 | (i as u8 & 0x0F))).unwrap();
+    }
+
+    // Pin the flush right after its new livelist segment is durable but before
+    // it takes the gate / builds the anchor overrides.
+    faults.install(
+        FaultPoint::DeadListPostSegWriteBeforeManifest,
+        1,
+        FaultAction::Block,
+    );
+    let db_flush = db.clone();
+    let flush_thread = std::thread::spawn(move || db_flush.flush());
+
+    // Wait until the flush thread parks at the block (threads-off: it drives the
+    // sync cycle on this spawned thread directly).
+    while faults.hits(FaultPoint::DeadListPostSegWriteBeforeManifest) < 1 {
+        std::thread::yield_now();
+    }
+
+    // Condense while the flush is pinned: re-anchors the chain to one condensed
+    // segment, promotes the tail atomic, and frees the OLD chain incl. `tail0`.
+    db.test_run_livelist_condense(2).unwrap();
+    let (_hc, tail_condensed) = db.test_page_live_list_anchors(clone).unwrap();
+    assert_ne!(tail_condensed, tail0, "condense did not re-anchor the live tail");
+
+    // Release the flush: the bail must keep the condenser's anchor rather than
+    // overwrite it with a segment dangling into the freed `tail0`.
+    faults.release_block(FaultPoint::DeadListPostSegWriteBeforeManifest);
+    flush_thread
+        .join()
+        .unwrap()
+        .expect("flush should still succeed after bailing the raced livelist");
+    faults.clear();
+
+    // The committed anchor is the condenser's condensed segment, NOT a stale
+    // `S_flush` — proves the flush detected the race and bailed.
+    let (_h, tail_after) = db.test_page_live_list_anchors(clone).unwrap();
+    assert_eq!(
+        tail_after, tail_condensed,
+        "flush overwrote the condenser's anchor instead of bailing (Bug 3)"
+    );
+
+    // Chain is walkable right now — the Bug-3 corruption (a new tail whose
+    // `prev` dangles into the condenser-freed `tail0`) would surface here as
+    // `read_chain_records → wrong page_type Free`.
+    let _ = db
+        .test_clone_live_allocs(clone)
+        .expect("livelist chain must stay walkable (no dangling freed prev)");
+
+    // The bail restored the drained records to the volatile accumulator. A later
+    // flush only re-drains them once its `wal_checkpoint` advances past their
+    // lsn, so drive a few real churn rounds (inserts raise the checkpoint) to
+    // let the shadow re-converge to the clone-private reachable subtree.
+    for round in 0u64..3 {
+        for i in 0u64..16 {
+            db.insert(clone, i * 256, v(0xF0u8.wrapping_add(round as u8) | (i as u8 & 0x0F)))
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+
+    drop(db);
+    assert_livelist_clean(dir.path());
+}
+
 /// Part A: dropping a clone eagerly frees its page-livelist segment chain (the
 /// page-rc decref cascade can't reach segment pages — rc 0). The volume's
 /// anchors are gone and the store stays verify-clean.
