@@ -491,7 +491,7 @@ fn run_volume_admin(
     let pinned: BTreeSet<VolumeOrdinal> = snapshots.iter().map(|s| s.vol_ord).collect();
 
     // CREATE: cap total live volumes so ords don't explode.
-    if model.l2p.len() < MAX_LIVE_VOLUMES && rng.gen_bool(0.5) {
+    if model.l2p.len() < max_live_volumes() && rng.gen_bool(0.5) {
         send_admin(child, next_id, "CREATE_VOLUME")?;
         match recv_ack(child)? {
             Ack::Volume(id, ord) if id == next_id => {
@@ -510,7 +510,7 @@ fn run_volume_admin(
     }
 
     // CLONE: roll a snapshot if we have any.
-    if model.l2p.len() < MAX_LIVE_VOLUMES && !snapshots.is_empty() && rng.gen_bool(0.4) {
+    if model.l2p.len() < max_live_volumes() && !snapshots.is_empty() && rng.gen_bool(0.4) {
         let pick = rng.gen_range(0..snapshots.len());
         let src = snapshots[pick].clone();
         send_admin(child, next_id, &format!("CLONE_VOLUME {}", src.id))?;
@@ -610,7 +610,7 @@ fn run_onyx_volume_admin(
     let pinned: BTreeSet<VolumeOrdinal> = snapshots.iter().map(|s| s.vol_ord).collect();
 
     // CREATE: cap total live volumes so ords don't explode.
-    if onyx_model.live_volumes().len() < MAX_LIVE_VOLUMES && rng.gen_bool(0.5) {
+    if onyx_model.live_volumes().len() < max_live_volumes() && rng.gen_bool(0.5) {
         send_admin(child, next_id, "CREATE_VOLUME")?;
         match recv_ack(child)? {
             Ack::Volume(id, ord) if id == next_id => {
@@ -629,7 +629,7 @@ fn run_onyx_volume_admin(
     }
 
     // CLONE: roll a snapshot if we have any.
-    if onyx_model.live_volumes().len() < MAX_LIVE_VOLUMES
+    if onyx_model.live_volumes().len() < max_live_volumes()
         && !snapshots.is_empty()
         && rng.gen_bool(0.4)
     {

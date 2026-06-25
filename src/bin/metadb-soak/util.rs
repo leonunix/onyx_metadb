@@ -7,6 +7,20 @@ fn open_or_create_with_faults(
     // concurrently with flush/drop/promote (the default is 16; a short soak
     // rarely grows a single clone chain that far). Unset = engine default.
     let mut cfg = onyx_metadb::Config::new(path);
+    // ZFS port Phase 4 S1c gate: lower the L2P shard count so more live volumes
+    // fit the single-page manifest (the capacity wall caps ~3 volumes at the
+    // default 16 shards). With `MAX_LIVE_VOLUMES=4` binding instead, clone /
+    // promote / drop churn actually gets dense — required to stress the clone
+    // COW-kill operand. Only consulted at CREATE (reopen reads the shard count
+    // from the manifest), and the parent's create env is inherited by every
+    // child. Unset = engine default (16).
+    if let Ok(raw) = std::env::var("METADB_SOAK_SHARDS") {
+        if let Ok(n) = raw.parse::<u32>() {
+            if n >= 1 {
+                cfg.shards_per_partition = n;
+            }
+        }
+    }
     if let Ok(raw) = std::env::var("METADB_SOAK_LIVELIST_CONDENSE_MIN_SEGMENTS") {
         if let Ok(n) = raw.parse::<usize>() {
             cfg.livelist_condense_min_segments = n;
