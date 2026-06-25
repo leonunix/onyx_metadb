@@ -722,6 +722,7 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
             volume.dead_list_head_pid,
             volume.dead_list_tail_pid,
             &mut live,
+            true, // PBA chain: strict ordering (single wal_checkpoint bound).
         )?;
         // ZFS port Phase 2: the volume's HEAD page-deadlist chain (L2P
         // metadata-page deaths) is a SECOND independent chain. Without
@@ -734,6 +735,7 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
             volume.page_dead_list_head_pid,
             volume.page_dead_list_tail_pid,
             &mut live,
+            false, // H1 page chain: per-shard seal bounds → ordering relaxed to warn.
         )?;
         // ZFS port Phase 3b: the per-clone page-livelist chain (clone-private
         // page ALLOC/FREE log) is a THIRD independent chain. Mark its segment
@@ -894,6 +896,15 @@ fn walk_dead_list_chain(
     head_pid: PageId,
     tail_pid: PageId,
     live: &mut LivePages,
+    // H1: `strict` enforces the "max_lsn strictly older going backward"
+    // cross-segment ordering as a HARD Corruption. The PBA chain keeps it
+    // (true); the page chain relaxes it to a warn (false) because per-shard
+    // seal bounds (`root_birth_lsn(shard)`) make adjacent segments' LSN ranges
+    // legitimately overlap across shards. The invariant is NON-load-bearing for
+    // the free/merge logic (`read_chain_records` flattens; `dl_record_freed` is
+    // a pure per-record predicate; the merge re-sorts) — kept only as a
+    // tripwire that has historically caught orphaned-tail / broken-prev bugs.
+    strict: bool,
 ) -> Result<()> {
     if tail_pid == NULL_PAGE {
         if head_pid != NULL_PAGE {
@@ -929,10 +940,20 @@ fn walk_dead_list_chain(
         let seg = crate::deadlist::SegmentHeader::decode(page.payload())?;
         if let Some(prev_min) = prev_min_lsn {
             if seg.max_lsn >= prev_min {
-                return Err(MetaDbError::Corruption(format!(
-                    "dead-list segment at {cur} max_lsn={} >= next segment min_lsn={prev_min} (chain must be strictly older going backward)",
-                    seg.max_lsn
-                )));
+                if strict {
+                    return Err(MetaDbError::Corruption(format!(
+                        "dead-list segment at {cur} max_lsn={} >= next segment min_lsn={prev_min} (chain must be strictly older going backward)",
+                        seg.max_lsn
+                    )));
+                }
+                // H1: page chain — per-shard seal bounds make this overlap
+                // legitimate; warn (keep the tripwire visible) and continue.
+                tracing::warn!(
+                    page = cur,
+                    max_lsn = seg.max_lsn,
+                    next_min_lsn = prev_min,
+                    "page-deadlist segment LSN range overlaps the next segment (expected under per-shard seal; not corruption)"
+                );
             }
         }
         for i in 0..seg.seg_page_count as u64 {

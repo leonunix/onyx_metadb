@@ -611,6 +611,30 @@ impl Db {
             commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
             commit_refcount_checkpoint(&refcount_shards, last_applied.max(1) + 1)?;
 
+            // ZFS port (H1 tripwire): this commit advanced `checkpoint_lsn` to
+            // `last_applied` and made every L2P root durable. ZFS-faithfully,
+            // every page-death those durable roots imply (`death_lsn <=
+            // last_applied`) MUST already be sealed durably in this same commit.
+            // If a volume still holds such a death only in its volatile
+            // accumulator, the durable deadlist is INCOMPLETE w.r.t. the durable
+            // roots and a later `drop_snapshot` fires a COMPLETENESS HOLE. This
+            // is the recovery-commit analogue of the drop_snapshot G1 tripwire;
+            // it converts the (multi-hour-soak-only) latent leak into a
+            // deterministic in-process failure.
+            #[cfg(debug_assertions)]
+            for vol in &sorted {
+                for (s, acc) in vol.page_dead_list.iter().enumerate() {
+                    debug_assert!(
+                        acc.peek().iter().all(|r| r.death_lsn > last_applied),
+                        "recovery post-replay commit advanced checkpoint_lsn={last_applied} but \
+                         volume {} shard {s} retains an unsealed page-death death_lsn<=checkpoint_lsn \
+                         (recovery deadlist-seal gap): {:?}",
+                        vol.ord,
+                        acc.peek().iter().map(|r| r.death_lsn).filter(|&d| d <= last_applied).collect::<Vec<_>>(),
+                    );
+                }
+            }
+
             // Open-path counterpart of `Db::reclaim_freed_pages`: no
             // readers can be pinned yet, so every deferred entry queued
             // by the checkpoint above is reclaimable in one pass. Done

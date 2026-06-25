@@ -444,8 +444,8 @@ impl Db {
         for vol in &volumes_snap {
             debug_assert!(
                 vol.page_dead_list
-                    .peek()
                     .iter()
+                    .flat_map(|a| a.peek())
                     .all(|r| r.death_lsn > checkpoint_lsn),
                 "drop_snapshot G1: volume {} retains a page-death <= checkpoint_lsn {checkpoint_lsn} after seal",
                 vol.ord,
@@ -786,7 +786,8 @@ impl Db {
                         .load(std::sync::atomic::Ordering::Acquire),
                     |p| self.page_store.read_page(p),
                 )?;
-                recs.extend(source_volume.page_dead_list.peek());
+                // H1: the accumulator fans out per shard — peek them all.
+                recs.extend(source_volume.page_dead_list.iter().flat_map(|a| a.peek()));
                 (MergeTarget::Head, recs)
             }
         };
@@ -934,7 +935,22 @@ impl Db {
     /// drop is retryable.
     fn seal_page_dead_list_accumulator(&self, vol: &Volume, cut: Lsn) -> Result<()> {
         use std::sync::atomic::Ordering;
-        let records = vol.page_dead_list.drain_up_to_lsn(cut);
+        // H1: drain EVERY shard accumulator at the uniform `cut`. Sound here
+        // (unlike the steady flush, which must use a per-shard bound) because
+        // drop_snapshot's `force_compact` folded every shard to
+        // `last_applied == cut` under `drop_gate.write`, so each shard's durable
+        // root reflects all its deaths <= cut. The per-shard drains merge into
+        // ONE segment (single chain); `provenance` lets the IO-failure path
+        // restore each sub-vec to its own accumulator so the drop is retryable.
+        let mut records: Vec<crate::deadlist::DeadRecord> = Vec::new();
+        let mut provenance: Vec<(usize, Vec<crate::deadlist::DeadRecord>)> = Vec::new();
+        for (s_idx, acc) in vol.page_dead_list.iter().enumerate() {
+            let recs = acc.drain_up_to_lsn(cut);
+            if !recs.is_empty() {
+                records.extend_from_slice(&recs);
+                provenance.push((s_idx, recs));
+            }
+        }
         if records.is_empty() {
             return Ok(());
         }
@@ -964,10 +980,67 @@ impl Db {
                 Ok(())
             }
             Err(e) => {
-                // Restore the drained records at the head so the aborted drop
-                // can be retried without losing them.
-                vol.page_dead_list.restore_front(records);
+                // Restore each shard's drained records to its OWN accumulator so
+                // the aborted drop can be retried without losing or mis-binding
+                // them (a flat restore into shard 0 would corrupt the per-shard
+                // seal bound on the next attempt).
+                for (s_idx, recs) in provenance {
+                    vol.page_dead_list[s_idx].restore_front(recs);
+                }
                 Err(e)
+            }
+        }
+    }
+
+    /// H1 (ZFS-faithful): seal EVERY listed volume's page-deadlist accumulator
+    /// into its durable HEAD chain at `cut`, so a checkpoint-advancing manifest
+    /// commit that makes these volumes' L2P roots durable ALSO makes the
+    /// page-deaths those roots imply durable IN THE SAME COMMIT (the bumped
+    /// HEAD anchors fold via `refresh_manifest_from_locked` /
+    /// `refresh_manifest_entries`). This is the generalization of the
+    /// `drop_snapshot` G1 seal: EVERY lifecycle op that `force_compact`s the
+    /// buffer before a checkpoint-advancing commit (`drop_volume`, recovery's
+    /// post-replay commit, in-place restore) MUST call this with
+    /// `cut = checkpoint_lsn` first — otherwise a folded death becomes
+    /// durable-dead with no durable death record and a later `drop_snapshot`
+    /// fires a COMPLETENESS HOLE (the produced-then-lost crash-recovery bug).
+    /// `flush` (per-shard drain-under-guard) and `drop_snapshot` already seal
+    /// inline; this serves the other sites. Call BEFORE the manifest commit so
+    /// the anchors fold into the same commit; on IO failure each accumulator is
+    /// restored (per-shard) so the operation stays retryable.
+    pub(in crate::db) fn seal_all_page_dead_lists(
+        &self,
+        volumes: &[std::sync::Arc<Volume>],
+        cut: Lsn,
+    ) -> Result<()> {
+        for vol in volumes {
+            self.seal_page_dead_list_accumulator(vol, cut)?;
+        }
+        Ok(())
+    }
+
+    /// H1 tripwire: after a checkpoint-advancing commit, no volume may retain a
+    /// page-death with `death_lsn <= checkpoint_lsn` — that exact state (durable
+    /// roots imply a free the durable deadlist never sealed) is the
+    /// crash-recovery completeness bug. Debug-only; converts the
+    /// (multi-hour-soak-only) latent leak into a deterministic in-process test
+    /// failure so any future checkpoint-advancing commit that forgets to seal
+    /// fails immediately.
+    #[cfg(debug_assertions)]
+    pub(in crate::db) fn debug_assert_page_deaths_sealed(
+        &self,
+        volumes: &[std::sync::Arc<Volume>],
+        checkpoint_lsn: Lsn,
+    ) {
+        for vol in volumes {
+            for (s, acc) in vol.page_dead_list.iter().enumerate() {
+                debug_assert!(
+                    acc.peek().iter().all(|r| r.death_lsn > checkpoint_lsn),
+                    "checkpoint_lsn={checkpoint_lsn} committed but volume {} shard {s} retains an \
+                     unsealed page-death death_lsn<=checkpoint_lsn (deadlist-seal gap): {:?}",
+                    vol.ord,
+                    acc.peek().iter().map(|r| r.death_lsn).filter(|&d| d <= checkpoint_lsn).collect::<Vec<_>>(),
+                );
             }
         }
     }

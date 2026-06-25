@@ -1119,7 +1119,18 @@ struct Volume {
     /// from `dead_list` (PBAs) above; same [`crate::deadlist`] codec.
     /// Pushed by the apply-layer / compactor-fold emitter, drained at
     /// checkpoint, sealed into a snapshot on `take_snapshot`.
-    page_dead_list: Arc<crate::deadlist::DeadListState>,
+    ///
+    /// H1 (ZFS port Phase 4): **one accumulator per L2P shard** (`len ==
+    /// shards.len()`), not one per volume. The steady flush drains each
+    /// shard under its OWN durable-root watermark `root_birth_lsn(shard)`
+    /// (`flush.rs`), which is the exact crash-complete seal bound — a
+    /// single per-volume bound is provably unsound (max over-seals a
+    /// low-folded shard → premature free; min leaves the residual). The
+    /// chain itself stays single per volume (the per-shard drains merge
+    /// into one segment); only this RAM accumulator fans out by shard.
+    /// Every push site routes to `page_dead_list[sid]` with the L2P shard
+    /// index in scope; drop-time seal / peek / rollback fan out over all.
+    page_dead_list: Vec<Arc<crate::deadlist::DeadListState>>,
     /// v18: oldest segment of the HEAD page-deadlist chain. Loaded from
     /// `VolumeEntry.page_dead_list_head_pid`; reset to `NULL_PAGE` when a
     /// snapshot seals the chain.
@@ -1162,8 +1173,18 @@ struct Volume {
     promotion_cursor: parking_lot::RwLock<Option<crate::types::Lba>>,
 }
 
+/// Build one fresh page-deadlist accumulator per L2P shard (H1: the HEAD
+/// page-deadlist fans out by shard so the flush can seal each shard under
+/// its own `root_birth_lsn`; see [`Volume::page_dead_list`]).
+fn fresh_page_dead_lists(nshards: usize) -> Vec<Arc<crate::deadlist::DeadListState>> {
+    (0..nshards)
+        .map(|_| Arc::new(crate::deadlist::DeadListState::new()))
+        .collect()
+}
+
 impl Volume {
     fn new(ord: VolumeOrdinal, shards: Vec<L2pShard>, created_lsn: Lsn) -> Self {
+        let nshards = shards.len();
         Self {
             ord,
             shards,
@@ -1172,7 +1193,7 @@ impl Volume {
             dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             dead_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
             dead_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
-            page_dead_list: Arc::new(crate::deadlist::DeadListState::new()),
+            page_dead_list: fresh_page_dead_lists(nshards),
             page_dead_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
             page_dead_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
             page_live_list: Arc::new(crate::livelist::LiveListState::new()),
@@ -1193,6 +1214,7 @@ impl Volume {
         head_pid: crate::types::PageId,
         tail_pid: crate::types::PageId,
     ) -> Self {
+        let nshards = shards.len();
         Self {
             ord,
             shards,
@@ -1201,7 +1223,7 @@ impl Volume {
             dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             dead_list_head_pid: AtomicU64::new(head_pid),
             dead_list_tail_pid: AtomicU64::new(tail_pid),
-            page_dead_list: Arc::new(crate::deadlist::DeadListState::new()),
+            page_dead_list: fresh_page_dead_lists(nshards),
             page_dead_list_head_pid: AtomicU64::new(crate::types::NULL_PAGE),
             page_dead_list_tail_pid: AtomicU64::new(crate::types::NULL_PAGE),
             page_live_list: Arc::new(crate::livelist::LiveListState::new()),
@@ -1258,6 +1280,7 @@ impl Volume {
                 shard.tree.write().set_clone_birth_lsn(Some(b));
             }
         }
+        let nshards = shards.len();
         Self {
             ord,
             shards,
@@ -1266,7 +1289,7 @@ impl Volume {
             dead_list: Arc::new(crate::deadlist::DeadListState::new()),
             dead_list_head_pid: AtomicU64::new(head_pid),
             dead_list_tail_pid: AtomicU64::new(tail_pid),
-            page_dead_list: Arc::new(crate::deadlist::DeadListState::new()),
+            page_dead_list: fresh_page_dead_lists(nshards),
             page_dead_list_head_pid: AtomicU64::new(page_dead_list_head_pid),
             page_dead_list_tail_pid: AtomicU64::new(page_dead_list_tail_pid),
             page_live_list: Arc::new(crate::livelist::LiveListState::new()),
@@ -1594,7 +1617,8 @@ impl Db {
         self.volumes
             .read()
             .get(&vol_ord)
-            .map(|v| v.page_dead_list.len())
+            // H1: accumulator fans out per shard — sum across them.
+            .map(|v| v.page_dead_list.iter().map(|a| a.len()).sum())
     }
 
     /// ZFS port Phase 2 test helper: the volume's HEAD page-deadlist

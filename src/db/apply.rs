@@ -147,7 +147,7 @@ pub(super) fn apply_op_bare(
             // ZFS port Phase 2: L2pPut COWs the root→leaf path on a direct
             // (non-buffer) write; record any page it displaced off the
             // head. Buffer mode COWs in the fold (witness empty here).
-            l2p::drain_page_deaths(volume, &mut tree, &snap_infos);
+            l2p::drain_page_deaths(volume, sid, &mut tree, &snap_infos);
             l2p::drain_live_events(volume, &mut tree);
             Ok(ApplyOutcome::L2pPrev(prev))
         }
@@ -188,7 +188,7 @@ pub(super) fn apply_op_bare(
             }
             // ZFS port Phase 2: a direct delete COWs the path to the
             // deleted leaf; record any displaced page.
-            l2p::drain_page_deaths(volume, &mut tree, &snap_infos);
+            l2p::drain_page_deaths(volume, sid, &mut tree, &snap_infos);
             l2p::drain_live_events(volume, &mut tree);
             Ok(ApplyOutcome::L2pPrev(prev))
         }

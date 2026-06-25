@@ -86,13 +86,19 @@ pub(in crate::db) fn snapshot_wms_of(snap_infos: &[SnapInfo]) -> Vec<Lsn> {
 /// live). Fires from BOTH the direct-apply tree COW and the buffer-fold COW (the
 /// only two `cow_for_write` entry points). The records carry the dying `PageId`
 /// in `DeadRecord.pba`.
+///
+/// H1: routes to `volume.page_dead_list[sid]` — the per-L2P-shard accumulator
+/// for the shard that performed the COW. `sid` is the shard index the caller
+/// already computed (`shard_for_key_l2p` / the fold loop / the lane key).
+/// Out-of-range `sid` panics (a loud guard so a missed push site fails fast).
 #[inline]
 pub(in crate::db) fn drain_page_deaths(
     volume: &Volume,
+    sid: usize,
     tree: &mut PagedL2p,
     _snap_infos: &[SnapInfo],
 ) {
-    drain_page_deaths_into(&volume.page_dead_list, tree);
+    drain_page_deaths_into(&volume.page_dead_list[sid], tree);
 }
 
 /// Lower-level page-death drainer. ALWAYS drains the witness (clears it so it
@@ -328,7 +334,7 @@ pub(in crate::db) fn apply_l2p_remap(
     // off the head into the HEAD page-deadlist. Direct mode COWs at
     // `tree.insert_at_lsn` above; buffer mode COWs later in the fold (the
     // witness is empty here, drained by the fold instead).
-    drain_page_deaths(volume, &mut tree, snap_infos);
+    drain_page_deaths(volume, l2p_sid, &mut tree, snap_infos);
     drain_live_events(volume, &mut tree);
 
     Ok(ApplyOutcome::L2pRemap {
@@ -646,7 +652,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
         // tree-locked path COWs (the lock-light buffer path `continue`d
         // above without touching the tree); buffer-mode COW happens in
         // the fold.
-        drain_page_deaths(volume, &mut tree, snap_infos);
+        drain_page_deaths(volume, l2p_sid, &mut tree, snap_infos);
         drain_live_events(volume, &mut tree);
     }
 
@@ -754,7 +760,7 @@ pub(in crate::db) fn apply_l2p_range_delete(
         publish_l2p_read_view(&volume.shards[sid], &tree);
         // ZFS port Phase 2: a range delete COWs the path to each deleted
         // leaf; record any page displaced off the head.
-        drain_page_deaths(volume, &mut tree, snap_infos);
+        drain_page_deaths(volume, sid, &mut tree, snap_infos);
         drain_live_events(volume, &mut tree);
     }
 

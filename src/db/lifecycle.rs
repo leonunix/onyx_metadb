@@ -77,6 +77,13 @@ struct DeadListDrainEntry {
     old_head: PageId,
     old_tail: PageId,
     kind: DeadListKind,
+    /// H1: per-shard provenance of a `Page` entry's drained records. The
+    /// `records` field is the concatenation of these (one merged segment per
+    /// volume keeps the chain single), but rollback must restore each sub-vec
+    /// into `page_dead_list[shard_idx]` — a flat restore into shard 0 would
+    /// permanently mis-bound a non-shard-0 death (shard 0's next-cycle
+    /// `root_birth_lsn` could exclude it forever). Empty for `Pba` / `Live`.
+    page_provenance: Vec<(usize, Vec<crate::deadlist::DeadRecord>)>,
 }
 
 /// Drained records for one chain. PBA / page deadlists carry
@@ -645,7 +652,7 @@ impl Db {
     fn compact_volume_buffers(&self, vol: &Arc<Volume>) -> Result<()> {
         use std::time::Instant;
         let snapshot_wms = self.snapshot_wms(vol.ord);
-        for shard in &vol.shards {
+        for (shard_idx, shard) in vol.shards.iter().enumerate() {
             if !shard.use_buffer {
                 continue;
             }
@@ -684,8 +691,9 @@ impl Db {
                 Ok(()) => {
                     // ZFS port Phase 2: harvest page-deaths from this
                     // all-slots fold before releasing the tree lock.
+                    // H1: route to this shard's own accumulator.
                     super::apply::drain_page_deaths_into(
-                        &vol.page_dead_list,
+                        &vol.page_dead_list[shard_idx],
                         &mut tree,
                     );
                     // ZFS port Phase 3b: same fold site for the per-clone
@@ -789,7 +797,8 @@ impl Db {
                                 txg,
                                 metrics,
                                 chunk_entries,
-                                page_dead_list,
+                                // H1: this shard's own page-death accumulator.
+                                &page_dead_list[shard_idx],
                                 page_live_list,
                                 snapshot_wms,
                             )
@@ -810,7 +819,7 @@ impl Db {
         } else {
             for vol in &vols {
                 let snapshot_wms = self.snapshot_wms(vol.ord);
-                for shard in &vol.shards {
+                for (shard_idx, shard) in vol.shards.iter().enumerate() {
                     if !shard.use_buffer {
                         continue;
                     }
@@ -819,7 +828,8 @@ impl Db {
                         txg,
                         metrics,
                         chunk_entries,
-                        &vol.page_dead_list,
+                        // H1: this shard's own page-death accumulator.
+                        &vol.page_dead_list[shard_idx],
                         &vol.page_live_list,
                         snapshot_wms.clone(),
                     )?;

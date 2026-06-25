@@ -27,6 +27,15 @@ fn open_or_create_with_faults(
             }
         }
     }
+    // Production (nvme-detailed.toml) runs txg_threads_enabled=true: the fold is
+    // the background TxgSyncThread's `drain_syncing_slot_into_trees`, not the
+    // inline `force_compact_l2p_buffers`. The soak defaults to threads-OFF, so
+    // the production fold path is otherwise never crash/restart-exercised.
+    // METADB_SOAK_TXG_THREADS=1 closes that coverage gap (a hard merge gate for
+    // the S2 flip alongside the threads-OFF run).
+    if matches!(std::env::var("METADB_SOAK_TXG_THREADS").as_deref(), Ok("1") | Ok("true")) {
+        cfg.txg_threads_enabled = true;
+    }
     match Db::open_with_config_and_faults(cfg.clone(), faults.clone()) {
         Ok(db) => Ok(db),
         Err(_) => Db::create_with_config_and_faults(cfg, faults),

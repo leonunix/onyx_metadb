@@ -575,6 +575,22 @@ impl Db {
         // a crash between cascade and a *later* commit would leave
         // the on-disk manifest pointing at Free pages, and
         // `open_l2p_shards` would fail at the next open.
+        // H1 (ZFS-faithful): the `force_compact_l2p_buffers()` above folded
+        // EVERY surviving volume's buffer, pushing snapshot-pinned page-deaths
+        // into their accumulators. This commit makes those folded roots durable
+        // and advances `checkpoint_lsn`, so the deaths those roots imply MUST be
+        // sealed into the SAME commit — otherwise they survive only in volatile
+        // RAM and a hard crash loses them (produced-then-lost), so a later
+        // `drop_snapshot` fires a COMPLETENESS HOLE. Mirrors the `drop_snapshot`
+        // G1 seal; the bumped HEAD anchors fold via `refresh_manifest_from_locked`
+        // below. The dropped volume itself is skipped (its deadlist is freed by
+        // the cascade after the commit).
+        let survivors: Vec<Arc<Volume>> = volumes_snap
+            .iter()
+            .filter(|v| v.ord != vol_ord)
+            .cloned()
+            .collect();
+        self.seal_all_page_dead_lists(&survivors, checkpoint_lsn)?;
         let dedup_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
         let dedup_update = {
             let mut mstate = self.manifest_state.lock();
@@ -610,6 +626,10 @@ impl Db {
         commit_refcount_checkpoint(&self.refcount_shards, dedup_generation)?;
         self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
         drop(l2p_guards);
+        // H1 tripwire: this commit advanced checkpoint_lsn; no surviving volume
+        // may retain a page-death the durable roots imply (death_lsn <= cut).
+        #[cfg(debug_assertions)]
+        self.debug_assert_page_deaths_sealed(&survivors, checkpoint_lsn);
 
         let lifecycle_op = crate::lifecycle_log::LifecycleOp::DropVolume {
             ord: vol_ord,

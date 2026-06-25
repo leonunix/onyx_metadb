@@ -449,7 +449,7 @@ impl Db {
             // page-deadlist. This is the dominant write path (single +
             // batched L2pPut/L2pDelete/unguarded L2pRemap all land here),
             // so it MUST drain — otherwise the witness leaks across ops.
-            super::apply::drain_page_deaths_into(&volume.page_dead_list, &mut tree);
+            super::apply::drain_page_deaths_into(&volume.page_dead_list[sid], &mut tree);
             // ZFS port Phase 3b: same site for the per-clone page-livelist
             // witness (empty for non-clones).
             super::apply::drain_live_events_into(&volume.page_live_list, &mut tree);

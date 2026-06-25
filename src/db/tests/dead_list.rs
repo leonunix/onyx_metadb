@@ -384,6 +384,139 @@ fn s2_drop_snapshot_crash_recovery_completeness() {
 }
 
 #[test]
+fn h1_steady_flush_seals_all_folded_page_deaths() {
+    // H1 (steady-flush crash completeness). A steady flush must seal EVERY
+    // page-death folded into the roots it makes durable — not just those with
+    // death_lsn <= wal_checkpoint. Pre-fix, the gate-free sample could fold a
+    // shard's root past wal_checkpoint while the page drain bounded at
+    // wal_checkpoint, leaving those durable-in-root deaths only in volatile RAM
+    // → lost on a hard crash → a later drop fired MISSING. The fix drains each
+    // shard's WHOLE accumulator under its tree guard, atomic with the root
+    // capture, so the seal cannot lag the durable root. (A `root_birth_lsn`
+    // bound is NOT sufficient: once a shard root forks private off the snapshot
+    // it is mutated in place without bumping its birth, so a later snapshot-
+    // pinned leaf death can sit above the root birth.)
+    let (dir, db) = mk_db();
+    // Leaf-spaced LBAs so each lands in a distinct leaf, spreading the dying
+    // pages across many (non-shard-0) L2P shards.
+    for i in 0u64..16 {
+        db.insert(0, i * 256, v(0x10 | i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let snap = db.take_snapshot(0).unwrap();
+    // Overwrite all → snapshot-pinned pages die off the head into the per-shard
+    // accumulators.
+    for i in 0u64..16 {
+        db.insert(0, i * 256, v(0xA0 | i as u8)).unwrap();
+    }
+    assert!(
+        db.test_page_dead_list_len(0).unwrap_or(0) > 0,
+        "setup: snapshot+overwrite must leave page-deaths in the accumulators"
+    );
+    // THE H1 SEAL POINT: a forced flush selects every shard, so it must drain
+    // every shard's accumulator completely — nothing left in RAM to lose.
+    db.flush().unwrap();
+    assert_eq!(
+        db.test_page_dead_list_len(0),
+        Some(0),
+        "H1: a forced flush must seal EVERY folded page-death across all shards"
+    );
+    // Hard crash WITHOUT a further flush, then reopen: the deaths must be
+    // durable in the sealed chain (pre-fix they were only in volatile RAM).
+    drop(db);
+    let db = crate::Db::open(dir.path()).unwrap();
+    // Drop the snapshot post-crash: the inherited deaths must be present (no
+    // MISSING) since the steady flush sealed them durably before the crash.
+    db.drop_snapshot(snap)
+        .unwrap()
+        .expect("drop after crash + reopen must not fire MISSING");
+    for i in 0u64..16 {
+        assert_eq!(
+            db.get(0, i * 256).unwrap(),
+            Some(v(0xA0 | i as u8)),
+            "lba {} live after drop",
+            i * 256
+        );
+    }
+    db.flush().unwrap();
+    drop(db);
+    // Reopen so `reclaim_orphan_pages` collects the dropped snapshot's deferred
+    // `SnapshotRoots` + deadlist pages (drop_snapshot leaves them for the next
+    // open by design, see snapshot.rs); offline `verify_path` does NOT reclaim,
+    // so without this the benign deferred orphans would be flagged.
+    let db = crate::Db::open(dir.path()).unwrap();
+    for i in 0u64..16 {
+        assert_eq!(db.get(0, i * 256).unwrap(), Some(v(0xA0 | i as u8)), "lba {} reopen", i * 256);
+    }
+    drop(db);
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+        },
+    )
+    .unwrap();
+    assert!(report.is_clean(), "verify after H1 crash-recovery: {:?}", report.issues);
+}
+
+#[test]
+fn h1_drop_volume_seals_other_volumes_page_deaths() {
+    // H1 (produced-then-lost — the soak's COMPLETENESS HOLE). drop_volume
+    // `force_compact`s EVERY volume's buffer (folding pending overwrites into
+    // snapshot-pinned page-deaths) and commits a checkpoint that makes those
+    // roots durable + advances checkpoint_lsn. Pre-fix it did NOT seal the
+    // page-deadlist accumulators, so a SURVIVING volume's just-folded deaths
+    // lived only in volatile RAM; a hard crash lost them and a later
+    // drop_snapshot fired a COMPLETENESS HOLE. The fix seals every surviving
+    // volume's accumulator into that same commit (ZFS-faithful: a death is
+    // durable iff the fold that produced it is durable, in one commit).
+    let (dir, db) = mk_db();
+    let victim = db.create_volume().unwrap(); // a second volume, dropped below
+    // Volume 0 (the survivor): write, flush, snapshot, then overwrite WITHOUT
+    // flushing so its snapshot-pinned page-deaths sit UNFOLDED in the buffer.
+    for i in 0u64..16 {
+        db.insert(0, i * 256, v(0x10 | i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let snap = db.take_snapshot(0).unwrap();
+    for i in 0u64..16 {
+        db.insert(0, i * 256, v(0xA0 | i as u8)).unwrap();
+    }
+    // Drop the OTHER volume: this force_compacts volume 0's buffer (producing
+    // its snapshot-pinned deaths) and advances the checkpoint. The fix must
+    // seal volume 0's deaths into THIS commit.
+    db.drop_volume(victim).unwrap().expect("drop victim volume");
+    // Hard crash WITHOUT a further flush, then reopen.
+    drop(db);
+    let db = crate::Db::open(dir.path()).unwrap();
+    // The snapshot-pinned deaths must be durable -> drop succeeds (no MISSING).
+    db.drop_snapshot(snap)
+        .unwrap()
+        .expect("drop after drop_volume + crash + reopen must not fire MISSING");
+    for i in 0u64..16 {
+        assert_eq!(db.get(0, i * 256).unwrap(), Some(v(0xA0 | i as u8)), "lba {} live", i * 256);
+    }
+    db.flush().unwrap();
+    drop(db);
+    // Reopen so reclaim_orphan_pages collects the dropped snapshot's deferred
+    // pages before the offline verify (which does not reclaim).
+    let db = crate::Db::open(dir.path()).unwrap();
+    drop(db);
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+        },
+    )
+    .unwrap();
+    assert!(report.is_clean(), "verify after H1 drop_volume crash-recovery: {:?}", report.issues);
+}
+
+#[test]
 fn page_deadlist_disjoint_across_live_snapshot_chains() {
     // ZFS port Phase 2a verify (E.2): with several live snapshots each
     // owning a sealed page-deadlist chain, every dying page version is

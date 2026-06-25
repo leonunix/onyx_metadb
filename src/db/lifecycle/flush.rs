@@ -561,32 +561,18 @@ impl Db {
                     .dead_list_tail_pid
                     .load(std::sync::atomic::Ordering::Acquire),
                 kind: DeadListKind::Pba,
+                page_provenance: Vec::new(),
             });
         }
-        // ZFS port Phase 2: the second, independent chain — L2P page
-        // deaths. Same `drain_up_to_lsn` filter (keeps the chain's
-        // "max_lsn strictly older going backward" invariant); same
-        // segment build / IO / rollback / promotion machinery, just
-        // tagged `Page` so each step touches the page anchors. Bounds
-        // the in-memory `page_dead_list` buffer the same way the PBA
-        // drain bounds `dead_list`.
-        for vol in &volumes {
-            let records = vol.page_dead_list.drain_up_to_lsn(wal_checkpoint);
-            if records.is_empty() {
-                continue;
-            }
-            drained_deadlists.push(DeadListDrainEntry {
-                vol: vol.clone(),
-                records: DrainRecords::Dead(records),
-                old_head: vol
-                    .page_dead_list_head_pid
-                    .load(std::sync::atomic::Ordering::Acquire),
-                old_tail: vol
-                    .page_dead_list_tail_pid
-                    .load(std::sync::atomic::Ordering::Acquire),
-                kind: DeadListKind::Page,
-            });
-        }
+        // ZFS port Phase 2 + H1: the second, independent chain — L2P page
+        // deaths — is drained LATER, after the per-shard L2P root capture
+        // loop below. Unlike the PBA / Live chains (bounded by the single
+        // `wal_checkpoint`), each page accumulator must be sealed under its
+        // OWN shard's `root_birth_lsn` (the gate-free sample can fold a
+        // shard's root past `wal_checkpoint`; a `wal_checkpoint` bound would
+        // leave those durable-in-root deaths unsealed → lost on crash). That
+        // watermark is only available once the guard walk has sampled each
+        // selected shard's root, so the drain is deferred to just after it.
         // ZFS port Phase 3b: the THIRD, independent chain — the per-clone
         // page-livelist (ALLOC/FREE of clone-private L2P pages). Same
         // `drain_up_to_lsn` filter + segment build / IO / rollback /
@@ -609,6 +595,7 @@ impl Db {
                     .page_live_list_tail_pid
                     .load(std::sync::atomic::Ordering::Acquire),
                 kind: DeadListKind::Live,
+                page_provenance: Vec::new(),
             });
         }
         if selected.is_empty() && drained_deadlists.is_empty() {
@@ -652,6 +639,13 @@ impl Db {
             let mut per_volume: Vec<Option<crate::paged::tree::Checkpoint>> =
                 Vec::with_capacity(volume.shards.len());
             let capture_roots = snapshot_force_ords.contains(&volume.ord);
+            // H1: per-shard page-death drain merged into ONE entry per volume so
+            // the page-deadlist chain stays single (one segment / anchor
+            // promotion, reusing the PBA/Live machinery). `page_provenance`
+            // records which shard each sub-vec came from so a rollback restores
+            // it to the right accumulator.
+            let mut page_merged: Vec<crate::deadlist::DeadRecord> = Vec::new();
+            let mut page_provenance: Vec<(usize, Vec<crate::deadlist::DeadRecord>)> = Vec::new();
             for s_idx in 0..volume.shards.len() {
                 if selected.l2p[v_idx][s_idx] {
                     let mut guard = guard_iter.next().expect(
@@ -665,12 +659,47 @@ impl Db {
                             *e = wm;
                         }
                     }
+                    // H1 — THE FIX: drain this shard's ENTIRE page-death
+                    // accumulator while the tree guard is held, atomic with the
+                    // `begin_checkpoint` root capture below. Every death in the
+                    // accumulator was pushed AFTER its COW under this same
+                    // `tree.write()`, so it is folded into the root this cycle
+                    // makes durable — sealing all of them is exactly crash-complete
+                    // and never premature. A concurrent open-txg fold cannot race a
+                    // post-checkpoint death into the drain because it would need
+                    // this very guard. (The earlier `root_birth_lsn`-bounded
+                    // attempt under-sealed: once a shard root forks private off the
+                    // snapshot it is mutated IN PLACE without bumping its birth, so
+                    // a later snapshot-pinned leaf death can sit ABOVE the root
+                    // birth — `root_birth_lsn` is the fork lsn, not a fold
+                    // watermark.) Unselected shards are left buffered: their root
+                    // is not made durable, so their deaths are not in any durable
+                    // root and are re-recorded by serial replay on crash.
+                    let recs = volume.page_dead_list[s_idx].drain();
+                    if !recs.is_empty() {
+                        page_merged.extend_from_slice(&recs);
+                        page_provenance.push((s_idx, recs));
+                    }
                     per_volume.push(Some(guard.begin_checkpoint()));
                 } else {
                     per_volume.push(None);
                 }
             }
             l2p_checkpoints.push(per_volume);
+            if !page_merged.is_empty() {
+                drained_deadlists.push(DeadListDrainEntry {
+                    vol: volume.clone(),
+                    records: DrainRecords::Dead(page_merged),
+                    old_head: volume
+                        .page_dead_list_head_pid
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    old_tail: volume
+                        .page_dead_list_tail_pid
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    kind: DeadListKind::Page,
+                    page_provenance,
+                });
+            }
         }
         debug_assert!(guard_iter.next().is_none());
         let l2p_walk_elapsed = l2p_walk_started.elapsed();
@@ -1738,25 +1767,38 @@ impl Db {
     ) {
         for entry in drained.iter_mut() {
             // Restore each drained chain's records back into its buffer so a
-            // later flush re-attempts them. Empty placeholder preserves the
-            // enum variant (so `kind` and the restore target stay aligned).
-            match &mut entry.records {
-                DrainRecords::Dead(recs) => {
-                    let records = std::mem::take(recs);
-                    if !records.is_empty() {
-                        match entry.kind {
-                            DeadListKind::Pba => entry.vol.dead_list.restore_front(records),
-                            DeadListKind::Page => entry.vol.page_dead_list.restore_front(records),
-                            DeadListKind::Live => unreachable!(
-                                "DrainRecords::Dead never carries DeadListKind::Live"
-                            ),
+            // later flush re-attempts them. Records are moved out via
+            // `mem::take` so a second rollback call is a no-op.
+            match entry.kind {
+                DeadListKind::Pba => {
+                    if let DrainRecords::Dead(recs) = &mut entry.records {
+                        let records = std::mem::take(recs);
+                        if !records.is_empty() {
+                            entry.vol.dead_list.restore_front(records);
                         }
                     }
                 }
-                DrainRecords::Live(recs) => {
-                    let records = std::mem::take(recs);
-                    if !records.is_empty() {
-                        entry.vol.page_live_list.restore_front(records);
+                DeadListKind::Page => {
+                    // H1: restore each sub-vec to ITS shard accumulator —
+                    // `page_provenance` is authoritative. A flat restore into
+                    // shard 0 would permanently mis-bound a non-shard-0 death
+                    // (shard 0's next-cycle `root_birth_lsn` could exclude it).
+                    // The merged `records` is just the concatenation; drop it.
+                    if let DrainRecords::Dead(recs) = &mut entry.records {
+                        let _ = std::mem::take(recs);
+                    }
+                    for (s_idx, recs) in std::mem::take(&mut entry.page_provenance) {
+                        if !recs.is_empty() {
+                            entry.vol.page_dead_list[s_idx].restore_front(recs);
+                        }
+                    }
+                }
+                DeadListKind::Live => {
+                    if let DrainRecords::Live(recs) = &mut entry.records {
+                        let records = std::mem::take(recs);
+                        if !records.is_empty() {
+                            entry.vol.page_live_list.restore_front(records);
+                        }
                     }
                 }
             }
