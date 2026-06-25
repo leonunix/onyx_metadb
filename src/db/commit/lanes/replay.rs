@@ -156,6 +156,8 @@ impl Db {
                         // `checkpoint_protected`, so the recycle path still copies
                         // (never clobbers) them.
                         Vec::new(),
+                        // S1c clone COW-kill pinners: same replay rationale — empty.
+                        Vec::new(),
                     );
                     let _ = tx.send(result);
                 }),
@@ -360,6 +362,8 @@ impl Db {
                 metrics.as_ref(),
                 rc_authoritative,
                 // ZFS port Phase 2/4: replay does not re-record page deaths.
+                Vec::new(),
+                // S1c clone COW-kill pinners: empty on replay (same rationale).
                 Vec::new(),
             )?;
             for (idx, outcome) in result.outcomes {

@@ -152,6 +152,7 @@ fn page_deadlist_segments_survive_reopen() {
             strict: false,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();
@@ -250,6 +251,7 @@ fn drop_middle_snapshot_merges_keep_into_s_next() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();
@@ -304,6 +306,7 @@ fn s2_drop_snapshot_nonclone_frees_via_free_pages() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();
@@ -377,6 +380,7 @@ fn s2_drop_snapshot_crash_recovery_completeness() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();
@@ -475,6 +479,7 @@ fn s1_promoted_exclone_buffer_fold_capture_watermark_no_hole() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: true,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();
@@ -557,6 +562,7 @@ fn h1_steady_flush_seals_all_folded_page_deaths() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();
@@ -612,6 +618,7 @@ fn h1_drop_volume_seals_other_volumes_page_deaths() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();
@@ -647,6 +654,7 @@ fn page_deadlist_disjoint_across_live_snapshot_chains() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();
@@ -875,6 +883,7 @@ fn s1_no_snapshot_overwrite_records_no_page_deaths() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();
@@ -941,6 +950,7 @@ fn s1_snapshot_overwrite_preserves_old_via_birth_no_divergence() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();

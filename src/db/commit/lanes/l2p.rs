@@ -90,6 +90,11 @@ impl Db {
         // COW-displaced L2P pages enter the HEAD page-deadlist. Empty (no live
         // snapshot, or the replay path) records nothing.
         snapshot_wms: Vec<Lsn>,
+        // ZFS port Phase 4 S1c: this volume's clone COW-kill pinner set
+        // ({B_C} ∪ own-snap wms ∪ descendant branch points), captured by the
+        // dispatcher. Empty for non-clones and on replay. Only read by the
+        // tree-mode clone arm of `cow_for_write`; the buffered path returns early.
+        clone_cow_pinners: Vec<Lsn>,
     ) -> Result<L2pBucketApplyResult> {
         let mut outcomes = Vec::with_capacity(indices.len());
         let mut rc_actions = Vec::new();
@@ -115,6 +120,9 @@ impl Db {
         // uses below). The buffered shards returned early above; this is the
         // tree-locked laned COW path.
         tree.set_snapshot_wms(snapshot_wms);
+        // S1c: the page-rc-independent clone COW-kill pinner set (separate field
+        // so the deadlist drain keeps reading `snapshot_wms`; empty for non-clones).
+        tree.set_clone_cow_pinners(clone_cow_pinners);
         let tree_lock_wait = tree_lock_started.elapsed();
         let read_view_prepare_started = std::time::Instant::now();
         let mut read_view_guard = if shard.active_readers.load(Ordering::Acquire) == 0

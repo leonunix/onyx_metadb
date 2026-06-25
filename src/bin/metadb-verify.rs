@@ -1,7 +1,7 @@
 use std::env;
 use std::process::ExitCode;
 
-use onyx_metadb::{VerifyOptions, VerifyReport, audit_clone_birth_shadow, verify_path};
+use onyx_metadb::{VerifyOptions, VerifyReport, verify_path};
 
 fn main() -> ExitCode {
     match run() {
@@ -45,12 +45,17 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::from(2));
     };
 
+    // ZFS port Phase 4 Step 4 (S1c): `--clone-birth-shadow` now drives the HARD
+    // operand gate (the operand consults descendant branch points, so the
+    // pure-birth gap is closed and findings are real corruption signals, not
+    // expected). Issues land in `report.issues` and affect the exit code.
     let report = verify_path(
         &path,
         VerifyOptions {
             strict,
             check_birth_shadow,
             check_clone_livelist,
+            check_clone_birth_shadow: clone_birth_shadow,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -58,22 +63,6 @@ fn run() -> Result<ExitCode, String> {
         print_json(&report);
     } else {
         print_human(&report);
-    }
-    // ZFS port Phase 4 Step 4 (S1c): read-only characterization of the
-    // candidate clone COW-kill birth operand. Findings are EXPECTED on some
-    // legitimate DAG shapes (where the pure-birth operand is insufficient and
-    // S1c must use reachability), so they are reported separately and do NOT
-    // affect the exit code — this is a measurement, not a pass/fail invariant.
-    if clone_birth_shadow {
-        match audit_clone_birth_shadow(&path) {
-            Ok(findings) => {
-                println!("clone_birth_shadow_findings: {}", findings.len());
-                for f in &findings {
-                    println!("  - {f}");
-                }
-            }
-            Err(e) => eprintln!("clone-birth-shadow: {e}"),
-        }
     }
     Ok(if report.is_clean() {
         ExitCode::SUCCESS

@@ -190,6 +190,9 @@ fn verify_reopened_db(
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: true,
+            // ZFS port Phase 4 S1c: validate the page-rc-independent clone COW-kill
+            // operand on every soak-end verify (the flip's tripwire).
+            check_clone_birth_shadow: true,
         },
     )
 }

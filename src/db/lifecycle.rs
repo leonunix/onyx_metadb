@@ -652,6 +652,8 @@ impl Db {
     fn compact_volume_buffers(&self, vol: &Arc<Volume>) -> Result<()> {
         use std::time::Instant;
         let snapshot_wms = self.snapshot_wms(vol.ord);
+        // ZFS port Phase 4 S1c: clone COW-kill pinner set (empty for non-clones).
+        let clone_cow_pinners = self.clone_cow_pinners(vol.ord);
         for (shard_idx, shard) in vol.shards.iter().enumerate() {
             if !shard.use_buffer {
                 continue;
@@ -686,6 +688,7 @@ impl Db {
                 &drained,
                 self.txg.open_txg(),
                 snapshot_wms.clone(),
+                clone_cow_pinners.clone(),
             );
             match apply_result {
                 Ok(()) => {
@@ -776,6 +779,9 @@ impl Db {
                     // by the per-shard fold tasks for the page-deadlist
                     // birth gate.
                     let snapshot_wms = self.snapshot_wms(vol.ord);
+                    // ZFS port Phase 4 S1c: clone COW-kill pinner set, computed
+                    // once per volume (empty for non-clones).
+                    let clone_cow_pinners = self.clone_cow_pinners(vol.ord);
                     let page_dead_list = &vol.page_dead_list;
                     let page_live_list = &vol.page_live_list;
                     for (shard_idx, shard) in vol.shards.iter().enumerate() {
@@ -783,6 +789,7 @@ impl Db {
                             continue;
                         }
                         let snapshot_wms = snapshot_wms.clone();
+                        let clone_cow_pinners = clone_cow_pinners.clone();
                         handles.push(scope.spawn(move || {
                             // Escape the single-CPU affinity inherited from
                             // the pinned `metadb-txg-sync` parent. Under NUMA
@@ -801,6 +808,7 @@ impl Db {
                                 &page_dead_list[shard_idx],
                                 page_live_list,
                                 snapshot_wms,
+                                clone_cow_pinners,
                             )
                         }));
                     }
@@ -819,6 +827,7 @@ impl Db {
         } else {
             for vol in &vols {
                 let snapshot_wms = self.snapshot_wms(vol.ord);
+                let clone_cow_pinners = self.clone_cow_pinners(vol.ord);
                 for (shard_idx, shard) in vol.shards.iter().enumerate() {
                     if !shard.use_buffer {
                         continue;
@@ -832,6 +841,7 @@ impl Db {
                         &vol.page_dead_list[shard_idx],
                         &vol.page_live_list,
                         snapshot_wms.clone(),
+                        clone_cow_pinners.clone(),
                     )?;
                 }
             }
@@ -860,6 +870,7 @@ impl Db {
     /// see a consistent tree + read overlay. Re-folding after a
     /// mid-chunk error stays idempotent via `page.generation >= lsn`,
     /// same as the one-shot retry contract.
+    #[allow(clippy::too_many_arguments)]
     fn drain_one_syncing_shard(
         shard: &super::L2pShard,
         txg: crate::types::Txg,
@@ -868,6 +879,7 @@ impl Db {
         page_dead_list: &crate::deadlist::DeadListState,
         page_live_list: &crate::livelist::LiveListState,
         snapshot_wms: Vec<Lsn>,
+        clone_cow_pinners: Vec<Lsn>,
     ) -> Result<()> {
         let started = std::time::Instant::now();
         // Snapshot (clone) the frozen syncing slot WITHOUT the tree lock so the
@@ -896,7 +908,13 @@ impl Db {
                 }
             }
             let mut tree = shard.tree.write();
-            super::txg_sync::apply_drain_ops(&mut tree, &plan[start..end], txg, snapshot_wms.clone())?;
+            super::txg_sync::apply_drain_ops(
+                &mut tree,
+                &plan[start..end],
+                txg,
+                snapshot_wms.clone(),
+                clone_cow_pinners.clone(),
+            )?;
             // ZFS port Phase 2: this fold COW'd L2P pages off the head;
             // record the snapshot-pinned ones into the HEAD page-deadlist
             // (buffer mode's only COW point — the apply-time witness was

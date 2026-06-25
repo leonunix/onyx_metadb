@@ -366,6 +366,7 @@ fn buffer_mode_snapshot_churn_no_premature_free() {
                 strict: true,
                 check_birth_shadow: true,
                 check_clone_livelist: false,
+                check_clone_birth_shadow: false,
             },
         )
             .unwrap();
@@ -424,6 +425,7 @@ fn create_volume_root_page_rc_survives_reopen() {
                 strict: true,
                 check_birth_shadow: true,
                 check_clone_livelist: false,
+                check_clone_birth_shadow: false,
             },
         )
             .unwrap();
@@ -485,6 +487,7 @@ fn take_snapshot_incref_survives_close_before_fold() {
                 strict: true,
                 check_birth_shadow: true,
                 check_clone_livelist: false,
+                check_clone_birth_shadow: false,
             },
         )
             .unwrap();
@@ -579,6 +582,7 @@ fn buffer_mode_concurrent_snapshot_churn_no_corruption() {
                 strict: true,
                 check_birth_shadow: true,
                 check_clone_livelist: false,
+                check_clone_birth_shadow: false,
             },
         )
             .unwrap();
@@ -922,6 +926,7 @@ fn drop_snapshot_force_fold_over_buffer_backlog_no_premature_free() {
                 strict: true,
                 check_birth_shadow: true,
                 check_clone_livelist: false,
+                check_clone_birth_shadow: false,
             },
         )
             .unwrap();
@@ -949,6 +954,7 @@ fn assert_birth_shadow_clean(path: &std::path::Path) {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();

@@ -93,9 +93,24 @@ pub struct PagedL2p {
     /// e.g. by `force_compact`, after newer snapshots exist). Set per-op by the
     /// apply / fold layer (mirrors [`set_current_txg`]) from the durable
     /// `SnapshotEntry::capture_watermark`s so the decision is identical live and
-    /// on replay. Ignored for clones (`clone_birth_lsn.is_some()` keeps page-rc
-    /// until S1c). Defaults to empty.
+    /// on replay. For clones, `snapshot_wms` stays C's OWN snapshots — it gates
+    /// the page-deadlist drain classification (`drain_page_deaths_into`), NOT the
+    /// clone COW-kill (that reads `clone_cow_pinners`). Defaults to empty.
     snapshot_wms: Vec<Lsn>,
+    /// ZFS port Phase 4 Step 4 (S1c): the page-rc-INDEPENDENT pinner-LSN set for
+    /// the CLONE COW-kill, SORTED ascending. Only meaningful when
+    /// `clone_birth_lsn.is_some()`. The set is `{B_C} ∪ {capture_watermark(S) : S
+    /// a live snapshot of C} ∪ {branched_at_lsn(V) : V another clone-lineage
+    /// volume, branched_at_lsn(V) > B_C}` (built by `Db::clone_cow_pinners`). A
+    /// clone page P dying at `D` is snapshot-pinned iff some pinner `p` has
+    /// `birth_lsn(P) <= p < D` — i.e. `birth_lsn(P) <= youngest_clone_pinner_below(D)`.
+    /// Kept SEPARATE from `snapshot_wms` so widening it for the COW-kill does not
+    /// perturb the deadlist drain (which must stay C-own-snapshots). Set per-op by
+    /// the apply / fold layer alongside `set_snapshot_wms`; empty on replay
+    /// (durable pages are `checkpoint_protected`, so the term must not fire) and
+    /// for non-clones. The `effective_rc > 1` page-rc floor is kept ALONGSIDE this
+    /// term until S3 (inverted shadow), so the term can only ADD preservation.
+    clone_cow_pinners: Vec<Lsn>,
 }
 
 pub(crate) struct Checkpoint {
@@ -178,6 +193,7 @@ impl PagedL2p {
             clone_birth_lsn: None,
             live_events: Vec::new(),
             snapshot_wms: Vec::new(),
+            clone_cow_pinners: Vec::new(),
         })
     }
 
@@ -225,6 +241,7 @@ impl PagedL2p {
             clone_birth_lsn: None,
             live_events: Vec::new(),
             snapshot_wms: Vec::new(),
+            clone_cow_pinners: Vec::new(),
         })
     }
 
@@ -260,6 +277,7 @@ impl PagedL2p {
             clone_birth_lsn: None,
             live_events: Vec::new(),
             snapshot_wms: Vec::new(),
+            clone_cow_pinners: Vec::new(),
         })
     }
 
@@ -291,6 +309,7 @@ impl PagedL2p {
             clone_birth_lsn: None,
             live_events: Vec::new(),
             snapshot_wms: Vec::new(),
+            clone_cow_pinners: Vec::new(),
         })
     }
 
@@ -421,9 +440,26 @@ impl PagedL2p {
         // "snapshot-pinned" — its old version must be PRESERVED on overwrite
         // (it "dies off the head" and stays alive for a snapshot) — vs PRIVATE
         // to the live volume (recyclable in place).
-        //   * CLONE (`clone_birth_lsn.is_some()`): page-rc as before (S1c flips
-        //     this to a clone-aware birth operand). Reproduces the legacy
-        //     `effective_rc > 1` gate exactly.
+        //   * CLONE (`clone_birth_lsn.is_some()`): S1c — page-rc-INDEPENDENT
+        //     pinner-LSN operand, `effective_rc > 1 OR birth <=
+        //     youngest_clone_pinner_below(lsn)`. The pinner set
+        //     (`clone_cow_pinners`, fed by `Db::clone_cow_pinners`) is
+        //     `{B_C} ∪ {C's live snapshot capture_watermarks} ∪ {descendant
+        //     branch points}` — the page-rc-independent completion of "P is
+        //     shared with a survivor". The `{B_C}` term pins origin pages
+        //     (`birth <= B_C`, shared with the parent); the descendant branch
+        //     points pin born>B_C pages a survivor clone (incl. a PROMOTED
+        //     ex-clone whose `parent_vol_ord` is cleared) still references after
+        //     C's own snapshot is dropped — the G6 premature-free P0 a pure-birth
+        //     `max(B_C, youngest_snap(C))` operand misses (`clone_birth_shadow`).
+        //     The `effective_rc > 1` floor stays (inverted shadow until S3): it
+        //     prevents an under-pin if the pinner cache lags, and S1c's term adds
+        //     the force-fold-P0 catch. Benign G8 over-COW: an origin page that
+        //     became C-exclusive (`birth <= B_C`, rc==1) is preserved rather than
+        //     recycled — correctness-safe, reclaimed by orphan-reclaim; the
+        //     shadow does NOT flag this direction. NO drain perturbation: the
+        //     deadlist classification keeps reading `snapshot_wms` (C's own
+        //     snapshots), not this wider set.
         //   * NON-CLONE: birth-authoritative. A page COW'd (dying) at `lsn` is
         //     snapshot-pinned iff some snapshot captured it, i.e.
         //     `birth_lsn(P) <= youngest_snap_below(lsn)` where
@@ -472,12 +508,21 @@ impl PagedL2p {
         //     uncommitted) so they recycle. (See `youngest_snap_below`.)
         // Strictly >= the legacy `rc > 1` pinning, so it can never premature-free
         // a page legacy preserved; the birth term only adds preservation.
-        let youngest_below = self.youngest_snap_below(lsn);
         let snapshot_pinned = match self.clone_birth_lsn {
-            Some(_) => effective_rc > 1,
+            // S1c CLONE arm: rc floor (inverted shadow until S3) OR the
+            // page-rc-independent clone pinner-set term. `youngest_clone_pinner_below`
+            // reads `clone_cow_pinners` ({B_C} ∪ own-snaps ∪ descendant branches),
+            // NOT `snapshot_wms`.
+            Some(_) => {
+                effective_rc > 1
+                    || match self.youngest_clone_pinner_below(lsn) {
+                        None => false,
+                        Some(s) => birth <= s && !self.private_pages.contains(&pid),
+                    }
+            }
             None => {
                 effective_rc > 1
-                    || match youngest_below {
+                    || match self.youngest_snap_below(lsn) {
                         None => false,
                         Some(s) => birth <= s && !self.private_pages.contains(&pid),
                     }
@@ -613,6 +658,34 @@ impl PagedL2p {
             None
         } else {
             Some(self.snapshot_wms[i - 1])
+        }
+    }
+
+    /// ZFS port Phase 4 Step 4 (S1c): set this clone shard's COW-kill pinner-LSN
+    /// set (`{B_C} ∪ own-snap watermarks ∪ descendant branch points`, built by
+    /// [`Db::clone_cow_pinners`]). Stored SORTED ascending for
+    /// [`youngest_clone_pinner_below`](Self::youngest_clone_pinner_below). Fed
+    /// per-op alongside [`set_snapshot_wms`](Self::set_snapshot_wms); empty for
+    /// non-clones and on replay. SEPARATE from `snapshot_wms` so the deadlist
+    /// drain (`drain_page_deaths_into`, C-own-snapshots) is untouched.
+    pub(crate) fn set_clone_cow_pinners(&mut self, mut pinners: Vec<Lsn>) {
+        pinners.sort_unstable();
+        self.clone_cow_pinners = pinners;
+    }
+
+    /// `max{p : p < lsn}` over [`clone_cow_pinners`](Self::clone_cow_pinners), or
+    /// `None`. The clone COW-kill (`cow_for_write`) preserves a page dying at
+    /// `lsn` iff `birth <= youngest_clone_pinner_below(lsn)` — i.e. some pinner
+    /// `p` with `birth <= p < lsn` (a pinner created at/after `lsn` sees the new
+    /// version, not the old). Sorted, so the answer is just below the
+    /// `partition_point`.
+    #[inline]
+    pub(crate) fn youngest_clone_pinner_below(&self, lsn: Lsn) -> Option<Lsn> {
+        let i = self.clone_cow_pinners.partition_point(|&p| p < lsn);
+        if i == 0 {
+            None
+        } else {
+            Some(self.clone_cow_pinners[i - 1])
         }
     }
 

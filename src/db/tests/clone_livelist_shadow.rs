@@ -578,6 +578,17 @@ fn clone_churn_shadow_stress() {
             .collect::<crate::Result<Vec<_>>>()
             .unwrap();
     }
+
+    // S1c: the page-rc-INDEPENDENT clone COW-kill operand must stay a complete
+    // superset of "pinned" across the whole clone+promote+drop churn — every page
+    // a surviving pinner reaches is COW'd by the operand (no clobber). Flush so the
+    // manifest reflects committed roots, then run the shadow over the final state.
+    db.flush().unwrap();
+    let findings = db.test_clone_birth_shadow_findings().unwrap();
+    assert!(
+        findings.is_empty(),
+        "clone-birth-shadow must be clean across clone churn (operand under-pinned): {findings:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +838,7 @@ fn s2_drop_clone_frees_exclusive_reachability_set() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: true,
+            check_clone_birth_shadow: true,
         },
     )
     .unwrap();
@@ -955,15 +967,15 @@ fn clone_birth_shadow_clean_on_simple_clone() {
     );
 }
 
-/// KEY FINDING (S1c): the pure-birth clone COW-kill operand is INSUFFICIENT for
-/// the DAG. C's born>B1 pages are still shared with a survivor descendant D, but
-/// after C's own snapshot s2 is dropped, B_eff(C) falls back to B1 (< their
-/// birth) — so the operand would write them in place, clobbering pages D reads.
-/// page-rc prevents this today (rc>1); the birth model alone cannot. The shadow
-/// must FLAG it, proving S1c's clone COW-kill must consult reachability, not
-/// birth. (Read-only — page-rc authoritative; nothing is actually clobbered.)
+/// S1c (the fix): the operand now consults DESCENDANT BRANCH POINTS, so the G6
+/// shape the pure-birth operand mishandled is CLEAN. C's born>B1 pages are shared
+/// with a survivor descendant D; after C's own snapshot s2 is dropped, the
+/// pure-birth `B_eff = max(B1, youngest_snap(C))` falls to B1 (< their birth) and
+/// would clobber them — but D's branch point (= s2.created_lsn > those births) is
+/// in C's pinner set, so `B_eff` stays above the births and the operand COWs them.
+/// This is the exact case `clone_cow_pinners`' descendant term exists to cover.
 #[test]
-fn clone_birth_shadow_flags_descendant_pinned_born_after_branch() {
+fn clone_birth_shadow_clean_under_descendant_pinner() {
     let (_d, db) = mk_db();
     let p = db.create_volume().unwrap();
     for i in 0u64..8 {
@@ -980,14 +992,98 @@ fn clone_birth_shadow_flags_descendant_pinned_born_after_branch() {
         assert_eq!(db.get(d, i).unwrap(), Some(v(0xC0 | i as u8)));
     }
     // Drop C's own snapshot -> youngest_snap(C) falls below C's born>B1 page
-    // births -> B_eff(C) == B1, yet D still pins those pages.
+    // births, but D's branch point (s2.created_lsn) keeps them pinned.
     let _ = db.drop_snapshot(s2).unwrap().unwrap();
     db.flush().unwrap();
 
     let findings = db.test_clone_birth_shadow_findings().unwrap();
     assert!(
+        findings.is_empty(),
+        "S1c operand consults descendant branch points, so C's born>B1 pages shared with survivor \
+         D must stay COW'd (no clobber). findings={findings:?}"
+    );
+}
+
+/// S1c END-TO-END (the data-survival proof): the runtime clone COW-kill must
+/// PRESERVE a born>B page a survivor descendant still references when the clone
+/// overwrites it in place — even after the clone's own snapshot is dropped. This
+/// is the G6 shape driven through the real write path: build C, snapshot s2,
+/// clone D from s2 (D shares C's born>B pages), drop s2, then OVERWRITE those
+/// LBAs on C and assert D still reads the OLD values. (With the page-rc floor
+/// kept this also passes via rc, but the structural `clone_birth_shadow` gate
+/// below proves the page-rc-INDEPENDENT operand is what holds it.)
+#[test]
+fn clone_cow_kill_preserves_descendant_shared_page_after_snap_drop() {
+    let (_d, db) = mk_db();
+    let p = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(p, i, v(i as u8)).unwrap();
+    }
+    let s1 = db.take_snapshot(p).unwrap();
+    let c = db.clone_volume(s1).unwrap();
+    for i in 0u64..8 {
+        db.insert(c, i, v(0xC0 | i as u8)).unwrap(); // C-private, born > B_C
+    }
+    let s2 = db.take_snapshot(c).unwrap();
+    let d = db.clone_volume(s2).unwrap(); // D shares C's born>B_C pages via s2
+    // Drop C's own snapshot: the only remaining pinner of C's born>B_C pages is
+    // the survivor descendant D (its branch point), NOT a live snapshot.
+    let _ = db.drop_snapshot(s2).unwrap().unwrap();
+    db.flush().unwrap();
+    // C overwrites every born>B_C page IN PLACE. The clone COW-kill must preserve
+    // the old versions (D reads them); a clobber corrupts D.
+    for i in 0u64..8 {
+        db.insert(c, i, v(0xE0 | i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    for i in 0u64..8 {
+        assert_eq!(
+            db.get(d, i).unwrap(),
+            Some(v(0xC0 | i as u8)),
+            "D's view of lba {i} was clobbered by C's in-place overwrite (clone COW-kill under-pinned)"
+        );
+        assert_eq!(db.get(c, i).unwrap(), Some(v(0xE0 | i as u8)), "C's own overwrite of lba {i} lost");
+    }
+    // The page-rc-independent operand agrees (no clobber would have been allowed).
+    let findings = db.test_clone_birth_shadow_findings().unwrap();
+    assert!(findings.is_empty(), "clone-birth-shadow not clean: {findings:?}");
+}
+
+/// TEETH: the `clone_birth_shadow` HARD gate must FIRE when a descendant pin is
+/// missing from the operand. Build the G6 DAG (clean), then corrupt D's manifest
+/// `branched_at_lsn` DOWN to B_C — dropping D from C's operand pinner set WITHOUT
+/// changing the reachability ground truth (D's roots still reach C's born>B
+/// pages). The operand now under-pins → the safety direction `pinned ∧ ¬COW`
+/// fires. Proves the gate has teeth (an under-pin is not silently passed).
+#[test]
+fn clone_birth_shadow_fires_when_descendant_pinner_missing() {
+    let (_d, db) = mk_db();
+    let p = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(p, i, v(i as u8)).unwrap();
+    }
+    let s1 = db.take_snapshot(p).unwrap();
+    let c = db.clone_volume(s1).unwrap();
+    for i in 0u64..8 {
+        db.insert(c, i, v(0xC0 | i as u8)).unwrap(); // C born > B_C
+    }
+    let s2 = db.take_snapshot(c).unwrap();
+    let d = db.clone_volume(s2).unwrap(); // D shares C's born>B_C pages
+    let _ = db.drop_snapshot(s2).unwrap().unwrap();
+    db.flush().unwrap();
+    // Clean while D's real branch point (> the births) pins them.
+    assert!(
+        db.test_clone_birth_shadow_findings().unwrap().is_empty(),
+        "precondition: should be clean with the real descendant pin"
+    );
+    // Simulate a regression that drops D's pin: lower its branch point to 0 so the
+    // `branched_at_lsn > B_C` filter excludes it from C's operand pinner set.
+    // Reachability ground truth (D's roots still reach C's born>B pages) unchanged.
+    db.test_set_manifest_branched_at_lsn(d, 0);
+    let findings = db.test_clone_birth_shadow_findings().unwrap();
+    assert!(
         findings.iter().any(|f| f.contains(&format!("vol {c} "))),
-        "pure-birth clone operand is insufficient here (C's born>B1 pages pinned by survivor D, \
-         B_eff(C) fell below their birth) — S1c must use reachability, not birth. findings={findings:?}"
+        "gate must fire: C's born>B pages are reachable from D but the operand lost D's pin. \
+         findings={findings:?}"
     );
 }

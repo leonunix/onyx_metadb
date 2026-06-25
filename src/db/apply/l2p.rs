@@ -258,7 +258,15 @@ pub(in crate::db) fn apply_l2p_remap(
     // ZFS port Phase 4 Step 4 (S1): arm the birth-authoritative non-clone
     // COW-kill decision with this op's youngest-snapshot lsn (same source the
     // `drain_page_deaths` below uses; identical live and on replay).
-    tree.set_snapshot_wms(snapshot_wms_of(snap_infos));
+    let snap_wms = snapshot_wms_of(snap_infos);
+    tree.set_snapshot_wms(snap_wms.clone());
+    // ZFS port Phase 4 S1c: arm the page-rc-independent CLONE COW-kill operand
+    // (empty for non-clones). Both callers (live serial apply + the open-time
+    // range-delete replay) pass real `snap_infos`, so the real pinner set is
+    // correct here — there is no empty-on-replay path through this function.
+    tree.set_clone_cow_pinners(crate::db::volume::clone_cow_pinners_from(
+        volumes, vol_ord, snap_wms,
+    ));
 
     if let Some((gp, min_rc)) = guard {
         let gp_sid = shard_for_key(refcount_shards, gp);
@@ -600,7 +608,12 @@ pub(in crate::db) fn apply_l2p_remap_range(
         // A3 cutover: tree-mode COW stages page-rc deltas into this TXG slot.
         tree.set_current_txg(txg);
         // ZFS port Phase 4 Step 4 (S1): birth-authoritative non-clone COW-kill.
-        tree.set_snapshot_wms(snapshot_wms_of(snap_infos));
+        let snap_wms = snapshot_wms_of(snap_infos);
+        tree.set_snapshot_wms(snap_wms.clone());
+        // ZFS port Phase 4 S1c: page-rc-independent clone COW-kill operand.
+        tree.set_clone_cow_pinners(crate::db::volume::clone_cow_pinners_from(
+            volumes, vol_ord, snap_wms,
+        ));
         for &i in indices {
             let lba = start_lba + i as u64;
             let new_value = values[i];
@@ -743,7 +756,14 @@ pub(in crate::db) fn apply_l2p_range_delete(
         // ZFS port Phase 4 Step 4 (S1): birth-authoritative non-clone COW-kill.
         // This is also the Discard REPLAY COW site; `snap_infos` is rebuilt from
         // the in-memory manifest at the replay point, so youngest is consistent.
-        tree.set_snapshot_wms(snapshot_wms_of(snap_infos));
+        let snap_wms = snapshot_wms_of(snap_infos);
+        tree.set_snapshot_wms(snap_wms.clone());
+        // ZFS port Phase 4 S1c: page-rc-independent clone COW-kill operand. The
+        // open-time range-delete replay (open.rs) rebuilds real `snap_infos`, so
+        // the real pinner set is correct on both the live and replay paths.
+        tree.set_clone_cow_pinners(crate::db::volume::clone_cow_pinners_from(
+            volumes, vol_ord, snap_wms,
+        ));
         for &idx in indices {
             let (lba, _) = captured[idx];
             // The snap-pin probe inside `stage_delete_rc` reads the snapshot

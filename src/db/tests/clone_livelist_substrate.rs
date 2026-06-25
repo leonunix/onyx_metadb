@@ -54,6 +54,7 @@ fn assert_livelist_clean(path: &std::path::Path) {
             strict: false,
             check_birth_shadow: true,
             check_clone_livelist: true,
+            check_clone_birth_shadow: true,
         },
     )
     .unwrap();

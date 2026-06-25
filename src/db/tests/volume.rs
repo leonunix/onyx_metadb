@@ -389,6 +389,7 @@ fn dropping_source_snapshot_after_clone_keeps_page_refcounts_balanced() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: false,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();

@@ -97,7 +97,15 @@ pub(super) fn apply_op_bare(
             // A3 cutover: tree-mode COW stages page-rc deltas into this
             // commit's TXG slot (no-op for the buffered path).
             tree.set_current_txg(txg);
-            tree.set_snapshot_wms(l2p::snapshot_wms_of(&snap_infos));
+            let snap_wms = l2p::snapshot_wms_of(&snap_infos);
+            tree.set_snapshot_wms(snap_wms.clone());
+            // ZFS port Phase 4 S1c: the page-rc-independent clone COW-kill pinner
+            // set ({B_C} ∪ own-snap wms ∪ descendant branch points), built from
+            // the borrowed volume map. Empty for non-clones (this serial path is
+            // tree-mode; the clone arm of `cow_for_write` is its only reader).
+            tree.set_clone_cow_pinners(crate::db::volume::clone_cow_pinners_from(
+                volumes, *vol_ord, snap_wms,
+            ));
             // L2pPut returns the rejecting `cur` as `L2pPrev(Some(cur))`;
             // caller distinguishes accept vs reject by comparing
             // `value.seq()` against `cur.seq()`.
@@ -163,7 +171,12 @@ pub(super) fn apply_op_bare(
             let snap_infos = snap_info_for_vol(*vol_ord);
             // A3 cutover: tree-mode COW (delete) stages page-rc deltas here.
             tree.set_current_txg(txg);
-            tree.set_snapshot_wms(l2p::snapshot_wms_of(&snap_infos));
+            let snap_wms = l2p::snapshot_wms_of(&snap_infos);
+            tree.set_snapshot_wms(snap_wms.clone());
+            // ZFS port Phase 4 S1c: clone COW-kill pinner set (empty for non-clones).
+            tree.set_clone_cow_pinners(crate::db::volume::clone_cow_pinners_from(
+                volumes, *vol_ord, snap_wms,
+            ));
             let prev = if use_buffer {
                 let cur = match volume.shards[sid].l2p_buffer.lookup_for_open_txg(txg, *lba) {
                     crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),

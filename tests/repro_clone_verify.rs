@@ -63,6 +63,7 @@ fn clone_volume_cross_write_keeps_refcounts_clean() {
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: true,
+            check_clone_birth_shadow: false,
         },
     )
     .unwrap();

@@ -1763,6 +1763,20 @@ impl Db {
         }
     }
 
+    /// S1c teeth helper: corrupt a volume's manifest `branched_at_lsn` so the
+    /// offline `clone_birth_shadow` operand drops that descendant from another
+    /// clone's pinner set WITHOUT touching the reachability ground truth — i.e.
+    /// simulate a regression where a descendant pin is missing/wrong. Manifest
+    /// only (the offline oracle reads `manifest_state.lock().manifest`); the
+    /// in-memory `Volume.branched_at_lsn` is immutable so it is left alone.
+    #[cfg(test)]
+    pub(crate) fn test_set_manifest_branched_at_lsn(&self, vol_ord: VolumeOrdinal, lsn: Lsn) {
+        let mut mst = self.manifest_state.lock();
+        if let Some(entry) = mst.manifest.volumes.iter_mut().find(|e| e.ord == vol_ord) {
+            entry.branched_at_lsn = lsn;
+        }
+    }
+
     /// Test helper: drive one step of the
     /// [[no-refcount-hot-path-design]] Phase 4 Step 5 promotion walker
     /// for `vol_ord`. Returns the step outcome so tests can assert

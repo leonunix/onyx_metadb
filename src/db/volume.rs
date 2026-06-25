@@ -1330,6 +1330,43 @@ impl Db {
             .unwrap_or_default()
     }
 
+    /// v21 (ZFS port Phase 4 Step 4 / S1c): the page-rc-INDEPENDENT pinner-LSN set
+    /// for `vol`'s CLONE COW-kill (`tree.set_clone_cow_pinners`). Empty for a
+    /// non-clone (it never reads this — its COW-kill uses `snapshot_wms`). For a
+    /// clone C with `B_C = branched_at_lsn`:
+    ///
+    /// ```text
+    /// {B_C} ∪ {capture_watermark(S) : S a live snapshot of C}
+    ///       ∪ {branched_at_lsn(V) : V another clone-lineage volume, branched_at_lsn(V) > B_C}
+    /// ```
+    ///
+    /// * `{B_C}` pins origin pages (`birth <= B_C`, shared with the parent / an
+    ///   ancestor snapshot).
+    /// * C's own snapshot watermarks (reused from `snapshot_wms`) pin pages C
+    ///   captured.
+    /// * the descendant branch points pin born>B_C pages a surviving descendant
+    ///   clone still references. We use the CONSERVATIVE superset "all other
+    ///   clone-lineage volumes that branched after B_C" rather than
+    ///   `parent_vol_ord == Some(C)`, because a PROMOTED ex-descendant has its
+    ///   `parent_vol_ord` cleared and can no longer be identified as C's
+    ///   descendant — yet it still shares C's pages (promotion bumps only global
+    ///   PBA rc, never restructures the page tree). Missing it is the G6
+    ///   premature-free P0. Every true descendant `V` has
+    ///   `branched_at_lsn(V) = (a snapshot in C's lineage).created_lsn > B_C`, and
+    ///   `branched_at_lsn(V) >= birth(P)` for every C-page P that V shares, so the
+    ///   set is a complete superset; including unrelated clones only over-pins
+    ///   (benign). Scanned from the in-memory `self.volumes` (carries
+    ///   `branched_at_lsn` + the sticky CLONE_LINEAGE flag) so no `manifest_state`
+    ///   lock is taken inside the fold.
+    pub(crate) fn clone_cow_pinners(&self, vol: VolumeOrdinal) -> Vec<Lsn> {
+        // Compute the clone's own snapshot watermarks FIRST (takes
+        // `snap_info_cache`), then take `volumes.read()` for `B_C` + descendant
+        // branch points — the two locks are never held simultaneously.
+        let own_snap_wms = self.snapshot_wms(vol);
+        let volumes = self.volumes.read();
+        clone_cow_pinners_from(&volumes, vol, own_snap_wms)
+    }
+
     /// Recompute the cache entry for `vol` from `manifest.snapshots`.
     /// Callers must already hold a manifest lock or be in a state where
     /// the snapshot list is stable for `vol` (typically `apply_gate` or
@@ -1536,6 +1573,38 @@ impl Db {
         out.sort_unstable_by_key(DiffEntry::key);
         Ok(out)
     }
+}
+
+/// Build the S1c clone COW-kill pinner-LSN set from a borrowed volume map plus
+/// the clone's own snapshot watermarks (`own_snap_wms`). Free helper so both
+/// [`Db::clone_cow_pinners`] (locks `self.volumes`) and `apply_op_bare` (already
+/// holds a `&HashMap`) share one definition without a double `volumes.read()`.
+/// Returns empty for a non-clone — its COW-kill never reads this set. See
+/// [`Db::clone_cow_pinners`] for the completeness argument. `own_snap_wms` is
+/// consumed and extended (no extra allocation).
+pub(in crate::db) fn clone_cow_pinners_from(
+    volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
+    vol: VolumeOrdinal,
+    mut own_snap_wms: Vec<Lsn>,
+) -> Vec<Lsn> {
+    use std::sync::atomic::Ordering;
+    let Some(target) = volumes.get(&vol) else {
+        return Vec::new();
+    };
+    if target.flags.load(Ordering::Relaxed) & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE == 0 {
+        return Vec::new();
+    }
+    let b_c = target.branched_at_lsn;
+    own_snap_wms.push(b_c);
+    for (&other_ord, other) in volumes.iter() {
+        if other_ord != vol
+            && other.flags.load(Ordering::Relaxed) & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0
+            && other.branched_at_lsn > b_c
+        {
+            own_snap_wms.push(other.branched_at_lsn);
+        }
+    }
+    own_snap_wms
 }
 
 /// Result of [`Db::drop_volume`].

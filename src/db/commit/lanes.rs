@@ -286,6 +286,10 @@ impl Db {
             // capture-watermarks for the birth COW-kill + page-deadlist gate
             // before the lane runs.
             let snapshot_wms = self.snapshot_wms(vol_ord);
+            // ZFS port Phase 4 S1c: the clone COW-kill pinner set, built from the
+            // SAME `volumes` snapshot this lane operates on (empty for non-clones).
+            let clone_cow_pinners =
+                crate::db::volume::clone_cow_pinners_from(volumes, vol_ord, snapshot_wms.clone());
             let (tx, rx) = crossbeam_channel::bounded(1);
             volume.shards[sid].apply_lane.enqueue_ready(
                 lsn,
@@ -301,6 +305,7 @@ impl Db {
                         metrics.as_ref(),
                         rc_authoritative,
                         snapshot_wms,
+                        clone_cow_pinners,
                     );
                     let _ = tx.send(result);
                 }),

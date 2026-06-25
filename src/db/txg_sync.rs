@@ -118,6 +118,7 @@ pub(crate) fn apply_drain_ops(
     ops: &[LeafDrainOp],
     txg: Txg,
     snapshot_wms: Vec<crate::types::Lsn>,
+    clone_cow_pinners: Vec<crate::types::Lsn>,
 ) -> Result<()> {
     // A3 cutover: the buffer-drain COW stages page-rc deltas into this
     // sync cycle's TXG slot (so the page-rc fold `begin_checkpoint(txg)`
@@ -132,6 +133,12 @@ pub(crate) fn apply_drain_ops(
     // reads via the tree, so COW-time and deadlist-drain agree (and replay
     // reproduces it from the durable `capture_watermark`s).
     tree.set_snapshot_wms(snapshot_wms);
+    // ZFS port Phase 4 Step 4 (S1c): the page-rc-independent CLONE COW-kill
+    // pinner set ({B_C} ∪ own-snap wms ∪ descendant branch points). Kept SEPARATE
+    // from `snapshot_wms` so the deadlist drain (`drain_page_deaths_into`, which
+    // reads `snapshot_wms`) keeps classifying by C's OWN snapshots only. Empty for
+    // non-clones (the clone arm is the only reader).
+    tree.set_clone_cow_pinners(clone_cow_pinners);
     for op in ops {
         if !op.inserts.is_empty() {
             tree.insert_leaf_run_at_lsn_deferred_finish(&op.inserts, op.inserts_max_lsn)?;
@@ -159,11 +166,18 @@ pub(crate) fn compact_drain_into_tree(
     draining: &HashMap<u64, super::l2p_buffer::BufferEntry>,
     txg: Txg,
     snapshot_wms: Vec<crate::types::Lsn>,
+    clone_cow_pinners: Vec<crate::types::Lsn>,
 ) -> Result<()> {
     if draining.is_empty() {
         return Ok(());
     }
-    apply_drain_ops(tree, &build_drain_plan(draining), txg, snapshot_wms)
+    apply_drain_ops(
+        tree,
+        &build_drain_plan(draining),
+        txg,
+        snapshot_wms,
+        clone_cow_pinners,
+    )
 }
 
 /// Callback that performs the actual per-TXG sync work for one cycle.

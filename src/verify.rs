@@ -31,6 +31,15 @@ pub struct VerifyOptions {
     /// clone-private subtree the substrate must faithfully record before
     /// Phase 4 reads it instead of page-rc. Off by default.
     pub check_clone_livelist: bool,
+    /// Run the S1c clone COW-kill operand SHADOW as a HARD gate (ZFS port
+    /// Phase 4 Step 4 / S1c): for every clone, assert every page reachable from a
+    /// surviving pinner (other volume head / snapshot tree) satisfies
+    /// `birth <= B_eff` where `B_eff = max({branched_at_lsn} ∪ {own snapshot
+    /// created_lsn} ∪ {descendant branch points})` — i.e. the page-rc-independent
+    /// clone COW-kill would preserve every shared page. The page-rc-independent
+    /// tripwire for the S1c flip. Off by default so existing callers are
+    /// unaffected.
+    pub check_clone_birth_shadow: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -232,6 +241,14 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
             .push(format!("clone-livelist check failed: {err}"));
     }
 
+    if options.check_clone_birth_shadow
+        && let Err(err) = check_clone_birth_shadow(&page_store, &manifest.manifest, &mut report)
+    {
+        report
+            .issues
+            .push(format!("clone-birth-shadow check failed: {err}"));
+    }
+
     Ok(report)
 }
 
@@ -422,22 +439,32 @@ fn check_birth_shadow(
 /// DAG sharing; this audit measures exactly that gap for the candidate
 /// post-page-rc clone COW-kill operand.
 ///
-/// For each clone C (`VOLUME_FLAG_CLONE_LINEAGE`) the candidate operand is
-/// `COW iff birth(P) <= B_eff`, `B_eff = max(branched_at_lsn, youngest_snap(C))`.
-/// The page-rc-INDEPENDENT ground truth "P is pinned" = P reachable from any
-/// OTHER live volume head or any snapshot tree (a pinned page MUST be COW'd or a
-/// clone write clobbers a shared page).
+/// For each clone C (`VOLUME_FLAG_CLONE_LINEAGE`) the S1c operand is
+/// `COW iff birth(P) <= B_eff`, where `B_eff` is the MAX of the page-rc-independent
+/// pinner-LSN set the runtime `cow_for_write` actually uses (built by
+/// `Db::clone_cow_pinners`):
+///
+/// ```text
+/// B_eff = max( branched_at_lsn(C),
+///              max{ snapshot.created_lsn : snapshot of C },
+///              max{ branched_at_lsn(V)   : V another clone-lineage volume,
+///                                          branched_at_lsn(V) > branched_at_lsn(C) } )
+/// ```
+///
+/// The third term — descendant branch points (incl. PROMOTED ex-descendants whose
+/// `parent_vol_ord` is cleared) — is what makes the operand sufficient for the
+/// DAG: it pins a born>B page a surviving descendant still references after C's own
+/// snapshot is dropped (the G6 premature-free the pure-birth `max(B, youngest_snap)`
+/// operand misses). The page-rc-INDEPENDENT ground truth "P is pinned" = P
+/// reachable from any OTHER live volume head or any snapshot tree (a pinned page
+/// MUST be COW'd or a clone write clobbers a shared page).
 ///
 /// Only the SAFETY direction is a finding: `pinned(P) && birth(P) > B_eff` — the
-/// operand would write in place over a shared page (the parent/sibling
-/// corruption hazard). The reverse (`birth(P) <= B_eff` but unpinned — e.g. a G8
-/// sole-owned origin page) is a benign conservative over-COW and is NOT flagged.
+/// operand would write in place over a shared page (the parent/sibling corruption
+/// hazard). The reverse (`birth(P) <= B_eff` but unpinned — e.g. a G8 sole-owned
+/// origin page) is a benign conservative over-COW and is NOT flagged.
 ///
-/// An EMPTY result proves the pure-birth clone operand is safe for the audited
-/// manifest. A NON-empty result pinpoints a DAG shape (e.g. a descendant clone
-/// pinning an ancestor's born>B page after the ancestor's own snapshot was
-/// dropped, so `B_eff` falls below the page's birth) where the operand is
-/// insufficient and S1c must consult cross-volume reachability, not birth alone.
+/// An EMPTY result proves the S1c clone operand is safe for the audited manifest.
 pub(crate) fn clone_birth_shadow_findings(
     page_store: &Arc<PageStore>,
     manifest: &Manifest,
@@ -456,7 +483,22 @@ pub(crate) fn clone_birth_shadow_findings(
             .map(|s| s.created_lsn)
             .max()
             .unwrap_or(0);
-        let b_eff = b.max(youngest_snap_clone);
+        // Descendant branch points (the S1c completion): max over every OTHER
+        // clone-lineage volume that branched after C — the conservative superset
+        // of C's descendants that also covers promoted ex-descendants. Mirrors
+        // `Db::clone_cow_pinners`'s third term.
+        let max_descendant_branch = manifest
+            .volumes
+            .iter()
+            .filter(|other| {
+                other.ord != vol
+                    && other.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0
+                    && other.branched_at_lsn > b
+            })
+            .map(|other| other.branched_at_lsn)
+            .max()
+            .unwrap_or(0);
+        let b_eff = b.max(youngest_snap_clone).max(max_descendant_branch);
 
         let head_set = reachable_l2p_pages(page_store, &volume.l2p_shard_roots)?;
 
@@ -504,8 +546,9 @@ pub(crate) fn clone_birth_shadow_findings(
             if pinned && !operand_cows {
                 findings.push(format!(
                     "clone-birth-shadow vol {vol} (B={b} youngest_snap={youngest_snap_clone} \
-                     B_eff={b_eff}) page {pid}: birth_lsn={} > B_eff but page is reachable from a \
-                     surviving pinner (pure-birth clone COW-kill would clobber a shared page)",
+                     max_descendant_branch={max_descendant_branch} B_eff={b_eff}) page {pid}: \
+                     birth_lsn={} > B_eff but page is reachable from a surviving pinner (the S1c \
+                     clone COW-kill would clobber a shared page)",
                     header.birth_lsn
                 ));
             }
@@ -514,9 +557,27 @@ pub(crate) fn clone_birth_shadow_findings(
     Ok(findings)
 }
 
+/// HARD `is_clean()` gate wrapping [`clone_birth_shadow_findings`] (ZFS port
+/// Phase 4 Step 4 / S1c). Pushes every safety-direction finding into
+/// `report.issues` so a manifest where the S1c clone COW-kill operand would
+/// clobber a shared page fails verification. Sound to gate now that the operand
+/// consults descendant branch points (the pure-birth gap is closed); page-rc is
+/// kept as the inverted-shadow floor until S3, so this is the page-rc-INDEPENDENT
+/// tripwire validating the operand across the soak.
+fn check_clone_birth_shadow(
+    page_store: &Arc<PageStore>,
+    manifest: &Manifest,
+    report: &mut VerifyReport,
+) -> Result<()> {
+    for finding in clone_birth_shadow_findings(page_store, manifest)? {
+        report.issues.push(finding);
+    }
+    Ok(())
+}
+
 /// CLI/offline entry for [`clone_birth_shadow_findings`]: open the latest
 /// manifest at `path` and return the safety-direction findings (empty == the
-/// pure-birth clone COW-kill operand is safe for this metadb).
+/// S1c clone COW-kill operand is safe for this metadb).
 pub fn audit_clone_birth_shadow(path: impl AsRef<Path>) -> Result<Vec<String>> {
     let page_store = Arc::new(PageStore::open(path.as_ref().join("pages.onyx_meta"))?);
     match ManifestStore::load_latest(&page_store)? {
