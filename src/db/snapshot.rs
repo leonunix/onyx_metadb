@@ -17,10 +17,13 @@ enum MergeTarget {
 /// Shared inputs the `drop_snapshot` page-deadlist work derives once: the
 /// previous surviving snapshot's `created_lsn`, the entity that inherits
 /// S's deaths, and that inheritor's current deadlist records (`DL_next`).
-/// `None` (clone-involved volume) means both the shadow check and the MERGE
-/// skip. Reused by `check_page_deadlist_shadow` and `plan_page_deadlist_merge`
-/// so the clone gate, S_prev/S_next selection, and chain read live in one
-/// place.
+/// Always derived (ZFS port Phase 4 S2c decoupled FREE from CHAIN
+/// maintenance): the MERGE runs on EVERY drop — incl. clone-involved ones —
+/// to keep the per-volume chain complete across routing flips, while the
+/// authoritative FREE-set comes from the deadlist (non-clone) or the
+/// reachability difference (clone-involved). The derivation is single-volume
+/// (`vol_ord == vol`), correct for a clone source. Reused by
+/// `check_page_deadlist_shadow` and `plan_page_deadlist_merge`.
 struct InheritorContext {
     s_prev_created: Lsn,
     target: MergeTarget,
@@ -531,24 +534,36 @@ impl Db {
                 }
             }
         }
-        // ZFS port Phase 2a: derive the inheritor context (S_prev/S_next +
-        // DL_next) once, shared by the shadow cross-check here and the MERGE
-        // below. `None` = clone-involved volume, which both skip. The page-rc
-        // apply between here and the merge frees only L2P pages, never
-        // deadlist segments, and we hold apply_gate.write + drop_gate.write,
-        // so `DL_next` (and the HEAD accumulator it peeked) stays valid for
-        // both consumers.
+        // ZFS port Phase 2a/S2c: derive the inheritor context (S_prev/S_next +
+        // DL_next) once. It always drives the MERGE below (single-volume chain
+        // bookkeeping, run on every drop); the NON-clone FREE path also feeds
+        // it to `check_page_deadlist_shadow`, while the clone-involved FREE path
+        // uses reachability instead. The page-rc apply between here and the
+        // merge frees only L2P pages, never deadlist segments, and we hold
+        // apply_gate.write + drop_gate.write, so `DL_next` (and the HEAD
+        // accumulator it peeked) stays valid for both consumers.
         let inheritor_ctx =
             self.page_deadlist_inheritor_context(&entry, &other_snapshots, &source_volume)?;
-        // ZFS port Phase 4 S2: for a NON-clone drop the deadlist is the
-        // authoritative, page-rc-independent free-set — the shadow returns it
-        // (== structural_to_free on Ok) and we freeze it into the WAL op. A
-        // clone-involved drop (inheritor_ctx None, R5/S2c) keeps the legacy
-        // page-rc cascade (`free_pages = None`).
-        let free_pages: Option<Vec<PageId>> = match &inheritor_ctx {
-            Some(ctx) => Some(self.check_page_deadlist_shadow(id, &entry, &pages, &after_refs, ctx)?),
-            None => None,
-        };
+        // ZFS port Phase 4 S2/S2c: the authoritative, page-rc-independent
+        // free-set. NON-clone drops use the single-volume deadlist (the shadow
+        // returns it, == structural_to_free on Ok). CLONE-INVOLVED drops
+        // (`snapshot_drop_clone_involved`, sticky CLONE_LINEAGE flag) use the
+        // structural reachability difference instead — the single-vol deadlist
+        // can't model cross-volume page sharing (R5). Either way the result is
+        // frozen into the WAL op so S3 can delete the page-rc cascade.
+        let free_pages: Option<Vec<PageId>> =
+            Some(if self.snapshot_drop_clone_involved(&source_volume) {
+                self.check_clone_drop_reachability_shadow(
+                    id,
+                    &entry,
+                    &pages,
+                    &after_refs,
+                    &all_current_roots,
+                    &other_snapshots,
+                )?
+            } else {
+                self.check_page_deadlist_shadow(id, &entry, &pages, &after_refs, &inheritor_ctx)?
+            });
 
         // Crash-recovery completeness (G2): plan the page-deadlist MERGE
         // (write the durable carried segment) BEFORE the WAL submit, and carry
@@ -560,11 +575,22 @@ impl Db {
         // carried segment is synced here, so it is durable before the op's
         // fsync. `checkpoint_lsn` (== last_applied) stamps the segment: it is
         // >= every carried `death_lsn` and < any post-drop death, preserving
-        // the chain-ordering invariant. `None` for clone-involved drops.
-        let merge_plan = match &inheritor_ctx {
-            Some(ctx) => Some(self.plan_page_deadlist_merge(&entry, ctx, checkpoint_lsn)?),
-            None => None,
-        };
+        // the chain-ordering invariant.
+        //
+        // S2c: the MERGE runs on EVERY drop, INCLUDING clone-involved ones.
+        // It is single-volume bookkeeping (per `inheritor_ctx`, keyed on V's
+        // own snapshots) and frees no L2P data pages — only rewrites V's
+        // deadlist chain. Skipping it on clone-involved drops (the old `None`
+        // arm) drops S's chain records instead of forwarding them, so when the
+        // last clone-lineage volume is dropped and routing flips back to the
+        // deadlist free-source, the inheritor chain diverges from the
+        // structural free-set → a legal non-clone drop fires a HARD
+        // `Corruption` in `check_page_deadlist_shadow` (observed as PREMATURE in
+        // `s2c_merge_runs_on_clone_routed_drop_no_missing_after_flip`; the
+        // missing-forward direction can also surface as a COMPLETENESS HOLE).
+        // Running it always keeps the chain consistent across routing flips
+        // (empty carry → NULL anchor, a no-op).
+        let merge_plan = Some(self.plan_page_deadlist_merge(&entry, &inheritor_ctx, checkpoint_lsn)?);
         let merge: Option<(crate::lifecycle_log::DropMergeTarget, PageId)> =
             merge_plan.as_ref().map(|m| {
                 let target = match m.target {
@@ -728,27 +754,24 @@ impl Db {
     /// `created_lsn` (`S_prev`), the entity that inherits S's deaths
     /// (`S_next`, or the live HEAD when S is youngest), and that inheritor's
     /// current records (`DL_next` — its sealed chain, plus the HEAD's
-    /// not-yet-drained accumulator when the inheritor is the HEAD). Returns
-    /// `None` for clone-involved volumes, which both consumers skip (clone
-    /// DAGs add cross-volume sharing the single-vol invariant can't model —
-    /// R5/Phase 3). Reading `DL_next` here keeps the S_prev/S_next selection
-    /// and the HEAD-vs-snapshot chain read in one place.
+    /// not-yet-drained accumulator when the inheritor is the HEAD). Reading
+    /// `DL_next` here keeps the S_prev/S_next selection and the
+    /// HEAD-vs-snapshot chain read in one place.
+    ///
+    /// S2c: derived for EVERY drop (no clone early-return). The MERGE runs
+    /// unconditionally so the per-volume chain stays complete even while a
+    /// clone exists and the FREE-set comes from reachability (see
+    /// `drop_snapshot`). The derivation is single-volume (`vol_ord == vol`)
+    /// and correct for a clone source — clones add cross-volume page
+    /// *sharing*, which changes the FREE decision, not this volume's own
+    /// snapshot chain bookkeeping.
     fn page_deadlist_inheritor_context(
         &self,
         entry: &SnapshotEntry,
         other_snapshots: &[SnapshotEntry],
         source_volume: &Volume,
-    ) -> Result<Option<InheritorContext>> {
+    ) -> Result<InheritorContext> {
         let vol = entry.vol_ord;
-        let is_clone = source_volume.parent_vol_ord.read().is_some();
-        let has_clone_child = self
-            .volumes
-            .read()
-            .values()
-            .any(|v| *v.parent_vol_ord.read() == Some(vol));
-        if is_clone || has_clone_child {
-            return Ok(None);
-        }
         // Order snapshots by the TOTAL order `(created_lsn, id)`, not
         // `created_lsn` alone. `id` is monotonic with creation, so this
         // breaks `created_lsn` ties (two snapshots taken with no committed
@@ -797,12 +820,160 @@ impl Db {
             .map(|s| s.created_lsn)
             .collect();
         other_created_sorted.sort_unstable();
-        Ok(Some(InheritorContext {
+        Ok(InheritorContext {
             s_prev_created,
             target,
             dl_next,
             other_created_sorted,
-        }))
+        })
+    }
+
+    /// ZFS port Phase 4 S2c — is this snapshot drop "clone-involved", i.e.
+    /// could any other volume share the dropped snapshot's L2P pages so the
+    /// single-volume page-deadlist would mis-predict the free-set? Routes the
+    /// drop to the reachability free-source ([`check_clone_drop_reachability_shadow`])
+    /// instead of the deadlist shadow.
+    ///
+    /// Uses the STICKY `VOLUME_FLAG_CLONE_LINEAGE` (set at clone create, never
+    /// cleared — survives promotion), mirroring the `drop_volume` Step-3 gate
+    /// and `clone_cow_pinners_from`. `parent_vol_ord.is_some()` (the old gate)
+    /// misses promoted ex-clones, which is exactly the dense-soak false-premature.
+    ///
+    /// True iff V itself is clone-lineage OR any OTHER live volume is — page
+    /// sharing only arises within a clone lineage, but promotion erases the
+    /// parent link, so we cannot cheaply prove an unrelated promoted ex-clone
+    /// does not reach V's pages. Over-routing is always safe (reachability is
+    /// authoritative and is already computed at every drop) and never
+    /// under-routes (any cross-volume share keeps the sticky flag forever).
+    fn snapshot_drop_clone_involved(&self, source_volume: &Volume) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let flag = crate::manifest::VOLUME_FLAG_CLONE_LINEAGE;
+        if source_volume.flags.load(Relaxed) & flag != 0 {
+            return true;
+        }
+        self.volumes
+            .read()
+            .values()
+            .any(|v| v.ord != source_volume.ord && v.flags.load(Relaxed) & flag != 0)
+    }
+
+    /// ZFS port Phase 4 S2c — the page-rc-INDEPENDENT free-source for a
+    /// CLONE-INVOLVED snapshot drop. The single-volume page-deadlist
+    /// (`check_page_deadlist_shadow`) cannot model the cross-volume page
+    /// sharing a clone DAG introduces, so the authoritative free-set is the
+    /// structural reachability difference
+    /// `structural_to_free = { pid ∈ pages : after_refs[pid] == 0 }` —
+    /// already computed by the prologue's `collect_paged_refcounts_for_roots`
+    /// walk over `roots_after` (every live volume head incl. promoted
+    /// ex-clones ∪ all OTHER snapshots' roots), so a page is freed iff S was
+    /// its last incoming edge and NO surviving root reaches it. That walk
+    /// never reads `l2p_page_rc`, so it survives the S3 page-rc deletion.
+    ///
+    /// HARD teeth: an INDEPENDENT reachability set-difference
+    /// `reachable(S) \ reachable(survivors)` (via `reachable_l2p_pages`, the
+    /// `drop_volume` clone path's oracle) must equal `structural_to_free`.
+    /// `survivor_roots` is built IDENTICALLY to the prologue's `roots_after`
+    /// (R1 — a different root set would false-fire). Premature
+    /// (`structural_to_free \ exclusive`: we'd free a survivor-reachable page,
+    /// the P0) and missing (`exclusive \ structural_to_free`) are both HARD
+    /// `Corruption`. page-rc stays the apply-side bookkeeping decref + the
+    /// offline inverted-shadow oracles, not a hot-path read here — the drop
+    /// runs quiesced (apply_gate.write + drop_gate.write held, post
+    /// force_compact/flush), the no-force-fold-hazard point.
+    fn check_clone_drop_reachability_shadow(
+        &self,
+        id: SnapshotId,
+        entry: &SnapshotEntry,
+        pages: &[PageId],
+        after_refs: &std::collections::BTreeMap<PageId, u32>,
+        all_current_roots: &[PageId],
+        other_snapshots: &[SnapshotEntry],
+    ) -> Result<Vec<PageId>> {
+        use std::collections::HashSet;
+        let vol = entry.vol_ord;
+
+        // Authoritative free-set: structural reachability difference, page-rc
+        // independent (== check_page_deadlist_shadow's structural_to_free).
+        let structural_to_free: HashSet<PageId> = pages
+            .iter()
+            .copied()
+            .filter(|pid| after_refs.get(pid).copied().unwrap_or(0) == 0)
+            .collect();
+
+        // Independent oracle: reachable(S) \ reachable(survivors). survivor_roots
+        // MUST mirror the prologue's `roots_after` (all live heads + all OTHER
+        // snapshots' `l2p_shard_roots`) so the two walks see the same graph.
+        let mut survivor_roots: Vec<PageId> = all_current_roots.to_vec();
+        survivor_roots.extend(
+            other_snapshots
+                .iter()
+                .flat_map(|s| s.l2p_shard_roots.iter().copied()),
+        );
+        let survivor_reachable =
+            crate::verify::reachable_l2p_pages(&self.page_store, &survivor_roots)?;
+        let snap_reachable =
+            crate::verify::reachable_l2p_pages(&self.page_store, &entry.l2p_shard_roots)?;
+        let exclusive: HashSet<PageId> = snap_reachable
+            .difference(&survivor_reachable)
+            .copied()
+            .collect();
+
+        let mut premature: Vec<PageId> =
+            structural_to_free.difference(&exclusive).copied().collect();
+        if !premature.is_empty() {
+            premature.sort_unstable();
+            return Err(MetaDbError::Corruption(format!(
+                "drop_snapshot {id} (vol {vol}, clone-involved): structural free-set names {} \
+                 page(s) still reachable from a surviving root (PREMATURE FREE): {premature:?} \
+                 (structural_to_free={} exclusive={})",
+                premature.len(),
+                structural_to_free.len(),
+                exclusive.len(),
+            )));
+        }
+        let mut missing: Vec<PageId> =
+            exclusive.difference(&structural_to_free).copied().collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            return Err(MetaDbError::Corruption(format!(
+                "drop_snapshot {id} (vol {vol}, clone-involved): reachability frees {} page(s) \
+                 the structural free-set omits (COMPLETENESS HOLE): {missing:?} \
+                 (structural_to_free={} exclusive={})",
+                missing.len(),
+                structural_to_free.len(),
+                exclusive.len(),
+            )));
+        }
+
+        // Both directions clean ⇒ structural_to_free == exclusive. Hand it
+        // back sorted (deterministic WAL `free_pages`).
+        let mut free_pages: Vec<PageId> = structural_to_free.into_iter().collect();
+        free_pages.sort_unstable();
+        Ok(free_pages)
+    }
+
+    /// Test shim: drive [`Db::check_clone_drop_reachability_shadow`] with
+    /// caller-crafted `pages`/`after_refs` so the premature/missing detectors
+    /// can be exercised directly (the production call site only ever passes a
+    /// self-consistent free-set).
+    #[cfg(test)]
+    pub(in crate::db) fn test_check_clone_drop_reachability_shadow(
+        &self,
+        id: SnapshotId,
+        entry: &SnapshotEntry,
+        pages: &[PageId],
+        after_refs: &std::collections::BTreeMap<PageId, u32>,
+        all_current_roots: &[PageId],
+        other_snapshots: &[SnapshotEntry],
+    ) -> Result<Vec<PageId>> {
+        self.check_clone_drop_reachability_shadow(
+            id,
+            entry,
+            pages,
+            after_refs,
+            all_current_roots,
+            other_snapshots,
+        )
     }
 
     /// Exact free predicate for a `dl_next` death record when dropping S:

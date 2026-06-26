@@ -1087,3 +1087,285 @@ fn clone_birth_shadow_fires_when_descendant_pinner_missing() {
          findings={findings:?}"
     );
 }
+
+// ============================================================================
+// ZFS port Phase 4 S2c — clone-involved snapshot-drop free-source (R5).
+// drop_snapshot of a clone-involved volume now frees the page-rc-independent
+// reachability difference (not the single-vol deadlist, which can't model
+// cross-volume page sharing), routed by the sticky CLONE_LINEAGE flag (covers
+// promoted ex-clones the old `parent_vol_ord` gate missed), and runs the MERGE
+// unconditionally so the per-volume chain stays complete across routing flips.
+// ============================================================================
+
+/// Verify options with every clone/birth/deadlist oracle on.
+fn s2c_verify_all(dir: &std::path::Path) -> crate::verify::VerifyReport {
+    crate::verify::verify_path(
+        dir,
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: true,
+            check_clone_birth_shadow: true,
+        },
+    )
+    .unwrap()
+}
+
+fn s2c_snap_entry(db: &Db, id: crate::SnapshotId) -> crate::manifest::SnapshotEntry {
+    db.manifest()
+        .snapshots
+        .iter()
+        .find(|e| e.id == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("snapshot {id} not found in manifest"))
+}
+
+/// T1/T2 (teeth + data-survival, RED-without-fix): drop a snapshot s_v of a
+/// plain origin volume P whose pinned pages a PROMOTED ex-clone D still shares,
+/// where P has overwritten them after s_v (so they are DEAD in P's own deadlist
+/// chain). The OLD `parent_vol_ord` detection routes it to the single-vol
+/// deadlist (`is_clone(P)`=false origin; `has_clone_child(P)`=false because D is
+/// promoted → parent cleared) → the deadlist frees P's dead pages while D still
+/// maps them → PREMATURE FREE Corruption. The NEW sticky-flag routing's "any
+/// other clone-lineage volume" disjunct catches the promoted D → reachability
+/// free-source → keeps the D-shared pages → success. This is exactly dense-soak
+/// issue #2 ("dropping a snapshot a [promoted] clone branched from").
+///
+/// Verified RED-without-fix: reverting `snapshot_drop_clone_involved` to the old
+/// `is_clone || has_clone_child` gate makes `drop_snapshot(s_v)` fire PREMATURE.
+#[test]
+fn s2c_promoted_exclone_sharer_routes_drop_to_reachability_not_deadlist() {
+    let (dir, db) = mk_db();
+    let p = db.create_volume().unwrap(); // plain origin (no CLONE_LINEAGE flag)
+    for i in 0u64..8 {
+        db.insert(p, i, v(i as u8)).unwrap();
+    }
+    let s_v = db.take_snapshot(p).unwrap(); // s_v pins P's value-i pages
+    let d = db.clone_volume(s_v).unwrap(); // D shares P's value-i pages via s_v
+    promote_to_completion(&db, d); // D.parent_vol_ord cleared → has_clone_child(P)=false
+    for i in 0u64..8 {
+        db.insert(p, i, v(0xD0 | i as u8)).unwrap(); // P's value-i pages DIE in P's deadlist; D still maps them
+    }
+    db.flush().unwrap();
+
+    // We are in the newly-covered category: P is a plain origin (old is_clone
+    // false), D is promoted (old has_clone_child false), yet D shares s_v's pages.
+    let pentry = db.manifest().volumes.iter().find(|e| e.ord == p).cloned().unwrap();
+    assert!(pentry.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE == 0, "P must be a plain origin");
+    let dentry = db.manifest().volumes.iter().find(|e| e.ord == d).cloned().unwrap();
+    assert!(dentry.parent_vol_ord.is_none(), "D must be promoted so old has_clone_child(P)=false");
+    assert!(dentry.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0, "D keeps the sticky flag");
+
+    // Old code: routes to the single-vol deadlist → PREMATURE (s_v's pages are
+    // dead in P's chain but still reachable from promoted survivor D). New code:
+    // the "any other clone-lineage volume" disjunct → reachability → success.
+    db.drop_snapshot(s_v)
+        .unwrap()
+        .expect("clone-involved snapshot drop must use reachability, not false-premature");
+    for i in 0u64..8 {
+        assert_eq!(db.get(d, i).unwrap(), Some(v(i as u8)), "D lost shared lba {i}");
+        assert_eq!(db.get(p, i).unwrap(), Some(v(0xD0 | i as u8)), "P head lba {i}");
+    }
+    db.flush().unwrap();
+    drop(db);
+    let db = crate::Db::open(dir.path()).unwrap();
+    for i in 0u64..8 {
+        assert_eq!(db.get(d, i).unwrap(), Some(v(i as u8)), "reopen D lba {i}");
+        assert_eq!(db.get(p, i).unwrap(), Some(v(0xD0 | i as u8)), "reopen P lba {i}");
+    }
+    drop(db);
+    let report = s2c_verify_all(dir.path());
+    assert!(report.is_clean(), "verify after S2c clone-involved drop: {:?}", report.issues);
+}
+
+/// T3 (frees): a promoted-ex-clone snapshot whose pinned pages NOTHING else
+/// shares is actually freed by the reachability free-source.
+#[test]
+fn s2c_clone_involved_snapshot_drop_frees_exclusive_pages() {
+    let (dir, db) = mk_db();
+    let p = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(p, i, v(i as u8)).unwrap();
+    }
+    let s1 = db.take_snapshot(p).unwrap();
+    let c = db.clone_volume(s1).unwrap();
+    for i in 0u64..8 {
+        db.insert(c, i, v(0xC0 | i as u8)).unwrap(); // C born > B
+    }
+    promote_to_completion(&db, c); // promoted ex-clone → clone-involved via sticky flag
+    let sc = db.take_snapshot(c).unwrap();
+    for i in 0u64..8 {
+        db.insert(c, i, v(0xD0 | i as u8)).unwrap(); // diverge after sc → sc-exclusive pages
+    }
+    db.flush().unwrap();
+
+    let report = db.drop_snapshot(sc).unwrap().expect("drop sc");
+    assert!(
+        report.pages_freed > 0,
+        "clone-involved snapshot drop must free the snapshot-exclusive pages via reachability"
+    );
+    for i in 0u64..8 {
+        assert_eq!(db.get(c, i).unwrap(), Some(v(0xD0 | i as u8)), "C head lost lba {i}");
+    }
+    db.flush().unwrap();
+    drop(db);
+    // Reopen so `reclaim_orphan_pages` sweeps the drop's deferred orphans (old
+    // deadlist segment chains + the snapshot's SnapshotRoots page) before the
+    // offline verify — the same flush→drop→reopen→verify the S2 deadlist test uses.
+    let db = crate::Db::open(dir.path()).unwrap();
+    for i in 0u64..8 {
+        assert_eq!(db.get(c, i).unwrap(), Some(v(0xD0 | i as u8)), "reopen C lba {i}");
+    }
+    drop(db);
+    let report = s2c_verify_all(dir.path());
+    assert!(report.is_clean(), "verify after S2c exclusive free: {:?}", report.issues);
+}
+
+/// T5 (the make-or-break, RED-without-the-always-merge): the MERGE must run on
+/// clone-routed drops so the per-volume deadlist chain stays complete when
+/// routing flips back to the deadlist free-source. V takes 3 snapshots while a
+/// clone exists; dropping the two oldest is clone-routed (reachability free +
+/// merge); after the clone is dropped the youngest drop is non-clone-routed
+/// (deadlist) and MUST NOT fire MISSING/COMPLETENESS-HOLE. Reverting the merge
+/// to conditional (skip on clone-routed) makes the final drop fire MISSING.
+#[test]
+fn s2c_merge_runs_on_clone_routed_drop_keeps_chain_consistent_after_flip() {
+    // The hole needs a page pinned by a SURVIVING OLDER snapshot whose death is
+    // recorded in a MIDDLE snapshot's chain. Drop the MIDDLE snapshot
+    // clone-routed (merge must forward those deaths to S_c); then flip routing
+    // and drop the OLDER snapshot non-clone — its deadlist must still account
+    // the forwarded deaths or `check_page_deadlist_shadow` fires a HARD
+    // `Corruption` (this shape surfaces it as PREMATURE; the dropped-forward
+    // direction can also surface as a COMPLETENESS HOLE). Layout:
+    //   value-i pages born < s_a (s_a pins them)
+    //   overwrite +1 between s_a and s_b → value-i deaths land in s_b's window
+    //   overwrite +2 between s_b and s_c; overwrite +3 after s_c
+    let (dir, db) = mk_db();
+    let vv = db.create_volume().unwrap();
+    for i in 0u64..16 {
+        db.insert(vv, i, v(i as u8)).unwrap(); // value-i pages
+    }
+    db.flush().unwrap();
+    let sa = db.take_snapshot(vv).unwrap(); // s_a pins value-i pages
+    for i in 0u64..16 {
+        db.insert(vv, i, v((i as u8).wrapping_add(1))).unwrap(); // value-i dies in (s_a, s_b]
+    }
+    db.flush().unwrap();
+    let sb = db.take_snapshot(vv).unwrap();
+    for i in 0u64..16 {
+        db.insert(vv, i, v((i as u8).wrapping_add(2))).unwrap();
+    }
+    db.flush().unwrap();
+    let sc = db.take_snapshot(vv).unwrap();
+    for i in 0u64..16 {
+        db.insert(vv, i, v((i as u8).wrapping_add(3))).unwrap();
+    }
+    db.flush().unwrap();
+
+    // A clone exists → V's snapshot drops are clone-involved (reachability + merge).
+    let wc = db.clone_volume(sc).unwrap();
+    // Drop the MIDDLE snapshot s_b clone-routed: its chain carries the value-i
+    // deaths that surviving s_a still pins → the merge must forward them to s_c.
+    db.drop_snapshot(sb).unwrap().expect("clone-routed drop of middle snapshot s_b");
+
+    // Drop the clone → no clone-lineage volume remains → routing flips back.
+    db.drop_volume(wc).unwrap().expect("drop clone wc");
+
+    // Drop the OLDER snapshot s_a non-clone-routed: it frees the value-i pages
+    // (pinned only by s_a now). Its deadlist must account the value-i deaths the
+    // s_b drop forwarded; without the merge the chain diverges → HARD Corruption.
+    db.drop_snapshot(sa)
+        .unwrap()
+        .expect("non-clone drop of s_a after flip must not fire a deadlist Corruption (merge kept chain consistent)");
+    for i in 0u64..16 {
+        assert_eq!(db.get(vv, i).unwrap(), Some(v((i as u8).wrapping_add(3))), "V head lba {i}");
+    }
+    db.flush().unwrap();
+    drop(db);
+    let db = crate::Db::open(dir.path()).unwrap();
+    for i in 0u64..16 {
+        assert_eq!(db.get(vv, i).unwrap(), Some(v((i as u8).wrapping_add(3))), "reopen lba {i}");
+    }
+    drop(db);
+    let report = s2c_verify_all(dir.path());
+    assert!(report.is_clean(), "verify after merge-across-flip: {:?}", report.issues);
+}
+
+/// T7 (over-routing harmless): an UNRELATED clone (off a different volume)
+/// over-routes V's snapshot drop to the reachability path. It still frees V's
+/// exclusive pages and leaves the unrelated volumes intact.
+#[test]
+fn s2c_unrelated_clone_over_routes_harmless() {
+    let (dir, db) = mk_db();
+    let vv = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(vv, i, v(i as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    let s = db.take_snapshot(vv).unwrap();
+    for i in 0u64..8 {
+        db.insert(vv, i, v((i as u8).wrapping_add(1))).unwrap(); // s-exclusive old pages
+    }
+    db.flush().unwrap();
+
+    // Unrelated lineage: U + clone W off U. V never shared with them.
+    let u = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(u, i, v(0xE0 | i as u8)).unwrap();
+    }
+    let su = db.take_snapshot(u).unwrap();
+    let w = db.clone_volume(su).unwrap();
+
+    // V's drop is over-routed to reachability (W is clone-lineage), still correct.
+    let report = db.drop_snapshot(s).unwrap().expect("over-routed drop of V's snapshot");
+    assert!(report.pages_freed > 0, "V's exclusive pages must still be freed");
+    for i in 0u64..8 {
+        assert_eq!(db.get(vv, i).unwrap(), Some(v((i as u8).wrapping_add(1))), "V lba {i}");
+        assert_eq!(db.get(u, i).unwrap(), Some(v(0xE0 | i as u8)), "U lba {i}");
+        assert_eq!(db.get(w, i).unwrap(), Some(v(0xE0 | i as u8)), "W lba {i}");
+    }
+    db.flush().unwrap();
+    drop(db);
+    // Reopen so deferred orphan reclaim runs before the offline verify.
+    let db = crate::Db::open(dir.path()).unwrap();
+    for i in 0u64..8 {
+        assert_eq!(db.get(vv, i).unwrap(), Some(v((i as u8).wrapping_add(1))), "reopen V lba {i}");
+    }
+    drop(db);
+    let report = s2c_verify_all(dir.path());
+    assert!(report.is_clean(), "verify after unrelated-clone over-route: {:?}", report.issues);
+}
+
+/// T9 (shim teeth): the reachability shadow fires PREMATURE when the structural
+/// free-set names a page that is actually reachable from a surviving root.
+/// Craft `after_refs` claiming the snapshot root has 0 survivor refs while the
+/// live head (no divergence) still reaches it.
+#[test]
+fn s2c_reachability_shadow_fires_premature_on_crafted_survivor_reachable() {
+    use std::collections::BTreeMap;
+    let (_d, db) = mk_db();
+    let vv = db.create_volume().unwrap();
+    for i in 0u64..8 {
+        db.insert(vv, i, v(i as u8)).unwrap();
+    }
+    let s = db.take_snapshot(vv).unwrap(); // no divergence: head == snapshot roots
+    let entry = s2c_snap_entry(&db, s);
+    let root0 = entry.l2p_shard_roots[0];
+
+    // Survivor roots = the (un-diverged) live head, which == the snapshot roots,
+    // so root0 IS survivor-reachable. Lie that after_refs[root0]==0 → it lands in
+    // structural_to_free but NOT in `exclusive` → PREMATURE.
+    let pages = vec![root0];
+    let mut after_refs: BTreeMap<crate::types::PageId, u32> = BTreeMap::new();
+    after_refs.insert(root0, 0);
+    let all_current_roots: Vec<crate::types::PageId> = entry.l2p_shard_roots.to_vec();
+    let other: Vec<crate::manifest::SnapshotEntry> = Vec::new();
+
+    let err = db
+        .test_check_clone_drop_reachability_shadow(s, &entry, &pages, &after_refs, &all_current_roots, &other)
+        .expect_err("crafted survivor-reachable free must fire PREMATURE");
+    assert!(
+        matches!(err, MetaDbError::Corruption(ref m) if m.contains("PREMATURE FREE")),
+        "expected PREMATURE Corruption, got: {err:?}"
+    );
+}
