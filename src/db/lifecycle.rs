@@ -542,7 +542,17 @@ impl Db {
             let Some(db) = weak_db.upgrade() else {
                 return Ok(());
             };
-            db.run_sync_cycle(txg, crate::metrics::FlushKind::Forced)
+            // ZFS port Part B: on a non-recoverable cycle failure, poison the
+            // sync subsystem (sets sync_poison + aborts the TXG state machine +
+            // fails queued snapshot tasks) so parked `wait_until_synced` callers
+            // get a restart-required error instead of hanging, and the worker
+            // loop stops re-driving the stuck Syncing slot. Mirrors the
+            // threads-off `flush_with_gate` Err arm.
+            let r = db.run_sync_cycle(txg, crate::metrics::FlushKind::Forced);
+            if let Err(err) = &r {
+                db.poison_sync(err);
+            }
+            r
         });
         let sync = super::txg_sync::TxgSyncThread::start(
             state.clone(),

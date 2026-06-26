@@ -247,6 +247,14 @@ impl Db {
         &self,
         kind: crate::metrics::FlushKind,
     ) -> Result<bool> {
+        // ZFS port Part B: a prior forced sync that failed non-recoverably
+        // poisoned the subsystem. Fail fast here BEFORE touching the TXG state
+        // machine — its slot is stuck in Syncing forever, so rolling/promoting
+        // would block (the deadlock this fixes). Covers every forced-sync entry
+        // (take_snapshot, create_volume, restore, plain flush) in both modes.
+        if let Some(err) = self.sync_poison_error() {
+            return Err(err);
+        }
         if self.txg_threads_enabled {
             // Threads-on: hand off to the sync thread and wait.
             // `signal_force` only sets the quiesce notifier flag; the
@@ -256,7 +264,14 @@ impl Db {
             // always runs to completion.
             let target = self.txg.open_txg();
             self.txg_quiesce_notifier.signal_force(target);
-            self.txg.wait_until_synced(target);
+            if !self.txg.wait_until_synced(target) {
+                // Aborted: the sync thread's cycle failed and poisoned the
+                // subsystem. Surface the restart-required error instead of
+                // reporting a clean flush.
+                return Err(self.sync_poison_error().unwrap_or_else(|| {
+                    MetaDbError::Corruption("txg sync aborted; restart required".into())
+                }));
+            }
             self.metrics
                 .record_flush_attempt(kind);
             // Wall-time accounting kept consistent with the inline
@@ -303,6 +318,19 @@ impl Db {
             return Ok(false);
         }
         self.txg.promote_to_syncing(target);
+        // ZFS port Part B: if a concurrent forced-sync's cycle aborted the
+        // subsystem WHILE we were parked in `promote_to_syncing` (or just before
+        // it), `promote_to_syncing` breaks on `aborted` and returns leaving
+        // `target` in Quiescing (NOT promoted to Syncing). Driving
+        // `run_sync_cycle(target)` then would `mark_synced` a non-Syncing slot
+        // and corrupt the ring (the `concurrent_take_snapshots_*` test catches
+        // this via a racer-2 debug_assert / dirty reopen). Re-check and bail with
+        // the restart-required error before touching the cycle.
+        if self.txg.is_aborted() {
+            return Err(self.sync_poison_error().unwrap_or_else(|| {
+                MetaDbError::Corruption("txg sync aborted; restart required".into())
+            }));
+        }
         let result = self.run_sync_cycle(target, kind);
         match result {
             Ok(()) => {
@@ -310,15 +338,15 @@ impl Db {
                 Ok(true)
             }
             Err(err) => {
-                // Sync work failed; leave the slot in Syncing so a
-                // subsequent flush can retry (matches the threaded
-                // path's `failed_sync_leaves_txg_in_syncing_state`
-                // semantics). The next inline `flush_with_gate` will
-                // hit `quiescing_txg != Some(...)` and short-circuit
-                // — recovery from a failed inline flush requires a
-                // process restart, same as the pre-Step-8 behaviour
-                // (a sample-phase err there would have left the
-                // shards' deferred RC apply state inconsistent).
+                // ZFS port Part B: the sync cycle failed and may have left
+                // deferred RC apply state un-retryable. Leave the slot in
+                // Syncing (preserves the `failed_sync_leaves_txg_in_syncing_state`
+                // contract) but POISON the sync subsystem: `poison_sync` aborts
+                // the TXG state machine so the next forced flush / take_snapshot
+                // fails fast with a clear error instead of HANGING in
+                // `promote_to_syncing` on the stuck slot. Recovery = process
+                // restart (do NOT retry on possibly-inconsistent state).
+                self.poison_sync(&err);
                 Err(err)
             }
         }

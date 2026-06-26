@@ -78,6 +78,14 @@ impl Db {
         // with a clean `InvalidArgument` before anything is queued.
         let _ = self.volume(vol_ord)?;
 
+        // ZFS port Part B: a prior forced sync failed non-recoverably and
+        // poisoned the subsystem (the TXG it left in Syncing can never
+        // complete). Reject new snapshots fast in BOTH threads modes instead of
+        // queueing a task that would hang in `wait_until_synced` / `flush_with_gate`.
+        if let Some(err) = self.sync_poison_error() {
+            return Err(err);
+        }
+
         // Enqueue the snapshot as a TXG sync task and force the open TXG to
         // sync. The actual work — capture the volume's just-flushed roots,
         // journal a `LifecycleOp::TakeSnapshot`, stage the per-root incref,
@@ -107,7 +115,16 @@ impl Db {
         // Drive `target` to sync and block until it is durable.
         if self.txg_threads_enabled {
             self.txg_quiesce_notifier.signal_force(target);
-            self.txg.wait_until_synced(target);
+            if !self.txg.wait_until_synced(target) {
+                // ZFS port Part B: the sync thread's cycle failed and aborted
+                // the subsystem. Drop our orphaned task and surface the
+                // restart-required error instead of hanging. (poison_sync also
+                // drains pending tasks, so the remove is belt-and-suspenders.)
+                self.remove_pending_sync_task(&result);
+                return Err(self.sync_poison_error().unwrap_or_else(|| {
+                    MetaDbError::Corruption("txg sync aborted; restart required".into())
+                }));
+            }
         } else if let Err(err) = self.flush_with_gate(crate::metrics::FlushKind::Forced) {
             // Threads-off: we drove the cycle inline and it failed. Remove
             // our orphaned task so a later flush doesn't resurrect it, then

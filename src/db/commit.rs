@@ -1351,6 +1351,46 @@ impl Db {
             .map(|msg| MetaDbError::Corruption(format!("commit pipeline failed: {msg}")))
     }
 
+    /// ZFS port Part B — poison the forced-sync subsystem after a
+    /// non-recoverable sync-cycle failure (e.g. a faulted manifest fsync that
+    /// left a TXG slot stuck in Syncing). Set-once (first writer wins), then
+    /// abort the TXG state machine so every parked waiter (`promote_to_syncing`,
+    /// `wait_until_synced`, `roll_to_quiescing`) unblocks instead of hanging,
+    /// and fail every still-queued snapshot task so none can land durable after
+    /// its `take_snapshot` caller was told the subsystem failed. Recovery =
+    /// process restart (a failed inline sync may have left deferred RC apply
+    /// state un-retryable; we deliberately do NOT retry). Called from BOTH the
+    /// threads-off `flush_with_gate` Err arm and the threads-on `sync_work`
+    /// closure.
+    ///
+    /// Lock order: the `sync_poison` lock is released (scoped block) BEFORE
+    /// `txg.mark_aborted()` (which locks `txg.inner`) and the
+    /// `pending_sync_tasks` lock, so no new `sync_poison`↔`txg.inner` /
+    /// `pending_sync_tasks` ordering edge is introduced.
+    pub(crate) fn poison_sync(&self, err: &MetaDbError) {
+        {
+            let mut p = self.sync_poison.lock();
+            if p.is_none() {
+                *p = Some(err.to_string());
+            }
+        }
+        self.txg.mark_aborted();
+        let mut tasks = self.pending_sync_tasks.lock();
+        for task in tasks.drain(..) {
+            *task.result.lock() = Some(Err(MetaDbError::Corruption(
+                "metadb persistence subsystem failed; restart required (sync aborted)".into(),
+            )));
+        }
+    }
+
+    pub(crate) fn sync_poison_error(&self) -> Option<MetaDbError> {
+        self.sync_poison.lock().as_ref().map(|msg| {
+            MetaDbError::Corruption(format!(
+                "metadb persistence subsystem failed; restart required: {msg}"
+            ))
+        })
+    }
+
     pub(super) fn register_dispatch_intent(&self, lsn: Lsn, footprint: DispatchFootprint) {
         let mut state = self.dispatch_state.lock();
         let old = state.pending.insert(

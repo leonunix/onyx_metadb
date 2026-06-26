@@ -321,6 +321,14 @@ fn run_worker(inner: Arc<Inner>) {
         if inner.shutdown.load(Ordering::Acquire) {
             break;
         }
+        // ZFS port Part B: once a cycle has failed and aborted the subsystem,
+        // NEVER re-invoke sync_work on the stuck Syncing slot. A re-run would
+        // be the exact unsafe retry-on-possibly-inconsistent-state the poison
+        // refuses, and could resurrect a snapshot whose take_snapshot caller
+        // was already told the subsystem failed. Recovery is a process restart.
+        if inner.state.is_aborted() {
+            continue;
+        }
         // Level check: is there actually a Syncing TXG to process?
         let Some(txg) = inner.state.snapshot().syncing_txg else {
             continue;
@@ -330,10 +338,12 @@ fn run_worker(inner: Arc<Inner>) {
                 inner.state.mark_synced(txg);
             }
             Err(err) => {
-                tracing::error!(error = %err, txg, "metadb: TxgSyncThread cycle failed; TXG stays Syncing");
-                // Do not advance checkpoint_txg. A subsequent notify
-                // will retry. The quiesce thread will eventually time
-                // out and surface as a soak alarm.
+                tracing::error!(error = %err, txg, "metadb: TxgSyncThread cycle failed; TXG stays Syncing (sync subsystem poisoned; restart required)");
+                // Do NOT advance checkpoint_txg and do NOT retry. `sync_work`
+                // (the run_sync_cycle wrapper) already called `poison_sync`,
+                // which aborted the state machine so parked waiters get a
+                // restart-required error; the `is_aborted` guard above stops
+                // any further re-drive of this slot.
             }
         }
     }

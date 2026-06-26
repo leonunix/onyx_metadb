@@ -183,4 +183,5 @@ mod lineage_gc;
 mod promotion;
 mod range_delete_stress;
 mod remap_range;
+mod sync_poison;
 mod volume;

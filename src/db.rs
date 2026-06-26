@@ -199,6 +199,16 @@ pub struct Db {
     /// commit fails after a higher-LSN commit has already been durably
     /// acked by another WAL lane.
     commit_poison: Mutex<Option<String>>,
+    /// ZFS port Part B — sticky failure set when a forced TXG sync cycle fails
+    /// non-recoverably (e.g. a faulted manifest fsync), via `poison_sync`. Once
+    /// set, forced-sync lifecycle ops (`take_snapshot`, `flush_with_gate`,
+    /// `create_volume`, restore) fail fast instead of blocking on the slot the
+    /// failed sync left stuck in Syncing. A failed inline sync may have left
+    /// deferred RC apply state un-retryable, so recovery is a process restart;
+    /// never cleared in-process (reset only by a fresh `Db` constructor on
+    /// reopen). Paired with `TxgStateMachine::aborted` (which unblocks the txg
+    /// waiters); this field surfaces the human-readable "restart required" error.
+    sync_poison: Mutex<Option<String>>,
     /// Scheduler for post-WAL dispatch into apply lanes. It lets a higher
     /// LSN bypass lower LSNs only when their declared lane footprints are
     /// disjoint; conflicting commits still dispatch in WAL order.

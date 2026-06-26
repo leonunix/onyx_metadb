@@ -100,6 +100,17 @@ struct Inner {
     syncing_txg: Option<Txg>,
     checkpoint_txg: Txg,
     shutdown: bool,
+    /// ZFS port Part B: set by `mark_aborted` when a forced TXG sync cycle
+    /// fails non-recoverably (e.g. faulted manifest fsync). Mirrors `shutdown`
+    /// in EVERY wait loop / early-return below: a failed sync leaves its slot
+    /// in `Syncing` forever (`mark_synced` never runs), so without this the
+    /// next `promote_to_syncing` / `wait_until_synced` / `roll_to_quiescing`
+    /// would block on a slot that can never complete. Unlike `shutdown`
+    /// (clean teardown), `aborted` is a fault state — `wait_until_synced`
+    /// reports it (returns `false`) so callers surface the "restart required"
+    /// sync-poison error instead of treating it as a clean sync. One-way
+    /// (never cleared in-process); recovery is a process restart + reopen.
+    aborted: bool,
     /// Set by `roll_to_quiescing` after the next-slot wait completes and
     /// BEFORE the inflight-drain wait begins. `enter()` blocks while this
     /// is set so no new commits join the closing TXG. Cleared once the
@@ -136,6 +147,7 @@ impl TxgStateMachine {
                 syncing_txg: None,
                 checkpoint_txg: initial_checkpoint_txg,
                 shutdown: false,
+                aborted: false,
                 closing_open: false,
             }),
             cv: Condvar::new(),
@@ -156,7 +168,7 @@ impl TxgStateMachine {
     /// drained within milliseconds.
     pub fn enter(&self) -> TxgGuard<'_> {
         let mut g = self.inner.lock();
-        while g.closing_open && !g.shutdown {
+        while g.closing_open && !g.shutdown && !g.aborted {
             self.cv.wait(&mut g);
         }
         let txg = g.open_txg;
@@ -202,10 +214,14 @@ impl TxgStateMachine {
         let next_idx = (next & TXG_INDEX_MASK) as usize;
 
         // (1) Ring-full wait.
-        while g.slots[next_idx].state != TxgState::Empty && !g.shutdown {
+        while g.slots[next_idx].state != TxgState::Empty && !g.shutdown && !g.aborted {
             self.cv.wait(&mut g);
         }
-        if g.shutdown {
+        if g.shutdown || g.aborted {
+            // `aborted`: a failed sync pinned a slot in Syncing forever, so
+            // the ring can never drain. Return without advancing (no
+            // closing_open set yet) — the quiesce worker re-checks
+            // `quiescing_txg != Some(cur)` and skips promote/notify.
             return cur;
         }
         debug_assert!(g.quiescing_txg.is_none(), "two TXGs in Quiescing");
@@ -217,13 +233,15 @@ impl TxgStateMachine {
 
         // (3) Drain wait: every commit that started enter() before step (2)
         // closed the door must finish submit + apply and drop its guard.
-        while g.slots[cur_idx].inflight > 0 && !g.shutdown {
+        while g.slots[cur_idx].inflight > 0 && !g.shutdown && !g.aborted {
             self.cv.wait(&mut g);
         }
-        if g.shutdown {
-            // Leave closing_open = true so the shutdown path is observable;
-            // shutdown() also notifies so the close flag does not matter
-            // beyond this point.
+        if g.shutdown || g.aborted {
+            // Leave closing_open = true so the shutdown/abort path is
+            // observable; shutdown()/mark_aborted() both notify and `enter()`
+            // breaks on either flag, so the close flag does not matter beyond
+            // this point. Returning without flipping leaves quiescing_txg
+            // unset → the quiesce worker skips promote/notify.
             return cur;
         }
 
@@ -262,10 +280,12 @@ impl TxgStateMachine {
     pub fn promote_to_syncing(&self, txg: Txg) {
         let mut g = self.inner.lock();
         let idx = (txg & TXG_INDEX_MASK) as usize;
-        while g.syncing_txg.is_some() && !g.shutdown {
+        while g.syncing_txg.is_some() && !g.shutdown && !g.aborted {
             self.cv.wait(&mut g);
         }
-        if g.shutdown {
+        if g.shutdown || g.aborted {
+            // Return WITHOUT promoting (caller re-checks via `is_aborted` /
+            // `snapshot().syncing_txg` before driving run_sync_cycle).
             return;
         }
         debug_assert_eq!(g.slots[idx].state, TxgState::Quiescing);
@@ -303,12 +323,26 @@ impl TxgStateMachine {
     }
 
     /// Park until `checkpoint_txg >= target`. Used by `flush_with_gate` after
-    /// it has force-rolled a TXG.
-    pub fn wait_until_synced(&self, target: Txg) {
+    /// it has force-rolled a TXG. Returns `false` iff the wait was released by
+    /// `aborted` (a failed sync; the target will never be reached) so the
+    /// caller surfaces the sync-poison "restart required" error instead of
+    /// treating it as a clean sync; `true` on a real sync OR on shutdown
+    /// (clean teardown, unchanged semantics).
+    #[must_use]
+    pub fn wait_until_synced(&self, target: Txg) -> bool {
         let mut g = self.inner.lock();
-        while g.checkpoint_txg < target && !g.shutdown {
+        while g.checkpoint_txg < target && !g.shutdown && !g.aborted {
             self.cv.wait(&mut g);
         }
+        !g.aborted
+    }
+
+    /// True once a forced sync cycle has failed non-recoverably (see
+    /// [`Inner::aborted`] / `mark_aborted`). Callers driving a sync re-check
+    /// this after `promote_to_syncing` to avoid running a cycle on a slot the
+    /// abort left un-promoted.
+    pub fn is_aborted(&self) -> bool {
+        self.inner.lock().aborted
     }
 
     /// Lock-free snapshot of `open_txg`. L2P read paths walk the buffer ring
@@ -344,6 +378,18 @@ impl TxgStateMachine {
     pub fn shutdown(&self) {
         let mut g = self.inner.lock();
         g.shutdown = true;
+        self.cv.notify_all();
+    }
+
+    /// ZFS port Part B — mark the sync subsystem permanently failed (e.g. a
+    /// faulted manifest fsync left a slot stuck in Syncing). Mirrors
+    /// `shutdown`: set the sticky `aborted` flag + `notify_all` so every parked
+    /// waiter (`enter`, `roll_to_quiescing`, `promote_to_syncing`,
+    /// `wait_until_synced`) re-checks and breaks instead of blocking on the
+    /// never-to-complete slot. One-way; recovery is a process restart.
+    pub fn mark_aborted(&self) {
+        let mut g = self.inner.lock();
+        g.aborted = true;
         self.cv.notify_all();
     }
 }
@@ -574,7 +620,7 @@ mod tests {
         let sm = Arc::new(TxgStateMachine::new(0));
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || {
-            sm2.wait_until_synced(1);
+            assert!(sm2.wait_until_synced(1), "synced wake must return true");
         });
         thread::sleep(Duration::from_millis(30));
         assert!(!h.is_finished());
@@ -622,7 +668,8 @@ mod tests {
         let sm = Arc::new(TxgStateMachine::new(0));
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || {
-            sm2.wait_until_synced(99);
+            // Shutdown is a clean teardown wake, not an abort → returns true.
+            assert!(sm2.wait_until_synced(99), "shutdown wake must return true (clean)");
         });
         thread::sleep(Duration::from_millis(30));
         sm.shutdown();
@@ -666,5 +713,62 @@ mod tests {
         assert_eq!(q, 1);
         let entered_txg = entrant.join().unwrap();
         assert_eq!(entered_txg, 2);
+    }
+
+    // ---- ZFS port Part B: abort flag wakes every txg waiter ----
+
+    #[test]
+    fn abort_makes_wait_until_synced_return_false() {
+        let sm = Arc::new(TxgStateMachine::new(0));
+        let sm2 = Arc::clone(&sm);
+        let h = thread::spawn(move || sm2.wait_until_synced(99));
+        thread::sleep(Duration::from_millis(30));
+        assert!(!h.is_finished(), "should block before abort");
+        sm.mark_aborted();
+        let synced = h.join().unwrap();
+        assert!(!synced, "aborted wait must return false (caller surfaces poison)");
+    }
+
+    #[test]
+    fn abort_wakes_blocked_promote_without_promoting() {
+        // q1 stuck in Syncing (never mark_synced — models a failed cycle);
+        // promote(q2) blocks on syncing_txg.is_some(); mark_aborted must wake it
+        // and it must NOT promote q2 (slot stays Quiescing).
+        let sm = Arc::new(TxgStateMachine::new(0));
+        let q1 = sm.roll_to_quiescing();
+        sm.promote_to_syncing(q1);
+        assert_eq!(sm.snapshot().syncing_txg, Some(1));
+        let q2 = sm.roll_to_quiescing();
+        assert_eq!(sm.snapshot().quiescing_txg, Some(2));
+        let sm2 = Arc::clone(&sm);
+        let h = thread::spawn(move || sm2.promote_to_syncing(q2));
+        thread::sleep(Duration::from_millis(40));
+        assert!(!h.is_finished(), "promote should block while q1 stuck Syncing");
+        sm.mark_aborted();
+        h.join().unwrap();
+        // q2 was NOT promoted: still Quiescing, syncing_txg still the stuck q1.
+        assert_eq!(sm.snapshot().quiescing_txg, Some(2));
+        assert_eq!(sm.snapshot().syncing_txg, Some(1));
+        assert!(sm.is_aborted());
+    }
+
+    #[test]
+    fn abort_breaks_blocked_roll() {
+        // A held `enter()` guard pins inflight>0, so roll_to_quiescing blocks on
+        // the inflight-drain wait (after setting closing_open). Abort must wake
+        // it and return the current txg WITHOUT advancing — the HANG-completeness
+        // fix for a roll wedged behind a stuck/aborted subsystem.
+        let sm = Arc::new(TxgStateMachine::new(0));
+        let g = sm.enter(); // inflight=1 on txg 1
+        let sm2 = Arc::clone(&sm);
+        let h = thread::spawn(move || sm2.roll_to_quiescing());
+        thread::sleep(Duration::from_millis(40));
+        assert!(!h.is_finished(), "roll should block on the inflight-drain wait");
+        sm.mark_aborted();
+        let returned = h.join().unwrap();
+        assert_eq!(returned, 1, "aborted roll returns cur without advancing");
+        assert_eq!(sm.snapshot().quiescing_txg, None, "aborted roll must not flip to Quiescing");
+        assert!(sm.is_aborted());
+        drop(g);
     }
 }

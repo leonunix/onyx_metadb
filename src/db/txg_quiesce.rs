@@ -194,6 +194,17 @@ fn run_worker(inner: Arc<Inner>) {
         if inner.shutdown.load(Ordering::Acquire) {
             break;
         }
+        // ZFS port Part B: a failed sync cycle aborted the state machine; the
+        // Syncing slot is stuck forever so further rolls can never sync. Stop
+        // rolling/notifying — otherwise a roll that flipped a slot to Quiescing
+        // followed by a (now no-op) promote + notify would re-trigger the sync
+        // worker on the stuck slot. (roll_to_quiescing also breaks on aborted,
+        // so it returns without advancing and the promote/notify below is
+        // skipped via the `quiescing_txg != Some(txg)` check; this just avoids
+        // the idle spin.)
+        if inner.state.is_aborted() {
+            break;
+        }
         // Roll → promote → notify sync. roll_to_quiescing handles its own
         // shutdown check (returns current open_txg without advancing) so
         // we re-check shutdown afterwards before promoting.
