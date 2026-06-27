@@ -59,24 +59,43 @@ impl Db {
     /// shard roots + an incref on each so the snapshot's view outlives
     /// subsequent COW writes on the target volume.
     ///
-    /// ZFS `dsl_sync_task` port: this does NOT block the write path. It
-    /// enqueues a [`SyncTaskOp::TakeSnapshot`] task against the current
-    /// open TXG (under a `txg.enter()` guard so the TXG can't promote to
-    /// syncing before the task is queued), forces that TXG to sync, and
-    /// blocks for exactly that one TXG. The sync cycle does the real work
-    /// in syncing context ([`Db::stage_pending_snapshots`]): it captures
+    /// ZFS `dsl_sync_task` port: enqueues a [`SyncTaskOp::TakeSnapshot`] task
+    /// against the current open TXG (under a `txg.enter()` guard so the TXG
+    /// can't promote to syncing before the task is queued), forces that TXG to
+    /// sync, and blocks for exactly that one TXG. The sync cycle does the real
+    /// work in syncing context ([`Db::stage_pending_snapshots`]): it captures
     /// the roots it is flushing this cycle, journals a
     /// `LifecycleOp::TakeSnapshot` (which mints a strictly-monotone lsn
     /// for the gen-idempotent root incref + makes the op crash-replayable),
     /// stages the incref into the open TXG slot, and inserts the
     /// `SnapshotEntry` — all durable atomically with that TXG's manifest
-    /// commit (= ZFS uberblock). Foreground writers join the next open TXG
-    /// and never block. The outcome (id or error) comes back through the
-    /// task's result slot.
+    /// commit (= ZFS uberblock). The outcome (id or error) comes back through
+    /// the task's result slot.
+    ///
+    /// Holds `drop_gate.write()` for the whole capture/force-sync window
+    /// (symmetric with [`Self::drop_snapshot`]). The original Part-B design ran
+    /// commit-concurrently (no `drop_gate.write`) so foreground writers never
+    /// blocked — but that was UNSOUND: a writer `commit_ops` overlapping the
+    /// forced sync could COW the target volume (or a clone of it), retiring a
+    /// page the just-captured snapshot roots still reference, and that cycle's
+    /// reclaim then freed it → premature free surfacing as a later
+    /// `drop_snapshot`/`drop_volume` shadow or reopen `got Free`. Excluding
+    /// commits (they take `drop_gate.read`) for the snapshot's capture+sync
+    /// closes the window. Deadlock-free: the bg sync/quiesce worker the force
+    /// drives never acquires `drop_gate`, so holding it across
+    /// `wait_until_synced` cannot block the thread we wait on. (Reproducers:
+    /// `tests/concurrent_snapshot_clone_warm_unguarded.rs`.)
     pub fn take_snapshot(&self, vol_ord: VolumeOrdinal) -> Result<SnapshotId> {
         // Validate the volume up front so an unknown ordinal short-circuits
         // with a clean `InvalidArgument` before anything is queued.
         let _ = self.volume(vol_ord)?;
+
+        // Exclude concurrent `commit_ops` (they take `drop_gate.read`) for the
+        // entire capture + forced-sync window so no COW can retire a page the
+        // snapshot roots we capture still reference. The bg sync worker does
+        // NOT take `drop_gate`, so holding write across the force/wait below is
+        // deadlock-free. Mirrors `drop_snapshot`.
+        let _drop_guard = self.drop_gate.write();
 
         // ZFS port Part B: a prior forced sync failed non-recoverably and
         // poisoned the subsystem (the TXG it left in Syncing can never
@@ -91,9 +110,7 @@ impl Db {
         // journal a `LifecycleOp::TakeSnapshot`, stage the per-root incref,
         // and insert the `SnapshotEntry` — runs in syncing context
         // ([`Db::stage_pending_snapshots`]), durable atomically with that
-        // TXG's manifest commit. Foreground writers join the NEXT open TXG
-        // and never block on us (no `drop_gate.write`, no synchronous
-        // all-shard flush).
+        // TXG's manifest commit.
         let result: Arc<Mutex<Option<Result<SnapshotId>>>> = Arc::new(Mutex::new(None));
         let target = {
             // Hold `txg.enter()` across the push so the open TXG cannot
