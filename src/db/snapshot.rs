@@ -338,11 +338,11 @@ impl Db {
     ///
     /// Phase B (A3 follow-up): the **forced TXG sync** that used to run
     /// at entry is GONE. It drained in-flight flush IO so the per-page
-    /// decref's whole-page rc write could not be clobbered. A3 moved the
-    /// page refcount into the [`L2pPageRc`](crate::l2p_page_rc) array:
-    /// `apply_drop_snapshot_pages` now `stage`s `-1` deltas and gates the
-    /// irreversible free on a fold-consistent `get_consistent` read (R2),
-    /// so there is no whole-page rc write left to clobber and no need to
+    /// decref's whole-page rc write could not be clobbered. ZFS port S3
+    /// deleted per-L2P-page refcounting: `apply_drop_snapshot_pages` now
+    /// frees exactly the explicit, structurally-computed free-set the
+    /// producer froze under the held gates, so there is no whole-page rc
+    /// write left to clobber and no need to
     /// quiesce flush IO. The refreshed-manifest commit below still makes
     /// the surviving roots durable; the decrefs ride the `DropSnapshot`
     /// WAL record (gen-stamped idempotent on replay).
@@ -439,11 +439,6 @@ impl Db {
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes_snap);
         flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_all_refcount_shards()?;
-        // A3: fold the page-rc array so the manifest committed below
-        // records a durable `l2p_page_rc_durable_seq = checkpoint_lsn`
-        // (the prior commits' page-rc deltas; this drop's own decrefs are
-        // at lsn > checkpoint_lsn and ride the WAL-replayed apply).
-        self.l2p_page_rc.flush()?;
 
         let checkpoint_lsn = *self.last_applied_lsn.lock();
         // Crash-recovery completeness (G1): this commit advances
@@ -661,9 +656,7 @@ impl Db {
         let outcome = apply_drop_snapshot_pages_and_decrefs(
             &self.page_store,
             &self.refcount_shards,
-            &self.l2p_page_rc,
             lsn,
-            _txg_guard.txg(),
             &pages,
             &pba_decrefs,
             free_pages.as_deref(),
@@ -1303,38 +1296,28 @@ impl Db {
     }
 
     /// ZFS `dsl_sync_task` (path B) — called AFTER the L2P `begin_checkpoint`
-    /// loop (tree guards released) and BEFORE the page-rc `begin_checkpoint`.
+    /// loop (tree guards released), inside the sync cycle's manifest window.
     /// For each queued [`SyncTaskOp::TakeSnapshot`] targeting `txg`:
     /// capacity-probe + assign id + write its SnapshotRoots page + build the
-    /// `SnapshotEntry` (into `committed_entry`) the FIRST time it is seen;
-    /// then, every attempt, collect its root pids grouped by page-rc shard.
-    /// Returns that per-page-rc-shard set of pids to FORCE-incref this cycle
-    /// (see [`crate::refcount::RcShard::begin_checkpoint_with_increfs`]).
+    /// `SnapshotEntry` (into `committed_entry`) the FIRST time it is seen.
     ///
-    /// The force-incref always applies and never bumps a page generation,
-    /// so it needs NO reserved lsn. Idempotency across the cycle's
-    /// abort-retry rides the page-rc checkpoint rollback: an aborted cycle
-    /// rolls back the fold (nothing durable), and the NEXT attempt
-    /// RECOMPUTES the increfs here — so the pids are collected every call,
-    /// even when `committed_entry` is already set (the entry/probe/roots-page
-    /// are done once; only the fold repeats). The take is manifest-only
-    /// (no lifecycle journal), so a crash before the manifest commit simply
-    /// loses the (never-committed) snapshot.
-    pub(crate) fn stage_pending_snapshot_increfs(
+    /// ZFS port S3: per-L2P-page refcounting was deleted, so this no longer
+    /// collects per-page-rc-shard root pids to force-incref. The take is
+    /// manifest-only (no lifecycle journal): a crash before the manifest
+    /// commit simply loses the (never-committed) snapshot, and the snapshot's
+    /// pages stay referenced because the source volume's tree still points at
+    /// the shared roots (COW preserves them on the next write).
+    pub(crate) fn prepare_pending_snapshot_entries(
         &self,
         txg: crate::types::Txg,
         snapshot_roots: &std::collections::HashMap<VolumeOrdinal, Vec<PageId>>,
         snapshot_watermarks: &std::collections::HashMap<VolumeOrdinal, Lsn>,
-    ) -> Result<Vec<Vec<Pba>>> {
-        let mut force_increfs: Vec<Vec<Pba>> =
-            (0..self.l2p_page_rc.shard_count()).map(|_| Vec::new()).collect();
+    ) -> Result<()> {
         let mut tasks = self.pending_sync_tasks.lock();
         for task in tasks.iter_mut().filter(|t| t.target_txg == txg) {
-            // Roots: reuse the already-built entry's on a retry (stable
-            // snapshot definition); otherwise process the task fresh.
-            let roots: Vec<PageId> = if let Some(entry) = &task.committed_entry {
-                entry.l2p_shard_roots.to_vec()
-            } else {
+            // Build the committed entry once; a retry with `committed_entry`
+            // already set is a no-op (the snapshot definition is stable).
+            if task.committed_entry.is_none() {
                 let SyncTaskOp::TakeSnapshot { vol_ord } = &task.op;
                 let vol_ord = *vol_ord;
                 let roots = snapshot_roots.get(&vol_ord).cloned().unwrap_or_default();
@@ -1401,24 +1384,16 @@ impl Db {
                     // v21 (S1): fold-watermark of these captured roots.
                     capture_watermark,
                 });
-                roots
-            };
-            // Collect the force-increfs (every attempt — see the doc).
-            for &root in &roots {
-                if root != crate::types::NULL_PAGE {
-                    force_increfs[self.l2p_page_rc.shard_for(root)].push(root);
-                }
             }
         }
-        Ok(force_increfs)
+        Ok(())
     }
 
     /// ZFS `dsl_sync_task` — phase A4, called in
     /// [`Db::run_sync_cycle_body`]'s manifest window (under
     /// `apply_gate.write()` + `manifest_state.lock()`). Insert each
     /// processed take's `SnapshotEntry` into the manifest about to be
-    /// committed, so it lands atomically with the page-rc fold (A3) that
-    /// made the incref durable. Id-idempotent on the cycle's abort-retry.
+    /// committed. Id-idempotent on the cycle's abort-retry.
     pub(crate) fn add_pending_snapshot_entries(
         &self,
         manifest: &mut crate::manifest::Manifest,
@@ -1486,11 +1461,19 @@ impl Db {
         resets
     }
 
-    /// ZFS `dsl_sync_task` — post-commit. The manifest with the
-    /// new `SnapshotEntry`s is durable, so report `Ok(id)` to each queued
-    /// `take_snapshot` caller, warm the per-volume `SnapInfo` cache, and
-    /// dequeue. Capacity-rejected tasks (`result` already `Err`) are
-    /// dequeued too. Needs neither `apply_gate` nor `manifest_state`.
+    /// ZFS `dsl_sync_task` — post-manifest-commit. The manifest with the new
+    /// `SnapshotEntry`s is durable, so report `Ok(id)` to each queued
+    /// `take_snapshot` caller, warm the per-volume `SnapInfo` cache, and dequeue.
+    /// Capacity-rejected tasks (`result` already `Err`) are dequeued too.
+    ///
+    /// ZFS port S3: the caller (`run_sync_cycle_body`) now invokes this INSIDE
+    /// the `apply_gate.write()` window (after the manifest commit, before the
+    /// drop) — the `SnapInfo` cache warm MUST be visible to every apply that
+    /// runs once the gate releases, or a concurrent COW could recycle the new
+    /// snapshot's root against a cold cache (page-rc floor that masked this is
+    /// gone). Takes only the `snap_info_cache` + `pending_sync_tasks` leaf
+    /// mutexes (no `manifest_state`); lock order `apply_gate -> snap_info_cache`
+    /// matches the read path.
     pub(crate) fn finish_pending_snapshots(&self, txg: crate::types::Txg) {
         let mut cache = self.snap_info_cache.lock();
         let mut tasks = self.pending_sync_tasks.lock();

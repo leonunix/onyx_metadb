@@ -70,3 +70,54 @@ fn clone_snapshot_take_drop_then_crash_reopen() {
     Db::open(path)
         .expect("reopen after drop_volume on a clone must succeed without an intervening flush");
 }
+
+/// Regression for the ZFS port S3 `need_birth` gap (found in /code-review): a
+/// NON-clone volume that shares L2P pages with a clone — after the linking
+/// snapshot is dropped — must read each page's REAL `birth_lsn` when COW-killing,
+/// not `0`. The S3 clone-source pin (`clone_cow_pinners` on the non-clone arm)
+/// is the replacement for the deleted page-rc floor; if `need_birth` omits
+/// `clone_cow_pinners`, the overwrite reads `birth = 0`, stamping a
+/// `birth_lsn = 0` record into the source volume's page-deadlist. A LATER
+/// non-clone deadlist drop (after the clone is gone → routing flips off
+/// reachability back to the deadlist) then feeds `birth_lsn = 0` into
+/// `dl_record_freed`, mis-classifying the record → HARD page-deadlist shadow
+/// Corruption (premature free / completeness hole). Drives the full sequence;
+/// the assertion is that the drops + reopen all succeed.
+#[test]
+fn nonclone_clone_source_overwrite_then_deadlist_drop_no_corruption() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path();
+
+    {
+        let db = Db::create(path).unwrap();
+        // Give vol0 real pages (born at lsns > 0) across more than one leaf.
+        for i in 0..40u64 {
+            db.insert(0, i * 64, v((i + 1) as u8)).unwrap();
+        }
+        let s1 = db.take_snapshot(0).unwrap();
+        let c1 = db.clone_volume(s1).unwrap();
+        // Drop the linking snapshot while the clone lives: vol0 and c1 now share
+        // pages with NO snapshot anchor (vol0.snapshot_wms empty, clone_cow_pinners
+        // = {c1.branch}). This is the path `need_birth` must still read birth on.
+        db.drop_snapshot(s1).unwrap().unwrap();
+        // Overwrite the shared pages on the non-clone SOURCE — the buggy COW.
+        for i in 0..40u64 {
+            db.insert(0, i * 64, v((i + 100) as u8)).unwrap();
+        }
+        db.flush().unwrap();
+        // Only clone gone → no CLONE_LINEAGE volume → snapshot drops route to the
+        // NON-clone page-deadlist free-source (HARD `check_page_deadlist_shadow`).
+        db.drop_volume(c1).unwrap().unwrap();
+        // vol0 snapshot churn → processes vol0's page-deadlist (with the records
+        // from the clone-source overwrite above). The HARD shadow fires here if a
+        // birth_lsn=0 record mis-classifies.
+        let s3 = db.take_snapshot(0).unwrap();
+        for i in 0..40u64 {
+            db.insert(0, i * 64, v((i + 200) as u8)).unwrap();
+        }
+        db.drop_snapshot(s3).unwrap().unwrap();
+        db.flush().unwrap();
+    }
+
+    Db::open(path).expect("reopen after clone-source overwrite + non-clone deadlist drop");
+}

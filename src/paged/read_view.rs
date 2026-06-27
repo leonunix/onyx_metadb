@@ -542,7 +542,7 @@ mod tests {
     }
 
     fn open_tree(ps: &Arc<PageStore>, pc: &Arc<PageCache>) -> PagedL2p {
-        PagedL2p::create_with_cache(ps.clone(), pc.clone()).unwrap()
+        PagedL2p::create_with_cache(ps.clone(), pc.clone(), 1).unwrap()
     }
 
     fn empty_view(tree: &PagedL2p, pc: Arc<PageCache>) -> ReadView {

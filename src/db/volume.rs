@@ -106,26 +106,11 @@ impl Db {
         let (shards, roots) = apply_create_volume(
             &self.page_store,
             &self.page_cache,
-            &self.l2p_page_rc,
             shard_count,
             self.metrics.clone(),
             self.l2p_buffer_enabled,
             lsn,
         )?;
-        // A3 cutover fix (2026-06-17): `apply_create_volume` only STAGES
-        // each shard root's page-rc `+1` into the array slot. Every other
-        // lifecycle op that mutates page rc — take_snapshot, drop_snapshot,
-        // clone_volume, and the bootstrap volume at `Db::create` — force-
-        // folds it durable with `l2p_page_rc.flush()`. create_volume was the
-        // sole exception: if the manifest commit / checkpoint advances past
-        // this CreateVolume LSN before the staged `+1` is folded (e.g. the
-        // standalone `create-volume` CLI process exits, or `created_lsn==0`
-        // makes the hot fold's `page_generation >= last_lsn` skip it), the
-        // root reopens with array rc=0. A later snapshot then drops it 1→0
-        // and frees a still-live shard root → page-type corruption under
-        // snapshot churn (nvme-box soak 2026-06-17). Fold it here, durable,
-        // before the manifest records this volume.
-        self.l2p_page_rc.flush()?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
@@ -195,10 +180,10 @@ impl Db {
     /// - `drop_gate.write()` — excludes every `commit_ops` path. The
     ///   rc-dependent drop plan relies on no concurrent `cow_for_write`
     ///   moving rcs out from under us.
-    /// - Phase B (A3 follow-up): **no forced TXG sync** at entry. The
-    ///   page-rc decrefs `stage` into the [`L2pPageRc`](crate::l2p_page_rc)
-    ///   array and free under a fold-consistent read, so there is no
-    ///   whole-page rc write left for a concurrent flush IO phase to
+    /// - Phase B (A3 follow-up): **no forced TXG sync** at entry. The drop
+    ///   frees pages from an explicit structural reachability set (per-L2P-page
+    ///   refcounting was deleted, ZFS port S3), so there is no whole-page rc
+    ///   write left for a concurrent flush IO phase to
     ///   clobber. The `force_compact_l2p_buffers` + `flush_locked_l2p_shards`
     ///   below are the only drain this path needs (mirrors
     ///   `drop_snapshot` / `range_delete`). Holding `drop_gate.write` across
@@ -217,6 +202,48 @@ impl Db {
     ///
     /// No manifest commit happens inside this function; the next
     /// natural [`flush`](Self::flush) captures the new volumes list.
+    ///
+    /// Collect every surviving L2P root for a `drop_volume` of the shard range
+    /// `target_start..target_end`: every OTHER volume's live root from the
+    /// locked `l2p_guards` (NOT the on-disk manifest — surviving volumes' COW'd
+    /// roots are only refreshed into it at the drop's commit, so a stale
+    /// manifest root would manufacture a false free) ∪ every snapshot's roots
+    /// (snapshots always survive a volume drop). Shared by the CLONE_LINEAGE
+    /// reachability shadow (`check_clone_livelist_shadow` RHS + the S0
+    /// promoted-PBA gate) and the non-clone (S3 / M1) reachability free-set.
+    fn collect_surviving_roots(
+        &self,
+        l2p_guards: &[RwLockWriteGuard<'_, PagedL2p>],
+        target_start: usize,
+        target_end: usize,
+    ) -> Result<Vec<PageId>> {
+        let mut surviving_roots: Vec<PageId> = Vec::new();
+        for (i, tree) in l2p_guards.iter().enumerate() {
+            if i >= target_start && i < target_end {
+                continue;
+            }
+            let r = tree.root();
+            if r != crate::types::NULL_PAGE {
+                surviving_roots.push(r);
+            }
+        }
+        let mstate = self.manifest_state.lock();
+        for snap in &mstate.manifest.snapshots {
+            let roots = crate::verify::snapshot_roots(
+                &self.page_store,
+                snap.l2p_roots_page,
+                &snap.l2p_shard_roots,
+            )?;
+            surviving_roots.extend(
+                roots
+                    .iter()
+                    .copied()
+                    .filter(|&r| r != crate::types::NULL_PAGE),
+            );
+        }
+        Ok(surviving_roots)
+    }
+
     pub fn drop_volume(&self, vol_ord: VolumeOrdinal) -> Result<Option<DropVolumeReport>> {
         if vol_ord == BOOTSTRAP_VOLUME_ORD {
             return Err(MetaDbError::InvalidArgument(
@@ -225,11 +252,12 @@ impl Db {
         }
         let _drop_guard = self.drop_gate.write();
         // Phase B (A3 follow-up): no forced TXG sync at entry (mirrors
-        // take_snapshot / drop_snapshot / clone_volume / range_delete). The
-        // page-rc decrefs stage into the L2pPageRc array and free under a
-        // fold-consistent read, so a concurrent flush IO phase has nothing
-        // to clobber; the targeted `force_compact_l2p_buffers` +
-        // `flush_locked_l2p_shards` below are the only drain this path needs.
+        // take_snapshot / drop_snapshot / clone_volume / range_delete). ZFS
+        // port S3 deleted per-L2P-page refcounting, so the drop frees pages
+        // from an explicit structural reachability set with no whole-page rc
+        // write for a concurrent flush IO phase to clobber; the targeted
+        // `force_compact_l2p_buffers` + `flush_locked_l2p_shards` below are
+        // the only drain this path needs.
         // `txg.enter()` pins the current Open TXG; `closing_open` makes it
         // wait out (not race) a concurrent background roll, so entering the
         // current Open TXG without rolling it ourselves is safe.
@@ -297,9 +325,6 @@ impl Db {
         let mut l2p_guards = lock_all_l2p_shards_for(&volumes_snap);
         flush_locked_l2p_shards(&mut l2p_guards)?;
         self.flush_all_refcount_shards()?;
-        // A3: fold the page-rc array so the refreshed manifest below
-        // records a durable `l2p_page_rc_durable_seq = checkpoint_lsn`.
-        self.l2p_page_rc.flush()?;
 
         // Locate the dying volume's shard range within l2p_guards.
         let mut target_start = 0usize;
@@ -311,37 +336,65 @@ impl Db {
         }
         let target_end = target_start + volume.shards.len();
 
-        // ZFS port Phase 3a: collect each dropped L2P page with its immutable
-        // birth + plan-time page-rc, so the clone-drop livelist shadow below
-        // can recover the freed subset (rc == 1) and the origin/clone-private
-        // partition. `clone_roots` feeds the shadow's reachability RHS.
-        let mut pages_with_birth: Vec<(PageId, Lsn, u32)> = Vec::new();
+        // ZFS port Phase 3a / S3: collect each dropped L2P page with its
+        // immutable birth + STRUCTURAL refcount, so the clone-drop livelist
+        // shadow below can recover the freed subset (rc == 1) and the
+        // origin/clone-private partition. `clone_roots` feeds the shadow's
+        // reachability RHS.
         let mut clone_roots: Vec<PageId> = Vec::new();
+        for tree in &l2p_guards[target_start..target_end] {
+            let root = tree.root();
+            if root != crate::types::NULL_PAGE {
+                clone_roots.push(root);
+            }
+        }
+        // S3 (page-rc deleted): the per-page plan-time refcount now comes from
+        // an explicit STRUCTURAL in-edge count over the live global L2P graph —
+        // this dying volume's roots ∪ every surviving volume head ∪ every
+        // snapshot root. In a forest of COW trees (one parent per page within
+        // any single root) a page's combined in-edge count equals the number of
+        // live roots whose tree routes through it, i.e. the old global page-rc
+        // for every page reachable from a live root. `rc == 1` therefore still
+        // means "reachable from this volume only" (C-exclusive), keeping the
+        // cascade gating and `check_clone_livelist_shadow.structural_free`
+        // identical to the page-rc era. Frozen here under the held gates.
+        let structural_rc = {
+            let surviving = self.collect_surviving_roots(&l2p_guards, target_start, target_end)?;
+            let mut all_roots = clone_roots.clone();
+            all_roots.extend_from_slice(&surviving);
+            crate::db::apply::collect_paged_refcounts_for_roots(&self.page_store, &all_roots)?
+        };
+        let mut pages_with_birth: Vec<(PageId, Lsn, u32)> = Vec::new();
         for tree in &mut l2p_guards[target_start..target_end] {
             let root = tree.root();
             if root == crate::types::NULL_PAGE {
                 continue;
             }
-            clone_roots.push(root);
-            pages_with_birth.extend(tree.collect_drop_pages_with_birth(root)?);
+            pages_with_birth.extend(tree.collect_drop_pages_with_birth(root, &structural_rc)?);
         }
         let mut pages: Vec<PageId> = pages_with_birth.iter().map(|(p, _, _)| *p).collect();
-        // Phase 2 dead-list: walk the volume's segment chain backward
-        // from its tail and add every chain page id to the drop
-        // payload, so `apply_drop_volume` releases them via the same
-        // `free_idempotent` path that reclaims tree pages. The chain
-        // also picks up any in-memory buffer entries; those records
-        // are now obsolete and discarded (the volume itself is gone).
-        let tail = volume
-            .dead_list_tail_pid
-            .load(std::sync::atomic::Ordering::Acquire);
-        if tail != crate::types::NULL_PAGE {
-            let page_store = self.page_store.clone();
-            let chain_pids = crate::deadlist::walk_chain_pages(tail, |pid| {
-                page_store.read_page(pid)
-            })?;
-            pages.extend(chain_pids);
-        }
+        // Phase 2 dead-list: walk the volume's segment chain backward from its
+        // tail. ZFS port S3: these segment pages are `allocate_run`-allocated and
+        // are NEVER page-rc/tree-reachable, so the post-S3 apply (which frees only
+        // the `free_pages` tree set, not `pages`) cannot reclaim them — collect
+        // them for the EAGER `free_idempotent` loop below (mirroring the v19
+        // page-livelist chain), NOT into `pages`. (Pre-S3 they were added to
+        // `pages` but the page-rc cascade skipped them as untracked `prev == 0`,
+        // so they already rode orphan-reclaim — the old comment claiming eager
+        // apply-time release was inaccurate even then.) The chain also picks up
+        // any in-memory buffer entries; those records are now obsolete and
+        // discarded (the volume itself is gone).
+        let deadlist_chain_pids: Vec<PageId> = {
+            let tail = volume
+                .dead_list_tail_pid
+                .load(std::sync::atomic::Ordering::Acquire);
+            if tail == crate::types::NULL_PAGE {
+                Vec::new()
+            } else {
+                let page_store = self.page_store.clone();
+                crate::deadlist::walk_chain_pages(tail, |pid| page_store.read_page(pid))?
+            }
+        };
         // Discard the volume's outstanding dead-list buffer — it
         // describes overwrites that targeted this volume's own LBAs,
         // which are about to disappear.
@@ -410,12 +463,12 @@ impl Db {
         // maps, surfaced to onyx. Declared here so it is in scope at the return
         // (stays empty for non-clones / rc-authoritative).
         let mut surfaced_freed: Vec<Pba> = Vec::new();
-        // ZFS port Phase 4 S2: the authoritative, page-rc-independent free-set
-        // frozen into the WAL op. `Some(exclusive)` for a CLONE_LINEAGE drop
-        // (the shadow returns it == structural_free); `None` for an unflagged
-        // volume (deferred to S3 — keeps the legacy page-rc cascade, which is
-        // correct because an unflagged clone *source* still shares its pages at
-        // rc>1 with a promoted ex-clone and the cascade keeps them at 2→1).
+        // ZFS port Phase 4 S2/S3: the authoritative, page-rc-independent free-set
+        // frozen into the WAL op. Always `Some` now: a CLONE_LINEAGE drop gets
+        // the reachability `exclusive` set cross-checked by
+        // `check_clone_livelist_shadow` (the `if` arm); a non-clone (unflagged)
+        // drop gets the same reachability `exclusive` set directly (the `else`
+        // arm, S3 / M1 — replaced the legacy page-rc cascade that S3 deletes).
         let mut free_pages: Option<Vec<PageId>> = None;
         // S0: the promoted-PBA edges to decref + the survivor data-PBA set are
         // COMPUTED here (read-only, under the held gates) but APPLIED post-commit
@@ -430,32 +483,8 @@ impl Db {
             & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE)
             != 0
         {
-            let mut surviving_roots: Vec<PageId> = Vec::new();
-            for (i, tree) in l2p_guards.iter().enumerate() {
-                if i >= target_start && i < target_end {
-                    continue;
-                }
-                let r = tree.root();
-                if r != crate::types::NULL_PAGE {
-                    surviving_roots.push(r);
-                }
-            }
-            {
-                let mstate = self.manifest_state.lock();
-                for snap in &mstate.manifest.snapshots {
-                    let roots = crate::verify::snapshot_roots(
-                        &self.page_store,
-                        snap.l2p_roots_page,
-                        &snap.l2p_shard_roots,
-                    )?;
-                    surviving_roots.extend(
-                        roots
-                            .iter()
-                            .copied()
-                            .filter(|&r| r != crate::types::NULL_PAGE),
-                    );
-                }
-            }
+            let surviving_roots =
+                self.collect_surviving_roots(&l2p_guards, target_start, target_end)?;
             // Phase 4 Step 1: reconstruct this clone's persistent page-livelist
             // (v19) ALLOC/FREE log as the THIRD independent ground truth the
             // shadow cross-checks (alongside the page-rc cascade and the
@@ -556,6 +585,34 @@ impl Db {
                     s0_promoted = promoted;
                 }
             }
+        } else {
+            // ZFS port Phase 4 S3 (M1): non-clone (unflagged) volume drop. The
+            // page-rc cascade was the legacy free-source here (`free_pages =
+            // None`); S3 deletes it, so freeze the page-rc-INDEPENDENT
+            // reachability free-set instead — exactly the birth-agnostic
+            // exclusivity the CLONE_LINEAGE arm computes, minus the livelist
+            // cross-check (non-clones emit no livelist records). `exclusive`
+            // = pages reachable only from the dying volume = pages no survivor
+            // maps. An unflagged volume that was a clone *source* still shares
+            // pages with a promoted ex-clone at rc>1; `surviving_roots` includes
+            // that ex-clone's roots, so the shared pages drop out of `exclusive`
+            // (they stay live), matching what the rc cascade did (decref 2→1, no
+            // free). For a truly private volume every page is exclusive. The
+            // result is a subset of `pages` (the rc-cascade frontier): an
+            // A-exclusive page is rc==1, reached via the rc==1 edges
+            // `collect_drop_pages_with_birth` recurses, so it is in `pages` —
+            // satisfying the `set ⊆ pages` apply invariant.
+            let surviving_roots =
+                self.collect_surviving_roots(&l2p_guards, target_start, target_end)?;
+            let reachable_clone = crate::verify::reachable_l2p_pages(&self.page_store, &clone_roots)?;
+            let reachable_surv =
+                crate::verify::reachable_l2p_pages(&self.page_store, &surviving_roots)?;
+            let mut exclusive: Vec<PageId> = reachable_clone
+                .difference(&reachable_surv)
+                .copied()
+                .collect();
+            exclusive.sort_unstable();
+            free_pages = Some(exclusive);
         }
 
         // Commit a manifest that:
@@ -648,9 +705,7 @@ impl Db {
 
         let pages_freed = apply_drop_volume(
             &self.page_store,
-            &self.l2p_page_rc,
             lsn,
-            _txg_guard.txg(),
             &pages,
             free_pages.as_deref(),
         )?;
@@ -674,6 +729,16 @@ impl Db {
         // Invalidate the cache so a stale segment byte can't shadow a recycled
         // allocation. The freed pages drain via `reclaim_freed_pages` below.
         for &pid in &livelist_chain_pids {
+            self.page_store.free_idempotent(pid, lsn)?;
+            self.page_cache.invalidate(pid);
+        }
+        // ZFS port S3: eagerly free the volume's page-deadlist segment chain too
+        // (collected above) — same crash-safe `free_idempotent` + invalidate as
+        // the livelist chain. The dropped volume has no live snapshots (drop
+        // refuses them), so the chain is exclusively its own; post-S3 apply no
+        // longer reaches these untracked segment pages. Without this they leak to
+        // `reclaim_orphan_pages` on the next open (the pre-S3 behavior).
+        for &pid in &deadlist_chain_pids {
             self.page_store.free_idempotent(pid, lsn)?;
             self.page_cache.invalidate(pid);
         }
@@ -999,18 +1064,16 @@ impl Db {
     ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
     ///
     /// Phase B (A3 follow-up): the **forced TXG sync** that used to run
-    /// at entry is GONE. Its sole job was to drain in-flight flush IO so
-    /// `apply_clone_volume_incref`'s whole-page rc RMW could not be
-    /// clobbered by a concurrent whole-page flush write. A3 relocated the
-    /// page refcount into the [`L2pPageRc`](crate::l2p_page_rc) array, so
-    /// the incref is now a sharded-delta `stage` (concurrency-safe with
-    /// flush, exactly like PBA rc) and the page bytes are never touched —
-    /// there is nothing left to clobber. Removing the forced sync stops
-    /// every clone from driving + waiting on a full sync cycle while
-    /// holding `drop_gate.write` (the snapshot-scaling barrier). Crash
-    /// durability is unchanged: the `CloneVolume` WAL record replays the
-    /// incref (gen-stamped idempotent), and the next natural flush commits
-    /// the manifest.
+    /// at entry is GONE. Its sole job was to drain in-flight flush IO so a
+    /// whole-page rc RMW could not be clobbered by a concurrent whole-page
+    /// flush write. ZFS port S3 deleted per-L2P-page refcounting entirely:
+    /// the clone no longer touches any page-rc, and the source pages it
+    /// shares are never modified by the clone op — there is nothing left to
+    /// clobber. Removing the forced sync stops every clone from driving +
+    /// waiting on a full sync cycle while holding `drop_gate.write` (the
+    /// snapshot-scaling barrier). Crash durability is unchanged: the
+    /// `CloneVolume` WAL record replays the clone-shard build, and the next
+    /// natural flush commits the manifest.
     ///
     /// Crash semantics:
     /// - Before WAL fsync: no effect observable.
@@ -1115,39 +1178,11 @@ impl Db {
         // `create_volume` / `drop_snapshot`.
         self.wait_for_global_apply_turn(lsn)?;
 
-        apply_clone_volume_incref(
-            &self.l2p_page_rc,
-            &self.faults,
-            lsn,
-            _txg_guard.txg(),
-            &src_shard_roots,
-        )?;
-        // `apply_clone_volume_incref` writes through `page_store`, so the
-        // shared `page_cache` *and* every in-memory `PageBuf` that holds
-        // a stale pre-incref copy of one of these roots need to drop it.
-        // It's not enough to invalidate only the source volume: every
-        // previously-created clone of the same snapshot already has its
-        // own PageBuf with the root cached at the pre-incref rc; that
-        // stale Clean copy can be dirtied by a later `incref_root_for_snapshot`
-        // (take_snapshot on a clone) or promoted to a `cow_for_write`
-        // fast-path decision, both of which would then flush an incorrect
-        // refcount back over the disk-direct rc we just wrote. Invalidate
-        // the page in every volume's PageBuf — `forget_page` is a no-op
-        // on volumes that don't share the pid, so the sweep is safe.
-        // `build_clone_volume_shards` below opens fresh `PagedL2p`s for
-        // the clone, which read straight from disk.
-        let all_volumes: Vec<Arc<Volume>> = self.volumes.read().values().cloned().collect();
-        for &pid in &src_shard_roots {
-            if pid == crate::types::NULL_PAGE {
-                continue;
-            }
-            self.page_cache.invalidate(pid);
-            for vol in &all_volumes {
-                for shard in &vol.shards {
-                    shard.tree.write().forget_page(pid);
-                }
-            }
-        }
+        // ZFS port S3: per-L2P-page refcounting is deleted, so the clone no
+        // longer increfs the source shard roots' page-rc. The source pages are
+        // not modified by the clone op (the clone just opens fresh `PagedL2p`s
+        // pointing at the shared source roots, and COWs down on first write), so
+        // there is no stale-byte hazard and no cache invalidation to perform.
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
@@ -1155,7 +1190,6 @@ impl Db {
             &src_shard_roots,
             &self.page_store,
             &self.page_cache,
-            &self.l2p_page_rc,
             lsn,
             self.metrics.clone(),
             self.l2p_buffer_enabled,
@@ -1511,7 +1545,6 @@ impl Db {
             volumes,
             l2p_guards,
             &self.refcount_shards,
-            &self.l2p_page_rc,
             durable_override,
         )
     }
@@ -1591,20 +1624,45 @@ pub(in crate::db) fn clone_cow_pinners_from(
     let Some(target) = volumes.get(&vol) else {
         return Vec::new();
     };
-    if target.flags.load(Ordering::Relaxed) & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE == 0 {
-        return Vec::new();
+    if target.flags.load(Ordering::Relaxed) & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0 {
+        // CLONE arm (S1c): `{B_C} ∪ own-snap watermarks ∪ {descendant branch
+        // points > B_C}`.
+        let b_c = target.branched_at_lsn;
+        own_snap_wms.push(b_c);
+        for (&other_ord, other) in volumes.iter() {
+            if other_ord != vol
+                && other.flags.load(Ordering::Relaxed) & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE
+                    != 0
+                && other.branched_at_lsn > b_c
+            {
+                own_snap_wms.push(other.branched_at_lsn);
+            }
+        }
+        return own_snap_wms;
     }
-    let b_c = target.branched_at_lsn;
-    own_snap_wms.push(b_c);
-    for (&other_ord, other) in volumes.iter() {
-        if other_ord != vol
-            && other.flags.load(Ordering::Relaxed) & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0
-            && other.branched_at_lsn > b_c
-        {
-            own_snap_wms.push(other.branched_at_lsn);
+    // ZFS port S3 (clone-SOURCE arm — replaces the deleted page-rc `rc > 1`
+    // floor for `repro_drop_free`): a NON-clone volume can still share L2P pages
+    // with a clone of one of its (possibly already-dropped) snapshots — onyx
+    // allows dropping a snapshot that has live clones, and promotion is lite
+    // (clears `parent_vol_ord`, never COW-divides the page tree), so after the
+    // linking snapshot is gone nothing else pins those shared pages. Without a
+    // pin the non-clone COW-kill would recycle a page a clone still reads =
+    // premature free. Pin conservatively on EVERY clone's branch point: a clone
+    // born at `B` shares all origin pages born `<= B`, and a precise lineage walk
+    // can't see a promoted ex-clone (sticky flag, cleared `parent_vol_ord`), so —
+    // exactly as the CLONE arm's descendant term — take the all-clone superset.
+    // Empty when no clones exist → ZERO change to the common non-clone path. The
+    // resulting over-COW on an unrelated volume is benign: it only fires while a
+    // clone is live, and then every snapshot drop routes to the S2c reachability
+    // free-set (computed from current structure, idempotent free), never a
+    // deadlist double-free.
+    let mut clone_branches = Vec::new();
+    for other in volumes.values() {
+        if other.flags.load(Ordering::Relaxed) & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0 {
+            clone_branches.push(other.branched_at_lsn);
         }
     }
-    own_snap_wms
+    clone_branches
 }
 
 /// Result of [`Db::drop_volume`].

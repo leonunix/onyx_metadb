@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::PAGE_SIZE;
 use crate::paged::format::{
-    L2pValue, index_child_at, index_set_child, leaf_bit_set, leaf_set, leaf_value_at,
+    L2pValue, index_set_child, leaf_bit_set, leaf_set, leaf_value_at,
 };
 use tempfile::TempDir;
 
@@ -100,28 +100,6 @@ fn install_flushed_snapshot_page_keeps_newer_dirty_copy() {
 }
 
 #[test]
-fn decref_cascades_into_index_children() {
-    let (_d, ps) = mk_store();
-    let mut buf = PageBuf::new(ps.clone());
-    let leaf0 = buf.alloc_leaf(1).unwrap();
-    let leaf1 = buf.alloc_leaf(1).unwrap();
-    let idx = buf.alloc_index(1, 1).unwrap();
-    index_set_child(buf.modify(idx, 1).unwrap(), 0, leaf0);
-    index_set_child(buf.modify(idx, 1).unwrap(), 42, leaf1);
-    buf.flush().unwrap();
-    // A3: commit the alloc'd pages' +1 into the page-rc array (the real
-    // write path does this at op end before any decref runs).
-    buf.commit_rc_deltas(1).unwrap();
-
-    let before = ps.free_list_len();
-    let out = buf.atomic_decref(idx, 1).unwrap();
-    assert_eq!(out, DecrefOutcome::Freed);
-    // index + leaf0 + leaf1 all hit the deferred-free queue.
-    ps.try_reclaim().unwrap();
-    assert_eq!(ps.free_list_len(), before + 3);
-}
-
-#[test]
 fn page_store_reclaim_requires_cache_invalidation_before_reuse() {
     let (_d, ps) = mk_store();
     let page_cache = Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES));
@@ -189,15 +167,10 @@ fn alloc_leaf_invalidates_reused_pinned_index_page() {
     leaf_set(buf.modify(reused, 3).unwrap(), 7, &v).unwrap();
     buf.flush().unwrap();
 
-    // Reuse `buf`'s page-rc store rather than letting a second
-    // `with_cache` allocate a fresh one: this test's `alloc_pool.push`
-    // hack (line above) leaves `idx` in the page_store free list even
-    // though it is now a live leaf, so a fresh `L2pPageRc::create`
-    // would `allocate()` that very page and clobber the leaf. Sharing
-    // the page-rc store is also the faithful "reopen the same store"
-    // semantics. (Production never hits this: Db shards share one
-    // page-rc via `with_cache_rc` and have no alloc_pool hack.)
-    let mut fresh = PageBuf::with_cache_rc(ps, page_cache, buf.page_rc().clone());
+    // A fresh PageBuf reopen reads the leaf straight from disk. (Per-L2P-page
+    // refcounting was deleted, so there is no longer a private page-rc store
+    // to clobber the leaf via the `alloc_pool.push` free-list hack.)
+    let mut fresh = PageBuf::with_cache(ps, page_cache);
     assert_eq!(fresh.read_level(reused).unwrap(), 0);
     assert_eq!(
         leaf_value_at(fresh.read(reused).unwrap(), 7).unwrap(),
@@ -241,49 +214,6 @@ fn checkpoint_install_invalidates_stale_leaf_cache_entry() {
 }
 
 #[test]
-fn decref_on_shared_index_stops_at_rc_decrement() {
-    let (_d, ps) = mk_store();
-    let mut buf = PageBuf::new(ps);
-    let leaf = buf.alloc_leaf(1).unwrap();
-    let idx = buf.alloc_index(1, 1).unwrap();
-    index_set_child(buf.modify(idx, 1).unwrap(), 0, leaf);
-    buf.flush().unwrap();
-    buf.commit_rc_deltas(1).unwrap(); // commit alloc'd +1s into the array
-    buf.atomic_incref(idx, 1).unwrap(); // rc = 2
-    let out = buf.atomic_decref(idx, 1).unwrap();
-    assert_eq!(out, DecrefOutcome::Decremented);
-    assert_eq!(buf.page_rc().get(idx).unwrap(), 1);
-    // Leaf is still reachable via the surviving reference.
-    assert!(buf.contains(leaf) || buf.read(leaf).is_ok());
-}
-
-#[test]
-fn cow_on_shared_index_bumps_children() {
-    let (_d, ps) = mk_store();
-    let mut buf = PageBuf::new(ps);
-    let leaf = buf.alloc_leaf(1).unwrap();
-    let idx = buf.alloc_index(1, 1).unwrap();
-    index_set_child(buf.modify(idx, 1).unwrap(), 7, leaf);
-    buf.flush().unwrap();
-    buf.commit_rc_deltas(1).unwrap(); // commit alloc'd +1s into the array
-    buf.atomic_incref(idx, 1).unwrap(); // rc(idx) = 2, rc(leaf) = 1
-    let new_idx = buf.cow_for_write(idx, 2, false).unwrap();
-    // rc deltas are batched; apply them like the tree write path
-    // would so the assertions below see the post-commit state.
-    buf.commit_rc_deltas(2).unwrap();
-    assert_ne!(new_idx, idx);
-    assert_eq!(buf.page_rc().get(idx).unwrap(), 1);
-    assert_eq!(buf.page_rc().get(new_idx).unwrap(), 1);
-    assert_eq!(
-        index_child_at(buf.read(new_idx).unwrap(), 7),
-        leaf,
-        "new index should share the same child pointer"
-    );
-    // Leaf picked up the new parent: rc went from 1 → 2.
-    assert_eq!(buf.page_rc().get(leaf).unwrap(), 2);
-}
-
-#[test]
 fn cow_clone_invalidates_reused_pinned_index_page() {
     let (_d, ps) = mk_store();
     let page_cache = Arc::new(PageCache::new_with_pin_budget(
@@ -299,11 +229,12 @@ fn cow_clone_invalidates_reused_pinned_index_page() {
     assert_eq!(page_cache.pinned_pages(), 1);
     buf.alloc_pool.clear();
 
-    buf.atomic_incref(live_leaf, 1).unwrap(); // rc(live_leaf) = 2, forcing COW.
+    // `cow_for_write` always copies now (per-L2P-page refcounting deleted), so
+    // no rc bump is needed to force the clone allocation.
     ps.free(stale_idx, 2).unwrap();
     ps.try_reclaim().unwrap();
 
-    let new_leaf = buf.cow_for_write(live_leaf, 3, false).unwrap();
+    let new_leaf = buf.cow_for_write(live_leaf, 3).unwrap();
     assert_eq!(new_leaf, stale_idx);
     assert_eq!(
         page_cache.pinned_pages(),
@@ -311,21 +242,8 @@ fn cow_clone_invalidates_reused_pinned_index_page() {
         "COW allocation must evict the stale pinned index incarnation"
     );
     assert_eq!(buf.read_level(new_leaf).unwrap(), 0);
-    buf.commit_rc_deltas(3).unwrap();
     buf.flush().unwrap();
 
     let mut fresh = PageBuf::with_cache(ps, page_cache);
     assert_eq!(fresh.read_level(new_leaf).unwrap(), 0);
-}
-
-#[test]
-fn cow_on_unique_page_is_noop() {
-    let (_d, ps) = mk_store();
-    let mut buf = PageBuf::new(ps);
-    let pid = buf.alloc_leaf(1).unwrap();
-    let out = buf.cow_for_write(pid, 2, false).unwrap();
-    assert_eq!(out, pid);
-    // A3: the alloc'd page's +1 is in the op accumulator (uncommitted),
-    // so the effective rc (array + pending) is 1.
-    assert_eq!(buf.effective_rc(pid).unwrap(), 1);
 }

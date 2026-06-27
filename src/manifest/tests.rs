@@ -95,8 +95,6 @@ fn commit_then_reopen_recovers_manifest() {
         free_list_head: 99,
         refcount_shard_roots: bx(&[17, 18, 19, 20]),
         refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
-        l2p_page_rc_shard_roots: bx(&[21, 22, 23, 24]),
-        l2p_page_rc_durable_seq: bx(&[1234, 1234, 1234, 1234]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE, NULL_PAGE]),
         next_snapshot_id: 5,
@@ -269,13 +267,6 @@ fn encode_decode_round_trip_with_refcount_and_dedup() {
             0xDEAD_BEEF_CAFE,
             0xDEAD_BEEF_CAFE,
         ]),
-        l2p_page_rc_shard_roots: bx(&[146, 147, 148, 149]),
-        l2p_page_rc_durable_seq: bx(&[
-            0xDEAD_BEEF_CAFE,
-            0xDEAD_BEEF_CAFE,
-            0xDEAD_BEEF_CAFE,
-            0xDEAD_BEEF_CAFE,
-        ]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE, 200, 300]),
         next_snapshot_id: 99,
@@ -301,8 +292,6 @@ fn encode_rejects_oversized_snapshot_table() {
     let mut m = Manifest::empty();
     m.refcount_shard_roots = bx(&[1, 2, 3, 4]);
     m.refcount_durable_seq = bx(&[0, 0, 0, 0]);
-    m.l2p_page_rc_shard_roots = bx(&[5, 6, 7, 8]);
-    m.l2p_page_rc_durable_seq = bx(&[0, 0, 0, 0]);
     let cap = max_snapshots_for_shards(m.shard_count());
     assert!(cap > 0);
     for i in 0..(cap + 1) as u64 {
@@ -365,8 +354,6 @@ fn v6_volumes_table_round_trip() {
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[50, 51]),
         refcount_durable_seq: bx(&[10, 10]),
-        l2p_page_rc_shard_roots: bx(&[52, 53]),
-        l2p_page_rc_durable_seq: bx(&[10, 10]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[]),
         next_snapshot_id: 2,
@@ -413,8 +400,6 @@ fn v6_rejects_volume_count_exceeding_capacity() {
     let mut m = Manifest::empty();
     m.refcount_shard_roots = bx(&[1]);
     m.refcount_durable_seq = bx(&[0]);
-    m.l2p_page_rc_shard_roots = bx(&[2]);
-    m.l2p_page_rc_durable_seq = bx(&[0]);
     // Start with just the bootstrap — this sets the baseline volume budget.
     m.volumes.push(boot_vol(1, &[10]));
     let baseline_budget: usize = m
@@ -424,7 +409,7 @@ fn v6_rejects_volume_count_exceeding_capacity() {
         .sum();
     // The current cuckoo/paged-reverse layout stores one dedup meta-head
     // group per index, independent of dedup_shards/apply-lane count.
-    let cap = max_snapshots_for_layout(m.shard_count(), m.shard_count(), 1, 0, baseline_budget);
+    let cap = max_snapshots_for_layout(m.shard_count(), 1, 0, baseline_budget);
     for i in 0..(cap + 1) as u64 {
         m.snapshots.push(snap(&ps, i, 0, &[10], i));
     }
@@ -447,8 +432,6 @@ fn dedup_n4_encode_decode_round_trip() {
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
         refcount_durable_seq: bx(&[100, 100]),
-        l2p_page_rc_shard_roots: bx(&[3, 4]),
-        l2p_page_rc_durable_seq: bx(&[100, 100]),
         dedup_shards: 4,
         dedup_index_shard_heads: one_shard(&[10]),
         next_snapshot_id: 1,
@@ -731,8 +714,6 @@ fn v11_per_shard_durable_seq_round_trip() {
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 11, 12, 13]),
         refcount_durable_seq: bx(&[5, 7, 6, 9]),
-        l2p_page_rc_shard_roots: bx(&[14, 15, 16, 17]),
-        l2p_page_rc_durable_seq: bx(&[5, 7, 6, 9]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[]),
         next_snapshot_id: 1,
@@ -791,8 +772,6 @@ fn encode_rejects_durable_seq_drift_from_checkpoint_lsn() {
         refcount_durable_seq: bx(&[42, 7]),
         // Consistent (>= checkpoint_lsn) so the drift surfaces from
         // refcount, not from page-rc.
-        l2p_page_rc_shard_roots: bx(&[5, 6]),
-        l2p_page_rc_durable_seq: bx(&[42, 42]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[]),
         next_snapshot_id: 1,
@@ -827,8 +806,6 @@ fn encode_rejects_refcount_durable_seq_length_mismatch() {
         refcount_shard_roots: bx(&[1, 2, 3]),
         refcount_durable_seq: bx(&[0, 0]), // wrong length
         // Consistent so the refcount length check is the one that fires.
-        l2p_page_rc_shard_roots: bx(&[4, 5, 6]),
-        l2p_page_rc_durable_seq: bx(&[0, 0, 0]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[]),
         next_snapshot_id: 1,
@@ -924,8 +901,6 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
         refcount_durable_seq: bx(&[]),
         // v10 hand-encoder ignores these; present only to satisfy the
         // struct literal (this manifest is never validated by encode()).
-        l2p_page_rc_shard_roots: bx(&[]),
-        l2p_page_rc_durable_seq: bx(&[]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[]),
         next_snapshot_id: 1,
@@ -1053,8 +1028,8 @@ fn v13_manifest_is_rejected_after_flag_day_to_v14() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v15"),
-                "expected v13-rejection message mentioning v15, got: {msg}"
+                msg.contains("unsupported manifest body version") && msg.contains("v22"),
+                "expected v13-rejection message mentioning v22, got: {msg}"
             );
         }
         e => panic!("expected Corruption from v13 manifest, got {e}"),
@@ -1077,8 +1052,8 @@ fn v14_manifest_is_rejected_after_flag_day_to_v15() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v15"),
-                "expected v14-rejection message mentioning v15, got: {msg}"
+                msg.contains("unsupported manifest body version") && msg.contains("v22"),
+                "expected v14-rejection message mentioning v22, got: {msg}"
             );
         }
         e => panic!("expected Corruption from v14 manifest, got {e}"),
@@ -1100,8 +1075,6 @@ fn v15_round_trip_carries_checkpoint_txg() {
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 20, 30, 40]),
         refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
-        l2p_page_rc_shard_roots: bx(&[50, 60, 70, 80]),
-        l2p_page_rc_durable_seq: bx(&[1234, 1234, 1234, 1234]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE]),
         next_snapshot_id: 1,
@@ -1133,8 +1106,6 @@ fn v15_checkpoint_txg_zero_round_trips() {
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[NULL_PAGE; 4]),
         refcount_durable_seq: bx(&[0; 4]),
-        l2p_page_rc_shard_roots: bx(&[NULL_PAGE; 4]),
-        l2p_page_rc_durable_seq: bx(&[0; 4]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE]),
         next_snapshot_id: 1,
@@ -1150,107 +1121,28 @@ fn v15_checkpoint_txg_zero_round_trips() {
     assert_eq!(decoded, m);
 }
 
-// ── snapshot-scaling Phase A2 (v17): l2p_page_rc shard group ─────────
+// ── ZFS port S3 (v22): l2p_page_rc shard group DELETED ──────────────
 
-/// A v16 manifest (no l2p_page_rc shard group) is flag-day rejected by
-/// the v17 decoder — backcompat is waived pre-release.
+/// A v21 manifest (still carried the now-deleted l2p_page_rc shard group)
+/// is flag-day rejected by the v22 decoder — backcompat is waived
+/// pre-release (onyx rebuilds metadb on schema change).
 #[test]
-fn v16_manifest_is_rejected_after_flag_day_to_v17() {
+fn v21_manifest_is_rejected_after_flag_day_to_v22() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
     {
         let p = page.payload_mut();
-        p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].copy_from_slice(&16u32.to_le_bytes());
+        p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].copy_from_slice(&21u32.to_le_bytes());
     }
     page.seal();
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v17"),
-                "expected v16-rejection message mentioning v17, got: {msg}"
+                msg.contains("unsupported manifest body version") && msg.contains("v22"),
+                "expected v21-rejection message mentioning v22, got: {msg}"
             );
         }
-        e => panic!("expected Corruption from v16 manifest, got {e}"),
-    }
-}
-
-/// The L2P-page-rc roots + per-shard durable_seq round-trip through v17
-/// encode/decode, and the shard count rides the (formerly reserved)
-/// offset-28 header slot. `checkpoint_lsn` is set to the global
-/// `min(durable_seq)` so the invariant tripwire stays satisfied.
-#[test]
-fn v17_l2p_page_rc_round_trip() {
-    let dir = TempDir::new().unwrap();
-    let ps = mk_store(&dir);
-    // refcount durable min = 8, page-rc durable min = 8, volume min = 8.
-    let m = Manifest {
-        body_version: MANIFEST_BODY_VERSION,
-        checkpoint_lsn: 8,
-        checkpoint_txg: 3,
-        last_processed_buffer_seq: 0,
-        lifecycle_replay_seq: 0,
-        free_list_head: NULL_PAGE,
-        refcount_shard_roots: bx(&[10, 11, 12, 13]),
-        refcount_durable_seq: bx(&[9, 8, 10, 11]),
-        l2p_page_rc_shard_roots: bx(&[20, 21, 22, 23]),
-        l2p_page_rc_durable_seq: bx(&[12, 9, 8, 14]),
-        dedup_shards: 1,
-        dedup_index_shard_heads: one_shard(&[NULL_PAGE]),
-        next_snapshot_id: 1,
-        next_volume_ord: 1,
-        snapshots: Vec::new(),
-        volumes: vec![boot_vol_at(4, &[1, 2, 3, 4], 8)],
-    };
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    m.encode(&mut page).unwrap();
-    page.seal();
-    page.verify(MANIFEST_PAGE_A).unwrap();
-    // The shard count is stored in the offset-28 slot.
-    assert_eq!(
-        u32::from_le_bytes(
-            page.payload()[OFF_L2P_PAGE_RC_SHARDS..OFF_L2P_PAGE_RC_SHARDS + 4]
-                .try_into()
-                .unwrap()
-        ),
-        4
-    );
-    let decoded = Manifest::decode(&page, &ps).unwrap();
-    assert_eq!(decoded, m);
-    assert_eq!(decoded.l2p_page_rc_shard_roots.as_ref(), &[20, 21, 22, 23]);
-    assert_eq!(decoded.l2p_page_rc_durable_seq.as_ref(), &[12, 9, 8, 14]);
-}
-
-/// Encoding rejects a length mismatch between `l2p_page_rc_shard_roots`
-/// and `l2p_page_rc_durable_seq`, mirroring the refcount pairing check.
-#[test]
-fn encode_rejects_l2p_page_rc_durable_seq_length_mismatch() {
-    let dir = TempDir::new().unwrap();
-    let _ps = mk_store(&dir);
-    let m = Manifest {
-        body_version: MANIFEST_BODY_VERSION,
-        checkpoint_lsn: 0,
-        checkpoint_txg: 0,
-        last_processed_buffer_seq: 0,
-        lifecycle_replay_seq: 0,
-        free_list_head: NULL_PAGE,
-        refcount_shard_roots: bx(&[1, 2]),
-        refcount_durable_seq: bx(&[0, 0]),
-        l2p_page_rc_shard_roots: bx(&[3, 4, 5]),
-        l2p_page_rc_durable_seq: bx(&[0, 0]), // wrong length
-        dedup_shards: 1,
-        dedup_index_shard_heads: one_shard(&[]),
-        next_snapshot_id: 1,
-        next_volume_ord: 1,
-        snapshots: Vec::new(),
-        volumes: vec![boot_vol(2, &[10, 11])],
-    };
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    let err = m.encode(&mut page).unwrap_err();
-    match err {
-        MetaDbError::Corruption(msg) => {
-            assert!(msg.contains("l2p_page_rc_durable_seq length"), "{msg}");
-        }
-        e => panic!("expected Corruption, got {e}"),
+        e => panic!("expected Corruption from v21 manifest, got {e}"),
     }
 }

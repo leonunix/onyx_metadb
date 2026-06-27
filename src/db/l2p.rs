@@ -475,10 +475,10 @@ impl Db {
         // Phase B (A3 follow-up): NO forced TXG sync at entry. This path
         // used to run `flush_with_gate(Forced)` here to drain in-flight
         // flush IO so `apply_l2p_range_delete`'s rc mutation could not be
-        // clobbered by a concurrent flush IO phase. A3 moved the page
-        // refcount into the `L2pPageRc` array: the apply now `stage`s its
-        // decrefs into the OPEN TXG slot while flush writes the FROZEN
-        // syncing slot, so there is nothing left to clobber. This mirrors
+        // clobbered by a concurrent flush IO phase. The PBA refcount apply
+        // `stage`s its decrefs into the OPEN TXG slot while flush writes the
+        // FROZEN syncing slot, so there is nothing left to clobber (and ZFS
+        // port S3 deleted per-L2P-page refcounting entirely). This mirrors
         // the same removal already done for `take_snapshot` /
         // `drop_snapshot` / `clone_volume`.
         //

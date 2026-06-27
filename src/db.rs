@@ -77,15 +77,6 @@ pub struct Db {
     /// refcount, remaining 24 bytes reserved). Refcount is a global running
     /// tally — not per-volume — and stays at the top level for that reason.
     refcount_shards: Vec<Shard>,
-    /// Per-L2P-page refcount store (snapshot-scaling Phase A2/A3). Same
-    /// shard count as `refcount_shards`; folded on the same TXG-sync
-    /// boundary. `Arc` so the one shared store can be injected into every
-    /// `PagedL2p`'s `PageBuf` (page-rc routes by global `PageId`, so any
-    /// shard's COW can touch any page-rc shard). A3-plumbing landed; the
-    /// page-header `refcount` byte is still authoritative until the
-    /// cutover routes the COW hot path through this. See
-    /// [`crate::l2p_page_rc`].
-    l2p_page_rc: Arc<crate::l2p_page_rc::L2pPageRc>,
     /// Global dedup index: 32-byte SHA-256 content hash → 28-byte opaque
     /// `DedupValue`. Backed by [`crate::dedup::DedupIndex`] so the apply path can
     /// fan writes across multiple LSMs once Phase 3 wires per-shard

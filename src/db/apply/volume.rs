@@ -51,20 +51,15 @@ pub(in crate::db) fn collect_paged_refcounts_for_roots(
 pub(in crate::db) fn apply_create_volume(
     page_store: &Arc<PageStore>,
     page_cache: &Arc<PageCache>,
-    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     shard_count: u32,
     metrics: Arc<MetaMetrics>,
     use_buffer: bool,
-    // A3: the volume's `created_lsn` (the CreateVolume op's lsn, strictly
-    // below the volume's first write op) — stamps each shard root's
-    // page-rc +1 so the fold applies it without colliding a later op.
     created_lsn: Lsn,
 ) -> Result<(Vec<L2pShard>, Box<[PageId]>)> {
     let n = validate_shard_count(shard_count)?;
     create_l2p_shards(
         page_store.clone(),
         page_cache.clone(),
-        page_rc.clone(),
         n,
         metrics,
         use_buffer,
@@ -75,66 +70,27 @@ pub(in crate::db) fn apply_create_volume(
 /// Apply a `DropVolume` op's page free. Reuses [`apply_drop_snapshot_pages`];
 /// `DropVolume` has the same per-page semantics and just doesn't need the
 /// freed-leaf-values vec the snapshot path surfaces in its report. `free_pages`
-/// is the S2 explicit free-set (`Some` for CLONE_LINEAGE drops, `None` for
-/// unflagged drops → legacy page-rc cascade); see the core for the contract.
+/// is the S2/S3 explicit reachability free-set (always `Some` post-S3 — both
+/// CLONE_LINEAGE and non-clone drops freeze it); see the core for the contract.
 pub(in crate::db) fn apply_drop_volume(
     page_store: &Arc<PageStore>,
-    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     lsn: Lsn,
-    txg: crate::types::Txg,
     pages: &[PageId],
     free_pages: Option<&[PageId]>,
 ) -> Result<usize> {
     let (_leaf_values, pages_freed) =
-        apply_drop_snapshot_pages(page_store, page_rc, lsn, txg, pages, free_pages)?;
+        apply_drop_snapshot_pages(page_store, lsn, pages, free_pages)?;
     Ok(pages_freed)
-}
-
-/// Increment the on-disk refcount of each shard root that a cloned
-/// volume pins. Idempotent across replays: pages already stamped with
-/// `page.generation >= lsn` are skipped (same guard pattern
-/// [`apply_drop_snapshot_pages`] uses). `NULL_PAGE` roots — empty
-/// source shards — are ignored because the clone materialises fresh
-/// empty trees for those shards (see [`build_clone_volume_shards`]).
-pub(in crate::db) fn apply_clone_volume_incref(
-    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
-    faults: &FaultController,
-    lsn: Lsn,
-    txg: crate::types::Txg,
-    src_shard_roots: &[PageId],
-) -> Result<()> {
-    for (idx, &pid) in src_shard_roots.iter().enumerate() {
-        if pid == crate::types::NULL_PAGE {
-            continue;
-        }
-        // A3 cutover: incref the page-rc array, not the page header. The
-        // page bytes are untouched (no whole-page rc write to be clobbered
-        // by a concurrent flush — which is the coupling this whole project
-        // removes). `stage`'s `page_lsn >= lsn` replay-skip gives the same
-        // idempotency the old `header.generation >= lsn` guard gave. The
-        // staged delta rides the next checkpoint's TXG fold (clone_volume
-        // commits no manifest itself) or a recovery replay.
-        page_rc.stage(txg, pid, 1, lsn)?;
-        // Fault injection window: fires after the first root's incref is
-        // staged but before subsequent ones. Recovery's replay-skip guard
-        // skips the pre-fault root and completes the rest.
-        if idx == 0 {
-            faults.inject(FaultPoint::CloneVolumeMidIncref)?;
-        }
-    }
-    Ok(())
 }
 
 /// Build the new volume's shard group for a clone. Each source root
 /// becomes the initial root of a fresh [`PagedL2p`]; empty source
 /// shards (`NULL_PAGE` root) get a freshly-allocated empty leaf so the
-/// tree is always operable. Caller must have already incref'd the
-/// non-null roots via [`apply_clone_volume_incref`].
+/// tree is always operable.
 pub(in crate::db) fn build_clone_volume_shards(
     src_shard_roots: &[PageId],
     page_store: &Arc<PageStore>,
     page_cache: &Arc<PageCache>,
-    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     created_lsn: Lsn,
     metrics: Arc<MetaMetrics>,
     use_buffer: bool,
@@ -142,21 +98,12 @@ pub(in crate::db) fn build_clone_volume_shards(
     let mut shards = Vec::with_capacity(src_shard_roots.len());
     let mut actual_roots = Vec::with_capacity(src_shard_roots.len());
     for (shard_idx, &root) in src_shard_roots.iter().enumerate() {
-        // Clone shards MUST share the one global page-rc store (not a
-        // private one), so the clone's COW page-rc deltas land in the
-        // same array the source volume uses. Hence the `_rc` ctors.
         let tree = if root == crate::types::NULL_PAGE {
-            PagedL2p::create_with_cache_rc(
-                page_store.clone(),
-                page_cache.clone(),
-                page_rc.clone(),
-                created_lsn,
-            )?
+            PagedL2p::create_with_cache(page_store.clone(), page_cache.clone(), created_lsn)?
         } else {
-            PagedL2p::open_with_cache_rc(
+            PagedL2p::open_with_cache(
                 page_store.clone(),
                 page_cache.clone(),
-                page_rc.clone(),
                 root,
                 created_lsn + 1,
             )?
@@ -237,100 +184,61 @@ fn harvest_and_free(
     Ok(())
 }
 
-/// Core of the `DropSnapshot` / `DropVolume` page free.
+/// Core of the `DropSnapshot` / `DropVolume` page free (ZFS port Phase 4 S3).
 ///
-/// Always decrements every page in `pages` by 1 in the page-rc array
-/// (stamping `generation = lsn`, replay-idempotent via `stage`'s
-/// `page_lsn >= lsn` skip). The free decision is `free_pages`:
-///
-/// * `None` (legacy / deferred clone-involved-snapshot + unflagged-volume
-///   paths) — page-rc-AUTHORITATIVE cascade: free a page iff its decref
-///   reaches 0, confirmed with a fold-consistent `get_consistent` read.
-///   That R2 guard is LOAD-BEARING: a background page-rc fold can race
-///   this apply (the fold runs in `run_sync_cycle_body`'s gateless sample
-///   phase, serialized only by `fold_lock` — `apply_gate.write` does NOT
-///   exclude it), and the cheap staged `new` can straddle the fold's
-///   [publish, clear] window and floor a live rc to a spurious 0.
-///
-/// * `Some(set)` (ZFS port Phase 4 S2 flip) — the explicit, page-rc-
-///   INDEPENDENT free-set frozen pre-commit (deadlist for non-clone
-///   snapshots, reachability `exclusive` for CLONE_LINEAGE volumes; the
-///   HARD shadow proved `set == the page-rc free-set` before the WAL
-///   submit). Here the `pages` decref is page-rc bookkeeping ONLY (keeps
-///   the array accurate as the inverted shadow for a sibling's later
-///   drop), and we free exactly `set`. NO `get_consistent` is needed —
-///   not because the fold can't race, but because the free decision NEVER
-///   reads page-rc; it frees the structurally-frozen set. (Do not "fix"
-///   this into reading rc, and do not strip the None-path's guard.)
+/// Frees exactly `free_pages` — the explicit, page-rc-INDEPENDENT free-set the
+/// producer froze under the held gates and a HARD shadow validated before the
+/// WAL submit (deadlist for non-clone snapshots; reachability `exclusive` for
+/// CLONE_LINEAGE / non-clone volumes + clone-involved snapshots). `pages` (the
+/// `collect_drop_pages_with_birth` cascade frontier) is retained only for the
+/// `free_pages ⊆ pages` subset assertion. The legacy page-rc cascade + its R2
+/// fold-consistent `get_consistent` guard are DELETED — page-rc no longer
+/// exists, so the free decision can never read it.
 ///
 /// Returns `(freed_leaf_values, pages_freed)`.
 pub(in crate::db) fn apply_drop_snapshot_pages(
     page_store: &Arc<PageStore>,
-    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     lsn: Lsn,
-    txg: crate::types::Txg,
     pages: &[PageId],
     free_pages: Option<&[PageId]>,
 ) -> Result<(Vec<L2pValue>, usize)> {
     let mut freed_leaf_values: Vec<L2pValue> = Vec::new();
     let mut pages_freed: usize = 0;
 
-    match free_pages {
-        None => {
-            for &pid in pages {
-                // A3 cutover: decref the page-rc array, not the page header.
-                let (prev, new) = page_rc.stage(txg, pid, -1, lsn)?;
-                if new != 0 || prev == 0 {
-                    // Still referenced (new > 0), or the replay-skip fired
-                    // (prev == new == 0). A non-freeing decref writes
-                    // nothing — the rc lives in the array, no header.
-                    continue;
-                }
-                // 1→0 transition. Confirm with a fold-consistent read
-                // before the IRREVERSIBLE free (R2 guard — see fn doc).
-                if page_rc.get_consistent(pid)? != 0 {
-                    continue;
-                }
-                harvest_and_free(
-                    page_store,
-                    pid,
-                    lsn,
-                    &mut freed_leaf_values,
-                    &mut pages_freed,
-                )?;
-            }
-        }
-        Some(set) => {
-            // Invariant: the frozen free-set is a subset of the decref
-            // `pages` (the shadows prove `set == structural_free`, and
-            // structural_free is filtered from `pages`). A `set` page absent
-            // from `pages` would be freed with no page-rc decref, leaving a
-            // permanent stale +1 in the array (an inverted-shadow lie). The
-            // call sites guarantee it; assert at the apply boundary (which
-            // replay also re-enters) so a future producer bug trips in test.
-            debug_assert!(
-                {
-                    let decref: std::collections::HashSet<PageId> = pages.iter().copied().collect();
-                    set.iter().all(|p| decref.contains(p))
-                },
-                "S2 free_pages must be a subset of the decref `pages`"
-            );
-            // Page-rc bookkeeping only (inverted shadow): decref every
-            // cascade-frontier page. The free is `set`, decided without
-            // reading rc.
-            for &pid in pages {
-                page_rc.stage(txg, pid, -1, lsn)?;
-            }
-            for &pid in set {
-                harvest_and_free(
-                    page_store,
-                    pid,
-                    lsn,
-                    &mut freed_leaf_values,
-                    &mut pages_freed,
-                )?;
-            }
-        }
+    // ZFS port Phase 4 S3: page-rc is deleted. Every drop op now freezes an
+    // explicit, page-rc-INDEPENDENT free-set (deadlist for non-clone snapshots,
+    // reachability `exclusive` for CLONE_LINEAGE / non-clone volumes + clone-
+    // involved snapshots — all proven HARD by the page-rc-independent shadows
+    // before the WAL submit). The legacy `None` page-rc cascade is gone; a None
+    // here can only be a corrupt/pre-S3 op (impossible on a fresh-metadb v22
+    // rebuild).
+    let set = free_pages.ok_or_else(|| {
+        MetaDbError::Corruption(
+            "post-S3 DropVolume/DropSnapshot must carry an explicit free_pages set \
+             (page-rc cascade deleted)"
+                .to_string(),
+        )
+    })?;
+    // Invariant: the frozen free-set is a subset of the cascade-frontier
+    // `pages` (`collect_drop_pages_with_birth`); the shadows prove
+    // `set == structural_free`, and structural_free is filtered from `pages`.
+    // Asserted at the apply boundary (which replay also re-enters) so a future
+    // producer bug trips in test.
+    debug_assert!(
+        {
+            let frontier: std::collections::HashSet<PageId> = pages.iter().copied().collect();
+            set.iter().all(|p| frontier.contains(p))
+        },
+        "S3 free_pages must be a subset of the cascade `pages`"
+    );
+    for &pid in set {
+        harvest_and_free(
+            page_store,
+            pid,
+            lsn,
+            &mut freed_leaf_values,
+            &mut pages_freed,
+        )?;
     }
 
     page_store.sync()?;
@@ -338,22 +246,20 @@ pub(in crate::db) fn apply_drop_snapshot_pages(
     Ok((freed_leaf_values, pages_freed))
 }
 
-/// Apply a full `LifecycleOp::DropSnapshot`: the page-refcount cascade for
-/// `pages`. Phase 5 ignores `pba_decrefs`: global PBA rc is not a
+/// Apply a full `LifecycleOp::DropSnapshot`: free the op's explicit
+/// `free_pages` set. Phase 5 ignores `pba_decrefs`: global PBA rc is not a
 /// per-live-LBA counter, so dropping a snapshot must not subtract one PBA
 /// rc entry per logical LBA in the snapshot diff.
 pub(in crate::db) fn apply_drop_snapshot_pages_and_decrefs(
     page_store: &Arc<PageStore>,
     refcount_shards: &[Shard],
-    page_rc: &Arc<crate::l2p_page_rc::L2pPageRc>,
     lsn: Lsn,
-    txg: crate::types::Txg,
     pages: &[PageId],
     pba_decrefs: &[Pba],
     free_pages: Option<&[PageId]>,
 ) -> Result<ApplyOutcome> {
     let (freed_leaf_values, pages_freed) =
-        apply_drop_snapshot_pages(page_store, page_rc, lsn, txg, pages, free_pages)?;
+        apply_drop_snapshot_pages(page_store, lsn, pages, free_pages)?;
     let _ = refcount_shards;
     let _ = pba_decrefs;
 

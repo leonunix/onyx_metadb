@@ -73,14 +73,6 @@ impl Db {
                 min_lsn = lsn;
             }
         }
-        // Phase A2: L2P-page-rc shards fold on the same boundary as
-        // refcount and advance in lock-step, so they join the floor.
-        for s_idx in 0..self.l2p_page_rc.shard_count() {
-            let lsn = self.l2p_page_rc.last_flushed_lsn(s_idx);
-            if lsn < min_lsn {
-                min_lsn = lsn;
-            }
-        }
         if min_lsn == Lsn::MAX { 0 } else { min_lsn }
     }
 
@@ -424,14 +416,13 @@ impl Db {
         // `apply_gate.write()` is now provided by:
         //
         // - Lifecycle ops hold `drop_gate.write` for the duration, which
-        //   keeps the syncing slot empty (no new Dirty Arcs form). Post-A3
-        //   their rc mutations (`atomic_incref` / `apply_drop_snapshot_pages`
-        //   / `apply_clone_volume_incref`) `stage` into the `L2pPageRc`
-        //   array rather than RMW-ing a whole page, so a concurrent flush
-        //   IO phase has nothing to clobber — which is why `take_snapshot`
-        //   / `drop_snapshot` / `clone_volume` no longer force-sync at
-        //   entry (Phase B). (`range_delete` / `drop_volume` / `create_volume`
-        //   still force-sync; their removal is a later step.)
+        //   keeps the syncing slot empty (no new Dirty Arcs form). ZFS port
+        //   S3 deleted per-L2P-page refcounting, so lifecycle ops no longer
+        //   RMW any whole-page rc — a concurrent flush IO phase has nothing
+        //   to clobber, which is why `take_snapshot` / `drop_snapshot` /
+        //   `clone_volume` no longer force-sync at entry (Phase B).
+        //   (`range_delete` / `drop_volume` / `create_volume` still
+        //   force-sync; their removal is a later step.)
         // - Per-shard `tree.write()` held during this flush's
         //   `lock_selected_l2p_shards_for` excludes lifecycle's
         //   `lock_all_l2p_shards_for` from racing the sample.
@@ -886,86 +877,24 @@ impl Db {
         // so the increfs fold into THIS cycle's page-rc checkpoint — durable
         // atomically with the manifest entry (added in A4). On error, roll
         // back the L2P + refcount checkpoints (nothing page-rc folded yet).
-        let prc_force_increfs = match self.stage_pending_snapshot_increfs(
+        if let Err(err) = self.prepare_pending_snapshot_entries(
             txg,
             &snapshot_roots,
             &snapshot_watermarks,
         ) {
-            Ok(v) => v,
-            Err(err) => {
-                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-                self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
-                self.metrics
-                    .record_flush_total(kind, flush_started.elapsed());
-                return Err(err);
-            }
-        };
+            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+            self.metrics
+                .record_flush_total(kind, flush_started.elapsed());
+            return Err(err);
+        }
 
-        // Snapshot-scaling Phase A2/A3: fold the L2P-page-rc shards on the
-        // SAME TXG boundary as the PBA refcount shards, reusing
-        // `selected.rc` (the two groups share a shard count). A3 made the
-        // array authoritative, so these checkpoints now carry real staged
-        // deltas: `begin_checkpoint` drains the TXG slot, `build_meta_chain`
-        // (below) seals data pages + allocates fresh meta pages. Every
-        // downstream IO/manifest error site therefore aborts
-        // `l2p_page_rc_checkpoints` too (`abort_prc_checkpoints_sparse`),
-        // exactly like `refcount_checkpoints` — search the
-        // `abort_prc_checkpoints_sparse` call sites. Each selected shard's
-        // `last_flushed_lsn` advances in lock-step with refcount
-        // (preserving `min(durable_seq[]) == checkpoint_lsn`).
-        debug_assert_eq!(
-            self.l2p_page_rc.shard_count(),
-            self.refcount_shards.len(),
-            "page-rc reuses selected.rc, so the two shard groups must share a count"
-        );
-        let l2p_page_rc_checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>> = {
-            let mut out: Vec<Option<crate::refcount::shard::RcCheckpoint>> =
-                (0..self.l2p_page_rc.shard_count()).map(|_| None).collect();
-            let mut prc_err: Option<MetaDbError> = None;
-            for s_idx in 0..self.l2p_page_rc.shard_count() {
-                let force_increfs = &prc_force_increfs[s_idx];
-                // Process a shard if it was selected for the normal fold OR
-                // it holds snapshot-root force-increfs this cycle (the roots
-                // must be incref'd durably even if the shard had no COW
-                // deltas — force-select it here so the incref isn't lost).
-                if !selected.rc[s_idx] && force_increfs.is_empty() {
-                    continue;
-                }
-                let shard = self.l2p_page_rc.shard(s_idx);
-                let res = if txg_threads_enabled {
-                    shard.begin_checkpoint_with_increfs(txg, force_increfs)
-                } else {
-                    // threads-off inline flush folds every slot; the
-                    // force-increfs ride the same checkpoint.
-                    shard.begin_checkpoint_all_slots_with_increfs(false, force_increfs)
-                };
-                match res {
-                    Ok(ckpt) if prc_err.is_none() => out[s_idx] = Some(ckpt),
-                    // A3: a sibling shard in this round already errored, so
-                    // abort this just-built checkpoint (frees its fresh
-                    // pages + restores its drained deltas). No-op on an
-                    // empty checkpoint.
-                    Ok(ckpt) => shard.abort_checkpoint(ckpt, wal_checkpoint),
-                    Err(err) if prc_err.is_none() => prc_err = Some(err),
-                    Err(_) => {}
-                }
-            }
-            if let Some(err) = prc_err {
-                for (s_idx, ckpt_opt) in out.into_iter().enumerate() {
-                    if let Some(ckpt) = ckpt_opt {
-                        self.l2p_page_rc
-                            .shard(s_idx)
-                            .abort_checkpoint(ckpt, wal_checkpoint);
-                    }
-                }
-                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-                self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
-                self.metrics
-                    .record_flush_total(kind, flush_started.elapsed());
-                return Err(err);
-            }
-            out
-        };
+        // ZFS port S3: per-L2P-page refcounting was deleted, so there is no
+        // page-rc checkpoint fold here. Snapshot roots stay referenced because
+        // the source volume's tree keeps pointing at the shared roots (COW
+        // preserves them on the next write); the snapshot's pages are reachable
+        // from its `SnapshotEntry` roots in the manifest.
+
         // No sample-phase gate to drop. The IO phase below proceeds
         // straight from the sample: concurrent commits never blocked
         // on us, and the dirty page Arcs we hold in the checkpoints
@@ -1004,10 +933,6 @@ impl Db {
                                     refcount_checkpoints,
                                     wal_checkpoint,
                                 );
-                                self.abort_prc_checkpoints_sparse(
-                                    l2p_page_rc_checkpoints,
-                                    wal_checkpoint,
-                                );
                                 self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                                 return Err(err);
                             }
@@ -1035,13 +960,6 @@ impl Db {
         // always empty, so this loop was a no-op and was omitted; A3 must
         // write them or the freshly-allocated array data pages are never
         // persisted → orphan / zeroed on reopen).
-        for ckpt_opt in &l2p_page_rc_checkpoints {
-            if let Some(ckpt) = ckpt_opt {
-                let before = sealed_pages.len();
-                ckpt.append_sealed_pages(&mut sealed_pages);
-                total_pages_written += sealed_pages.len() - before;
-            }
-        }
         // Build the per-shard meta chains in memory (no IO) and fold
         // every sealed chain page into the global `sealed_pages` batch.
         // The shard's head meta page id is stable across rewrites
@@ -1084,38 +1002,6 @@ impl Db {
                     self.metrics
                         .record_flush_total(kind, flush_started.elapsed());
                     self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-                    self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
-                    self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
-                    return Err(err);
-                }
-            }
-        }
-        // Phase A2/A3: build the L2P-page-rc meta chains into the same
-        // sealed batch + cache-insert / to-free lists. A3 stages real
-        // deltas, so a non-empty checkpoint seals chain pages + frees old
-        // continuation pages here; the error arm aborts every page-rc
-        // checkpoint (`abort_prc_checkpoints_sparse`), like refcount.
-        let mut l2p_page_rc_new_chains: Vec<Option<Vec<PageId>>> =
-            (0..self.l2p_page_rc.shard_count()).map(|_| None).collect();
-        for (s_idx, ckpt_opt) in l2p_page_rc_checkpoints.iter().enumerate() {
-            let Some(ckpt) = ckpt_opt else { continue };
-            let shard = self.l2p_page_rc.shard(s_idx);
-            match shard.build_meta_chain(ckpt) {
-                Ok((chain, chain_sealed, free_pids)) => {
-                    let added = chain_sealed.len();
-                    rc_chain_cache_inserts.extend(chain_sealed.iter().cloned());
-                    sealed_pages.extend(chain_sealed);
-                    total_pages_written += added;
-                    rc_to_free.extend(free_pids);
-                    l2p_page_rc_new_chains[s_idx] = Some(chain);
-                }
-                Err(err) => {
-                    self.metrics
-                        .record_flush_io(io_started.elapsed(), total_pages_written);
-                    self.metrics
-                        .record_flush_total(kind, flush_started.elapsed());
-                    self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-                    self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
                     self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                     return Err(err);
                 }
@@ -1182,7 +1068,6 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1197,7 +1082,6 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1212,7 +1096,6 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1232,12 +1115,6 @@ impl Db {
                 self.refcount_shards[s_idx].rc.mark_staged_durable(ckpt);
             }
         }
-        // Phase A2: same for the L2P-page-rc shards (no-op on empty).
-        for (s_idx, ckpt_opt) in l2p_page_rc_checkpoints.iter().enumerate() {
-            if let Some(ckpt) = ckpt_opt {
-                self.l2p_page_rc.shard(s_idx).mark_staged_durable(ckpt);
-            }
-        }
         // Dead-list segment pages are now durable on disk. The
         // manifest still references the OLD tails until the commit
         // below; if it fails we restore drained records to the
@@ -1252,7 +1129,6 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1358,7 +1234,6 @@ impl Db {
                     wal_checkpoint,
                 );
                 self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-                self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
                 self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                 return Err(err);
             }
@@ -1375,7 +1250,6 @@ impl Db {
             drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1396,7 +1270,6 @@ impl Db {
             drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1469,7 +1342,6 @@ impl Db {
             &mut manifest_state.manifest,
             &volumes,
             &self.refcount_shards,
-            &self.l2p_page_rc,
             &selected,
             wal_checkpoint,
         ) {
@@ -1481,7 +1353,6 @@ impl Db {
             drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1499,7 +1370,6 @@ impl Db {
             drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1513,7 +1383,6 @@ impl Db {
             drop(apply_guard);
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_prc_checkpoints_sparse(l2p_page_rc_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1592,14 +1461,6 @@ impl Db {
                         .fetch_max(wal_checkpoint, Ordering::Release);
                 }
             }
-            // Phase A2: L2P-page-rc shards advance in lock-step with
-            // refcount (same `selected.rc`), so their durable_seq joins
-            // the `min(durable_seq[]) == checkpoint_lsn` invariant.
-            for s_idx in 0..self.l2p_page_rc.shard_count() {
-                if selected.rc[s_idx] {
-                    self.l2p_page_rc.fetch_max_last_flushed(s_idx, wal_checkpoint);
-                }
-            }
         }
         {
             let mut unlogged = self.unlogged_pending_lsn.lock();
@@ -1607,17 +1468,33 @@ impl Db {
                 *unlogged = None;
             }
         }
+        // ZFS `dsl_sync_task` drain (post-commit): the manifest (with the new
+        // `SnapshotEntry`s) is durable now, so report success to the queued
+        // `take_snapshot` callers, warm the per-volume `SnapInfo` cache, and
+        // dequeue the tasks.
+        //
+        // ZFS port S3 — MUST run INSIDE the `apply_gate.write()` window (before
+        // the drop below), NOT after it. The COW-kill reads each volume's live
+        // snapshot watermarks from `snap_info_cache` (`snapshot_wms`), and S3
+        // deleted the page-rc force-incref + `effective_rc > 1` floor that used
+        // to pin a freshly-taken snapshot's root regardless of when the cache
+        // warmed. If this warm ran AFTER the gate dropped, a backlogged commit
+        // could acquire `apply_gate.read()` in the gap, COW the just-snapshotted
+        // volume's head against a COLD cache (`youngest_snap_below == None`),
+        // and recycle/retire the snapshot's still-referenced root → premature
+        // free / snapshot corruption. Warming under the gate makes every apply
+        // that runs after the drop observe the new snapshot. The warm takes only
+        // the `snap_info_cache` / `pending_sync_tasks` leaf mutexes (same
+        // `apply_gate -> snap_info_cache` order the read path uses — no
+        // inversion), and the woken `take_snapshot` caller does not re-acquire
+        // the gate.
+        self.finish_pending_snapshots(txg);
+
         // End of the narrow `apply_gate.write()` window. Everything
         // below this point (RC meta install, L2P checkpoint install
         // via apply lanes, reclaim, WAL prune) takes its own per-shard
         // locks and does not need the global gate.
         drop(apply_guard);
-
-        // ZFS `dsl_sync_task` drain (post-commit): the manifest (with the
-        // new `SnapshotEntry`s) is durable now, so report success to the
-        // queued `take_snapshot` callers, update the per-volume snap cache,
-        // and dequeue the tasks. Does not need `apply_gate` / `manifest_state`.
-        self.finish_pending_snapshots(txg);
 
         // Manifest is durable. Install refcount meta chains in memory
         // so subsequent `begin_checkpoint` sees the new chain when
@@ -1629,14 +1506,6 @@ impl Db {
         for (s_idx, chain_opt) in rc_new_chains.into_iter().enumerate() {
             if let Some(new_chain) = chain_opt {
                 self.refcount_shards[s_idx].rc.install_meta_chain(new_chain);
-            }
-        }
-        // Phase A2: install the L2P-page-rc meta chains (re-installs the
-        // same chain in A2 since `build_meta_chain` returned the existing
-        // one for the empty checkpoints — harmless).
-        for (s_idx, chain_opt) in l2p_page_rc_new_chains.into_iter().enumerate() {
-            if let Some(new_chain) = chain_opt {
-                self.l2p_page_rc.shard(s_idx).install_meta_chain(new_chain);
             }
         }
         // Trailing continuation pages from the old chains can be
@@ -1661,7 +1530,6 @@ impl Db {
         // Drop checkpoints to release the snapshot bookkeeping; abort
         // is no longer reachable for these.
         drop(refcount_checkpoints);
-        drop(l2p_page_rc_checkpoints);
 
         let install_started = std::time::Instant::now();
         let mut install_receivers = Vec::new();
@@ -1994,25 +1862,6 @@ impl Db {
         }
     }
 
-    /// A3 handoff (§6): page-rc analogue of
-    /// [`abort_rc_checkpoints_sparse`]. Once A3 stages real page-rc
-    /// deltas, the page-rc fold allocates fresh pages / seals data pages,
-    /// so every flush error site that aborts `refcount_checkpoints` must
-    /// also roll back `l2p_page_rc_checkpoints` (free fresh pages, restore
-    /// drained deltas). Indexes the page-rc shard group instead of the
-    /// PBA-refcount one; otherwise identical to the refcount version.
-    fn abort_prc_checkpoints_sparse(
-        &self,
-        checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>>,
-        free_lsn: Lsn,
-    ) {
-        for (s_idx, ckpt_opt) in checkpoints.into_iter().enumerate() {
-            if let Some(ckpt) = ckpt_opt {
-                self.l2p_page_rc.shard(s_idx).abort_checkpoint(ckpt, free_lsn);
-            }
-        }
-    }
-
     /// Project what `compute_min_last_flushed_lsn` will return after
     /// this round's atomic stores land — substitute `wal_checkpoint`
     /// for selected shards (which we're about to commit), keep the
@@ -2076,19 +1925,6 @@ impl Db {
             // shard durable to `wal_checkpoint` (and an unselected one stays
             // at `prev`), exactly like a non-buffered L2P shard — so
             // `candidate` already bounds rc correctly. See `refcount::shard`.
-        }
-        // Phase A2: L2P-page-rc shards, selected 1:1 with refcount via
-        // `selected.rc` — same `wal_checkpoint.max(prev)` projection.
-        for s_idx in 0..self.l2p_page_rc.shard_count() {
-            let prev = self.l2p_page_rc.last_flushed_lsn(s_idx);
-            let candidate = if selected.rc[s_idx] {
-                wal_checkpoint.max(prev)
-            } else {
-                prev
-            };
-            if candidate < min_lsn {
-                min_lsn = candidate;
-            }
         }
         if min_lsn == Lsn::MAX { 0 } else { min_lsn }
     }

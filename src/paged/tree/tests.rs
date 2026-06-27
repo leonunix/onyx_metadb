@@ -163,28 +163,6 @@ fn flush_and_reads_do_not_leave_private_clean_pages_resident() {
 }
 
 #[test]
-fn snapshot_incref_preserves_old_view_under_writes() {
-    let (_d, ps) = mk_store();
-    let mut t = PagedL2p::create(ps).unwrap();
-    t.insert(3, v(1)).unwrap();
-    t.insert(300, v(2)).unwrap(); // forces level 1+
-    t.flush().unwrap();
-
-    // "Take a snapshot" — bump root rc and remember the root id.
-    t.incref_root_for_snapshot(0, 1).unwrap();
-    let snap_root = t.root();
-
-    // Mutate the live tree.
-    t.insert(3, v(99)).unwrap();
-    t.insert(300, v(88)).unwrap();
-    assert_eq!(t.get(3).unwrap(), Some(v(99)));
-
-    // The snapshot root still sees the old values.
-    assert_eq!(t.get_at(snap_root, 3).unwrap(), Some(v(1)));
-    assert_eq!(t.get_at(snap_root, 300).unwrap(), Some(v(2)));
-}
-
-#[test]
 fn checkpoint_protected_private_pages_cow_before_mutation() {
     let (_d, ps) = mk_store();
     let mut t = PagedL2p::create(ps.clone()).unwrap();
@@ -291,13 +269,15 @@ fn range_stream_matches_range() {
 
 #[test]
 fn attach_subtree_root_adopts_foreign_root_for_reads() {
-    // Populate a source tree, snapshot its root (incref), then attach
-    // that root into a freshly-created empty tree. Reads via the
-    // attached tree must see the source's data.
+    // Populate a source tree, then attach its root into a freshly-created
+    // empty tree. Reads via the attached tree must see the source's data.
+    // (Per-L2P-page refcounting was deleted, so no root incref is needed for
+    // the share to survive — the shared root's pages are read from disk.)
     let (_d, ps) = mk_store();
     let mut src = PagedL2p::create_with_cache(
         ps.clone(),
         Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES)),
+        1,
     )
     .unwrap();
     for (i, k) in [1u64, 200, 4096].iter().enumerate() {
@@ -305,13 +285,12 @@ fn attach_subtree_root_adopts_foreign_root_for_reads() {
     }
     let src_root = src.root();
     let src_level = src.root_level();
-    // Bump the root's on-disk refcount so the clone share survives.
-    src.incref_root_for_snapshot(0, 1).unwrap();
     src.flush().unwrap();
 
     let mut dst = PagedL2p::create_with_cache(
         ps.clone(),
         Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES)),
+        1,
     )
     .unwrap();
     dst.attach_subtree_root(src_root, src_level).unwrap();
@@ -334,101 +313,6 @@ fn attach_subtree_root_rejects_invalid_level() {
     ));
 }
 
-/// Regression for the sibling-concurrent cross-tree race:
-/// A3: cross-tree page rc lives in the one shared `L2pPageRc` store
-/// (the Db injects it via `create_with_cache_rc`), NOT the page header.
-/// Two trees share a root page; a snapshot-incref on one must survive a
-/// cow_for_write on the other because both route through the same shared
-/// array. (Was `incref_root_for_snapshot_uses_disk_direct_rc`, which
-/// inspected the now-dead in-page header rc.)
-#[test]
-fn incref_root_for_snapshot_uses_shared_array_rc() {
-    let (_d, ps) = mk_store();
-    let page_cache = Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES));
-    let (page_rc, _roots) =
-        crate::l2p_page_rc::L2pPageRc::create(ps.clone(), page_cache.clone(), 1).unwrap();
-    let page_rc = Arc::new(page_rc);
-
-    // Build the source tree and take a "snapshot" by bumping its root rc.
-    // Fresh root → shared array rc 1, post-incref = 2.
-    let mut src =
-        PagedL2p::create_with_cache_rc(ps.clone(), page_cache.clone(), page_rc.clone(), 1).unwrap();
-    src.insert(1, v(10)).unwrap();
-    src.insert(300, v(20)).unwrap();
-    src.flush().unwrap();
-    let root_pid = src.root();
-    src.incref_root_for_snapshot(0, 1).unwrap();
-
-    assert_eq!(
-        page_rc.get(root_pid).unwrap(),
-        2,
-        "snapshot incref must reach the shared array"
-    );
-
-    // Dst attaches the same root page — a post-`clone_volume` sibling
-    // sharing the root + the shared page-rc store.
-    let mut dst =
-        PagedL2p::create_with_cache_rc(ps.clone(), page_cache.clone(), page_rc.clone(), 1).unwrap();
-    dst.attach_subtree_root(root_pid, src.root_level()).unwrap();
-    assert_eq!(dst.get(1).unwrap(), Some(v(10)));
-
-    // A write on dst triggers cow_for_write(root, lsn), staging
-    // pending_rc[root] -= 1 → the shared array rc must go 2 → 1, proving
-    // the incref and the cross-tree cow share one rc view.
-    dst.set_current_txg(0);
-    dst.insert_at_lsn(42, v(99), 100).unwrap();
-    assert_eq!(
-        page_rc.get(root_pid).unwrap(),
-        1,
-        "cross-tree cow must see the shared-array incref"
-    );
-
-    // Snapshot root still readable; its stored mapping is preserved.
-    assert_eq!(src.get_at(root_pid, 1).unwrap(), Some(v(10)));
-    assert_eq!(src.get_at(root_pid, 300).unwrap(), Some(v(20)));
-}
-
-#[test]
-fn same_lsn_parent_then_child_cow_does_not_skip_child_decref() {
-    let (_d, ps) = mk_store();
-    let page_cache = Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES));
-    let (page_rc, _roots) =
-        crate::l2p_page_rc::L2pPageRc::create(ps.clone(), page_cache.clone(), 1).unwrap();
-    let page_rc = Arc::new(page_rc);
-
-    let mut src =
-        PagedL2p::create_with_cache_rc(ps.clone(), page_cache.clone(), page_rc.clone(), 1).unwrap();
-    src.insert(1, v(1)).unwrap();
-    src.insert(300, v(2)).unwrap();
-    src.flush().unwrap();
-    let shared_root = src.root();
-    let root_level = src.root_level();
-    assert_eq!(root_level, 1);
-
-    let root_page = ps.read_page_unchecked(shared_root).unwrap();
-    let child_pid = crate::paged::format::index_child_at(&root_page, 0);
-    assert_ne!(child_pid, crate::types::NULL_PAGE);
-    assert_eq!(page_rc.get(child_pid).unwrap(), 1);
-
-    src.incref_root_for_snapshot(0, 1).unwrap();
-
-    let mut writer =
-        PagedL2p::create_with_cache_rc(ps.clone(), page_cache.clone(), page_rc.clone(), 1).unwrap();
-    writer.attach_subtree_root(shared_root, root_level).unwrap();
-    writer.set_current_txg(0);
-
-    writer
-        .insert_at_lsn(LEAF_ENTRY_COUNT as u64, v(10), 100)
-        .unwrap();
-    assert_eq!(page_rc.get(child_pid).unwrap(), 2);
-
-    writer.insert_at_lsn(2, v(20), 100).unwrap();
-    assert_eq!(
-        page_rc.get(child_pid).unwrap(),
-        1,
-        "same-LSN child COW must apply -1 after parent COW stamped the child"
-    );
-}
 
 // -------- warmup_index_pages ---------------------------------------
 
@@ -440,7 +324,7 @@ fn mk_tree_with_pin(pin_pages: u64) -> (TempDir, PagedL2p) {
         64 * PAGE_SIZE as u64,
         pin_pages * PAGE_SIZE as u64,
     ));
-    let tree = PagedL2p::create_with_cache(ps, cache).unwrap();
+    let tree = PagedL2p::create_with_cache(ps, cache, 1).unwrap();
     (dir, tree)
 }
 

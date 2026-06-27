@@ -52,45 +52,6 @@ fn ref_bound(b: &Bound<u64>) -> Bound<&u64> {
     }
 }
 
-/// Rich outcome returned by [`PagedL2p::insert_at_lsn_with_share_info`]
-/// and [`PagedL2p::delete_at_lsn_with_share_info`]. The onyx-adapter
-/// apply path (`WalOp::L2pRemap`, `LifecycleOp::Discard`) uses
-/// `leaf_was_shared` together with `prev` to decide whether to
-/// suppress the paired refcount decref (see SPEC §3.1 decision
-/// table): if the leaf that held the old mapping was shared with a
-/// live snapshot, the snapshot's tree still references `prev.pba` via
-/// the old leaf bytes, and decrementing `prev.pba`'s refcount here
-/// would double-free it later when the snapshot drops.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct InsertOutcome {
-    /// Previous mapping at the key, or `None` if the slot was unset.
-    pub prev: Option<L2pValue>,
-    /// `true` iff the leaf page that contained this key was shared
-    /// with another tree (snapshot / clone) at the moment this op
-    /// reached it — i.e. the pre-COW effective refcount was `> 1`.
-    ///
-    /// For a freshly-allocated leaf (no prior mapping existed at all)
-    /// the value is `false`, matching the "not shared" semantics of
-    /// an exclusive page.
-    pub leaf_was_shared: bool,
-}
-
-/// Delete-path analogue of [`InsertOutcome`]. Returned by
-/// [`PagedL2p::delete_at_lsn_with_share_info`]; consumed by the
-/// onyx-adapter `LifecycleOp::Discard` apply path. `prev` is `None`
-/// when the lba was unmapped — the apply path short-circuits in that
-/// case and treats the op as a no-op for refcount accounting.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct DeleteOutcome {
-    /// Previous mapping at the key, or `None` if the slot was unset
-    /// and this call was a no-op.
-    pub prev: Option<L2pValue>,
-    /// `true` iff the leaf page that contained this key was shared
-    /// with another tree in the pre-op state — same semantics as
-    /// [`InsertOutcome::leaf_was_shared`].
-    pub leaf_was_shared: bool,
-}
-
 /// One entry in the delta between two subtrees. Emitted by
 /// [`PagedL2p::diff_subtrees`] and surfaced via `Db::diff`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

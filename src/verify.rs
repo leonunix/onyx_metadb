@@ -103,15 +103,10 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
     };
 
     let mut free_pages = BTreeSet::new();
-    // A3 cutover: page rc lives in the `L2pPageRc` array, not the page
-    // header. The scan records which pids passed verify, and which are
-    // L2P pages (`PagedLeaf` / `PagedIndex`) — only those carry a page-rc
-    // array entry. Non-L2P live pages (refcount / page-rc / dedup meta
-    // chains, dead-list segments) had a trivial header rc of 1 under the
-    // old scheme and are NOT tracked by the array, so the rc comparison
-    // below skips them.
+    // ZFS port S3: per-L2P-page refcounting was DELETED, so verify no longer
+    // cross-checks an array rc. The scan just records which pids passed verify
+    // (used below to flag a live page that didn't survive the byte scan).
     let mut scanned_pids: HashSet<PageId> = HashSet::new();
-    let mut l2p_pids: HashSet<PageId> = HashSet::new();
     for pid in FIRST_DATA_PAGE..page_store.high_water() {
         report.scanned_pages += 1;
         let raw = match page_store.read_page_unchecked(pid) {
@@ -136,12 +131,6 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
                 if header.page_type == PageType::Free {
                     free_pages.insert(pid);
                 }
-                if matches!(
-                    header.page_type,
-                    PageType::PagedLeaf | PageType::PagedIndex
-                ) {
-                    l2p_pids.insert(pid);
-                }
                 scanned_pids.insert(pid);
             }
             Err(err) => report
@@ -151,27 +140,17 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
     }
     report.free_pages = free_pages.len();
 
-    // Open the L2P-page-rc array from the manifest roots so the
-    // parent-pointer counts can be checked against it (the old A4 step,
-    // folded into A3 — verify would otherwise misfire on the now-dead
-    // header rc field). Fold-consistent reads; the store is offline so
-    // there is no concurrent fold, but `get_consistent` is the correct
-    // "free decision"-grade read regardless.
-    let verify_page_cache = Arc::new(crate::cache::PageCache::new(
-        page_store.clone(),
-        16 * 1024 * 1024,
-    ));
-    let page_rc = crate::l2p_page_rc::L2pPageRc::open(
-        page_store.clone(),
-        verify_page_cache,
-        &manifest.manifest.l2p_page_rc_shard_roots,
-        &manifest.manifest.l2p_page_rc_durable_seq,
-    )?;
-
+    // ZFS port S3: per-L2P-page refcounting was DELETED, so there is no
+    // page-rc array to cross-check parent-pointer counts against. The
+    // structural reachability walk (`collect_live_pages`) still runs to flag
+    // live/free conflicts, live pages that didn't pass the scan, and orphans
+    // (pages reachable from no live root). The page-rc-INDEPENDENT shadows
+    // (`check_birth_shadow` / `check_page_deadlist_shadow` /
+    // `check_clone_livelist_shadow`) are the structural-soundness oracles now.
     match collect_live_pages(&page_store, &manifest) {
         Ok(live) => {
             report.live_pages = live.refs.len();
-            for (pid, expected) in &live.refs {
+            for (pid, _expected) in &live.refs {
                 if free_pages.contains(pid) {
                     report
                         .issues
@@ -182,22 +161,6 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
                         .issues
                         .push(format!("live page {pid} did not pass the page scan"));
                     continue;
-                }
-                // Only L2P pages carry a page-rc array entry; the
-                // refcount/page-rc/dedup meta chains + dead-list segments
-                // that `collect_live_pages` also marks are not refcounted
-                // there.
-                if !l2p_pids.contains(pid) {
-                    continue;
-                }
-                match page_rc.get_consistent(*pid) {
-                    Ok(actual) if actual == *expected => {}
-                    Ok(actual) => report.issues.push(format!(
-                        "page {pid} page-rc mismatch: array={actual}, expected={expected}"
-                    )),
-                    Err(err) => report
-                        .issues
-                        .push(format!("page {pid} page-rc read failed: {err}")),
                 }
             }
 
@@ -830,18 +793,8 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         // via its on_meta callback, matching walk_cuckoo / walk_dedup_reverse.
         walk_refcount_paged_array(page_store, meta_pid, &mut live, &mut seen_btree)?;
     }
-    // v17 (snapshot-scaling Phase A2): the L2P-page-rc shard group is a
-    // second `RcShard`/`PagedRefcountArray` group with the identical
-    // paged-array layout, so its meta chains + data pages walk through
-    // the same routine. Without this the orphan-reclaim-on-open pass
-    // would treat the page-rc meta pages as unreachable and free them,
-    // corrupting the store on the next reopen.
-    for &meta_pid in manifest.l2p_page_rc_shard_roots.iter() {
-        if meta_pid == NULL_PAGE {
-            continue;
-        }
-        walk_refcount_paged_array(page_store, meta_pid, &mut live, &mut seen_btree)?;
-    }
+    // ZFS port S3: the v17 L2P-page-rc shard group is deleted, so there are no
+    // page-rc meta chains to mark live here.
 
     for snapshot in &manifest.snapshots {
         let l2p_roots = snapshot_roots(

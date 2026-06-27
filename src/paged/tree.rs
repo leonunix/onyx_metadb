@@ -34,7 +34,7 @@ mod types;
 
 use helpers::*;
 use types::OwnedRange;
-pub use types::{DeleteOutcome, DiffEntry, InsertOutcome, PagedRangeIter, WarmupStats};
+pub use types::{DiffEntry, PagedRangeIter, WarmupStats};
 
 /// ZFS port Phase 4 Step 4 (S1): process-global count of non-clone COW-kill
 /// decisions where the birth-txg said "recycle" (page NOT snapshot-pinned) but
@@ -163,76 +163,37 @@ impl PagedL2p {
     }
 
     /// Fresh empty tree. Allocates one leaf as the root, level 0.
+    /// Standalone/test trees birth the root at lsn 1.
     pub fn create(page_store: Arc<PageStore>) -> Result<Self> {
         let page_cache = Arc::new(PageCache::new(page_store.clone(), DEFAULT_PAGE_CACHE_BYTES));
-        Self::create_with_cache(page_store, page_cache)
+        Self::create_with_cache(page_store, page_cache, 1)
     }
 
+    /// Create a fresh empty tree sharing an existing `PageCache`. Births
+    /// the empty root at `root_lsn` (the volume's `created_lsn`). Birthing
+    /// the page header at the volume's `created_lsn` keeps the "a
+    /// snapshot's created_lsn >= birth_lsn of every page it captures"
+    /// invariant the page-deadlist recording filter relies on
+    /// (`drain_page_deaths_into`: record a page death iff
+    /// `birth <= youngest_snapshot.created`). The bootstrap volume has
+    /// `created_lsn == 0`, so birthing its roots at lsn 1 would put them
+    /// above any snapshot taken before the first op (`created_lsn == 0`),
+    /// dropping the death record at the snapshot's drop. (Per-L2P-page
+    /// refcounting was deleted, ZFS port S3.)
     pub fn create_with_cache(
         page_store: Arc<PageStore>,
         page_cache: Arc<PageCache>,
-    ) -> Result<Self> {
-        let mut buf = PageBuf::with_cache(page_store, page_cache);
-        let root = buf.alloc_leaf(1)?;
-        buf.flush()?;
-        // A3: commit the root's +1 (staged by alloc_leaf into the op
-        // accumulator) into the private page-rc store. Standalone trees
-        // are not Db-verified, so a fixed `root_lsn = 1` (≤ any test op's
-        // lsn) is sufficient for the fold to apply it. The Db path uses
-        // `create_with_cache_rc`, which threads the volume's `created_lsn`.
-        buf.commit_rc_deltas_unskippable(1)?;
-        Ok(Self {
-            buf,
-            root,
-            root_level: 0,
-            next_gen: 2,
-            private_pages: PageIdSet::default(),
-            retired_pages: PageIdSet::default(),
-            checkpoint_protected: PageIdSet::default(),
-            cow_displaced: Vec::new(),
-            clone_birth_lsn: None,
-            live_events: Vec::new(),
-            snapshot_wms: Vec::new(),
-            clone_cow_pinners: Vec::new(),
-        })
-    }
-
-    /// Db-path create: share the one global `L2pPageRc` (page-rc routes
-    /// by global `PageId`, so every shard's tree must reach the same
-    /// store). Peer of [`create_with_cache`](Self::create_with_cache),
-    /// which builds a private store for standalone/test use.
-    pub fn create_with_cache_rc(
-        page_store: Arc<PageStore>,
-        page_cache: Arc<PageCache>,
-        page_rc: Arc<crate::l2p_page_rc::L2pPageRc>,
         root_lsn: Lsn,
     ) -> Result<Self> {
-        let mut buf = PageBuf::with_cache_rc(page_store, page_cache, page_rc);
-        // Birth the empty root at `root_lsn` (the volume's `created_lsn`),
-        // NOT a hardcoded 1. The page-rc +1 below already folds at
-        // `root_lsn`; birthing the page header at the same lsn keeps the
-        // "a snapshot's created_lsn >= birth_lsn of every page it captures"
-        // invariant the page-deadlist recording filter relies on
-        // (`drain_page_deaths_into`: record a page death iff
-        // `birth <= youngest_snapshot.created`). The bootstrap volume has
-        // `created_lsn == 0`, so the old `alloc_leaf(1)` birthed its roots
-        // at lsn 1 — above any snapshot taken before the first op
-        // (`created_lsn == 0`) — so a shared COW of such a root dropped the
-        // death record (`1 <= 0` is false) even though those created=0
-        // snapshots pin it, producing a page-deadlist completeness hole at
-        // their drop.
+        let mut buf = PageBuf::with_cache(page_store, page_cache);
         let root = buf.alloc_leaf(root_lsn)?;
         buf.flush()?;
-        // A3: commit the root's +1 to the shared page-rc array (see
-        // `create_with_cache`).
-        buf.commit_rc_deltas_unskippable(root_lsn)?;
         Ok(Self {
             buf,
             root,
             root_level: 0,
             // Keep the generation watermark strictly above the root's
-            // birth so later stamps stay monotonic (matches the old
-            // `birth 1 -> next_gen 2`).
+            // birth so later stamps stay monotonic.
             next_gen: root_lsn + 1,
             private_pages: PageIdSet::default(),
             retired_pages: PageIdSet::default(),
@@ -259,38 +220,6 @@ impl PagedL2p {
         next_gen: Lsn,
     ) -> Result<Self> {
         let mut buf = PageBuf::with_cache(page_store, page_cache);
-        let root_level = buf.read_level(root)?;
-        if root_level > MAX_INDEX_LEVEL {
-            return Err(MetaDbError::Corruption(format!(
-                "paged: root {root} has level {root_level} exceeding max {MAX_INDEX_LEVEL}"
-            )));
-        }
-        Ok(Self {
-            buf,
-            root,
-            root_level,
-            next_gen,
-            private_pages: PageIdSet::default(),
-            retired_pages: PageIdSet::default(),
-            checkpoint_protected: PageIdSet::default(),
-            cow_displaced: Vec::new(),
-            clone_birth_lsn: None,
-            live_events: Vec::new(),
-            snapshot_wms: Vec::new(),
-            clone_cow_pinners: Vec::new(),
-        })
-    }
-
-    /// Db-path open: share the one global `L2pPageRc`. Peer of
-    /// [`open_with_cache`](Self::open_with_cache) (private store).
-    pub fn open_with_cache_rc(
-        page_store: Arc<PageStore>,
-        page_cache: Arc<PageCache>,
-        page_rc: Arc<crate::l2p_page_rc::L2pPageRc>,
-        root: PageId,
-        next_gen: Lsn,
-    ) -> Result<Self> {
-        let mut buf = PageBuf::with_cache_rc(page_store, page_cache, page_rc);
         let root_level = buf.read_level(root)?;
         if root_level > MAX_INDEX_LEVEL {
             return Err(MetaDbError::Corruption(format!(
@@ -353,14 +282,10 @@ impl PagedL2p {
         }
     }
 
-    /// Set the current op's TXG, threaded down to `PageBuf` so the
-    /// page-rc array stages (COW `commit_rc_deltas`, snapshot/drop
-    /// incref/decref) land in the right TXG ring slot. Foreground apply
-    /// sets the commit txg; the sync-cycle buffer drain sets the sync
-    /// txg (A3 plan §0).
-    pub fn set_current_txg(&mut self, txg: crate::types::Txg) {
-        self.buf.set_current_txg(txg);
-    }
+    /// No-op retained for call-site stability. Per-L2P-page refcounting was
+    /// deleted (ZFS port S3), so the op's TXG no longer threads down to a
+    /// page-rc ring slot. The argument is ignored.
+    pub fn set_current_txg(&mut self, _txg: crate::types::Txg) {}
 
     /// Underlying page store handle (shared with `Db` for free-list
     /// inspection, etc.).
@@ -418,13 +343,21 @@ impl PagedL2p {
     }
 
     fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
-        let effective_rc = self.buf.effective_rc(pid)?;
         // Read the page's immutable `birth_lsn` ONCE, only when needed: clones
         // need it for the livelist FREE classification; non-clones with a live
-        // snapshot need it for the S1 birth COW-kill decision. A non-clone with
-        // no snapshot needs neither (its pages are never snapshot-pinned), so
-        // the hot path stays read-free there.
-        let need_birth = self.clone_birth_lsn.is_some() || !self.snapshot_wms.is_empty();
+        // snapshot need it for the S1 birth COW-kill decision; and a non-clone
+        // CLONE SOURCE (S3: `clone_cow_pinners` non-empty even with no own
+        // snapshot — see `clone_cow_pinners_from`) needs it so the clone-source
+        // pin compares the REAL birth, not 0. Omitting `clone_cow_pinners` here
+        // would read `birth = 0`, making `0 <= youngest_clone_pinner` ALWAYS
+        // true (over-COW every page) AND stamping `birth_lsn = 0` into the
+        // `cow_displaced` deadlist record → a later non-clone deadlist drop
+        // mis-classifies it (`dl_record_freed`) = premature free / completeness
+        // hole. A truly independent non-clone with no snapshots and no clones in
+        // the system keeps the read-free hot path (`clone_cow_pinners` empty).
+        let need_birth = self.clone_birth_lsn.is_some()
+            || !self.snapshot_wms.is_empty()
+            || !self.clone_cow_pinners.is_empty();
         let birth = if need_birth {
             self.buf.read(pid)?.birth_lsn()
         } else {
@@ -441,8 +374,8 @@ impl PagedL2p {
         // (it "dies off the head" and stays alive for a snapshot) — vs PRIVATE
         // to the live volume (recyclable in place).
         //   * CLONE (`clone_birth_lsn.is_some()`): S1c — page-rc-INDEPENDENT
-        //     pinner-LSN operand, `effective_rc > 1 OR birth <=
-        //     youngest_clone_pinner_below(lsn)`. The pinner set
+        //     pinner-LSN operand, `birth <= youngest_clone_pinner_below(lsn)`.
+        //     The pinner set
         //     (`clone_cow_pinners`, fed by `Db::clone_cow_pinners`) is
         //     `{B_C} ∪ {C's live snapshot capture_watermarks} ∪ {descendant
         //     branch points}` — the page-rc-independent completion of "P is
@@ -452,9 +385,9 @@ impl PagedL2p {
         //     ex-clone whose `parent_vol_ord` is cleared) still references after
         //     C's own snapshot is dropped — the G6 premature-free P0 a pure-birth
         //     `max(B_C, youngest_snap(C))` operand misses (`clone_birth_shadow`).
-        //     The `effective_rc > 1` floor stays (inverted shadow until S3): it
-        //     prevents an under-pin if the pinner cache lags, and S1c's term adds
-        //     the force-fold-P0 catch. Benign G8 over-COW: an origin page that
+        //     S3 dropped the legacy `effective_rc > 1` floor (page-rc deleted):
+        //     the pinner-set term is now the sole, authoritative clone operand.
+        //     Benign G8 over-COW: an origin page that
         //     became C-exclusive (`birth <= B_C`, rc==1) is preserved rather than
         //     recycled — correctness-safe, reclaimed by orphan-reclaim; the
         //     shadow does NOT flag this direction. NO drain perturbation: the
@@ -487,45 +420,50 @@ impl PagedL2p {
         //     would send it to the SHARED (preserve+deadlist) arm instead of
         //     RECYCLE, leaking an orphan the drop-time page-deadlist later tries
         //     to free (the premature-free the structural shadow rejects). page-rc
-        //     never hit this: a private page has `effective_rc == 1`.
-        // S1 COW-kill (non-clone): `effective_rc > 1 OR birth-pin`.
-        //   * `effective_rc > 1` is the page-rc FLOOR — the proven-safe legacy
-        //     gate. It pins any page page-rc still counts as shared, which
-        //     prevents an under-pin (premature free) when the birth operand is
-        //     momentarily incomplete: under concurrency the per-volume snapshot
-        //     `capture_watermark` cache (`snapshot_wms`) can LAG a just-created
-        //     snapshot, so `youngest_snap_below(lsn)` may miss a snapshot that
-        //     genuinely captured this page (`birth > all cached wms` yet
-        //     `rc == 2`). Keeping the rc floor makes that case preserve, not
-        //     free.
-        //   * `birth <= youngest_snap_below(lsn) && !private` is the ADDITIONAL
-        //     pin that catches the force-fold P0 the port exists to kill: when a
-        //     force-fold transiently floors a captured page's rc LOW (`rc <= 1`),
-        //     the rc floor misses it, but its birth predates a snapshot
-        //     (`birth <= some wm < lsn`) so birth pins it. `youngest_snap_below`
-        //     excludes snapshots captured AFTER the page died (`wm >= lsn`); the
-        //     `!private` gate excludes intra-batch transients (`rc == 1`,
-        //     uncommitted) so they recycle. (See `youngest_snap_below`.)
-        // Strictly >= the legacy `rc > 1` pinning, so it can never premature-free
-        // a page legacy preserved; the birth term only adds preservation.
+        //     never hit this: a private page had `effective_rc == 1`.
+        // S3 COW-kill (non-clone): the birth-pin `birth <= youngest_snap_below(lsn)
+        // && !private` is the SOLE operand — the legacy `effective_rc > 1` page-rc
+        // floor is DELETED. The birth term equals the old `rc > 1` pinning on
+        // every reachable state: a snapshot `S` captures page `P` iff
+        // `birth(P) <= capture_watermark(S)` (= max of S's captured root births,
+        // sampled under `tree.write()` after the take-snapshot quiesce), and the
+        // per-op `snapshot_wms` is fetched FRESH under `apply_gate`/`drop_gate`
+        // each op — warmed by `finish_pending_snapshots` before any op that could
+        // fold a death past S's watermark runs — so the cache cannot lag a
+        // snapshot able to pin a not-yet-folded death (the only under-pin the
+        // floor ever guarded). The `!private` gate above already excludes the
+        // intra-batch transients the old `rc == 1` exclusion covered. The
+        // page-rc-INDEPENDENT `check_birth_shadow` / `check_page_deadlist_shadow`
+        // oracles are the HARD tripwire now that the inverted shadow is gone.
         let snapshot_pinned = match self.clone_birth_lsn {
-            // S1c CLONE arm: rc floor (inverted shadow until S3) OR the
-            // page-rc-independent clone pinner-set term. `youngest_clone_pinner_below`
-            // reads `clone_cow_pinners` ({B_C} ∪ own-snaps ∪ descendant branches),
-            // NOT `snapshot_wms`.
-            Some(_) => {
-                effective_rc > 1
-                    || match self.youngest_clone_pinner_below(lsn) {
-                        None => false,
-                        Some(s) => birth <= s && !self.private_pages.contains(&pid),
-                    }
-            }
+            // S1c CLONE arm: the page-rc-independent clone pinner-set term.
+            // `youngest_clone_pinner_below` reads `clone_cow_pinners` ({B_C} ∪
+            // own-snaps ∪ descendant branches), NOT `snapshot_wms`. S3 dropped
+            // the legacy `effective_rc > 1` floor (page-rc is deleted): the
+            // pinner-set is now the sole, authoritative clone COW-kill operand.
+            Some(_) => match self.youngest_clone_pinner_below(lsn) {
+                None => false,
+                Some(s) => birth <= s && !self.private_pages.contains(&pid),
+            },
+            // NON-CLONE arm: birth-authoritative. S3 dropped the `effective_rc
+            // > 1` floor; the pin is `birth <= max(youngest_snap_below(lsn),
+            // youngest_clone_pinner_below(lsn)) && !private`. The clone term is
+            // the S3 replacement for the rc floor's clone-SOURCE coverage: a
+            // non-clone volume that shares L2P pages with a clone (of a possibly
+            // already-dropped snapshot) is fed every clone's branch point in
+            // `clone_cow_pinners` (see `clone_cow_pinners_from`), so an origin
+            // page born at/before a clone's branch is preserved, not recycled
+            // under it (repro_drop_free). Empty when no clones exist.
             None => {
-                effective_rc > 1
-                    || match self.youngest_snap_below(lsn) {
-                        None => false,
-                        Some(s) => birth <= s && !self.private_pages.contains(&pid),
-                    }
+                let pin = self
+                    .youngest_snap_below(lsn)
+                    .into_iter()
+                    .chain(self.youngest_clone_pinner_below(lsn))
+                    .max();
+                match pin {
+                    None => false,
+                    Some(s) => birth <= s && !self.private_pages.contains(&pid),
+                }
             }
         };
 
@@ -556,7 +494,7 @@ impl PagedL2p {
             }
             let already_touched_by_lsn = self.buf.read(pid)?.generation() >= lsn;
             if already_touched_by_lsn {
-                let new_pid = self.buf.cow_for_write(pid, lsn, false)?;
+                let new_pid = self.buf.cow_for_write(pid, lsn)?;
                 if new_pid != pid {
                     self.private_pages.remove(&pid);
                     self.private_pages.insert(new_pid);
@@ -582,13 +520,12 @@ impl PagedL2p {
         // leaves the old version alive for that snapshot — it "dies off the
         // head" here. Capture `(pid, birth, death=lsn)` BEFORE the COW consumes
         // the slot; the apply / fold layer drains it into the HEAD page-deadlist.
-        // FORCE the copy (`force_copy = true`): the birth decision is
-        // authoritative, so `PageBuf::cow_for_write` must NOT fall back to its
-        // own `effective_rc <= 1` early-return and clobber `pid` in place under a
-        // force-fold-transient low rc — that would premature-free a snapshot-
-        // pinned page AND (via `new_pid == pid`) silently drop the `cow_displaced`
-        // record, tripping a HARD `missing` at the next `drop_snapshot`.
-        let new_pid = self.buf.cow_for_write(pid, lsn, true)?;
+        // `PageBuf::cow_for_write` always copies now (per-L2P-page refcounting
+        // was deleted, ZFS port S3): the birth decision above is the sole,
+        // authoritative "shared" test, so the copy is unconditional — `new_pid`
+        // is always a fresh page (`new_pid != pid`), the `cow_displaced` record
+        // is always captured, and the old version is preserved for the snapshot.
+        let new_pid = self.buf.cow_for_write(pid, lsn)?;
         if new_pid != pid {
             self.private_pages.insert(new_pid);
             self.cow_displaced.push(crate::deadlist::DeadRecord {
@@ -1064,9 +1001,7 @@ impl PagedL2p {
         lsn: Lsn,
     ) -> Result<Option<L2pValue>> {
         self.advance_next_gen(lsn);
-        let result = self
-            .insert_with_lsn_inner(lba, value, lsn, false)
-            .map(|outcome| outcome.prev);
+        let result = self.insert_with_lsn_inner(lba, value, lsn);
         self.finalize_rc_deltas_deferred_finish(lsn, result)
     }
 
@@ -1131,42 +1066,9 @@ impl PagedL2p {
         self.finalize_rc_deltas_deferred_finish(lsn, result)
     }
 
-    /// Variant of [`insert_at_lsn`](Self::insert_at_lsn) that also
-    /// reports whether the leaf holding `lba` was shared with another
-    /// tree (snapshot / clone) at the moment this op descended to it.
-    ///
-    /// Used exclusively by the onyx adapter apply path for
-    /// `WalOp::L2pRemap`: the decref decision table in SPEC §3.1
-    /// ("leaf-rc-suppress") depends on this bit to avoid double-freeing
-    /// a PBA that the snapshot still references. The flag is captured
-    /// before the leaf's `cow_for_write` runs, so it reflects the
-    /// pre-op sharing state regardless of how the op's own COW cascade
-    /// reshapes the tree afterwards.
-    pub fn insert_at_lsn_with_share_info(
-        &mut self,
-        lba: u64,
-        value: L2pValue,
-        lsn: Lsn,
-    ) -> Result<InsertOutcome> {
-        self.advance_next_gen(lsn);
-        let result = self.insert_with_lsn_and_share(lba, value, lsn);
-        self.finalize_rc_deltas(lsn, result)
-    }
-
     fn insert_with_lsn(&mut self, lba: u64, value: L2pValue, lsn: Lsn) -> Result<Option<L2pValue>> {
-        let result = self
-            .insert_with_lsn_inner(lba, value, lsn, false)
-            .map(|outcome| outcome.prev);
+        let result = self.insert_with_lsn_inner(lba, value, lsn);
         self.finalize_rc_deltas(lsn, result)
-    }
-
-    fn insert_with_lsn_and_share(
-        &mut self,
-        lba: u64,
-        value: L2pValue,
-        lsn: Lsn,
-    ) -> Result<InsertOutcome> {
-        self.insert_with_lsn_inner(lba, value, lsn, true)
     }
 
     fn insert_with_lsn_inner(
@@ -1174,19 +1076,9 @@ impl PagedL2p {
         lba: u64,
         value: L2pValue,
         lsn: Lsn,
-        capture_share_info: bool,
-    ) -> Result<InsertOutcome> {
+    ) -> Result<Option<L2pValue>> {
         let leaf_idx = lba >> LEAF_SHIFT;
         let bit = (lba & LEAF_MASK) as usize;
-
-        // Root-is-leaf path: tree hasn't grown past level 0, so the
-        // leaf we're about to mutate IS the root. Capture its pre-COW
-        // effective rc here — the walk-down loop never reaches
-        // level==1 in this case, and by the time `grow_root` runs the
-        // leaf's refcount has already been bumped by the newly-
-        // allocated parent index.
-        let mut leaf_was_shared =
-            capture_share_info && self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
 
         // Grow root up to whatever level covers `leaf_idx`.
         while leaf_idx > max_leaf_idx_at_level(self.root_level) {
@@ -1201,27 +1093,12 @@ impl PagedL2p {
             let slot = slot_in_index(leaf_idx, level);
             let child = index_child_at(self.buf.read(current)?, slot);
             let new_child = if child == NULL_PAGE {
-                // Missing slot: fabricated leaf has no pre-op reference
-                // from any tree, so `leaf_was_shared` stays at whatever
-                // the root-is-leaf branch set (it's only true when the
-                // ORIGINAL root was a shared leaf, which cannot coexist
-                // with a missing slot in an index that didn't exist
-                // yet — this branch therefore leaves the flag at false).
                 if level == 1 {
                     self.alloc_leaf_private(lsn)?
                 } else {
                     self.alloc_index_private(lsn, level - 1)?
                 }
             } else {
-                if capture_share_info && level == 1 {
-                    // Capture the pre-COW effective rc so the caller
-                    // can distinguish "snapshot still references old
-                    // leaf via this page" from "op can safely mutate
-                    // in place". `cow_for_write` below may fold in
-                    // pending rc deltas and clone the page; we take
-                    // the decision before that mutation.
-                    leaf_was_shared = self.buf.effective_rc(child)? > 1;
-                }
                 self.cow_for_write(child, lsn)?
             };
             index_set_child(self.buf.modify(current, lsn)?, slot, new_child);
@@ -1235,10 +1112,7 @@ impl PagedL2p {
             ))
         })?;
         self.root = new_root;
-        Ok(InsertOutcome {
-            prev: old,
-            leaf_was_shared,
-        })
+        Ok(old)
     }
 
     /// Remove `lba`'s mapping. Returns the previous value, or `None` if
@@ -1274,32 +1148,8 @@ impl PagedL2p {
             return Ok(None);
         }
         self.advance_next_gen(lsn);
-        let result = self
-            .delete_with_lsn_inner_with_share(lba, lsn, false)
-            .map(|outcome| outcome.prev);
+        let result = self.delete_with_lsn_inner(lba, lsn, false);
         self.finalize_rc_deltas_deferred_finish(lsn, result)
-    }
-
-    /// Variant of [`delete_at_lsn`](Self::delete_at_lsn) that also
-    /// reports whether the leaf holding `lba` was shared with another
-    /// tree in the pre-op state. Used by `LifecycleOp::Discard`'s
-    /// apply path for the same leaf-rc-suppress decision
-    /// [`insert_at_lsn_with_share_info`](Self::insert_at_lsn_with_share_info)
-    /// serves on the write side (SPEC §4.4).
-    ///
-    /// Returns `DeleteOutcome { prev: None, leaf_was_shared: false }`
-    /// when `lba` is unmapped; the caller should treat that as a
-    /// no-op and not emit a refcount decref.
-    pub fn delete_at_lsn_with_share_info(&mut self, lba: u64, lsn: Lsn) -> Result<DeleteOutcome> {
-        if self.get(lba)?.is_none() {
-            return Ok(DeleteOutcome {
-                prev: None,
-                leaf_was_shared: false,
-            });
-        }
-        self.advance_next_gen(lsn);
-        let result = self.delete_with_lsn_inner_with_share(lba, lsn, false);
-        self.finalize_rc_deltas(lsn, result)
     }
 
     fn delete_with_lsn(
@@ -1308,27 +1158,18 @@ impl PagedL2p {
         lsn: Lsn,
         free_empty_pages: bool,
     ) -> Result<Option<L2pValue>> {
-        let result = self
-            .delete_with_lsn_inner_with_share(lba, lsn, free_empty_pages)
-            .map(|outcome| outcome.prev);
+        let result = self.delete_with_lsn_inner(lba, lsn, free_empty_pages);
         self.finalize_rc_deltas(lsn, result)
     }
 
-    fn delete_with_lsn_inner_with_share(
+    fn delete_with_lsn_inner(
         &mut self,
         lba: u64,
         lsn: Lsn,
         free_empty_pages: bool,
-    ) -> Result<DeleteOutcome> {
+    ) -> Result<Option<L2pValue>> {
         let leaf_idx = lba >> LEAF_SHIFT;
         let bit = (lba & LEAF_MASK) as usize;
-
-        // Root-is-leaf path: capture share-ness before any mutation
-        // advances the tree. Same rule as the insert side (see
-        // `insert_with_lsn_inner`): when `root_level == 0` the leaf
-        // about to be mutated IS the root, and the walk-down loop
-        // never reaches `level == 1`.
-        let mut leaf_was_shared = self.root_level == 0 && self.buf.effective_rc(self.root)? > 1;
 
         let new_root = self.cow_for_write(self.root, lsn)?;
         let mut current = new_root;
@@ -1342,11 +1183,6 @@ impl PagedL2p {
                 child != NULL_PAGE,
                 "paged::delete: pre-check said key exists but slot is null"
             );
-            if level == 1 {
-                // Pre-COW effective rc for the leaf — same capture
-                // point the insert path uses.
-                leaf_was_shared = self.buf.effective_rc(child)? > 1;
-            }
             let new_child = self.cow_for_write(child, lsn)?;
             index_set_child(self.buf.modify(current, lsn)?, slot, new_child);
             path.push((current, slot));
@@ -1390,33 +1226,26 @@ impl PagedL2p {
         }
 
         self.root = new_root;
-        Ok(DeleteOutcome {
-            prev: old,
-            leaf_was_shared,
-        })
+        Ok(old)
     }
 
-    /// Commit the op's batched rc deltas on success, or drop them on
-    /// error. `result` is returned as-is (after `finish_op` bookkeeping).
-    /// If commit itself fails the commit error wins over a successful
-    /// `result`; any queued deltas for a failing op are discarded so a
-    /// retry won't double-apply.
+    /// Finalize the op: on success, return `result` after `finish_op`
+    /// bookkeeping; on error, drop the COW-death / livelist witnesses so a
+    /// retry won't replay them. (Per-L2P-page refcount delta commit was
+    /// deleted, ZFS port S3 — `lsn` is now unused by the success arm but
+    /// kept for signature stability with the deferred variants.)
     fn finalize_rc_deltas<T>(&mut self, lsn: Lsn, result: Result<T>) -> Result<T> {
         let result = self.finalize_rc_deltas_deferred_finish(lsn, result);
         self.finish_op(result)
     }
 
-    fn finalize_rc_deltas_deferred_finish<T>(&mut self, lsn: Lsn, result: Result<T>) -> Result<T> {
+    fn finalize_rc_deltas_deferred_finish<T>(&mut self, _lsn: Lsn, result: Result<T>) -> Result<T> {
         match result {
-            Ok(v) => {
-                let commit = self.buf.commit_rc_deltas(lsn);
-                commit.map(|()| v)
-            }
+            Ok(v) => Ok(v),
             Err(e) => {
-                self.buf.clear_rc_deltas();
                 // The op aborted: its COW page-deaths never became durable,
-                // so drop the witness too (mirrors `clear_rc_deltas`). A
-                // successful op leaves it for the apply / fold layer.
+                // so drop the witness. A successful op leaves it for the
+                // apply / fold layer.
                 self.cow_displaced.clear();
                 // v19: same for the page-livelist witness — an aborted op's
                 // clone-private allocs/frees never landed.
@@ -1517,32 +1346,6 @@ impl PagedL2p {
 
     // -------- snapshot helpers ------------------------------------------
 
-    /// Bump the root's refcount so a caller (snapshot take) holds a
-    /// separate reference. Idempotent in the sense that every call adds
-    /// exactly one ref — pair it with a `decref` on snapshot drop.
-    ///
-    /// A3: routes through [`PageBuf::atomic_incref`] into the shared
-    /// [`L2pPageRc`](crate::l2p_page_rc::L2pPageRc) array (`lsn` =
-    /// snapshot `created_lsn`), so a sibling volume's concurrent
-    /// `cow_for_write` against the same root (post-`clone_volume`) reads
-    /// the same shared entry and can't drop the incref.
-    pub fn incref_root_for_snapshot(&mut self, txg: crate::types::Txg, lsn: Lsn) -> Result<()> {
-        self.buf.set_current_txg(txg);
-        self.buf.atomic_incref(self.root, lsn)?;
-        self.finish_op(Ok(()))
-    }
-
-    /// Decref `root` and cascade through any uniquely-owned subtree.
-    /// Used by snapshot drop to release a snapshot's grip on a tree.
-    /// A3: routes through [`PageBuf::atomic_decref`] (page-rc array,
-    /// fold-consistent free decisions) for the same cross-tree reason as
-    /// [`incref_root_for_snapshot`](Self::incref_root_for_snapshot).
-    pub fn decref_root(&mut self, root: PageId, txg: crate::types::Txg, lsn: Lsn) -> Result<()> {
-        self.buf.set_current_txg(txg);
-        self.buf.atomic_decref(root, lsn)?;
-        self.finish_op(Ok(()))
-    }
-
     /// Compute the diff between two subtrees. Onyx does not use this
     /// on the hot path — callers are snapshot diff tools — so the
     /// implementation is a simple "collect both subtrees, merge sorted
@@ -1555,72 +1358,10 @@ impl PagedL2p {
         self.finish_op(Ok(out))
     }
 
-    /// Release a subtree held by a snapshot, returning every leaf value
-    /// that was freed in the process. Matches `BTree::drop_subtree`'s
-    /// semantics so `Db::drop_snapshot` can use either tree type
-    /// interchangeably.
-    ///
-    /// The walk visits each page once, decrements rc by 1, and for
-    /// pages that hit rc=0 collects leaf values (or recurses into index
-    /// children). Pages still shared after the decrement are left alone.
-    ///
-    /// Rc mutations route through the shared `L2pPageRc` array (A3
-    /// cutover), so a sibling volume's concurrent `cow_for_write` against a
-    /// shared page can't race. Leaves `page.generation` untouched — this
-    /// path is not WAL-replayed.
-    pub fn drop_subtree(
-        &mut self,
-        snap_root: PageId,
-        txg: crate::types::Txg,
-        lsn: Lsn,
-    ) -> Result<Vec<L2pValue>> {
-        use crate::page::PageType;
-        use crate::paged::cache::DecrefOutcome;
-        self.buf.set_current_txg(txg);
-        let mut collected: Vec<L2pValue> = Vec::new();
-        let mut worklist: Vec<PageId> = vec![snap_root];
-        while let Some(pid) = worklist.pop() {
-            // If this page is a leaf that will be freed, we need its
-            // values *before* the atomic RMW clears the page from our
-            // cache. Index pages contribute no values; children come
-            // back from `atomic_decref_one` when rc hits 0.
-            let pending_values: Vec<L2pValue> = {
-                let page = self.buf.read(pid)?;
-                let header = page.header()?;
-                match header.page_type {
-                    PageType::PagedLeaf => {
-                        let mut values = Vec::new();
-                        for i in 0..LEAF_ENTRY_COUNT {
-                            if leaf_bit_set(page, i)
-                                && let Some(value) = leaf_value_at(page, i)?
-                            {
-                                values.push(value);
-                            }
-                        }
-                        values
-                    }
-                    PageType::PagedIndex => Vec::new(),
-                    other => {
-                        return Err(MetaDbError::Corruption(format!(
-                            "paged::drop_subtree: unexpected page type {other:?} at {pid}"
-                        )));
-                    }
-                }
-            };
-            let (outcome, children) = self.buf.atomic_decref_one(pid, lsn)?;
-            if matches!(outcome, DecrefOutcome::Freed) {
-                collected.extend(pending_values);
-                worklist.extend(children);
-            }
-        }
-        self.finish_op(Ok(collected))
-    }
-
     /// Build an rc-dependent drop plan rooted at `snap_root`. The walk
-    /// mirrors [`drop_subtree`](Self::drop_subtree)'s cascading
-    /// decrement: the root always contributes, and a page's children
-    /// contribute only if the page's refcount would hit 0 after the
-    /// (hypothetical) decrement. No mutations happen — this is a
+    /// cascades: the root always contributes, and a page's children
+    /// contribute only if the page's structural refcount would hit 0 after
+    /// the (hypothetical) decrement. No mutations happen — this is a
     /// read-only simulation.
     ///
     /// Returns the ordered list of pages to decrement. Safe under
@@ -1630,30 +1371,47 @@ impl PagedL2p {
     /// cascade decisions here. `Db::drop_snapshot` takes
     /// `drop_gate.write()` for exactly that reason.
     ///
-    /// `NULL_PAGE` input returns an empty vec (empty shard).
-    pub fn collect_drop_pages(&mut self, snap_root: PageId) -> Result<Vec<PageId>> {
+    /// `NULL_PAGE` input returns an empty vec (empty shard). `structural_rc`
+    /// is the live-global-graph in-edge map (see
+    /// [`collect_drop_pages_with_birth`](Self::collect_drop_pages_with_birth)).
+    pub fn collect_drop_pages(
+        &mut self,
+        snap_root: PageId,
+        structural_rc: &std::collections::BTreeMap<PageId, u32>,
+    ) -> Result<Vec<PageId>> {
         Ok(self
-            .collect_drop_pages_with_birth(snap_root)?
+            .collect_drop_pages_with_birth(snap_root, structural_rc)?
             .into_iter()
             .map(|(pid, _, _)| pid)
             .collect())
     }
 
     /// `collect_drop_pages`, but also returning each visited page's immutable
-    /// `birth_lsn` and its fold-consistent page-rc at plan time. The birth
-    /// rides the page read the cascade already performs (no extra IO); the rc
-    /// lets the caller recover the *freed* subset — pages with `rc == 1` whose
-    /// `-1` decref reaches zero are freed by `apply_drop_*_pages`, while
-    /// `rc > 1` entries are the decref-only shared boundary (a page still
-    /// pinned by another root, decremented but kept). ZFS port Phase 3a: the
-    /// clone-drop livelist shadow (`Db::check_clone_livelist_shadow`) consumes
-    /// this to compare the page-rc free-set against an independent
-    /// C-exclusive reachability walk; the birth is carried as the
-    /// origin-vs-clone-private partition key for diagnostics and the Phase 3b
-    /// livelist substrate.
+    /// `birth_lsn` and its STRUCTURAL refcount at plan time. The birth rides
+    /// the page read the cascade already performs (no extra IO); the rc lets
+    /// the caller recover the *freed* subset — pages with `rc == 1` whose `-1`
+    /// decref reaches zero are freed by `apply_drop_*_pages`, while `rc > 1`
+    /// entries are the decref-only shared boundary (a page still pinned by
+    /// another root, decremented but kept).
+    ///
+    /// ZFS port S3: per-L2P-page refcounting was DELETED, so the rc no longer
+    /// comes from a page-rc array. The caller supplies `structural_rc` — the
+    /// number of parent edges pointing at each page in the live global L2P
+    /// graph (every surviving volume head + every snapshot root, plus this
+    /// dying volume's roots), computed once by
+    /// [`collect_paged_refcounts_for_roots`](crate::db::apply::collect_paged_refcounts_for_roots).
+    /// Because each COW tree is a tree (one parent per page within a single
+    /// root), a page's combined in-edge count is exactly the number of live
+    /// roots whose tree routes through it — i.e. the old global page-rc for
+    /// every page reachable from a live root. `structural_rc == 1` therefore
+    /// equals "reachable from this volume only" (C-exclusive), so the
+    /// `rc == 1` cascade gating and the
+    /// [`Db::check_clone_livelist_shadow`](crate::db) `structural_free` LHS
+    /// stay identical to the page-rc era.
     pub fn collect_drop_pages_with_birth(
         &mut self,
         snap_root: PageId,
+        structural_rc: &std::collections::BTreeMap<PageId, u32>,
     ) -> Result<Vec<(PageId, Lsn, u32)>> {
         use crate::page::PageType;
         if snap_root == NULL_PAGE {
@@ -1662,12 +1420,17 @@ impl PagedL2p {
         let mut out: Vec<(PageId, Lsn, u32)> = Vec::new();
         let mut worklist: Vec<PageId> = vec![snap_root];
         while let Some(pid) = worklist.pop() {
-            // A3 cutover: rc comes from the page-rc array (fold-consistent
-            // — this drop-plan simulation's cascade decisions gate the
-            // page frees `apply_drop_*_pages` will perform). The page read
-            // supplies the type + children for the cascade walk and the
-            // immutable birth_lsn for the livelist shadow partition.
-            let rc = self.buf.page_rc().get_consistent(pid)?;
+            // Structural in-edge count over the live global graph supplied by
+            // the caller; a page reachable from this dying volume is always
+            // present (the map was built over a root-set that includes this
+            // volume's roots). The page read supplies the type + children for
+            // the cascade walk and the immutable birth_lsn for the livelist
+            // shadow partition.
+            let rc = structural_rc.get(&pid).copied().ok_or_else(|| {
+                MetaDbError::Corruption(format!(
+                    "paged::collect_drop_pages: page {pid} missing from the structural refcount map"
+                ))
+            })?;
             let (page_type, birth, children) = {
                 let page = self.buf.read(pid)?;
                 let header = page.header()?;
@@ -1689,7 +1452,7 @@ impl PagedL2p {
             }
             out.push((pid, birth, rc));
             // Only recurse into children if the decrement would free
-            // this page — matches `drop_subtree`'s cascade.
+            // this page — matches the old page-rc cascade.
             if rc == 1 && matches!(page_type, PageType::PagedIndex) {
                 worklist.extend(children);
             }

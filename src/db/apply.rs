@@ -13,8 +13,8 @@ pub(super) use l2p::{
 };
 pub(super) use promotion::{apply_promotion_chunk, apply_promotion_complete};
 pub(super) use volume::{
-    apply_clone_volume_incref, apply_create_volume, apply_drop_snapshot_pages_and_decrefs,
-    apply_drop_volume, build_clone_volume_shards, collect_paged_refcounts_for_roots,
+    apply_create_volume, apply_drop_snapshot_pages_and_decrefs, apply_drop_volume,
+    build_clone_volume_shards, collect_paged_refcounts_for_roots,
 };
 
 /// Must be invoked **before** the caller drops the tree write guard:
