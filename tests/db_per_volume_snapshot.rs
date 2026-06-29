@@ -133,65 +133,42 @@ fn drop_volume_while_snapshot_exists_is_refused() {
     assert_eq!(db.volumes(), vec![0, ord]);
 }
 
-/// Reproducer for the soak failure at cycle 2801 (20260422T145020Z):
-/// `take_snapshot` incref'd + flushed shard root refcounts before
-/// `store.commit(&manifest)` ran, so when the manifest encode failed
-/// the capacity check the refcount bumps stayed on disk as orphans.
-/// Offline verify then reported every L2P shard root as
-/// `header=N+1, expected=N`.
+/// v23 retired the single-page snapshot-table capacity wall: the snapshot table
+/// chains out-of-line, so `take_snapshot` no longer fails on count. This test
+/// drives the bootstrap volume far past the old ~30-snapshot manifest cap and
+/// confirms (a) every take succeeds, (b) they survive reopen, and (c) offline
+/// verify stays clean (no orphan refcount bumps — the original soak-2801 bug
+/// the now-deleted capacity-failure path used to guard against).
 ///
-/// To trigger the capacity-check failure deterministically we dial
-/// `shards_per_partition` up to a value that leaves only a handful of
-/// snapshot rows in the manifest payload. v11+ added per-shard
-/// durable_seq (8 B per shard, doubling per-shard overhead from 8 →
-/// 16 B), and v17 (snapshot-scaling L2P-page-rc schema) added the `l2p_page_rc`
-/// shard group's roots + durable_seq (another 16 B per shard at the
-/// manifest top level), so per-shard manifest overhead is now ~48 B
-/// (16 refcount + 16 page-rc + 16 bootstrap-volume). 100 shards no
-/// longer fits even the bootstrap volume + shard arrays; 60 shards
-/// under the v17 layout leaves room for ~30 snapshots — still well
-/// under the test's `taken <= 64` guard, and well above `taken >= 1`.
+/// 60 shards keeps the per-volume catalog entry large, so the snapshot chain
+/// genuinely spans several pages.
 #[test]
-fn take_snapshot_capacity_failure_does_not_leak_refcount() {
+fn many_snapshots_exceed_old_single_page_cap_and_verify_clean() {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
     cfg.shards_per_partition = 60;
     cfg.direct_io = false;
     let db = Db::create_with_config(cfg).unwrap();
 
-    // Take snapshots on the bootstrap volume (ord 0) until the cap is hit.
-    let mut taken = 0usize;
-    let err = loop {
-        match db.take_snapshot(0) {
-            Ok(_) => {
-                taken += 1;
-                assert!(taken <= 64, "snapshot cap should trigger well before 64");
-            }
-            Err(e) => break e,
-        }
-    };
-    assert!(
-        taken >= 1,
-        "should have taken at least one snapshot before hitting cap"
-    );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("snapshot count") && msg.contains("exceeds capacity"),
-        "expected capacity-exceeded error, got {msg:?}"
-    );
+    // Far beyond the old single-page cap (~30 at 60 shards).
+    let target = 200usize;
+    for _ in 0..target {
+        db.take_snapshot(0).expect("snapshot count is no longer capped");
+    }
+    db.flush().unwrap();
+    assert_eq!(db.snapshots_for(0).len(), target);
 
-    // Drop the db so verify_path can open the store cleanly.
+    // Survive reopen.
+    drop(db);
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(db.snapshots_for(0).len(), target);
     drop(db);
 
     let report = verify_path(dir.path(), VerifyOptions::default()).unwrap();
-    let rc_issues: Vec<&String> = report
-        .issues
-        .iter()
-        .filter(|i| i.contains("refcount mismatch"))
-        .collect();
     assert!(
-        rc_issues.is_empty(),
-        "take_snapshot failed after flush — orphan refcount bumps on disk: {rc_issues:#?}"
+        report.is_clean(),
+        "verify issues after many snapshots: {:?}",
+        report.issues
     );
 }
 

@@ -1356,8 +1356,8 @@ impl Db {
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
-        let manifest = manifest_state.manifest.clone();
-        if let Err(err) = manifest_state.store.commit(&manifest) {
+        let mut manifest = manifest_state.manifest.clone();
+        if let Err(err) = manifest_state.store.commit(&mut manifest) {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
             self.metrics

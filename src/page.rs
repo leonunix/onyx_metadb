@@ -140,6 +140,12 @@ pub enum PageType {
     /// [`DeadListSegment`] but a distinct magic ("LIVS") + an ALLOC/FREE
     /// kind byte per record. Layout owned by [`crate::livelist`].
     LiveListSegment = 14,
+    /// Page in a manifest catalog chain: the COW byte-stream chain that holds
+    /// the volume catalog or the snapshot table out-of-line so neither is
+    /// capped by the single manifest page. Layout (16 B chain header +
+    /// catalog bytes) owned by [`crate::manifest::catalog`]; the chain kind
+    /// (volumes vs snapshots) is recorded in `key_count`.
+    ManifestCatalog = 15,
 }
 
 impl PageType {
@@ -160,6 +166,7 @@ impl PageType {
             12 => Self::CuckooData,
             13 => Self::DeadListSegment,
             14 => Self::LiveListSegment,
+            15 => Self::ManifestCatalog,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }

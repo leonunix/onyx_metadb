@@ -9,10 +9,15 @@
 
 use std::sync::Arc;
 
+use onyx_metadb::cache::PageCache;
 use onyx_metadb::manifest::{Manifest, ManifestStore};
 use onyx_metadb::page_store::PageStore;
 use onyx_metadb::testing::faults::FaultController;
 use tempfile::TempDir;
+
+fn cache(ps: &Arc<PageStore>) -> Arc<PageCache> {
+    Arc::new(PageCache::new(ps.clone(), 8 * 1024 * 1024))
+}
 
 #[test]
 fn manifest_survives_page_store_reopen() {
@@ -23,18 +28,18 @@ fn manifest_survives_page_store_reopen() {
     {
         let ps = Arc::new(PageStore::create(&pages).unwrap());
         let faults = FaultController::new();
-        let (mut mstore, _) = ManifestStore::open_or_create(ps, faults).unwrap();
+        let (mut mstore, _) = ManifestStore::open_or_create(ps.clone(), cache(&ps), faults).unwrap();
         for lsn in [42u64, 77, 123] {
             let mut m = Manifest::empty();
             m.checkpoint_lsn = lsn;
-            mstore.commit(&m).unwrap();
+            mstore.commit(&mut m).unwrap();
         }
     }
 
     // Reopen and verify the freshest manifest is loaded.
     let ps = Arc::new(PageStore::open(&pages).unwrap());
     let faults = FaultController::new();
-    let (mstore, manifest) = ManifestStore::open_or_create(ps, faults).unwrap();
+    let (mstore, manifest) = ManifestStore::open_or_create(ps.clone(), cache(&ps), faults).unwrap();
     assert_eq!(manifest.checkpoint_lsn, 123);
     // We wrote 4 times total (1 fresh + 3 commits), so sequence=4.
     assert_eq!(mstore.sequence(), 4);

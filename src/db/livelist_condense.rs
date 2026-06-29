@@ -239,7 +239,7 @@ fn condense_one(
     // 4. Commit the re-anchored manifest. A missing entry means drop_volume
     //    raced and removed the clone (it leaves the tail atomic untouched, so
     //    the cur_tail check above passes) — a CLEAN abort, never corruption.
-    let manifest_for_commit = {
+    let mut manifest_for_commit = {
         let mut mstate = inner.manifest_state.lock();
         let entry = match mstate.manifest.volumes.iter_mut().find(|v| v.ord == vol_ord) {
             Some(entry) => entry,
@@ -256,7 +256,7 @@ fn condense_one(
     };
     {
         let mut mstate = inner.manifest_state.lock();
-        mstate.store.commit(&manifest_for_commit)?;
+        mstate.store.commit(&mut manifest_for_commit)?;
     }
 
     // 5. Manifest durable — promote the in-memory anchors so the next flush

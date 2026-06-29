@@ -40,7 +40,7 @@ impl Db {
         let metrics = Arc::new(MetaMetrics::new());
         page_store.attach_metrics(metrics.clone());
         let (mut manifest_store, mut manifest) =
-            ManifestStore::open_or_create(page_store.clone(), faults.clone())?;
+            ManifestStore::open_or_create(page_store.clone(), page_cache.clone(), faults.clone())?;
         let (l2p_shards, l2p_roots) = create_l2p_shards(
             page_store.clone(),
             page_cache.clone(),
@@ -105,7 +105,7 @@ impl Db {
             promoted_log_tail_pid: crate::types::NULL_PAGE,
         }];
         manifest.next_volume_ord = BOOTSTRAP_VOLUME_ORD + 1;
-        manifest_store.commit(&manifest)?;
+        manifest_store.commit(&mut manifest)?;
 
         let lsn_alloc = LsnAllocator::new(manifest.checkpoint_lsn + 1);
 
@@ -320,7 +320,7 @@ impl Db {
         let metrics = Arc::new(MetaMetrics::new());
         page_store.attach_metrics(metrics.clone());
         let (mut manifest_store, mut manifest) =
-            ManifestStore::open_existing(page_store.clone(), faults.clone())?;
+            ManifestStore::open_existing(page_store.clone(), page_cache.clone(), faults.clone())?;
         if manifest.volumes.is_empty() {
             return Err(MetaDbError::Corruption(
                 "manifest has no volume entries; database was not initialized".into(),
@@ -565,7 +565,7 @@ impl Db {
             // generation guards) but would also synthesise fresh LSNs
             // that overlap with later WAL traffic.
             manifest.lifecycle_replay_seq = lifecycle_max_seq;
-            manifest_store.commit(&manifest)?;
+            manifest_store.commit(&mut manifest)?;
             commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
             commit_refcount_checkpoint(&refcount_shards, last_applied.max(1) + 1)?;
 

@@ -561,7 +561,7 @@ fn advance_head_pid_durable(
     };
 
     // Mutate the manifest copy, commit, then promote atomics.
-    let manifest_for_commit = {
+    let mut manifest_for_commit = {
         let mut mstate = ctx.manifest_state.lock();
         let entry = mstate
             .manifest
@@ -591,7 +591,7 @@ fn advance_head_pid_durable(
 
     {
         let mut mstate = ctx.manifest_state.lock();
-        mstate.store.commit(&manifest_for_commit)?;
+        mstate.store.commit(&mut manifest_for_commit)?;
     }
 
     // Manifest commit is durable. Promote atomics so subsequent

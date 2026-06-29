@@ -731,6 +731,16 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
     let mut seen_paged: HashSet<PageId> = HashSet::new();
     let mut seen_btree: HashSet<PageId> = HashSet::new();
 
+    // v23: the volume catalog + snapshot table live in per-slot chains anchored
+    // in each manifest slot's body (not inline in the manifest page anymore).
+    // BOTH slots' chains are live (double-buffer), so mark every chain page of
+    // both generations — otherwise the non-winning slot's chain is mis-flagged
+    // as orphaned and `reclaim_orphan_pages` (run on open) frees it out from
+    // under that generation. Pure anchor pages, unreachable via any tree walk.
+    for pid in crate::manifest::catalog_chain_pids_all_slots(page_store) {
+        live.mark(pid);
+    }
+
     for volume in &manifest.volumes {
         for &root in volume.l2p_shard_roots.iter() {
             if root == NULL_PAGE {

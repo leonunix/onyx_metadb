@@ -1,4 +1,5 @@
 use super::*;
+use crate::cache::PageCache;
 use crate::config::PAGE_SIZE;
 use crate::page_store::PageStore;
 use crate::testing::faults::FaultAction;
@@ -10,6 +11,46 @@ fn mk_store(dir: &TempDir) -> Arc<PageStore> {
 
 fn reopen(dir: &TempDir) -> Arc<PageStore> {
     Arc::new(PageStore::open(dir.path().join("pages.onyx_meta")).unwrap())
+}
+
+fn mk_cache(ps: &Arc<PageStore>) -> Arc<PageCache> {
+    Arc::new(PageCache::new(ps.clone(), 8 * 1024 * 1024))
+}
+
+/// v23 `ManifestStore::open_or_create` needs a [`PageCache`] (to invalidate
+/// displaced catalog chain pages). The tests don't exercise the cache, so a
+/// small one is fine — this wrapper keeps the call sites terse. The function
+/// is referenced as a value (not called inline) so the `open_or_create(` →
+/// `open_oc(` call-site rewrite doesn't recurse into this body.
+fn open_oc(
+    ps: Arc<PageStore>,
+    faults: Arc<FaultController>,
+) -> Result<(ManifestStore, Manifest)> {
+    let cache = mk_cache(&ps);
+    let open = ManifestStore::open_or_create;
+    open(ps, cache, faults)
+}
+
+/// Full v23 round-trip: commit `m` to a fresh store (which COWs the volume +
+/// snapshot catalog chains and fills `m`'s chain-head anchors), reopen, and
+/// return the decoded manifest. Asserts it equals the committed `m` — head
+/// anchors included, since the reload reads exactly what commit wrote.
+fn roundtrip(dir: &TempDir, ps: Arc<PageStore>, m: Manifest) -> Manifest {
+    let (mut store, _) = open_oc(ps.clone(), FaultController::new()).unwrap();
+    let mut committed = m;
+    store.commit(&mut committed).unwrap();
+    drop(store);
+    let (_, loaded) = open_oc(reopen(dir), FaultController::new()).unwrap();
+    assert_eq!(loaded, committed);
+    loaded
+}
+
+/// Normalise the dynamically-allocated catalog chain-head anchors so a manifest
+/// can be compared against the static [`Manifest::empty`].
+fn without_catalog_heads(mut m: Manifest) -> Manifest {
+    m.volume_catalog_head_pid = NULL_PAGE;
+    m.snapshot_catalog_head_pid = NULL_PAGE;
+    m
 }
 
 fn bx(v: &[PageId]) -> Box<[PageId]> {
@@ -73,8 +114,8 @@ fn fresh_open_creates_empty_manifest_at_sequence_1() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let faults = FaultController::new();
-    let (store, manifest) = ManifestStore::open_or_create(ps, faults).unwrap();
-    assert_eq!(manifest, Manifest::empty());
+    let (store, manifest) = open_oc(ps, faults).unwrap();
+    assert_eq!(without_catalog_heads(manifest), Manifest::empty());
     assert_eq!(store.sequence(), 1);
     assert_eq!(store.next_slot(), MANIFEST_PAGE_B);
 }
@@ -84,14 +125,16 @@ fn commit_then_reopen_recovers_manifest() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let faults = FaultController::new();
-    let (mut store, _) = ManifestStore::open_or_create(ps.clone(), faults).unwrap();
+    let (mut store, _) = open_oc(ps.clone(), faults).unwrap();
 
-    let m = Manifest {
+    let mut m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 1234,
         checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
         free_list_head: 99,
         refcount_shard_roots: bx(&[17, 18, 19, 20]),
         refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
@@ -102,11 +145,11 @@ fn commit_then_reopen_recovers_manifest() {
         snapshots: vec![snap(&ps, 1, 0, &[11, 12, 13, 14], 100)],
         volumes: vec![boot_vol_at(4, &[7, 8, 9, 10], 1234)],
     };
-    store.commit(&m).unwrap();
+    store.commit(&mut m).unwrap();
     drop(store);
 
     let ps2 = reopen(&dir);
-    let (store2, loaded) = ManifestStore::open_or_create(ps2, FaultController::new()).unwrap();
+    let (store2, loaded) = open_oc(ps2, FaultController::new()).unwrap();
     assert_eq!(loaded, m);
     assert_eq!(store2.sequence(), 2);
 }
@@ -116,15 +159,15 @@ fn commits_alternate_slots() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let faults = FaultController::new();
-    let (mut store, _) = ManifestStore::open_or_create(ps, faults).unwrap();
-    let m = Manifest::empty();
+    let (mut store, _) = open_oc(ps, faults).unwrap();
+    let mut m = Manifest::empty();
     for expected_next in [
         MANIFEST_PAGE_A,
         MANIFEST_PAGE_B,
         MANIFEST_PAGE_A,
         MANIFEST_PAGE_B,
     ] {
-        store.commit(&m).unwrap();
+        store.commit(&mut m).unwrap();
         assert_eq!(store.next_slot(), expected_next);
     }
     assert_eq!(store.sequence(), 5);
@@ -134,16 +177,16 @@ fn commits_alternate_slots() {
 fn higher_sequence_wins_on_open() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
-    let (mut store, _) = ManifestStore::open_or_create(ps, FaultController::new()).unwrap();
+    let (mut store, _) = open_oc(ps, FaultController::new()).unwrap();
 
     for lsn in [1u64, 2, 3, 4, 5] {
         let mut m = Manifest::empty();
         m.checkpoint_lsn = lsn;
-        store.commit(&m).unwrap();
+        store.commit(&mut m).unwrap();
     }
     drop(store);
 
-    let (_, loaded) = ManifestStore::open_or_create(reopen(&dir), FaultController::new()).unwrap();
+    let (_, loaded) = open_oc(reopen(&dir), FaultController::new()).unwrap();
     assert_eq!(loaded.checkpoint_lsn, 5);
 }
 
@@ -154,10 +197,10 @@ fn corrupt_slot_a_falls_back_to_slot_b() {
     let ps = mk_store(&dir);
 
     let faults = FaultController::new();
-    let (mut store, _) = ManifestStore::open_or_create(ps, faults).unwrap();
+    let (mut store, _) = open_oc(ps, faults).unwrap();
     let mut target = Manifest::empty();
     target.checkpoint_lsn = 777;
-    store.commit(&target).unwrap();
+    store.commit(&mut target).unwrap();
     drop(store);
 
     {
@@ -172,8 +215,8 @@ fn corrupt_slot_a_falls_back_to_slot_b() {
     }
 
     let (store2, loaded) =
-        ManifestStore::open_or_create(reopen(&dir), FaultController::new()).unwrap();
-    assert_eq!(loaded, Manifest::empty());
+        open_oc(reopen(&dir), FaultController::new()).unwrap();
+    assert_eq!(without_catalog_heads(loaded), Manifest::empty());
     assert_eq!(store2.sequence(), 1);
     assert_eq!(store2.next_slot(), MANIFEST_PAGE_B);
 }
@@ -184,7 +227,7 @@ fn both_slots_corrupt_rewrites_fresh_empty() {
     let page_path = dir.path().join("pages.onyx_meta");
     {
         let ps = mk_store(&dir);
-        let (_, _) = ManifestStore::open_or_create(ps, FaultController::new()).unwrap();
+        let (_, _) = open_oc(ps, FaultController::new()).unwrap();
     }
     {
         use std::os::unix::fs::FileExt;
@@ -196,8 +239,8 @@ fn both_slots_corrupt_rewrites_fresh_empty() {
         f.sync_all().unwrap();
     }
     let (store, manifest) =
-        ManifestStore::open_or_create(reopen(&dir), FaultController::new()).unwrap();
-    assert_eq!(manifest, Manifest::empty());
+        open_oc(reopen(&dir), FaultController::new()).unwrap();
+    assert_eq!(without_catalog_heads(manifest), Manifest::empty());
     assert_eq!(store.sequence(), 1);
 }
 
@@ -206,14 +249,14 @@ fn fsync_before_error_does_not_advance_state() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let faults = FaultController::new();
-    let (mut store, _) = ManifestStore::open_or_create(ps, faults.clone()).unwrap();
+    let (mut store, _) = open_oc(ps, faults.clone()).unwrap();
     let start_seq = store.sequence();
     let start_slot = store.next_slot();
 
     faults.install(FaultPoint::ManifestFsyncBefore, 1, FaultAction::Error);
     let mut m = Manifest::empty();
     m.checkpoint_lsn = 42;
-    assert!(store.commit(&m).is_err());
+    assert!(store.commit(&mut m).is_err());
     assert_eq!(store.sequence(), start_seq);
     assert_eq!(store.next_slot(), start_slot);
 }
@@ -223,15 +266,15 @@ fn fsync_after_error_durably_wrote_but_callers_sees_err() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let faults = FaultController::new();
-    let (mut store, _) = ManifestStore::open_or_create(ps, faults.clone()).unwrap();
+    let (mut store, _) = open_oc(ps, faults.clone()).unwrap();
 
     faults.install(FaultPoint::ManifestFsyncAfter, 1, FaultAction::Error);
     let mut m = Manifest::empty();
     m.checkpoint_lsn = 42;
-    assert!(store.commit(&m).is_err());
+    assert!(store.commit(&mut m).is_err());
     drop(store);
 
-    let (_, loaded) = ManifestStore::open_or_create(reopen(&dir), FaultController::new()).unwrap();
+    let (_, loaded) = open_oc(reopen(&dir), FaultController::new()).unwrap();
     assert_eq!(loaded, m);
 }
 
@@ -259,6 +302,8 @@ fn encode_decode_round_trip_with_refcount_and_dedup() {
         checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
         free_list_head: 1234,
         refcount_shard_roots: bx(&[142, 143, 144, 145]),
         refcount_durable_seq: bx(&[
@@ -277,28 +322,29 @@ fn encode_decode_round_trip_with_refcount_and_dedup() {
         ],
         volumes: vec![boot_vol_at(4, &[42, 43, 44, 45], 0xDEAD_BEEF_CAFE)],
     };
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 7));
-    m.encode(&mut page).unwrap();
-    page.seal();
-    page.verify(MANIFEST_PAGE_A).unwrap();
-    let decoded = Manifest::decode(&page, &ps).unwrap();
-    assert_eq!(decoded, m);
+    roundtrip(&dir, ps, m);
 }
 
 #[test]
-fn encode_rejects_oversized_snapshot_table() {
+fn snapshot_table_spans_chain_pages() {
+    // v23: the snapshot table chains out-of-line, so a count that would have
+    // overflowed the single manifest page (the old capacity wall) now
+    // round-trips. 500 × 48 B ≈ 24 KB → ~6 snapshot chain pages.
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let mut m = Manifest::empty();
     m.refcount_shard_roots = bx(&[1, 2, 3, 4]);
     m.refcount_durable_seq = bx(&[0, 0, 0, 0]);
-    let cap = max_snapshots_for_shards(m.shard_count());
-    assert!(cap > 0);
-    for i in 0..(cap + 1) as u64 {
-        m.snapshots.push(snap(&ps, i, 0, &[10, 11, 12, 13], i));
+    m.volumes = vec![boot_vol(4, &[10, 11, 12, 13])];
+    let count = 500u64;
+    m.next_snapshot_id = count + 1;
+    for i in 0..count {
+        m.snapshots.push(snap(&ps, i + 1, 0, &[10, 11, 12, 13], i + 1));
     }
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    assert!(m.encode(&mut page).is_err());
+    let decoded = roundtrip(&dir, ps, m);
+    assert_eq!(decoded.snapshots.len() as u64, count);
+    assert_eq!(decoded.snapshots[0].id, 1);
+    assert_eq!(decoded.snapshots[(count - 1) as usize].id, count);
 }
 
 #[test]
@@ -351,6 +397,8 @@ fn v6_volumes_table_round_trip() {
         checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[50, 51]),
         refcount_durable_seq: bx(&[10, 10]),
@@ -382,39 +430,30 @@ fn v6_volumes_table_round_trip() {
             },
         ],
     };
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    m.encode(&mut page).unwrap();
-    page.seal();
-    let decoded = Manifest::decode(&page, &ps).unwrap();
-    assert_eq!(decoded, m);
+    roundtrip(&dir, ps, m);
 }
 
 #[test]
-fn v6_rejects_volume_count_exceeding_capacity() {
-    // Cram the volume table with entries until encode has to
-    // complain. Uses tiny volumes (shard_count = 1) so the failure
-    // comes from the snapshot-table capacity check, not from an
-    // inline-volume-entry budget mismatch.
+fn volume_catalog_spans_chain_pages() {
+    // v23: the volume catalog chains out-of-line, so cramming many volumes no
+    // longer overflows the manifest page (the old wall capped this at ~10-30).
+    // 200 single-shard volumes (~108 B each) span several chain pages.
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let mut m = Manifest::empty();
     m.refcount_shard_roots = bx(&[1]);
     m.refcount_durable_seq = bx(&[0]);
-    // Start with just the bootstrap — this sets the baseline volume budget.
-    m.volumes.push(boot_vol(1, &[10]));
-    let baseline_budget: usize = m
-        .volumes
-        .iter()
-        .map(|v| volume_entry_inline_size(v.shard_count as usize))
-        .sum();
-    // The current cuckoo/paged-reverse layout stores one dedup meta-head
-    // group per index, independent of dedup_shards/apply-lane count.
-    let cap = max_snapshots_for_layout(m.shard_count(), 1, 0, baseline_budget);
-    for i in 0..(cap + 1) as u64 {
-        m.snapshots.push(snap(&ps, i, 0, &[10], i));
+    let count = 200u16;
+    for ord in 0..count {
+        let mut v = boot_vol(1, &[10]);
+        v.ord = ord;
+        m.volumes.push(v);
     }
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    assert!(m.encode(&mut page).is_err());
+    m.next_volume_ord = count;
+    let decoded = roundtrip(&dir, ps, m);
+    assert_eq!(decoded.volumes.len(), count as usize);
+    assert_eq!(decoded.volumes[0].ord, 0);
+    assert_eq!(decoded.volumes[(count - 1) as usize].ord, count - 1);
 }
 
 #[test]
@@ -429,6 +468,8 @@ fn dedup_n4_encode_decode_round_trip() {
         checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
         refcount_durable_seq: bx(&[100, 100]),
@@ -439,11 +480,7 @@ fn dedup_n4_encode_decode_round_trip() {
         snapshots: Vec::new(),
         volumes: vec![boot_vol_at(2, &[100, 101], 100)],
     };
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    m.encode(&mut page).unwrap();
-    page.seal();
-    let decoded = Manifest::decode(&page, &ps).unwrap();
-    assert_eq!(decoded, m);
+    roundtrip(&dir, ps, m);
 }
 
 #[test]
@@ -455,8 +492,7 @@ fn dedup_encode_rejects_non_power_of_two_shards() {
     m.refcount_durable_seq = bx(&[0, 0]);
     m.volumes = vec![boot_vol(2, &[100, 101])];
     m.dedup_shards = 3;
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    let err = m.encode(&mut page).unwrap_err();
+    let err = m.check_encodable().unwrap_err();
     match err {
         MetaDbError::InvalidArgument(msg) => {
             assert!(msg.contains("power of two"), "{msg}");
@@ -477,8 +513,7 @@ fn dedup_encode_rejects_meta_head_outer_length_mismatch() {
     // Cuckoo uses one meta-head group regardless of
     // dedup_shards/apply-lane count.
     m.dedup_index_shard_heads = vec![bx(&[]); 2].into_boxed_slice();
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    let err = m.encode(&mut page).unwrap_err();
+    let err = m.check_encodable().unwrap_err();
     match err {
         MetaDbError::InvalidArgument(msg) => {
             assert!(msg.contains("dedup meta-head outer length"), "{msg}");
@@ -711,6 +746,8 @@ fn v11_per_shard_durable_seq_round_trip() {
         checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 11, 12, 13]),
         refcount_durable_seq: bx(&[5, 7, 6, 9]),
@@ -739,11 +776,7 @@ fn v11_per_shard_durable_seq_round_trip() {
             promoted_log_tail_pid: NULL_PAGE,
         }],
     };
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    m.encode(&mut page).unwrap();
-    page.seal();
-    let decoded = Manifest::decode(&page, &ps).unwrap();
-    assert_eq!(decoded, m);
+    let decoded = roundtrip(&dir, ps, m);
     assert_eq!(decoded.refcount_durable_seq.as_ref(), &[5, 7, 6, 9]);
     assert_eq!(
         decoded.volumes[0].l2p_shard_durable_seq.as_ref(),
@@ -765,6 +798,8 @@ fn encode_rejects_durable_seq_drift_from_checkpoint_lsn() {
         checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
         // Intentionally lower than checkpoint_lsn — drift the
@@ -779,8 +814,7 @@ fn encode_rejects_durable_seq_drift_from_checkpoint_lsn() {
         snapshots: Vec::new(),
         volumes: vec![boot_vol_at(2, &[3, 4], 42)],
     };
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    let err = m.encode(&mut page).unwrap_err();
+    let err = m.check_encodable().unwrap_err();
     match err {
         MetaDbError::Corruption(msg) => {
             assert!(msg.contains("durable_seq invariant broken"), "{msg}");
@@ -802,6 +836,8 @@ fn encode_rejects_refcount_durable_seq_length_mismatch() {
         checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2, 3]),
         refcount_durable_seq: bx(&[0, 0]), // wrong length
@@ -813,8 +849,7 @@ fn encode_rejects_refcount_durable_seq_length_mismatch() {
         snapshots: Vec::new(),
         volumes: vec![boot_vol(2, &[10, 11])],
     };
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    let err = m.encode(&mut page).unwrap_err();
+    let err = m.check_encodable().unwrap_err();
     match err {
         MetaDbError::Corruption(msg) => {
             assert!(msg.contains("refcount_durable_seq length"), "{msg}");
@@ -896,6 +931,8 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
         checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2, 3]),
         refcount_durable_seq: bx(&[]),
@@ -1072,6 +1109,8 @@ fn v15_round_trip_carries_checkpoint_bfg() {
         checkpoint_bfg: 42,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 20, 30, 40]),
         refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
@@ -1082,13 +1121,9 @@ fn v15_round_trip_carries_checkpoint_bfg() {
         snapshots: Vec::new(),
         volumes: vec![boot_vol_at(4, &[1, 2, 3, 4], 1234)],
     };
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    m.encode(&mut page).unwrap();
-    page.seal();
-    let decoded = Manifest::decode(&page, &ps).unwrap();
+    let decoded = roundtrip(&dir, ps, m);
     assert_eq!(decoded.checkpoint_bfg, 42);
     assert_eq!(decoded.checkpoint_lsn, 1234);
-    assert_eq!(decoded, m);
 }
 
 #[test]
@@ -1103,6 +1138,8 @@ fn v15_checkpoint_bfg_zero_round_trips() {
         checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[NULL_PAGE; 4]),
         refcount_durable_seq: bx(&[0; 4]),
@@ -1113,12 +1150,8 @@ fn v15_checkpoint_bfg_zero_round_trips() {
         snapshots: Vec::new(),
         volumes: vec![boot_vol_at(4, &[NULL_PAGE; 4], 0)],
     };
-    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
-    m.encode(&mut page).unwrap();
-    page.seal();
-    let decoded = Manifest::decode(&page, &ps).unwrap();
+    let decoded = roundtrip(&dir, ps, m);
     assert_eq!(decoded.checkpoint_bfg, 0);
-    assert_eq!(decoded, m);
 }
 
 // ── BFG (v22): l2p_page_rc shard group DELETED ──────────────
@@ -1145,4 +1178,187 @@ fn v21_manifest_is_rejected_after_flag_day_to_v22() {
         }
         e => panic!("expected Corruption from v21 manifest, got {e}"),
     }
+}
+
+// ── v23: catalog chained out-of-line ────────────────────────
+
+/// The immediate prior on-disk version (v22, both tables inlined) is flag-day
+/// rejected by the v23 decoder.
+#[test]
+fn v22_manifest_is_rejected_after_flag_day_to_v23() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
+    {
+        let p = page.payload_mut();
+        p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].copy_from_slice(&22u32.to_le_bytes());
+    }
+    page.seal();
+    match Manifest::decode(&page, &ps).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(
+                msg.contains("unsupported manifest body version") && msg.contains("v23"),
+                "expected v22-rejection message mentioning v23, got: {msg}"
+            );
+        }
+        e => panic!("expected Corruption from v22 manifest, got {e}"),
+    }
+}
+
+/// The load-bearing crash-safety invariant: every commit COWs both chains to
+/// fresh pids and frees ONLY the chain the target slot previously held (the
+/// 2-generation-old chain). So the PREVIOUS generation's catalog stays intact,
+/// and a corrupt newest slot falls back to a fully-readable older generation.
+#[test]
+fn two_generation_fallback_survives_newest_slot_corruption() {
+    let dir = TempDir::new().unwrap();
+    let page_path = dir.path().join("pages.onyx_meta");
+    let ps = mk_store(&dir);
+    let (mut store, _) = open_oc(ps, FaultController::new()).unwrap();
+
+    let mut gen_a = Manifest::empty();
+    gen_a.checkpoint_lsn = 100;
+    gen_a.refcount_shard_roots = bx(&[1]);
+    gen_a.refcount_durable_seq = bx(&[100]);
+    gen_a.volumes = vec![{
+        let mut v = boot_vol_at(1, &[10], 100);
+        v.ord = 5;
+        v
+    }];
+    store.commit(&mut gen_a).unwrap(); // seq 2, slot B
+
+    let mut gen_b = gen_a.clone();
+    gen_b.checkpoint_lsn = 200;
+    gen_b.refcount_durable_seq = bx(&[200]);
+    gen_b.volumes = vec![{
+        let mut v = boot_vol_at(1, &[11], 200);
+        v.ord = 9;
+        v
+    }];
+    store.commit(&mut gen_b).unwrap(); // seq 3, slot A (newest)
+    drop(store);
+
+    // Corrupt the newest slot (A = page 0).
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&page_path)
+            .unwrap();
+        let off = MANIFEST_PAGE_A * PAGE_SIZE as u64 + 500;
+        f.write_all_at(&[0xFF], off).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // Newest slot (gen B) fails CRC → fall back to gen A, whose catalog chain
+    // was never freed and decodes cleanly.
+    let (_, loaded) = open_oc(reopen(&dir), FaultController::new()).unwrap();
+    assert_eq!(loaded.checkpoint_lsn, 100);
+    assert_eq!(loaded.volumes.len(), 1);
+    assert_eq!(loaded.volumes[0].ord, 5);
+}
+
+/// Per-slot chains are reused in place; only a SHRINK frees the trailing
+/// continuation pages a slot no longer needs.
+#[test]
+fn catalog_shrink_frees_trailing_pages() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let (mut store, _) = open_oc(ps.clone(), FaultController::new()).unwrap();
+
+    let big = |lsn: Lsn| {
+        let mut m = Manifest::empty();
+        m.checkpoint_lsn = lsn;
+        m.refcount_shard_roots = bx(&[1]);
+        m.refcount_durable_seq = bx(&[lsn]);
+        for ord in 0..200u16 {
+            let mut v = boot_vol_at(1, &[10], lsn);
+            v.ord = ord;
+            m.volumes.push(v);
+        }
+        m.next_volume_ord = 200;
+        m
+    };
+    let small = |lsn: Lsn| {
+        let mut m = Manifest::empty();
+        m.checkpoint_lsn = lsn;
+        m.refcount_shard_roots = bx(&[1]);
+        m.refcount_durable_seq = bx(&[lsn]);
+        m.volumes = vec![boot_vol_at(1, &[10], lsn)];
+        m.next_volume_ord = 1;
+        m
+    };
+
+    // Grow BOTH slots' chains to several pages.
+    let mut a = big(10);
+    store.commit(&mut a).unwrap();
+    let mut b = big(20);
+    store.commit(&mut b).unwrap();
+
+    // Shrink BOTH slots back to one volume; trailing chain pages are freed.
+    let before = ps.deferred_free_len();
+    let mut c = small(30);
+    store.commit(&mut c).unwrap();
+    let mut d = small(40);
+    store.commit(&mut d).unwrap();
+    let after = ps.deferred_free_len();
+
+    assert!(
+        after > before,
+        "shrinking the catalog should free trailing chain pages: before={before}, after={after}"
+    );
+}
+
+/// A 300-volume catalog (multiple chain pages) round-trips, and a subsequent
+/// shrink to a single volume on the same file still reopens cleanly.
+#[test]
+fn catalog_chain_grows_then_shrinks() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+
+    let mut big = Manifest::empty();
+    big.refcount_shard_roots = bx(&[1]);
+    big.refcount_durable_seq = bx(&[0]);
+    for ord in 0..300u16 {
+        let mut v = boot_vol(1, &[10]);
+        v.ord = ord;
+        big.volumes.push(v);
+    }
+    big.next_volume_ord = 300;
+    let loaded = roundtrip(&dir, ps, big);
+    assert_eq!(loaded.volumes.len(), 300);
+
+    let (mut store, _) = open_oc(reopen(&dir), FaultController::new()).unwrap();
+    let mut small = Manifest::empty();
+    small.refcount_shard_roots = bx(&[1]);
+    small.refcount_durable_seq = bx(&[0]);
+    small.volumes = vec![boot_vol(1, &[10])];
+    store.commit(&mut small).unwrap();
+    drop(store);
+
+    let (_, reloaded) = open_oc(reopen(&dir), FaultController::new()).unwrap();
+    assert_eq!(reloaded.volumes.len(), 1);
+}
+
+/// A non-empty catalog is durable BEFORE the manifest slot, so an error at the
+/// fsync-after-manifest fault still reopens to the committed generation.
+#[test]
+fn fsync_after_error_with_catalog_reopens_to_committed() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let faults = FaultController::new();
+    let (mut store, _) = open_oc(ps, faults.clone()).unwrap();
+
+    let mut m = Manifest::empty();
+    m.checkpoint_lsn = 55;
+    m.refcount_shard_roots = bx(&[1]);
+    m.refcount_durable_seq = bx(&[55]);
+    m.volumes = vec![boot_vol_at(1, &[10], 55)];
+
+    faults.install(FaultPoint::ManifestFsyncAfter, 1, FaultAction::Error);
+    assert!(store.commit(&mut m).is_err());
+    drop(store);
+
+    let (_, loaded) = open_oc(reopen(&dir), FaultController::new()).unwrap();
+    assert_eq!(loaded, m);
 }

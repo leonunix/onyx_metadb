@@ -498,8 +498,8 @@ impl Db {
             // correctly excluded and replayed on the next open. Held under
             // `apply_gate.write`. See `stamp_replay_watermarks`.
             self.stamp_replay_watermarks(&mut mstate.manifest);
-            let manifest = mstate.manifest.clone();
-            mstate.store.commit(&manifest)?;
+            let mut manifest = mstate.manifest.clone();
+            mstate.store.commit(&mut manifest)?;
             dedup_update
         };
         commit_l2p_checkpoint(&mut l2p_guards, dedup_generation)?;

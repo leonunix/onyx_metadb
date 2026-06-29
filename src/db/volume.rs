@@ -671,8 +671,8 @@ impl Db {
             // `apply_gate.write`. See `stamp_replay_watermarks` (its doc names
             // this exact PromotionChunk hazard).
             self.stamp_replay_watermarks(&mut mstate.manifest);
-            let manifest = mstate.manifest.clone();
-            mstate.store.commit(&manifest)?;
+            let mut manifest = mstate.manifest.clone();
+            mstate.store.commit(&mut manifest)?;
             dedup_update
         };
         commit_l2p_checkpoint(&mut l2p_guards, dedup_generation)?;

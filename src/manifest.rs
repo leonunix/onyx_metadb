@@ -158,7 +158,23 @@ use crate::types::{
 /// onyx rebuilds metadb on schema change). page-rc free decisions were
 /// replaced by page-rc-independent deadlist / livelist / reachability data, so
 /// nothing reads the deleted store.
-pub const MANIFEST_BODY_VERSION: u32 = 22;
+///
+/// v23: moves the volume catalog and the snapshot table OUT of the single
+/// manifest page into two independent COW byte-stream chains
+/// ([`crate::manifest::catalog`]). The manifest page no longer inlines either
+/// table; instead the fixed header carries two new `PageId` anchors at offsets
+/// 76 and 84 — `volume_catalog_head_pid` and `snapshot_catalog_head_pid` —
+/// and the variable region keeps only refcount roots + per-shard durable_seq +
+/// dedup heads. `OFF_VARIABLE_START` shifts 76 → 92. This removes the
+/// single-page `{volumes + snapshots}` capacity wall (which capped a database
+/// at ~10-30 volumes, making `config.max_volumes` unreachable): both tables are
+/// now O(pages). Each commit COWs both chains to fresh pids and frees the
+/// displaced 2-generation-old chain after the new manifest slot is durable, so
+/// the double-buffered slot fallback is preserved (see
+/// [`crate::manifest::store::ManifestStore::commit`]). Old v22-and-earlier
+/// manifests are hard-rejected on open — no on-disk migration (fresh rebuild;
+/// onyx rebuilds metadb on schema change).
+pub const MANIFEST_BODY_VERSION: u32 = 23;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -197,7 +213,15 @@ const OFF_CHECKPOINT_BFG: usize = 52;
 // See `MANIFEST_BODY_VERSION` doc comment for the contract.
 const OFF_LAST_PROCESSED_BUFFER_SEQ: usize = 60;
 const OFF_LIFECYCLE_REPLAY_SEQ: usize = 68;
-const OFF_VARIABLE_START: usize = 76;
+// v23 inserts the two catalog-chain head pids into the fixed header:
+//   offset 76: `volume_catalog_head_pid`   (head of the volume-catalog chain)
+//   offset 84: `snapshot_catalog_head_pid` (head of the snapshot-table chain)
+// Both are real allocated pids (a chain always has >= 1 page); the variable
+// region — refcount roots + durable_seq + dedup heads, no inline volumes /
+// snapshots — now starts at 92.
+const OFF_VOLUME_CATALOG_HEAD: usize = 76;
+const OFF_SNAPSHOT_CATALOG_HEAD: usize = 84;
+const OFF_VARIABLE_START: usize = 92;
 
 /// Per-snapshot row size on disk. v6 packs: id(8) + vol_ord(2) + 6 pad +
 /// l2p_roots_page(8) + created_lsn(8). v18 (BFG) appends
@@ -222,7 +246,9 @@ const _: () = {
     assert!(OFF_VOLUME_COUNT + 4 == OFF_CHECKPOINT_BFG);
     assert!(OFF_CHECKPOINT_BFG + 8 == OFF_LAST_PROCESSED_BUFFER_SEQ);
     assert!(OFF_LAST_PROCESSED_BUFFER_SEQ + 8 == OFF_LIFECYCLE_REPLAY_SEQ);
-    assert!(OFF_LIFECYCLE_REPLAY_SEQ + 8 == OFF_VARIABLE_START);
+    assert!(OFF_LIFECYCLE_REPLAY_SEQ + 8 == OFF_VOLUME_CATALOG_HEAD);
+    assert!(OFF_VOLUME_CATALOG_HEAD + 8 == OFF_SNAPSHOT_CATALOG_HEAD);
+    assert!(OFF_SNAPSHOT_CATALOG_HEAD + 8 == OFF_VARIABLE_START);
     assert!(SNAPSHOT_ENTRY_SIZE == 48);
     assert!(OFF_SNAP_PAGE_DEADLIST_TAIL + 8 == OFF_SNAP_CAPTURE_WATERMARK);
     assert!(OFF_SNAP_CAPTURE_WATERMARK + 8 == SNAPSHOT_ENTRY_SIZE);
@@ -289,6 +315,27 @@ pub fn max_snapshots_for_layout(
     (PAGE_PAYLOAD_SIZE - used) / SNAPSHOT_ENTRY_SIZE
 }
 
+/// Bytes the v23 manifest variable region occupies: refcount roots +
+/// per-shard durable_seq + dedup head groups (+ their level pids). Volumes and
+/// snapshots are NOT here in v23 — they chain out-of-line — so this is the full
+/// in-page footprint after the fixed header. Saturating so an absurd shard
+/// count surfaces as "exceeds payload" rather than wrapping.
+fn variable_region_bytes(
+    refcount_shard_count: usize,
+    dedup_head_group_count: usize,
+    total_dedup_level_count: usize,
+) -> usize {
+    let refcount = refcount_shard_count
+        .saturating_mul(size_of::<PageId>())
+        .saturating_mul(2); // roots + durable_seq
+    let dedup_headers = dedup_head_group_count.saturating_mul(size_of::<u32>());
+    let dedup_levels = total_dedup_level_count.saturating_mul(size_of::<PageId>());
+    OFF_VARIABLE_START
+        .saturating_add(refcount)
+        .saturating_add(dedup_headers)
+        .saturating_add(dedup_levels)
+}
+
 /// One snapshot's manifest entry. v6 tracks the owning volume's
 /// ordinal and the snapshot's L2P shard-root vector (materialised via
 /// a [`PageType::SnapshotRoots`] page). Refcount state is global and
@@ -330,11 +377,14 @@ impl SnapshotEntry {
 // emits v5. These types + codecs let the wire format flip in one atomic
 // change while the current v5 soak keeps running without drift.
 
+pub(crate) mod catalog;
 mod snapshot_roots;
 mod store;
 mod volume;
 
+use catalog::CatalogKind;
 pub(crate) use snapshot_roots::{load_snapshot_roots, write_snapshot_roots_page};
+pub(crate) use store::catalog_chain_pids_all_slots;
 pub use store::{LoadedManifest, ManifestStore};
 pub use volume::{
     VOLUME_ENTRY_FIXED_SIZE, VOLUME_FLAG_CLONE_LINEAGE, VOLUME_FLAG_DROP_PENDING, VolumeEntry,
@@ -361,6 +411,17 @@ pub struct Manifest {
     /// Highest lifecycle-log record seq whose effects are covered by this checkpoint. Records with
     /// seq > this value are replayed before the buffer.
     pub lifecycle_replay_seq: u64,
+    /// v23: head page of the volume-catalog COW chain
+    /// ([`crate::manifest::catalog`]). The [`volumes`](Self::volumes) `Vec` is
+    /// the runtime source of truth; this anchor is where the chain that
+    /// reconstructs it on open lives. Populated by `decode`; assigned afresh
+    /// every commit (the chain is COW'd each commit, never reused in place).
+    /// `NULL_PAGE` only in a never-committed [`Manifest::empty`].
+    pub volume_catalog_head_pid: PageId,
+    /// v23: head page of the snapshot-table COW chain. Mirrors
+    /// [`volume_catalog_head_pid`](Self::volume_catalog_head_pid) for
+    /// [`snapshots`](Self::snapshots).
+    pub snapshot_catalog_head_pid: PageId,
     /// Head of the persisted free-list page chain, or [`NULL_PAGE`].
     pub free_list_head: PageId,
     /// Current per-shard PBA-refcount B+tree roots. Refcount is a global
@@ -411,6 +472,8 @@ impl Manifest {
             checkpoint_bfg: 0,
             last_processed_buffer_seq: 0,
             lifecycle_replay_seq: 0,
+            volume_catalog_head_pid: NULL_PAGE,
+            snapshot_catalog_head_pid: NULL_PAGE,
             free_list_head: NULL_PAGE,
             refcount_shard_roots: Vec::new().into_boxed_slice(),
             refcount_durable_seq: Vec::new().into_boxed_slice(),
@@ -448,7 +511,12 @@ impl Manifest {
     /// refcount state on disk.
     pub(crate) fn check_encodable(&self) -> Result<()> {
         let mut probe = Page::new(PageHeader::new(PageType::Manifest, 0));
-        self.encode(&mut probe)
+        // v23: the catalog is chained, so a dry-run only validates the small
+        // refcount/dedup region + the durable_seq invariant — it can no longer
+        // reject for `{volumes + snapshots}` overflow (that wall is gone). The
+        // real chain heads are unknown at probe time; `NULL_PAGE` is fine
+        // because the head bytes do not affect the fit check.
+        self.encode(&mut probe, NULL_PAGE, NULL_PAGE)
     }
 
     /// durable-seq rollout (per-shard durable-seq) tripwire: `checkpoint_lsn` must equal the
@@ -530,7 +598,14 @@ impl Manifest {
         max_seen
     }
 
-    fn encode(&self, page: &mut Page) -> Result<()> {
+    /// Encode the manifest's fixed header + variable region (refcount roots /
+    /// durable_seq / dedup heads) into `page`. v23: the volume catalog and the
+    /// snapshot table are NOT inlined — they live in the COW chains anchored by
+    /// `vol_head` / `snap_head`, which the caller
+    /// ([`crate::manifest::store::ManifestStore::commit`]) has already built +
+    /// fsynced. [`check_encodable`](Self::check_encodable) passes `NULL_PAGE`
+    /// for a dry-run fit probe.
+    fn encode(&self, page: &mut Page, vol_head: PageId, snap_head: PageId) -> Result<()> {
         self.assert_durable_seq_invariant()?;
         let refcount_shard_count = self.refcount_shard_roots.len();
         if refcount_shard_count > MAX_SHARD_ROOTS_PER_PAGE {
@@ -551,34 +626,22 @@ impl Manifest {
                 self.dedup_index_shard_heads.len(),
             )));
         }
-        let total_dedup_levels = self.total_dedup_index_levels();
 
-        let volumes_budget_bytes: usize = self
-            .volumes
-            .iter()
-            .map(|v| volume_entry_inline_size(v.shard_count as usize))
-            .sum();
-
-        let max_snapshots = max_snapshots_for_layout(
+        // v23: only refcount roots + per-shard durable_seq + dedup heads share
+        // the manifest page now (volumes / snapshots chain out-of-line). The
+        // former `max_snapshots_for_layout` single-page gate is gone — the
+        // catalog is O(pages). What remains is a sanity check that this
+        // fixed-but-bounded region still fits; it only bites at absurd shard
+        // counts (~245+).
+        let region_used = variable_region_bytes(
             refcount_shard_count,
             DEDUP_META_HEAD_GROUPS,
-            total_dedup_levels,
-            volumes_budget_bytes,
+            self.total_dedup_index_levels(),
         );
-        if self.snapshots.len() > max_snapshots {
+        if region_used > PAGE_PAYLOAD_SIZE {
             return Err(MetaDbError::InvalidArgument(format!(
-                "manifest snapshot count {} exceeds capacity {max_snapshots}",
-                self.snapshots.len(),
+                "manifest refcount/dedup region {region_used} B exceeds page payload {PAGE_PAYLOAD_SIZE} B",
             )));
-        }
-
-        for entry in &self.snapshots {
-            if entry.needs_l2p_roots_page() {
-                return Err(MetaDbError::InvalidArgument(format!(
-                    "snapshot {} is missing l2p_roots_page",
-                    entry.id,
-                )));
-            }
         }
 
         let p = page.payload_mut();
@@ -611,6 +674,12 @@ impl Manifest {
             .copy_from_slice(&self.last_processed_buffer_seq.to_le_bytes());
         p[OFF_LIFECYCLE_REPLAY_SEQ..OFF_LIFECYCLE_REPLAY_SEQ + 8]
             .copy_from_slice(&self.lifecycle_replay_seq.to_le_bytes());
+        // v23: catalog chain head anchors. Real allocated pids on a committed
+        // manifest; `NULL_PAGE` only in a probe / never-committed empty.
+        p[OFF_VOLUME_CATALOG_HEAD..OFF_VOLUME_CATALOG_HEAD + 8]
+            .copy_from_slice(&vol_head.to_le_bytes());
+        p[OFF_SNAPSHOT_CATALOG_HEAD..OFF_SNAPSHOT_CATALOG_HEAD + 8]
+            .copy_from_slice(&snap_head.to_le_bytes());
 
         let mut off = OFF_VARIABLE_START;
         for root in self.refcount_shard_roots.iter().copied() {
@@ -633,24 +702,58 @@ impl Manifest {
                 off += 8;
             }
         }
-        for entry in &self.snapshots {
-            p[off..off + 8].copy_from_slice(&entry.id.to_le_bytes());
-            p[off + 8..off + 10].copy_from_slice(&entry.vol_ord.to_le_bytes());
-            // p[off + 10..off + 16] = reserved / zero
-            p[off + 16..off + 24].copy_from_slice(&entry.l2p_roots_page.to_le_bytes());
-            p[off + 24..off + 32].copy_from_slice(&entry.created_lsn.to_le_bytes());
-            // v18: page-deadlist tail anchor at offset 32.
-            p[off + OFF_SNAP_PAGE_DEADLIST_TAIL..off + OFF_SNAP_PAGE_DEADLIST_TAIL + 8]
-                .copy_from_slice(&entry.page_dead_list_tail_pid.to_le_bytes());
-            // v21: snapshot capture-watermark at offset 40.
-            p[off + OFF_SNAP_CAPTURE_WATERMARK..off + OFF_SNAP_CAPTURE_WATERMARK + 8]
-                .copy_from_slice(&entry.capture_watermark.to_le_bytes());
-            off += SNAPSHOT_ENTRY_SIZE;
-        }
-        for entry in &self.volumes {
-            encode_volume_entry_inline(entry, p, &mut off)?;
-        }
+        // v23: volumes + snapshots are NOT inlined — they live in the catalog
+        // chains anchored above (`vol_head` / `snap_head`). The page ends after
+        // the dedup heads.
+        debug_assert!(off <= PAGE_PAYLOAD_SIZE);
         Ok(())
+    }
+
+    /// Serialise the volume catalog into the byte stream that
+    /// [`crate::manifest::catalog`] splits across the volume chain. Reuses the
+    /// inline per-entry codec; the entries are simply concatenated.
+    pub(crate) fn encode_volume_catalog_bytes(&self) -> Result<Vec<u8>> {
+        let total: usize = self
+            .volumes
+            .iter()
+            .map(|v| volume_entry_inline_size(v.shard_count as usize))
+            .sum();
+        let mut buf = vec![0u8; total];
+        let mut off = 0usize;
+        for entry in &self.volumes {
+            encode_volume_entry_inline(entry, &mut buf, &mut off)?;
+        }
+        debug_assert_eq!(off, total);
+        Ok(buf)
+    }
+
+    /// Serialise the snapshot table into the byte stream that
+    /// [`crate::manifest::catalog`] splits across the snapshot chain. Each
+    /// 48-byte row mirrors the former inline layout; every entry must carry a
+    /// durable `l2p_roots_page` (the check that used to live in `encode`).
+    pub(crate) fn encode_snapshot_catalog_bytes(&self) -> Result<Vec<u8>> {
+        for entry in &self.snapshots {
+            if entry.needs_l2p_roots_page() {
+                return Err(MetaDbError::InvalidArgument(format!(
+                    "snapshot {} is missing l2p_roots_page",
+                    entry.id,
+                )));
+            }
+        }
+        let mut buf = vec![0u8; self.snapshots.len() * SNAPSHOT_ENTRY_SIZE];
+        for (i, entry) in self.snapshots.iter().enumerate() {
+            let r = &mut buf[i * SNAPSHOT_ENTRY_SIZE..(i + 1) * SNAPSHOT_ENTRY_SIZE];
+            r[0..8].copy_from_slice(&entry.id.to_le_bytes());
+            r[8..10].copy_from_slice(&entry.vol_ord.to_le_bytes());
+            // r[10..16] reserved / zero
+            r[16..24].copy_from_slice(&entry.l2p_roots_page.to_le_bytes());
+            r[24..32].copy_from_slice(&entry.created_lsn.to_le_bytes());
+            r[OFF_SNAP_PAGE_DEADLIST_TAIL..OFF_SNAP_PAGE_DEADLIST_TAIL + 8]
+                .copy_from_slice(&entry.page_dead_list_tail_pid.to_le_bytes());
+            r[OFF_SNAP_CAPTURE_WATERMARK..OFF_SNAP_CAPTURE_WATERMARK + 8]
+                .copy_from_slice(&entry.capture_watermark.to_le_bytes());
+        }
+        Ok(buf)
     }
 
     fn decode(page: &Page, page_store: &PageStore) -> Result<Self> {
@@ -661,30 +764,18 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            22 => Self::decode_v22(page, page_store),
+            23 => Self::decode_v23(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v22 \
-                 (per-L2P-page refcount deleted) is \
-                 readable — older databases (v7/v8 carried the retired \
-                 dedup_reverse section; v9 carried compact leaf v2 with the \
-                 100-unit cap; v10/v11 used compact leaf v3 which predates \
-                 birth_lsn; v12 had birth_lsn but no per-volume dead-list \
-                 anchor; v13 had dead-list but no lineage tracking; v14 had \
-                 lineage tracking but no checkpoint_bfg; v15 had checkpoint_bfg \
-                 but no buffer-replay watermarks; v16 had the buffer-replay \
-                 watermarks but no l2p_page_rc shard group; v17 had the \
-                 l2p_page_rc shard group but no page-deadlist anchors; v18 had \
-                 the page-deadlist anchors but no per-clone page-livelist \
-                 anchors; v19 had the page-livelist but no promoted-PBA log \
-                 anchors; v20 had the promoted-PBA log but no snapshot \
-                 capture-watermark; v21 still carried the now-deleted \
-                 l2p_page_rc shard group) must be rebuilt"
+                "unsupported manifest body version {other}; only v23 (volume \
+                 catalog + snapshot table chained out-of-line) is readable — \
+                 older databases (v22-and-earlier inlined both tables in the \
+                 single manifest page) must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v22(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 22)
+    fn decode_v23(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 23)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {
@@ -762,29 +853,34 @@ impl Manifest {
             dedup_index_shard_heads.push(read_u64_vec(p, &mut off, level_count));
         }
 
-        let max_snapshots = max_snapshots_for_layout(
-            refcount_shard_count,
-            DEDUP_META_HEAD_GROUPS,
-            total_index_levels,
-            0,
-        );
-        if snapshot_count > max_snapshots {
-            return Err(MetaDbError::Corruption(format!(
-                "manifest snapshot_count {snapshot_count} exceeds capacity {max_snapshots}",
-            )));
-        }
+        // The v22 single-page snapshot-capacity gate is gone — the snapshot
+        // table is chained, so `snapshot_count` is bounded only by the chain.
+        let _ = total_index_levels;
 
-        let snapshots = decode_snapshots(p, &mut off, snapshot_count, version, page_store)?;
-        let mut volumes = decode_volumes(p, &mut off, volume_count, version)?;
-        if version < 11 {
-            // v10 upgrade: backfill every volume's per-L2P-shard
-            // durable_seq from the single `checkpoint_lsn`. The next
-            // commit re-encodes as v11 with real per-shard atomics.
-            for vol in &mut volumes {
-                vol.l2p_shard_durable_seq =
-                    vec![checkpoint_lsn; vol.shard_count as usize].into_boxed_slice();
-            }
-        }
+        // v23: the volume catalog + snapshot table live in two COW chains
+        // anchored in the fixed header. Walk each chain back into its byte
+        // stream and decode the rows. A torn / missing chain page surfaces as
+        // `Err` here, so `ManifestStore::load_latest` cleanly falls back to the
+        // other (intact) slot.
+        let volume_catalog_head_pid = u64::from_le_bytes(
+            p[OFF_VOLUME_CATALOG_HEAD..OFF_VOLUME_CATALOG_HEAD + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let snapshot_catalog_head_pid = u64::from_le_bytes(
+            p[OFF_SNAPSHOT_CATALOG_HEAD..OFF_SNAPSHOT_CATALOG_HEAD + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let volume_bytes =
+            catalog::read_catalog_chain(page_store, volume_catalog_head_pid, CatalogKind::Volumes)?;
+        let volumes = decode_volume_catalog_bytes(&volume_bytes, volume_count, version)?;
+        let snapshot_bytes = catalog::read_catalog_chain(
+            page_store,
+            snapshot_catalog_head_pid,
+            CatalogKind::Snapshots,
+        )?;
+        let snapshots = decode_snapshot_catalog_bytes(&snapshot_bytes, snapshot_count, page_store)?;
 
         Ok(Self {
             body_version: MANIFEST_BODY_VERSION,
@@ -792,6 +888,8 @@ impl Manifest {
             checkpoint_bfg,
             last_processed_buffer_seq,
             lifecycle_replay_seq,
+            volume_catalog_head_pid,
+            snapshot_catalog_head_pid,
             free_list_head,
             refcount_shard_roots,
             refcount_durable_seq,
@@ -834,43 +932,61 @@ fn decode_tail_counters(p: &[u8]) -> (u64, VolumeOrdinal, usize, usize) {
     )
 }
 
-fn decode_snapshots(
-    p: &[u8],
-    off: &mut usize,
+/// Decode the volume catalog from the byte stream walked out of the volume
+/// chain. `volume_count` (from the fixed header) drives the loop; the decoded
+/// entries must consume the stream exactly, or the chain is corrupt.
+fn decode_volume_catalog_bytes(
+    bytes: &[u8],
+    volume_count: usize,
+    body_version: u32,
+) -> Result<Vec<VolumeEntry>> {
+    let mut volumes = Vec::with_capacity(volume_count);
+    let mut off = 0usize;
+    for _ in 0..volume_count {
+        volumes.push(decode_volume_entry_inline(bytes, &mut off, body_version)?);
+    }
+    if off != bytes.len() {
+        return Err(MetaDbError::Corruption(format!(
+            "manifest volume catalog: {volume_count} entries consumed {off} of {} chain bytes",
+            bytes.len(),
+        )));
+    }
+    Ok(volumes)
+}
+
+/// Decode the snapshot table from the byte stream walked out of the snapshot
+/// chain. Each row is a fixed [`SNAPSHOT_ENTRY_SIZE`] block (v23 layout); the
+/// per-snapshot L2P shard roots are loaded from each entry's `SnapshotRoots`
+/// page exactly as the legacy inline path did.
+fn decode_snapshot_catalog_bytes(
+    bytes: &[u8],
     snapshot_count: usize,
-    version: u32,
     page_store: &PageStore,
 ) -> Result<Vec<SnapshotEntry>> {
+    let expected = snapshot_count.saturating_mul(SNAPSHOT_ENTRY_SIZE);
+    if bytes.len() != expected {
+        return Err(MetaDbError::Corruption(format!(
+            "manifest snapshot catalog: {snapshot_count} rows need {expected} bytes, chain has {}",
+            bytes.len(),
+        )));
+    }
     let mut snapshots = Vec::with_capacity(snapshot_count);
-    for _ in 0..snapshot_count {
-        let id = u64::from_le_bytes(p[*off..*off + 8].try_into().unwrap());
-        let vol_ord = u16::from_le_bytes(p[*off + 8..*off + 10].try_into().unwrap());
-        let l2p_roots_page = u64::from_le_bytes(p[*off + 16..*off + 24].try_into().unwrap());
-        let created_lsn = u64::from_le_bytes(p[*off + 24..*off + 32].try_into().unwrap());
-        // v18: page-deadlist tail anchor at offset 32. Pre-v18 manifests
-        // are hard-rejected at dispatch, so the `NULL_PAGE` fallback is
-        // only reached by the (dead) generic decode path.
-        let page_dead_list_tail_pid = if version >= 18 {
-            u64::from_le_bytes(
-                p[*off + OFF_SNAP_PAGE_DEADLIST_TAIL..*off + OFF_SNAP_PAGE_DEADLIST_TAIL + 8]
-                    .try_into()
-                    .unwrap(),
-            )
-        } else {
-            NULL_PAGE
-        };
-        // v21: snapshot capture-watermark at offset 40. Pre-v21 manifests are
-        // hard-rejected at dispatch; the `created_lsn` fallback (a safe upper
-        // bound) is only reachable via the dead generic decode path.
-        let capture_watermark = if version >= 21 {
-            u64::from_le_bytes(
-                p[*off + OFF_SNAP_CAPTURE_WATERMARK..*off + OFF_SNAP_CAPTURE_WATERMARK + 8]
-                    .try_into()
-                    .unwrap(),
-            )
-        } else {
-            created_lsn
-        };
+    for i in 0..snapshot_count {
+        let r = &bytes[i * SNAPSHOT_ENTRY_SIZE..(i + 1) * SNAPSHOT_ENTRY_SIZE];
+        let id = u64::from_le_bytes(r[0..8].try_into().unwrap());
+        let vol_ord = u16::from_le_bytes(r[8..10].try_into().unwrap());
+        let l2p_roots_page = u64::from_le_bytes(r[16..24].try_into().unwrap());
+        let created_lsn = u64::from_le_bytes(r[24..32].try_into().unwrap());
+        let page_dead_list_tail_pid = u64::from_le_bytes(
+            r[OFF_SNAP_PAGE_DEADLIST_TAIL..OFF_SNAP_PAGE_DEADLIST_TAIL + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let capture_watermark = u64::from_le_bytes(
+            r[OFF_SNAP_CAPTURE_WATERMARK..OFF_SNAP_CAPTURE_WATERMARK + 8]
+                .try_into()
+                .unwrap(),
+        );
         let l2p_shard_roots = load_snapshot_roots(page_store, l2p_roots_page)?;
         snapshots.push(SnapshotEntry {
             id,
@@ -881,23 +997,8 @@ fn decode_snapshots(
             page_dead_list_tail_pid,
             capture_watermark,
         });
-        *off += SNAPSHOT_ENTRY_SIZE;
     }
     Ok(snapshots)
-}
-
-fn decode_volumes(
-    p: &[u8],
-    off: &mut usize,
-    volume_count: usize,
-    body_version: u32,
-) -> Result<Vec<VolumeEntry>> {
-    let mut volumes = Vec::with_capacity(volume_count);
-    for _ in 0..volume_count {
-        let entry = decode_volume_entry_inline(p, off, body_version)?;
-        volumes.push(entry);
-    }
-    Ok(volumes)
 }
 
 fn read_u64_vec(p: &[u8], off: &mut usize, count: usize) -> Box<[PageId]> {
