@@ -521,7 +521,9 @@ impl Db {
         // reserved LSN, no `finish_global_apply` hole, and no dependence on
         // `wal_checkpoint`.
         let wal_checkpoint = self.bfg.slot_max_lsn(bfg);
-        let volumes = self.volumes_snapshot();
+        // `mut` so the gate-window reconciliation below can prune volumes
+        // dropped between this gateless sample and the manifest commit.
+        let mut volumes = self.volumes_snapshot();
         // Volumes with a `take_snapshot` task queued for this bfg. Their L2P
         // shards are force-selected below so the roots the snapshot entry will
         // reference are flushed durable this cycle.
@@ -538,7 +540,9 @@ impl Db {
         // Decide which shards this round samples. Forced flushes
         // (`flush()`, snapshot, shutdown) always select everything;
         // steady-state `try_flush()` honours the budget cap.
-        let selected = self.select_shards_for_flush(
+        // `mut` so the gate-window reconciliation below can prune the
+        // per-volume `selected.l2p` rows of volumes dropped mid-cycle.
+        let mut selected = self.select_shards_for_flush(
             &volumes,
             matches!(kind, crate::metrics::FlushKind::Forced),
             &snapshot_force_ords,
@@ -730,6 +734,11 @@ impl Db {
             }
         }
         debug_assert!(guard_iter.next().is_none());
+        // Release the per-shard tree guards (and the `&volumes` borrow their
+        // type carries) now that the L2P sample is captured — the gate-window
+        // reconciliation below mutates `volumes` to prune mid-cycle drops.
+        drop(guard_iter);
+        drop(l2p_guards);
         let l2p_walk_elapsed = l2p_walk_started.elapsed();
         // Refcount sample: drain delta + stage sealed pages in memory.
         // No disk IO. Meta-chain rewrite + page writes happen in the
@@ -1200,6 +1209,53 @@ impl Db {
             &mut page_live_list_overrides,
             wal_checkpoint,
         );
+        // BFG — drop-volume TOCTOU: the volume set is sampled GATELESS at
+        // the top of this cycle (`volumes_snapshot()` above). A `drop_volume`
+        // that committed between that sample and this `apply_gate.write()`
+        // acquisition removed its entry from BOTH `self.volumes` and the
+        // durable manifest. But our sampled `volumes` (and the volume-parallel
+        // `l2p_checkpoints` / `flushed_l2p` / `selected.l2p`) still carry the
+        // dropped volume, so `refresh_manifest_from_checkpoints` below — which
+        // rebuilds `manifest.volumes` wholesale from this sample — would
+        // RESURRECT its `VolumeEntry`. That ghost re-pins a descendant clone's
+        // `parent_vol_ord`, so the next `drop_volume(parent)` is refused by the
+        // descendant gate (the failure `meta_only_snapshot_lifecycle` hit), and
+        // leaves a stale catalog entry generally. `drop_volume` holds
+        // `apply_gate.write` for its whole body, so under this gate
+        // `self.volumes` is the authoritative live set: prune every sampled
+        // volume no longer live from the volume-parallel arrays in lockstep so
+        // the committed manifest names exactly the survivors. A pruned volume's
+        // already-sealed L2P pages (if any — an empty/idle drop has all-`None`
+        // checkpoints) become orphans the next open reclaims, identical to the
+        // crash-after-seal path.
+        {
+            let live_ords: std::collections::HashSet<VolumeOrdinal> =
+                self.volumes.read().keys().copied().collect();
+            if volumes.iter().any(|v| !live_ords.contains(&v.ord)) {
+                let keep: Vec<bool> = volumes.iter().map(|v| live_ords.contains(&v.ord)).collect();
+                let dropped: Vec<VolumeOrdinal> = volumes
+                    .iter()
+                    .filter(|v| !live_ords.contains(&v.ord))
+                    .map(|v| v.ord)
+                    .collect();
+                tracing::debug!(
+                    ?dropped,
+                    "flush: pruning volumes dropped between gateless sample and manifest commit"
+                );
+                // Drop the same positions from every volume-parallel array.
+                // `retain` visits in order, so a shared boolean mask keeps them
+                // in lockstep even for the move-only checkpoint element types.
+                fn retain_by_mask<T>(v: &mut Vec<T>, keep: &[bool]) {
+                    debug_assert_eq!(v.len(), keep.len());
+                    let mut it = keep.iter();
+                    v.retain(|_| *it.next().unwrap_or(&false));
+                }
+                retain_by_mask(&mut volumes, &keep);
+                retain_by_mask(&mut l2p_checkpoints, &keep);
+                retain_by_mask(&mut flushed_l2p, &keep);
+                retain_by_mask(&mut selected.l2p, &keep);
+            }
+        }
         let mut manifest_state = self.manifest_state.lock();
         let dedup_update = match self
             .prepare_dedup_manifest_update(&mut manifest_state.manifest, tree_generation)
