@@ -1179,8 +1179,18 @@ impl Db {
         vol_ord: VolumeOrdinal,
         pbas: &[Pba],
     ) -> Result<ApplyOutcome> {
-        let _txg_guard = self.txg.enter();
+        // Lock order: drop_gate.read() BEFORE txg.enter() — matches commit_ops
+        // and is load-bearing for deadlock-freedom. A commit parked at
+        // drop_gate.read() (behind a lifecycle op's drop_gate.write) must NOT
+        // already hold a txg guard: take_snapshot / create_volume force-sync
+        // while holding drop_gate.write, and their roll_to_quiescing waits for
+        // slots[cur].inflight == 0. An enter-before-read commit (the
+        // LineageGcWorker runs this autonomously) would pin inflight while
+        // parked on drop_gate.read → roll never drains → hard deadlock. Entering
+        // AFTER drop_gate.read keeps the reserve-after-enter / record_lsn-under-
+        // guard sequence below identical to commit_ops.
         let _drop_guard = self.drop_gate.read();
+        let _txg_guard = self.txg.enter();
         let footprint = DispatchFootprint::global();
         let lsn = self.lsn_alloc.reserve(|lsn| {
             self.register_dispatch_intent(lsn, footprint);

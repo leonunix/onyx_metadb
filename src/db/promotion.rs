@@ -160,8 +160,13 @@ impl Db {
         pba_increfs: Vec<Pba>,
         next_cursor: Option<Lba>,
     ) -> Result<()> {
-        let _txg_guard = self.txg.enter();
+        // drop_gate.read() BEFORE txg.enter() — deadlock-free lock order (see
+        // commit_free_pbas / commit_ops): a commit parked at drop_gate.read
+        // must hold no txg inflight, else a force-syncing lifecycle op
+        // (take_snapshot / create_volume) deadlocks on roll_to_quiescing's
+        // inflight drain. promote_volume drives this autonomously.
         let _drop_guard = self.drop_gate.read();
+        let _txg_guard = self.txg.enter();
         let lifecycle_op = LifecycleOp::PromotionChunk {
             vol_ord,
             pba_increfs: pba_increfs.clone(),
@@ -299,8 +304,12 @@ impl Db {
     }
 
     pub(crate) fn commit_promotion_complete(&self, vol_ord: VolumeOrdinal) -> Result<()> {
-        let _txg_guard = self.txg.enter();
+        // drop_gate.read() BEFORE txg.enter() — deadlock-free lock order (see
+        // commit_free_pbas / commit_ops). PromotionComplete is emitted at the
+        // tail of every promote_volume run; an enter-before-read here would
+        // leave the deadlock live on the completion record.
         let _drop_guard = self.drop_gate.read();
+        let _txg_guard = self.txg.enter();
         let lifecycle_op = LifecycleOp::PromotionComplete { vol_ord };
         let lsn = self.submit_lifecycle_op_with_dispatch(&lifecycle_op)?;
         _txg_guard.record_lsn(lsn);
