@@ -1,4 +1,4 @@
-//! Phase 7 commit 9 integration: per-volume `take_snapshot` / routing
+//! commit 9 integration: per-volume `take_snapshot` / routing
 //! through `entry.vol_ord`. Covers snapshot isolation across volumes,
 //! drop-snapshot side effects staying scoped to the source volume, and
 //! crash recovery with snapshots on non-bootstrap volumes.
@@ -144,7 +144,7 @@ fn drop_volume_while_snapshot_exists_is_refused() {
 /// `shards_per_partition` up to a value that leaves only a handful of
 /// snapshot rows in the manifest payload. v11+ added per-shard
 /// durable_seq (8 B per shard, doubling per-shard overhead from 8 →
-/// 16 B), and v17 (snapshot-scaling Phase A2) added the `l2p_page_rc`
+/// 16 B), and v17 (snapshot-scaling L2P-page-rc schema) added the `l2p_page_rc`
 /// shard group's roots + durable_seq (another 16 B per shard at the
 /// manifest top level), so per-shard manifest overhead is now ~48 B
 /// (16 refcount + 16 page-rc + 16 bootstrap-volume). 100 shards no

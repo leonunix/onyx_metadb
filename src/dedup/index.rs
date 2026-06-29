@@ -335,7 +335,7 @@ impl DedupIndex {
     // in-RAM `staging` map and warm L0 (so `get`'s L0 short-circuit does
     // not hide the staged entry); the blocking cuckoo write is deferred
     // to `drain_shard_once`, run by the background drainer / checkpoint
-    // barrier (Phase 2).
+    // barrier ().
 
     /// Stage a `(hash → value)` put.
     pub fn stage_put(&self, hash: Hash8, value: DedupValue, lsn: Lsn) -> Result<()> {
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn delete_of_absent_hash_does_not_evict_fp_collision_sibling() {
-        // Regression for db_phase6_proptest::db_vs_reference_with_reopens.
+        // Regression for db_proptest::db_vs_reference_with_reopens.
         // The L0 sketch is reference-counted by 32-bit fingerprint
         // (`fp_of(hash) = u32::from_le_bytes(hash[..4])`). Two distinct
         // hashes that share the same low 4 bytes also share an L0

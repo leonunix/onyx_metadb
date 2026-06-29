@@ -4,7 +4,7 @@
 //! `metadb-verify`), reads the requested state, and prints human-
 //! readable or `--json` output.
 //!
-//! Intended use: Phase 7 adapter debugging ("did this LBA actually
+//! Intended use: adapter debugging ("did this LBA actually
 //! land?", "what does the manifest say about snapshot 3?") — not a
 //! bulk exporter. LSM full-scans are deliberately out of scope for v1.
 

@@ -340,19 +340,19 @@ fn compact_drops_tombstones_at_deepest_level() {
 fn compact_preserves_tombstones_when_deeper_level_exists() {
     let (_d, _ps, lsm) = mk_lsm_small();
     // Seed L2 with put(h1) = v(1) by forcing multi-level.
-    // Step 1: put + flush + compact to L1.
+    // lineage tracking: put + flush + compact to L1.
     for _ in 0..3 {
         lsm.put(h(1), v(1));
         lsm.flush_memtable(1).unwrap().unwrap();
     }
     lsm.compact_once(10).unwrap().unwrap(); // L1 now has put(h1,v1)
-    // Step 2: fake-promote L1 content to L2 so L1 is empty and L2
+    // lineage pinning: fake-promote L1 content to L2 so L1 is empty and L2
     // holds put(h1,v1). We do this by injecting a synthetic level.
     let levels_now = lsm.levels_snapshot();
     assert_eq!(levels_now.len(), 2);
     let l1_content = levels_now[1].clone();
     lsm.debug_replace_levels(vec![Vec::new(), Vec::new(), l1_content]);
-    // Step 3: new L0 with tombstone(h1) and pressure to push to L1.
+    // FreePbas split: new L0 with tombstone(h1) and pressure to push to L1.
     for _ in 0..3 {
         lsm.delete(h(1));
         lsm.flush_memtable(11).unwrap().unwrap();

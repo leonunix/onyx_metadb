@@ -229,18 +229,18 @@ fn run_cycle(
     };
     let cycle_start_recorded_sum = onyx_stats.refcount_sum;
 
-    // Phase 1: pre-worker volume admin (create / drop / clone / promote).
+    // pre-worker volume admin (create / drop / clone / promote).
     if cfg.workload == Workload::Legacy {
         next_id = run_volume_admin(child, cycle, model, admin_rng, snapshots, events, next_id)?;
     } else if cfg.workload == Workload::OnyxConcurrent {
-        // ZFS port Phase 3b: drive clone/promote/drop concurrently with the
+        // BFG: drive clone/promote/drop concurrently with the
         // high-pipeline-depth onyx write/range_delete/dedup mix — the
         // realistic clone-churn the in-process tests can't reproduce.
         next_id =
             run_onyx_volume_admin(child, cycle, onyx_model, admin_rng, snapshots, events, next_id)?;
     }
 
-    // Phase 2: workers pounding across the live volume set.
+    // workers pounding across the live volume set.
     let mut sent_ops = 0usize;
     let effective_pipeline_depth = match cfg.workload {
         // Onyx-mix is reference-model checked. Keep exactly one op in
@@ -378,7 +378,7 @@ fn run_cycle(
         )?;
     }
 
-    // Phase 3: flush + optional snapshot churn.
+    // flush + optional snapshot churn.
     send_admin(child, next_id, "FLUSH")?;
     match recv_ack(child)? {
         Ack::Ok(id) if id == next_id => {
@@ -526,7 +526,7 @@ fn run_volume_admin(
         match recv_ack(child)? {
             Ack::Volume(id, ord) if id == next_id => {
                 model.l2p.insert(ord, src.l2p.clone());
-                // ZFS port Phase 3b: track the new clone so a later cycle can
+                // BFG: track the new clone so a later cycle can
                 // PROMOTE it (and then drop its parent / itself).
                 model.clones.insert(ord);
                 events.write(
@@ -551,7 +551,7 @@ fn run_volume_admin(
     }
 
     // PROMOTE: drive a clone's promotion walker to completion. This is the
-    // ZFS port Phase 3b interleave the runtime clone-drop livelist shadow
+    // BFG interleave the runtime clone-drop livelist shadow
     // needs — a promoted ex-clone clears its `parent_vol_ord`, unpinning the
     // parent for the DROP roll below (promote→drop-parent / drop-promoted).
     let promote_candidates = model.promote_candidates();
@@ -582,7 +582,7 @@ fn run_volume_admin(
         match recv_ack(child)? {
             Ack::Ok(id) if id == next_id => {
                 model.l2p.remove(&pick);
-                // ZFS port Phase 3b: a dropped clone leaves the un-promoted set.
+                // BFG: a dropped clone leaves the un-promoted set.
                 model.clones.remove(&pick);
                 events.write("drop_volume_ok", &format!("cycle={} ord={}", cycle, pick))?;
             }
@@ -604,7 +604,7 @@ fn run_volume_admin(
 /// create / clone / promote / drop_volume against `onyx_model` so the
 /// concurrent onyx workload actually exercises the clone livelist path.
 /// Clones source from the shared `snapshots` list (DB snapshots taken in
-/// Phase 3). The `OnyxConcurrent` verify is structure-only
+/// ). The `OnyxConcurrent` verify is structure-only
 /// (`verify_path` / `--clone-livelist`), so the model only needs coherent
 /// `live_volumes` / `clones` bookkeeping — not per-volume content.
 fn run_onyx_volume_admin(

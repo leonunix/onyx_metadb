@@ -102,15 +102,15 @@ fn small_remap_batches_use_lane_dispatch_not_global_serial() {
 // ------------------------------------------------------------------------
 // Precision tests for the dispatch-footprint refcount-shard computation.
 //
-// Pre-Phase-5 the planner did `rc_enqueued.fill(true)` on any remap,
+// Pre-the planner did `rc_enqueued.fill(true)` on any remap,
 // claiming all 16 refcount lanes regardless of whether any op actually
-// touched rc. With Phase 5 making L2pRemap/L2pRemapRange rc-neutral on
+// touched rc. With making L2pRemap/L2pRemapRange rc-neutral on
 // the hot path, that blanket was the dominant serialization cause for
 // concurrent commit_workers on a single volume — every commit's
 // footprint conflicted with every other commit on the rc lanes.
 //
 // These tests pin the precise contract:
-//   - L2pRemapRange (always unguarded, Phase 5 rc-neutral): zero rc lanes
+//   - L2pRemapRange (always unguarded, rc-neutral): zero rc lanes
 //   - L2pRemap { guard: None }: zero rc lanes
 //   - L2pRemap { guard: Some((P, _)) }: exactly rc_shard_of_pba(P)
 //   - DedupPut / DedupPutGuarded / DedupDelete / DedupCompareDelete /
@@ -171,7 +171,7 @@ fn remap_range_only_commits_have_no_rc_footprint() {
     assert_eq!(
         rc_lanes(&footprint),
         Vec::<usize>::new(),
-        "L2pRemapRange is always unguarded + Phase 5 rc-neutral; must not claim any rc lane"
+        "L2pRemapRange is always unguarded and rc-neutral; must not claim any rc lane"
     );
 }
 
@@ -196,7 +196,7 @@ fn unguarded_remap_commits_have_no_rc_footprint() {
     assert_eq!(
         rc_lanes(&footprint),
         Vec::<usize>::new(),
-        "Unguarded L2pRemap is Phase 5 rc-neutral; must not claim any rc lane"
+        "Unguarded L2pRemap is rc-neutral; must not claim any rc lane"
     );
 }
 
@@ -288,7 +288,7 @@ fn two_disjoint_l2p_remap_range_commits_do_not_conflict() {
     let db = Db::create(dir.path()).unwrap();
 
     // Build two L2pRemapRange ops whose LBA spans hash to different L2P
-    // shards. With Phase 5 making rc-neutral and Component A removing
+    // shards. With making rc-neutral and Component A removing
     // the blanket rc_enqueued.fill, two commits on disjoint L2P shards
     // must have disjoint footprints — this is the regression gate that
     // the seqwrite hot path can finally fan out across commit_workers.
@@ -348,7 +348,7 @@ fn two_disjoint_l2p_remap_range_commits_do_not_conflict() {
     );
 }
 
-// -------- ZFS-TXG-clone Phase 1: direct L2P apply fast path --------
+// -------- BFG: direct L2P apply fast path --------
 
 /// Build a Db with both `l2p_buffer_enabled` and
 /// `commit_direct_apply_enabled` on. The direct-apply path requires
@@ -507,7 +507,7 @@ fn direct_apply_path_increments_counter_and_serves_reads() {
 fn direct_apply_equivalent_to_lane_path() {
     // Drive identical L2P-only workloads through both paths and
     // assert the post-commit reads return identical values. This is
-    // the load-bearing safety check for Phase 1: the direct path is
+    // the load-bearing safety check for the direct path is
     // only safe if it produces byte-equivalent state.
     let (_d1, db_direct) = mk_direct_apply_db();
     let (_d2, db_lane) = mk_lane_only_db();
@@ -562,7 +562,7 @@ fn direct_apply_equivalent_to_lane_path() {
     );
 }
 
-// -------- ZFS-TXG-clone Phase 2: deferred outcome API --------
+// -------- BFG: deferred outcome API --------
 
 fn mk_deferred_apply_db(deferred: bool) -> (tempfile::TempDir, std::sync::Arc<Db>) {
     let dir = tempfile::TempDir::new().unwrap();
@@ -698,7 +698,7 @@ fn commit_ops_deferred_handle_drop_does_not_leak_sender() {
     assert_eq!(outs.len(), 1);
 }
 
-// -------- ZFS-TXG-clone onyx-side stager (`Db::stage_ops`) --------
+// -------- BFG onyx-side stager (`Db::stage_ops`) --------
 
 /// Empty batch returns `(last_applied_lsn, [])` and bumps the
 /// `commit_empty` counter — same observable behaviour as
@@ -714,7 +714,7 @@ fn stage_ops_empty_batch_is_noop() {
 
 /// L2P-only batch: stage_ops applies into the buffer slot and reads
 /// observe the value immediately through `multi_get` (which consults
-/// `lookup_for_open_txg` before falling through to the tree).
+/// `lookup_for_open_bfg` before falling through to the tree).
 #[test]
 fn stage_ops_l2p_put_visible_to_reads() {
     let (_d, db) = mk_deferred_apply_db(true);
@@ -807,7 +807,7 @@ fn stage_ops_seq_guard_rejects_stale_replay() {
 }
 
 /// Concurrent stage_ops from many threads land with distinct LSNs and
-/// every write is observable. Exercises the LsnAllocator + TxgGuard
+/// every write is observable. Exercises the LsnAllocator + BfgGuard
 /// monotonicity invariant under contention.
 #[test]
 fn stage_ops_concurrent_writers_all_visible() {
@@ -957,11 +957,10 @@ fn commit_ops_deferred_remap_range_round_trip() {
             for (i, bit) in applied.iter().enumerate() {
                 assert!(*bit, "fresh remap-range write at off {i} must apply");
             }
-            // Phase 5 default: freed_pbas always empty (Lineage GC
+            // default: freed_pbas always empty (Lineage GC
             // owns freed-PBA delivery now).
             assert!(freed_pbas.is_empty());
         }
         other => panic!("expected L2pRemapRange outcome, got {other:?}"),
     }
 }
-

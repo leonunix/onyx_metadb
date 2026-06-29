@@ -71,11 +71,11 @@ fn clone_snapshot_take_drop_then_crash_reopen() {
         .expect("reopen after drop_volume on a clone must succeed without an intervening flush");
 }
 
-/// Regression for the ZFS port S3 `need_birth` gap (found in /code-review): a
+/// Regression for the BFG `need_birth` gap (found in /code-review): a
 /// NON-clone volume that shares L2P pages with a clone — after the linking
 /// snapshot is dropped — must read each page's REAL `birth_lsn` when COW-killing,
-/// not `0`. The S3 clone-source pin (`clone_cow_pinners` on the non-clone arm)
-/// is the replacement for the deleted page-rc floor; if `need_birth` omits
+/// not `0`. The clone-source pin (`clone_cow_pinners` on the non-clone arm)
+/// replaces the deleted page-rc floor; if `need_birth` omits
 /// `clone_cow_pinners`, the overwrite reads `birth = 0`, stamping a
 /// `birth_lsn = 0` record into the source volume's page-deadlist. A LATER
 /// non-clone deadlist drop (after the clone is gone → routing flips off

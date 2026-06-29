@@ -22,7 +22,7 @@ impl Db {
         cfg: Config,
         faults: Arc<FaultController>,
     ) -> Result<Arc<Self>> {
-        validate_phase5_refcount_mode(&cfg)?;
+        validate_rc_neutral_refcount_mode(&cfg)?;
         let shard_count = validate_shard_count(cfg.shards_per_partition)?;
         let dedup_shards = validate_dedup_shards(cfg.dedup_shards)?;
         std::fs::create_dir_all(&cfg.path)?;
@@ -208,25 +208,25 @@ impl Db {
             deferred_outcomes,
             commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
             wal_async_commits_enabled: cfg.wal_async_commits_enabled,
-            // Phase 4 Step 4: fresh DB starts with checkpoint_txg = 0 so the
-            // first Open TXG is 1.
-            txg: Arc::new(crate::txg::TxgStateMachine::new(0)),
-            txg_threads_enabled: cfg.txg_threads_enabled,
+            // fresh DB starts with checkpoint_bfg = 0 so the
+            // first Open BFG is 1.
+            bfg: Arc::new(crate::bfg::BfgStateMachine::new(0)),
+            bfg_threads_enabled: cfg.bfg_threads_enabled,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
             l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
             rc_authoritative_reclaim: cfg.rc_authoritative_reclaim,
-            // Phase 4 Step 7: notifiers allocated regardless; the worker
+            // notifiers allocated regardless; the worker
             // threads are spawned conditionally below.
-            txg_quiesce_notifier: Arc::new(crate::db::txg_quiesce::QuiesceNotifier::new()),
-            txg_sync_notifier: Arc::new(crate::db::txg_sync::SyncNotifier::new()),
-            txg_quiesce: Mutex::new(None),
-            txg_sync: Mutex::new(None),
+            bfg_quiesce_notifier: Arc::new(crate::db::bfg_quiesce::QuiesceNotifier::new()),
+            bfg_sync_notifier: Arc::new(crate::db::bfg_sync::SyncNotifier::new()),
+            bfg_quiesce: Mutex::new(None),
+            bfg_sync: Mutex::new(None),
             buffer_applied_watermark: AtomicU64::new(0),
             lifecycle_applied_watermark: AtomicU64::new(0),
             lifecycle_journal,
             pending_sync_tasks: Mutex::new(Vec::new()),
         };
-        // The refcount fold is inline + per-TXG-slot (no background rc
+        // The refcount fold is inline + per-BFG-slot (no background rc
         // drainer to spawn — see `refcount::shard`).
         // Spawn the async dedup-index drainers (no-op when
         // `dedup_drainer_enabled = false`). Fresh DB → no replay.
@@ -249,20 +249,20 @@ impl Db {
         if async_reclaim_enabled {
             db.start_async_reclaim(async_reclaim_params);
         }
-        // ZFS port Phase 3b: spawn the background livelist-condense worker
+        // BFG: spawn the background livelist-condense worker
         // (independent of async_reclaim). Drop stops it before page_store /
         // page_cache teardown.
         if livelist_condense_min_segments > 0 {
             db.start_livelist_condense(livelist_condense_params);
         }
-        // ZFS-TXG-clone Phase 4 Step 8: the background L2P drainer
-        // is now the `TxgSyncThread`, spawned below when
-        // `txg_threads_enabled` is true. When the threads are off,
+        // BFG: the background L2P drainer
+        // is now the `BfgSyncThread`, spawned below when
+        // `bfg_threads_enabled` is true. When the threads are off,
         // `flush_with_gate`'s inline path drives the per-shard drain
         // via `force_compact_l2p_buffers` synchronously.
         let db = Arc::new(db);
-        if db.txg_threads_enabled {
-            Self::start_txg_threads(&db, cfg.txg_timeout_ms);
+        if db.bfg_threads_enabled {
+            Self::start_bfg_threads(&db, cfg.bfg_timeout_ms);
         }
         // The sole production trigger for FreePbas-emitting PBA reclaim.
         // Started after `Arc::new` so it can hold a `Weak<Db>`; Drop joins
@@ -297,7 +297,7 @@ impl Db {
         cfg: Config,
         faults: Arc<FaultController>,
     ) -> Result<Arc<Self>> {
-        validate_phase5_refcount_mode(&cfg)?;
+        validate_rc_neutral_refcount_mode(&cfg)?;
         let pages_path = page_file(&cfg.path);
         let page_store = Arc::new(if cfg.rebuild_free_list_on_open {
             PageStore::open_with_grow_chunk_and_bg_cap(
@@ -350,9 +350,9 @@ impl Db {
 
         let next_gen = manifest.checkpoint_lsn.max(1) + 1;
 
-        // Phase 7 commit 8: open every volume recorded in the manifest.
+        // commit 8: open every volume recorded in the manifest.
         // Earlier versions of the manifest (v3/v4/v5) are not readable —
-        // Phase 7 is fresh-install only, and `Manifest::decode` rejects
+        // is fresh-install only, and `Manifest::decode` rejects
         // them at the page-layer.
         // v11 manifest persists per-shard `durable_seq` so we can
         // restore each shard's `last_flushed_lsn` atomic
@@ -421,7 +421,7 @@ impl Db {
             cfg.dedup_drainer_enabled,
         )?);
 
-        // Buffer-as-sole-journal Phase D.5b retired the WAL writer.
+        // Buffer-as-sole-journal lifecycle journal cutover retired the WAL writer.
         // Recovery now starts from `manifest.checkpoint_lsn` (the last
         // durable manifest commit) and folds the lifecycle journal
         // forward; data-plane state is rebuilt from onyx's LV2 buffer
@@ -429,15 +429,15 @@ impl Db {
         // about lifecycle records sitting above the manifest
         // watermark.
         //
-        // ZFS-TXG-clone Phase 4 Step 8a: capture the durable TXG so
-        // every replayed lifecycle record folds into `checkpoint_txg
-        // + 1` — the Open TXG the new TxgStateMachine will be
+        // BFG: capture the durable BFG so
+        // every replayed lifecycle record folds into `checkpoint_bfg
+        // + 1` — the Open BFG the new BfgStateMachine will be
         // constructed with below.
-        let replay_open_txg = manifest.checkpoint_txg + 1;
+        let replay_open_bfg = manifest.checkpoint_bfg + 1;
         let mut replayed_drop = false;
         let mut mutated_volumes = false;
 
-        // Buffer-as-sole-journal Phase C.4: replay any uncovered
+        // Buffer-as-sole-journal lifecycle replay: replay any uncovered
         // lifecycle records into the freshly-opened in-memory state.
         // Lifecycle records carry a monotonic `seq` but not an LSN; we
         // synthesise replay LSNs sequentially starting from
@@ -463,7 +463,7 @@ impl Db {
                 &faults,
                 metrics.clone(),
                 last_applied,
-                replay_open_txg,
+                replay_open_bfg,
                 cfg.l2p_buffer_enabled,
                 cfg.rc_authoritative_reclaim,
                 from_seq,
@@ -557,7 +557,7 @@ impl Db {
                 Some(last_applied),
             )?;
             manifest.checkpoint_lsn = last_applied;
-            // Phase C.4: stamp the lifecycle replay watermark alongside
+            // lifecycle replay: stamp the lifecycle replay watermark alongside
             // `checkpoint_lsn` so any lifecycle records we just folded
             // in are now "covered" by the durable manifest. Without
             // this stamp the next open would re-replay the same
@@ -569,14 +569,13 @@ impl Db {
             commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
             commit_refcount_checkpoint(&refcount_shards, last_applied.max(1) + 1)?;
 
-            // ZFS port (H1 tripwire): this commit advanced `checkpoint_lsn` to
-            // `last_applied` and made every L2P root durable. ZFS-faithfully,
-            // every page-death those durable roots imply (`death_lsn <=
-            // last_applied`) MUST already be sealed durably in this same commit.
-            // If a volume still holds such a death only in its volatile
+            // This commit advanced `checkpoint_lsn` to `last_applied` and made
+            // every L2P root durable. Every page-death those durable roots
+            // imply (`death_lsn <= last_applied`) must already be sealed durably
+            // in this same commit. If a volume still holds such a death only in its volatile
             // accumulator, the durable deadlist is INCOMPLETE w.r.t. the durable
             // roots and a later `drop_snapshot` fires a COMPLETENESS HOLE. This
-            // is the recovery-commit analogue of the drop_snapshot G1 tripwire;
+            // is the recovery-commit analogue of the drop_snapshot accumulator-seal tripwire;
             // it converts the (multi-hour-soak-only) latent leak into a
             // deterministic in-process failure.
             #[cfg(debug_assertions)]
@@ -660,7 +659,7 @@ impl Db {
         // AFTER the post-replay commit + orphan reclaim (which consume the
         // un-bumped `last_applied` as a durable_seq override / reclaim
         // generation) and BEFORE the dedup lanes, `lsn_alloc`,
-        // `last_applied_lsn`, and `txg.record_lsn` (all seeded from the
+        // `last_applied_lsn`, and `bfg.record_lsn` (all seeded from the
         // bumped value). In the replayed path the post-replay commit set
         // every shard's durable_seq to `last_applied`, so the frontier
         // equals `last_applied` and the bump is a no-op; it only acts on the
@@ -672,7 +671,7 @@ impl Db {
 
         // Capture before `manifest` is moved into `ManifestState` below.
         let manifest_dedup_shards = manifest.dedup_shards as usize;
-        let manifest_checkpoint_txg = manifest.checkpoint_txg;
+        let manifest_checkpoint_bfg = manifest.checkpoint_bfg;
         let drainer_cfg = cfg.clone();
         let metrics_for_drainers = metrics.clone();
         let page_store_for_writeback = page_store.clone();
@@ -760,21 +759,21 @@ impl Db {
             deferred_outcomes,
             commit_deferred_outcomes_enabled: cfg.commit_deferred_outcomes_enabled,
             wal_async_commits_enabled: cfg.wal_async_commits_enabled,
-            // Phase 4 Step 4: resume TXG accounting at the manifest's last
-            // synced TXG. open_txg will be checkpoint_txg + 1 — replayed
-            // ops fold into that TXG so the next quiesce/sync persists
-            // them with a fresh checkpoint_txg.
-            txg: Arc::new(crate::txg::TxgStateMachine::new(manifest_checkpoint_txg)),
-            txg_threads_enabled: cfg.txg_threads_enabled,
+            // resume BFG accounting at the manifest's last
+            // synced BFG. open_bfg will be checkpoint_bfg + 1 — replayed
+            // ops fold into that BFG so the next quiesce/sync persists
+            // them with a fresh checkpoint_bfg.
+            bfg: Arc::new(crate::bfg::BfgStateMachine::new(manifest_checkpoint_bfg)),
+            bfg_threads_enabled: cfg.bfg_threads_enabled,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
             l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
             rc_authoritative_reclaim: cfg.rc_authoritative_reclaim,
-            txg_quiesce_notifier: Arc::new(crate::db::txg_quiesce::QuiesceNotifier::new()),
-            txg_sync_notifier: Arc::new(crate::db::txg_sync::SyncNotifier::new()),
-            txg_quiesce: Mutex::new(None),
-            txg_sync: Mutex::new(None),
+            bfg_quiesce_notifier: Arc::new(crate::db::bfg_quiesce::QuiesceNotifier::new()),
+            bfg_sync_notifier: Arc::new(crate::db::bfg_sync::SyncNotifier::new()),
+            bfg_quiesce: Mutex::new(None),
+            bfg_sync: Mutex::new(None),
             buffer_applied_watermark: AtomicU64::new(0),
-            // Phase C.4: resume the lifecycle watermark from whatever
+            // lifecycle replay: resume the lifecycle watermark from whatever
             // the post-replay manifest commit just persisted. Future
             // lifecycle ops `fetch_max` onto this value so the next
             // checkpoint stamps a monotonic `lifecycle_replay_seq`
@@ -783,13 +782,13 @@ impl Db {
             lifecycle_journal,
             pending_sync_tasks: Mutex::new(Vec::new()),
         };
-        // Stamp `slot_max_lsn(open_txg)` with the post-replay
+        // Stamp `slot_max_lsn(open_bfg)` with the post-replay
         // `last_applied`. `apply_replay_batch` and `apply_op_bare` fold
-        // every replayed op into `manifest.checkpoint_txg + 1` without
-        // going through `TxgGuard::record_lsn`, so without this stamp
-        // `slot_max_lsn(open_txg)` would be 0 — which would regress
+        // every replayed op into `manifest.checkpoint_bfg + 1` without
+        // going through `BfgGuard::record_lsn`, so without this stamp
+        // `slot_max_lsn(open_bfg)` would be 0 — which would regress
         // `manifest.checkpoint_lsn` to 0 on the next flush body that
-        // reads `wal_checkpoint = self.txg.slot_max_lsn(txg)`.
+        // reads `wal_checkpoint = self.bfg.slot_max_lsn(bfg)`.
         //
         // Stamping is safe before any commit thread starts: the
         // commit path's own `record_lsn` is max-monotonic, so a later
@@ -798,9 +797,9 @@ impl Db {
         // manifest.checkpoint_lsn`); that keeps the very first flush's
         // `wal_checkpoint` >= the durable manifest's `checkpoint_lsn`
         // even on a clean open with no commits yet.
-        db.txg.record_lsn(db.txg.open_txg(), last_applied);
+        db.bfg.record_lsn(db.bfg.open_bfg(), last_applied);
         db.recompute_all_snap_infos();
-        // The refcount fold is inline + per-TXG-slot (no background rc
+        // The refcount fold is inline + per-BFG-slot (no background rc
         // drainer — see `refcount::shard`).
         // Spawn the async dedup-index drainers AFTER replay (so they
         // never observe mid-replay state). No-op when
@@ -825,23 +824,23 @@ impl Db {
         if async_reclaim_enabled {
             db.start_async_reclaim(async_reclaim_params);
         }
-        // ZFS port Phase 3b: spawn the background livelist-condense worker
+        // BFG: spawn the background livelist-condense worker
         // (independent of async_reclaim). Drop stops it before page_store /
         // page_cache teardown.
         if livelist_condense_min_segments > 0 {
             db.start_livelist_condense(livelist_condense_params);
         }
-        // ZFS-TXG-clone Phase 4 Step 8: the background L2P drainer
-        // is now the `TxgSyncThread`, spawned below when
-        // `txg_threads_enabled` is true. With the legacy
+        // BFG: the background L2P drainer
+        // is now the `BfgSyncThread`, spawned below when
+        // `bfg_threads_enabled` is true. With the legacy
         // `L2pCompactor` retired, the post-replay flush at the
         // bottom of `open_with_config_and_faults` is the sole
         // initial drainer; subsequent drains come from either the
         // sync thread (threads on) or `flush_with_gate`'s inline
         // path (threads off).
         let db = Arc::new(db);
-        if db.txg_threads_enabled {
-            Self::start_txg_threads(&db, cfg.txg_timeout_ms);
+        if db.bfg_threads_enabled {
+            Self::start_bfg_threads(&db, cfg.bfg_timeout_ms);
         }
         // The sole production trigger for FreePbas-emitting PBA reclaim.
         // Started after `Arc::new` (so it can hold a `Weak<Db>`) and after
@@ -858,10 +857,10 @@ impl Db {
     }
 }
 
-fn validate_phase5_refcount_mode(cfg: &Config) -> Result<()> {
+fn validate_rc_neutral_refcount_mode(cfg: &Config) -> Result<()> {
     if !cfg.lineage_gc_emit_freepbas {
         return Err(MetaDbError::InvalidArgument(
-            "lineage_gc_emit_freepbas=false is no longer supported: Phase 5 rc-neutral \
+            "lineage_gc_emit_freepbas=false is no longer supported: rc-neutral \
              L2P remaps require Lineage GC to emit FreePbas retire events"
                 .into(),
         ));
@@ -890,11 +889,11 @@ struct LifecycleReplayOutcome {
     replayed_drop_snapshot: bool,
 }
 
-/// Phase C.4: replay every lifecycle-log record above
+/// lifecycle replay: replay every lifecycle-log record above
 /// `manifest.lifecycle_replay_seq` against the post-WAL-replay
 /// in-memory state. Mirrors the per-op dispatch in the WAL-replay
 /// closure for the variants that have migrated to the lifecycle
-/// journal in Phase C.3 (CreateVolume / DropVolume / CloneVolume /
+/// journal in lifecycle journal split (CreateVolume / DropVolume / CloneVolume /
 /// DropSnapshot / PromotionChunk / PromotionComplete).
 ///
 /// LSN assignment: each record gets `starting_lsn + i + 1` (`i` = its
@@ -917,7 +916,7 @@ fn replay_lifecycle_journal_into(
     faults: &Arc<FaultController>,
     metrics: Arc<MetaMetrics>,
     starting_lsn: Lsn,
-    replay_open_txg: crate::types::Txg,
+    replay_open_bfg: crate::types::Bfg,
     l2p_buffer_enabled: bool,
     rc_authoritative: bool,
     from_seq: u64,
@@ -954,7 +953,7 @@ fn replay_lifecycle_journal_into(
             faults,
             &metrics,
             lsn,
-            replay_open_txg,
+            replay_open_bfg,
             l2p_buffer_enabled,
             rc_authoritative,
             &op,
@@ -971,7 +970,7 @@ fn apply_lifecycle_record_replay(
     manifest: &mut Manifest,
     volumes: &mut HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
-    // ZFS port S3: page-rc deleted, so the clone/drop replay arms no longer
+    // BFG: page-rc deleted, so the clone/drop replay arms no longer
     // consult these. Kept in the signature for call-site stability.
     _dedup_index: &Arc<crate::dedup::DedupIndex>,
     page_store: &Arc<PageStore>,
@@ -979,7 +978,7 @@ fn apply_lifecycle_record_replay(
     _faults: &Arc<FaultController>,
     metrics: &Arc<MetaMetrics>,
     lsn: Lsn,
-    replay_open_txg: crate::types::Txg,
+    replay_open_bfg: crate::types::Bfg,
     l2p_buffer_enabled: bool,
     rc_authoritative: bool,
     op: &crate::lifecycle_log::LifecycleOp,
@@ -1037,7 +1036,7 @@ fn apply_lifecycle_record_replay(
             // NB: this arm is normally a no-op on replay — `drop_volume`
             // commits the volume-removed manifest BEFORE the WAL submit, so
             // `volumes.contains_key(ord)` is false here and the crash backstop
-            // is `reclaim_orphan_pages`. The S2 `free_pages` only ever drives
+            // is `reclaim_orphan_pages`. The free-set `free_pages` only ever drives
             // the live path; it is threaded through for completeness.
             if volumes.contains_key(ord) {
                 apply_drop_volume(
@@ -1058,7 +1057,7 @@ fn apply_lifecycle_record_replay(
             src_shard_roots,
         } => {
             if !volumes.contains_key(new_ord) {
-                // ZFS port S3: per-L2P-page refcounting is deleted, so the
+                // BFG: per-L2P-page refcounting is deleted, so the
                 // clone replay no longer increfs the source roots (and there
                 // is no stale-rc buffer hazard to sweep — the source pages are
                 // unmodified). Just rebuild the clone's shards pointing at the
@@ -1113,7 +1112,7 @@ fn apply_lifecycle_record_replay(
                     l2p_shard_roots: actual_roots,
                     l2p_shard_durable_seq: durable_seqs,
                     created_lsn: lsn,
-                    // v19: sticky clone-lineage flag (ZFS port Phase 3b).
+                    // v19: sticky clone-lineage flag (BFG).
                     flags: crate::manifest::VOLUME_FLAG_CLONE_LINEAGE,
                     dead_list_head_pid: crate::types::NULL_PAGE,
                     dead_list_tail_pid: crate::types::NULL_PAGE,
@@ -1142,7 +1141,7 @@ fn apply_lifecycle_record_replay(
         } => {
             // Drive the same page-free + per-pba decref the live
             // `Db::drop_snapshot` path uses. Page generations + the page-rc
-            // `stage` replay-skip gate idempotency across re-applies. S2:
+            // `stage` replay-skip gate idempotency across re-applies. free-set:
             // `free_pages` carries the frozen authoritative free-set (Some
             // for non-clone drops, None for clone-involved); the apply core
             // honours it exactly as on the live path.
@@ -1154,13 +1153,13 @@ fn apply_lifecycle_record_replay(
                 pba_decrefs,
                 free_pages.as_deref(),
             )?;
-            // Crash-recovery completeness (G2): re-apply the page-deadlist
+            // Crash-recovery completeness (merge-reanchor): re-apply the page-deadlist
             // MERGE re-anchor from the op ATOMICALLY with the snapshot removal
             // below — mirrors the live `drop_snapshot`. The carried segment is
             // durable (synced before the op). Head → bump the source volume's
             // HEAD anchors (+ its manifest entry; the post-replay
             // `refresh_manifest_entries` also folds the atomics); Snapshot →
-            // set the inheritor snapshot's tail. (G1's accumulator seal rode
+            // set the inheritor snapshot's tail. (accumulator-seal's accumulator seal rode
             // the pre-WAL commit, so it is already durable.)
             if let Some((target, anchor)) = merge {
                 use std::sync::atomic::Ordering;
@@ -1204,7 +1203,7 @@ fn apply_lifecycle_record_replay(
                 volumes,
                 refcount_shards,
                 lsn,
-                replay_open_txg,
+                replay_open_bfg,
                 *vol_ord,
                 pba_increfs,
                 *next_cursor,
@@ -1218,7 +1217,7 @@ fn apply_lifecycle_record_replay(
             start_lba,
             count,
         } => {
-            // Phase D.1 replay: the record only carries the range —
+            // lifecycle discard support replay: the record only carries the range —
             // rescan the L2P at apply time to rebuild the captured
             // list, then drive the same `apply_l2p_range_delete` the
             // live path uses. The rescan naturally observes whatever
@@ -1254,7 +1253,7 @@ fn apply_lifecycle_record_replay(
                     volumes,
                     refcount_shards,
                     lsn,
-                    replay_open_txg,
+                    replay_open_bfg,
                     *vol_ord,
                     &captured,
                     &snap_lookup(*vol_ord),
@@ -1262,12 +1261,11 @@ fn apply_lifecycle_record_replay(
                 )?;
             }
         }
-        // `take_snapshot` is manifest-only (ZFS `dsl_sync_task` port folds
-        // the snapshot-root incref INSIDE the take's own sync cycle, atomic
-        // with the manifest commit — no lifecycle-journal record). A
-        // `TakeSnapshot` record on disk therefore indicates the on-disk
-        // schema has moved ahead of this binary; surface it as corruption
-        // rather than silently misapplying.
+        // `take_snapshot` is manifest-only: the snapshot-root incref folds
+        // inside the take's own BFG sync cycle, atomic with the manifest commit,
+        // with no lifecycle-journal record. A `TakeSnapshot` record on disk
+        // therefore indicates the on-disk schema has moved ahead of this binary;
+        // surface it as corruption rather than silently misapplying.
         LifecycleOp::TakeSnapshot { .. } => {
             return Err(MetaDbError::Corruption(format!(
                 "lifecycle replay: TakeSnapshot (tag 0x{:02x}) is not \

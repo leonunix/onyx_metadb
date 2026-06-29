@@ -91,8 +91,8 @@ use crate::types::{Lsn, NULL_PAGE, PageId};
 /// are a big-endian `u64` birth_lsn — the WAL LSN at which the PBA was
 /// first L2P-pointed by this volume. Stamped at apply time when
 /// incoming birth_lsn is `0`; preserved otherwise (promote / scanner
-/// paths that carry the source PBA's birth). Powers Phase 2's per-
-/// volume dead-list emission ([[no-refcount-hot-path-design]]).
+/// paths that carry the source PBA's birth). Powers 's per-
+/// volume dead-list emission ().
 pub const LEAF_VALUE_SIZE: usize = 44;
 
 /// Byte offset within an `L2pValue` where the 8-byte big-endian commit
@@ -351,7 +351,7 @@ pub fn leaf_entry_count(page: &Page) -> u16 {
 /// If the unit dict is full when a new unit would be appended, this
 /// function runs `compact_in_place` to drop dead unit entries and
 /// retries. In v5 the payload-bound cap is `MAX_UNITS_PER_LEAF = 128`
-/// (= LEAF_ENTRY_COUNT, restored after Phase 1 v4 tightened it to 110
+/// (= LEAF_ENTRY_COUNT, restored after v4 tightened it to 110
 /// to make room for `birth_delta`); `compact_in_place` after a typical
 /// clear cycle frees enough room for one more unit. A retry that still
 /// fails surfaces as `Corruption`.

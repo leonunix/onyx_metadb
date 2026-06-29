@@ -1,4 +1,4 @@
-//! Buffer-as-sole-journal Phase C: commit_ops smoke tests in Buffer mode.
+//! Buffer-as-sole-journal buffer-journal replay: commit_ops smoke tests in Buffer mode.
 //!
 //! In Buffer mode the hot commit path skips `wal.submit` entirely.
 //! These tests pin the contract from the metadb client side:
@@ -89,9 +89,9 @@ fn buffer_mode_manifest_watermark_only_moves_when_published() {
 #[test]
 fn buffer_mode_data_plane_commits_do_not_grow_wal_records() {
     // Smoke check that data-plane commits in Buffer mode don't write
-    // WAL records. Phase C.3 also moves lifecycle ops out of the WAL,
+    // WAL records. lifecycle journal split also moves lifecycle ops out of the WAL,
     // so after a fresh `create_volume` the WAL counter is still 0 —
-    // no need to anchor on a post-setup baseline. Phase D.1 also
+    // no need to anchor on a post-setup baseline. lifecycle discard support also
     // moves `range_delete` (the last data-plane WAL writer) onto the
     // lifecycle journal, so its commit must not grow `wal_records`
     // either.
@@ -101,7 +101,7 @@ fn buffer_mode_data_plane_commits_do_not_grow_wal_records() {
     assert_eq!(
         db.metrics_snapshot().wal_records,
         0,
-        "Phase C.3: Buffer-mode create_volume must not write a WAL record"
+        "Buffer-mode create_volume must not write a WAL record"
     );
 
     for k in 0..32u64 {
@@ -115,14 +115,14 @@ fn buffer_mode_data_plane_commits_do_not_grow_wal_records() {
         "Buffer-mode data-plane commits must not grow wal_records (after: {after})"
     );
 
-    // Phase D.1: range_delete now writes a LifecycleOp::Discard
+    // lifecycle discard support: range_delete now writes a LifecycleOp::Discard
     // instead of a WalOp::L2pRangeDelete. The WAL record counter
     // must stay at zero.
     let _ = db.range_delete(ord, 0, 32).unwrap();
     let after_discard = db.metrics_snapshot().wal_records;
     assert_eq!(
         after_discard, 0,
-        "Phase D.1: Buffer-mode range_delete must not grow wal_records \
+        "Buffer-mode range_delete must not grow wal_records \
          (before: {after}, after: {after_discard})"
     );
     // The discard must have been visible to readers and persisted
@@ -134,7 +134,7 @@ fn buffer_mode_data_plane_commits_do_not_grow_wal_records() {
 
 #[test]
 fn buffer_mode_range_delete_grows_lifecycle_journal() {
-    // Phase D.1: `range_delete` in Buffer mode emits at least one
+    // lifecycle discard support: `range_delete` in Buffer mode emits at least one
     // `LifecycleOp::Discard` record. The watermark advances by the
     // number of Discard records written (typical TRIM ranges fit in
     // one `u32::MAX` chunk, so the delta is exactly 1).
@@ -158,7 +158,7 @@ fn buffer_mode_range_delete_grows_lifecycle_journal() {
 
 #[test]
 fn buffer_mode_lifecycle_ops_grow_lifecycle_journal_only() {
-    // Phase C.3: each lifecycle op should bump
+    // lifecycle journal split: each lifecycle op should bump
     // `lifecycle_applied_watermark` by exactly one and leave
     // `wal_records` at zero. We exercise create + clone + snapshot +
     // drop_snapshot + drop_volume from a single Db instance so the
@@ -188,7 +188,7 @@ fn buffer_mode_lifecycle_ops_grow_lifecycle_journal_only() {
     assert_eq!(
         db.lifecycle_applied_watermark(),
         after_create,
-        "take_snapshot is still manifest-only in Phase C.3"
+        "take_snapshot is still manifest-only"
     );
 
     // clone_volume from the live snapshot.
@@ -216,7 +216,7 @@ fn buffer_mode_lifecycle_ops_grow_lifecycle_journal_only() {
 
 #[test]
 fn buffer_mode_promotion_ops_grow_lifecycle_journal_only() {
-    // Phase C.3 / D.5b: promotion records must land in the lifecycle
+    // Promotion records must land in the lifecycle
     // journal in Buffer mode (no WAL exists). The clone scenario gives
     // us a volume with `parent_vol_ord` set so the `commit_promotion_*`
     // helpers drive a real apply through the lifecycle journal.
@@ -255,7 +255,7 @@ fn buffer_mode_promotion_ops_grow_lifecycle_journal_only() {
 fn buffer_mode_lifecycle_watermark_persists_through_flush() {
     // The next `flush` after each lifecycle op must copy
     // `lifecycle_applied_watermark` into `manifest.lifecycle_replay_seq`
-    // so a re-open (Phase C.4) can decide which records are already
+    // so a re-open (lifecycle replay) can decide which records are already
     // covered by the manifest checkpoint.
     let dir = TempDir::new().unwrap();
     let db = Db::create_with_config(buffer_cfg(&dir)).unwrap();

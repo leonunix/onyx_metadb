@@ -10,10 +10,10 @@ pub struct AffinityConfig {
     /// Same syntax as the other knobs ("0-3,8,12-15"). Leave empty to
     /// inherit the OS default.
     pub refcount_drainer_cpus: String,
-    /// CPU set for the ZFS-TXG-clone Phase 4 background workers — the
-    /// `TxgSyncThread` (single serial thread that drains the syncing
-    /// TXG slot per shard, writes RC + L2P checkpoint pages, fsyncs,
-    /// commits the manifest) plus the `TxgQuiesceThread` (also a
+    /// CPU set for the BFG background workers — the
+    /// `BfgSyncThread` (single serial thread that drains the syncing
+    /// BFG slot per shard, writes RC + L2P checkpoint pages, fsyncs,
+    /// commits the manifest) plus the `BfgQuiesceThread` (also a
     /// single thread, on the same role).
     ///
     /// Field name kept for backward compatibility with operator
@@ -47,13 +47,13 @@ pub enum ThreadRole {
     /// drainer with dedup work on the right NUMA node without a new
     /// affinity config knob.
     DedupDrainer,
-    /// ZFS-TXG-clone Phase 4 sync + quiesce workers. Bound to a small
+    /// BFG sync + quiesce workers. Bound to a small
     /// dedicated CPU set so the kernel scheduler cannot co-locate
     /// them on an apply-lane CPU during a flush window. Replaces the
     /// retired `L2pCompactor` role; the affinity config field
     /// (`l2p_compactor_cpus`) keeps its legacy name for backward
     /// compatibility with operator configs.
-    TxgSync,
+    BfgSync,
     /// io_uring submitter thread. With pool>1 each ordinal binds to a
     /// distinct CPU so the kernel mq-block layer routes its IO to a
     /// different NVMe hardware queue. Without pinning, multiple
@@ -69,7 +69,7 @@ struct AffinityLayout {
     refcount_apply: CpuSet,
     dedup_apply: CpuSet,
     refcount_drainer: CpuSet,
-    /// Backs `ThreadRole::TxgSync`. Field name kept for backward
+    /// Backs `ThreadRole::BfgSync`. Field name kept for backward
     /// compatibility with the `l2p_compactor_cpus` config knob the
     /// retired `L2pCompactor` used.
     l2p_compactor: CpuSet,
@@ -96,7 +96,7 @@ pub struct NodePod {
 /// `AffinityConfig`: shard-indexed roles bind to their shard's pod CPU SET
 /// (not a single CPU) and set their own memory policy to prefer the pod's
 /// node so per-shard structures first-touch locally; singletons (WAL,
-/// TxgSync, IoSubmitter) bind to the home pod.
+/// BfgSync, IoSubmitter) bind to the home pod.
 #[derive(Clone, Debug)]
 pub struct NodeAffinityConfig {
     pub pods: Vec<NodePod>,
@@ -124,7 +124,7 @@ impl NodeAffinityConfig {
             ThreadRole::DedupApply | ThreadRole::DedupDrainer => {
                 self.dedup_shard_pods[ordinal % self.dedup_shard_pods.len().max(1)]
             }
-            ThreadRole::Wal | ThreadRole::TxgSync | ThreadRole::IoSubmitter => self.home_pod,
+            ThreadRole::Wal | ThreadRole::BfgSync | ThreadRole::IoSubmitter => self.home_pod,
         };
         &self.pods[idx.min(self.pods.len() - 1)]
     }
@@ -161,11 +161,11 @@ pub(crate) fn bind_current(role: ThreadRole, ordinal: usize) {
     }
 }
 
-/// Placement for the parallel L2P TXG-drain workers (one per shard,
-/// scope-spawned from the pinned `metadb-txg-sync` thread). Under NUMA
+/// Placement for the parallel L2P BFG-drain workers (one per shard,
+/// scope-spawned from the pinned `metadb-bfg-sync` thread). Under NUMA
 /// partition each worker binds to its shard's pod so the COW fold touches
-/// node-local pages; otherwise fall back to the legacy "widen to all CPUs"
-/// (the ZFS `dp_sync_taskq` analog) to escape the inherited single-CPU pin.
+/// node-local pages; otherwise widen to all CPUs to escape the inherited
+/// single-CPU pin.
 pub(crate) fn bind_for_l2p_drain(shard_idx: usize) {
     if let Some(nodes) = NODE_LAYOUT.get() {
         if !nodes.pods.is_empty() {
@@ -209,7 +209,7 @@ impl AffinityLayout {
             ThreadRole::DedupApply => &self.dedup_apply,
             ThreadRole::DedupDrainer => &self.dedup_apply,
             ThreadRole::RefcountDrainer => &self.refcount_drainer,
-            ThreadRole::TxgSync => &self.l2p_compactor,
+            ThreadRole::BfgSync => &self.l2p_compactor,
             ThreadRole::IoSubmitter => &self.io_submitter,
         }
     }
@@ -359,9 +359,8 @@ fn set_thread_preferred_node(_node: usize) -> std::io::Result<()> {
 /// Widen the calling thread's CPU affinity to ALL CPUs, clearing any
 /// inherited single-CPU pin. Worker threads spawned from a `bind_current`-
 /// pinned parent (e.g. the parallel L2P drain fanned out from the pinned
-/// `metadb-txg-sync` thread) inherit that one-CPU mask and would otherwise
-/// pile onto a single core instead of spreading — the ZFS `dp_sync_taskq`
-/// runs its sync threads at normal priority across all CPUs, not pinned.
+/// `metadb-bfg-sync` thread) inherit that one-CPU mask and would otherwise
+/// pile onto a single core instead of spreading.
 pub(crate) fn unbind_current() {
     if let Err(err) = set_current_all_cpus() {
         tracing::warn!(error = %err, "failed to widen metadb thread CPU affinity");

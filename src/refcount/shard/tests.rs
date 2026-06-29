@@ -10,8 +10,8 @@ fn make_shard() -> (TempDir, RcShard) {
     (dir, s)
 }
 
-// Most tests don't care which TXG a stage lands in — use slot 0 (txg=0).
-const T0: crate::types::Txg = 0;
+// Most tests don't care which BFG a stage lands in — use slot 0 (bfg=0).
+const T0: crate::types::Bfg = 0;
 
 #[test]
 fn stage_then_get_sees_pending() {
@@ -258,12 +258,12 @@ fn many_ops_one_shard_correctness() {
     }
 }
 
-// ── TXG-slot ring tests ──────────────────────────────────────────────
+// ── BFG-slot ring tests ──────────────────────────────────────────────
 
 #[test]
-fn stage_routes_to_txg_slot_and_reads_sum_across_slots() {
+fn stage_routes_to_bfg_slot_and_reads_sum_across_slots() {
     let (_d, s) = make_shard();
-    // Two TXGs touch the same PBA, landing in different ring slots.
+    // Two BFGs touch the same PBA, landing in different ring slots.
     s.stage(0, 10, 1, 100).unwrap(); // slot 0
     s.stage(1, 10, 1, 200).unwrap(); // slot 1
     // The deltas live in distinct slots…
@@ -280,7 +280,7 @@ fn begin_checkpoint_folds_only_the_syncing_slot() {
     s.stage(0, 10, 3, 100).unwrap(); // slot 0
     s.stage(1, 20, 5, 200).unwrap(); // slot 1
 
-    // Fold ONLY slot 0 (txg=0).
+    // Fold ONLY slot 0 (bfg=0).
     let ckpt0 = s.begin_checkpoint(0).unwrap();
     assert!(!ckpt0.is_empty());
     // Slot 0 is now empty; slot 1 still pending.
@@ -290,7 +290,7 @@ fn begin_checkpoint_folds_only_the_syncing_slot() {
     assert_eq!(s.get(10).unwrap(), 3);
     assert_eq!(s.get(20).unwrap(), 5);
 
-    // Fold slot 1 (txg=1).
+    // Fold slot 1 (bfg=1).
     let ckpt1 = s.begin_checkpoint(1).unwrap();
     assert!(!ckpt1.is_empty());
     assert_eq!(s.get(20).unwrap(), 5);
@@ -299,25 +299,25 @@ fn begin_checkpoint_folds_only_the_syncing_slot() {
 #[test]
 fn begin_checkpoint_empty_slot_is_no_op() {
     let (_d, s) = make_shard();
-    // No deltas for txg=2's slot → empty checkpoint.
+    // No deltas for bfg=2's slot → empty checkpoint.
     let ckpt = s.begin_checkpoint(2).unwrap();
     assert!(ckpt.is_empty());
 }
 
 #[test]
-fn cross_txg_incref_then_decref_same_pba_folds_to_correct_count() {
+fn cross_bfg_incref_then_decref_same_pba_folds_to_correct_count() {
     let (_d, s) = make_shard();
-    // TXG 0 increfs P to 1; TXG 1 decrefs it back to 0.
+    // BFG 0 increfs P to 1; BFG 1 decrefs it back to 0.
     s.stage(0, 42, 1, 100).unwrap();
     s.stage(1, 42, -1, 200).unwrap();
     // Cumulative read across both slots = 0.
     assert_eq!(s.get(42).unwrap(), 0);
 
-    // Fold txg 0 → array has rc=1 for P, slot 1 still holds the -1.
+    // Fold bfg 0 → array has rc=1 for P, slot 1 still holds the -1.
     let _c0 = s.begin_checkpoint(0).unwrap();
     assert_eq!(s.get(42).unwrap(), 0, "array(1) + slot1(-1) = 0");
 
-    // Fold txg 1 → the decref lands, rc back to 0.
+    // Fold bfg 1 → the decref lands, rc back to 0.
     let _c1 = s.begin_checkpoint(1).unwrap();
     assert_eq!(s.get(42).unwrap(), 0);
     // Persist + reopen-style check via flush: still 0.
@@ -327,14 +327,14 @@ fn cross_txg_incref_then_decref_same_pba_folds_to_correct_count() {
 
 #[test]
 fn freed_pba_surfaces_on_cumulative_zero_not_per_slot() {
-    // P has a durable rc=1 (folded). A decref in a later TXG slot takes
+    // P has a durable rc=1 (folded). A decref in a later BFG slot takes
     // the cumulative to 0 → stage returns (1, 0) so the caller surfaces
     // freed_pba. The decref before fold reads the array base (1).
     let (_d, s) = make_shard();
     s.stage(0, 77, 1, 100).unwrap();
     s.begin_checkpoint(0).unwrap(); // P durable at rc=1
     assert_eq!(s.get(77).unwrap(), 1);
-    // Decref in TXG 1's slot.
+    // Decref in BFG 1's slot.
     assert_eq!(s.stage(1, 77, -1, 200).unwrap(), (1, 0));
     assert_eq!(s.get(77).unwrap(), 0);
 }
@@ -352,11 +352,11 @@ fn pending_delta_count_sums_all_slots() {
 /// `begin_checkpoint_all_slots(force=true)`) RE-APPLIES a decref the array
 /// already reflects, driving a still-live rc below its true floor.
 ///
-/// PBA-rc monotonicity guard (ZFS port Phase 4 S3 — replaces the page-rc
+/// PBA-rc monotonicity guard (BFG — replaces the page-rc
 /// force-fold premature-free repro `c8a6bfc`, which was deliberately RED until
 /// the page-rc array was deleted).
 ///
-/// The premature-free P0 lived in the now-DELETED per-L2P-page refcount array,
+/// The premature-free case lived in the now-DELETED per-L2P-page refcount array,
 /// whose `stage_unskippable` + buffer-drain radix-key ordering produced
 /// NON-MONOTONE deltas: a decref the array had already folded could reappear in
 /// a slot with `last_lsn <= page_generation`, and a force fold (`flush()` →
@@ -456,18 +456,18 @@ fn get_consistent_never_reads_spurious_zero_under_concurrent_fold() {
         let stop = stop.clone();
         std::thread::spawn(move || {
             let mut lsn = 100u64;
-            let mut txg = 1u64;
+            let mut bfg = 1u64;
             while !stop.load(Ordering::Relaxed) {
                 // decref 4 then fold (array 8 -> 4): net-decref publish.
-                s.stage(txg, pba, -4, lsn).unwrap();
+                s.stage(bfg, pba, -4, lsn).unwrap();
                 lsn += 1;
-                s.begin_checkpoint(txg).unwrap();
-                txg += 1;
+                s.begin_checkpoint(bfg).unwrap();
+                bfg += 1;
                 // incref 4 back then fold (array 4 -> 8).
-                s.stage(txg, pba, 4, lsn).unwrap();
+                s.stage(bfg, pba, 4, lsn).unwrap();
                 lsn += 1;
-                s.begin_checkpoint(txg).unwrap();
-                txg += 1;
+                s.begin_checkpoint(bfg).unwrap();
+                bfg += 1;
             }
         })
     };

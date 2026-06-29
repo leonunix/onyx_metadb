@@ -6,7 +6,7 @@ impl Db {
         metrics: Arc<MetaMetrics>,
         mut actions: Vec<RcApplyAction>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
     ) -> Result<RcBucketApplyResult> {
         let mut result = RcBucketApplyResult::default();
         if actions.is_empty() {
@@ -28,8 +28,7 @@ impl Db {
             // while another overwrites away from P). Summing the net delta and
             // staging ONCE is what keeps the freed-pba surfacing honest: a
             // serial +1 then -1 (or -1 then +1) would transiently cross rc==0
-            // and wrongly surface a still-referenced pba as freed. Pre-Phase-5
-            // `apply_l2p_remap` collapsed per-pba net delta for exactly this
+            // and wrongly surface a still-referenced pba as freed. Pre-            // `apply_l2p_remap` collapsed per-pba net delta for exactly this
             // reason. Standalone refcount ops (which need individual
             // `RefcountNew` outcomes) keep the per-action serial path below.
             let can_coalesce_remap = group.iter().all(|action| !action.standalone_refcount);
@@ -43,7 +42,7 @@ impl Db {
                 }
                 let op_started = std::time::Instant::now();
                 let op_idxs: Vec<usize> = group.iter().map(|a| a.op_idx).collect();
-                // P0 diagnostic: trace every coalesced stage call so we can
+                // case diagnostic: trace every coalesced stage call so we can
                 // confirm whether the +N at lsn=X actually reached the rc
                 // shard. Filter via
                 // `RUST_LOG=onyx_metadb::db::commit::rc_stage=trace`.
@@ -55,7 +54,7 @@ impl Db {
                     lsn,
                     "apply_refcount_bucket_to_tree: coalesced stage entry"
                 );
-                let (pre, new) = match rc.stage(txg, pba, delta, lsn) {
+                let (pre, new) = match rc.stage(bfg, pba, delta, lsn) {
                     Ok(r) => r,
                     Err(err) => {
                         tracing::error!(
@@ -97,7 +96,7 @@ impl Db {
 
             for action in group {
                 let op_started = std::time::Instant::now();
-                let (pre, new) = match rc.stage(txg, action.pba, action.delta, lsn) {
+                let (pre, new) = match rc.stage(bfg, action.pba, action.delta, lsn) {
                     Ok(r) => r,
                     Err(err) => {
                         tracing::error!(

@@ -111,7 +111,7 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
                         let src_snap_id = parse_part_u64(parts.next(), "clone src_snap_id")?;
                         db.clone_volume(src_snap_id).map(|ord| Ack::Volume(id, ord))
                     }
-                    // ZFS port Phase 3b: drive a clone's promotion walker to
+                    // BFG: drive a clone's promotion walker to
                     // completion so the soak exercises the promote→drop
                     // interleave the runtime clone-drop livelist shadow needs.
                     "PROMOTE" => {
@@ -479,7 +479,7 @@ fn audit_pba_refcounts(db: &Db) -> onyx_metadb::Result<()> {
     // consistent snapshot (no commit's rc delta or dedup put still in flight).
     db.wait_apply_idle();
 
-    // Phase-5 PBA refcount model: exclusive L2P writes are rc-NEUTRAL — a
+    // PBA refcount model: exclusive L2P writes are rc-NEUTRAL — a
     // block's liveness is determined by L2P reachability, not by refcount
     // (the structural `metadb-verify` pass below covers reachability). So the
     // ONLY sources of a nonzero PBA refcount are:
@@ -489,7 +489,7 @@ fn audit_pba_refcounts(db: &Db) -> onyx_metadb::Result<()> {
     //   (b) clone PROMOTION lineage — `apply_promotion_chunk` increfs the
     //       global PBA rc for the promoted clone's PBAs; NOT tracked per-PBA
     //       by this harness.
-    // The pre-Phase-5 audit modelled rc as one-per-live-L2P-value, so it
+    // The pre-audit modelled rc as one-per-live-L2P-value, so it
     // mismatched on every exclusive block (rc=0) AND every deduped block
     // (rc=1, no L2P witness) — which is why it had to be downgraded to a
     // noisy non-fatal warning. Rebuild `expected` from dedup membership and

@@ -1,9 +1,7 @@
 //! Configuration knobs exposed to the embedder.
 //!
 //! Defaults picked to match the values documented in `docs/DESIGN.md §11`.
-//! Each field has a phase at which it first becomes meaningful; fields that
-//! are not yet consumed by any code path are still listed here so the
-//! surface is stable across phases.
+//! Field docs describe the runtime behavior, not the historical rollout order.
 
 use std::path::PathBuf;
 
@@ -26,13 +24,10 @@ pub const MAX_APPLY_LANE_SHARDS: usize = 64;
 /// so it lives here as a compile-time constant rather than a config field.
 pub const PAGE_SIZE: usize = 4096;
 
-/// Buffer-as-sole-journal selector. Phase D retired the legacy Wal
-/// and Shadow modes; Buffer is the only remaining variant. The enum
-/// (and the [`Config::journal_mode`] field) survive as a single-arm
-/// shape so the on-disk config wire format is unchanged for onyx and
-/// the toml deserialiser still accepts the historical `"buffer"`
-/// string — future expansion (e.g. an inline-WAL hybrid for embedded
-/// callers) would re-introduce variants here.
+/// Buffer-as-sole-journal selector. `Buffer` is the only remaining variant.
+/// The enum and [`Config::journal_mode`] field survive as a single-arm shape so
+/// the on-disk config wire format is unchanged for onyx and the toml
+/// deserialiser still accepts the historical `"buffer"` string.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MetaDbJournalMode {
     /// Data-plane commits skip any metadb-side journal entirely. Onyx's
@@ -48,14 +43,11 @@ pub struct Config {
     /// Directory that will hold the page file, WAL segments, and manifest.
     pub path: PathBuf,
 
-    /// Number of shards per partition for the L2P B+tree. Consumed from
-    /// phase 4 onward.
+    /// Number of shards per partition for the L2P B+tree.
     ///
-    /// Phase 7 renames the concept from "partition" to "volume". The field
-    /// still exists for transitional tests, but new code should read
-    /// [`Config::shards_per_volume`] — the two resolve to the same numeric
-    /// value. After Phase 7's commit-path reshape lands, `shards_per_partition`
-    /// becomes a deprecated alias.
+    /// "Partition" is the old name for what the rest of metadb now calls a
+    /// volume. New code should read [`Config::shards_per_volume`]; both names
+    /// resolve to the same numeric value.
     pub shards_per_partition: u32,
 
     /// Upper bound on the number of volumes a single `Db` can hold. Used to
@@ -63,7 +55,7 @@ pub struct Config {
     /// configuration error, not a runtime drift. Defaults to 1024.
     pub max_volumes: u32,
 
-    /// Size of a single WAL segment before rotation. Consumed from phase 1.
+    /// Size of a single WAL segment before rotation.
     pub wal_segment_bytes: u64,
 
     /// Number of WAL writer lanes used by `Db`. Each lane has its own
@@ -80,12 +72,12 @@ pub struct Config {
     /// independent durable replay source until checkpoint. Default off.
     pub unlogged_commits_enabled: bool,
 
-    /// ZFS-TXG-clone Phase 1: when true (default), `commit_ops` detects
-    /// L2P-only commits (no rc / dedup buckets, all target L2P shards in
-    /// buffered mode) and applies their L2P buckets DIRECTLY on the caller
-    /// thread instead of enqueuing closures onto per-shard apply-lane
-    /// workers. Eliminates ~230 us of channel + queue-wait + worker
-    /// scheduling overhead per commit on the seqwrite hot path.
+    /// When true (default), `commit_ops` detects L2P-only commits (no rc /
+    /// dedup buckets, all target L2P shards in buffered mode) and applies their
+    /// L2P buckets directly on the caller thread instead of enqueueing closures
+    /// onto per-shard apply-lane workers. Eliminates ~230 us of channel +
+    /// queue-wait + worker scheduling overhead per commit on the seqwrite hot
+    /// path.
     ///
     /// Falls back to the lane path automatically when:
     ///   * the commit touches any dedup bucket,
@@ -94,29 +86,22 @@ pub struct Config {
     ///     guarded remap on a snapshot-bearing volume).
     ///
     /// Behaviour is byte-equivalent to the lane path; this is purely a
-    /// concurrency / latency optimisation. See
-    /// `/root/.claude/plans/zfs-txg-clone.md` Phase 1. Set to false to
-    /// force the legacy lane path (e.g. for differential debugging).
+    /// concurrency / latency optimisation. Set to false to force the lane path
+    /// for differential debugging.
     pub commit_direct_apply_enabled: bool,
 
-    /// ZFS-TXG-clone Phase 2: when true, `commit_ops_deferred` parks
-    /// the freshly-computed `Vec<ApplyOutcome>` in the
-    /// [`crate::DeferredOutcomeAggregator`] keyed by LSN and returns
-    /// immediately. The L2P compactor's per-pass loop drains every
-    /// staged entry whose touched `(volume, shard)` pairs have all
-    /// been folded into the on-disk tree (the metadb equivalent of a
-    /// ZFS TXG sync). When false (default during the first-month
-    /// soak), `commit_ops_deferred` is a thin wrapper that delivers
-    /// outcomes synchronously — call sites then either upgrade
-    /// transparently or are routed through the legacy
-    /// `commit_ops_sync` shape; on-disk format is unchanged.
+    /// When true, `commit_ops_deferred` parks the freshly-computed
+    /// `Vec<ApplyOutcome>` in the [`crate::DeferredOutcomeAggregator`] keyed by
+    /// LSN and returns immediately. The L2P compactor's per-pass loop drains
+    /// every staged entry whose touched `(volume, shard)` pairs have all been
+    /// folded into the on-disk tree (the metadb equivalent of a BFG sync). When
+    /// false, `commit_ops_deferred` is a thin wrapper that delivers outcomes
+    /// synchronously; on-disk format is unchanged.
     ///
-    /// This flag governs whether the staging path is exercised at all;
-    /// the deferred API is *always* compiled in. Flip to `true` after
-    /// the 8h `deferred_outcomes_proptest` soak gate on nvme-box
-    /// passes. Behaviour is byte-equivalent to the sync path —
-    /// outcomes for a given LSN match exactly; only delivery timing
-    /// shifts (compactor boundary instead of caller thread).
+    /// This flag governs whether the staging path is exercised at all; the
+    /// deferred API is always compiled in. Behaviour is byte-equivalent to the
+    /// sync path: outcomes for a given LSN match exactly; only delivery timing
+    /// shifts from caller thread to compactor boundary.
     pub commit_deferred_outcomes_enabled: bool,
 
     /// Upper bound on a single group-commit batch, in bytes.
@@ -126,17 +111,16 @@ pub struct Config {
     /// a partial batch, in microseconds.
     pub group_commit_timeout_us: u64,
 
-    /// ZFS-TXG-clone Phase 3: when true, `commit_ops_deferred` submits to
-    /// the WAL with `synchronous=false`. The writer thread writes the
-    /// batch to OS page cache and acks the caller without calling fsync.
-    /// Durability is consolidated at the next `flush_with_gate`, which
-    /// fans an `Op::FsyncAll` to every WAL lane before promoting the
-    /// manifest's `checkpoint_lsn`.
+    /// When true, `commit_ops_deferred` submits to the WAL with
+    /// `synchronous=false`. The writer thread writes the batch to OS page cache
+    /// and acks the caller without calling fsync. Durability is consolidated at
+    /// the next `flush_with_gate`, which fans an `Op::FsyncAll` to every WAL
+    /// lane before promoting the manifest's `checkpoint_lsn`.
     ///
     /// Safety relies on two invariants outside metadb:
     /// 1. The onyx LV2 write buffer fsyncs every user write before ack,
     ///    acting as the ZIL equivalent. Anything past the last metadb
-    ///    TXG sync is re-driven by the onyx commit_worker on restart.
+    ///    BFG sync is re-driven by the onyx commit_worker on restart.
     /// 2. The metadb `apply_gate.write()` barrier in `flush_with_gate`
     ///    sampled `last_applied_lsn` only after every in-flight commit
     ///    completed `finish_global_apply`, which is itself gated on
@@ -145,10 +129,8 @@ pub struct Config {
     ///    after the sample makes those bytes durable.
     ///
     /// **Requires `commit_deferred_outcomes_enabled = true`.** Async
-    /// WAL without deferred outcomes is an untested combination — the
-    /// commit_ops_deferred guard rejects the mismatch. Flip to `true`
-    /// after the 24h nvme-box soak + 10 SIGKILLs + 5 sysrq power-loss
-    /// matrix passes.
+    /// WAL without deferred outcomes is an unsupported combination; the
+    /// `commit_ops_deferred` guard rejects the mismatch.
     pub wal_async_commits_enabled: bool,
 
     /// Deadline (microseconds) for group-commit batches whose submits
@@ -157,14 +139,14 @@ pub struct Config {
     /// deadline collapses back to `group_commit_timeout_us` so sync
     /// hot-path latency is protected.
     ///
-    /// Default 1000 (1 ms) — large enough to amortise the rare TXG
+    /// Default 1000 (1 ms) — large enough to amortise the rare BFG
     /// fsync over many async commits, small enough to keep the inflight
     /// WAL-on-OS-page-cache window bounded.
     pub wal_async_group_commit_window_us: u64,
 
-    /// Buffer-as-sole-journal selector. See [`MetaDbJournalMode`]. Phase D
-    /// collapsed this to a single variant; the field is preserved so
-    /// the on-disk config wire format remains compatible.
+    /// Buffer-as-sole-journal selector. See [`MetaDbJournalMode`]. This is a
+    /// single-variant enum today; the field is preserved so the on-disk config
+    /// wire format remains compatible.
     pub journal_mode: MetaDbJournalMode,
 
     /// Maximum bytes held by the in-memory page cache.
@@ -190,8 +172,8 @@ pub struct Config {
     /// Set at [`Db::create`](crate::db::Db::create) and recorded in the
     /// manifest. Opening with `cfg.dedup_shards != manifest.dedup_shards`
     /// is rejected — the shard count is part of the on-disk layout, not
-    /// a runtime tunable. Default is 1 (single-shard, identical to the
-    /// pre-Phase-2 layout).
+    /// a runtime tunable. Default is 1, matching the original single-shard
+    /// layout.
     pub dedup_shards: u32,
 
     /// Amount of WAL (bytes) accumulated before a checkpoint is forced.
@@ -323,11 +305,10 @@ pub struct Config {
     /// a huge final batch into the overlay.
     pub refcount_drainer_backpressure_pages: usize,
 
-    /// Enable the B2 in-memory L2P buffer + periodic compaction path.
-    /// When `false` (default), commits mutate the paged radix tree
-    /// in-line (Phase 0 behaviour). When `true`, commits insert into
-    /// the per-shard `L2pBuffer` and a background compactor folds it
-    /// into the tree on its own cadence. See
+    /// Enable the in-memory L2P buffer + periodic compaction path.
+    /// When `false` (default), commits mutate the paged radix tree in-line.
+    /// When `true`, commits insert into the per-shard `L2pBuffer` and a
+    /// background compactor folds it into the tree on its own cadence. See
     /// [`crate::db::l2p_buffer`] + [`docs/DESIGN.md §B2`].
     pub l2p_buffer_enabled: bool,
 
@@ -347,30 +328,23 @@ pub struct Config {
     /// lag and WAL retention on idle systems.
     pub l2p_buffer_max_interval_ms: u64,
 
-    /// ZFS-TXG-clone Phase 4: when `true`, spawn the
-    /// [`crate::db::txg_quiesce::TxgQuiesceThread`] and
-    /// [`crate::db::txg_sync::TxgSyncThread`] at `Db::open` time.
-    /// Default `false` — Phase 4 lands in sub-steps and the threads
-    /// don't yet drive the persistence path (Step 7 ships the threading
-    /// model + state machine in parallel with the existing
-    /// `L2pCompactor`; Step 8 retires the compactor and routes
-    /// flush through the new threads). Turning this on without Step 8
-    /// is observable only as advancing `manifest.checkpoint_txg` in
-    /// memory; no on-disk effect.
-    pub txg_threads_enabled: bool,
+    /// When `true`, spawn the [`crate::db::bfg_quiesce::BfgQuiesceThread`] and
+    /// [`crate::db::bfg_sync::BfgSyncThread`] at `Db::open` time. When `false`,
+    /// callers fold and flush through the inline path.
+    pub bfg_threads_enabled: bool,
 
-    /// Fan the per-TXG L2P syncing-slot drain out across shards (one task
+    /// Fan the per-BFG L2P syncing-slot drain out across shards (one task
     /// per shard) instead of folding them serially on the single
-    /// `metadb-txg-sync` thread. Each shard is independent (own `tree`
+    /// `metadb-bfg-sync` thread. Each shard is independent (own `tree`
     /// lock + `l2p_buffer` + per-shard page alloc pool); the serial fold
-    /// was the txg-sync drain bottleneck (~74% of that thread in
+    /// was the bfg-sync drain bottleneck (~74% of that thread in
     /// `compact_drain_into_tree`), capping single-volume write throughput.
     /// Default `true`; set `false` for the legacy serial fold (A/B,
     /// fallback). Mirrors the already-parallel refcount `begin_checkpoint`.
     pub parallel_l2p_drain_enabled: bool,
 
     /// Bound on buffered entries folded per `tree.write()` acquisition
-    /// in the per-TXG L2P syncing-slot drain. The one-shot fold held the
+    /// in the per-BFG L2P syncing-slot drain. The one-shot fold held the
     /// shard's tree write lock for the whole slot (100k+ entries under
     /// sustained load) while `apply_l2p_remap` takes the same lock per
     /// commit op and dedup/read multi_gets take the read side — a proven
@@ -385,19 +359,18 @@ pub struct Config {
     /// (every L2P remap increfs its new head_pba; a packed N-LBA unit → +N),
     /// so onyx GC reclaim becomes a pure `rc==0` check and the full-volume
     /// `referenced_extents` reverify scan (which held `tree.read()` across the
-    /// whole volume and stalled the TXG fold/checkpoint → multi-second commit
+    /// whole volume and stalled the BFG fold/checkpoint → multi-second commit
     /// spikes) is eliminated. Decrements ride the existing lineage deadlist;
     /// the increfs ride the existing off-gate refcount drainer. Default
-    /// `false` (Phase-5 rc-neutral behaviour). ⚠ Turning this on requires a
+    /// `false` (current rc-neutral behaviour). ⚠ Turning this on requires a
     /// FRESH metadb: an existing store has `rc==0` for all exclusive PBAs,
     /// which the authoritative reader would mass-premature-free — `Db::open`
     /// REFUSES a pre-`RC_AUTHORITATIVE` manifest when this is set.
     pub rc_authoritative_reclaim: bool,
 
-    /// `txg_timeout_ms` mirrors ZFS `zfs_txg_timeout` (default 5 s) —
-    /// the quiesce thread rolls a TXG at least this often even with
-    /// no force_roll signal. Ignored when `txg_threads_enabled = false`.
-    pub txg_timeout_ms: u64,
+    /// The quiesce thread rolls a BFG group at least this often even with no
+    /// force_roll signal. Ignored when `bfg_threads_enabled = false`.
+    pub bfg_timeout_ms: u64,
 
     /// Run a background L2P streaming writeback worker that continuously
     /// seals dirty pages and writes them through the centralised
@@ -454,8 +427,7 @@ pub struct Config {
     /// enabling `l2p_writeback_enabled` regresses commit-write p99
     /// (validated 2026-05-16 on nvme-box: writeback off vs on,
     /// READ p99 +50 % / WRITE p99 +117 % at SQ=16384).
-    /// 0 disables the cap (admit bg ops freely; matches pre-Tier-1.C
-    /// behaviour for regression A/Bs).
+    /// 0 disables the cap (admit bg ops freely; useful for regression A/Bs).
     pub io_submitter_bg_inflight_cap: usize,
 
     /// Per-flush budget on the sum of `(dirty_l2p_pages +
@@ -491,16 +463,14 @@ pub struct Config {
     /// via a condvar, so under load the worker stays hot and only
     /// hits this on truly idle systems.
     pub async_reclaim_idle_interval_ms: u64,
-    /// ZFS port Phase 3b: a clone's persisted page-livelist chain is
-    /// condensed to a single segment once it reaches at least this many
-    /// segments. `0` disables the background condense worker entirely
-    /// (it is never started). Independent of `async_reclaim_enabled`.
+    /// A clone's persisted page-livelist chain is condensed to a single segment
+    /// once it reaches at least this many segments. `0` disables the background
+    /// condense worker entirely. Independent of `async_reclaim_enabled`.
     pub livelist_condense_min_segments: usize,
     /// Max milliseconds the livelist-condense worker parks between scans.
     pub livelist_condense_idle_interval_ms: u64,
-    /// [[no-refcount-hot-path-design]] Phase 5: Lineage GC emits a
-    /// `FreePbas` lifecycle/dispatch record for every dead-list record it
-    /// retires before truncating the chain. The historical Phase 3
+    /// Lineage GC emits a `FreePbas` lifecycle/dispatch record for every
+    /// dead-list record it retires before truncating the chain. The old
     /// chain-truncation-only mode is no longer supported; create/open reject
     /// `false` because rc-neutral L2P remaps require FreePbas retire events.
     pub lineage_gc_emit_freepbas: bool,
@@ -510,11 +480,11 @@ pub struct Config {
     /// parks on `lineage_gc_interval_ms` and drives
     /// [`Db::run_lineage_gc_cycle_inner`](crate::db::Db) so dead-list
     /// segments are surfaced as `FreePbas` and the per-volume dead-list
-    /// chain actually advances. **This is the only production trigger for
-    /// Phase 5 PBA reclaim** — the `async_reclaim` worker deliberately
-    /// holds no `Arc<Db>` and cannot emit FreePbas. Without this thread
-    /// dead-list chains grow without bound and no LV3 PBA is ever
-    /// reclaimed (`gc_lineage_freed_blocks` stays 0).
+    /// chain actually advances. **This is the only production trigger for PBA
+    /// reclaim** — the `async_reclaim` worker deliberately holds no `Arc<Db>`
+    /// and cannot emit FreePbas. Without this thread dead-list chains grow
+    /// without bound and no LV3 PBA is ever reclaimed
+    /// (`gc_lineage_freed_blocks` stays 0).
     ///
     /// Defaults OFF in [`Config::new`]: metadb's own lineage_gc unit
     /// tests and `metadb-soak` drive GC synchronously via
@@ -542,8 +512,8 @@ pub struct Config {
     ///
     /// ## Why dropping rc>0 is safe — and its hard precondition
     ///
-    /// Under Phase 5 the only events that bump a PBA's global rc are
-    /// `DedupPut`/`PromotionChunk` (L2P remaps are rc-neutral). So an
+    /// In the current rc-neutral mode, the only events that bump a PBA's global
+    /// rc are `DedupPut`/`PromotionChunk` (L2P remaps are rc-neutral). So an
     /// `rc > 0` dead-list record is EITHER (a) a dedup-target PBA whose rc is
     /// pure dedup_index membership, reclaimed by the client's dedup
     /// orphan-reclaim path (DedupDelete → rc 0 → retire → confirm-scan free),
@@ -563,10 +533,10 @@ pub struct Config {
 }
 
 impl Config {
-    /// Phase-7 accessor for the per-volume shard count. Reads from
+    /// Accessor for the per-volume shard count. Reads from
     /// [`Config::shards_per_partition`]; kept as a dedicated method so call
-    /// sites migrate to the new name without waiting for the field rename in
-    /// Phase B.
+    /// sites can use the volume terminology while the serialized field name
+    /// remains unchanged.
     pub fn shards_per_volume(&self) -> u32 {
         self.shards_per_partition
     }
@@ -581,23 +551,17 @@ impl Config {
             wal_segment_bytes: 64 * 1024 * 1024,
             wal_lanes: 1,
             unlogged_commits_enabled: false,
-            // ZFS-TXG-clone Phase 1 — default on. Direct L2P apply on
-            // caller thread for L2P-only commits. Safe fallback to lane
-            // path for any commit that doesn't match the eligibility
-            // check (see `commit_direct_apply_enabled` doc).
+            // Direct L2P apply defaults on for L2P-only commits. Any commit
+            // outside the eligibility check falls back to the lane path.
             commit_direct_apply_enabled: true,
-            // ZFS-TXG-clone Phase 2 — production default. Validated by
-            // the 8h nvme-phase23-soak (verify-clean, zero underflow,
-            // engine alive end-to-end). See `commit_deferred_outcomes_enabled` doc.
+            // Deferred outcomes are the production default; see the field doc
+            // for the timing contract.
             commit_deferred_outcomes_enabled: true,
             group_commit_max_batch_bytes: 4 * 1024 * 1024,
             group_commit_timeout_us: 1,
-            // ZFS-TXG-clone Phase 3 — production default. Validated by
-            // the same 8h nvme-phase23-soak as Phase 2 (both flags ran
-            // hot together). Async-WAL durability still relies on the
-            // onyx LV2 buffer as the ZIL equivalent (see
-            // `wal_async_commits_enabled` doc); 24h SIGKILL/sysrq crash
-            // matrix is a later hardening gate, not a prerequisite.
+            // Async WAL is the production default. Durability still relies on
+            // the onyx LV2 buffer as the upstream replay source; see the field
+            // doc for the exact contract.
             wal_async_commits_enabled: true,
             wal_async_group_commit_window_us: 1000,
             journal_mode: MetaDbJournalMode::Buffer,
@@ -644,15 +608,13 @@ impl Config {
             // last flush even if `notify()` was missed; long
             // enough not to busy-loop on otherwise-idle pages.
             async_reclaim_idle_interval_ms: 50,
-            // ZFS port Phase 3b: condense a clone's livelist chain once it
-            // reaches 16 segments. Independent of `async_reclaim_enabled`
-            // (condense only rewrites the SHADOW livelist; it changes no
-            // page-rc free decision). Lazy threshold + 1 s idle scan keep
-            // the worker near-free for non-clone / low-churn workloads.
+            // Condense a clone's livelist chain once it reaches 16 segments.
+            // This only rewrites the clone-private log; it does not change any
+            // free decision. Lazy threshold + 1 s idle scan keep the worker
+            // near-free for non-clone / low-churn workloads.
             livelist_condense_min_segments: 16,
             livelist_condense_idle_interval_ms: 1000,
-            // [[no-refcount-hot-path-design]] Phase 5: hot-path RC
-            // writes are gone — Lineage GC is the sole producer of
+            // Hot-path RC writes are gone; Lineage GC is the sole producer of
             // PBA-free decisions, so FreePbas emission is mandatory.
             lineage_gc_emit_freepbas: true,
             // Background Lineage GC defaults OFF for standalone metadb:
@@ -692,9 +654,8 @@ impl Config {
             dedup_drainer_threshold_entries: 4_096,
             dedup_drainer_max_entries_per_cycle: 65_536,
             dedup_drainer_backpressure_entries: 16_384,
-            // Drainer ships **default-on** (Tier 1.A,
-            // `/root/.claude/plans/ticklish-sparking-barto.md`). The
-            // background drainer absorbs `RcShard.delta_active` into
+            // Drainer ships **default-on**. The background drainer absorbs
+            // `RcShard.delta_active` into
             // a sealed-page overlay outside `apply_gate.write()` so
             // `flush()`'s sample-phase rc_drain shrinks from ~2 s
             // (priority-1 verbatim) to <100 ms. Flip back to `false`
@@ -706,11 +667,8 @@ impl Config {
             refcount_drainer_max_entries_per_cycle: 65_536,
             refcount_drainer_alloc_run_size: 64,
             refcount_drainer_backpressure_pages: 8_192,
-            // B2 buffer ships default-off. Phase 1 lands the
-            // infrastructure; Phase 3 flips behaviour (commit writes
-            // buffer only); Phase 5 may flip default to true after
-            // nvme-box validation. See
-            // /root/.claude/plans/ticklish-sparking-barto.md.
+            // The L2P buffer ships default-off in the generic config; onyx can
+            // opt in once its workload wants buffered writes.
             l2p_buffer_enabled: false,
             // 64 K entries soft trigger ≈ 5 MB / shard. Compactor
             // wakes when any shard crosses this. Same magnitude as
@@ -727,10 +685,10 @@ impl Config {
             // compactor will fire at least this often so
             // `checkpoint_lsn` and WAL retention don't drift.
             l2p_buffer_max_interval_ms: 30_000,
-            // ZFS-TXG-clone Phase 4 threads default-off — see field doc.
-            txg_threads_enabled: false,
+            // BFG worker threads default-off in the generic config; see field doc.
+            bfg_threads_enabled: false,
             // Parallel per-shard L2P drain default-OFF: disproven on nvme-box
-            // (3-4× regression — spawned threads inherit the txg-sync CPU
+            // (3-4× regression — spawned threads inherit the bfg-sync CPU
             // pinning + the drain wasn't the healthy-window gate). Kept behind
             // the flag as a documented dead-end. See memory parallel_l2p_drain_impl.
             parallel_l2p_drain_enabled: false,
@@ -739,7 +697,7 @@ impl Config {
             // the one-shot hold for A/B.
             l2p_drain_chunk_entries: 4096,
             rc_authoritative_reclaim: false,
-            txg_timeout_ms: 5_000,
+            bfg_timeout_ms: 5_000,
             // Streaming writeback ships default-off in this generic
             // `Config::new` so unit tests that assert on page-allocator
             // / snapshot state observe a quiescent backend (no

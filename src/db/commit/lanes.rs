@@ -30,14 +30,14 @@ impl Db {
         let dedup_shard_count_u32 = dedup_shard_count as u32;
         let mut dedup_buckets: Vec<Vec<usize>> =
             (0..dedup_shard_count).map(|_| Vec::new()).collect();
-        // Precise refcount footprint. The pre-Phase-5 planner used a
+        // Precise refcount footprint. The pre-planner used a
         // blanket `rc_enqueued.fill(true)` on any remap because the
         // hot-path L2pRemap drove rc deltas itself — that blanket made
         // every commit's footprint claim all 16 refcount lanes,
         // serializing every commit against every other commit on a
         // single volume regardless of which L2P shard each touched.
         //
-        // Phase 5 ([phase5-option-a-landed]) made L2pRemap/L2pRemapRange
+        // made L2pRemap/L2pRemapRange
         // rc-neutral on the hot path — the rc-staging now rides
         // exclusively on the dedup ops (DedupPut/Guarded/Delete/Compare*)
         // via `lanes/dedup.rs::stage_rc{,_decref_if_live}`. So the
@@ -64,7 +64,7 @@ impl Db {
         // To keep the dispatch footprint a superset of every rc shard the
         // commit will stage (a footprint/emit mismatch races the per-shard
         // apply → underflow), blanket-claim ALL rc shards when rc_auth. This
-        // is the pre-Phase-5 behaviour (`rc_enqueued.fill(true)` on any
+        // is the pre-behaviour (`rc_enqueued.fill(true)` on any
         // remap); it serializes commits on the rc lanes. The inline-rc cost
         // (this serialization + the per-LBA stages) is the explicit target of
         // the commit-perf optimization step — correctness first.
@@ -231,7 +231,7 @@ impl Db {
 
         // rc-authoritative: blanket-claim every rc shard (see the rationale
         // at `rc_auth` above — the inline decref's pba is unknown at plan
-        // time). Off (Phase-5): the precise per-op marks above stand.
+        // time). Off (): the precise per-op marks above stand.
         if rc_auth {
             for touched in rc_shards_touched.iter_mut() {
                 *touched = true;
@@ -263,7 +263,7 @@ impl Db {
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         plan: LaneDispatchPlan,
         ops: Arc<Vec<WalOp>>,
     ) -> QueuedLanePlan {
@@ -282,11 +282,11 @@ impl Db {
             let apply_ops = ops.clone();
             let metrics = self.metrics.clone();
             let refcount_shards_arc = refcount_shards_arc.clone();
-            // ZFS port Phase 4 S1: capture this volume's live snapshot
+            // BFG: capture this volume's live snapshot
             // capture-watermarks for the birth COW-kill + page-deadlist gate
             // before the lane runs.
             let snapshot_wms = self.snapshot_wms(vol_ord);
-            // ZFS port Phase 4 S1c: the clone COW-kill pinner set, built from the
+            // BFG: the clone COW-kill pinner set, built from the
             // SAME `volumes` snapshot this lane operates on (empty for non-clones).
             let clone_cow_pinners =
                 crate::db::volume::clone_cow_pinners_from(volumes, vol_ord, snapshot_wms.clone());
@@ -299,7 +299,7 @@ impl Db {
                         sid,
                         indices,
                         lsn,
-                        txg,
+                        bfg,
                         apply_ops.as_slice(),
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
@@ -323,7 +323,7 @@ impl Db {
         }
         QueuedLanePlan {
             ops,
-            txg,
+            bfg,
             l2p_receivers,
             rc_buckets: plan.rc_buckets,
             dedup_buckets: plan.dedup_buckets,
@@ -372,10 +372,10 @@ impl Db {
             return Err(err);
         }
 
-        // TXG this commit is stamped to. The rc/dedup `rc.stage(txg, …)`
+        // BFG this commit is stamped to. The rc/dedup `rc.stage(bfg, …)`
         // below must land in this slot (kept frozen-open by the commit's
-        // still-held `TxgGuard`, since we await every receiver here).
-        let txg = plan.txg;
+        // still-held `BfgGuard`, since we await every receiver here).
+        let bfg = plan.bfg;
         let mut rc_receivers = Vec::new();
         let rc_enqueue_started = std::time::Instant::now();
         for sid in 0..plan.rc_buckets.len() {
@@ -390,7 +390,7 @@ impl Db {
                 lsn,
                 Box::new(move || {
                     let result =
-                        Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn, txg);
+                        Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn, bfg);
                     let _ = tx.send(result);
                 }),
             );
@@ -448,15 +448,15 @@ impl Db {
         // AWAITS every one before returning.
         //
         // The previous async dispatch (fire the dedup closure on its lane
-        // and return without awaiting) is gone under the TXG-slot refcount
+        // and return without awaiting) is gone under the BFG-slot refcount
         // model: under `rc_authoritative` the dedup bucket stages derived
         // refcount deltas (`DedupPut` membership ±1), and those must land
-        // in THIS commit's TXG slot to stay aligned with the dedup_index
+        // in THIS commit's BFG slot to stay aligned with the dedup_index
         // entry's durability. If the closure ran after the commit returned
-        // (and its `TxgGuard` dropped), this TXG could roll to Syncing and
+        // (and its `BfgGuard` dropped), this BFG could roll to Syncing and
         // its slot fold/clear before the stage landed → a foreign-slot rc
         // delta and a refcount-vs-dedup_index durability skew on replay.
-        // Awaiting keeps the `TxgGuard` alive across `rc.stage(txg, …)`, so
+        // Awaiting keeps the `BfgGuard` alive across `rc.stage(bfg, …)`, so
         // the slot stays frozen-open. The dedup_index cuckoo write itself
         // is already moved off the commit critical path by the dedup
         // drainer; awaiting here costs only the cheap `stage_put` + rc
@@ -489,7 +489,7 @@ impl Db {
                     ops.as_slice(),
                     bucket,
                     lsn,
-                    txg,
+                    bfg,
                 );
                 metrics.record_dedup_lane_task(bucket_ops, ready_queue_wait, exec_started.elapsed());
                 let _ = tx.send(outcomes);

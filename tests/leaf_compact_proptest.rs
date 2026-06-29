@@ -207,7 +207,7 @@ proptest! {
 // the 101st insert. v3 raised the cap to 128 by dropping on-disk
 // `unit_lba_count` and shrinking per-slot seq from u64 to u32 delta.
 //
-// v4 (Phase 1 of [[no-refcount-hot-path-design]]) added a per-leaf
+// v4 (of ) added a per-leaf
 // 8 B `base_birth_lsn` and a per-unit 4 B `birth_delta`, tightening
 // `MAX_UNITS_PER_LEAF` back to 110 — which surfaced as
 // `compact_in_place did not free enough room for one unit` corruption

@@ -1,6 +1,6 @@
 //! Per-volume dead-list: append-only log of `(pba, birth_lsn, death_lsn)`
-//! triples emitted on every L2P overwrite. Feeds Phase 3 lineage GC of
-//! the [[no-refcount-hot-path-design]] plan.
+//! triples emitted on every L2P overwrite. Feeds lineage GC of
+//! the plan.
 //!
 //! # Concurrency
 //!
@@ -78,7 +78,7 @@ impl DeadListState {
     /// Drain only records with `death_lsn <= max_lsn`; keep the rest
     /// in the buffer for a later flush. Used by `run_sync_cycle`'s
     /// gate-free sample phase: concurrent apply for commits stamped to
-    /// `open_txg > syncing_txg` may keep pushing `DeadRecord`s with
+    /// `open_bfg > syncing_bfg` may keep pushing `DeadRecord`s with
     /// `death_lsn > wal_checkpoint` during / after the drain, and
     /// folding those into this flush's segment would produce a chain
     /// whose `max_lsn` overlaps the next flush's `min_lsn` (the
@@ -333,10 +333,10 @@ fn decode_records(buf: &[u8], count: usize, out: &mut Vec<DeadRecord>) {
     }
 }
 
-/// Read every [`DeadRecord`] from a chain, walking `tail_pid` backward
-/// through `prev_seg_pid` to `NULL_PAGE`. Used by `drop_snapshot` (ZFS
-/// port Phase 2) to consume a dropped snapshot's immutable page-deadlist.
-/// Order is tail-segment-first; callers that need a set don't care.
+/// Read every [`DeadRecord`] from a chain, walking `tail_pid` backward through
+/// `prev_seg_pid` to `NULL_PAGE`. Used by `drop_snapshot` to consume a dropped
+/// snapshot's immutable page-deadlist. Order is tail-segment-first; callers
+/// that need a set don't care.
 pub fn read_chain_records<F>(tail_pid: PageId, read_page: F) -> Result<Vec<DeadRecord>>
 where
     F: Fn(PageId) -> Result<Page>,
@@ -414,7 +414,7 @@ where
 /// boundary in the manifest) OR when a segment's `prev_seg_pid` is
 /// `NULL_PAGE`.
 ///
-/// Phase 3 Lineage GC uses this to locate the "segment newer than the
+/// Lineage GC uses this to locate the "segment newer than the
 /// current head" when advancing `head_pid`: that's the second-to-last
 /// element of the returned vec (the head segment is the last). If the
 /// chain has a single segment, advancing past it sets head/tail back to

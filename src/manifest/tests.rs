@@ -89,7 +89,7 @@ fn commit_then_reopen_recovers_manifest() {
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 1234,
-        checkpoint_txg: 0,
+        checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
         free_list_head: 99,
@@ -256,7 +256,7 @@ fn encode_decode_round_trip_with_refcount_and_dedup() {
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 0xDEAD_BEEF_CAFE,
-        checkpoint_txg: 0,
+        checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
         free_list_head: 1234,
@@ -319,7 +319,7 @@ fn find_snapshot_locates_by_id() {
 
 #[test]
 fn decode_rejects_pre_v6_body_versions() {
-    // v5 and v4 are no longer supported — Phase 7 is fresh-install
+    // v5 and v4 are no longer supported — is fresh-install
     // only. Any body_version other than v6 reports `Corruption`.
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
@@ -348,7 +348,7 @@ fn v6_volumes_table_round_trip() {
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 10,
-        checkpoint_txg: 0,
+        checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
         free_list_head: NULL_PAGE,
@@ -426,7 +426,7 @@ fn dedup_n4_encode_decode_round_trip() {
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 100,
-        checkpoint_txg: 0,
+        checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
         free_list_head: NULL_PAGE,
@@ -694,7 +694,7 @@ fn volume_entry_many_back_to_back() {
     assert_eq!(off, total);
 }
 
-// ── Tier 2.B Stage 1: per-shard durable_seq[] tests ─────────────────
+// ── per-shard durable-seq durable-seq rollout: per-shard durable_seq[] tests ─────────────────
 
 /// Diverging per-shard `durable_seq` values must round-trip through
 /// v11 encode/decode. `checkpoint_lsn` is set to `min(per-shard)` so
@@ -708,7 +708,7 @@ fn v11_per_shard_durable_seq_round_trip() {
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 5,
-        checkpoint_txg: 0,
+        checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
         free_list_head: NULL_PAGE,
@@ -762,7 +762,7 @@ fn encode_rejects_durable_seq_drift_from_checkpoint_lsn() {
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 42,
-        checkpoint_txg: 0,
+        checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
         free_list_head: NULL_PAGE,
@@ -799,7 +799,7 @@ fn encode_rejects_refcount_durable_seq_length_mismatch() {
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 0,
-        checkpoint_txg: 0,
+        checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
         free_list_head: NULL_PAGE,
@@ -884,7 +884,7 @@ fn encode_v10_for_test(m: &Manifest, page: &mut Page) {
 
 /// A v10 manifest (no on-disk per-shard durable_seq arrays) must
 /// v10 manifests carry compact leaf v3 in the paged tree, which is
-/// wire-incompatible with v4. The Phase 1 flag-day cutover (manifest
+/// wire-incompatible with v4. The flag-day cutover (manifest
 /// v12 ↔ leaf v4) hard-rejects v10/v11 instead of lazy-upgrading.
 #[test]
 fn v10_manifest_is_rejected_after_flag_day_to_v12() {
@@ -893,7 +893,7 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 99,
-        checkpoint_txg: 0,
+        checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
         free_list_head: NULL_PAGE,
@@ -941,7 +941,7 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
     }
 }
 
-// ── Phase 4 Step 1: lineage fields on VolumeEntry ───────────────────
+// ── lineage fields on VolumeEntry ───────────────────
 
 /// A v14 `VolumeEntry` with a non-trivial lineage trio must round-trip
 /// inline encode/decode without losing `parent_vol_ord` /
@@ -1010,7 +1010,7 @@ fn v14_volume_entry_round_trip_carries_lineage_fields() {
     assert!(decoded.promotion_cursor.is_none());
 }
 
-/// Old (pre-Phase 4) v13 manifests are flag-day rejected by the v14
+/// Old (pre-) v13 manifests are flag-day rejected by the v14
 /// decoder so a downgraded binary that ran briefly on the same on-disk
 /// state can't be silently re-promoted.
 #[test]
@@ -1038,9 +1038,9 @@ fn v13_manifest_is_rejected_after_flag_day_to_v14() {
 
 #[test]
 fn v14_manifest_is_rejected_after_flag_day_to_v15() {
-    // ZFS-TXG-clone Phase 4 flag-day: a v14 body has no `checkpoint_txg`
+    // BFG flag-day: a v14 body has no `checkpoint_bfg`
     // slot. The decoder must reject it before it ever reaches the new
-    // OFF_CHECKPOINT_TXG read.
+    // OFF_CHECKPOINT_BFG read.
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
@@ -1061,15 +1061,15 @@ fn v14_manifest_is_rejected_after_flag_day_to_v15() {
 }
 
 #[test]
-fn v15_round_trip_carries_checkpoint_txg() {
-    // ZFS-TXG-clone Phase 4: a real-shaped manifest round-trips its
-    // `checkpoint_txg` field byte-equivalent through encode + decode.
+fn v15_round_trip_carries_checkpoint_bfg() {
+    // BFG: a real-shaped manifest round-trips its
+    // `checkpoint_bfg` field byte-equivalent through encode + decode.
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 1234,
-        checkpoint_txg: 42,
+        checkpoint_bfg: 42,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
         free_list_head: NULL_PAGE,
@@ -1086,21 +1086,21 @@ fn v15_round_trip_carries_checkpoint_txg() {
     m.encode(&mut page).unwrap();
     page.seal();
     let decoded = Manifest::decode(&page, &ps).unwrap();
-    assert_eq!(decoded.checkpoint_txg, 42);
+    assert_eq!(decoded.checkpoint_bfg, 42);
     assert_eq!(decoded.checkpoint_lsn, 1234);
     assert_eq!(decoded, m);
 }
 
 #[test]
-fn v15_checkpoint_txg_zero_round_trips() {
-    // Empty manifest (checkpoint_txg = 0) must encode + decode cleanly —
+fn v15_checkpoint_bfg_zero_round_trips() {
+    // Empty manifest (checkpoint_bfg = 0) must encode + decode cleanly —
     // the codepath new databases hit at first open.
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
     let m = Manifest {
         body_version: MANIFEST_BODY_VERSION,
         checkpoint_lsn: 0,
-        checkpoint_txg: 0,
+        checkpoint_bfg: 0,
         last_processed_buffer_seq: 0,
         lifecycle_replay_seq: 0,
         free_list_head: NULL_PAGE,
@@ -1117,11 +1117,11 @@ fn v15_checkpoint_txg_zero_round_trips() {
     m.encode(&mut page).unwrap();
     page.seal();
     let decoded = Manifest::decode(&page, &ps).unwrap();
-    assert_eq!(decoded.checkpoint_txg, 0);
+    assert_eq!(decoded.checkpoint_bfg, 0);
     assert_eq!(decoded, m);
 }
 
-// ── ZFS port S3 (v22): l2p_page_rc shard group DELETED ──────────────
+// ── BFG (v22): l2p_page_rc shard group DELETED ──────────────
 
 /// A v21 manifest (still carried the now-deleted l2p_page_rc shard group)
 /// is flag-day rejected by the v22 decoder — backcompat is waived

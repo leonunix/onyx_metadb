@@ -8,7 +8,7 @@
 //! plus a `draining` slot. The hot-path apply arms call
 //! [`DedupStaging::merge_put`] / [`merge_delete`] (an O(1) HashMap merge)
 //! instead of the blocking 4 KiB cuckoo page write; a background drainer
-//! (Phase 2) folds the staged mutations into the on-disk cuckoo outside
+//! () folds the staged mutations into the on-disk cuckoo outside
 //! the apply gate.
 //!
 //! ## Merge rule = last-LSN-wins (NOT additive)

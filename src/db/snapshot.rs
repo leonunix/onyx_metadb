@@ -6,7 +6,7 @@ use super::*;
 const RESTORE_MAX_OPS_PER_TX: usize = 16_384;
 
 /// Which surviving entity inherits a dropped snapshot's page-deadlist
-/// (ZFS port Phase 2a MERGE). The youngest snapshot's `S_next` is the live
+/// (BFG MERGE). The youngest snapshot's `S_next` is the live
 /// HEAD; otherwise the next-younger surviving snapshot.
 #[derive(Clone, Copy)]
 enum MergeTarget {
@@ -17,7 +17,7 @@ enum MergeTarget {
 /// Shared inputs the `drop_snapshot` page-deadlist work derives once: the
 /// previous surviving snapshot's `created_lsn`, the entity that inherits
 /// S's deaths, and that inheritor's current deadlist records (`DL_next`).
-/// Always derived (ZFS port Phase 4 S2c decoupled FREE from CHAIN
+/// Always derived (BFG decoupled FREE from CHAIN
 /// maintenance): the MERGE runs on EVERY drop — incl. clone-involved ones —
 /// to keep the per-volume chain complete across routing flips, while the
 /// authoritative FREE-set comes from the deadlist (non-clone) or the
@@ -54,26 +54,22 @@ impl Db {
     /// Take a snapshot of volume `vol_ord`'s L2P state. Returns the new
     /// snapshot id. Unknown volume ordinals surface as `InvalidArgument`.
     ///
-    /// Refcount state is global (Phase 6.5b retired per-snapshot refcount
-    /// roots), so the snapshot only captures the target volume's L2P
-    /// shard roots + an incref on each so the snapshot's view outlives
-    /// subsequent COW writes on the target volume.
+    /// Refcount state is global, so the snapshot only captures the target
+    /// volume's L2P shard roots + an incref on each so the snapshot's view
+    /// outlives subsequent COW writes on the target volume.
     ///
-    /// ZFS `dsl_sync_task` port: enqueues a [`SyncTaskOp::TakeSnapshot`] task
-    /// against the current open TXG (under a `txg.enter()` guard so the TXG
-    /// can't promote to syncing before the task is queued), forces that TXG to
-    /// sync, and blocks for exactly that one TXG. The sync cycle does the real
-    /// work in syncing context ([`Db::stage_pending_snapshots`]): it captures
-    /// the roots it is flushing this cycle, journals a
-    /// `LifecycleOp::TakeSnapshot` (which mints a strictly-monotone lsn
-    /// for the gen-idempotent root incref + makes the op crash-replayable),
-    /// stages the incref into the open TXG slot, and inserts the
-    /// `SnapshotEntry` — all durable atomically with that TXG's manifest
-    /// commit (= ZFS uberblock). The outcome (id or error) comes back through
-    /// the task's result slot.
+    /// Enqueues a [`SyncTaskOp::TakeSnapshot`] task against the current open
+    /// BFG group (under a `bfg.enter()` guard so the group cannot promote before
+    /// the task is queued), forces that group to sync, and blocks for exactly
+    /// that group. The sync cycle does the real work in syncing context
+    /// ([`Db::stage_pending_snapshots`]): it captures the roots it is flushing
+    /// this cycle, journals a `LifecycleOp::TakeSnapshot`, stages the incref
+    /// into the open group slot, and inserts the `SnapshotEntry`, all durable
+    /// atomically with that group's manifest commit. The outcome comes back
+    /// through the task's result slot.
     ///
     /// Holds `drop_gate.write()` for the whole capture/force-sync window
-    /// (symmetric with [`Self::drop_snapshot`]). The original Part-B design ran
+    /// (symmetric with [`Self::drop_snapshot`]). The original forced-sync poisoning design ran
     /// commit-concurrently (no `drop_gate.write`) so foreground writers never
     /// blocked — but that was UNSOUND: a writer `commit_ops` overlapping the
     /// forced sync could COW the target volume (or a clone of it), retiring a
@@ -97,32 +93,32 @@ impl Db {
         // deadlock-free. Mirrors `drop_snapshot`.
         let _drop_guard = self.drop_gate.write();
 
-        // ZFS port Part B: a prior forced sync failed non-recoverably and
-        // poisoned the subsystem (the TXG it left in Syncing can never
-        // complete). Reject new snapshots fast in BOTH threads modes instead of
-        // queueing a task that would hang in `wait_until_synced` / `flush_with_gate`.
+        // A prior forced sync failed non-recoverably and poisoned the subsystem
+        // (the BFG slot it left in Syncing can never complete). Reject new
+        // snapshots fast in both thread modes instead of queueing a task that
+        // would hang in `wait_until_synced` / `flush_with_gate`.
         if let Some(err) = self.sync_poison_error() {
             return Err(err);
         }
 
-        // Enqueue the snapshot as a TXG sync task and force the open TXG to
+        // Enqueue the snapshot as a BFG sync task and force the open BFG to
         // sync. The actual work — capture the volume's just-flushed roots,
         // journal a `LifecycleOp::TakeSnapshot`, stage the per-root incref,
         // and insert the `SnapshotEntry` — runs in syncing context
         // ([`Db::stage_pending_snapshots`]), durable atomically with that
-        // TXG's manifest commit.
+        // BFG's manifest commit.
         let result: Arc<Mutex<Option<Result<SnapshotId>>>> = Arc::new(Mutex::new(None));
         let target = {
-            // Hold `txg.enter()` across the push so the open TXG cannot
+            // Hold `bfg.enter()` across the push so the open BFG cannot
             // promote-to-syncing before our task is queued; otherwise the
             // cycle that syncs `target` could miss it (the enqueue/roll
             // race). Dropping the guard before forcing the sync below
             // avoids the reverse wait (sync waits for the guard).
-            let guard = self.txg.enter();
-            let target = guard.txg();
+            let guard = self.bfg.enter();
+            let target = guard.bfg();
             self.pending_sync_tasks.lock().push(PendingSyncTask {
                 op: SyncTaskOp::TakeSnapshot { vol_ord },
-                target_txg: target,
+                target_bfg: target,
                 result: result.clone(),
                 committed_entry: None,
             });
@@ -130,16 +126,16 @@ impl Db {
         };
 
         // Drive `target` to sync and block until it is durable.
-        if self.txg_threads_enabled {
-            self.txg_quiesce_notifier.signal_force(target);
-            if !self.txg.wait_until_synced(target) {
-                // ZFS port Part B: the sync thread's cycle failed and aborted
-                // the subsystem. Drop our orphaned task and surface the
-                // restart-required error instead of hanging. (poison_sync also
-                // drains pending tasks, so the remove is belt-and-suspenders.)
+        if self.bfg_threads_enabled {
+            self.bfg_quiesce_notifier.signal_force(target);
+            if !self.bfg.wait_until_synced(target) {
+                // The sync thread's cycle failed and aborted the subsystem.
+                // Drop our orphaned task and surface the restart-required error
+                // instead of hanging. (`poison_sync` also drains pending tasks,
+                // so this remove is belt-and-suspenders.)
                 self.remove_pending_sync_task(&result);
                 return Err(self.sync_poison_error().unwrap_or_else(|| {
-                    MetaDbError::Corruption("txg sync aborted; restart required".into())
+                    MetaDbError::Corruption("bfg sync aborted; restart required".into())
                 }));
             }
         } else if let Err(err) = self.flush_with_gate(crate::metrics::FlushKind::Forced) {
@@ -150,13 +146,13 @@ impl Db {
             return Err(err);
         }
 
-        // The cycle filled the result before advancing `checkpoint_txg`
+        // The cycle filled the result before advancing `checkpoint_bfg`
         // (threads-on) / returning (threads-off), so it is set now.
         match result.lock().take() {
             Some(outcome) => outcome,
             None => {
                 // `target` synced without processing our task. The
-                // `txg.enter()` guard makes this unreachable in normal
+                // `bfg.enter()` guard makes this unreachable in normal
                 // operation (the task is always queued before `target`
                 // promotes-to-syncing); treat it defensively.
                 self.remove_pending_sync_task(&result);
@@ -281,7 +277,7 @@ impl Db {
         // Settle everything before diffing: `diff_with_current` reads each
         // shard's committed `tree.root()`, which excludes both unfolded
         // l2p_buffer entries AND staged commits (onyx's flusher commits via the
-        // staged path, whose tree fold is deferred to the next TXG sync). A
+        // staged path, whose tree fold is deferred to the next BFG sync). A
         // forced sync applies the staged commits and folds the buffer into the
         // tree, so the diff sees the volume's full committed state; without it
         // the very overwrites we must roll back are invisible and the restore
@@ -353,9 +349,9 @@ impl Db {
     /// - `snapshot_views.write()` — waits for outstanding
     ///   [`SnapshotView`]s to drop before any page is freed.
     ///
-    /// Phase B (A3 follow-up): the **forced TXG sync** that used to run
-    /// at entry is GONE. It drained in-flight flush IO so the per-page
-    /// decref's whole-page rc write could not be clobbered. ZFS port S3
+    /// The forced BFG sync that used to run at entry is gone. It drained
+    /// in-flight flush IO so the per-page decref's whole-page rc write could
+    /// not be clobbered. BFG
     /// deleted per-L2P-page refcounting: `apply_drop_snapshot_pages` now
     /// frees exactly the explicit, structurally-computed free-set the
     /// producer froze under the held gates, so there is no whole-page rc
@@ -374,18 +370,18 @@ impl Db {
     /// natural [`flush`](Self::flush) captures the new snapshot list.
     pub fn drop_snapshot(&self, id: SnapshotId) -> Result<Option<DropReport>> {
         let _drop_guard = self.drop_gate.write();
-        // Phase B (A3 follow-up): no forced TXG sync. The page-rc decrefs
-        // now `stage` into the array and free under a fold-consistent
-        // read, so the flush-IO-drain barrier is unnecessary. `txg.enter()`
-        // pins the current Open TXG; `closing_open` makes it wait out (not
+        // No forced BFG sync. The page-rc decrefs now `stage` into the array
+        // and free under a fold-consistent
+        // read, so the flush-IO-drain barrier is unnecessary. `bfg.enter()`
+        // pins the current Open BFG; `closing_open` makes it wait out (not
         // race) a concurrent background roll, so entering without first
-        // rolling the TXG ourselves is safe.
+        // rolling the BFG ourselves is safe.
         //
-        // Phase 4 gate-shrink: `_txg_guard.record_lsn(lsn)` (below)
-        // records this lifecycle op's WAL LSN into `slot_max_lsn(open_txg)`
-        // so `run_sync_cycle_body`'s `wal_checkpoint = slot_max_lsn(txg)`
+        // gate-shrink: `_bfg_guard.record_lsn(lsn)` (below)
+        // records this lifecycle op's WAL LSN into `slot_max_lsn(open_bfg)`
+        // so `run_sync_cycle_body`'s `wal_checkpoint = slot_max_lsn(bfg)`
         // watermark reflects it and the WAL segment is eventually pruned.
-        let _txg_guard = self.txg.enter();
+        let _bfg_guard = self.bfg.enter();
         let _apply_guard = self.apply_gate.write();
         let _view_guard = self.snapshot_views.write();
 
@@ -409,7 +405,7 @@ impl Db {
                 .collect::<Vec<_>>();
             (entry, others)
         };
-        // v6 SnapshotEntry no longer carries refcount state (Phase 6.5b
+        // v6 SnapshotEntry no longer carries refcount state (.5b
         // retired it), so there's nothing to assert about refcount here.
 
         // Commit 9: snapshots are per-volume, so page collection +
@@ -458,7 +454,7 @@ impl Db {
         self.flush_all_refcount_shards()?;
 
         let checkpoint_lsn = *self.last_applied_lsn.lock();
-        // Crash-recovery completeness (G1): this commit advances
+        // Crash-recovery completeness (accumulator-seal): this commit advances
         // `checkpoint_lsn` to `last_applied_lsn` and makes the
         // `force_compact`-folded roots durable. Seal every volume's pending
         // page-deadlist accumulator into its HEAD chain FIRST so no death the
@@ -468,7 +464,7 @@ impl Db {
         for vol in &volumes_snap {
             self.seal_page_dead_list_accumulator(vol, checkpoint_lsn)?;
         }
-        // Tripwire (Step E): after the G1 seal, no volume may still hold a
+        // Tripwire: after sealing the accumulator, no volume may still hold a
         // page-death at or below the checkpoint this commit advances to —
         // that exact state (durable roots imply a free the deadlist never
         // sealed) is the crash-recovery completeness bug this fixes.
@@ -479,7 +475,7 @@ impl Db {
                     .iter()
                     .flat_map(|a| a.peek())
                     .all(|r| r.death_lsn > checkpoint_lsn),
-                "drop_snapshot G1: volume {} retains a page-death <= checkpoint_lsn {checkpoint_lsn} after seal",
+                "drop_snapshot accumulator seal: volume {} retains a page-death <= checkpoint_lsn {checkpoint_lsn} after seal",
                 vol.ord,
             );
         }
@@ -495,7 +491,7 @@ impl Db {
                 Some(checkpoint_lsn),
             )?;
             mstate.manifest.checkpoint_lsn = checkpoint_lsn;
-            // Phase B: no forced TXG sync ran ahead of this commit, so it
+            // buffer-backed journal: no forced BFG sync ran ahead of this commit, so it
             // is the checkpoint that makes the flushes above durable and
             // must advance the lifecycle/buffer replay watermarks. The
             // `DropSnapshot` op is submitted AFTER this, so its seq is
@@ -511,7 +507,7 @@ impl Db {
         self.finish_dedup_manifest_update(dedup_update, dedup_generation)?;
 
         let all_current_roots: Vec<PageId> = l2p_guards.iter().map(|tree| tree.root()).collect();
-        // Phase 5: do not emit PBA decrefs for snapshot-only logical
+        // do not emit PBA decrefs for snapshot-only logical
         // mappings. Global PBA rc is no longer a per-live-LBA counter
         // (ordinary remaps and dedup hits are rc-neutral), so walking the
         // snapshot/current diff and subtracting one per LBA can drive rc to
@@ -529,7 +525,7 @@ impl Db {
         // from the complete manifest-visible page graph so a page is
         // decremented exactly when removing this snapshot removes one
         // physical incoming edge. PBA-level reclaim is deliberately absent
-        // here in Phase 5; dead-list / retired-extent confirmation owns it.
+        // here in ; dead-list / retired-extent confirmation owns it.
         let mut roots_before = all_current_roots.clone();
         roots_before.extend(entry.l2p_shard_roots.iter().copied());
         roots_before.extend(
@@ -563,7 +559,7 @@ impl Db {
                 }
             }
         }
-        // ZFS port Phase 2a/S2c: derive the inheritor context (S_prev/S_next +
+        // BFG: derive the inheritor context (S_prev/S_next +
         // DL_next) once. It always drives the MERGE below (single-volume chain
         // bookkeeping, run on every drop); the NON-clone FREE path also feeds
         // it to `check_page_deadlist_shadow`, while the clone-involved FREE path
@@ -573,13 +569,13 @@ impl Db {
         // accumulator it peeked) stays valid for both consumers.
         let inheritor_ctx =
             self.page_deadlist_inheritor_context(&entry, &other_snapshots, &source_volume)?;
-        // ZFS port Phase 4 S2/S2c: the authoritative, page-rc-independent
+        // BFG: the authoritative, page-rc-independent
         // free-set. NON-clone drops use the single-volume deadlist (the shadow
         // returns it, == structural_to_free on Ok). CLONE-INVOLVED drops
         // (`snapshot_drop_clone_involved`, sticky CLONE_LINEAGE flag) use the
         // structural reachability difference instead — the single-vol deadlist
-        // can't model cross-volume page sharing (R5). Either way the result is
-        // frozen into the WAL op so S3 can delete the page-rc cascade.
+        // can't model cross-volume page sharing (cross-volume clone sharing). Either way the result is
+        // frozen into the WAL op so page-rc removal can delete the page-rc cascade.
         let free_pages: Option<Vec<PageId>> =
             Some(if self.snapshot_drop_clone_involved(&source_volume) {
                 self.check_clone_drop_reachability_shadow(
@@ -594,7 +590,7 @@ impl Db {
                 self.check_page_deadlist_shadow(id, &entry, &pages, &after_refs, &inheritor_ctx)?
             });
 
-        // Crash-recovery completeness (G2): plan the page-deadlist MERGE
+        // Crash-recovery completeness (merge-reanchor): plan the page-deadlist MERGE
         // (write the durable carried segment) BEFORE the WAL submit, and carry
         // the resulting re-anchor in the `DropSnapshot` op. Applying the
         // re-anchor from the op (live AND replay) makes it ATOMIC with the
@@ -606,7 +602,7 @@ impl Db {
         // >= every carried `death_lsn` and < any post-drop death, preserving
         // the chain-ordering invariant.
         //
-        // S2c: the MERGE runs on EVERY drop, INCLUDING clone-involved ones.
+        // clone-involved snapshot drop: the MERGE runs on EVERY drop, INCLUDING clone-involved ones.
         // It is single-volume bookkeeping (per `inheritor_ctx`, keyed on V's
         // own snapshots) and frees no L2P data pages — only rewrites V's
         // deadlist chain. Skipping it on clone-involved drops (the old `None`
@@ -660,7 +656,7 @@ impl Db {
             merge,
         };
         let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
-        _txg_guard.record_lsn(lsn);
+        _bfg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Block until every prior LSN has applied. Under our locks,
@@ -697,7 +693,7 @@ impl Db {
             }
         }
 
-        // Crash-recovery completeness (G2): apply the page-deadlist MERGE
+        // Crash-recovery completeness (merge-reanchor): apply the page-deadlist MERGE
         // re-anchor (planned + sealed durably BEFORE the WAL submit above)
         // atomically with S's removal. This is the LIVE application of the
         // exact re-anchor the `DropSnapshot` op carries; WAL replay re-applies
@@ -712,9 +708,9 @@ impl Db {
                     MergeTarget::Head => {
                         use std::sync::atomic::Ordering;
                         // The carried segment already absorbed the HEAD's deaths
-                        // (the G1 seal drained the accumulator at the commit
+                        // (the accumulator seal drained the accumulator at the commit
                         // above; `plan_page_deadlist_merge` then read the
-                        // G1-extended HEAD chain). Just re-anchor.
+                        // accumulator-seal-extended HEAD chain). Just re-anchor.
                         source_volume
                             .page_dead_list_head_pid
                             .store(merge.anchor, Ordering::Release);
@@ -776,7 +772,7 @@ impl Db {
         }))
     }
 
-    /// ZFS port Phase 2a — derive the shared inputs the drop's page-deadlist
+    /// BFG — derive the shared inputs the drop's page-deadlist
     /// shadow check and MERGE both need: the previous surviving snapshot's
     /// `created_lsn` (`S_prev`), the entity that inherits S's deaths
     /// (`S_next`, or the live HEAD when S is youngest), and that inheritor's
@@ -785,7 +781,7 @@ impl Db {
     /// `DL_next` here keeps the S_prev/S_next selection and the
     /// HEAD-vs-snapshot chain read in one place.
     ///
-    /// S2c: derived for EVERY drop (no clone early-return). The MERGE runs
+    /// clone-involved snapshot drop: derived for EVERY drop (no clone early-return). The MERGE runs
     /// unconditionally so the per-volume chain stays complete even while a
     /// clone exists and the FREE-set comes from reachability (see
     /// `drop_snapshot`). The derivation is single-volume (`vol_ord == vol`)
@@ -855,14 +851,14 @@ impl Db {
         })
     }
 
-    /// ZFS port Phase 4 S2c — is this snapshot drop "clone-involved", i.e.
+    /// BFG — is this snapshot drop "clone-involved", i.e.
     /// could any other volume share the dropped snapshot's L2P pages so the
     /// single-volume page-deadlist would mis-predict the free-set? Routes the
     /// drop to the reachability free-source ([`check_clone_drop_reachability_shadow`])
     /// instead of the deadlist shadow.
     ///
     /// Uses the STICKY `VOLUME_FLAG_CLONE_LINEAGE` (set at clone create, never
-    /// cleared — survives promotion), mirroring the `drop_volume` Step-3 gate
+    /// cleared — survives promotion), mirroring the `drop_volume` sticky-flag gate
     /// and `clone_cow_pinners_from`. `parent_vol_ord.is_some()` (the old gate)
     /// misses promoted ex-clones, which is exactly the dense-soak false-premature.
     ///
@@ -884,7 +880,7 @@ impl Db {
             .any(|v| v.ord != source_volume.ord && v.flags.load(Relaxed) & flag != 0)
     }
 
-    /// ZFS port Phase 4 S2c — the page-rc-INDEPENDENT free-source for a
+    /// BFG — the page-rc-INDEPENDENT free-source for a
     /// CLONE-INVOLVED snapshot drop. The single-volume page-deadlist
     /// (`check_page_deadlist_shadow`) cannot model the cross-volume page
     /// sharing a clone DAG introduces, so the authoritative free-set is the
@@ -894,15 +890,15 @@ impl Db {
     /// walk over `roots_after` (every live volume head incl. promoted
     /// ex-clones ∪ all OTHER snapshots' roots), so a page is freed iff S was
     /// its last incoming edge and NO surviving root reaches it. That walk
-    /// never reads `l2p_page_rc`, so it survives the S3 page-rc deletion.
+    /// never reads `l2p_page_rc`, so it is independent of page-rc.
     ///
     /// HARD teeth: an INDEPENDENT reachability set-difference
     /// `reachable(S) \ reachable(survivors)` (via `reachable_l2p_pages`, the
     /// `drop_volume` clone path's oracle) must equal `structural_to_free`.
     /// `survivor_roots` is built IDENTICALLY to the prologue's `roots_after`
-    /// (R1 — a different root set would false-fire). Premature
+    /// (birth-shadow equivalence — a different root set would false-fire). Premature
     /// (`structural_to_free \ exclusive`: we'd free a survivor-reachable page,
-    /// the P0) and missing (`exclusive \ structural_to_free`) are both HARD
+    /// the case) and missing (`exclusive \ structural_to_free`) are both HARD
     /// `Corruption`. page-rc stays the apply-side bookkeeping decref + the
     /// offline inverted-shadow oracles, not a hot-path read here — the drop
     /// runs quiesced (apply_gate.write + drop_gate.write held, post
@@ -1018,15 +1014,12 @@ impl Db {
         !(i < other_created_sorted.len() && other_created_sorted[i] < death)
     }
 
-    /// ZFS port Phase 2 (2a, SHADOW): cross-check the page-deadlist model
-    /// against the structural ground truth that page-rc still drives the
-    /// real free from. `structural_to_free` = the L2P pages this drop
-    /// releases (lose their last incoming edge: in `pages` with
-    /// `after_refs == 0`). The deadlist side follows ZFS
-    /// `process_old_deadlist` (dsl_destroy.c): destroying S frees from
-    /// **S_next's** deadlist (deaths in `(S, S_next]`) the entries born
-    /// after S_prev — NOT S's own chain (deaths in `(S_prev, S]`, which S
-    /// never referenced). An entry is freed iff `birth > S_prev.created`
+    /// Cross-check the page-deadlist model against the structural ground truth.
+    /// `structural_to_free` is the L2P pages this drop releases: pages in
+    /// `pages` whose `after_refs == 0`. Destroying snapshot S frees from
+    /// **S_next's** deadlist (deaths in `(S, S_next]`) the entries born after
+    /// S_prev, not S's own chain (deaths in `(S_prev, S]`, which S never
+    /// referenced). An entry is freed iff `birth > S_prev.created`
     /// (born after the previous surviving snapshot, so only S pinned it);
     /// else it is still pinned by S_prev and merges forward. `S_next` is the
     /// youngest surviving snapshot of this volume newer than S, or the live
@@ -1034,15 +1027,15 @@ impl Db {
     /// segment chain + the not-yet-drained in-memory accumulator).
     ///
     /// Scoped to non-clone volumes (clone DAGs add cross-volume sharing the
-    /// single-vol invariant doesn't model — R5/Phase 3). Phase 2b: BOTH
+    /// single-vol invariant doesn't model — cross-volume clone sharing/). BOTH
     /// directions are HARD `Corruption` — premature (a deadlist entry mapping
     /// to a still-referenced page) and missing (a structurally-freed page the
     /// deadlist did not predict). With the MERGE maintaining the inheritor
     /// chains the two sets are provably equal at every drop, the invariant
-    /// Phase 4 needs to make the deadlist the sole free source.
+    /// needs to make the deadlist the sole free source.
     /// Returns the deadlist-derived free-set (`deadlist_to_free`). With both
     /// shadow directions HARD, on `Ok` it equals `structural_to_free`, so the
-    /// ZFS port Phase 4 S2 flip inlines it as the `DropSnapshot.free_pages`
+    /// BFG flip inlines it as the `DropSnapshot.free_pages`
     /// authoritative, page-rc-independent free-set.
     fn check_page_deadlist_shadow(
         &self,
@@ -1069,11 +1062,10 @@ impl Db {
             .filter(|r| Self::dl_record_freed(&ctx.other_created_sorted, r.birth_lsn, r.death_lsn))
             .map(|r| r.pba)
             .collect();
-        // PREMATURE-FREE (P0) direction: a deadlist entry that maps to a
-        // page the structural graph still references. The page-deadlist read
-        // above is ZFS-faithful, so this set must be empty — a non-empty
-        // premature set is a real soundness bug (the exact class the whole
-        // port exists to kill), so it is a HARD `Corruption`.
+        // PREMATURE-FREE direction: a deadlist entry maps to a page the
+        // structural graph still references. This set must be empty; a
+        // non-empty premature set is a real soundness bug and becomes a hard
+        // `Corruption`.
         let mut premature: Vec<PageId> =
             deadlist_to_free.difference(&structural_to_free).copied().collect();
         if !premature.is_empty() {
@@ -1091,9 +1083,9 @@ impl Db {
         // deadlist did not predict. With the cross-drop MERGE maintaining
         // every inheritor chain, this set is empty across all churn/drop
         // tests (panic-probe verified) and the snapshot-churn soak's verify
-        // cycles. Phase 2b makes it a HARD `Corruption` alongside premature:
+        // cycles. makes it a HARD `Corruption` alongside premature:
         // the deadlist now PROVABLY equals the page-rc free-set at every
-        // drop, which is the invariant Phase 4 relies on when it deletes
+        // drop, which is the invariant relies on when it deletes
         // page-rc and the deadlist becomes the sole free source.
         let mut missing: Vec<PageId> =
             structural_to_free.difference(&deadlist_to_free).copied().collect();
@@ -1109,14 +1101,14 @@ impl Db {
             )));
         }
         // Both directions clean ⇒ deadlist_to_free == structural_to_free.
-        // Hand it back sorted (deterministic WAL `free_pages`) as the S2
+        // Hand it back sorted (deterministic WAL `free_pages`) as the
         // authoritative free-set.
         let mut free_pages: Vec<PageId> = deadlist_to_free.into_iter().collect();
         free_pages.sort_unstable();
         Ok(free_pages)
     }
 
-    /// Crash-recovery completeness (S2 cutover prerequisite, "G1"): seal a
+    /// Crash-recovery completeness: seal a
     /// volume's in-memory page-deadlist accumulator (COW deaths drained into
     /// it by `force_compact_l2p_buffers`, all with `death_lsn <= cut`) into a
     /// durable segment EXTENDING the HEAD chain, and bump the volume's HEAD
@@ -1190,16 +1182,13 @@ impl Db {
         }
     }
 
-    /// H1 (ZFS-faithful): seal EVERY listed volume's page-deadlist accumulator
-    /// into its durable HEAD chain at `cut`, so a checkpoint-advancing manifest
-    /// commit that makes these volumes' L2P roots durable ALSO makes the
-    /// page-deaths those roots imply durable IN THE SAME COMMIT (the bumped
-    /// HEAD anchors fold via `refresh_manifest_from_locked` /
-    /// `refresh_manifest_entries`). This is the generalization of the
-    /// `drop_snapshot` G1 seal: EVERY lifecycle op that `force_compact`s the
-    /// buffer before a checkpoint-advancing commit (`drop_volume`, recovery's
-    /// post-replay commit, in-place restore) MUST call this with
-    /// `cut = checkpoint_lsn` first — otherwise a folded death becomes
+    /// Seal every listed volume's page-deadlist accumulator into its durable
+    /// HEAD chain at `cut`. A checkpoint-advancing manifest commit that makes
+    /// these volumes' L2P roots durable must also make the page-deaths those
+    /// roots imply durable in the same commit. Any lifecycle op that
+    /// `force_compact`s the buffer before a checkpoint-advancing commit
+    /// (`drop_volume`, recovery's post-replay commit, in-place restore) must
+    /// call this with `cut = checkpoint_lsn` first; otherwise a folded death becomes
     /// durable-dead with no durable death record and a later `drop_snapshot`
     /// fires a COMPLETENESS HOLE (the produced-then-lost crash-recovery bug).
     /// `flush` (per-shard drain-under-guard) and `drop_snapshot` already seal
@@ -1243,10 +1232,9 @@ impl Db {
         }
     }
 
-    /// ZFS port Phase 2a — plan the page-deadlist MERGE for dropping
-    /// snapshot S, following ZFS `process_old_deadlist` (dsl_destroy.c).
-    /// Builds the new single-segment chain for the entity that inherits S's
-    /// deaths (`ctx.target` — S_next, or the live HEAD when S is youngest).
+    /// Plan the page-deadlist merge for dropping snapshot S. Builds the new
+    /// single-segment chain for the entity that inherits S's deaths
+    /// (`ctx.target`: S_next, or the live HEAD when S is youngest).
     ///
     /// `carried = DL_S ∪ {r ∈ DL_next : still pinned by a surviving snap}`:
     /// S's own chain (deaths in `(S_prev, S]`, all still pinned by S_prev or
@@ -1312,13 +1300,13 @@ impl Db {
         })
     }
 
-    /// ZFS `dsl_sync_task` (path B) — called AFTER the L2P `begin_checkpoint`
-    /// loop (tree guards released), inside the sync cycle's manifest window.
-    /// For each queued [`SyncTaskOp::TakeSnapshot`] targeting `txg`:
+    /// Called after the L2P `begin_checkpoint` loop (tree guards released),
+    /// inside the sync cycle's manifest window. For each queued
+    /// [`SyncTaskOp::TakeSnapshot`] targeting `bfg`:
     /// capacity-probe + assign id + write its SnapshotRoots page + build the
     /// `SnapshotEntry` (into `committed_entry`) the FIRST time it is seen.
     ///
-    /// ZFS port S3: per-L2P-page refcounting was deleted, so this no longer
+    /// BFG: per-L2P-page refcounting was deleted, so this no longer
     /// collects per-page-rc-shard root pids to force-incref. The take is
     /// manifest-only (no lifecycle journal): a crash before the manifest
     /// commit simply loses the (never-committed) snapshot, and the snapshot's
@@ -1326,12 +1314,12 @@ impl Db {
     /// the shared roots (COW preserves them on the next write).
     pub(crate) fn prepare_pending_snapshot_entries(
         &self,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         snapshot_roots: &std::collections::HashMap<VolumeOrdinal, Vec<PageId>>,
         snapshot_watermarks: &std::collections::HashMap<VolumeOrdinal, Lsn>,
     ) -> Result<()> {
         let mut tasks = self.pending_sync_tasks.lock();
-        for task in tasks.iter_mut().filter(|t| t.target_txg == txg) {
+        for task in tasks.iter_mut().filter(|t| t.target_bfg == bfg) {
             // Build the committed entry once; a retry with `committed_entry`
             // already set is a no-op (the snapshot definition is stable).
             if task.committed_entry.is_none() {
@@ -1351,7 +1339,7 @@ impl Db {
                 // suppression + lineage). Same monotone space as lite's
                 // `*last_applied_lsn.lock()`.
                 let created_lsn = *self.last_applied_lsn.lock();
-                // v21 (S1): the EXACT fold-watermark of the captured roots
+                // v21 (snapshot watermark): the EXACT fold-watermark of the captured roots
                 // (`max(root.birth_lsn)`), computed under each shard's
                 // `tree.write()` in `run_sync_cycle_body` and passed in here.
                 // Feeds the birth COW-kill oracle (NOT `created_lsn`). See
@@ -1398,7 +1386,7 @@ impl Db {
                     // v18: filled by the page-deadlist seal step; an empty
                     // chain (no page-deaths yet) stays `NULL_PAGE`.
                     page_dead_list_tail_pid: crate::types::NULL_PAGE,
-                    // v21 (S1): fold-watermark of these captured roots.
+                    // v21 (snapshot watermark): fold-watermark of these captured roots.
                     capture_watermark,
                 });
             }
@@ -1406,18 +1394,17 @@ impl Db {
         Ok(())
     }
 
-    /// ZFS `dsl_sync_task` — phase A4, called in
-    /// [`Db::run_sync_cycle_body`]'s manifest window (under
-    /// `apply_gate.write()` + `manifest_state.lock()`). Insert each
-    /// processed take's `SnapshotEntry` into the manifest about to be
-    /// committed. Id-idempotent on the cycle's abort-retry.
+    /// Called in [`Db::run_sync_cycle_body`]'s manifest window (under
+    /// `apply_gate.write()` + `manifest_state.lock()`). Insert each processed
+    /// take's `SnapshotEntry` into the manifest about to be committed.
+    /// Id-idempotent on the cycle's abort-retry.
     pub(crate) fn add_pending_snapshot_entries(
         &self,
         manifest: &mut crate::manifest::Manifest,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
     ) {
         let tasks = self.pending_sync_tasks.lock();
-        for task in tasks.iter().filter(|t| t.target_txg == txg) {
+        for task in tasks.iter().filter(|t| t.target_bfg == bfg) {
             if let Some(entry) = &task.committed_entry {
                 if !manifest.snapshots.iter().any(|s| s.id == entry.id) {
                     let next = entry.id.saturating_add(1);
@@ -1428,7 +1415,7 @@ impl Db {
         }
     }
 
-    /// ZFS port Phase 2 — seal each pending take's page-deadlist. Called
+    /// BFG — seal each pending take's page-deadlist. Called
     /// in `run_sync_cycle_body`'s manifest window AFTER the page dead-list
     /// override map is built and BEFORE `refresh_manifest_from_checkpoints`.
     ///
@@ -1437,8 +1424,7 @@ impl Db {
     /// tail when a segment was written this round, else the pre-existing
     /// durable anchor. The head then resets to a fresh empty chain (so
     /// deaths after this snapshot accumulate into the NEXT snapshot's
-    /// deadlist), mirroring ZFS handing the head's `ds_deadlist` to the
-    /// new snapshot. The reset is split across the commit boundary like
+    /// deadlist). The reset is split across the commit boundary like
     /// the normal anchor promotion: this writes `(NULL,NULL)` into the
     /// override map so `refresh` stamps NULL manifest anchors, and returns
     /// the volume ordinals whose in-memory atomics the caller must reset
@@ -1447,14 +1433,14 @@ impl Db {
     /// `add_pending_snapshot_entries`).
     pub(crate) fn seal_pending_snapshot_page_deadlists(
         &self,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         volumes: &[Arc<Volume>],
         page_dead_list_overrides: &mut std::collections::HashMap<VolumeOrdinal, (PageId, PageId)>,
     ) -> Vec<VolumeOrdinal> {
         use std::sync::atomic::Ordering;
         let mut resets: Vec<VolumeOrdinal> = Vec::new();
         let mut tasks = self.pending_sync_tasks.lock();
-        for task in tasks.iter_mut().filter(|t| t.target_txg == txg) {
+        for task in tasks.iter_mut().filter(|t| t.target_bfg == bfg) {
             let Some(entry) = task.committed_entry.as_mut() else {
                 continue;
             };
@@ -1478,24 +1464,24 @@ impl Db {
         resets
     }
 
-    /// ZFS `dsl_sync_task` — post-manifest-commit. The manifest with the new
-    /// `SnapshotEntry`s is durable, so report `Ok(id)` to each queued
-    /// `take_snapshot` caller, warm the per-volume `SnapInfo` cache, and dequeue.
-    /// Capacity-rejected tasks (`result` already `Err`) are dequeued too.
+    /// Post-manifest-commit completion for queued snapshots. The manifest with
+    /// the new `SnapshotEntry`s is durable, so report `Ok(id)` to each
+    /// `take_snapshot` caller, warm the per-volume `SnapInfo` cache, and
+    /// dequeue. Capacity-rejected tasks (`result` already `Err`) are dequeued too.
     ///
-    /// ZFS port S3: the caller (`run_sync_cycle_body`) now invokes this INSIDE
-    /// the `apply_gate.write()` window (after the manifest commit, before the
-    /// drop) — the `SnapInfo` cache warm MUST be visible to every apply that
+    /// The caller (`run_sync_cycle_body`) invokes this inside the
+    /// `apply_gate.write()` window (after the manifest commit, before dropping
+    /// the gate). The `SnapInfo` cache warm must be visible to every apply that
     /// runs once the gate releases, or a concurrent COW could recycle the new
     /// snapshot's root against a cold cache (page-rc floor that masked this is
     /// gone). Takes only the `snap_info_cache` + `pending_sync_tasks` leaf
     /// mutexes (no `manifest_state`); lock order `apply_gate -> snap_info_cache`
     /// matches the read path.
-    pub(crate) fn finish_pending_snapshots(&self, txg: crate::types::Txg) {
+    pub(crate) fn finish_pending_snapshots(&self, bfg: crate::types::Bfg) {
         let mut cache = self.snap_info_cache.lock();
         let mut tasks = self.pending_sync_tasks.lock();
         tasks.retain(|t| {
-            if t.target_txg != txg {
+            if t.target_bfg != bfg {
                 return true;
             }
             if let Some(entry) = &t.committed_entry {

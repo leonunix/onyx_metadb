@@ -2,7 +2,7 @@
 //!
 //! All id types are plain integer aliases so they cost nothing at runtime
 //! and pass by value freely. Strong typing (newtype wrappers) may come in a
-//! later phase if type confusion becomes a real problem; today it would be
+//! later if type confusion becomes a real problem; today it would be
 //! churn for no benefit.
 
 /// Monotonically-increasing log sequence number. Every committed WAL record
@@ -10,11 +10,11 @@
 /// most recently written in its header (`generation`).
 pub type Lsn = u64;
 
-/// Transaction-group epoch number. ZFS-style: every committed op is stamped
-/// with the open TXG at enter-time; persistence happens per-TXG at
-/// quiesce/sync boundaries. Strictly monotonic; ring index in the
-/// `TxgStateMachine` is `txg & (TXG_SIZE - 1)`.
-pub type Txg = u64;
+/// BFG epoch number. Every committed op is stamped with the open group at
+/// enter-time; persistence happens per group at quiesce/sync boundaries.
+/// Strictly monotonic; ring index in the `BfgStateMachine` is
+/// `bfg & (BFG_SIZE - 1)`.
+pub type Bfg = u64;
 
 /// Index of a 4 KiB page within the page file.  Page 0 and page 1 are the
 /// double-buffered manifest slots; data pages start at [`FIRST_DATA_PAGE`].
@@ -33,7 +33,7 @@ pub type PartitionId = u32;
 
 /// Stable 16-bit ordinal identifying a volume inside a `Db`. Adapter layers
 /// (onyx-storage) own the mapping from user-facing volume names to this
-/// ordinal; metadb only ever sees the ordinal. Phase 7 reserves `u16::MAX` as
+/// ordinal; metadb only ever sees the ordinal. `u16::MAX` is reserved as
 /// [`INVALID_VOLUME`]; valid ordinals are `[0, u16::MAX)`.
 pub type VolumeOrdinal = u16;
 

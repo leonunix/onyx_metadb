@@ -45,7 +45,7 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::from(2));
     };
 
-    // ZFS port Phase 4 Step 4 (S1c): `--clone-birth-shadow` now drives the HARD
+    // BFG: `--clone-birth-shadow` now drives the HARD
     // operand gate (the operand consults descendant branch points, so the
     // pure-birth gap is closed and findings are real corruption signals, not
     // expected). Issues land in `report.issues` and affect the exit code.

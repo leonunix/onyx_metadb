@@ -123,7 +123,7 @@ fn iter_dedup_survives_flush_and_reopen() {
     assert_eq!(items.len(), 2);
 }
 
-// Phase D.5: `flush_prunes_checkpointed_wal_segments` tested
+// WAL-free recovery: `flush_prunes_checkpointed_wal_segments` tested
 // post-checkpoint WAL segment pruning — the WAL is gone.
 
 #[test]
@@ -200,7 +200,7 @@ fn scan_range_unordered_chunked_visits_each_chunk() {
     assert_eq!(got, expected);
 }
 
-// -------- phase 5e: refcount + dedup integration --------
+// -------- refcount + dedup integration --------
 
 #[test]
 fn refcount_fresh_pba_reads_as_zero() {
@@ -221,7 +221,7 @@ fn incref_and_decref_roundtrip() {
     assert_eq!(db.get_refcount(42).unwrap(), 0);
 }
 
-// Phase 5: `decref_underflow_errors` removed — `Db::decref_pba` now
+// `decref_underflow_errors` removed — `Db::decref_pba` now
 // drives `commit_free_pbas` which never underflows (rc>0 → decref by 1;
 // rc==0 → exclusive surface, no error). The underlying refcount
 // overflow/underflow guard is covered by the rc shard's own unit tests
@@ -342,7 +342,7 @@ fn take_snapshot_captures_refcount_state() {
     for pba in 0u64..50 {
         assert_eq!(db.get_refcount(pba).unwrap(), 2);
     }
-    // Phase 6.5b retired refcount snapshots; v6 SnapshotEntry no
+    // .5b retired refcount snapshots; v6 SnapshotEntry no
     // longer carries refcount fields at all. L2P roots page is still
     // allocated because L2P tree IS snapshotted.
     let snap_entry = &db.snapshots()[0];
@@ -376,9 +376,9 @@ fn drop_snapshot_releases_refcount_state() {
     }
 }
 
-// -------- phase 6: post-flush durability --------
+// -------- post-flush durability --------
 //
-// Phase D.5: the historical `*_survive_reopen_without_flush` tests
+// WAL-free recovery: the historical `*_survive_reopen_without_flush` tests
 // exercised WAL replay across reopen and have been removed alongside
 // the WAL subsystem. `refcount_writes_survive_reopen_without_flush`
 // stays because refcount shards persist data pages synchronously per
@@ -418,7 +418,7 @@ fn multi_op_tx_commits_atomically_and_all_ops_visible() {
     assert_eq!(db.get_dedup(&h(1)).unwrap(), Some(dv(9)));
 }
 
-// Phase D.5: `multi_op_tx_survives_reopen_all_or_nothing` tested
+// WAL-free recovery: `multi_op_tx_survives_reopen_all_or_nothing` tested
 // WAL-record atomicity across reopen — the WAL is gone. Multi-op tx
 // atomicity within a single commit is still covered by
 // `multi_op_tx_commits_atomically_and_all_ops_visible` (the
@@ -481,7 +481,7 @@ fn empty_tx_commit_is_noop() {
     assert_eq!(db.last_applied_lsn(), 0);
 }
 
-// Phase D.5: `reopen_replay_advances_last_applied` exercised WAL
+// WAL-free recovery: `reopen_replay_advances_last_applied` exercised WAL
 // replay of `last_applied_lsn` advancement across reopen — the WAL
 // is gone. Buffer-mode reopen resumes at `manifest.checkpoint_lsn`,
 // which is tested by `checkpoint_advances_on_flush` (live commit)
@@ -493,7 +493,7 @@ fn apply_lane_h2_metrics_record_wakeups_and_bursts() {
     // 2026-05-10. After at least one commit, the L2P lane must have been
     // woken at least once (the worker starts idle).
     //
-    // Phase 5: refcount lane no longer wakes from L2pRemap commits
+    // refcount lane no longer wakes from L2pRemap commits
     // (hot-path RC was removed). `Db::incref_pba` drives
     // `commit_promotion_chunk` through `apply_op_bare`, not through the
     // per-shard rc apply lane; the RC lane wakeup assertion has been
@@ -535,7 +535,7 @@ fn apply_lane_h2_metrics_record_wakeups_and_bursts() {
     );
 }
 
-// The "phase 6e: dedup_reverse" test block (round_trip / register_and_scan /
+// The "dedup_reverse" test block (round_trip / register_and_scan /
 // unregister / scan_sees_entries / tx_atomically / survives_reopen) retired
 // alongside the paged_reverse module + DedupReverse WAL ops (manifest v9 /
 // WAL 0xB3). Onyx no longer registers reverse entries — promote-on-verified-hit

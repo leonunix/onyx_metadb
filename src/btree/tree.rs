@@ -303,8 +303,8 @@ impl BTree {
 
     /// Iterate the entire tree. Same materialisation caveat as
     /// [`BTree::range`] today — the `_stream` suffix reserves space for
-    /// a Phase C swap to a lazy walker without touching call sites.
-    /// Phase 7 uses this to expose `Db::iter_refcounts`.
+    /// a buffer-journal replay swap to a lazy walker without touching call sites.
+    /// uses this to expose `Db::iter_refcounts`.
     pub fn iter_stream(&mut self) -> Result<RangeIter> {
         self.range(..)
     }

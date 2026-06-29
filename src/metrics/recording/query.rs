@@ -129,7 +129,7 @@ impl MetaMetrics {
         record_duration(&self.wal_fsync_us, &self.wal_fsync_max_us, elapsed);
     }
 
-    /// ZFS-TXG-clone Phase 3: per-async-batch counters. `acks` is the
+    /// BFG: per-async-batch counters. `acks` is the
     /// number of submitters in the batch (every one of them returned
     /// without seeing an inline fsync); `bytes` is the encoded batch
     /// size. Both stay zero when `wal_async_commits_enabled = false`
@@ -141,15 +141,15 @@ impl MetaMetrics {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    /// ZFS-TXG-clone Phase 3: TXG-sync barrier latency.
+    /// BFG: BFG-sync barrier latency.
     /// `WalSet::fsync_all_lanes` accumulates wall-clock here so the
-    /// reader can see how the TXG fsync amortises against the bytes
+    /// reader can see how the BFG fsync amortises against the bytes
     /// that landed in `wal_async_pending_bytes_total` since the last
     /// flush.
-    pub(crate) fn record_wal_fsync_at_txg_sync(&self, elapsed: Duration) {
+    pub(crate) fn record_wal_fsync_at_bfg_sync(&self, elapsed: Duration) {
         record_duration(
-            &self.wal_fsync_at_txg_sync_us,
-            &self.wal_fsync_at_txg_sync_max_us,
+            &self.wal_fsync_at_bfg_sync_us,
+            &self.wal_fsync_at_bfg_sync_max_us,
             elapsed,
         );
     }

@@ -30,7 +30,7 @@ fn sample_ops() -> Vec<LifecycleOp> {
             start_lba: 512,
             count: 64,
         },
-        // S2: cover both `free_pages` presence-byte arms across the two ops
+        // free-set: cover both `free_pages` presence-byte arms across the two ops
         // (Some = the flip's frozen authoritative set; None = legacy page-rc
         // cascade). Kept at exactly two ops so the replay-seq tests that
         // hardcode `sample_ops().len()` stay valid.

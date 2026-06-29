@@ -5,8 +5,7 @@
 //! PBA-triggered reverse cleanup (a separate LSM instance keyed on
 //! `(pba, hash)`).
 //!
-//! Modules landed in phase 5:
-//! - [`format`]: fixed 64-byte record codec and associated sizes.
+//! Modules landed in //! - [`format`]: fixed 64-byte record codec and associated sizes.
 //! - [`memtable`]: sorted in-memory buffer of pending ops with a
 //!   freeze/release handoff protocol for the flusher.
 //! - [`bloom`]: double-hashing bloom filter sized per-SST.
@@ -17,20 +16,19 @@
 //!   flush to L0, and reader-drain coordination.
 //! - [`compact`]: L0 → L1 and leveled Ln → Ln+1 merges.
 //!
-//! # Phase-5 items deferred into phase 6
-//!
+//! # items deferred into //!
 //! - **`dedup_reverse` LSM instance** (`(pba, hash_first_24B) →
 //!   hash_last_8B`). Used by PBA refcount → 0 to locate and tombstone
 //!   the corresponding `dedup_index` entries. Intentionally not
 //!   implemented here because correctness requires atomic commit
 //!   across refcount tree + `dedup_index` + `dedup_reverse`, which is
-//!   exactly what phase 6's transaction layer provides. See
-//!   [`docs/ROADMAP.md`](../../docs/ROADMAP.md) Phase 5 → "Deferred".
+//!   exactly what 's transaction layer provides. See
+//!   [`docs/ROADMAP.md`](../../docs/ROADMAP.md) → "Deferred".
 //! - **WAL-backed mutation replay**. Today a crash between `Db::flush`
-//!   calls can lose LSM + refcount writes. Phase 6 wires ops through
+//!   calls can lose LSM + refcount writes. wires ops through
 //!   the WAL.
-//! - **Property + crash-injection test suite (phase 5f)**. Planned
-//!   against the unified transaction API from phase 6 rather than the
+//! - **Property + crash-injection test suite ()**. Planned
+//!   against the unified transaction API from rather than the
 //!   intermediate per-call API here.
 
 pub mod bloom;

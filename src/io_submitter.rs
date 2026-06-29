@@ -94,8 +94,8 @@ const CHANNEL_CAPACITY: usize = SQ_ENTRIES as usize * 2;
 ///
 /// 1024 is ~6 % of SQ (16384). Tunable via
 /// [`crate::config::Config::io_submitter_bg_inflight_cap`]. 0 disables
-/// the cap (background ops admit freely; matches pre-Tier-1.C behaviour
-/// when paired with Sync routing for both classes).
+/// the cap (background ops admit freely, useful when comparing against uncapped
+/// routing).
 #[cfg(target_os = "linux")]
 pub(crate) const DEFAULT_BG_INFLIGHT_CAP: usize = 1024;
 
@@ -210,8 +210,8 @@ impl IoSubmitter {
     /// `bg_inflight_cap` bounds the number of [`IoPriority::Background`]
     /// ops in flight. Background ops over the cap wait in a deferred
     /// queue inside the submitter and admit as in-flight bg slots
-    /// retire. `0` admits background ops freely (no cap) — useful for
-    /// regression-testing against pre-Tier-1.C behaviour.
+    /// retire. `0` admits background ops freely (no cap), useful for
+    /// regression-testing uncapped behaviour.
     pub(crate) fn start_with_ordinal(
         fd: RawFd,
         ordinal: usize,
@@ -455,7 +455,7 @@ fn submitter_loop(
 
     // Background ops over the inflight cap wait here. The deferred
     // queue is drained back into the SQ at the top of every loop
-    // iteration as bg slots retire (see Phase 0 below). Bounded by
+    // iteration as bg slots retire (see below). Bounded by
     // CHANNEL_CAPACITY in practice: senders block on `bg_rx` once that
     // many bg ops are outstanding (channel + deferred).
     let mut deferred_bg: VecDeque<IoOp> = VecDeque::new();
@@ -465,7 +465,7 @@ fn submitter_loop(
     let bg_uncapped = bg_inflight_cap == 0;
 
     'outer: loop {
-        // -- Phase 0: drain the deferred-bg queue if there's room -----
+        // -- drain the deferred-bg queue if there's room -----
         //
         // This runs FIRST so a bg op that arrived while bg-inflight was
         // saturated cannot be starved indefinitely by a busy sync
@@ -491,7 +491,7 @@ fn submitter_loop(
             }
         }
 
-        // -- Phase 1: pull ops from channels into the SQ --------------
+        // -- pull ops from channels into the SQ --------------
         //
         // If nothing is in flight we block on the first op so the
         // submitter doesn't busy-spin. Sync ops always admit straight
@@ -601,7 +601,7 @@ fn submitter_loop(
             }
         }
 
-        // -- Phase 2: submit and (if anything is in flight) wait -------
+        // -- submit and (if anything is in flight) wait -------
 
         if inflight.is_empty() {
             // Either we got nothing but a Shutdown sentinel, or all
@@ -644,7 +644,7 @@ fn submitter_loop(
             }
         }
 
-        // -- Phase 3: harvest CQEs ------------------------------------
+        // -- harvest CQEs ------------------------------------
 
         let mut cq = ring.completion();
         cq.sync();

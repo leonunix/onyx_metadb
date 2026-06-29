@@ -16,29 +16,29 @@ use crate::types::{FIRST_DATA_PAGE, Lsn, NULL_PAGE, Pba, PageId};
 pub struct VerifyOptions {
     /// Escalate orphaned allocated pages from warnings to hard failures.
     pub strict: bool,
-    /// Run the birth-txg SHADOW invariant (ZFS birth-txg port, Phase 1):
+    /// Run the birth-LSN shadow check:
     /// for every head-reachable L2P page P of each non-clone volume,
     /// assert `birth_lsn(P) <= youngest_snap(V)` ⟺ P is reachable from
     /// the youngest snapshot's tree. This proves `birth_lsn` is a reliable
-    /// immutable birth-txg substrate (the COW kill decision Phase 2 will
+    /// immutable birth metadata substrate (the COW kill decision will
     /// use) WITHOUT changing any behavior — page-rc stays authoritative.
     /// Off by default so existing verify callers are unaffected.
     pub check_birth_shadow: bool,
-    /// Run the per-clone page-livelist audit (ZFS port Phase 3b): for every
+    /// Run the per-clone page-livelist audit (BFG): for every
     /// clone (volume with `VOLUME_FLAG_CLONE_LINEAGE`), reconstruct the
     /// live-ALLOC set from its livelist chain (ALLOC minus matched FREE) and
     /// assert it equals `reachable(clone) ∩ {birth > branched_at_lsn}` — the
-    /// clone-private subtree the substrate must faithfully record before
-    /// Phase 4 reads it instead of page-rc. Off by default.
+    /// clone-private subtree the livelist must faithfully record before clone
+    /// drop relies on it instead of page-rc. Off by default.
     pub check_clone_livelist: bool,
-    /// Run the S1c clone COW-kill operand SHADOW as a HARD gate (ZFS port
-    /// Phase 4 Step 4 / S1c): for every clone, assert every page reachable from a
+    /// Run the clone COW-kill pinner check as a hard gate: for every clone,
+    /// assert every page reachable from a
     /// surviving pinner (other volume head / snapshot tree) satisfies
     /// `birth <= B_eff` where `B_eff = max({branched_at_lsn} ∪ {own snapshot
     /// created_lsn} ∪ {descendant branch points})` — i.e. the page-rc-independent
     /// clone COW-kill would preserve every shared page. The page-rc-independent
-    /// tripwire for the S1c flip. Off by default so existing callers are
-    /// unaffected.
+    /// tripwire for the page-rc-independent clone COW decision. Off by default
+    /// so existing callers are unaffected.
     pub check_clone_birth_shadow: bool,
 }
 
@@ -103,7 +103,7 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
     };
 
     let mut free_pages = BTreeSet::new();
-    // ZFS port S3: per-L2P-page refcounting was DELETED, so verify no longer
+    // BFG: per-L2P-page refcounting was DELETED, so verify no longer
     // cross-checks an array rc. The scan just records which pids passed verify
     // (used below to flag a live page that didn't survive the byte scan).
     let mut scanned_pids: HashSet<PageId> = HashSet::new();
@@ -140,7 +140,7 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
     }
     report.free_pages = free_pages.len();
 
-    // ZFS port S3: per-L2P-page refcounting was DELETED, so there is no
+    // BFG: per-L2P-page refcounting was DELETED, so there is no
     // page-rc array to cross-check parent-pointer counts against. The
     // structural reachability walk (`collect_live_pages`) still runs to flag
     // live/free conflicts, live pages that didn't pass the scan, and orphans
@@ -215,7 +215,7 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
     Ok(report)
 }
 
-/// Per-clone page-livelist audit (ZFS port Phase 3b). For every clone (a
+/// Per-clone page-livelist audit. For every clone (a
 /// volume carrying `VOLUME_FLAG_CLONE_LINEAGE`, set at clone creation and
 /// sticky past promotion), reconstruct the live-ALLOC set from its livelist
 /// chain — ALLOC records not cancelled by a matching `(pid, birth)` FREE —
@@ -223,11 +223,11 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
 ///
 ///   live-ALLOC(C)  ==  reachable_l2p_pages(C roots) ∩ { birth_lsn > B }
 ///
-/// where `B = branched_at_lsn`. This is the substrate invariant Phase 4
-/// relies on to free a dropped clone's private pages from the livelist
+/// where `B = branched_at_lsn`. This is the substrate invariant clone drop relies
+/// on to free a clone's private pages from the livelist
 /// instead of walking the tree / consulting page-rc. Both directions are
 /// hard `issues`: a logged page no longer reachable (`extra`) is a stale /
-/// over-logged record (a leak at the Phase-4 cutover); a reachable
+/// over-logged record (a leak at the cutover); a reachable
 /// clone-private page absent from the live-ALLOC set (`missing`) is an
 /// under-log (a premature-free at the cutover). Structural checks: every
 /// record has `birth > B`, and `live_allocs` rejects a FREE without a prior
@@ -319,10 +319,10 @@ fn check_clone_livelist(
     Ok(())
 }
 
-/// Birth-txg SHADOW invariant (ZFS birth-txg port, Phase 1). For each
+/// Birth-LSN shadow check. For each
 /// non-clone volume, prove that the immutable `birth_lsn` faithfully
 /// predicts snapshot-preservation — the exact comparison the COW kill
-/// decision will use in Phase 2 (`COW iff birth(P) <= youngest_snap`):
+/// decision uses (`birth_lsn <= youngest_snap`):
 ///
 ///   for every head-reachable L2P page P:
 ///     birth_lsn(P) <= youngest_snap(V)  ⟺  P reachable from youngest snapshot
@@ -331,11 +331,11 @@ fn check_clone_livelist(
 /// youngest snapshot iff `birth_lsn <= youngest_snap`; in that case the
 /// snapshot still pins that exact version (reachable from its tree).
 /// Mismatches are hard `issues` — they pinpoint a wrong `birth_lsn` stamp
-/// before any liveness decision rides on it (resolves R1 empirically).
+/// before any liveness decision rides on it (resolves birth-shadow equivalence empirically).
 ///
-/// Clones are skipped: their pages form a cross-volume DAG (R5) whose
-/// sharing a per-volume reachability walk cannot see — that is Phase 3
-/// (livelist) territory. Page-rc remains authoritative throughout.
+/// Clones are skipped: their pages form a cross-volume DAG (cross-volume clone sharing) whose
+/// sharing a per-volume reachability walk cannot see — that is livelist
+/// territory. Page-rc remains authoritative throughout.
 fn check_birth_shadow(
     page_store: &Arc<PageStore>,
     manifest: &Manifest,
@@ -396,13 +396,13 @@ fn check_birth_shadow(
     Ok(())
 }
 
-/// Clone COW-kill birth-operand SHADOW (ZFS port Phase 4 Step 4 / S1c —
+/// Clone COW-kill birth-operand SHADOW (BFG —
 /// READ-ONLY characterization, page-rc stays authoritative). `check_birth_shadow`
 /// skips clones because a per-volume birth comparison cannot see cross-volume
 /// DAG sharing; this audit measures exactly that gap for the candidate
 /// post-page-rc clone COW-kill operand.
 ///
-/// For each clone C (`VOLUME_FLAG_CLONE_LINEAGE`) the S1c operand is
+/// For each clone C (`VOLUME_FLAG_CLONE_LINEAGE`) the clone COW-kill operand is
 /// `COW iff birth(P) <= B_eff`, where `B_eff` is the MAX of the page-rc-independent
 /// pinner-LSN set the runtime `cow_for_write` actually uses (built by
 /// `Db::clone_cow_pinners`):
@@ -417,17 +417,17 @@ fn check_birth_shadow(
 /// The third term — descendant branch points (incl. PROMOTED ex-descendants whose
 /// `parent_vol_ord` is cleared) — is what makes the operand sufficient for the
 /// DAG: it pins a born>B page a surviving descendant still references after C's own
-/// snapshot is dropped (the G6 premature-free the pure-birth `max(B, youngest_snap)`
+/// snapshot is dropped (the descendant-share premature-free the pure-birth `max(B, youngest_snap)`
 /// operand misses). The page-rc-INDEPENDENT ground truth "P is pinned" = P
 /// reachable from any OTHER live volume head or any snapshot tree (a pinned page
 /// MUST be COW'd or a clone write clobbers a shared page).
 ///
 /// Only the SAFETY direction is a finding: `pinned(P) && birth(P) > B_eff` — the
 /// operand would write in place over a shared page (the parent/sibling corruption
-/// hazard). The reverse (`birth(P) <= B_eff` but unpinned — e.g. a G8 sole-owned
+/// hazard). The reverse (`birth(P) <= B_eff` but unpinned — e.g. a origin-fallthrough sole-owned
 /// origin page) is a benign conservative over-COW and is NOT flagged.
 ///
-/// An EMPTY result proves the S1c clone operand is safe for the audited manifest.
+/// An EMPTY result proves the clone COW-kill clone operand is safe for the audited manifest.
 pub(crate) fn clone_birth_shadow_findings(
     page_store: &Arc<PageStore>,
     manifest: &Manifest,
@@ -446,7 +446,7 @@ pub(crate) fn clone_birth_shadow_findings(
             .map(|s| s.created_lsn)
             .max()
             .unwrap_or(0);
-        // Descendant branch points (the S1c completion): max over every OTHER
+        // Descendant branch points (the clone COW-kill completion): max over every OTHER
         // clone-lineage volume that branched after C — the conservative superset
         // of C's descendants that also covers promoted ex-descendants. Mirrors
         // `Db::clone_cow_pinners`'s third term.
@@ -510,7 +510,7 @@ pub(crate) fn clone_birth_shadow_findings(
                 findings.push(format!(
                     "clone-birth-shadow vol {vol} (B={b} youngest_snap={youngest_snap_clone} \
                      max_descendant_branch={max_descendant_branch} B_eff={b_eff}) page {pid}: \
-                     birth_lsn={} > B_eff but page is reachable from a surviving pinner (the S1c \
+                     birth_lsn={} > B_eff but page is reachable from a surviving pinner (the \
                      clone COW-kill would clobber a shared page)",
                     header.birth_lsn
                 ));
@@ -520,12 +520,12 @@ pub(crate) fn clone_birth_shadow_findings(
     Ok(findings)
 }
 
-/// HARD `is_clean()` gate wrapping [`clone_birth_shadow_findings`] (ZFS port
-/// Phase 4 Step 4 / S1c). Pushes every safety-direction finding into
-/// `report.issues` so a manifest where the S1c clone COW-kill operand would
+/// HARD `is_clean()` gate wrapping [`clone_birth_shadow_findings`] (BFG
+/// ). Pushes every safety-direction finding into
+/// `report.issues` so a manifest where the clone COW-kill clone COW-kill operand would
 /// clobber a shared page fails verification. Sound to gate now that the operand
 /// consults descendant branch points (the pure-birth gap is closed); page-rc is
-/// kept as the inverted-shadow floor until S3, so this is the page-rc-INDEPENDENT
+/// kept as the inverted-shadow floor until page-rc removal, so this is the page-rc-INDEPENDENT
 /// tripwire validating the operand across the soak.
 fn check_clone_birth_shadow(
     page_store: &Arc<PageStore>,
@@ -540,7 +540,7 @@ fn check_clone_birth_shadow(
 
 /// CLI/offline entry for [`clone_birth_shadow_findings`]: open the latest
 /// manifest at `path` and return the safety-direction findings (empty == the
-/// S1c clone COW-kill operand is safe for this metadb).
+/// clone COW-kill clone COW-kill operand is safe for this metadb).
 pub fn audit_clone_birth_shadow(path: impl AsRef<Path>) -> Result<Vec<String>> {
     let page_store = Arc::new(PageStore::open(path.as_ref().join("pages.onyx_meta"))?);
     match ManifestStore::load_latest(&page_store)? {
@@ -551,7 +551,7 @@ pub fn audit_clone_birth_shadow(path: impl AsRef<Path>) -> Result<Vec<String>> {
     }
 }
 
-/// Page-deadlist record audit (ZFS birth-txg port, Phase 2a). For each
+/// Page-deadlist record audit. For each
 /// non-clone volume, read every [`DeadRecord`] across its page-deadlist
 /// chains — the live HEAD chain plus each snapshot's sealed chain — and
 /// check the two model invariants the `drop_snapshot` free decision rides
@@ -641,7 +641,7 @@ fn check_page_deadlist(
 
 /// Set of every L2P page reachable from `roots` (roots + all descendants),
 /// reusing [`walk_paged_tree`]. Membership only — no multiplicity. Exposed
-/// `pub(crate)` so the ZFS port Phase 3a clone-drop livelist shadow
+/// `pub(crate)` so the BFG clone-drop livelist shadow
 /// (`Db::check_clone_livelist_shadow`) can build its independent
 /// C-exclusive reachability oracle from the same walk verify uses.
 pub(crate) fn reachable_l2p_pages(
@@ -660,7 +660,7 @@ pub(crate) fn reachable_l2p_pages(
     Ok(live.refs.into_keys().collect())
 }
 
-/// ZFS port Phase 4 Step 4 (S0): the set of data-PBA `head_pba`s mapped by any
+/// BFG: the set of data-PBA `head_pba`s mapped by any
 /// of `roots` — each a per-shard L2P root, either a surviving volume's current
 /// root or a snapshot root. `drop_volume`'s promoted-PBA decref uses this to
 /// gate the surface decision: a promoted PBA still reachable from a surviving
@@ -748,7 +748,7 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
             &mut live,
             true, // PBA chain: strict ordering (single wal_checkpoint bound).
         )?;
-        // ZFS port Phase 2: the volume's HEAD page-deadlist chain (L2P
+        // BFG: the volume's HEAD page-deadlist chain (L2P
         // metadata-page deaths) is a SECOND independent chain. Without
         // marking it, `reclaim_orphan_pages` (run on open) would free its
         // segments out from under the live manifest anchors → page-type
@@ -761,7 +761,7 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
             &mut live,
             false, // H1 page chain: per-shard seal bounds → ordering relaxed to warn.
         )?;
-        // ZFS port Phase 3b: the per-clone page-livelist chain (clone-private
+        // BFG: the per-clone page-livelist chain (clone-private
         // page ALLOC/FREE log) is a THIRD independent chain. Mark its segment
         // pages live so `reclaim_orphan_pages`-on-open does not free them out
         // from under the manifest anchors → page-type corruption. Walk by tail
@@ -773,7 +773,7 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
                 live.mark(pid);
             }
         }
-        // ZFS port Phase 4 Step 4 (S0): the promoted-PBA log is a FOURTH
+        // BFG: the promoted-PBA log is a FOURTH
         // independent per-volume chain (raw PBAs the promotion walker incref'd,
         // `LiveListSegment` codec). Mark its segment pages live so orphan-reclaim
         // does not free the chain on reopen.
@@ -793,7 +793,7 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         // via its on_meta callback, matching walk_cuckoo / walk_dedup_reverse.
         walk_refcount_paged_array(page_store, meta_pid, &mut live, &mut seen_btree)?;
     }
-    // ZFS port S3: the v17 L2P-page-rc shard group is deleted, so there are no
+    // BFG: the v17 L2P-page-rc shard group is deleted, so there are no
     // page-rc meta chains to mark live here.
 
     for snapshot in &manifest.snapshots {
@@ -816,7 +816,7 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         }
         // v6 dropped per-snapshot refcount state; refcount tree is
         // walked once at the top level above.
-        // ZFS port Phase 2: a snapshot owns the sealed page-deadlist chain
+        // BFG: a snapshot owns the sealed page-deadlist chain
         // it inherited from the head at take time. Only the tail anchor is
         // stored (the chain is immutable, head implicit at
         // `prev_seg_pid == NULL_PAGE`), so walk it to NULL and mark every

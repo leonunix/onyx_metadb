@@ -17,11 +17,10 @@
 //! 5. Return the LSN (and, for auto-commit wrappers, any per-op
 //!    pre-image the caller expected).
 //!
-//! Phase 6 shipped this path under a single `commit_lock` that wrapped
-//! both the WAL submit and the apply, giving an MVP-simple "LSN order
-//! == apply order trivially" proof. Phase 8b replaced that with the
-//! LSN-ordered condvar queue described above so WAL group commit can
-//! actually form batches.
+//! Older builds held one `commit_lock` across both WAL submit and apply, which
+//! made "LSN order == apply order" obvious but prevented useful WAL batching.
+//! The current path uses the LSN-ordered condvar queue described above so group
+//! commit can form real batches.
 //!
 //! [`WalOp`]: crate::op::WalOp
 
@@ -37,26 +36,19 @@ use crate::op::WalOp;
 /// around `Transaction` use these to surface pre-images through the
 /// existing `Db::insert` / `Db::delete` / … signatures.
 ///
-/// Phase A reserves variants for the onyx-adapter ops that land in
-/// sessions S2–S4 of [`docs/ONYX_INTEGRATION_PLAN.md`]:
-/// * [`ApplyOutcome::L2pRemap`] — landed in S2 (`WalOp::L2pRemap`).
-/// * [`ApplyOutcome::RangeDelete`] — landed in S3 (lifecycle `Discard`).
-/// * The `freed_pbas` field on [`ApplyOutcome::DropSnapshot`] —
-///   retained for lifecycle-log compatibility; Phase 5 leaves it empty
-///   because DropSnapshot is PBA rc-neutral.
-///
-/// S1 declares the shape so apply-path plumbing is stable for the
-/// follow-up sessions; each session fills in its own producer.
+/// Some variants are specific to the Onyx adapter: range remaps, lifecycle
+/// discards, and cleanup surfaces for freed PBAs. A few fields remain for
+/// compatibility with older lifecycle-log shapes even when the current apply
+/// path leaves them empty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
     /// L2P put/delete; returns the previous value, if any.
     L2pPrev(Option<L2pValue>),
-    /// [[no-refcount-hot-path-design]] Phase 5: standalone refcount
-    /// ops were retired (WAL schema 0xB7), and the hot path no longer
-    /// emits implicit refcount deltas from L2P remaps. This variant
-    /// stays only because the dispatch plumbing still threads a
-    /// per-shard rc lane that produces zero outcomes. Future cleanup
-    /// can remove both the lane and this variant together.
+    /// Standalone refcount ops were retired (WAL schema 0xB7), and the hot path
+    /// no longer emits implicit refcount deltas from L2P remaps. This variant
+    /// stays only because the dispatch plumbing still threads a per-shard rc
+    /// lane that produces zero outcomes. Future cleanup can remove both the
+    /// lane and this variant together.
     RefcountNew(u32),
     /// Dedup put/delete; no pre-image surfaced (LSM reads are not
     /// constant-time, and callers don't need the old value).
@@ -73,9 +65,8 @@ pub enum ApplyOutcome {
     /// the same arm but the collected vec is discarded — the numbers
     /// aren't load-bearing for recovery.
     ///
-    /// `freed_pbas` is retained for the historical S4 lifecycle shape.
-    /// Phase 5 ignores `pba_decrefs`, so DropSnapshot never surfaces PBA
-    /// frees here.
+    /// `freed_pbas` is retained for lifecycle-log compatibility. DropSnapshot
+    /// is PBA-rc-neutral today, so it never surfaces PBA frees here.
     DropSnapshot {
         freed_leaf_values: Vec<L2pValue>,
         pages_freed: usize,
@@ -83,7 +74,7 @@ pub enum ApplyOutcome {
     },
     /// Outcome of `WalOp::L2pRemap` (the onyx-adapter hot path that
     /// fuses L2P put + refcount decref(old) + refcount incref(new) into
-    /// a single WAL record). Reserved in S1; populated in S2.
+    /// a single WAL record).
     ///
     /// * `applied=false` iff the op's liveness `guard` rejected the
     ///   remap; in that case `prev` and `freed_pba` are both `None`
@@ -101,7 +92,7 @@ pub enum ApplyOutcome {
     },
     /// Outcome of the lifecycle `Discard` op — bulk delete across `[start,
     /// end)` for one volume, with per-(lba, pba) decrefs applied under
-    /// the leaf-rc-suppress rule. Reserved in S1; populated in S3.
+    /// the leaf-rc-suppress rule.
     ///
     /// `freed_pbas` lists pbas whose refcount transitioned from `>0`
     /// to `0` during the apply. Order is undefined.
@@ -127,8 +118,8 @@ pub enum ApplyOutcome {
         prevs: Box<[Option<L2pValue>]>,
         freed_pbas: Vec<Pba>,
     },
-    /// Outcome of [`Db::commit_free_pbas`] — [[no-refcount-hot-path-design]]
-    /// Phase 4 Step 3 retire-surface for the Lineage GC consumer.
+    /// Outcome of [`Db::commit_free_pbas`], used by Lineage GC after it proves
+    /// a set of PBAs can be retired.
     /// `freed_pbas` is the union of:
     ///
     /// - **Shared PBAs** whose rc transitioned from `>0` to `0` during
@@ -146,11 +137,10 @@ pub enum ApplyOutcome {
     /// precheck + `gc_lineage_idempotent_frees` counter), NOT because
     /// retire is set-typed (onyx no longer routes these through retire).
     FreePbas { freed_pbas: Box<[Pba]> },
-    /// Outcome of [`LifecycleOp::PromotionChunk`] —
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 background
-    /// promotion walker progress record. The walker incref'd
-    /// `increfs_applied` PBAs against the global refcount table and
-    /// advanced the volume's `promotion_cursor` to `cursor_advanced_to`.
+    /// Outcome of [`LifecycleOp::PromotionChunk`], recording progress from the
+    /// background promotion walker. The walker incref'd `increfs_applied` PBAs
+    /// against the global refcount table and advanced the volume's
+    /// `promotion_cursor` to `cursor_advanced_to`.
     ///
     /// `cursor_advanced_to == None` means "the walker finished its last
     /// chunk for this volume" (the next op will be `PromotionComplete`);
@@ -160,11 +150,10 @@ pub enum ApplyOutcome {
         increfs_applied: usize,
         cursor_advanced_to: Option<crate::types::Lba>,
     },
-    /// Outcome of [`LifecycleOp::PromotionComplete`] —
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 walker finish
-    /// record. Apply cleared the volume's `parent_vol_ord` and
-    /// `promotion_cursor`. No data is carried; the outcome slot exists
-    /// only to preserve the `outcomes.len() == ops.len()` contract.
+    /// Outcome of [`LifecycleOp::PromotionComplete`]. Apply cleared the
+    /// volume's `parent_vol_ord` and `promotion_cursor`. No data is carried;
+    /// the outcome slot exists only to preserve the
+    /// `outcomes.len() == ops.len()` contract.
     PromotionComplete,
 }
 
@@ -381,25 +370,23 @@ impl<'db> Transaction<'db> {
         self.db.commit_ops_unlogged(&self.ops)
     }
 
-    /// ZFS-TXG-clone onyx-side stager. Like [`commit_unlogged_with_outcomes`]
-    /// but bypasses the per-LSN dispatch wait (`mark_wal_durable_and_wait_for_dispatch`,
-    /// ~614 µs/commit on nvme-box). Apply runs synchronously on the
-    /// caller thread under a `TxgGuard`; durability is via the caller's
-    /// LV2 buffer until the next metadb TXG sync covers this LSN.
-    /// See [`Db::stage_ops`] for the full invariant list.
+    /// BFG onyx-side stager. Like [`commit_unlogged_with_outcomes`] but
+    /// bypasses the per-LSN dispatch wait
+    /// (`mark_wal_durable_and_wait_for_dispatch`, ~614 us/commit on nvme-box).
+    /// Apply runs synchronously on the caller thread under a `BfgGuard`;
+    /// durability is via the caller's LV2 buffer until the next metadb BFG sync
+    /// covers this LSN. See [`Db::stage_ops`] for the full invariant list.
     pub fn commit_staged_with_outcomes(mut self) -> Result<(Lsn, Vec<ApplyOutcome>)> {
         self.resolve_dedup_old_pbas()?;
         self.db.stage_ops(&self.ops)
     }
 
-    /// ZFS-TXG-clone Phase 2: like
-    /// [`commit_with_outcomes`](Self::commit_with_outcomes) but returns
-    /// a [`crate::DeferredOutcomeHandle`] instead of the outcomes vec.
-    /// The handle delivers the same outcomes the sync path would have,
-    /// at the next L2P compactor pass when
-    /// `Config::commit_deferred_outcomes_enabled = true`. With the
-    /// flag off the handle is pre-populated and `recv()` returns
-    /// immediately. See `commit/outcomes.rs` for the delivery model.
+    /// Like [`commit_with_outcomes`](Self::commit_with_outcomes), but returns a
+    /// [`crate::DeferredOutcomeHandle`] instead of the outcomes vec. When
+    /// `Config::commit_deferred_outcomes_enabled = true`, the handle resolves
+    /// when the relevant L2P buffer entries have been folded. With the flag off
+    /// the handle is pre-populated and `recv()` returns immediately. See
+    /// `commit/outcomes.rs` for the delivery model.
     pub fn commit_deferred_with_outcomes(
         mut self,
     ) -> Result<(Lsn, crate::DeferredOutcomeHandle)> {
@@ -415,13 +402,11 @@ impl<'db> Transaction<'db> {
     /// as its `old_pba`, matching what the live apply path computes
     /// from a serialized read view.
     ///
-    /// [[no-refcount-hot-path-design]] Phase 5 needs apply to be
-    /// deterministic from the WAL alone — the on-disk dedup_index
+    /// Apply must be deterministic from the WAL alone. The on-disk dedup_index
     /// data pages are written eagerly per op (only the meta page is
-    /// checkpoint-gated), so replaying `apply_op_bare` against the
-    /// post-crash dedup_index state previously observed a hash → value
-    /// mapping that already reflected ops above `checkpoint_lsn` and
-    /// computed the wrong rc deltas.
+    /// checkpoint-gated), so replaying `apply_op_bare` against post-crash
+    /// dedup_index state could otherwise observe a hash -> value mapping from
+    /// above `checkpoint_lsn` and compute the wrong rc deltas.
     ///
     /// Concurrent-commit note: in metadb today different writer threads
     /// can race two `tx.commit()`s targeting the same hash. The reads

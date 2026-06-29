@@ -84,8 +84,7 @@ pub enum FaultPoint {
     /// written + `page_store.sync()` returned successfully, but the
     /// manifest commit hasn't yet captured the new `dead_list_tail_pid`.
     /// A crash here leaves the segment pages as durable orphans — the
-    /// next open's manifest still points at the old tail. Phase 2
-    /// accepts the leak; the test fixture asserts L2P / RC state stays
+    /// next open's manifest still points at the old tail.     /// accepts the leak; the test fixture asserts L2P / RC state stays
     /// self-consistent.
     DeadListPostSegWriteBeforeManifest,
     /// During [`flush_with_gate`], the manifest commit succeeded with
@@ -95,43 +94,43 @@ pub enum FaultPoint {
     /// repopulates, and the next flush writes a fresh segment linked
     /// to the manifest's tail.
     DeadListPostManifestBeforeNextFlush,
-    /// Phase 3 (no-refcount-hot-path) Lineage GC fault: the head
+    /// Lineage GC fault: the head
     /// segment's records have all been verified reclaim-eligible
     /// and the new manifest body has been assembled, but the
     /// durable commit hasn't fired yet. A crash here leaves the
     /// manifest pointing at the original head — recovery is
     /// identical to "GC pass never ran". No leak, no orphan.
     LineageGcPostFreePbasBeforeManifest,
-    /// Phase 3 Lineage GC fault: the manifest commit landed with a
+    /// Lineage GC fault: the manifest commit landed with a
     /// new `dead_list_head_pid` and the atomics have been promoted,
     /// but the old head segment's pages haven't been
     /// `page_store.free_many`-ed yet. A crash here leaves the old
     /// segment pages allocated but unreferenced (orphans). The
     /// next `Db::open` rebuilds the free list by scanning the page
     /// file, so orphans land on the free list at startup and get
-    /// reclaimed lazily. Phase 5 page_store reconciliation closes
-    /// this hole tightly; Phase 3 accepts the lazy reclaim.
+    /// reclaimed lazily. page_store reconciliation closes
+    /// this hole tightly; accepts the lazy reclaim.
     LineageGcPostHeadAdvanceBeforeFree,
-    /// Phase 3 Lineage GC fault: mid-way through reading a head
+    /// Lineage GC fault: mid-way through reading a head
     /// segment's pages (e.g. one of the continuation pages errored
     /// or the worker was killed). No side effect — the GC pass
     /// hadn't yet mutated anything.
     LineageGcMidSegmentRead,
-    /// ZFS port Phase 3b livelist-condense fault: the condensed single
+    /// BFG livelist-condense fault: the condensed single
     /// segment has been written + synced, but the manifest re-anchor
     /// commit hasn't fired yet. A crash here leaves the committed anchor
     /// pointing at the OLD chain (intact) + the new segment as an
     /// unreferenced orphan that `reclaim_orphan_pages` sweeps on the next
     /// open. Mirrors [`Self::LineageGcPostFreePbasBeforeManifest`].
     LivelistCondensePostSegWriteBeforeManifest,
-    /// ZFS port Phase 3b livelist-condense fault: the re-anchor manifest
+    /// BFG livelist-condense fault: the re-anchor manifest
     /// commit landed and the atomics were promoted to the condensed
     /// segment, but the OLD chain pages haven't been `free_idempotent`-ed
     /// yet. A crash here leaves them allocated-but-unreferenced (orphans);
     /// the next open reclaims them. Mirrors
     /// [`Self::LineageGcPostHeadAdvanceBeforeFree`].
     LivelistCondensePostManifestBeforeFree,
-    /// ZFS-TXG-clone Phase 2 fault: inside the L2P compactor's
+    /// BFG fault: inside the L2P compactor's
     /// step-7 drain of [`crate::db::commit::DeferredOutcomeAggregator`],
     /// after the staged outcomes have been popped from the pending
     /// map but **before** any `sender.send(...)` has fired.
@@ -144,7 +143,7 @@ pub enum FaultPoint {
     /// treated as a Panic since `drain_up_to_lsn` returns `usize`
     /// (no Result to propagate).
     DeferredOutcomeDrainMidway,
-    /// ZFS-TXG-clone Phase 3 fault: inside `flush_with_gate`, AFTER
+    /// BFG fault: inside `flush_with_gate`, AFTER
     /// `WalSet::fsync_all_lanes` returned Ok (every async WAL byte
     /// is on durable storage) BUT BEFORE
     /// `manifest_state.store.commit()` has fsynced the new
@@ -155,21 +154,21 @@ pub enum FaultPoint {
     /// idempotently (apply guards on `page.generation >= lsn`,
     /// refcount delta merge, cuckoo put-if-absent). End state must
     /// be byte-equivalent to a clean flush.
-    TxgSyncMidway,
-    /// ZFS-TXG-clone Phase 4 fault: inside
-    /// `TxgQuiesceThread::run_worker`, fires AFTER
-    /// `state.roll_to_quiescing` has closed the Open TXG + advanced
-    /// `open_txg` to the next slot BUT BEFORE `promote_to_syncing`
+    BfgSyncMidway,
+    /// BFG fault: inside
+    /// `BfgQuiesceThread::run_worker`, fires AFTER
+    /// `state.roll_to_quiescing` has closed the Open BFG + advanced
+    /// `open_bfg` to the next slot BUT BEFORE `promote_to_syncing`
     /// flips the Quiescing slot to Syncing. `FaultAction::Panic`
     /// simulates a crash in this window: the in-memory state machine
     /// is mid-quiesce; the on-disk manifest still records the old
-    /// `checkpoint_txg`. Recovery reconstructs the state machine from
+    /// `checkpoint_bfg`. Recovery reconstructs the state machine from
     /// the durable manifest, replays WAL, and folds replayed ops into
-    /// the post-recovery open TXG — the discarded mid-quiesce state
+    /// the post-recovery open BFG — the discarded mid-quiesce state
     /// must be unreachable (no on-disk visible side effect from a
-    /// non-promoted TXG).
-    TxgQuiesceMidway,
-    /// ZFS-TXG-clone Phase 3 fault: inside the WAL writer thread,
+    /// non-promoted BFG).
+    BfgQuiesceMidway,
+    /// BFG fault: inside the WAL writer thread,
     /// fires in lieu of `seg.append(&buf)` for an async-only batch.
     /// Simulates the strongest possible loss case: the kernel never
     /// flushes the OS page cache write for an async-submitted
@@ -212,8 +211,8 @@ impl FaultPoint {
                 "livelist_condense.post_manifest.before_free"
             }
             Self::DeferredOutcomeDrainMidway => "deferred_outcomes.drain.midway",
-            Self::TxgSyncMidway => "flush.txg_sync.midway",
-            Self::TxgQuiesceMidway => "txg.quiesce.midway",
+            Self::BfgSyncMidway => "flush.bfg_sync.midway",
+            Self::BfgQuiesceMidway => "bfg.quiesce.midway",
             Self::WalSubmitAsyncDropped => "wal.submit_async.dropped",
         }
     }

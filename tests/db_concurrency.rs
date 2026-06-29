@@ -94,7 +94,7 @@ fn multi_writer_stress_finishes_and_reopens_cleanly() {
     assert_eq!(after_reopen, before_reopen);
 }
 
-// Phase D.5: `multi_lane_wal_replay_survives_reopen_without_flush`
+// WAL-free recovery: `multi_lane_wal_replay_survives_reopen_without_flush`
 // exercised the multi-lane WAL writer + replay. The lanes existed
 // only inside the WAL subsystem, which is gone; Buffer mode has no
 // per-lane fan-out today.
@@ -172,7 +172,7 @@ fn snapshots_match_reference_during_multi_writer_rounds() {
     assert_eq!(current, want_current);
 }
 
-/// Phase 8b regression: `commit_ops` submits to the WAL *without* any
+/// regression: `commit_ops` submits to the WAL *without* any
 /// Db-level lock, so concurrent commits from N threads land in the same
 /// group-commit batch at the WAL writer and amortise one fsync across
 /// many records. Under the old `commit_lock` path every submit was

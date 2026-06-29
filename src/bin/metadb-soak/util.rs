@@ -2,12 +2,12 @@ fn open_or_create_with_faults(
     path: &Path,
     faults: Arc<FaultController>,
 ) -> onyx_metadb::Result<Arc<Db>> {
-    // ZFS port Phase 3b: let the soak drive the background livelist-condense
+    // BFG: let the soak drive the background livelist-condense
     // worker at a low segment threshold so a short run actually exercises it
     // concurrently with flush/drop/promote (the default is 16; a short soak
     // rarely grows a single clone chain that far). Unset = engine default.
     let mut cfg = onyx_metadb::Config::new(path);
-    // ZFS port Phase 4 S1c gate: lower the L2P shard count so more live volumes
+    // BFG gate: lower the L2P shard count so more live volumes
     // fit the single-page manifest (the capacity wall caps ~3 volumes at the
     // default 16 shards). With `MAX_LIVE_VOLUMES=4` binding instead, clone /
     // promote / drop churn actually gets dense — required to stress the clone
@@ -26,10 +26,10 @@ fn open_or_create_with_faults(
             cfg.livelist_condense_min_segments = n;
         }
     }
-    // ZFS port Phase 4 S2 gate: the soak defaults to direct-fold
+    // BFG gate: the soak defaults to direct-fold
     // (l2p_buffer_enabled=false), but every onyx/production config runs BUFFER
     // mode (l2p_buffer_enabled=true; nvme-detailed.toml etc.). Setting
-    // METADB_SOAK_L2P_BUFFER=1 makes the soak match production so the S2
+    // METADB_SOAK_L2P_BUFFER=1 makes the soak match production so the free-set
     // deadlist/reachability flip is validated in the mode it actually ships in.
     // A short max-interval keeps the compactor folding periodically so deaths
     // are sealed (and crash windows exercised) even at low write rates.
@@ -41,14 +41,14 @@ fn open_or_create_with_faults(
             }
         }
     }
-    // Production (nvme-detailed.toml) runs txg_threads_enabled=true: the fold is
-    // the background TxgSyncThread's `drain_syncing_slot_into_trees`, not the
+    // Production (nvme-detailed.toml) runs bfg_threads_enabled=true: the fold is
+    // the background BfgSyncThread's `drain_syncing_slot_into_trees`, not the
     // inline `force_compact_l2p_buffers`. The soak defaults to threads-OFF, so
     // the production fold path is otherwise never crash/restart-exercised.
-    // METADB_SOAK_TXG_THREADS=1 closes that coverage gap (a hard merge gate for
-    // the S2 flip alongside the threads-OFF run).
-    if matches!(std::env::var("METADB_SOAK_TXG_THREADS").as_deref(), Ok("1") | Ok("true")) {
-        cfg.txg_threads_enabled = true;
+    // METADB_SOAK_BFG_THREADS=1 closes that coverage gap (a hard merge gate for
+    // the free-set flip alongside the threads-OFF run).
+    if matches!(std::env::var("METADB_SOAK_BFG_THREADS").as_deref(), Ok("1") | Ok("true")) {
+        cfg.bfg_threads_enabled = true;
     }
     // take_snapshot deadlock fix (commit 6cc1bae) gate: the bg LineageGcWorker
     // drives `commit_free_pbas` (a read-before-enter commit path) autonomously
@@ -57,7 +57,7 @@ fn open_or_create_with_faults(
     // commit_free_pbas never fires and the lock-order deadlock window stays shut
     // (exactly why the 8h soak missed the deadlock). METADB_SOAK_LINEAGE_GC=1
     // turns it on with a short interval so it overlaps the snapshot/promote
-    // churn; pair with METADB_SOAK_TXG_THREADS=1 for the bg quiesce/sync path
+    // churn; pair with METADB_SOAK_BFG_THREADS=1 for the bg quiesce/sync path
     // that take_snapshot's forced sync drives.
     if matches!(std::env::var("METADB_SOAK_LINEAGE_GC").as_deref(), Ok("1") | Ok("true")) {
         cfg.lineage_gc_enabled = true;

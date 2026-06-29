@@ -22,7 +22,7 @@ pub struct MetaMetricsSnapshot {
     pub commit_finish_global_wait_max_us: u64,
     pub commit_apply_us: u64,
     pub commit_apply_max_us: u64,
-    // ZFS-TXG-clone Phase 1: direct L2P apply on caller thread.
+    // BFG: direct L2P apply on caller thread.
     pub commit_direct_apply_count: u64,
     pub commit_direct_apply_us: u64,
     pub commit_direct_apply_max_us: u64,
@@ -69,17 +69,17 @@ pub struct MetaMetricsSnapshot {
     pub wal_fsync_max_us: u64,
     pub wal_batch_records_max: u64,
     pub wal_batch_bytes_max: u64,
-    /// ZFS-TXG-clone Phase 3: cumulative count of submits acked
+    /// BFG: cumulative count of submits acked
     /// without an inline fsync. See `MetaMetrics::wal_async_acks_total`.
     pub wal_async_acks_total: u64,
-    /// ZFS-TXG-clone Phase 3: cumulative bytes written via async-only
+    /// BFG: cumulative bytes written via async-only
     /// batches. See `MetaMetrics::wal_async_pending_bytes_total`.
     pub wal_async_pending_bytes_total: u64,
-    /// ZFS-TXG-clone Phase 3: cumulative time spent in
+    /// BFG: cumulative time spent in
     /// `fsync_all_lanes` (max + sum). See
-    /// `MetaMetrics::wal_fsync_at_txg_sync_us`.
-    pub wal_fsync_at_txg_sync_us: u64,
-    pub wal_fsync_at_txg_sync_max_us: u64,
+    /// `MetaMetrics::wal_fsync_at_bfg_sync_us`.
+    pub wal_fsync_at_bfg_sync_us: u64,
+    pub wal_fsync_at_bfg_sync_max_us: u64,
     pub range_delete_calls: u64,
     pub range_delete_success: u64,
     pub range_delete_errors: u64,

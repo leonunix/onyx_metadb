@@ -1,4 +1,4 @@
-//! Phase 3 (no-refcount-hot-path) Lineage GC end-to-end tests.
+//! Lineage GC end-to-end tests.
 //!
 //! These exercise the head_pid advance path that the background
 //! `metadb-async-reclaim` worker normally drives. Tests use
@@ -279,13 +279,13 @@ fn lineage_gc_advance_survives_reopen() {
     let db = Db::open(dir.path()).unwrap();
     let (head_reopen, tail_reopen) = db.test_dead_list_anchors(0).unwrap();
     // Either NULL_PAGE (GC committed) or the original chain (GC
-    // didn't commit). Phase 3 plumbing-only: we asserted GC ran
+    // didn't commit). plumbing-only: we asserted GC ran
     // pre-close so the manifest must reflect that.
     assert_eq!(head_reopen, NULL_PAGE);
     assert_eq!(tail_reopen, NULL_PAGE);
 }
 
-// ── Phase 4 Step 2: cross-volume snap_pin via descendant.branched_at_lsn ──
+// ── cross-volume snap_pin via descendant.branched_at_lsn ──
 
 // A clone's `branched_at_lsn` must pin parent dead-list records whose
 // `[birth, death)` window contains it — otherwise the parent's GC
@@ -293,7 +293,7 @@ fn lineage_gc_advance_survives_reopen() {
 // L2P (the background promotion walker has not yet run, so the global
 // rc hasn't been bumped for the clone's lineage).
 #[test]
-fn phase4_lineage_gc_pins_parent_pba_via_descendant_branched_lsn() {
+fn lineage_gc_pins_parent_pba_via_descendant_branched_lsn() {
     use super::BOOTSTRAP_VOLUME_ORD;
 
     let (_d, db) = mk_db();
@@ -307,9 +307,9 @@ fn phase4_lineage_gc_pins_parent_pba_via_descendant_branched_lsn() {
     // sits strictly above every prior birth_lsn.
     let snap = db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
     let _clone = db.clone_volume(snap).unwrap();
-    // Drop the snapshot — without Phase 4's descendant pin, the
+    // Drop the snapshot — without 's descendant pin, the
     // parent's GC would now happily free the PBAs that the clone
-    // still references via the COW L2P. Phase 4 must hold them
+    // still references via the COW L2P. must hold them
     // because `clone.parent_vol_ord == Some(parent)` and the
     // clone's `branched_at_lsn ∈ [birth, death)` for every record
     // about to be emitted by the parent's overwrites.
@@ -337,7 +337,7 @@ fn phase4_lineage_gc_pins_parent_pba_via_descendant_branched_lsn() {
     assert_eq!(head_after, head_before, "head_pid must not advance");
 }
 
-// ── Phase 5: GC always emits commit_free_pbas ──
+// ── GC always emits commit_free_pbas ──
 
 fn mk_db_with_emit_freepbas() -> (tempfile::TempDir, std::sync::Arc<Db>) {
     use crate::Config;
@@ -347,7 +347,7 @@ fn mk_db_with_emit_freepbas() -> (tempfile::TempDir, std::sync::Arc<Db>) {
     (dir, db)
 }
 
-// Phase 5: GC emits a `commit_free_pbas` for each advancing volume.
+// GC emits a `commit_free_pbas` for each advancing volume.
 // We can't observe the outcome directly (the driver discards it), so
 // the contract test is "the cycle advanced AND the LSN advanced past
 // the writes' last LSN", which is only possible if GC committed at least
@@ -377,7 +377,7 @@ fn gc_emits_freepbas() {
     let lsn_after_gc = db.last_applied_lsn();
     assert!(
         lsn_after_gc > lsn_before_gc,
-        "Phase 5 GC must call commit_free_pbas (lsn {lsn_before_gc} -> {lsn_after_gc})"
+        "lineage GC must call commit_free_pbas (lsn {lsn_before_gc} -> {lsn_after_gc})"
     );
 }
 
@@ -398,7 +398,7 @@ fn lineage_gc_emit_freepbas_false_is_rejected() {
     );
 }
 
-// Phase 4 Step 7: a registered `freed_pbas_sink` receives the
+// a registered `freed_pbas_sink` receives the
 // `ApplyOutcome::FreePbas.freed_pbas` set produced by the GC cycle's
 // internal `commit_free_pbas` apply. Verifies the sink fires exactly
 // once with a non-empty list and is keyed by the GC'd volume ordinal.
@@ -437,11 +437,11 @@ fn freed_pbas_sink_receives_lineage_gc_outcomes() {
     assert!(!pbas.is_empty(), "GC cycle freed nothing: {pbas:?}");
 }
 
-// Once the clone's `parent_vol_ord` is cleared (the Step 5 background
+// Once the clone's `parent_vol_ord` is cleared (the promotion walker background
 // promotion walker's last act after PromotionComplete), the parent's
 // GC must resume — the descendant no longer counts as a pin point.
 #[test]
-fn phase4_lineage_gc_resumes_after_promotion_clears_parent_vol_ord() {
+fn lineage_gc_resumes_after_promotion_clears_parent_vol_ord() {
     use super::BOOTSTRAP_VOLUME_ORD;
 
     let (_d, db) = mk_db();
@@ -461,8 +461,8 @@ fn phase4_lineage_gc_resumes_after_promotion_clears_parent_vol_ord() {
     assert_eq!(db.test_run_lineage_gc_cycle().unwrap(), 0);
 
     // Simulate the background promotion walker finishing: clear the
-    // descendant's parent edge. Phase 5 wires this through a real
-    // `LifecycleOp::PromotionComplete` apply; for Step 2 the test helper
+    // descendant's parent edge. wires this through a real
+    // `LifecycleOp::PromotionComplete` apply; for lineage pinning the test helper
     // mutates manifest + in-memory state directly.
     db.test_clear_parent_vol_ord(clone);
 
@@ -477,7 +477,7 @@ fn phase4_lineage_gc_resumes_after_promotion_clears_parent_vol_ord() {
 
 // ── The production trigger: the background LineageGcWorker drives the
 //    FreePbas-emitting GC on its own, with NO manual cycle call. This is
-//    the regression test for the "Phase 5 lineage GC has no production
+//    the regression test for the "lineage GC has no production
 //    trigger" bug — on the pre-fix code the head never advances and the
 //    sink never fires, so the poll below times out. ──
 #[test]

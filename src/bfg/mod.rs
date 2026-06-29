@@ -1,35 +1,40 @@
-//! Three-state global TXG epoch state machine.
+//! Three-state global BFG epoch state machine.
+//!
+//! BFG - Blueflame Gatling Group
+//! Inspired by ZFS TXG, but shoots faster 🔵
 //!
 //! Replaces the single-`compacted_lsn` / `checkpoint_lsn` progress point with
-//! ZFS-style TXG (transaction group) accounting. At any moment up to three
-//! TXGs are active in a ring of `TXG_SIZE = 4` slots (index = `txg & 3`):
+//! BFG accounting. The code still uses `Bfg` for the epoch type because that
+//! name is wired through configs, metrics, tests, and on-disk fields. At any
+//! moment up to three groups are active in a ring of `BFG_SIZE = 4` slots
+//! (index = `bfg & 3`):
 //!
 //! - **Open**: accepting new commits. Exactly one slot.
-//! - **Quiescing**: closed to new commits, waiting for in-flight `TxgGuard`s
+//! - **Quiescing**: closed to new commits, waiting for in-flight `BfgGuard`s
 //!   to drop. At most one slot.
-//! - **Syncing**: drained; `TxgSyncThread` is persisting it. At most one slot.
+//! - **Syncing**: drained; `BfgSyncThread` is persisting it. At most one slot.
 //! - **Empty**: ring slot available for the next roll.
 //!
 //! Commit hot path:
 //! ```ignore
 //! let guard = state.enter();          // 1 mutex acquire, ~50ns
-//! // ... submit WAL, apply ops, stamp L2pBuffer slot[guard.txg & 3] ...
+//! // ... submit WAL, apply ops, stamp L2pBuffer slot[guard.bfg & 3] ...
 //! guard.record_lsn(lsn);              // 1 mutex acquire
 //! drop(guard);                         // 1 mutex acquire
 //! ```
 //!
 //! Quiesce thread (single, fires on 5 s timer or dirty-data trigger):
 //! ```ignore
-//! let txg = state.roll_to_quiescing();   // close current Open, open next
-//! state.wait_quiesce_drained(txg);       // park until inflight == 0
-//! state.promote_to_syncing(txg);
+//! let bfg = state.roll_to_quiescing();   // close current Open, open next
+//! state.wait_quiesce_drained(bfg);       // park until inflight == 0
+//! state.promote_to_syncing(bfg);
 //! sync_notify.wake();
 //! ```
 //!
 //! Sync thread (single, fires on quiesce notify):
 //! ```ignore
 //! // drain L2pBuffer slots, apply to tree, manifest commit, then:
-//! state.mark_synced(txg);
+//! state.mark_synced(bfg);
 //! ```
 //!
 //! ## Concurrency
@@ -40,36 +45,36 @@
 //! plus the commit hot path; commits do not block each other on this mutex
 //! beyond the trivial slot-counter bump.
 //!
-//! Lookup-side cheaper paths use `open_txg_atomic` / `checkpoint_txg_atomic`
+//! Lookup-side cheaper paths use `open_bfg_atomic` / `checkpoint_bfg_atomic`
 //! snapshots so the L2P read path can walk the ring without taking the
 //! inner mutex.
 //!
 //! ## Ring invariants (debug_asserted)
 //!
-//! - Exactly one slot in Open, at `open_txg & 3`.
-//! - At most one slot in Quiescing, at `(open_txg - 1) & 3`.
+//! - Exactly one slot in Open, at `open_bfg & 3`.
+//! - At most one slot in Quiescing, at `(open_bfg - 1) & 3`.
 //! - At most one slot in Syncing.
-//! - `checkpoint_txg + 1 <= open_txg`
-//! - `open_txg - checkpoint_txg <= TXG_SIZE - 1` (at most `TXG_CONCURRENT_STATES` active)
+//! - `checkpoint_bfg + 1 <= open_bfg`
+//! - `open_bfg - checkpoint_bfg <= BFG_SIZE - 1` (at most `BFG_CONCURRENT_STATES` active)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::types::{Lsn, Txg};
+use crate::types::{Lsn, Bfg};
 
-/// Ring slot count. Must be a power of two (slot index = `txg & (TXG_SIZE - 1)`).
-pub const TXG_SIZE: usize = 4;
+/// Ring slot count. Must be a power of two (slot index = `bfg & (BFG_SIZE - 1)`).
+pub const BFG_SIZE: usize = 4;
 
-/// Maximum number of concurrently-active TXGs (Open + Quiescing + Syncing).
+/// Maximum number of concurrently-active BFGs (Open + Quiescing + Syncing).
 /// One slot in the ring is always Empty, acting as the next-slot reservation
 /// for the upcoming roll.
-pub const TXG_CONCURRENT_STATES: usize = 3;
+pub const BFG_CONCURRENT_STATES: usize = 3;
 
-const TXG_INDEX_MASK: u64 = (TXG_SIZE as u64) - 1;
+const BFG_INDEX_MASK: u64 = (BFG_SIZE as u64) - 1;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TxgState {
+pub enum BfgState {
     Empty,
     Open,
     Quiescing,
@@ -78,7 +83,7 @@ pub enum TxgState {
 
 #[derive(Copy, Clone, Debug)]
 struct Slot {
-    state: TxgState,
+    state: BfgState,
     inflight: u64,
     max_lsn: Lsn,
 }
@@ -86,7 +91,7 @@ struct Slot {
 impl Slot {
     const fn empty() -> Self {
         Self {
-            state: TxgState::Empty,
+            state: BfgState::Empty,
             inflight: 0,
             max_lsn: 0,
         }
@@ -94,138 +99,135 @@ impl Slot {
 }
 
 struct Inner {
-    slots: [Slot; TXG_SIZE],
-    open_txg: Txg,
-    quiescing_txg: Option<Txg>,
-    syncing_txg: Option<Txg>,
-    checkpoint_txg: Txg,
+    slots: [Slot; BFG_SIZE],
+    open_bfg: Bfg,
+    quiescing_bfg: Option<Bfg>,
+    syncing_bfg: Option<Bfg>,
+    checkpoint_bfg: Bfg,
     shutdown: bool,
-    /// ZFS port Part B: set by `mark_aborted` when a forced TXG sync cycle
-    /// fails non-recoverably (e.g. faulted manifest fsync). Mirrors `shutdown`
-    /// in EVERY wait loop / early-return below: a failed sync leaves its slot
-    /// in `Syncing` forever (`mark_synced` never runs), so without this the
-    /// next `promote_to_syncing` / `wait_until_synced` / `roll_to_quiescing`
-    /// would block on a slot that can never complete. Unlike `shutdown`
-    /// (clean teardown), `aborted` is a fault state — `wait_until_synced`
-    /// reports it (returns `false`) so callers surface the "restart required"
-    /// sync-poison error instead of treating it as a clean sync. One-way
-    /// (never cleared in-process); recovery is a process restart + reopen.
+    /// Set by `mark_aborted` when a forced BFG sync fails in a way that cannot
+    /// be retried in this process, for example a faulted manifest fsync. A
+    /// failed sync leaves its slot in `Syncing` forever because `mark_synced`
+    /// never runs, so every waiter must wake and return instead of blocking on
+    /// a slot that can never complete. Unlike `shutdown`, this is a poison
+    /// state: `wait_until_synced` returns `false` so callers report "restart
+    /// required". Recovery is a process restart + reopen.
     aborted: bool,
     /// Set by `roll_to_quiescing` after the next-slot wait completes and
     /// BEFORE the inflight-drain wait begins. `enter()` blocks while this
-    /// is set so no new commits join the closing TXG. Cleared once the
-    /// state flip + open_txg advance is done.
+    /// is set so no new commits join the closing BFG. Cleared once the
+    /// state flip + open_bfg advance is done.
     ///
     /// Without this, the WAL allocator may hand out an LSN < L to a
-    /// commit stamped to TXG N+1 (entered between the inflight-drain
-    /// wakeup and the open_txg advance) — breaking the monotonicity
-    /// invariant `max(LSN in TXG_n) <= min(LSN in TXG_n+1)` that
+    /// commit stamped to BFG N+1 (entered between the inflight-drain
+    /// wakeup and the open_bfg advance) — breaking the monotonicity
+    /// invariant `max(LSN in BFG_n) <= min(LSN in BFG_n+1)` that
     /// `checkpoint_lsn = slot[K].max_lsn` relies on for WAL prune
     /// correctness.
     closing_open: bool,
 }
 
-pub struct TxgStateMachine {
+pub struct BfgStateMachine {
     inner: Mutex<Inner>,
     cv: Condvar,
-    open_txg_atomic: AtomicU64,
-    checkpoint_txg_atomic: AtomicU64,
+    open_bfg_atomic: AtomicU64,
+    checkpoint_bfg_atomic: AtomicU64,
 }
 
-impl TxgStateMachine {
+impl BfgStateMachine {
     /// Fresh state machine with all slots empty except the Open slot at
-    /// `(initial_checkpoint_txg + 1) & 3`.
-    pub fn new(initial_checkpoint_txg: Txg) -> Self {
-        let mut slots = [Slot::empty(); TXG_SIZE];
-        let open_txg = initial_checkpoint_txg + 1;
-        slots[(open_txg & TXG_INDEX_MASK) as usize].state = TxgState::Open;
+    /// `(initial_checkpoint_bfg + 1) & 3`.
+    pub fn new(initial_checkpoint_bfg: Bfg) -> Self {
+        let mut slots = [Slot::empty(); BFG_SIZE];
+        let open_bfg = initial_checkpoint_bfg + 1;
+        slots[(open_bfg & BFG_INDEX_MASK) as usize].state = BfgState::Open;
         Self {
             inner: Mutex::new(Inner {
                 slots,
-                open_txg,
-                quiescing_txg: None,
-                syncing_txg: None,
-                checkpoint_txg: initial_checkpoint_txg,
+                open_bfg,
+                quiescing_bfg: None,
+                syncing_bfg: None,
+                checkpoint_bfg: initial_checkpoint_bfg,
                 shutdown: false,
                 aborted: false,
                 closing_open: false,
             }),
             cv: Condvar::new(),
-            open_txg_atomic: AtomicU64::new(open_txg),
-            checkpoint_txg_atomic: AtomicU64::new(initial_checkpoint_txg),
+            open_bfg_atomic: AtomicU64::new(open_bfg),
+            checkpoint_bfg_atomic: AtomicU64::new(initial_checkpoint_bfg),
         }
     }
 
-    /// Stamp the caller's commit to the currently-Open TXG. Holds a refcount
+    /// Stamp the caller's commit to the currently-Open BFG. Holds a refcount
     /// on that slot until the returned guard is dropped. **Hot path.**
     ///
     /// Blocks (briefly) while a `roll_to_quiescing` is in its drain window
     /// — without that block a freshly-entered commit could obtain a WAL
-    /// LSN before the rolling TXG's last commit, breaking the
-    /// `max(LSN in TXG_n) <= min(LSN in TXG_n+1)` monotonicity invariant
+    /// LSN before the rolling BFG's last commit, breaking the
+    /// `max(LSN in BFG_n) <= min(LSN in BFG_n+1)` monotonicity invariant
     /// the manifest WAL-prune logic depends on. The window is bounded by
-    /// the in-flight commit count on the closing TXG, which is normally
+    /// the in-flight commit count on the closing BFG, which is normally
     /// drained within milliseconds.
-    pub fn enter(&self) -> TxgGuard<'_> {
+    pub fn enter(&self) -> BfgGuard<'_> {
         let mut g = self.inner.lock();
         while g.closing_open && !g.shutdown && !g.aborted {
             self.cv.wait(&mut g);
         }
-        let txg = g.open_txg;
-        let idx = (txg & TXG_INDEX_MASK) as usize;
-        debug_assert_eq!(g.slots[idx].state, TxgState::Open);
+        let bfg = g.open_bfg;
+        let idx = (bfg & BFG_INDEX_MASK) as usize;
+        debug_assert_eq!(g.slots[idx].state, BfgState::Open);
         g.slots[idx].inflight += 1;
-        TxgGuard { sm: self, txg }
+        BfgGuard { sm: self, bfg }
     }
 
     /// Bump the slot's `max_lsn` if the supplied LSN is larger. Called by the
     /// commit thread after `submit_wal_ops` returns the LSN. Must be called
-    /// while a `TxgGuard` for this TXG is held — otherwise the slot may have
+    /// while a `BfgGuard` for this BFG is held — otherwise the slot may have
     /// already rolled and the write would land on a stale slot.
-    pub fn record_lsn(&self, txg: Txg, lsn: Lsn) {
+    pub fn record_lsn(&self, bfg: Bfg, lsn: Lsn) {
         let mut g = self.inner.lock();
-        let idx = (txg & TXG_INDEX_MASK) as usize;
+        let idx = (bfg & BFG_INDEX_MASK) as usize;
         if lsn > g.slots[idx].max_lsn {
             g.slots[idx].max_lsn = lsn;
         }
     }
 
-    /// Close the currently-Open TXG, wait for its in-flight commits to
-    /// drain, then advance `open_txg` to the next slot. Returns the now-
-    /// Quiescing TXG.
+    /// Close the currently-Open BFG, wait for its in-flight commits to
+    /// drain, then advance `open_bfg` to the next slot. Returns the now-
+    /// Quiescing BFG.
     ///
     /// Three-phase wait under the inner mutex:
     ///   1. Ring-full wait — `slots[(cur+1) & 3]` must be Empty.
     ///   2. Close `enter()` to new commits via `closing_open = true`.
     ///   3. Drain wait — `slots[cur & 3].inflight` must hit 0.
-    /// Only then flip states and advance `open_txg`. The drain wait
+    /// Only then flip states and advance `open_bfg`. The drain wait
     /// happens BEFORE the advance (not after) so the WAL allocator
-    /// cannot interleave a TXG_(N+1) commit's LSN below a TXG_N
+    /// cannot interleave a BFG_(N+1) commit's LSN below a BFG_N
     /// commit's LSN — preserving the
-    /// `max(LSN in TXG_n) <= min(LSN in TXG_n+1)` invariant.
+    /// `max(LSN in BFG_n) <= min(LSN in BFG_n+1)` invariant.
     ///
-    /// Called only by `TxgQuiesceThread`. Idempotent under shutdown:
-    /// returns the current `open_txg` without advancing.
-    pub fn roll_to_quiescing(&self) -> Txg {
+    /// Called only by `BfgQuiesceThread`. Idempotent under shutdown:
+    /// returns the current `open_bfg` without advancing.
+    pub fn roll_to_quiescing(&self) -> Bfg {
         let mut g = self.inner.lock();
-        let cur = g.open_txg;
-        let cur_idx = (cur & TXG_INDEX_MASK) as usize;
+        let cur = g.open_bfg;
+        let cur_idx = (cur & BFG_INDEX_MASK) as usize;
         let next = cur + 1;
-        let next_idx = (next & TXG_INDEX_MASK) as usize;
+        let next_idx = (next & BFG_INDEX_MASK) as usize;
 
         // (1) Ring-full wait.
-        while g.slots[next_idx].state != TxgState::Empty && !g.shutdown && !g.aborted {
+        while g.slots[next_idx].state != BfgState::Empty && !g.shutdown && !g.aborted {
             self.cv.wait(&mut g);
         }
         if g.shutdown || g.aborted {
             // `aborted`: a failed sync pinned a slot in Syncing forever, so
             // the ring can never drain. Return without advancing (no
             // closing_open set yet) — the quiesce worker re-checks
-            // `quiescing_txg != Some(cur)` and skips promote/notify.
+            // `quiescing_bfg != Some(cur)` and skips promote/notify.
             return cur;
         }
-        debug_assert!(g.quiescing_txg.is_none(), "two TXGs in Quiescing");
-        debug_assert_eq!(g.slots[cur_idx].state, TxgState::Open);
+        debug_assert!(g.quiescing_bfg.is_none(), "two BFGs in Quiescing");
+        debug_assert_eq!(g.slots[cur_idx].state, BfgState::Open);
 
         // (2) Close enter() to new commits. Without this the drain wait
         // below would race against fresh commits joining the slot.
@@ -240,98 +242,92 @@ impl TxgStateMachine {
             // Leave closing_open = true so the shutdown/abort path is
             // observable; shutdown()/mark_aborted() both notify and `enter()`
             // breaks on either flag, so the close flag does not matter beyond
-            // this point. Returning without flipping leaves quiescing_txg
+            // this point. Returning without flipping leaves quiescing_bfg
             // unset → the quiesce worker skips promote/notify.
             return cur;
         }
 
-        // Flip states and advance open_txg.
-        g.slots[cur_idx].state = TxgState::Quiescing;
-        g.slots[next_idx].state = TxgState::Open;
-        g.quiescing_txg = Some(cur);
-        g.open_txg = next;
-        self.open_txg_atomic.store(next, Ordering::Release);
+        // Flip states and advance open_bfg.
+        g.slots[cur_idx].state = BfgState::Quiescing;
+        g.slots[next_idx].state = BfgState::Open;
+        g.quiescing_bfg = Some(cur);
+        g.open_bfg = next;
+        self.open_bfg_atomic.store(next, Ordering::Release);
         // Reopen the door — new commits now stamp to `next`.
         g.closing_open = false;
         self.cv.notify_all();
         cur
     }
 
-    /// Promote a Quiescing TXG to Syncing. `inflight` must be zero.
+    /// Promote a Quiescing BFG to Syncing. `inflight` must be zero.
     ///
-    /// **Blocks until the previous Syncing TXG has been consumed**
-    /// (`mark_synced` cleared `syncing_txg`), enforcing "at most one
-    /// Syncing". The quiesce worker is allowed to roll + quiesce TXG N+1
-    /// while TXG N is still syncing (ZFS-style 3-concurrent
-    /// open/quiescing/syncing, bounded by the ring-full wait in
-    /// `roll_to_quiescing`), but the handoff INTO Syncing must wait for
-    /// N's sync to finish. Without this wait, a `TxgSyncThread` that lags
-    /// the roll cadence (e.g. `write_dirty_pages` under load) would let
-    /// the worker promote a second TXG into Syncing — previously a
-    /// `debug_assert` that panicked the worker, orphaned the sync thread,
-    /// and hung every `wait_until_synced` (a shutdown deadlock). This is
-    /// the metadb equivalent of ZFS `txg_quiesce_thread` waiting on
-    /// `txg_has_quiesced_to_sync`.
+    /// **Blocks until the previous Syncing BFG has been consumed**
+    /// (`mark_synced` cleared `syncing_bfg`), enforcing "at most one
+    /// Syncing". The quiesce worker may roll BFG N+1 while BFG N is still
+    /// syncing, but the handoff INTO Syncing must wait for N's sync to finish.
+    /// Without this wait, a `BfgSyncThread` that lags the roll cadence (for
+    /// example `write_dirty_pages` under load) could promote two groups into
+    /// Syncing, orphan the sync thread, and hang every `wait_until_synced`.
     ///
     /// On the threads-off inline flush path this never waits:
-    /// `mark_synced` for the prior TXG has already run before the next
+    /// `mark_synced` for the prior BFG has already run before the next
     /// `roll_to_quiescing` → `promote_to_syncing`. Returns without
-    /// promoting under shutdown (the caller re-checks `quiescing_txg`).
-    pub fn promote_to_syncing(&self, txg: Txg) {
+    /// promoting under shutdown (the caller re-checks `quiescing_bfg`).
+    pub fn promote_to_syncing(&self, bfg: Bfg) {
         let mut g = self.inner.lock();
-        let idx = (txg & TXG_INDEX_MASK) as usize;
-        while g.syncing_txg.is_some() && !g.shutdown && !g.aborted {
+        let idx = (bfg & BFG_INDEX_MASK) as usize;
+        while g.syncing_bfg.is_some() && !g.shutdown && !g.aborted {
             self.cv.wait(&mut g);
         }
         if g.shutdown || g.aborted {
             // Return WITHOUT promoting (caller re-checks via `is_aborted` /
-            // `snapshot().syncing_txg` before driving run_sync_cycle).
+            // `snapshot().syncing_bfg` before driving run_sync_cycle).
             return;
         }
-        debug_assert_eq!(g.slots[idx].state, TxgState::Quiescing);
+        debug_assert_eq!(g.slots[idx].state, BfgState::Quiescing);
         debug_assert_eq!(g.slots[idx].inflight, 0);
-        debug_assert_eq!(g.quiescing_txg, Some(txg));
-        g.slots[idx].state = TxgState::Syncing;
-        g.quiescing_txg = None;
-        g.syncing_txg = Some(txg);
+        debug_assert_eq!(g.quiescing_bfg, Some(bfg));
+        g.slots[idx].state = BfgState::Syncing;
+        g.quiescing_bfg = None;
+        g.syncing_bfg = Some(bfg);
     }
 
-    /// Mark a Syncing TXG complete; advance `checkpoint_txg`. Wakes ring-full
+    /// Mark a Syncing BFG complete; advance `checkpoint_bfg`. Wakes ring-full
     /// roll waiters and any flush callers parked in `wait_until_synced`.
-    pub fn mark_synced(&self, txg: Txg) {
+    pub fn mark_synced(&self, bfg: Bfg) {
         let mut g = self.inner.lock();
-        let idx = (txg & TXG_INDEX_MASK) as usize;
-        debug_assert_eq!(g.slots[idx].state, TxgState::Syncing);
-        debug_assert_eq!(g.syncing_txg, Some(txg));
-        g.slots[idx].state = TxgState::Empty;
+        let idx = (bfg & BFG_INDEX_MASK) as usize;
+        debug_assert_eq!(g.slots[idx].state, BfgState::Syncing);
+        debug_assert_eq!(g.syncing_bfg, Some(bfg));
+        g.slots[idx].state = BfgState::Empty;
         g.slots[idx].inflight = 0;
         g.slots[idx].max_lsn = 0;
-        g.syncing_txg = None;
-        if txg > g.checkpoint_txg {
-            g.checkpoint_txg = txg;
-            self.checkpoint_txg_atomic.store(txg, Ordering::Release);
+        g.syncing_bfg = None;
+        if bfg > g.checkpoint_bfg {
+            g.checkpoint_bfg = bfg;
+            self.checkpoint_bfg_atomic.store(bfg, Ordering::Release);
         }
         self.cv.notify_all();
     }
 
     /// Read the slot's max LSN. Returns the live value; if the slot has just
     /// been marked Empty by `mark_synced` the returned value is 0.
-    pub fn slot_max_lsn(&self, txg: Txg) -> Lsn {
+    pub fn slot_max_lsn(&self, bfg: Bfg) -> Lsn {
         let g = self.inner.lock();
-        let idx = (txg & TXG_INDEX_MASK) as usize;
+        let idx = (bfg & BFG_INDEX_MASK) as usize;
         g.slots[idx].max_lsn
     }
 
-    /// Park until `checkpoint_txg >= target`. Used by `flush_with_gate` after
-    /// it has force-rolled a TXG. Returns `false` iff the wait was released by
+    /// Park until `checkpoint_bfg >= target`. Used by `flush_with_gate` after
+    /// it has force-rolled a BFG. Returns `false` iff the wait was released by
     /// `aborted` (a failed sync; the target will never be reached) so the
     /// caller surfaces the sync-poison "restart required" error instead of
     /// treating it as a clean sync; `true` on a real sync OR on shutdown
     /// (clean teardown, unchanged semantics).
     #[must_use]
-    pub fn wait_until_synced(&self, target: Txg) -> bool {
+    pub fn wait_until_synced(&self, target: Bfg) -> bool {
         let mut g = self.inner.lock();
-        while g.checkpoint_txg < target && !g.shutdown && !g.aborted {
+        while g.checkpoint_bfg < target && !g.shutdown && !g.aborted {
             self.cv.wait(&mut g);
         }
         !g.aborted
@@ -345,15 +341,15 @@ impl TxgStateMachine {
         self.inner.lock().aborted
     }
 
-    /// Lock-free snapshot of `open_txg`. L2P read paths walk the buffer ring
+    /// Lock-free snapshot of `open_bfg`. L2P read paths walk the buffer ring
     /// starting from this value.
-    pub fn open_txg(&self) -> Txg {
-        self.open_txg_atomic.load(Ordering::Acquire)
+    pub fn open_bfg(&self) -> Bfg {
+        self.open_bfg_atomic.load(Ordering::Acquire)
     }
 
-    /// Lock-free snapshot of `checkpoint_txg`.
-    pub fn checkpoint_txg(&self) -> Txg {
-        self.checkpoint_txg_atomic.load(Ordering::Acquire)
+    /// Lock-free snapshot of `checkpoint_bfg`.
+    pub fn checkpoint_bfg(&self) -> Bfg {
+        self.checkpoint_bfg_atomic.load(Ordering::Acquire)
     }
 
     /// Observability / test snapshot of every slot's state.
@@ -366,10 +362,10 @@ impl TxgStateMachine {
                 (g.slots[2].state, g.slots[2].inflight, g.slots[2].max_lsn),
                 (g.slots[3].state, g.slots[3].inflight, g.slots[3].max_lsn),
             ],
-            open_txg: g.open_txg,
-            quiescing_txg: g.quiescing_txg,
-            syncing_txg: g.syncing_txg,
-            checkpoint_txg: g.checkpoint_txg,
+            open_bfg: g.open_bfg,
+            quiescing_bfg: g.quiescing_bfg,
+            syncing_bfg: g.syncing_bfg,
+            checkpoint_bfg: g.checkpoint_bfg,
         }
     }
 
@@ -381,12 +377,12 @@ impl TxgStateMachine {
         self.cv.notify_all();
     }
 
-    /// ZFS port Part B — mark the sync subsystem permanently failed (e.g. a
-    /// faulted manifest fsync left a slot stuck in Syncing). Mirrors
-    /// `shutdown`: set the sticky `aborted` flag + `notify_all` so every parked
-    /// waiter (`enter`, `roll_to_quiescing`, `promote_to_syncing`,
-    /// `wait_until_synced`) re-checks and breaks instead of blocking on the
-    /// never-to-complete slot. One-way; recovery is a process restart.
+    /// Mark the BFG sync subsystem permanently failed, for example after a
+    /// manifest fsync fault leaves a slot stuck in Syncing. Mirrors `shutdown`:
+    /// set the sticky `aborted` flag and wake every waiter (`enter`,
+    /// `roll_to_quiescing`, `promote_to_syncing`, `wait_until_synced`) so they
+    /// return instead of blocking on the never-to-complete slot. One-way;
+    /// recovery is a process restart.
     pub fn mark_aborted(&self) {
         let mut g = self.inner.lock();
         g.aborted = true;
@@ -394,26 +390,26 @@ impl TxgStateMachine {
     }
 }
 
-pub struct TxgGuard<'a> {
-    sm: &'a TxgStateMachine,
-    pub txg: Txg,
+pub struct BfgGuard<'a> {
+    sm: &'a BfgStateMachine,
+    pub bfg: Bfg,
 }
 
-impl TxgGuard<'_> {
-    pub fn txg(&self) -> Txg {
-        self.txg
+impl BfgGuard<'_> {
+    pub fn bfg(&self) -> Bfg {
+        self.bfg
     }
 
-    /// Record the highest LSN observed against this guard's TXG.
+    /// Record the highest LSN observed against this guard's BFG.
     pub fn record_lsn(&self, lsn: Lsn) {
-        self.sm.record_lsn(self.txg, lsn);
+        self.sm.record_lsn(self.bfg, lsn);
     }
 }
 
-impl Drop for TxgGuard<'_> {
+impl Drop for BfgGuard<'_> {
     fn drop(&mut self) {
         let mut g = self.sm.inner.lock();
-        let idx = (self.txg & TXG_INDEX_MASK) as usize;
+        let idx = (self.bfg & BFG_INDEX_MASK) as usize;
         debug_assert!(g.slots[idx].inflight > 0);
         g.slots[idx].inflight -= 1;
         // Notify when the slot just emptied. `roll_to_quiescing` parks
@@ -428,11 +424,11 @@ impl Drop for TxgGuard<'_> {
 
 #[derive(Clone, Debug)]
 pub struct StateSnapshot {
-    pub slots: [(TxgState, u64, Lsn); TXG_SIZE],
-    pub open_txg: Txg,
-    pub quiescing_txg: Option<Txg>,
-    pub syncing_txg: Option<Txg>,
-    pub checkpoint_txg: Txg,
+    pub slots: [(BfgState, u64, Lsn); BFG_SIZE],
+    pub open_bfg: Bfg,
+    pub quiescing_bfg: Option<Bfg>,
+    pub syncing_bfg: Option<Bfg>,
+    pub checkpoint_bfg: Bfg,
 }
 
 #[cfg(test)]
@@ -444,38 +440,38 @@ mod tests {
 
     #[test]
     fn new_initial_state() {
-        let sm = TxgStateMachine::new(0);
+        let sm = BfgStateMachine::new(0);
         let s = sm.snapshot();
-        assert_eq!(s.checkpoint_txg, 0);
-        assert_eq!(s.open_txg, 1);
-        assert_eq!(s.quiescing_txg, None);
-        assert_eq!(s.syncing_txg, None);
+        assert_eq!(s.checkpoint_bfg, 0);
+        assert_eq!(s.open_bfg, 1);
+        assert_eq!(s.quiescing_bfg, None);
+        assert_eq!(s.syncing_bfg, None);
         // Slot 1 is Open; everything else Empty.
-        assert_eq!(s.slots[1].0, TxgState::Open);
-        assert_eq!(s.slots[0].0, TxgState::Empty);
-        assert_eq!(s.slots[2].0, TxgState::Empty);
-        assert_eq!(s.slots[3].0, TxgState::Empty);
-        assert_eq!(sm.open_txg(), 1);
-        assert_eq!(sm.checkpoint_txg(), 0);
+        assert_eq!(s.slots[1].0, BfgState::Open);
+        assert_eq!(s.slots[0].0, BfgState::Empty);
+        assert_eq!(s.slots[2].0, BfgState::Empty);
+        assert_eq!(s.slots[3].0, BfgState::Empty);
+        assert_eq!(sm.open_bfg(), 1);
+        assert_eq!(sm.checkpoint_bfg(), 0);
     }
 
     #[test]
     fn new_with_nonzero_checkpoint() {
-        let sm = TxgStateMachine::new(7);
+        let sm = BfgStateMachine::new(7);
         let s = sm.snapshot();
-        assert_eq!(s.checkpoint_txg, 7);
-        assert_eq!(s.open_txg, 8);
+        assert_eq!(s.checkpoint_bfg, 7);
+        assert_eq!(s.open_bfg, 8);
         // 8 & 3 == 0 → slot 0 is Open.
-        assert_eq!(s.slots[0].0, TxgState::Open);
+        assert_eq!(s.slots[0].0, BfgState::Open);
     }
 
     #[test]
     fn enter_increments_inflight() {
-        let sm = TxgStateMachine::new(0);
+        let sm = BfgStateMachine::new(0);
         let g1 = sm.enter();
         let g2 = sm.enter();
-        assert_eq!(g1.txg(), 1);
-        assert_eq!(g2.txg(), 1);
+        assert_eq!(g1.bfg(), 1);
+        assert_eq!(g2.bfg(), 1);
         let s = sm.snapshot();
         assert_eq!(s.slots[1].1, 2);
         drop(g1);
@@ -488,109 +484,109 @@ mod tests {
 
     #[test]
     fn record_lsn_keeps_max() {
-        let sm = TxgStateMachine::new(0);
+        let sm = BfgStateMachine::new(0);
         let g = sm.enter();
         g.record_lsn(10);
         g.record_lsn(5);
         g.record_lsn(20);
-        assert_eq!(sm.slot_max_lsn(g.txg()), 20);
+        assert_eq!(sm.slot_max_lsn(g.bfg()), 20);
     }
 
     #[test]
-    fn roll_advances_open_txg() {
-        let sm = TxgStateMachine::new(0);
+    fn roll_advances_open_bfg() {
+        let sm = BfgStateMachine::new(0);
         let q = sm.roll_to_quiescing();
         assert_eq!(q, 1);
         let s = sm.snapshot();
-        assert_eq!(s.open_txg, 2);
-        assert_eq!(s.quiescing_txg, Some(1));
-        assert_eq!(s.slots[1].0, TxgState::Quiescing);
-        assert_eq!(s.slots[2].0, TxgState::Open);
+        assert_eq!(s.open_bfg, 2);
+        assert_eq!(s.quiescing_bfg, Some(1));
+        assert_eq!(s.slots[1].0, BfgState::Quiescing);
+        assert_eq!(s.slots[2].0, BfgState::Open);
     }
 
     #[test]
     fn full_cycle_open_quiesce_sync_empty() {
-        let sm = TxgStateMachine::new(0);
+        let sm = BfgStateMachine::new(0);
         // No inflight commits — roll completes its embedded drain wait
-        // immediately and returns the now-Quiescing TXG.
+        // immediately and returns the now-Quiescing BFG.
         let q = sm.roll_to_quiescing();
         assert_eq!(q, 1);
         sm.promote_to_syncing(q);
         let s = sm.snapshot();
-        assert_eq!(s.syncing_txg, Some(1));
-        assert_eq!(s.quiescing_txg, None);
-        assert_eq!(s.slots[1].0, TxgState::Syncing);
+        assert_eq!(s.syncing_bfg, Some(1));
+        assert_eq!(s.quiescing_bfg, None);
+        assert_eq!(s.slots[1].0, BfgState::Syncing);
         sm.mark_synced(q);
         let s = sm.snapshot();
-        assert_eq!(s.syncing_txg, None);
-        assert_eq!(s.checkpoint_txg, 1);
-        assert_eq!(s.slots[1].0, TxgState::Empty);
+        assert_eq!(s.syncing_bfg, None);
+        assert_eq!(s.checkpoint_bfg, 1);
+        assert_eq!(s.slots[1].0, BfgState::Empty);
     }
 
     #[test]
-    fn three_concurrent_txgs_then_ring_full() {
-        let sm = TxgStateMachine::new(0);
-        // Roll until 3 active TXGs.
+    fn three_concurrent_bfgs_then_ring_full() {
+        let sm = BfgStateMachine::new(0);
+        // Roll until 3 active BFGs.
         let q1 = sm.roll_to_quiescing();
         sm.promote_to_syncing(q1);
-        // TXG 1 Syncing, TXG 2 Open.
+        // BFG 1 Syncing, BFG 2 Open.
         let q2 = sm.roll_to_quiescing();
-        // TXG 2 Quiescing, TXG 3 Open, TXG 1 still Syncing.
+        // BFG 2 Quiescing, BFG 3 Open, BFG 1 still Syncing.
         let s = sm.snapshot();
-        assert_eq!(s.open_txg, 3);
-        assert_eq!(s.quiescing_txg, Some(2));
-        assert_eq!(s.syncing_txg, Some(1));
-        assert_eq!(s.slots[1].0, TxgState::Syncing);
-        assert_eq!(s.slots[2].0, TxgState::Quiescing);
-        assert_eq!(s.slots[3].0, TxgState::Open);
-        assert_eq!(s.slots[0].0, TxgState::Empty);
+        assert_eq!(s.open_bfg, 3);
+        assert_eq!(s.quiescing_bfg, Some(2));
+        assert_eq!(s.syncing_bfg, Some(1));
+        assert_eq!(s.slots[1].0, BfgState::Syncing);
+        assert_eq!(s.slots[2].0, BfgState::Quiescing);
+        assert_eq!(s.slots[3].0, BfgState::Open);
+        assert_eq!(s.slots[0].0, BfgState::Empty);
         let _ = q2;
     }
 
     #[test]
     fn promote_blocks_until_prior_sync_consumed() {
         // Regression for the threads-on shutdown deadlock: the quiesce
-        // worker may roll + quiesce TXG 2 while TXG 1 is still Syncing
-        // (3-concurrent), but promoting TXG 2 INTO Syncing must wait for
-        // TXG 1's sync to be consumed. This used to be a debug_assert
-        // ("two TXGs in Syncing") that panicked the quiesce worker when a
-        // slow TxgSyncThread let it get ahead — orphaning the sync worker
+        // worker may roll + quiesce BFG 2 while BFG 1 is still Syncing
+        // (3-concurrent), but promoting BFG 2 INTO Syncing must wait for
+        // BFG 1's sync to be consumed. This used to be a debug_assert
+        // ("two BFGs in Syncing") that panicked the quiesce worker when a
+        // slow BfgSyncThread let it get ahead — orphaning the sync worker
         // and hanging every wait_until_synced.
-        let sm = Arc::new(TxgStateMachine::new(0));
+        let sm = Arc::new(BfgStateMachine::new(0));
         let q1 = sm.roll_to_quiescing();
         sm.promote_to_syncing(q1);
-        assert_eq!(sm.snapshot().syncing_txg, Some(1));
-        // Roll TXG 2 -> Quiescing while TXG 1 is still Syncing: allowed
+        assert_eq!(sm.snapshot().syncing_bfg, Some(1));
+        // Roll BFG 2 -> Quiescing while BFG 1 is still Syncing: allowed
         // (ring-full has a free slot), this is the 3-concurrent state.
         let q2 = sm.roll_to_quiescing();
         assert_eq!(q2, 2);
-        assert_eq!(sm.snapshot().quiescing_txg, Some(2));
-        assert_eq!(sm.snapshot().syncing_txg, Some(1));
-        // promote(2) must BLOCK until TXG 1's sync is consumed.
+        assert_eq!(sm.snapshot().quiescing_bfg, Some(2));
+        assert_eq!(sm.snapshot().syncing_bfg, Some(1));
+        // promote(2) must BLOCK until BFG 1's sync is consumed.
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || sm2.promote_to_syncing(2));
         thread::sleep(Duration::from_millis(40));
         assert!(
             !h.is_finished(),
-            "promote_to_syncing must block while another TXG is still Syncing"
+            "promote_to_syncing must block while another BFG is still Syncing"
         );
-        // Consume TXG 1's sync; the blocked promote now proceeds.
+        // Consume BFG 1's sync; the blocked promote now proceeds.
         sm.mark_synced(1);
         h.join().unwrap();
         let s = sm.snapshot();
-        assert_eq!(s.syncing_txg, Some(2));
-        assert_eq!(s.quiescing_txg, None);
+        assert_eq!(s.syncing_bfg, Some(2));
+        assert_eq!(s.quiescing_bfg, None);
     }
 
     // Ring-full block path (slot[(open+1) & 3] not Empty) is exercised by
-    // integration tests once `TxgQuiesceThread` and `TxgSyncThread` are
-    // wired together — that's where the 3-active-TXG state is reachable.
+    // integration tests once `BfgQuiesceThread` and `BfgSyncThread` are
+    // wired together — that's where the 3-active-BFG state is reachable.
     // Single-threaded unit tests can't construct it without violating the
     // single-quiesce-thread invariant.
 
     #[test]
     fn roll_blocks_until_inflight_drains() {
-        let sm = Arc::new(TxgStateMachine::new(0));
+        let sm = Arc::new(BfgStateMachine::new(0));
         let g = sm.enter();
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || sm2.roll_to_quiescing());
@@ -600,9 +596,9 @@ mod tests {
         let sm3 = Arc::clone(&sm);
         let h2 = thread::spawn(move || {
             let entered = sm3.enter();
-            let txg = entered.txg();
+            let bfg = entered.bfg();
             drop(entered);
-            txg
+            bfg
         });
         thread::sleep(Duration::from_millis(30));
         assert!(!h2.is_finished(), "enter should be blocked by closing_open");
@@ -610,14 +606,14 @@ mod tests {
         let q = h.join().unwrap();
         assert_eq!(q, 1);
         // After roll completes, the blocked enter() unblocks and stamps the
-        // NEW open_txg (2), not the now-Quiescing one.
-        let entered_txg = h2.join().unwrap();
-        assert_eq!(entered_txg, 2);
+        // NEW open_bfg (2), not the now-Quiescing one.
+        let entered_bfg = h2.join().unwrap();
+        assert_eq!(entered_bfg, 2);
     }
 
     #[test]
     fn wait_until_synced_blocks_then_releases() {
-        let sm = Arc::new(TxgStateMachine::new(0));
+        let sm = Arc::new(BfgStateMachine::new(0));
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || {
             assert!(sm2.wait_until_synced(1), "synced wake must return true");
@@ -628,35 +624,35 @@ mod tests {
         sm.promote_to_syncing(q);
         sm.mark_synced(q);
         h.join().unwrap();
-        assert_eq!(sm.checkpoint_txg(), 1);
+        assert_eq!(sm.checkpoint_bfg(), 1);
     }
 
     #[test]
     fn slot_indexing_wraps_correctly() {
-        // checkpoint_txg starts at 100; open_txg = 101, index = 101 & 3 = 1.
-        let sm = TxgStateMachine::new(100);
-        assert_eq!(sm.open_txg(), 101);
-        assert_eq!(sm.snapshot().slots[1].0, TxgState::Open);
+        // checkpoint_bfg starts at 100; open_bfg = 101, index = 101 & 3 = 1.
+        let sm = BfgStateMachine::new(100);
+        assert_eq!(sm.open_bfg(), 101);
+        assert_eq!(sm.snapshot().slots[1].0, BfgState::Open);
         for expected_open in 102..=110u64 {
             let q = sm.roll_to_quiescing();
             sm.promote_to_syncing(q);
             sm.mark_synced(q);
-            assert_eq!(sm.open_txg(), expected_open);
+            assert_eq!(sm.open_bfg(), expected_open);
             let s = sm.snapshot();
-            assert_eq!(s.slots[(expected_open & 3) as usize].0, TxgState::Open);
+            assert_eq!(s.slots[(expected_open & 3) as usize].0, BfgState::Open);
         }
     }
 
     #[test]
     fn shutdown_wakes_blocked_roll() {
-        let sm = Arc::new(TxgStateMachine::new(0));
+        let sm = Arc::new(BfgStateMachine::new(0));
         let g = sm.enter();
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || sm2.roll_to_quiescing());
         thread::sleep(Duration::from_millis(30));
         sm.shutdown();
         let returned = h.join().unwrap();
-        // Under shutdown, roll returns current `open_txg` without
+        // Under shutdown, roll returns current `open_bfg` without
         // advancing — the closing_open flag stays set but no commit can
         // observe it because `enter()` also sees shutdown.
         assert_eq!(returned, 1);
@@ -665,7 +661,7 @@ mod tests {
 
     #[test]
     fn shutdown_wakes_sync_waiter() {
-        let sm = Arc::new(TxgStateMachine::new(0));
+        let sm = Arc::new(BfgStateMachine::new(0));
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || {
             // Shutdown is a clean teardown wake, not an abort → returns true.
@@ -677,49 +673,49 @@ mod tests {
     }
 
     #[test]
-    fn open_txg_atomic_kept_in_sync() {
-        let sm = TxgStateMachine::new(0);
-        assert_eq!(sm.open_txg(), 1);
+    fn open_bfg_atomic_kept_in_sync() {
+        let sm = BfgStateMachine::new(0);
+        assert_eq!(sm.open_bfg(), 1);
         let q = sm.roll_to_quiescing();
-        assert_eq!(sm.open_txg(), 2);
+        assert_eq!(sm.open_bfg(), 2);
         sm.promote_to_syncing(q);
-        assert_eq!(sm.open_txg(), 2);
+        assert_eq!(sm.open_bfg(), 2);
         sm.mark_synced(q);
-        assert_eq!(sm.open_txg(), 2);
-        assert_eq!(sm.checkpoint_txg(), 1);
+        assert_eq!(sm.open_bfg(), 2);
+        assert_eq!(sm.checkpoint_bfg(), 1);
     }
 
     #[test]
     fn enter_during_close_window_blocks_until_advance() {
         // Direct test of the closing_open gate: a roll that's waiting on
         // inflight must block fresh enter()s; the unblocked enter sees the
-        // NEW open TXG, not the closing one.
-        let sm = Arc::new(TxgStateMachine::new(0));
-        let g0 = sm.enter(); // pin TXG 1
+        // NEW open BFG, not the closing one.
+        let sm = Arc::new(BfgStateMachine::new(0));
+        let g0 = sm.enter(); // pin BFG 1
         let sm2 = Arc::clone(&sm);
         let roller = thread::spawn(move || sm2.roll_to_quiescing());
         thread::sleep(Duration::from_millis(15));
         let sm3 = Arc::clone(&sm);
         let entrant = thread::spawn(move || {
             let g = sm3.enter();
-            let txg = g.txg();
+            let bfg = g.bfg();
             drop(g);
-            txg
+            bfg
         });
         thread::sleep(Duration::from_millis(15));
         assert!(!entrant.is_finished());
         drop(g0);
         let q = roller.join().unwrap();
         assert_eq!(q, 1);
-        let entered_txg = entrant.join().unwrap();
-        assert_eq!(entered_txg, 2);
+        let entered_bfg = entrant.join().unwrap();
+        assert_eq!(entered_bfg, 2);
     }
 
-    // ---- ZFS port Part B: abort flag wakes every txg waiter ----
+    // ---- Abort flag wakes every BFG waiter ----
 
     #[test]
     fn abort_makes_wait_until_synced_return_false() {
-        let sm = Arc::new(TxgStateMachine::new(0));
+        let sm = Arc::new(BfgStateMachine::new(0));
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || sm2.wait_until_synced(99));
         thread::sleep(Duration::from_millis(30));
@@ -732,23 +728,23 @@ mod tests {
     #[test]
     fn abort_wakes_blocked_promote_without_promoting() {
         // q1 stuck in Syncing (never mark_synced — models a failed cycle);
-        // promote(q2) blocks on syncing_txg.is_some(); mark_aborted must wake it
+        // promote(q2) blocks on syncing_bfg.is_some(); mark_aborted must wake it
         // and it must NOT promote q2 (slot stays Quiescing).
-        let sm = Arc::new(TxgStateMachine::new(0));
+        let sm = Arc::new(BfgStateMachine::new(0));
         let q1 = sm.roll_to_quiescing();
         sm.promote_to_syncing(q1);
-        assert_eq!(sm.snapshot().syncing_txg, Some(1));
+        assert_eq!(sm.snapshot().syncing_bfg, Some(1));
         let q2 = sm.roll_to_quiescing();
-        assert_eq!(sm.snapshot().quiescing_txg, Some(2));
+        assert_eq!(sm.snapshot().quiescing_bfg, Some(2));
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || sm2.promote_to_syncing(q2));
         thread::sleep(Duration::from_millis(40));
         assert!(!h.is_finished(), "promote should block while q1 stuck Syncing");
         sm.mark_aborted();
         h.join().unwrap();
-        // q2 was NOT promoted: still Quiescing, syncing_txg still the stuck q1.
-        assert_eq!(sm.snapshot().quiescing_txg, Some(2));
-        assert_eq!(sm.snapshot().syncing_txg, Some(1));
+        // q2 was NOT promoted: still Quiescing, syncing_bfg still the stuck q1.
+        assert_eq!(sm.snapshot().quiescing_bfg, Some(2));
+        assert_eq!(sm.snapshot().syncing_bfg, Some(1));
         assert!(sm.is_aborted());
     }
 
@@ -756,10 +752,10 @@ mod tests {
     fn abort_breaks_blocked_roll() {
         // A held `enter()` guard pins inflight>0, so roll_to_quiescing blocks on
         // the inflight-drain wait (after setting closing_open). Abort must wake
-        // it and return the current txg WITHOUT advancing — the HANG-completeness
+        // it and return the current bfg WITHOUT advancing — the HANG-completeness
         // fix for a roll wedged behind a stuck/aborted subsystem.
-        let sm = Arc::new(TxgStateMachine::new(0));
-        let g = sm.enter(); // inflight=1 on txg 1
+        let sm = Arc::new(BfgStateMachine::new(0));
+        let g = sm.enter(); // inflight=1 on bfg 1
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || sm2.roll_to_quiescing());
         thread::sleep(Duration::from_millis(40));
@@ -767,7 +763,7 @@ mod tests {
         sm.mark_aborted();
         let returned = h.join().unwrap();
         assert_eq!(returned, 1, "aborted roll returns cur without advancing");
-        assert_eq!(sm.snapshot().quiescing_txg, None, "aborted roll must not flip to Quiescing");
+        assert_eq!(sm.snapshot().quiescing_bfg, None, "aborted roll must not flip to Quiescing");
         assert!(sm.is_aborted());
         drop(g);
     }

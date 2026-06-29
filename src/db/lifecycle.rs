@@ -87,8 +87,8 @@ struct DeadListDrainEntry {
 }
 
 /// Drained records for one chain. PBA / page deadlists carry
-/// [`crate::deadlist::DeadRecord`]s; the per-clone page-livelist (ZFS port
-/// Phase 3b) carries [`crate::livelist::LiveRecord`]s (ALLOC/FREE + kind
+/// [`crate::deadlist::DeadRecord`]s; the per-clone page-livelist (BFG
+/// ) carries [`crate::livelist::LiveRecord`]s (ALLOC/FREE + kind
 /// byte). Kept as one enum so the shared flush drain→build→write→
 /// rollback→promote machinery dispatches on it rather than duplicating
 /// ~10 rollback call sites.
@@ -108,11 +108,11 @@ impl DrainRecords {
 
 /// Which of a volume's independent dead/live-list chains a drain
 /// entry / segment plan belongs to. The PBA chain (`Pba`) records
-/// data-block deaths for lineage GC; the page chain (`Page`, ZFS port
-/// Phase 2) records L2P-metadata-page deaths for `drop_snapshot`; both
+/// data-block deaths for lineage GC; the page chain (`Page`, BFG
+/// ) records L2P-metadata-page deaths for `drop_snapshot`; both
 /// reuse the `DeadListSegment` codec and differ only in the buffer
-/// drained + the manifest anchors promoted. The `Live` chain (ZFS port
-/// Phase 3b) is the per-clone page-livelist (ALLOC/FREE of clone-private
+/// drained + the manifest anchors promoted. The `Live` chain (BFG
+/// ) is the per-clone page-livelist (ALLOC/FREE of clone-private
 /// pages) using the separate `LiveListSegment` codec + the
 /// `page_live_list_*_pid` anchors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,7 +327,7 @@ fn run_l2p_checkpoint_install_step(
 }
 
 impl Db {
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 7. Subscribe to
+    /// . Subscribe to
     /// `commit_free_pbas` apply outcomes produced by metadb's internal
     /// lineage-GC commit path. The sink is invoked exactly once per
     /// successful internal `commit_free_pbas(vol_ord, ..)` call with
@@ -357,7 +357,7 @@ impl Db {
         *self.freed_pbas_sink.lock() = None;
     }
 
-    /// Buffer-as-sole-journal Phase B / C: stamp the watermark the
+    /// Stamp the buffer-backed journal watermark that the
     /// next checkpoint will copy into `manifest.last_processed_buffer_seq`.
     ///
     /// Onyx calls this from the flusher's `post_commit` path with the
@@ -396,8 +396,8 @@ impl Db {
     /// Copy the live buffer + lifecycle replay watermarks into a manifest
     /// about to be committed. [`Db::run_sync_cycle_body`] does this for
     /// the checkpoint it commits (`flush.rs`); lifecycle ops that commit a
-    /// manifest WITHOUT first driving a forced TXG sync (`take_snapshot` /
-    /// `drop_snapshot` after Phase B) must do the same, or the manifest
+    /// manifest WITHOUT first driving a forced BFG sync (`take_snapshot` /
+    /// `drop_snapshot` after buffer-backed journal) must do the same, or the manifest
     /// keeps a stale `lifecycle_replay_seq` and recovery re-replays
     /// already-folded lifecycle ops (e.g. a `PromotionChunk` incref) on
     /// top of the durable refcount array, double-counting them.
@@ -444,7 +444,7 @@ impl Db {
     /// invoking; this method assumes the knob was true so it can
     /// stay on `&self` without re-reading config.
     ///
-    /// Phase 5 passes a lineage context only so the worker can refuse the
+    /// passes a lineage context only so the worker can refuse the
     /// historical chain-truncation-only path. FreePbas-emitting Lineage GC
     /// must run through `Db::run_lineage_gc_cycle_inner`, where a `Db`
     /// handle can commit the retire record before advancing the chain.
@@ -473,7 +473,7 @@ impl Db {
         *self.async_reclaim.lock() = Some(worker);
     }
 
-    /// ZFS port Phase 3b: start the background per-clone page-livelist
+    /// BFG: start the background per-clone page-livelist
     /// condense worker. Caller (`Db::create` / `Db::open`) checks
     /// `cfg.livelist_condense_min_segments > 0` first. Independent of
     /// `async_reclaim_enabled` — condense only rewrites the SHADOW livelist
@@ -494,7 +494,7 @@ impl Db {
     /// Start the background Lineage GC driver — the production trigger for
     /// FreePbas-emitting PBA reclaim. Caller (`Db::create` / `Db::open`)
     /// checks `cfg.lineage_gc_enabled` first. Takes `self: &Arc<Self>` so
-    /// the worker can hold a `Weak<Db>` (mirrors `start_txg_threads`) and
+    /// the worker can hold a `Weak<Db>` (mirrors `start_bfg_threads`) and
     /// never extend `Db`'s lifetime past `Drop`.
     fn start_lineage_gc_worker(self: &Arc<Self>, params: super::lineage_gc::LineageGcParams) {
         let worker = super::lineage_gc::LineageGcWorker::start(Arc::downgrade(self), params);
@@ -518,85 +518,84 @@ impl Db {
         self.async_reclaim.lock().is_some()
     }
 
-    /// ZFS-TXG-clone Phase 4 Step 8: spawn the quiesce + sync workers
-    /// when `cfg.txg_threads_enabled = true`. Step 7 shipped an inert
-    /// `sync_work` callback; Step 8 retargets it at
-    /// [`Db::run_sync_cycle`], the real per-TXG flush body extracted
+    /// BFG: spawn the quiesce + sync workers
+    /// when `cfg.bfg_threads_enabled = true`. The sync worker drives
+    /// [`Db::run_sync_cycle`], the real per-BFG flush body extracted
     /// from `flush_with_gate`.
     ///
     /// The closure captures a [`Weak<Db>`] so the worker thread does
-    /// not extend `Db`'s lifetime — `Drop` calls `stop_txg_threads`
+    /// not extend `Db`'s lifetime — `Drop` calls `stop_bfg_threads`
     /// before the strong refcount falls to zero (the strong refcount
     /// is what the caller holds via `Arc<Db>`), so a successful
     /// `weak.upgrade()` inside the closure always sees a live `Db`.
     /// A failed upgrade (would only happen if shutdown raced with a
     /// stale wake-up; the worker checks `shutdown` before calling)
-    /// is a no-op success: the TXG just stays in Syncing and the
+    /// is a no-op success: the BFG just stays in Syncing and the
     /// shutdown path observes it.
-    fn start_txg_threads(self: &Arc<Self>, txg_timeout_ms: u64) {
-        let state = self.txg.clone();
-        let sync_notifier = self.txg_sync_notifier.clone();
+    fn start_bfg_threads(self: &Arc<Self>, bfg_timeout_ms: u64) {
+        let state = self.bfg.clone();
+        let sync_notifier = self.bfg_sync_notifier.clone();
         let metrics = self.metrics.clone();
         let weak_db = Arc::downgrade(self);
-        let sync_work: super::txg_sync::SyncWorkFn = Arc::new(move |txg| {
+        let sync_work: super::bfg_sync::SyncWorkFn = Arc::new(move |bfg| {
             let Some(db) = weak_db.upgrade() else {
                 return Ok(());
             };
-            // ZFS port Part B: on a non-recoverable cycle failure, poison the
-            // sync subsystem (sets sync_poison + aborts the TXG state machine +
-            // fails queued snapshot tasks) so parked `wait_until_synced` callers
-            // get a restart-required error instead of hanging, and the worker
-            // loop stops re-driving the stuck Syncing slot. Mirrors the
-            // threads-off `flush_with_gate` Err arm.
-            let r = db.run_sync_cycle(txg, crate::metrics::FlushKind::Forced);
+            // On a non-recoverable cycle failure, poison the sync subsystem
+            // (sets sync_poison + aborts the BFG state machine + fails queued
+            // snapshot tasks) so parked `wait_until_synced` callers get a
+            // restart-required error instead of hanging, and the worker loop
+            // stops re-driving the stuck Syncing slot. Mirrors the threads-off
+            // `flush_with_gate` Err arm.
+            let r = db.run_sync_cycle(bfg, crate::metrics::FlushKind::Forced);
             if let Err(err) = &r {
                 db.poison_sync(err);
             }
             r
         });
-        let sync = super::txg_sync::TxgSyncThread::start(
+        let sync = super::bfg_sync::BfgSyncThread::start(
             state.clone(),
             sync_notifier.clone(),
             sync_work,
             metrics.clone(),
         );
-        *self.txg_sync.lock() = Some(sync);
+        *self.bfg_sync.lock() = Some(sync);
 
-        let quiesce = super::txg_quiesce::TxgQuiesceThread::start(
+        let quiesce = super::bfg_quiesce::BfgQuiesceThread::start(
             state,
-            self.txg_quiesce_notifier.clone(),
+            self.bfg_quiesce_notifier.clone(),
             sync_notifier,
-            super::txg_quiesce::QuiesceParams { txg_timeout_ms },
+            super::bfg_quiesce::QuiesceParams { bfg_timeout_ms },
             metrics,
             self.faults.clone(),
         );
-        *self.txg_quiesce.lock() = Some(quiesce);
+        *self.bfg_quiesce.lock() = Some(quiesce);
     }
 
-    /// ZFS-TXG-clone Phase 4 Step 7: stop the TXG worker pair, quiesce
-    /// first then sync, so no new TXG enters Syncing during teardown
+    /// BFG: stop the BFG worker pair, quiesce
+    /// first then sync, so no new BFG enters Syncing during teardown
     /// and the sync side drains its current cycle before exiting.
     /// Idempotent: a second call is a no-op.
-    pub(super) fn stop_txg_threads(&self) {
-        if let Some(mut q) = self.txg_quiesce.lock().take() {
+    pub(super) fn stop_bfg_threads(&self) {
+        if let Some(mut q) = self.bfg_quiesce.lock().take() {
             q.stop();
         }
-        if let Some(mut s) = self.txg_sync.lock().take() {
+        if let Some(mut s) = self.bfg_sync.lock().take() {
             s.stop();
         }
     }
 
-    /// Force-fold every L2P shard's TXG ring buffer into its on-disk
+    /// Force-fold every L2P shard's BFG ring buffer into its on-disk
     /// tree synchronously. Used by:
     ///
     /// - [`Db::flush_with_gate`]'s inline path (when
-    ///   `txg_threads_enabled = false`). The sample-phase no longer
+    ///   `bfg_threads_enabled = false`). The sample-phase no longer
     ///   holds `apply_gate.write`; serialisation against concurrent
     ///   commits' `cow_for_write` falls on the per-shard `tree.write()`
     ///   this helper takes.
     /// - The snapshot / `range_delete` / `drop_volume` / `drop_snapshot`
     ///   paths. `take_snapshot` / `drop_snapshot` / `range_delete`
-    ///   (Phase B) no longer force-sync at entry, so this drain is
+    ///   (buffer-backed journal) no longer force-sync at entry, so this drain is
     ///   LOAD-BEARING there: it folds every buffered L2P op into the tree
     ///   so the root sample / refresh / range scan observes all applied
     ///   ops. `drop_gate.write` held by the lifecycle op keeps the slots
@@ -605,8 +604,8 @@ impl Db {
     /// - The post-replay path in `open_with_config_and_faults`,
     ///   before any commit can race the recovered buffer state.
     ///
-    /// When `txg_threads_enabled = true`, the `TxgSyncThread` is the
-    /// regular drainer (one slot per TXG cycle). Lifecycle ops still
+    /// When `bfg_threads_enabled = true`, the `BfgSyncThread` is the
+    /// regular drainer (one slot per BFG cycle). Lifecycle ops still
     /// call this helper as a belt-and-braces defensive drain; the
     /// per-shard `tree.write()` serialises it against the sync thread
     /// so the two drain paths cannot conflict.
@@ -654,7 +653,7 @@ impl Db {
         Ok(())
     }
 
-    /// Fold every TXG slot of one volume's L2P shard buffers into its
+    /// Fold every BFG slot of one volume's L2P shard buffers into its
     /// tree. Shared body of [`force_compact_l2p_buffers`] (all volumes)
     /// and [`force_compact_l2p_buffers_for_volume`] (one volume). Callers
     /// hold `drop_gate.write` (lifecycle ops) or run pre-commit
@@ -662,7 +661,7 @@ impl Db {
     fn compact_volume_buffers(&self, vol: &Arc<Volume>) -> Result<()> {
         use std::time::Instant;
         let snapshot_wms = self.snapshot_wms(vol.ord);
-        // ZFS port Phase 4 S1c: clone COW-kill pinner set (empty for non-clones).
+        // BFG: clone COW-kill pinner set (empty for non-clones).
         let clone_cow_pinners = self.clone_cow_pinners(vol.ord);
         for (shard_idx, shard) in vol.shards.iter().enumerate() {
             if !shard.use_buffer {
@@ -670,11 +669,11 @@ impl Db {
             }
             let started = Instant::now();
             let mut tree = shard.tree.write();
-            // Drain ALL four TXG slots in one shot. Used only by
+            // Drain ALL four BFG slots in one shot. Used only by
             // paths that need every slot folded NOW: lifecycle ops
             // (which hold `drop_gate.write`, so the slots are
             // quiesced), the post-replay open, and the threads-OFF
-            // inline flush. The regular threads-ON per-TXG sync uses
+            // inline flush. The regular threads-ON per-BFG sync uses
             // `drain_syncing_slot_into_trees` instead (drains only
             // the frozen syncing slot, publish-before-clear). Note:
             // this drain is NOT publish-before-clear, so on the
@@ -688,28 +687,27 @@ impl Db {
             }
             let count = drained.len();
             let max_lsn = drained.values().map(|e| e.lsn).max().unwrap_or(0);
-            // A3 cutover: this all-slots drain folds page-rc deltas
-            // into the current Open TXG slot; the lifecycle/recovery
-            // callers fold every page-rc slot afterwards (RcShard
-            // all-slots flush / `begin_checkpoint_all_slots`), so any
-            // live slot is correct here.
-            let apply_result = super::txg_sync::compact_drain_into_tree(
+            // This all-slots drain folds page-rc deltas into the current Open
+            // BFG slot; lifecycle/recovery callers fold every page-rc slot
+            // afterwards (RcShard all-slots flush /
+            // `begin_checkpoint_all_slots`), so any live slot is correct here.
+            let apply_result = super::bfg_sync::compact_drain_into_tree(
                 &mut tree,
                 &drained,
-                self.txg.open_txg(),
+                self.bfg.open_bfg(),
                 snapshot_wms.clone(),
                 clone_cow_pinners.clone(),
             );
             match apply_result {
                 Ok(()) => {
-                    // ZFS port Phase 2: harvest page-deaths from this
+                    // BFG: harvest page-deaths from this
                     // all-slots fold before releasing the tree lock.
                     // H1: route to this shard's own accumulator.
                     super::apply::drain_page_deaths_into(
                         &vol.page_dead_list[shard_idx],
                         &mut tree,
                     );
-                    // ZFS port Phase 3b: same fold site for the per-clone
+                    // BFG: same fold site for the per-clone
                     // page-livelist witness (empty for non-clones).
                     super::apply::drain_live_events_into(&vol.page_live_list, &mut tree);
                     super::apply::publish_l2p_read_view(shard, &tree);
@@ -727,15 +725,14 @@ impl Db {
         Ok(())
     }
 
-    /// Threads-ON per-TXG sync drain: fold ONLY the frozen syncing slot
-    /// (`txg & 3`) of every L2P shard into its tree, the ZFS-faithful
-    /// per-TXG separation the 4-slot ring was built for. The Open and
-    /// Quiescing slots are left untouched — they drain on their own
-    /// future sync cycles, so each cycle's work is bounded by one TXG's
-    /// writes (≈ `txg_timeout`) instead of the whole accumulated backlog.
+    /// Threads-ON BFG sync drain: fold only the frozen syncing slot (`bfg & 3`)
+    /// of every L2P shard into its tree. Open and Quiescing slots are left
+    /// untouched and drain on their own future sync cycles, so each cycle's work
+    /// is bounded by one group's writes (roughly `bfg_timeout`) instead of the
+    /// whole accumulated backlog.
     ///
     /// **Publish-before-clear** is the load-bearing correctness rule.
-    /// `lookup_for_open_txg` (used by both a commit's prev-value read in
+    /// `lookup_for_open_bfg` (used by both a commit's prev-value read in
     /// `apply_l2p_bucket_buffer` and a user read) walks `open .. open-2`,
     /// which includes the syncing slot, and falls through to `read_view`
     /// only on a miss. If we cleared the slot before folding+publishing,
@@ -754,9 +751,9 @@ impl Db {
     /// what makes the step-1 snapshot equal the step-4 clear.
     ///
     /// We clone in step 1 rather than hold the slot lock across the fold
-    /// so a concurrent `lookup_for_open_txg` is never blocked for the
+    /// so a concurrent `lookup_for_open_bfg` is never blocked for the
     /// fold's duration (read-latency protection).
-    pub(super) fn drain_syncing_slot_into_trees(&self, txg: crate::types::Txg) -> Result<()> {
+    pub(super) fn drain_syncing_slot_into_trees(&self, bfg: crate::types::Bfg) -> Result<()> {
         if !self.l2p_buffer_enabled {
             return Ok(());
         }
@@ -771,8 +768,8 @@ impl Db {
         // `alloc_pool` that batch-refills from `page_store` (so the global
         // allocate mutex is touched only at refill granularity, not per page).
         // The only shared resources — `page_store` and `self.metrics` — are
-        // internally synchronized. The previously-serial fold was the txg-sync
-        // drain bottleneck (on-CPU: ~74% of the `metadb-txg-sync` thread in
+        // internally synchronized. The previously-serial fold was the bfg-sync
+        // drain bottleneck (on-CPU: ~74% of the `metadb-bfg-sync` thread in
         // `compact_drain_into_tree`); serializing 16 shards' COW folds on one
         // thread bounded single-volume write throughput, so by default we fan
         // out across shards (mirrors the refcount `begin_checkpoint` fan-out in
@@ -784,13 +781,12 @@ impl Db {
             let results: Vec<Result<()>> = std::thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for vol in &vols {
-                    // Youngest snapshot pinning this volume's pages (ZFS
-                    // `prev_snap_txg`); computed once per volume, captured
-                    // by the per-shard fold tasks for the page-deadlist
-                    // birth gate.
+                    // Youngest snapshot pinning this volume's pages; computed
+                    // once per volume and captured by per-shard fold tasks for
+                    // the page-deadlist birth gate.
                     let snapshot_wms = self.snapshot_wms(vol.ord);
-                    // ZFS port Phase 4 S1c: clone COW-kill pinner set, computed
-                    // once per volume (empty for non-clones).
+                    // Clone COW-kill pinner set, computed once per volume
+                    // (empty for non-clones).
                     let clone_cow_pinners = self.clone_cow_pinners(vol.ord);
                     let page_dead_list = &vol.page_dead_list;
                     let page_live_list = &vol.page_live_list;
@@ -802,16 +798,15 @@ impl Db {
                         let clone_cow_pinners = clone_cow_pinners.clone();
                         handles.push(scope.spawn(move || {
                             // Escape the single-CPU affinity inherited from
-                            // the pinned `metadb-txg-sync` parent. Under NUMA
-                            // partition this binds to the shard's pod (the
-                            // COW fold touches node-local pages); otherwise
-                            // it widens to all CPUs (ZFS `dp_sync_taskq`
-                            // runs unpinned at normal priority) — without
-                            // either, all 16 pile onto one core.
+                            // the pinned `metadb-bfg-sync` parent. Under NUMA
+                            // partition this binds to the shard's pod (the COW
+                            // fold touches node-local pages); otherwise it
+                            // widens to all CPUs so drain tasks do not all pile
+                            // onto one core.
                             crate::affinity::bind_for_l2p_drain(shard_idx);
                             Self::drain_one_syncing_shard(
                                 shard,
-                                txg,
+                                bfg,
                                 metrics,
                                 chunk_entries,
                                 // H1: this shard's own page-death accumulator.
@@ -829,7 +824,7 @@ impl Db {
                     .collect()
             });
             // First error wins. Every shard that could drain has drained and
-            // cleared its frozen slot, so a retry of this TXG only re-processes
+            // cleared its frozen slot, so a retry of this BFG only re-processes
             // the shard(s) that errored (their slots are still populated).
             for r in results {
                 r?;
@@ -844,7 +839,7 @@ impl Db {
                     }
                     Self::drain_one_syncing_shard(
                         shard,
-                        txg,
+                        bfg,
                         metrics,
                         chunk_entries,
                         // H1: this shard's own page-death accumulator.
@@ -874,7 +869,7 @@ impl Db {
     /// parked for the fold's full duration. Releasing between chunks is
     /// safe because the slot stays populated until `take_syncing_slot`
     /// below (publish-before-clear, see `drain_syncing_slot_into_trees`
-    /// doc): a concurrent `lookup_for_open_txg` hits the live slot
+    /// doc): a concurrent `lookup_for_open_bfg` hits the live slot
     /// entries and never observes the partially-folded tree, and every
     /// chunk ends with `finish_batch_apply` so interleaving lock takers
     /// see a consistent tree + read overlay. Re-folding after a
@@ -883,7 +878,7 @@ impl Db {
     #[allow(clippy::too_many_arguments)]
     fn drain_one_syncing_shard(
         shard: &super::L2pShard,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         metrics: &crate::metrics::MetaMetrics,
         chunk_entries: usize,
         page_dead_list: &crate::deadlist::DeadListState,
@@ -894,7 +889,7 @@ impl Db {
         let started = std::time::Instant::now();
         // Snapshot (clone) the frozen syncing slot WITHOUT the tree lock so the
         // brief slot-lock is not held across the fold. Empty → nothing to do.
-        let entries = shard.l2p_buffer.snapshot_syncing_slot(txg);
+        let entries = shard.l2p_buffer.snapshot_syncing_slot(bfg);
         if entries.is_empty() {
             return Ok(());
         }
@@ -903,7 +898,7 @@ impl Db {
         // Build the fold plan (leaf grouping + sorting) off-lock: it is
         // pure CPU over the frozen snapshot, and its transient
         // allocations live and die outside the lock hold.
-        let plan = super::txg_sync::build_drain_plan(&entries);
+        let plan = super::bfg_sync::build_drain_plan(&entries);
         drop(entries);
         let mut start = 0;
         while start < plan.len() {
@@ -918,19 +913,19 @@ impl Db {
                 }
             }
             let mut tree = shard.tree.write();
-            super::txg_sync::apply_drain_ops(
+            super::bfg_sync::apply_drain_ops(
                 &mut tree,
                 &plan[start..end],
-                txg,
+                bfg,
                 snapshot_wms.clone(),
                 clone_cow_pinners.clone(),
             )?;
-            // ZFS port Phase 2: this fold COW'd L2P pages off the head;
+            // BFG: this fold COW'd L2P pages off the head;
             // record the snapshot-pinned ones into the HEAD page-deadlist
             // (buffer mode's only COW point — the apply-time witness was
             // empty for buffered writes).
             super::apply::drain_page_deaths_into(page_dead_list, &mut tree);
-            // ZFS port Phase 3b: per-clone page-livelist witness (empty for
+            // BFG: per-clone page-livelist witness (empty for
             // non-clones).
             super::apply::drain_live_events_into(page_live_list, &mut tree);
             if end == plan.len() {
@@ -943,7 +938,7 @@ impl Db {
         }
         // Clear the now-folded+published slot. Frozen, so this equals the
         // snapshot; the return value is discarded.
-        let _ = shard.l2p_buffer.take_syncing_slot(txg);
+        let _ = shard.l2p_buffer.take_syncing_slot(bfg);
         shard.l2p_buffer.note_compacted(max_lsn);
         metrics.record_l2p_buffer_compaction(count, started.elapsed());
         Ok(())
@@ -977,7 +972,7 @@ impl Db {
             .collect()
     }
 
-    /// Number of shards in this database. In Phase B commit 5 this reports
+    /// Number of shards in this database. This reports
     /// the bootstrap volume's shard count; every volume in the map is
     /// created with the same shard count, so this remains the right answer
     /// once multi-volume support lands.

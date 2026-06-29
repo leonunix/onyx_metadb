@@ -13,7 +13,7 @@ impl Db {
     ///   for in-flight commits to finish so our subsequent WAL submit +
     ///   `commit_cvar` wait cannot deadlock behind an LSN assigned to a
     ///   commit that hasn't reached apply yet.
-    /// - **Forced TXG sync** — kept for consistency with the other
+    /// - **Forced BFG sync** — kept for consistency with the other
     ///   lifecycle ops, so future maintainers do not have to reason
     ///   about a mixed model. `create_volume` itself does not perform
     ///   any whole-page rc RMW, so the sync is not strictly required
@@ -36,13 +36,13 @@ impl Db {
         // required (no whole-page rc RMW happens here) but kept so the
         // lifecycle API has a uniform shape.
         self.flush_with_gate(crate::metrics::FlushKind::Forced)?;
-        // Phase 4 gate-shrink: record this lifecycle op's WAL LSN into
-        // `slot_max_lsn(open_txg)` so `run_sync_cycle_body`'s
-        // `wal_checkpoint = slot_max_lsn(txg)` watermark reflects it.
+        // gate-shrink: record this lifecycle op's WAL LSN into
+        // `slot_max_lsn(open_bfg)` so `run_sync_cycle_body`'s
+        // `wal_checkpoint = slot_max_lsn(bfg)` watermark reflects it.
         // Must be entered AFTER `flush_with_gate(Forced)` returns —
-        // that call rolls the current Open TXG; entering before would
+        // that call rolls the current Open BFG; entering before would
         // race `roll_to_quiescing` waiting for `inflight == 0`.
-        let _txg_guard = self.txg.enter();
+        let _bfg_guard = self.bfg.enter();
         let _apply_guard = self.apply_gate.write();
 
         let (ord, shard_count) = {
@@ -95,7 +95,7 @@ impl Db {
 
         let lifecycle_op = crate::lifecycle_log::LifecycleOp::CreateVolume { ord, shard_count };
         let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
-        _txg_guard.record_lsn(lsn);
+        _bfg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Under our two write gates no other commit is between submit
@@ -180,9 +180,9 @@ impl Db {
     /// - `drop_gate.write()` — excludes every `commit_ops` path. The
     ///   rc-dependent drop plan relies on no concurrent `cow_for_write`
     ///   moving rcs out from under us.
-    /// - Phase B (A3 follow-up): **no forced TXG sync** at entry. The drop
-    ///   frees pages from an explicit structural reachability set (per-L2P-page
-    ///   refcounting was deleted, ZFS port S3), so there is no whole-page rc
+    /// - No forced BFG sync at entry. The drop frees pages from an explicit
+    ///   structural reachability set (per-L2P-page
+    ///   refcounting was deleted, BFG), so there is no whole-page rc
     ///   write left for a concurrent flush IO phase to
     ///   clobber. The `force_compact_l2p_buffers` + `flush_locked_l2p_shards`
     ///   below are the only drain this path needs (mirrors
@@ -209,8 +209,8 @@ impl Db {
     /// roots are only refreshed into it at the drop's commit, so a stale
     /// manifest root would manufacture a false free) ∪ every snapshot's roots
     /// (snapshots always survive a volume drop). Shared by the CLONE_LINEAGE
-    /// reachability shadow (`check_clone_livelist_shadow` RHS + the S0
-    /// promoted-PBA gate) and the non-clone (S3 / M1) reachability free-set.
+    /// reachability shadow (`check_clone_livelist_shadow` RHS + the promoted-PBA reclaim
+    /// promoted-PBA gate) and the non-clone (page-rc removal / non-clone reachability) reachability free-set.
     fn collect_surviving_roots(
         &self,
         l2p_guards: &[RwLockWriteGuard<'_, PagedL2p>],
@@ -251,19 +251,18 @@ impl Db {
             ));
         }
         let _drop_guard = self.drop_gate.write();
-        // Phase B (A3 follow-up): no forced TXG sync at entry (mirrors
-        // take_snapshot / drop_snapshot / clone_volume / range_delete). ZFS
-        // port S3 deleted per-L2P-page refcounting, so the drop frees pages
-        // from an explicit structural reachability set with no whole-page rc
-        // write for a concurrent flush IO phase to clobber; the targeted
-        // `force_compact_l2p_buffers` + `flush_locked_l2p_shards` below are
-        // the only drain this path needs.
-        // `txg.enter()` pins the current Open TXG; `closing_open` makes it
+        // No forced BFG sync at entry (mirrors take_snapshot / drop_snapshot /
+        // clone_volume / range_delete). Per-L2P-page refcounting is gone, so
+        // the drop frees pages from an explicit structural reachability set
+        // with no whole-page rc write for a concurrent flush IO phase to
+        // clobber; the targeted `force_compact_l2p_buffers` +
+        // `flush_locked_l2p_shards` below are the only drain this path needs.
+        // `bfg.enter()` pins the current Open BFG; `closing_open` makes it
         // wait out (not race) a concurrent background roll, so entering the
-        // current Open TXG without rolling it ourselves is safe.
-        // `_txg_guard.record_lsn(lsn)` (after the WAL submit below) records
-        // this op's LSN into `slot_max_lsn(open_txg)` so WAL prune sees it.
-        let _txg_guard = self.txg.enter();
+        // current Open BFG without rolling it ourselves is safe.
+        // `_bfg_guard.record_lsn(lsn)` (after the WAL submit below) records
+        // this op's LSN into `slot_max_lsn(open_bfg)` so WAL prune sees it.
+        let _bfg_guard = self.bfg.enter();
         let _apply_guard = self.apply_gate.write();
         let _view_guard = self.snapshot_views.write();
 
@@ -281,12 +280,12 @@ impl Db {
                     "cannot drop volume {vol_ord} with live snapshots"
                 )));
             }
-            // [[no-refcount-hot-path-design]] Phase 4 Step 6: descendant
+            // descendant
             // clones whose `parent_vol_ord == vol_ord` rely on the
             // parent's COW-shared L2P pages until their promotion walker
             // finishes. Dropping the parent now would free those pages
             // out from under live descendants. Cross-volume snap_pin
-            // (Step 2) keeps the parent's PBA-level data observable,
+            // (lineage pinning) keeps the parent's PBA-level data observable,
             // but the L2P page tree itself is per-volume — once we
             // collect-and-free the parent's pages there's nothing for
             // the descendant to COW from. Reject and let the caller
@@ -315,7 +314,7 @@ impl Db {
 
         // Lock ALL volumes' shards + refcount shards so we can flush
         // them and later commit a refreshed manifest. With the entry forced
-        // sync removed (Phase B), drain the L2P buffer into the trees first
+        // sync removed (buffer-backed journal), drain the L2P buffer into the trees first
         // so `collect_drop_pages_with_birth` / the root sample observe every
         // applied op and `checkpoint_lsn` stays safe (mirrors drop_snapshot).
         // All volumes (not scoped): the manifest refresh below covers every
@@ -336,7 +335,7 @@ impl Db {
         }
         let target_end = target_start + volume.shards.len();
 
-        // ZFS port Phase 3a / S3: collect each dropped L2P page with its
+        // BFG: collect each dropped L2P page with its
         // immutable birth + STRUCTURAL refcount, so the clone-drop livelist
         // shadow below can recover the freed subset (rc == 1) and the
         // origin/clone-private partition. `clone_roots` feeds the shadow's
@@ -348,7 +347,7 @@ impl Db {
                 clone_roots.push(root);
             }
         }
-        // S3 (page-rc deleted): the per-page plan-time refcount now comes from
+        // page-rc removal (page-rc deleted): the per-page plan-time refcount now comes from
         // an explicit STRUCTURAL in-edge count over the live global L2P graph —
         // this dying volume's roots ∪ every surviving volume head ∪ every
         // snapshot root. In a forest of COW trees (one parent per page within
@@ -373,12 +372,12 @@ impl Db {
             pages_with_birth.extend(tree.collect_drop_pages_with_birth(root, &structural_rc)?);
         }
         let mut pages: Vec<PageId> = pages_with_birth.iter().map(|(p, _, _)| *p).collect();
-        // Phase 2 dead-list: walk the volume's segment chain backward from its
-        // tail. ZFS port S3: these segment pages are `allocate_run`-allocated and
-        // are NEVER page-rc/tree-reachable, so the post-S3 apply (which frees only
+        // dead-list: walk the volume's segment chain backward from its
+        // tail. BFG: these segment pages are `allocate_run`-allocated and
+        // are NEVER page-rc/tree-reachable, so the post-page-rc removal apply (which frees only
         // the `free_pages` tree set, not `pages`) cannot reclaim them — collect
         // them for the EAGER `free_idempotent` loop below (mirroring the v19
-        // page-livelist chain), NOT into `pages`. (Pre-S3 they were added to
+        // page-livelist chain), NOT into `pages`. (Pre-page-rc removal they were added to
         // `pages` but the page-rc cascade skipped them as untracked `prev == 0`,
         // so they already rode orphan-reclaim — the old comment claiming eager
         // apply-time release was inaccurate even then.) The chain also picks up
@@ -399,7 +398,7 @@ impl Db {
         // describes overwrites that targeted this volume's own LBAs,
         // which are about to disappear.
         let _ = volume.dead_list.drain();
-        // ZFS port Phase 3b: collect this clone's page-livelist (v19) segment
+        // BFG: collect this clone's page-livelist (v19) segment
         // chain so it can be EAGERLY freed once the manifest commit below
         // drops the entry. Segment pages are allocated via `allocate_run` and
         // are never page-rc-tracked, so routing them through `pages` / the
@@ -424,7 +423,7 @@ impl Db {
             }
         };
 
-        // ZFS port Phase 3a (SHADOW): for a CLONE, cross-check the page-rc
+        // BFG: for a CLONE, cross-check the page-rc
         // free-set against an independent C-exclusive reachability walk
         // BEFORE the irreversible cascade. Surviving roots = every OTHER
         // volume's live shard roots (read from the locked, just-flushed trees
@@ -434,43 +433,43 @@ impl Db {
         // snapshot's roots. The drop+apply+snapshot_views write gates plus the
         // `force_compact_l2p_buffers` + `l2p_page_rc.flush()` above keep the
         // graph + page-rc quiescent and fold-consistent (the entry forced sync
-        // is gone, Phase B; the page-rc `get_consistent` read carries the
+        // is gone, buffer-backed journal; the page-rc `get_consistent` read carries the
         // fold-consistency); running before the WAL submit / manifest commit
         // means a Corruption abort leaves no half-applied drop. Page-rc stays
         // authoritative — this is a shadow assertion, NOT the free decision.
-        // Phase 4 Step 3 (DAG correctness): gated on the sticky
+        // gated on the sticky
         // `VOLUME_FLAG_CLONE_LINEAGE` flag — set once at clone creation, never
         // cleared, surviving `PromotionComplete` (which clears `parent_vol_ord`)
         // — so a *promoted* ex-clone is ALSO covered. Promotion is lite (bumps
         // only the global PBA refcount + clears `parent_vol_ord`, does NOT
         // COW-divide the page tree or touch the L2P page-rc), so a promoted
-        // ex-clone may still page-rc-SHARE L2P pages with its lineage; Step 1's
+        // ex-clone may still page-rc-SHARE L2P pages with its lineage; lineage tracking's
         // narrower `parent_vol_ord.is_some()` gate skipped it. Widening is
         // strictly additive (the flag is 0 on plain volumes, sticky on clones)
         // and SOUND: the reachability `exclusive` set below is birth-agnostic
-        // C-exclusivity, so it handles the DAG hazards natively — G6 (a born>B
+        // C-exclusivity, so it handles the DAG hazards natively — descendant-share (a born>B
         // page shared with a promoted descendant E stays reachable from E, a
-        // survivor → kept) and G8 (a born≤B origin page sole-owned to this
+        // survivor → kept) and origin-fallthrough (a born≤B origin page sole-owned to this
         // volume → freed, and drops out of both livelist sides by birth). The
         // `missing→HARD` precondition (surviving_roots complete) is re-proven
         // for the promoted case on `check_clone_livelist_shadow` below. Page-rc
         // stays authoritative — still a shadow assertion, NOT the free decision.
-        // The promoted-PBA decref (S0) and the manifest commit both stamp this
+        // The promoted-PBA decref (promoted-PBA reclaim) and the manifest commit both stamp this
         // LSN; read it once here — stable under the held `apply_gate.write` (no
         // commit advances `last_applied_lsn` while we hold it).
         let checkpoint_lsn = *self.last_applied_lsn.lock();
-        // S0: clone promotion-edge PBAs whose rc reached 0 and that no survivor
+        // promoted-PBA reclaim: clone promotion-edge PBAs whose rc reached 0 and that no survivor
         // maps, surfaced to onyx. Declared here so it is in scope at the return
         // (stays empty for non-clones / rc-authoritative).
         let mut surfaced_freed: Vec<Pba> = Vec::new();
-        // ZFS port Phase 4 S2/S3: the authoritative, page-rc-independent free-set
+        // BFG: the authoritative, page-rc-independent free-set
         // frozen into the WAL op. Always `Some` now: a CLONE_LINEAGE drop gets
         // the reachability `exclusive` set cross-checked by
         // `check_clone_livelist_shadow` (the `if` arm); a non-clone (unflagged)
         // drop gets the same reachability `exclusive` set directly (the `else`
-        // arm, S3 / M1 — replaced the legacy page-rc cascade that S3 deletes).
+        // arm, page-rc removal / non-clone reachability — replaced the legacy page-rc cascade that page-rc removal deletes).
         let mut free_pages: Option<Vec<PageId>> = None;
-        // S0: the promoted-PBA edges to decref + the survivor data-PBA set are
+        // promoted-PBA reclaim: the promoted-PBA edges to decref + the survivor data-PBA set are
         // COMPUTED here (read-only, under the held gates) but APPLIED post-commit
         // (see the post-commit decref block) — the refcount array writes data
         // pages in place, so a pre-commit decref-flush would make the decref
@@ -485,7 +484,7 @@ impl Db {
         {
             let surviving_roots =
                 self.collect_surviving_roots(&l2p_guards, target_start, target_end)?;
-            // Phase 4 Step 1: reconstruct this clone's persistent page-livelist
+            // reconstruct this clone's persistent page-livelist
             // (v19) ALLOC/FREE log as the THIRD independent ground truth the
             // shadow cross-checks (alongside the page-rc cascade and the
             // reachability walk). The on-disk segment chain alone UNDER-counts:
@@ -520,10 +519,9 @@ impl Db {
                 &live_records,
             )?);
 
-            // ZFS port Phase 4 Step 4 (S0): close the clone-promotion global
+            // BFG: close the clone-promotion global
             // PBA-rc over-pin. The promotion walker incref'd +1 per clone-
-            // referenced head_pba (incl. parent-COW-shared PBAs); under Phase 5
-            // rc-neutral writes nothing ever decref'd them, so onyx's
+            // referenced head_pba (incl. parent-COW-shared PBAs); under             // rc-neutral writes nothing ever decref'd them, so onyx's
             // delete-time "free iff rc==0" never reclaims the LV3 block. We undo
             // each logged +1, SURVIVOR-GATED: a promoted PBA still reachable from
             // a surviving root (any other volume's current L2P or any snapshot's
@@ -537,7 +535,7 @@ impl Db {
             // `range_delete`; a second promotion-edge decref here would drive a
             // still-parent-mapped PBA to 0 → premature free under the
             // rc-authoritative GC authority. The over-pin this actuator fixes
-            // exists ONLY in the rc-neutral (Phase 5) regime.
+            // exists ONLY in the rc-neutral () regime.
             //
             // This block only READS (under the held gates, after the shadow
             // `?`): the promoted-PBA log → the multiset of edges to decref, and
@@ -562,7 +560,7 @@ impl Db {
                         // (`promotion.rs` faithfulness note), so a
                         // promote-then-crash-without-flush leaves a subset of
                         // edges un-logged → still over-pinned: a data-safe
-                        // residual strictly smaller than the pre-S0 leak.
+                        // residual strictly smaller than the pre-promoted-PBA reclaim leak.
                         let page_store = self.page_store.clone();
                         crate::livelist::read_chain_records(tail, |p| page_store.read_page(p))?
                             .into_iter()
@@ -586,9 +584,9 @@ impl Db {
                 }
             }
         } else {
-            // ZFS port Phase 4 S3 (M1): non-clone (unflagged) volume drop. The
+            // BFG (non-clone reachability): non-clone (unflagged) volume drop. The
             // page-rc cascade was the legacy free-source here (`free_pages =
-            // None`); S3 deletes it, so freeze the page-rc-INDEPENDENT
+            // None`); page-rc removal deletes it, so freeze the page-rc-INDEPENDENT
             // reachability free-set instead — exactly the birth-agnostic
             // exclusivity the CLONE_LINEAGE arm computes, minus the livelist
             // cross-check (non-clones emit no livelist records). `exclusive`
@@ -632,14 +630,12 @@ impl Db {
         // a crash between cascade and a *later* commit would leave
         // the on-disk manifest pointing at Free pages, and
         // `open_l2p_shards` would fail at the next open.
-        // H1 (ZFS-faithful): the `force_compact_l2p_buffers()` above folded
-        // EVERY surviving volume's buffer, pushing snapshot-pinned page-deaths
-        // into their accumulators. This commit makes those folded roots durable
-        // and advances `checkpoint_lsn`, so the deaths those roots imply MUST be
-        // sealed into the SAME commit — otherwise they survive only in volatile
-        // RAM and a hard crash loses them (produced-then-lost), so a later
-        // `drop_snapshot` fires a COMPLETENESS HOLE. Mirrors the `drop_snapshot`
-        // G1 seal; the bumped HEAD anchors fold via `refresh_manifest_from_locked`
+        // `force_compact_l2p_buffers()` above folded every surviving volume's
+        // buffer, pushing snapshot-pinned page-deaths into their accumulators.
+        // This commit makes those folded roots durable and advances
+        // `checkpoint_lsn`, so the deaths those roots imply must be sealed into
+        // the same commit. Otherwise they survive only in volatile RAM, and a
+        // hard crash loses them before a later `drop_snapshot` can free them.
         // below. The dropped volume itself is skipped (its deadlist is freed by
         // the cascade after the commit).
         let survivors: Vec<Arc<Volume>> = volumes_snap
@@ -661,14 +657,14 @@ impl Db {
             )?;
             mstate.manifest.volumes.retain(|v| v.ord != vol_ord);
             mstate.manifest.checkpoint_lsn = checkpoint_lsn;
-            // Phase B: no forced TXG sync ran ahead of this commit, so it is the
+            // buffer-backed journal: no forced BFG sync ran ahead of this commit, so it is the
             // checkpoint that makes the flushes above durable and must advance
             // the lifecycle/buffer replay watermarks. CRITICAL for clone drops:
             // the `flush_all_refcount_shards()` above force-folded the clone's
             // PromotionChunk increfs into the durable refcount array — without
             // bumping `lifecycle_replay_seq` here, reopen would re-replay those
             // increfs on top of the now-durable array and double-count them. (The
-            // S0 promotion-edge DECREFS are applied post-commit and are NOT
+            // promoted-PBA reclaim promotion-edge DECREFS are applied post-commit and are NOT
             // lifecycle ops, so they are never replayed either way.) The
             // `DropVolume` op is submitted AFTER this commit, so its seq is
             // correctly excluded here and replayed on the next open. Held under
@@ -694,7 +690,7 @@ impl Db {
             free_pages: free_pages.clone(),
         };
         let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
-        _txg_guard.record_lsn(lsn);
+        _bfg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
         // Fault window specific to drop_volume: WAL record durable, no
         // page decref has touched disk yet. Recovery re-drives the full
@@ -721,7 +717,7 @@ impl Db {
                 shard.tree.write().forget_page(pid);
             }
         }
-        // ZFS port Phase 3b: eagerly free the clone's page-livelist segment
+        // BFG: eagerly free the clone's page-livelist segment
         // chain (collected above, before the manifest commit dropped the
         // entry). `free_idempotent` is crash-safe + idempotent — an already-
         // freed pid (crash mid-loop) returns `Ok(false)`, and any pid not yet
@@ -732,18 +728,18 @@ impl Db {
             self.page_store.free_idempotent(pid, lsn)?;
             self.page_cache.invalidate(pid);
         }
-        // ZFS port S3: eagerly free the volume's page-deadlist segment chain too
+        // BFG: eagerly free the volume's page-deadlist segment chain too
         // (collected above) — same crash-safe `free_idempotent` + invalidate as
         // the livelist chain. The dropped volume has no live snapshots (drop
-        // refuses them), so the chain is exclusively its own; post-S3 apply no
+        // refuses them), so the chain is exclusively its own; post-page-rc removal apply no
         // longer reaches these untracked segment pages. Without this they leak to
-        // `reclaim_orphan_pages` on the next open (the pre-S3 behavior).
+        // `reclaim_orphan_pages` on the next open (the pre-page-rc removal behavior).
         for &pid in &deadlist_chain_pids {
             self.page_store.free_idempotent(pid, lsn)?;
             self.page_cache.invalidate(pid);
         }
 
-        // ZFS port Phase 4 Step 4 (S0): APPLY the promoted-PBA decrefs now —
+        // BFG: APPLY the promoted-PBA decrefs now —
         // POST-commit. The refcount array writes data pages IN PLACE (only
         // previously-hole `page_idx` slots get fresh pids), so staging the decref
         // + flushing it BEFORE the manifest commit would make it durable while
@@ -754,7 +750,7 @@ impl Db {
         // unreachable: the only crash states are (clone present, no decref)
         // [before the commit] and (clone gone, decref maybe-durable) [here]. A
         // crash mid-flush loses the decref = data-safe over-pin (never
-        // corruption), strictly smaller than the pre-S0 always-leak. On the
+        // corruption), strictly smaller than the pre-promoted-PBA reclaim always-leak. On the
         // no-crash path the committed manifest's refcount roots point at the
         // in-place-updated data pages, so a completed flush is durable + correct
         // (the decref is non-WAL and not replay-reconstructed). The drop/apply/
@@ -769,7 +765,7 @@ impl Db {
                 let (prev, new) =
                     self.refcount_shards[sid]
                         .rc
-                        .stage_unskippable(_txg_guard.txg(), pba, -1, checkpoint_lsn)?;
+                        .stage_unskippable(_bfg_guard.bfg(), pba, -1, checkpoint_lsn)?;
                 // Surface iff this decref reached 0 from a positive count AND no
                 // survivor maps it. `prev > 0` matches `stage`'s documented
                 // `freed_pba` contract and guards against a floored decref-past-0
@@ -836,12 +832,12 @@ impl Db {
         }))
     }
 
-    /// ZFS port Phase 3a (SHADOW): cross-check the per-clone page-livelist
+    /// BFG: cross-check the per-clone page-livelist
     /// free model against the structural ground truth `drop_volume` still
     /// frees from — the page-rc `collect_drop_pages` cascade. Page-rc stays
     /// AUTHORITATIVE; this only observes and aborts on a soundness divergence,
     /// so a clone-churn soak can prove the livelist model equals page-rc
-    /// before Phase 4 deletes page-rc and makes the livelist the sole free
+    /// before deletes page-rc and makes the livelist the sole free
     /// source.
     ///
     /// For a clone C with `B = branched_at_lsn`, the set of L2P pages this
@@ -852,32 +848,32 @@ impl Db {
     /// (any other volume head or any snapshot, including snapshots/clones of
     /// C). `birth_lsn` does NOT gate the free for clones — cross-volume DAG
     /// sharing makes the single-vol `birth > B` predicate unsound in both
-    /// directions (the Phase 3 audit found premature-free and leak
+    /// directions (the audit found premature-free and leak
     /// counterexamples, both at a *legal* drop after `PromotionComplete`
     /// clears `parent_vol_ord` while leaving page-rc sharing intact). Birth is
     /// carried only to partition the freed set into origin (`birth <= B`) vs
-    /// clone-private (`birth > B`) for diagnostics and the Phase 3b livelist
+    /// clone-private (`birth > B`) for diagnostics and the livelist
     /// substrate.
     ///
     /// The RHS is computed by an INDEPENDENT reachability walk
     /// ([`crate::verify::reachable_l2p_pages`], a set-difference), a different
     /// code path from the page-rc cascade so the assertion is
     /// non-tautological. Posture mirrors the `drop_snapshot` page-deadlist
-    /// shadow before its Phase 2b escalation:
+    /// shadow before its escalation:
     ///   - **premature** (page-rc would free a page still reachable from a
-    ///     surviving root — the premature-free P0 the port exists to kill) →
+    ///     surviving root — the premature-free case the port exists to kill) →
     ///     HARD [`MetaDbError::Corruption`]. Only fires on a real page-rc
     ///     under-count: a reachability-walk error can only shrink this set
     ///     (an omitted survivor edge enlarges `exclusive`, never the
     ///     premature difference), so the HARD direction can't false-fire.
     ///   - **missing** (the exclusivity walk frees a page page-rc keeps live)
-    ///     → HARD [`MetaDbError::Corruption`] (Phase 4 Step 1 escalation, was a
+    ///     → HARD [`MetaDbError::Corruption`] (escalation, was a
     ///     soft warn). **Soundness precondition**: `surviving_roots` is COMPLETE
     ///     for a legal drop of any `VOLUME_FLAG_CLONE_LINEAGE` volume — every
     ///     OTHER live volume's just-flushed root + every snapshot root, frozen
     ///     under drop_gate.write + apply_gate.write + snapshot_views.write. An
     ///     incomplete `surviving_roots` would over-enlarge `exclusive` and
-    ///     manufacture a false `missing`. **Phase 4 Step 3 re-proof for the
+    ///     manufacture a false `missing`. **re-proof for the
     ///     widened (promoted-ex-clone) gate**: promotion (`apply/promotion.rs`)
     ///     edits only the `parent_vol_ord`/`promotion_cursor` RwLocks and NEVER
     ///     removes a volume from `self.volumes`, so a promoted ex-clone's
@@ -888,7 +884,7 @@ impl Db {
     ///     still a survivor). reachability is transitive, so arbitrary DAG depth
     ///     is covered. Checked AFTER premature so `structural_free == exclusive`
     ///     holds for the livelist reduction below.
-    ///   - **livelist cross-check** (Phase 4 Step 1, NEW) → HARD. With the two
+    ///   - **livelist cross-check** (, NEW) → HARD. With the two
     ///     checks above passing, `structural_free == exclusive`, so the
     ///     clone-private part of the free-set is `exclusive ∩ {birth > B}`.
     ///     The persistent v19 livelist's live-ALLOC set (`LA`, an INDEPENDENT
@@ -900,10 +896,10 @@ impl Db {
     ///     three independent ground truths. The born≤B origin-fallthrough
     ///     pages page-rc frees are NOT in the livelist by construction and drop
     ///     out of both sides.
-    /// Returns the reachability `exclusive` set (sorted). With premature +
-    /// missing both HARD, on `Ok` it equals `structural_free`, so the ZFS
-    /// port Phase 4 S2 flip inlines it as the `DropVolume.free_pages`
-    /// authoritative, page-rc-independent free-set for CLONE_LINEAGE drops.
+    /// Returns the reachability `exclusive` set (sorted). With premature and
+    /// missing cases both treated as hard errors, `Ok` means it equals
+    /// `structural_free`, making it the authoritative page-rc-independent
+    /// free-set for CLONE_LINEAGE drops.
     fn check_clone_livelist_shadow(
         &self,
         vol_ord: VolumeOrdinal,
@@ -974,7 +970,7 @@ impl Db {
             )));
         }
 
-        // Livelist cross-check (Phase 4 Step 1). `LA` = the persistent v19
+        // Livelist cross-check (). `LA` = the persistent v19
         // live-ALLOC set, keyed on (pid, birth) to match the substrate
         // invariant (`live_allocs` can legitimately carry one pid twice across
         // births — a pid-only projection would mask a real (pid,birth)
@@ -1012,7 +1008,7 @@ impl Db {
             )));
         }
         // All checks clean ⇒ exclusive == structural_free. Hand it back
-        // sorted (deterministic WAL `free_pages`) as the S2 authoritative
+        // sorted (deterministic WAL `free_pages`) as the free-set authoritative
         // free-set.
         let mut free_pages: Vec<PageId> = exclusive.into_iter().collect();
         free_pages.sort_unstable();
@@ -1063,10 +1059,9 @@ impl Db {
     /// - `apply_gate.write()` — serialises the WAL submit + apply against
     ///   [`Db::run_sync_cycle_body`]'s manifest-commit window.
     ///
-    /// Phase B (A3 follow-up): the **forced TXG sync** that used to run
-    /// at entry is GONE. Its sole job was to drain in-flight flush IO so a
-    /// whole-page rc RMW could not be clobbered by a concurrent whole-page
-    /// flush write. ZFS port S3 deleted per-L2P-page refcounting entirely:
+    /// The forced BFG sync that used to run at entry is gone. Its sole job was
+    /// to drain in-flight flush IO so a whole-page rc RMW could not be clobbered
+    /// by a concurrent whole-page flush write. BFG deleted per-L2P-page refcounting entirely:
     /// the clone no longer touches any page-rc, and the source pages it
     /// shares are never modified by the clone op — there is nothing left to
     /// clobber. Removing the forced sync stops every clone from driving +
@@ -1086,18 +1081,18 @@ impl Db {
     /// [`open`](Self::open) — captures the new volumes table.
     pub fn clone_volume(&self, src_snap_id: SnapshotId) -> Result<VolumeOrdinal> {
         let _drop_guard = self.drop_gate.write();
-        // Phase B (A3 follow-up): no forced TXG sync here. The page-rc
-        // incref is now a `stage` into the array (clobber-free), so the
-        // sync-drain barrier is unnecessary. `txg.enter()` pins the
-        // current Open TXG; `TxgStateMachine`'s `closing_open` flag makes
+        // No forced BFG sync here. The page-rc incref is now a `stage` into the
+        // array (clobber-free), so the
+        // sync-drain barrier is unnecessary. `bfg.enter()` pins the
+        // current Open BFG; `BfgStateMachine`'s `closing_open` flag makes
         // it wait out (not race) a concurrent background roll, so it is
-        // safe to enter without first rolling the TXG ourselves.
+        // safe to enter without first rolling the BFG ourselves.
         //
-        // Phase 4 gate-shrink: `_txg_guard.record_lsn(lsn)` (below)
-        // records this lifecycle op's WAL LSN into `slot_max_lsn(open_txg)`
-        // so `run_sync_cycle_body`'s `wal_checkpoint = slot_max_lsn(txg)`
+        // gate-shrink: `_bfg_guard.record_lsn(lsn)` (below)
+        // records this lifecycle op's WAL LSN into `slot_max_lsn(open_bfg)`
+        // so `run_sync_cycle_body`'s `wal_checkpoint = slot_max_lsn(bfg)`
         // watermark reflects it and the WAL segment is eventually pruned.
-        let _txg_guard = self.txg.enter();
+        let _bfg_guard = self.bfg.enter();
         let _apply_guard = self.apply_gate.write();
 
         // Resolve the snapshot entry + allocate the new ord under the
@@ -1170,7 +1165,7 @@ impl Db {
             src_shard_roots: src_shard_roots.clone(),
         };
         let lsn = self.submit_lifecycle_op(&lifecycle_op)?;
-        _txg_guard.record_lsn(lsn);
+        _bfg_guard.record_lsn(lsn);
         self.faults.inject(FaultPoint::CommitPostWalBeforeApply)?;
 
         // Under our two write gates no other commit sits between submit
@@ -1178,7 +1173,7 @@ impl Db {
         // `create_volume` / `drop_snapshot`.
         self.wait_for_global_apply_turn(lsn)?;
 
-        // ZFS port S3: per-L2P-page refcounting is deleted, so the clone no
+        // BFG: per-L2P-page refcounting is deleted, so the clone no
         // longer increfs the source shard roots' page-rc. The source pages are
         // not modified by the clone op (the clone just opens fresh `PagedL2p`s
         // pointing at the shared source roots, and COWs down on first write), so
@@ -1247,7 +1242,7 @@ impl Db {
                 // durable. Future flushes advance per-shard.
                 l2p_shard_durable_seq: durable_seqs,
                 created_lsn: lsn,
-                // v19: sticky clone-lineage flag (ZFS port Phase 3b). Never
+                // v19: sticky clone-lineage flag (BFG). Never
                 // cleared by promotion, so the per-clone page-livelist keeps
                 // recording for promoted ex-clones too.
                 flags: crate::manifest::VOLUME_FLAG_CLONE_LINEAGE,
@@ -1258,10 +1253,10 @@ impl Db {
                 // parent's).
                 dead_list_head_pid: crate::types::NULL_PAGE,
                 dead_list_tail_pid: crate::types::NULL_PAGE,
-                // Phase 4 lineage tracking. `parent_vol_ord` + `branched_at_lsn`
+                // lineage tracking. `parent_vol_ord` + `branched_at_lsn`
                 // mark this volume as a clone whose Lineage GC must consult the
-                // parent (cross-volume snap_pin: Step 2). `promotion_cursor`
-                // stays `None` until Step 5 arms the background walker that
+                // parent (cross-volume snap_pin: lineage pinning). `promotion_cursor`
+                // stays `None` until promotion walker arms the background walker that
                 // increfs the global rc for each shared PBA, which is what
                 // ultimately lets the parent be dropped independently.
                 parent_vol_ord: Some(src_ord),
@@ -1303,7 +1298,7 @@ impl Db {
     }
 
     /// Clone out the bootstrap volume. Panics if it is missing — it is
-    /// inserted at create / open time and Phase B never removes it.
+    /// inserted at create / open time and buffer-backed journal never removes it.
     pub(super) fn volume_zero(&self) -> Arc<Volume> {
         self.volumes
             .read()
@@ -1326,7 +1321,7 @@ impl Db {
     }
 
     /// Read-side: cloned snapshot info for `vol`. Empty Vec when no
-    /// snap is live on the volume. Phase 5 RangeDelete is PBA
+    /// snap is live on the volume. RangeDelete is PBA
     /// rc-neutral, so it does not consult this cache for refcount work.
     pub(super) fn snap_info_for_vol(&self, vol: VolumeOrdinal) -> Vec<SnapInfo> {
         self.snap_info_cache
@@ -1336,12 +1331,10 @@ impl Db {
             .unwrap_or_default()
     }
 
-    /// Youngest live snapshot's `created_lsn` for `vol` (ZFS `prev_snap_txg`
-    /// analogue), or `None` when the volume has no live snapshot. This is
-    /// the birth-txg threshold for the COW kill decision in the birth-txg
-    /// port: a page reachable from the head with `birth_lsn <= youngest_snap`
-    /// is still pinned by that snapshot. Phase 2 reads it on the buffer-fold
-    /// path to gate which COW'd L2P pages enter the HEAD page-deadlist.
+    /// Youngest live snapshot's `created_lsn` for `vol`, or `None` when the
+    /// volume has no live snapshot. This is the birth threshold for the COW kill
+    /// decision: a page reachable from the head with
+    /// `birth_lsn <= youngest_snap` is still pinned by that snapshot.
     /// `Some(0)` (a snapshot taken before the first op on the bootstrap
     /// volume) is distinct from `None` (no snapshot) — the former still
     /// pins genesis pages born at lsn 0.
@@ -1352,7 +1345,7 @@ impl Db {
             .and_then(|infos| infos.iter().map(|s| s.created_lsn).max())
     }
 
-    /// v21 (Phase 4 S1): the live snapshots' `capture_watermark`s for `vol`, the
+    /// v21 (snapshot watermark): the live snapshots' `capture_watermark`s for `vol`, the
     /// operand of the birth COW-kill (`tree.set_snapshot_wms`). The fold path
     /// passes this in; the COW-kill filters it per dying-page lsn
     /// (`youngest_snap_below`). Empty when the volume has no live snapshot.
@@ -1364,7 +1357,7 @@ impl Db {
             .unwrap_or_default()
     }
 
-    /// v21 (ZFS port Phase 4 Step 4 / S1c): the page-rc-INDEPENDENT pinner-LSN set
+    /// v21 (BFG): the page-rc-INDEPENDENT pinner-LSN set
     /// for `vol`'s CLONE COW-kill (`tree.set_clone_cow_pinners`). Empty for a
     /// non-clone (it never reads this — its COW-kill uses `snapshot_wms`). For a
     /// clone C with `B_C = branched_at_lsn`:
@@ -1384,8 +1377,8 @@ impl Db {
     ///   `parent_vol_ord == Some(C)`, because a PROMOTED ex-descendant has its
     ///   `parent_vol_ord` cleared and can no longer be identified as C's
     ///   descendant — yet it still shares C's pages (promotion bumps only global
-    ///   PBA rc, never restructures the page tree). Missing it is the G6
-    ///   premature-free P0. Every true descendant `V` has
+    ///   PBA rc, never restructures the page tree). Missing it is the descendant-share
+    ///   premature-free case. Every true descendant `V` has
     ///   `branched_at_lsn(V) = (a snapshot in C's lineage).created_lsn > B_C`, and
     ///   `branched_at_lsn(V) >= birth(P)` for every C-page P that V shares, so the
     ///   set is a complete superset; including unrelated clones only over-pins
@@ -1527,7 +1520,7 @@ impl Db {
     /// `apply_gate.write()` (flush / take_snapshot / drop_snapshot) and
     /// therefore have an authoritative reading of `last_applied_lsn`.
     ///
-    /// `durable_override` is Stage 1 (Tier 2.B) plumbing: callers
+    /// `durable_override` is durable-seq rollout (per-shard durable-seq) plumbing: callers
     /// that just flushed every shard and are about to write
     /// `manifest.checkpoint_lsn = last_applied_lsn` pass `Some(lsn)`
     /// so the persisted per-shard `durable_seq` arrays match the new
@@ -1608,7 +1601,7 @@ impl Db {
     }
 }
 
-/// Build the S1c clone COW-kill pinner-LSN set from a borrowed volume map plus
+/// Build the clone COW-kill clone COW-kill pinner-LSN set from a borrowed volume map plus
 /// the clone's own snapshot watermarks (`own_snap_wms`). Free helper so both
 /// [`Db::clone_cow_pinners`] (locks `self.volumes`) and `apply_op_bare` (already
 /// holds a `&HashMap`) share one definition without a double `volumes.read()`.
@@ -1625,7 +1618,7 @@ pub(in crate::db) fn clone_cow_pinners_from(
         return Vec::new();
     };
     if target.flags.load(Ordering::Relaxed) & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0 {
-        // CLONE arm (S1c): `{B_C} ∪ own-snap watermarks ∪ {descendant branch
+        // CLONE arm (clone COW-kill): `{B_C} ∪ own-snap watermarks ∪ {descendant branch
         // points > B_C}`.
         let b_c = target.branched_at_lsn;
         own_snap_wms.push(b_c);
@@ -1640,7 +1633,7 @@ pub(in crate::db) fn clone_cow_pinners_from(
         }
         return own_snap_wms;
     }
-    // ZFS port S3 (clone-SOURCE arm — replaces the deleted page-rc `rc > 1`
+    // BFG (clone-SOURCE arm — replaces the deleted page-rc `rc > 1`
     // floor for `repro_drop_free`): a NON-clone volume can still share L2P pages
     // with a clone of one of its (possibly already-dropped) snapshots — onyx
     // allows dropping a snapshot that has live clones, and promotion is lite
@@ -1653,7 +1646,7 @@ pub(in crate::db) fn clone_cow_pinners_from(
     // exactly as the CLONE arm's descendant term — take the all-clone superset.
     // Empty when no clones exist → ZERO change to the common non-clone path. The
     // resulting over-COW on an unrelated volume is benign: it only fires while a
-    // clone is live, and then every snapshot drop routes to the S2c reachability
+    // clone is live, and then every snapshot drop routes to the clone-involved snapshot drop reachability
     // free-set (computed from current structure, idempotent free), never a
     // deadlist double-free.
     let mut clone_branches = Vec::new();
@@ -1672,7 +1665,7 @@ pub struct DropVolumeReport {
     pub vol_ord: VolumeOrdinal,
     /// Number of metadb pages released back to the page store.
     pub pages_freed: usize,
-    /// ZFS port Phase 4 Step 4 (S0): clone promotion-edge PBAs whose global
+    /// BFG: clone promotion-edge PBAs whose global
     /// PBA-rc reached 0 during the survivor-gated decref AND that no surviving
     /// root still maps. Surfaced to onyx as `pba_freed` cleanups so the LV3
     /// block is reclaimed (closing the clone-promotion over-pin leak). Empty

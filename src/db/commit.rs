@@ -132,15 +132,15 @@ struct LaneDispatchPlan {
 
 struct QueuedLanePlan {
     ops: Arc<Vec<WalOp>>,
-    /// TXG this commit is stamped to. Threaded into the rc/dedup apply
-    /// closures so `rc.stage(txg, …)` lands the derived refcount delta in
-    /// the same TXG ring slot as the commit's L2P buffer insert — the
+    /// BFG this commit is stamped to. Threaded into the rc/dedup apply
+    /// closures so `rc.stage(bfg, …)` lands the derived refcount delta in
+    /// the same BFG ring slot as the commit's L2P buffer insert — the
     /// refcount fold must be keyed to the same `checkpoint_lsn` prefix as
     /// L2P or onyx's replay re-derivation double-counts (see
-    /// `refcount::shard`). The commit thread holds its `TxgGuard` across
+    /// `refcount::shard`). The commit thread holds its `BfgGuard` across
     /// `apply_ops_laned` (it awaits every rc/dedup receiver), so the slot
     /// cannot roll to Syncing while these stages run.
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     l2p_receivers: Vec<crossbeam_channel::Receiver<Result<L2pBucketApplyResult>>>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
     /// Per-shard dedup op indices. Drained into the per-shard apply
@@ -186,11 +186,11 @@ struct CommitApplyContext<'a> {
     plan_dedup_ops: usize,
     dispatch_lanes: usize,
     ops: &'a [WalOp],
-    /// ZFS-TXG-clone Phase 4 Step 8a: the TXG that the committing thread
-    /// pinned via [`crate::txg::TxgStateMachine::enter`]. Threads down
+    /// BFG: the BFG that the committing thread
+    /// pinned via [`crate::bfg::BfgStateMachine::enter`]. Threads down
     /// into every L2pBuffer write so the slot stamp matches the slot
-    /// the [`crate::txg::TxgGuard`] is keeping alive.
-    txg: crate::types::Txg,
+    /// the [`crate::bfg::BfgGuard`] is keeping alive.
+    bfg: crate::types::Bfg,
 }
 
 pub(super) struct ActiveApplyGuard<'a> {
@@ -437,16 +437,16 @@ impl Db {
         // `reserve_unlogged` so apply ordering / dispatch tracking
         // stays consistent.
         //
-        // ZFS-TXG-clone Phase 4 Step 4: acquire a TxgGuard BEFORE the
+        // BFG: acquire a BfgGuard BEFORE the
         // LSN reservation so the slot stamp is locked in before the
-        // allocator can hand out a higher LSN to a later TXG. The
+        // allocator can hand out a higher LSN to a later BFG. The
         // guard's drop (at function exit) decrements the slot's
-        // inflight counter, which is what the `TxgQuiesceThread`
+        // inflight counter, which is what the `BfgQuiesceThread`
         // parks on. Holding it across the apply also means
         // `take_syncing_slot` cannot race with this commit's tree
         // mutations because the slot stays pinned (state == Open or
         // Quiescing — never Syncing while inflight > 0).
-        let _txg_guard = self.txg.enter();
+        let _bfg_guard = self.bfg.enter();
         let wal_started = std::time::Instant::now();
         let lsn = {
             let result = self.lsn_alloc.reserve(|lsn| {
@@ -463,7 +463,7 @@ impl Db {
                 }
             }
         };
-        _txg_guard.record_lsn(lsn);
+        _bfg_guard.record_lsn(lsn);
         drop(unlogged_commit_guard);
         if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
             self.metrics.record_commit_error(commit_started.elapsed());
@@ -497,13 +497,13 @@ impl Db {
                 plan_dedup_ops,
                 dispatch_lanes,
                 ops,
-                txg: _txg_guard.txg(),
+                bfg: _bfg_guard.bfg(),
             },
             "metadb: slow commit_with_outcomes (>=1s)",
         )
     }
 
-    /// ZFS-TXG-clone Phase 2 entry point. Same WAL + apply pipeline as
+    /// BFG entry point. Same WAL + apply pipeline as
     /// [`Self::commit_ops`], but the returned outcome `Vec` is parked
     /// in the [`DeferredOutcomeAggregator`] keyed by the freshly
     /// assigned LSN and delivered through the
@@ -526,10 +526,10 @@ impl Db {
             return Ok((lsn, DeferredOutcomeHandle::ready(lsn, Ok(Vec::new()))));
         }
 
-        // ZFS-TXG-clone Phase 3: route through the WAL with
-        // `synchronous=false` IFF both Phase 2 and Phase 3 flags are
+        // BFG: route through the WAL with
+        // `synchronous=false` IFF both and flags are
         // enabled. Async WAL on the inline outcome path is an untested
-        // Buffer-as-sole-journal Phase D.5b retired the WAL writer, so
+        // Buffer-as-sole-journal lifecycle journal cutover retired the WAL writer, so
         // there is no sync/async fsync choice to thread through any
         // more — every commit runs the same path. The `wal_async_*`
         // flag is preserved on `Config` as dead-but-accepted so older
@@ -625,10 +625,10 @@ impl Db {
             .unwrap_or_else(DispatchFootprint::global);
         let dispatch_lanes = dispatch_footprint.lanes.len();
 
-        // ZFS-TXG-clone Phase 4 Step 4: same TxgGuard pattern as
+        // BFG: same BfgGuard pattern as
         // commit_ops_with_options. Acquire before WAL reserve to preserve
         // the LSN-monotonicity invariant across the unlogged path.
-        let _txg_guard = self.txg.enter();
+        let _bfg_guard = self.bfg.enter();
         let dispatch_started = std::time::Instant::now();
         let lsn = match self.lsn_alloc.reserve(|lsn| {
             self.register_dispatch_intent(lsn, dispatch_footprint);
@@ -640,7 +640,7 @@ impl Db {
                 return Err(err);
             }
         };
-        _txg_guard.record_lsn(lsn);
+        _bfg_guard.record_lsn(lsn);
         if let Err(err) = self.mark_wal_durable_and_wait_for_dispatch(lsn) {
             timing.dispatch_wait = dispatch_started.elapsed();
             self.metrics.record_commit_apply_wait(timing.dispatch_wait);
@@ -664,7 +664,7 @@ impl Db {
                 plan_dedup_ops,
                 dispatch_lanes,
                 ops,
-                txg: _txg_guard.txg(),
+                bfg: _bfg_guard.bfg(),
             },
             "metadb: slow unlogged commit_with_outcomes (>=1s)",
         );
@@ -706,13 +706,13 @@ impl Db {
     ///   * `drop_gate.read()` — keeps lifecycle ops (drop_snapshot /
     ///     drop_volume / clone_volume / range_delete / create_volume /
     ///     take_snapshot) from racing with our apply. Lifecycle paths
-    ///     hold `drop_gate.write()` across their forced TXG sync and
+    ///     hold `drop_gate.write()` across their forced BFG sync and
     ///     plan-then-apply, so they observe a quiesced state.
-    ///   * `TxgGuard` pinned **before** LSN allocation. The
-    ///     `closing_open` flag in `TxgStateMachine::roll_to_quiescing`
+    ///   * `BfgGuard` pinned **before** LSN allocation. The
+    ///     `closing_open` flag in `BfgStateMachine::roll_to_quiescing`
     ///     blocks new `enter()` while a roll is mid-drain, preserving
-    ///     `max(LSN in TXG_n) <= min(LSN in TXG_n+1)`. This is the
-    ///     invariant `wal_checkpoint = slot_max_lsn(txg)` relies on.
+    ///     `max(LSN in BFG_n) <= min(LSN in BFG_n+1)`. This is the
+    ///     invariant `wal_checkpoint = slot_max_lsn(bfg)` relies on.
     ///   * `lsn_alloc.reserve(|_| {})` — bumps the global LSN counter
     ///     under a brief mutex. The callback is a no-op (no dispatch
     ///     intent registration).
@@ -752,10 +752,10 @@ impl Db {
 
         let volumes = self.volumes.read().clone();
 
-        // TxgGuard before LSN reserve: the `closing_open` invariant
-        // (txg/mod.rs) blocks `enter()` during a roll's drain, so any
-        // LSN we allocate is bounded above by every later TXG's LSNs.
-        let _txg_guard = self.txg.enter();
+        // BfgGuard before LSN reserve: the `closing_open` invariant
+        // (bfg/mod.rs) blocks `enter()` during a roll's drain, so any
+        // LSN we allocate is bounded above by every later BFG's LSNs.
+        let _bfg_guard = self.bfg.enter();
         let lsn_started = std::time::Instant::now();
         let lsn = match self.lsn_alloc.reserve(|_| {}) {
             Ok(lsn) => lsn,
@@ -766,10 +766,10 @@ impl Db {
             }
         };
         self.metrics.record_commit_wal_submit(lsn_started.elapsed());
-        _txg_guard.record_lsn(lsn);
+        _bfg_guard.record_lsn(lsn);
 
         let apply_started = std::time::Instant::now();
-        let outcomes = match self.apply_commit_batch(&volumes, lsn, _txg_guard.txg(), ops) {
+        let outcomes = match self.apply_commit_batch(&volumes, lsn, _bfg_guard.bfg(), ops) {
             Ok(outcomes) => outcomes,
             Err(err) => {
                 self.metrics.record_commit_apply(apply_started.elapsed());
@@ -801,7 +801,7 @@ impl Db {
         Ok((lsn, outcomes))
     }
 
-    /// ZFS-TXG-clone Phase 1 eligibility check.
+    /// BFG eligibility check.
     ///
     /// The L2P-direct fast path can carry a commit iff:
     ///   * no dedup bucket carries work — dedup apply lives in its own
@@ -842,7 +842,7 @@ impl Db {
         true
     }
 
-    /// ZFS-TXG-clone Phase 1 direct apply.
+    /// BFG direct apply.
     ///
     /// Mirrors what `enqueue_lane_plan` + the L2P recv loop of
     /// `apply_ops_laned` would do, but runs every per-shard
@@ -866,7 +866,7 @@ impl Db {
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         plan: LaneDispatchPlan,
         ops: &[WalOp],
     ) -> Result<Vec<ApplyOutcome>> {
@@ -889,7 +889,7 @@ impl Db {
                 sid,
                 entries,
                 lsn,
-                txg,
+                bfg,
                 ops,
                 &refcount_shards_snapshot,
                 &self.metrics,
@@ -947,7 +947,7 @@ impl Db {
 
         let apply_started = std::time::Instant::now();
         let outcomes = if let Some(plan) = ctx.plan {
-            // ZFS-TXG-clone Phase 1 fast path: when the plan is
+            // BFG fast path: when the plan is
             // L2P-only (no dedup buckets, no rc-touched shards) and
             // every target L2P shard is in buffered mode, run the L2P
             // apply directly on this thread. This skips
@@ -961,7 +961,7 @@ impl Db {
             if self.commit_direct_apply_enabled
                 && Self::plan_is_l2p_direct_eligible(&plan, &ctx.volumes)
             {
-                match self.apply_l2p_direct(&ctx.volumes, lsn, ctx.txg, plan, ctx.ops) {
+                match self.apply_l2p_direct(&ctx.volumes, lsn, ctx.bfg, plan, ctx.ops) {
                     Ok(outcomes) => {
                         ctx.timing.apply = apply_started.elapsed();
                         self.metrics.record_commit_apply(ctx.timing.apply);
@@ -991,7 +991,7 @@ impl Db {
                 let queued_plan = self.enqueue_lane_plan(
                     &ctx.volumes,
                     lsn,
-                    ctx.txg,
+                    ctx.bfg,
                     plan,
                     Arc::new(ctx.ops.to_vec()),
                 );
@@ -1028,7 +1028,7 @@ impl Db {
                     .record_commit_error(ctx.commit_started.elapsed());
                 return Err(err);
             }
-            match self.apply_commit_batch(&ctx.volumes, lsn, ctx.txg, ctx.ops) {
+            match self.apply_commit_batch(&ctx.volumes, lsn, ctx.bfg, ctx.ops) {
                 Ok(outcomes) => {
                     ctx.timing.apply = apply_started.elapsed();
                     self.metrics.record_commit_apply(ctx.timing.apply);
@@ -1132,7 +1132,7 @@ impl Db {
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         op: &WalOp,
     ) -> Result<ApplyOutcome> {
         let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
@@ -1143,7 +1143,7 @@ impl Db {
             &self.dedup_index,
             &self.page_store,
             lsn,
-            txg,
+            bfg,
             op,
             &snap_lookup,
             self.rc_authoritative_reclaim,
@@ -1179,10 +1179,10 @@ impl Db {
         vol_ord: VolumeOrdinal,
         pbas: &[Pba],
     ) -> Result<ApplyOutcome> {
-        // Lock order: drop_gate.read() BEFORE txg.enter() — matches commit_ops
+        // Lock order: drop_gate.read() BEFORE bfg.enter() — matches commit_ops
         // and is load-bearing for deadlock-freedom. A commit parked at
         // drop_gate.read() (behind a lifecycle op's drop_gate.write) must NOT
-        // already hold a txg guard: take_snapshot / create_volume force-sync
+        // already hold a bfg guard: take_snapshot / create_volume force-sync
         // while holding drop_gate.write, and their roll_to_quiescing waits for
         // slots[cur].inflight == 0. An enter-before-read commit (the
         // LineageGcWorker runs this autonomously) would pin inflight while
@@ -1190,17 +1190,17 @@ impl Db {
         // AFTER drop_gate.read keeps the reserve-after-enter / record_lsn-under-
         // guard sequence below identical to commit_ops.
         let _drop_guard = self.drop_gate.read();
-        let _txg_guard = self.txg.enter();
+        let _bfg_guard = self.bfg.enter();
         let footprint = DispatchFootprint::global();
         let lsn = self.lsn_alloc.reserve(|lsn| {
             self.register_dispatch_intent(lsn, footprint);
         })?;
-        _txg_guard.record_lsn(lsn);
+        _bfg_guard.record_lsn(lsn);
         self.mark_wal_durable_and_wait_for_dispatch(lsn)?;
 
         let _apply_guard = self.acquire_commit_apply_gate(lsn);
         let _active = self.enter_active_apply(lsn);
-        let outcome = apply_free_pbas(&self.refcount_shards, lsn, _txg_guard.txg(), pbas)?;
+        let outcome = apply_free_pbas(&self.refcount_shards, lsn, _bfg_guard.bfg(), pbas)?;
         self.finish_global_apply(lsn)?;
         self.advance_dispatch_lsn(lsn);
         Ok(outcome)
@@ -1294,18 +1294,18 @@ impl Db {
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         ops: &[WalOp],
     ) -> Result<Vec<ApplyOutcome>> {
         const BUCKET_THRESHOLD: usize = 8;
         if ops.len() < BUCKET_THRESHOLD || self.batch_requires_serial_apply(ops) {
             let mut outcomes = Vec::with_capacity(ops.len());
             for op in ops {
-                outcomes.push(self.apply_op(volumes, lsn, txg, op)?);
+                outcomes.push(self.apply_op(volumes, lsn, bfg, op)?);
             }
             return Ok(outcomes);
         }
-        self.apply_ops_grouped(volumes, lsn, txg, ops)
+        self.apply_ops_grouped(volumes, lsn, bfg, ops)
     }
 
     fn batch_requires_serial_apply(&self, ops: &[WalOp]) -> bool {
@@ -1361,21 +1361,21 @@ impl Db {
             .map(|msg| MetaDbError::Corruption(format!("commit pipeline failed: {msg}")))
     }
 
-    /// ZFS port Part B — poison the forced-sync subsystem after a
-    /// non-recoverable sync-cycle failure (e.g. a faulted manifest fsync that
-    /// left a TXG slot stuck in Syncing). Set-once (first writer wins), then
-    /// abort the TXG state machine so every parked waiter (`promote_to_syncing`,
-    /// `wait_until_synced`, `roll_to_quiescing`) unblocks instead of hanging,
-    /// and fail every still-queued snapshot task so none can land durable after
-    /// its `take_snapshot` caller was told the subsystem failed. Recovery =
-    /// process restart (a failed inline sync may have left deferred RC apply
-    /// state un-retryable; we deliberately do NOT retry). Called from BOTH the
+    /// Poison the forced-sync subsystem after a non-recoverable sync-cycle
+    /// failure (e.g. a faulted manifest fsync that left a BFG slot stuck in
+    /// Syncing). Set-once (first writer wins), then abort the BFG state machine
+    /// so every parked waiter (`promote_to_syncing`, `wait_until_synced`,
+    /// `roll_to_quiescing`) unblocks instead of hanging, and fail every
+    /// still-queued snapshot task so none can land durable after its
+    /// `take_snapshot` caller was told the subsystem failed. Recovery = process
+    /// restart (a failed inline sync may have left deferred RC apply state
+    /// un-retryable; we deliberately do NOT retry). Called from BOTH the
     /// threads-off `flush_with_gate` Err arm and the threads-on `sync_work`
     /// closure.
     ///
     /// Lock order: the `sync_poison` lock is released (scoped block) BEFORE
-    /// `txg.mark_aborted()` (which locks `txg.inner`) and the
-    /// `pending_sync_tasks` lock, so no new `sync_poison`↔`txg.inner` /
+    /// `bfg.mark_aborted()` (which locks `bfg.inner`) and the
+    /// `pending_sync_tasks` lock, so no new `sync_poison`↔`bfg.inner` /
     /// `pending_sync_tasks` ordering edge is introduced.
     pub(crate) fn poison_sync(&self, err: &MetaDbError) {
         {
@@ -1384,7 +1384,7 @@ impl Db {
                 *p = Some(err.to_string());
             }
         }
-        self.txg.mark_aborted();
+        self.bfg.mark_aborted();
         let mut tasks = self.pending_sync_tasks.lock();
         for task in tasks.drain(..) {
             *task.result.lock() = Some(Err(MetaDbError::Corruption(

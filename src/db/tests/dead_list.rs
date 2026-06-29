@@ -1,4 +1,4 @@
-//! Phase 2 dead-list tests. Cover emit correctness across the three
+//! dead-list tests. Cover emit correctness across the three
 //! L2P apply sites, checkpoint flush behaviour (single + multi page
 //! segment, chain extension across two flushes), WAL replay re-emit,
 //! buffer-only flush trigger, and drop_volume chain reclaim.
@@ -83,7 +83,7 @@ fn checkpoint_flush_writes_single_page_segment() {
 
 #[test]
 fn page_deadlist_populated_by_snapshot_overwrite() {
-    // ZFS port Phase 2 make-or-break: a live snapshot pins the L2P tree,
+    // BFG make-or-break: a live snapshot pins the L2P tree,
     // so a subsequent overwrite COWs each root→leaf path and the old
     // (snapshot-pinned) L2P pages "die off the head" and MUST be recorded
     // into the HEAD page-deadlist. An empty deadlist here would mean the
@@ -112,7 +112,7 @@ fn page_deadlist_populated_by_snapshot_overwrite() {
 
 #[test]
 fn page_deadlist_segments_survive_reopen() {
-    // ZFS port Phase 2: the page-deadlist segments live under the new
+    // BFG: the page-deadlist segments live under the new
     // `page_dead_list_*_pid` anchors (volume) + `page_dead_list_tail_pid`
     // (snapshots). `collect_live_pages` MUST walk those chains or
     // `reclaim_orphan_pages` (run on open) frees the segments out from
@@ -161,7 +161,7 @@ fn page_deadlist_segments_survive_reopen() {
 
 #[test]
 fn drop_older_snapshot_frees_s_next_deadlist_not_s_own() {
-    // ZFS `process_old_deadlist`: destroying S frees from S_NEXT's
+    // Snapshot-deadlist rule: destroying S frees from S_NEXT's
     // page-deadlist (deaths in `(S, S_next]`), filtered `birth > S_prev`,
     // NOT S's own (deaths in `(S_prev, S]`, which S never referenced).
     // The drop shadow assertion HARD-fails (`Corruption`) on a premature
@@ -194,11 +194,11 @@ fn drop_older_snapshot_frees_s_next_deadlist_not_s_own() {
 
 #[test]
 fn drop_middle_snapshot_merges_keep_into_s_next() {
-    // ZFS port Phase 2a MERGE (process_old_deadlist): dropping a MIDDLE
-    // snapshot S2 (S1 < S2 < S3 all live) is the only case with a
-    // non-trivial KEEP/FREE partition — S3's deadlist entries born <= S1
-    // are KEPT (still pinned by S1) and merged into S3, the rest are freed.
-    // With S_prev = S1 > 0 this exercises the partition the oldest-drop
+    // BFG MERGE (process_old_deadlist): dropping a middle snapshot `s2` while
+    // `s1 < s2 < s3` are all live is the only case with a non-trivial KEEP/FREE
+    // partition. `s3`'s deadlist entries born <= `s1` stay pinned by `s1` and
+    // merge into `s3`; the rest are freed. With `S_prev = s1 > 0`, this exercises
+    // the partition the oldest-drop
     // churn (S_prev = 0, KEEP empty) never reaches. Data must survive and
     // the merged chains must stay disjoint + clean under verify.
     let (dir, db) = mk_db();
@@ -207,8 +207,8 @@ fn drop_middle_snapshot_merges_keep_into_s_next() {
     }
     db.flush().unwrap();
     let s1 = db.take_snapshot(0).unwrap();
-    // Overwrite only the FIRST half so some pages stay born<=S1 across S2/S3
-    // (KEEP) while others are reborn in (S1,S2] (FREE on the S2 drop).
+    // Overwrite only the FIRST half so some pages stay born <= s1 across s2/s3
+    // (KEEP) while others are reborn in (s1, s2] (FREE on the s2 drop).
     for i in 0u64..150 {
         db.insert(0, i, v((i as u8).wrapping_add(1))).unwrap();
     }
@@ -237,8 +237,8 @@ fn drop_middle_snapshot_merges_keep_into_s_next() {
     // snapshot-less manifest once a flush commits it).
     db.flush().unwrap();
     drop(db);
-    // Reopen so `reclaim_orphan_pages` sweeps the old S2/S3 deadlist
-    // segments the MERGE superseded (deferred-free, like the post-drop
+    // Reopen so `reclaim_orphan_pages` sweeps the old s2/s3 deadlist segments
+    // the merge superseded (deferred-free, like the post-drop
     // SnapshotRoots pages); strict verify trips on them otherwise.
     let db = crate::Db::open(dir.path()).unwrap();
     for i in 0u64..300 {
@@ -264,7 +264,7 @@ fn drop_middle_snapshot_merges_keep_into_s_next() {
 
 #[test]
 fn s2_drop_snapshot_nonclone_frees_via_free_pages() {
-    // ZFS port Phase 4 S2: a NON-clone snapshot drop now frees the explicit,
+    // BFG: a NON-clone snapshot drop now frees the explicit,
     // page-rc-independent deadlist set (`DropSnapshot.free_pages = Some(...)`),
     // NOT the implicit "rc→0" cascade. The HARD `check_page_deadlist_shadow`
     // proves the set equals the structural free-set before the WAL submit, so
@@ -315,11 +315,11 @@ fn s2_drop_snapshot_nonclone_frees_via_free_pages() {
 
 #[test]
 fn s2_drop_snapshot_crash_recovery_completeness() {
-    // Crash-recovery completeness (S2 cutover prerequisite). COW deaths sitting
+    // Crash-recovery completeness: COW deaths sitting
     // in the in-memory page-deadlist accumulator must be sealed DURABLY,
     // atomically with the drop_snapshot commit that advances checkpoint_lsn
-    // (G1), and the MERGE re-anchor must survive a hard crash via the WAL op
-    // (G2). Pre-fix, a Snapshot-inheritor drop left the source volume's HEAD
+    // (accumulator-seal), and the MERGE re-anchor must survive a hard crash via the WAL op
+    // (merge-reanchor). Pre-fix, a Snapshot-inheritor drop left the source volume's HEAD
     // accumulator unsealed while advancing checkpoint past it; a hard kill +
     // reopen lost those deaths and a later drop fired MISSING/COMPLETENESS HOLE.
     let (dir, db) = mk_db();
@@ -333,7 +333,7 @@ fn s2_drop_snapshot_crash_recovery_completeness() {
     }
     db.flush().unwrap();
     let s2 = db.take_snapshot(0).unwrap();
-    // Overwrite AFTER S2 so the deaths are pinned by S2 and sit in the HEAD
+    // Overwrite after s2 so the deaths are pinned by s2 and sit in the HEAD
     // accumulator; NO flush, so the normal flush seal never runs for them.
     for i in 0u64..64 {
         db.insert(0, i, v((i as u8).wrapping_add(2))).unwrap();
@@ -343,15 +343,16 @@ fn s2_drop_snapshot_crash_recovery_completeness() {
         "setup: post-S2 overwrite must leave deaths in the HEAD accumulator"
     );
 
-    // Drop the OLDEST snapshot S1 → inheritor is S2 (Snapshot-inheritor): the
-    // case that pre-fix left the HEAD accumulator unsealed. G1 must seal it
+    // Drop the oldest snapshot. The next surviving snapshot inherits its
+    // dead-list records; this is the case that used to leave the HEAD
+    // accumulator unsealed. The accumulator seal must write those records
     // into the durable HEAD chain as part of the drop commit.
     db.drop_snapshot(s1).unwrap().expect("drop s1");
     assert_eq!(
         db.test_page_dead_list_len(0),
         Some(0),
-        "G1: drop_snapshot must seal the HEAD accumulator (pre-fix the Snapshot-inheritor \
-         path retained the post-S2 deaths only in volatile RAM)"
+        "drop_snapshot must seal the HEAD accumulator (pre-fix the snapshot-inheritor \
+         path retained the post-snapshot deaths only in volatile RAM)"
     );
 
     // Hard crash: drop the Db WITHOUT a final flush — the volatile accumulator
@@ -359,10 +360,10 @@ fn s2_drop_snapshot_crash_recovery_completeness() {
     drop(db);
     let db = crate::Db::open(dir.path()).unwrap();
 
-    // Drop S2 (now youngest → HEAD-inheritor). Pre-fix the post-S2 deaths were
+    // Drop s2 (now youngest → HEAD-inheritor). Pre-fix the post-s2 deaths were
     // lost across the crash, so the inheritor's dl_next under-counted →
     // check_page_deadlist_shadow MISSING Corruption. Post-fix they are durable
-    // in the HEAD chain (G1) → the drop succeeds.
+    // in the HEAD chain (accumulator-seal) → the drop succeeds.
     db.drop_snapshot(s2).unwrap().expect("drop s2 after crash + reopen (no MISSING)");
     for i in 0u64..64 {
         assert_eq!(db.get(0, i).unwrap(), Some(v((i as u8).wrapping_add(2))), "lba {i} live");
@@ -389,7 +390,7 @@ fn s2_drop_snapshot_crash_recovery_completeness() {
 
 #[test]
 fn s1_promoted_exclone_buffer_fold_capture_watermark_no_hole() {
-    // ZFS port Phase 4 S1 — Bug 2 regression: a snapshot's `capture_watermark`
+    // BFG — Bug 2 regression: a snapshot's `capture_watermark`
     // must be the shard's true FOLD watermark (`next_generation()-1`), NOT
     // `root_birth_lsn()`.
     //
@@ -578,7 +579,7 @@ fn h1_drop_volume_seals_other_volumes_page_deaths() {
     // page-deadlist accumulators, so a SURVIVING volume's just-folded deaths
     // lived only in volatile RAM; a hard crash lost them and a later
     // drop_snapshot fired a COMPLETENESS HOLE. The fix seals every surviving
-    // volume's accumulator into that same commit (ZFS-faithful: a death is
+    // volume's accumulator into that same commit (a death is
     // durable iff the fold that produced it is durable, in one commit).
     let (dir, db) = mk_db();
     let victim = db.create_volume().unwrap(); // a second volume, dropped below
@@ -627,7 +628,7 @@ fn h1_drop_volume_seals_other_volumes_page_deaths() {
 
 #[test]
 fn page_deadlist_disjoint_across_live_snapshot_chains() {
-    // ZFS port Phase 2a verify (E.2): with several live snapshots each
+    // BFG verify (E.2): with several live snapshots each
     // owning a sealed page-deadlist chain, every dying page version is
     // recorded into exactly one chain (the head accumulator at death time,
     // sealed into one snapshot). `metadb-verify --birth-shadow` runs
@@ -739,7 +740,7 @@ fn buffer_nonempty_triggers_flush_even_with_no_l2p_dirty() {
     assert_ne!(tail_after, tail_before, "flush must advance tail when buffer has records");
 }
 
-// Phase D.5: `wal_replay_re_emits_dead_records_into_buffer` tested
+// WAL-free recovery: `wal_replay_re_emits_dead_records_into_buffer` tested
 // the L2pPut WAL-replay arm's dead-list emission; the WAL is gone.
 // Dead-list emission on the buffer-replay path lives on the onyx
 // side (the LV2 flusher re-issues each L2pPut on recovery and the
@@ -824,7 +825,7 @@ fn segment_record_count_excludes_zero_mappings() {
 
 #[test]
 fn segment_record_size_matches_spec() {
-    // Guard the wire-level constant — Phase 3 GC will scan segments
+    // Guard the wire-level constant — GC will scan segments
     // assuming 24 B/record, so a future refactor must not silently
     // change DEAD_RECORD_BYTES without bumping the manifest version.
     assert_eq!(DEAD_RECORD_BYTES, 24);
@@ -835,7 +836,7 @@ fn segment_record_size_matches_spec() {
     );
 }
 
-// ── ZFS port Phase 4 Step 4 (S1): birth-authoritative non-clone COW-kill ──
+// ── BFG: birth-authoritative non-clone COW-kill ──
 // The COW-kill decision (preserve-on-overwrite vs recycle) now keys on
 // `birth_lsn(P) <= youngest_snap` for non-clones instead of the page-rc
 // `effective_rc > 1`. These assert the observable consequences; the existing

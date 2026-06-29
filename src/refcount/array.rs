@@ -132,7 +132,7 @@ struct Inner {
     /// analogue of the paged tree's `PageBuf` dirty set.
     ///
     /// Why it must exist: the checkpoint fold (`stage_one_page`) runs in
-    /// the GATELESS sample phase (ZFS-TXG-clone Phase 4 gate-shrink), so
+    /// the GATELESS sample phase (BFG gate-shrink), so
     /// commit-side reads (`RcShard::stage` / `lookup_entry` under
     /// `rc_authoritative_reclaim`) are concurrent with it. The staged
     /// page only enters the *evictable* shared LRU; its disk write is
@@ -140,7 +140,7 @@ struct Inner {
     /// evicts the staged page inside that window, a reader falls
     /// through to disk and sees, for a fresh page, unwritten zeros
     /// (`PageMagicMismatch 0x0` — the 2026-06-11 nvme-box commit-error
-    /// P0), or, for a pre-existing page, the PRE-fold content while the
+    /// case), or, for a pre-existing page, the PRE-fold content while the
     /// delta slot was already cleared (silent rc under-count → spurious
     /// `freed_pba` → premature free). Every data-page read therefore
     /// consults this overlay (under `inner`) before the cache/disk.
@@ -310,12 +310,11 @@ impl PagedRefcountArray {
 
     /// Like [`Self::stage_deltas_in_memory`] but additionally applies a set
     /// of **force-increfs** — an unconditional `+1` to each `force_increfs`
-    /// pba that (a) ALWAYS applies (never gated by the per-page replay-skip)
-    /// and (b) contributes NOTHING to the page generation. This is the ZFS
-    /// `dsl_sync_task` snapshot-root incref folded INSIDE the sync cycle
-    /// (the page-rc analogue of lite's out-of-cycle force-fold): it must
-    /// land even when its natural lsn `<=` the page generation (the
-    /// snapshot-take TXG often has no commits of its own), and it must NOT
+    /// pba that (a) always applies (never gated by the per-page replay-skip)
+    /// and (b) contributes nothing to the page generation. This is how a
+    /// snapshot-root incref folds inside the BFG sync cycle: it must land even
+    /// when its natural lsn `<=` the page generation (the snapshot-take group
+    /// often has no commits of its own), and it must not
     /// raise the generation — bumping it to a value above a future COW
     /// delta on a SIBLING pid sharing the data page would mis-skip that
     /// sibling's fold → child premature-free (the "bone"). A force-incref
@@ -782,9 +781,9 @@ fn new_empty_data_page() -> Page {
         key_count: DATA_KEY_COUNT_MARKER,
         flags: 0,
         generation: 0,
-        // Non-L2P page: birth is meaningless here. The post-A3 header rc
-        // field is gone (rc lives in the PageId-keyed arrays); birth_lsn
-        // is carried only as an incidental value, never read for this type.
+        // Non-L2P page: birth is meaningless here. The old header rc field is
+        // gone; birth_lsn is carried only as an incidental value, never read for
+        // this type.
         birth_lsn: 0,
     })
 }

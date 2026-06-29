@@ -69,8 +69,8 @@ pub(super) fn refresh_manifest_entries(
         let mut durable_seqs = Vec::with_capacity(vol.shards.len());
         for shard in vol.shards.iter() {
             roots.push(l2p_guards[guard_cursor].root());
-            // Capture the per-L2P-shard durable_seq. v11 (Tier 2.B
-            // Stage 1) persists this alongside `l2p_shard_roots` so
+            // Capture the per-L2P-shard durable_seq. v11 (per-shard durable-seq
+            // durable-seq rollout) persists this alongside `l2p_shard_roots` so
             // each shard's watermark survives crash recovery without
             // collapsing through the global `checkpoint_lsn`.
             //
@@ -83,7 +83,7 @@ pub(super) fn refresh_manifest_entries(
             // bumped only by `flush_with_gate`'s post-commit loop).
             // Reading atomics would otherwise leave the manifest's
             // durable_seq lagging the new checkpoint_lsn, violating
-            // the Stage 1 invariant.
+            // the durable-seq rollout invariant.
             let seq = durable_override.unwrap_or_else(|| {
                 shard
                     .last_flushed_lsn

@@ -1,4 +1,4 @@
-//! Buffer-as-sole-journal Phase C.4: lifecycle journal replay tests.
+//! Buffer-as-sole-journal lifecycle replay: lifecycle journal replay tests.
 //!
 //! These tests crash + reopen a Buffer-mode database whose lifecycle
 //! journal has uncovered records, and assert that the open path folds

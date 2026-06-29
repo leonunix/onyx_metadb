@@ -4,11 +4,11 @@ use crate::types::{INVALID_VOLUME, Lba};
 /// Flag bits on a [`VolumeEntry`].
 pub const VOLUME_FLAG_DROP_PENDING: u8 = 0x01;
 
-/// Sticky "this volume has clone lineage" flag (ZFS port Phase 3b). Set by
+/// Sticky "this volume has clone lineage" flag (BFG). Set by
 /// `clone_volume` when the volume is branched off a snapshot; **never
 /// cleared** — survives `PromotionComplete` (which clears `parent_vol_ord`)
 /// so the per-clone page-livelist keeps recording for promoted ex-clones,
-/// which Phase 4's authoritative free path must still cover. On reopen this
+/// whose authoritative free path must still cover. On reopen this
 /// (together with `branched_at_lsn`) is what arms the shard trees'
 /// `clone_birth_lsn` capture threshold.
 pub const VOLUME_FLAG_CLONE_LINEAGE: u8 = 0x02;
@@ -32,7 +32,7 @@ pub struct VolumeEntry {
     pub shard_count: u32,
     pub l2p_shard_roots: Box<[PageId]>,
     /// Per-L2P-shard durable LSN watermark, same length as
-    /// `l2p_shard_roots`. v11 schema (Tier 2.B Stage 1): persisted
+    /// `l2p_shard_roots`. v11 schema (per-shard durable-seq durable-seq rollout): persisted
     /// alongside the roots so each shard's `last_flushed_lsn` survives
     /// crash recovery independently. v10 manifests synthesise this
     /// from `checkpoint_lsn` on first open; the next manifest commit
@@ -42,14 +42,14 @@ pub struct VolumeEntry {
     pub l2p_shard_durable_seq: Box<[Lsn]>,
     pub created_lsn: Lsn,
     pub flags: u8,
-    /// Oldest dead-list segment page (Phase 2 / [[no-refcount-hot-path-design]]).
-    /// `NULL_PAGE` while the chain is empty. Phase 3 GC consumes from here
+    /// Oldest dead-list segment page .
+    /// `NULL_PAGE` while the chain is empty. GC consumes from here
     /// forward via the segment's `prev_seg_pid` back-link.
     pub dead_list_head_pid: PageId,
     /// Newest dead-list segment page (apply-time append anchor for the next
     /// checkpoint flush). `NULL_PAGE` while the chain is empty.
     pub dead_list_tail_pid: PageId,
-    /// Phase 4 lineage tracking. The clone's parent volume while a
+    /// lineage tracking. The clone's parent volume while a
     /// background promotion walker still owes work; `None` for top-level
     /// volumes and for clones whose promotion has completed. Cross-volume
     /// snap_pin in Lineage GC consults this back-pointer to keep the
@@ -67,7 +67,7 @@ pub struct VolumeEntry {
     /// volume — both for fresh top-level volumes and for clones whose
     /// promotion has reached the end of the keyspace.
     pub promotion_cursor: Option<Lba>,
-    /// v18 (ZFS port Phase 2): oldest segment of this volume's HEAD
+    /// v18 (BFG): oldest segment of this volume's HEAD
     /// page-deadlist — the L2P metadata `PageId`s that died off the head
     /// during COW while pinned by a snapshot. Independent of the PBA
     /// `dead_list_head_pid` above; same `DeadListSegment` codec, separate
@@ -77,7 +77,7 @@ pub struct VolumeEntry {
     /// v18: newest segment of the HEAD page-deadlist (append anchor for
     /// the next checkpoint flush). `NULL_PAGE` while empty.
     pub page_dead_list_tail_pid: PageId,
-    /// v19 (ZFS port Phase 3b): oldest segment of this clone's per-clone
+    /// v19 (BFG): oldest segment of this clone's per-clone
     /// page-livelist — the ALLOC/FREE log of its clone-private L2P pages
     /// (`birth > branched_at_lsn`). `NULL_PAGE` for non-clone volumes and
     /// while the chain is empty. Same `LiveListSegment` codec, separate
@@ -86,7 +86,7 @@ pub struct VolumeEntry {
     /// v19: newest segment of the page-livelist (append anchor for the next
     /// checkpoint flush). `NULL_PAGE` while empty.
     pub page_live_list_tail_pid: PageId,
-    /// v20 (ZFS port Phase 4 Step 4 / S0): oldest segment of this volume's
+    /// v20 (BFG): oldest segment of this volume's
     /// promoted-PBA log — the global-PBA-rc edges the promotion walker
     /// incref'd (`apply_promotion_chunk`), recorded durably so `drop_volume`
     /// can later decref them survivor-gated (closing the promotion rc leak).
@@ -103,7 +103,7 @@ pub struct VolumeEntry {
 /// variable `l2p_shard_roots` tail follows immediately.
 ///
 /// v13 grew the fixed header by 16 B (dead-list head/tail page ids).
-/// v14 grew it by another 20 B for Phase 4 lineage tracking:
+/// v14 grew it by another 20 B for lineage tracking:
 /// `parent_vol_ord` (2) + alignment pad (2) + `branched_at_lsn` (8) +
 /// `promotion_cursor` (8).
 /// v18 grew it by another 16 B for the HEAD page-deadlist anchors:

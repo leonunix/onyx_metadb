@@ -142,7 +142,7 @@ pub(super) fn h(n: u64) -> Hash8 {
 pub(super) fn dv(n: u8) -> DedupValue {
     // Encode `n` as a big-endian u64 in the leading 8 bytes so
     // `head_pba()` decodes to a small integer rather than a 56-bit
-    // shifted value. Phase 5 routes `DedupPut` through rc.stage on
+    // shifted value. routes `DedupPut` through rc.stage on
     // `head_pba`, and pathological PBAs (e.g. 7e16) would otherwise
     // OOM the refcount array.
     let mut x = [0u8; 28];

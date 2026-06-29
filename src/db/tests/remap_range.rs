@@ -230,7 +230,7 @@ fn rc_authoritative_invariant_under_random_overwrites() {
     }
 }
 
-/// Flag OFF (default): L2pRemap stays rc-neutral (Phase-5 contract).
+/// Flag OFF (default): L2pRemap stays rc-neutral (contract).
 #[test]
 fn rc_neutral_when_flag_off() {
     let (_d, db) = mk_db(); // default config: rc_authoritative_reclaim = false
@@ -280,7 +280,7 @@ fn assert_remap_applied(outcome: ApplyOutcome) -> (Option<L2pValue>, Option<Pba>
 
 #[test]
 fn l2p_remap_first_write_increfs_new_pba() {
-    // Phase 5: per-write rc path retired. L2pRemap never touches global
+    // per-write rc path retired. L2pRemap never touches global
     // rc; freed_pba is always None. Asserts now read "rc stays at 0".
     let (_d, db) = mk_db();
     let outcome = remap(&db, 10, remap_val(100, 1), None);
@@ -294,7 +294,7 @@ fn l2p_remap_first_write_increfs_new_pba() {
 
 #[test]
 fn l2p_remap_same_pba_in_place_overwrite_net_zero() {
-    // Phase 5: L2pRemap never touches rc, period. The "net-zero same-pba
+    // L2pRemap never touches rc, period. The "net-zero same-pba
     // overwrite" invariant trivially holds because there is nothing to
     // collapse.
     let (_d, db) = mk_db();
@@ -307,13 +307,13 @@ fn l2p_remap_same_pba_in_place_overwrite_net_zero() {
     assert_eq!(
         db.get_refcount(100).unwrap(),
         0,
-        "Phase 5: L2pRemap never increments rc"
+        "L2pRemap never increments rc in rc-neutral mode"
     );
 }
 
 #[test]
 fn l2p_remap_same_pba_leaf_shared_increfs_new() {
-    // Phase 5: L2pRemap is uniformly rc-neutral across both the hot
+    // L2pRemap is uniformly rc-neutral across both the hot
     // (lane) path and the serial path that snapshot-on-volume routes
     // through. The serial path still exists for the dead-list /
     // snap-pin recording inside `record_dead`, but the rc table is
@@ -328,13 +328,13 @@ fn l2p_remap_same_pba_leaf_shared_increfs_new() {
     assert_eq!(
         db.get_refcount(100).unwrap(),
         0,
-        "Phase 5: L2pRemap is rc-neutral on both hot-path and serial path",
+        "L2pRemap is rc-neutral on both hot-path and serial path",
     );
 }
 
 #[test]
 fn l2p_remap_different_pba_exclusive_decrefs_old_increfs_new() {
-    // Phase 5: L2pRemap never touches rc, so no freed_pba surfaces from
+    // L2pRemap never touches rc, so no freed_pba surfaces from
     // the hot path. The old PBA's retirement now flows through the
     // dead-list → Lineage GC path (not exercised here).
     let (_d, db) = mk_db();
@@ -343,19 +343,19 @@ fn l2p_remap_different_pba_exclusive_decrefs_old_increfs_new() {
     let outcome = remap(&db, 10, remap_val(200, 1), None);
     let (prev, freed) = assert_remap_applied(outcome);
     assert_eq!(prev, Some(remap_val(100, 1)));
-    assert_eq!(freed, None, "Phase 5: L2pRemap never surfaces freed_pba");
+    assert_eq!(freed, None, "L2pRemap never surfaces freed_pba");
     assert_eq!(db.get_refcount(100).unwrap(), 0);
     assert_eq!(db.get_refcount(200).unwrap(), 0);
 }
 
 #[test]
 fn l2p_remap_different_pba_leaf_shared_stays_rc_neutral() {
-    // Phase 5: L2pRemap is rc-neutral regardless of routing. Snapshot
+    // L2pRemap is rc-neutral regardless of routing. Snapshot
     // pinning of the old PBA is enforced by `record_dead` populating
     // the volume's dead-list with the prev `(pba, birth_lsn, death_lsn)`;
     // Lineage GC consumes the dead-list and emits `FreePbas` only when
     // both snap-pin and descendant-pin clear. The freed_pba slot on
-    // L2pRemap is always None on the Phase 5 hot path.
+    // L2pRemap is always None on the hot path.
     let (_d, db) = mk_db();
     remap(&db, 10, remap_val(100, 1), None);
     db.take_snapshot(BOOTSTRAP_VOLUME_ORD).unwrap();
@@ -363,13 +363,13 @@ fn l2p_remap_different_pba_leaf_shared_stays_rc_neutral() {
     let (prev, freed) = assert_remap_applied(outcome);
     assert_eq!(prev, Some(remap_val(100, 1)));
     assert_eq!(freed, None);
-    assert_eq!(db.get_refcount(100).unwrap(), 0, "Phase 5: rc-neutral apply");
-    assert_eq!(db.get_refcount(200).unwrap(), 0, "Phase 5: rc-neutral apply");
+    assert_eq!(db.get_refcount(100).unwrap(), 0, "rc-neutral apply");
+    assert_eq!(db.get_refcount(200).unwrap(), 0, "rc-neutral apply");
 }
 
 #[test]
 fn l2p_remap_different_pba_decref_not_to_zero_reports_no_freed() {
-    // Phase 5: dedup-style multi-LBA-same-PBA no longer accumulates
+    // dedup-style multi-LBA-same-PBA no longer accumulates
     // rc on remap (rc is only mutated by Lineage GC / promotion walker
     // now). rc stays at 0 throughout.
     let (_d, db) = mk_db();
@@ -384,7 +384,7 @@ fn l2p_remap_different_pba_decref_not_to_zero_reports_no_freed() {
 
 #[test]
 fn l2p_remap_guard_pass_applies_and_increfs() {
-    // Phase 5: the rc-based guard machinery still runs (used by dedup
+    // the rc-based guard machinery still runs (used by dedup
     // hits for verified-shared PBAs), but rc is only seeded via the
     // test helper now. Pre-seed rc(100)=1 so the guard passes, then
     // confirm the op applies without any new rc movement.
@@ -398,13 +398,13 @@ fn l2p_remap_guard_pass_applies_and_increfs() {
     assert_eq!(
         db.get_refcount(100).unwrap(),
         1,
-        "Phase 5: guard passes, but L2pRemap itself does not change rc"
+        "guard passes, but L2pRemap itself does not change rc"
     );
 }
 
 #[test]
 fn l2p_remap_guard_fail_rejects_op_without_touching_state() {
-    // Phase 5: rc is no longer seeded by L2pRemap, so seed it via the
+    // rc is no longer seeded by L2pRemap, so seed it via the
     // test helper first; the guard machinery itself is unchanged.
     let (_d, db) = mk_db();
     remap(&db, 10, remap_val(100, 1), None);
@@ -448,7 +448,7 @@ fn l2p_remap_guard_fail_when_pba_never_registered() {
 
 #[test]
 fn l2p_remap_packed_slot_multi_lba_refcount_aggregates_correctly() {
-    // Phase 5: L2pRemap never moves rc, so the "3 → 2 → 1 → 0 with the
+    // L2pRemap never moves rc, so the "3 → 2 → 1 → 0 with the
     // final remap surfacing freed_pba" cascade does not happen on the
     // hot path. The L2P state still progresses correctly; rc stays 0.
     let (_d, db) = mk_db();
@@ -470,12 +470,12 @@ fn l2p_remap_packed_slot_multi_lba_refcount_aggregates_correctly() {
     assert_eq!(db.get_refcount(100).unwrap(), 0);
 }
 
-// Phase D.5: `l2p_remap_survives_restart_via_wal_replay` exercised
+// WAL-free recovery: `l2p_remap_survives_restart_via_wal_replay` exercised
 // WAL replay of L2pRemap across reopen — the WAL is gone.
 
 #[test]
 fn l2p_remap_guarded_survives_restart_with_same_decision() {
-    // Phase 5: removed — the "same decision live vs replay" invariant
+    // removed — the "same decision live vs replay" invariant
     // is unstable because the live commit path no longer touches rc
     // while the legacy `apply_l2p_remap` (used by WAL replay) still
     // does. A guarded op that lives through replay sees a different
@@ -505,7 +505,7 @@ fn l2p_remap_guarded_survives_restart_with_same_decision() {
     assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 11).unwrap(), None);
 }
 
-// Phase D.5: `l2p_remap_guard_reject_does_not_replay_after_later_refcount_growth`
+// WAL-free recovery: `l2p_remap_guard_reject_does_not_replay_after_later_refcount_growth`
 // and `l2p_remap_freed_pba_round_trips_through_replay` exercised
 // WAL-replay specifics that are gone with the WAL.
 
@@ -515,7 +515,7 @@ fn l2p_remap_guarded_survives_restart_with_same_decision() {
 /// Used to set up range_delete test fixtures without dragging in
 /// the full remap decision table.
 ///
-/// Phase 5: hot-path L2pRemap no longer increments global rc, so
+/// hot-path L2pRemap no longer increments global rc, so
 /// after the remaps we bring rc(pba) up to `count` by incref'ing the
 /// shortfall. When a snapshot is live the commit went through the
 /// legacy apply path which already bumped rc — comparing before/after
@@ -550,7 +550,7 @@ fn seed_distinct_remaps_batched(db: &Db, total: usize) {
         }
         tx.commit().unwrap();
     }
-    // Phase 5: hot-path L2pRemap no longer bumps global rc; seed it
+    // hot-path L2pRemap no longer bumps global rc; seed it
     // explicitly so range_delete can prove it leaves PBA rc untouched.
     for (pba, count) in pba_counts {
         db.incref_pba(pba, count).unwrap();
@@ -559,7 +559,7 @@ fn seed_distinct_remaps_batched(db: &Db, total: usize) {
 
 #[test]
 fn range_delete_empty_range_is_noop() {
-    // Phase 5: seed rc explicitly because L2pRemap no longer does.
+    // seed rc explicitly because L2pRemap no longer does.
     let (_d, db) = mk_db();
     remap(&db, 5, remap_val(100, 1), None);
     db.incref_pba(100, 1).unwrap();
@@ -577,7 +577,7 @@ fn range_delete_empty_range_is_noop() {
 
 #[test]
 fn range_delete_with_no_live_mappings_is_noop() {
-    // Phase 5: seed rc explicitly because L2pRemap no longer does.
+    // seed rc explicitly because L2pRemap no longer does.
     let (_d, db) = mk_db();
     remap(&db, 100, remap_val(500, 1), None);
     db.incref_pba(500, 1).unwrap();
@@ -594,7 +594,7 @@ fn range_delete_with_no_live_mappings_is_noop() {
 
 #[test]
 fn range_delete_removes_mappings_and_keeps_pba_rc() {
-    // Phase 5: range delete is L2P-only for PBA refcounts. Global PBA rc
+    // range delete is L2P-only for PBA refcounts. Global PBA rc
     // is not a per-live-LBA counter, so discard must not subtract one rc
     // entry per captured LBA.
     let (_d, db) = mk_db();
@@ -615,7 +615,7 @@ fn range_delete_removes_mappings_and_keeps_pba_rc() {
 
 #[test]
 fn range_delete_half_open_interval_excludes_end() {
-    // Phase 5: seed rc explicitly because L2pRemap no longer does.
+    // seed rc explicitly because L2pRemap no longer does.
     let (_d, db) = mk_db();
     remap(&db, 10, remap_val(100, 0), None);
     remap(&db, 11, remap_val(200, 0), None);
@@ -677,7 +677,7 @@ fn range_delete_with_live_snapshot_keeps_pba_rc() {
 
 #[test]
 fn range_delete_mixed_shared_and_exclusive_leaves() {
-    // Phase 5: rc seeding now comes through `seed_remaps` which
+    // rc seeding now comes through `seed_remaps` which
     // explicitly increfs after the remap.
     let (_d, db) = mk_db();
     // LBA 10..13 exist pre-snapshot; pba=500.
@@ -695,13 +695,13 @@ fn range_delete_mixed_shared_and_exclusive_leaves() {
     // Shared leaf: unchanged.
     assert_eq!(db.get_refcount(500).unwrap(), 3);
     // Fresh post-snapshot leaf: also unchanged; range delete is PBA
-    // rc-neutral in Phase 5.
+    // rc-neutral in .
     assert_eq!(db.get_refcount(600).unwrap(), 3);
 }
 
 #[test]
 fn range_delete_survives_restart_via_wal_replay() {
-    // Phase 5: WAL replay re-applies L2pRemap through the legacy
+    // WAL replay re-applies L2pRemap through the legacy
     // rc-mutating apply, which would double-incref against our
     // explicit `seed_remaps` incref. Flush before close so replay
     // starts after the checkpoint and the test exercises the
@@ -720,7 +720,7 @@ fn range_delete_survives_restart_via_wal_replay() {
     assert_eq!(db.get_refcount(100).unwrap(), 4);
 }
 
-// Phase D.5: `range_delete_auto_splits_above_cap` exercised the
+// WAL-free recovery: `range_delete_auto_splits_above_cap` exercised the
 // Wal-mode `range_delete_via_wal` per-chunk WAL splitting. Buffer
 // mode chunks by Discard's `count: u32` LBA range; basic coverage
 // lives in `tests/db_buffer_journal_mode.rs::buffer_mode_range_delete_grows_lifecycle_journal`.
@@ -737,7 +737,7 @@ fn range_delete_crosses_shard_boundaries() {
     // unmapped and all refcounts stay put" — the PBA grouping is
     // orthogonal to that.
     //
-    // Phase 5: hot-path L2pRemap no longer bumps rc; we seed rc
+    // hot-path L2pRemap no longer bumps rc; we seed rc
     // explicitly after the remaps to assert RangeDelete keeps it stable.
     let (_d, db) = mk_db_with_shards(8);
     use std::collections::HashMap;
@@ -783,7 +783,7 @@ fn range_delete_dedup_with_snapshot_keeps_rc() {
 
 #[test]
 fn l2p_remap_leaf_shared_plus_drop_snapshot_ends_at_correct_refcount() {
-    // Phase 5: L2pRemap and DropSnapshot are both PBA rc-neutral, so
+    // L2pRemap and DropSnapshot are both PBA rc-neutral, so
     // `freed_pbas` is empty and both rcs stay at 0.
     let (_d, db) = mk_db();
     remap(&db, 10, remap_val(100, 1), None);
@@ -804,7 +804,7 @@ fn l2p_remap_leaf_shared_plus_drop_snapshot_ends_at_correct_refcount() {
 
 #[test]
 fn drop_snapshot_symmetric_with_no_snapshot_refcounts() {
-    // Phase 5: SPEC §4.4 rc symmetry no longer holds asymmetrically:
+    // SPEC §4.4 rc symmetry no longer holds asymmetrically:
     // snapshot-on-volume commits use the legacy apply path (which
     // bumps rc); plain (snapshot-free) volume uses the hot-path lane
     // (rc unchanged). The L2P state symmetry still holds — that is
@@ -835,10 +835,10 @@ fn drop_snapshot_symmetric_with_no_snapshot_refcounts() {
 
 #[test]
 fn drop_snapshot_keeps_pba_rc_for_dedup_multi_lba_share() {
-    // Phase 5: rc must be seeded explicitly because hot-path L2pRemap
+    // rc must be seeded explicitly because hot-path L2pRemap
     // no longer maintains it. Seed rc(777)=4 (matches the four LBAs
     // sharing the PBA), then exercise the packed-slot drop-snapshot
-    // path. Phase 5 no longer subtracts one PBA rc entry per snapshot
+    // path. no longer subtracts one PBA rc entry per snapshot
     // LBA diff, so rc(777) stays intact and no freed_pbas are surfaced.
     let (_d, db) = mk_db();
     for lba in 10u64..14 {
@@ -859,7 +859,7 @@ fn drop_snapshot_keeps_pba_rc_for_dedup_multi_lba_share() {
         !freed.contains(&777),
         "pba 777 should not be freed by per-LBA snapshot decrefs",
     );
-    // Phase 5: L2pRemap is rc-neutral on all paths, so the new PBAs
+    // L2pRemap is rc-neutral on all paths, so the new PBAs
     // stay at rc=0 and are not in `freed_pbas` (they were never live
     // in the snapshot's L2P at plan time).
     for lba in 10u64..14 {
@@ -871,7 +871,7 @@ fn drop_snapshot_keeps_pba_rc_for_dedup_multi_lba_share() {
 
 #[test]
 fn drop_snapshot_pages_commit_atomically_via_wal_without_pba_decref() {
-    // Phase 5: DropSnapshot still releases metadata pages through the
+    // DropSnapshot still releases metadata pages through the
     // lifecycle WAL, but ignores PBA decrefs because global PBA rc is not
     // a per-live-LBA counter.
     let dir = TempDir::new().unwrap();
@@ -889,7 +889,7 @@ fn drop_snapshot_pages_commit_atomically_via_wal_without_pba_decref() {
     let db = Db::open(dir.path()).unwrap();
     // Replay must not run a per-LBA pba_decref.
     assert_eq!(db.get_refcount(100).unwrap(), 1);
-    // Phase 5: rc(200) stays at whatever the legacy apply_l2p_remap
+    // rc(200) stays at whatever the legacy apply_l2p_remap
     // assigned during replay (may be 0 or 1 depending on prev state);
     // the load-bearing snapshot-list invariant is below.
     assert!(
@@ -940,7 +940,7 @@ fn remap_range(
 
 #[test]
 fn l2p_remap_range_writes_each_lba_and_increfs_distinct_pbas() {
-    // Phase 5: L2pRemapRange never touches global rc, so freed is
+    // L2pRemapRange never touches global rc, so freed is
     // always empty and rc stays at 0 for every pba.
     let (_d, db) = mk_db();
     let values = (0..4u8).map(|i| remap_val(100 + i as u64, i)).collect();
@@ -958,7 +958,7 @@ fn l2p_remap_range_writes_each_lba_and_increfs_distinct_pbas() {
 
 #[test]
 fn l2p_remap_range_overwrite_collects_freed_pbas() {
-    // Phase 5: L2pRemapRange never touches global rc; freed_pbas is
+    // L2pRemapRange never touches global rc; freed_pbas is
     // always empty for L2P remap ops. The L2P prev values are still
     // surfaced so onyx can drive volume-dead-list cleanup.
     let (_d, db) = mk_db();
@@ -977,7 +977,7 @@ fn l2p_remap_range_overwrite_collects_freed_pbas() {
     }
     assert!(
         freed.is_empty(),
-        "Phase 5: L2pRemapRange surfaces no freed PBAs (dead-list owns them)"
+        "L2pRemapRange surfaces no freed PBAs (dead-list owns them)"
     );
     for i in 0..4u8 {
         assert_eq!(db.get_refcount(100 + i as u64).unwrap(), 0);
@@ -987,7 +987,7 @@ fn l2p_remap_range_overwrite_collects_freed_pbas() {
 
 #[test]
 fn l2p_remap_range_crosses_l2p_shard_boundary() {
-    // Phase 5: rc stays at 0; the load-bearing assertion is shard-cross
+    // rc stays at 0; the load-bearing assertion is shard-cross
     // L2P routing, not rc.
     let (_d, db) = mk_db();
     let values: Vec<_> = (0..32u8).map(|i| remap_val(500 + i as u64, i)).collect();
@@ -1007,7 +1007,7 @@ fn l2p_remap_range_crosses_l2p_shard_boundary() {
 
 #[test]
 fn l2p_remap_range_snapshot_pin_stays_rc_neutral() {
-    // Phase 5: L2pRemapRange is rc-neutral on all paths. Pre- and
+    // L2pRemapRange is rc-neutral on all paths. Pre- and
     // post-snapshot range writes leave global rc at 0 for every PBA;
     // freed_pbas surfaces nothing.
     let (_d, db) = mk_db();
@@ -1018,7 +1018,7 @@ fn l2p_remap_range_snapshot_pin_stays_rc_neutral() {
     let (_applied, _prevs, freed) = remap_range(&db, 10, new_values);
     assert!(
         freed.is_empty(),
-        "Phase 5 range remap is rc-neutral even with a snapshot"
+        "range remap is rc-neutral even with a snapshot"
     );
     for i in 0..4u8 {
         assert_eq!(db.get_refcount(700 + i as u64).unwrap(), 0);
@@ -1066,26 +1066,26 @@ fn l2p_remap_range_stale_seq_per_lba_rejection() {
     assert_eq!(applied[3], true);
 }
 
-// ---- TXG-slot rc fold: checkpoint + reopen alignment (the perf/recovery fix) ----
+// ---- BFG-slot rc fold: checkpoint + reopen alignment (the perf/recovery fix) ----
 
-fn rc_auth_cfg(dir: &std::path::Path, txg_threads: bool) -> Config {
+fn rc_auth_cfg(dir: &std::path::Path, bfg_threads: bool) -> Config {
     let mut cfg = Config::new(dir);
     cfg.l2p_buffer_enabled = true;
     cfg.rc_authoritative_reclaim = true;
-    cfg.txg_threads_enabled = txg_threads;
+    cfg.bfg_threads_enabled = bfg_threads;
     cfg
 }
 
-/// With the threads-ON per-TXG sync driving the fold, the rc fold folds only
+/// With the threads-ON per-BFG sync driving the fold, the rc fold folds only
 /// the frozen Syncing slot per cycle. A sequence of overwrite commits, each
-/// flushed (rolling/syncing TXGs), must keep rc EXACT — the cross-TXG
+/// flushed (rolling/syncing BFGs), must keep rc EXACT — the cross-BFG
 /// incref(new)/decref(old) pair lands across distinct ring slots that fold
 /// independently. `checkpoint_lsn` monotonicity is asserted; its absolute
 /// advance under threads-on is timing-driven (the latest commit can sit in the
 /// Open slot until it rolls), so threads-OFF checkpoint advance is covered
 /// separately by `checkpoint_advances_on_flush`.
 #[test]
-fn rc_authoritative_txg_threads_rc_exact_across_checkpoints() {
+fn rc_authoritative_bfg_threads_rc_exact_across_checkpoints() {
     let dir = TempDir::new().unwrap();
     let db = Db::create_with_config(rc_auth_cfg(dir.path(), true)).unwrap();
 
@@ -1109,7 +1109,7 @@ fn rc_authoritative_txg_threads_rc_exact_across_checkpoints() {
         prev_ckpt = ckpt;
     }
     // Final state: exactly one live reference (the last pba); all earlier ones
-    // decref'd to 0 across their respective TXG-slot folds.
+    // decref'd to 0 across their respective BFG-slot folds.
     assert_eq!(db.get_refcount(106).unwrap(), 1);
     for old in 100u64..=105 {
         assert_eq!(db.get_refcount(old).unwrap(), 0, "pba {old} fully decref'd");
@@ -1123,10 +1123,10 @@ fn rc_authoritative_txg_threads_rc_exact_across_checkpoints() {
 /// manifest commit → reopen path for both threads-on and threads-off.
 #[test]
 fn rc_authoritative_checkpoint_then_reopen_preserves_rc() {
-    for txg_threads in [false, true] {
+    for bfg_threads in [false, true] {
         let dir = TempDir::new().unwrap();
         {
-            let db = Db::create_with_config(rc_auth_cfg(dir.path(), txg_threads)).unwrap();
+            let db = Db::create_with_config(rc_auth_cfg(dir.path(), bfg_threads)).unwrap();
             // Two distinct live references + one overwrite that frees a pba.
             let mut tx = db.begin();
             tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(500, 1), None);
@@ -1143,21 +1143,21 @@ fn rc_authoritative_checkpoint_then_reopen_preserves_rc() {
             assert_eq!(db.get_refcount(600).unwrap(), 1, "pre-reopen: 600 live");
         }
         // Reopen: rc must survive the checkpoint durably (no commit replay).
-        let db = Db::open_with_config(rc_auth_cfg(dir.path(), txg_threads)).unwrap();
+        let db = Db::open_with_config(rc_auth_cfg(dir.path(), bfg_threads)).unwrap();
         assert_eq!(
             db.get_refcount(500).unwrap(),
             0,
-            "txg_threads={txg_threads}: freed pba stays 0 across reopen"
+            "bfg_threads={bfg_threads}: freed pba stays 0 across reopen"
         );
         assert_eq!(
             db.get_refcount(501).unwrap(),
             1,
-            "txg_threads={txg_threads}: live pba 501 survives reopen"
+            "bfg_threads={bfg_threads}: live pba 501 survives reopen"
         );
         assert_eq!(
             db.get_refcount(600).unwrap(),
             1,
-            "txg_threads={txg_threads}: live pba 600 survives reopen"
+            "bfg_threads={bfg_threads}: live pba 600 survives reopen"
         );
     }
 }

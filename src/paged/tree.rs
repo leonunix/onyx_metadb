@@ -36,8 +36,8 @@ use helpers::*;
 use types::OwnedRange;
 pub use types::{DiffEntry, PagedRangeIter, WarmupStats};
 
-/// ZFS port Phase 4 Step 4 (S1): process-global count of non-clone COW-kill
-/// decisions where the birth-txg said "recycle" (page NOT snapshot-pinned) but
+/// BFG: process-global count of non-clone COW-kill
+/// decisions where the birth-LSN said "recycle" (page NOT snapshot-pinned) but
 /// the retained page-rc still read `effective_rc > 1` ("shared"). Under a
 /// correct `birth_lsn` stamp (enforced HARD by the offline
 /// `verify::check_birth_shadow`) the page is genuinely unpinned and the page-rc
@@ -59,30 +59,26 @@ pub struct PagedL2p {
     private_pages: PageIdSet,
     retired_pages: PageIdSet,
     checkpoint_protected: PageIdSet,
-    /// ZFS port Phase 2 (page-deadlist) witness: L2P pages displaced off
-    /// the head by a *shared* COW this op — `DeadRecord{pba=old_pid,
-    /// birth_lsn, death_lsn=cow lsn}`, captured at the `effective_rc > 1`
-    /// clone branch. rc>1 means the old page is still pinned by a snapshot
-    /// (Phase-1 invariant: head-reachable `rc>1 ⟺ birth<=youngest_snap`),
-    /// so it "died off the head" but survives for the snapshot — the ZFS
-    /// `dsl_dataset_block_kill` deferred-free case. Drained per op by the
+    /// Page-deadlist witness: L2P pages displaced off the head by a shared COW
+    /// in this op. `rc > 1` means the old page is still pinned by a snapshot, so
+    /// it died off the head but survives for the snapshot. Drained per op by the
     /// apply / fold layer via [`take_cow_displaced`](Self::take_cow_displaced);
-    /// cleared on the op error path (mirrors `clear_rc_deltas`).
+    /// cleared on the op error path.
     cow_displaced: Vec<crate::deadlist::DeadRecord>,
-    /// ZFS port Phase 3b sticky per-clone capture threshold. `Some(B)` =
+    /// BFG sticky per-clone capture threshold. `Some(B)` =
     /// this shard belongs to a clone branched at `B = branched_at_lsn`, so
     /// COW/alloc/free of its clone-private pages (`birth > B`) emit
     /// `LiveRecord`s into `live_events`; `None` = non-clone, zero overhead.
     /// Set at clone build / reopen and **never cleared** (survives promotion
-    /// — promoted ex-clones keep recording, which Phase 4 needs).
+    /// — promoted ex-clones keep recording, which needs).
     clone_birth_lsn: Option<Lsn>,
-    /// ZFS port Phase 3b page-livelist witness: ALLOC/FREE events for this
+    /// BFG page-livelist witness: ALLOC/FREE events for this
     /// clone's clone-private L2P pages, accumulated per op and drained by
     /// the apply / fold layer via [`take_live_events`](Self::take_live_events);
     /// cleared on the op error path (mirrors `cow_displaced`). Empty unless
     /// `clone_birth_lsn` is set.
     live_events: Vec<crate::livelist::LiveRecord>,
-    /// ZFS port Phase 4 Step 4 (S1): the `capture_watermark`s of the live
+    /// BFG: the `capture_watermark`s of the live
     /// snapshots of the NON-CLONE volume owning this shard, SORTED ascending.
     /// The birth-authoritative COW-kill decision in
     /// [`cow_for_write`](Self::cow_for_write) treats a page COW'd (dying) at lsn
@@ -91,13 +87,13 @@ pub struct PagedL2p {
     /// max{wm : wm < D}` (snapshots with `wm >= D` were captured AFTER the page
     /// died, so they cannot reference it — critical when a death is folded LATE,
     /// e.g. by `force_compact`, after newer snapshots exist). Set per-op by the
-    /// apply / fold layer (mirrors [`set_current_txg`]) from the durable
+    /// apply / fold layer (mirrors [`set_current_bfg`]) from the durable
     /// `SnapshotEntry::capture_watermark`s so the decision is identical live and
     /// on replay. For clones, `snapshot_wms` stays C's OWN snapshots — it gates
     /// the page-deadlist drain classification (`drain_page_deaths_into`), NOT the
     /// clone COW-kill (that reads `clone_cow_pinners`). Defaults to empty.
     snapshot_wms: Vec<Lsn>,
-    /// ZFS port Phase 4 Step 4 (S1c): the page-rc-INDEPENDENT pinner-LSN set for
+    /// BFG: the page-rc-INDEPENDENT pinner-LSN set for
     /// the CLONE COW-kill, SORTED ascending. Only meaningful when
     /// `clone_birth_lsn.is_some()`. The set is `{B_C} ∪ {capture_watermark(S) : S
     /// a live snapshot of C} ∪ {branched_at_lsn(V) : V another clone-lineage
@@ -109,7 +105,7 @@ pub struct PagedL2p {
     /// the apply / fold layer alongside `set_snapshot_wms`; empty on replay
     /// (durable pages are `checkpoint_protected`, so the term must not fire) and
     /// for non-clones. The `effective_rc > 1` page-rc floor is kept ALONGSIDE this
-    /// term until S3 (inverted shadow), so the term can only ADD preservation.
+    /// term until page-rc removal (inverted shadow), so the term can only ADD preservation.
     clone_cow_pinners: Vec<Lsn>,
 }
 
@@ -179,7 +175,7 @@ impl PagedL2p {
     /// `created_lsn == 0`, so birthing its roots at lsn 1 would put them
     /// above any snapshot taken before the first op (`created_lsn == 0`),
     /// dropping the death record at the snapshot's drop. (Per-L2P-page
-    /// refcounting was deleted, ZFS port S3.)
+    /// refcounting was deleted, BFG.)
     pub fn create_with_cache(
         page_store: Arc<PageStore>,
         page_cache: Arc<PageCache>,
@@ -283,9 +279,9 @@ impl PagedL2p {
     }
 
     /// No-op retained for call-site stability. Per-L2P-page refcounting was
-    /// deleted (ZFS port S3), so the op's TXG no longer threads down to a
+    /// deleted (BFG), so the op's BFG no longer threads down to a
     /// page-rc ring slot. The argument is ignored.
-    pub fn set_current_txg(&mut self, _txg: crate::types::Txg) {}
+    pub fn set_current_bfg(&mut self, _bfg: crate::types::Bfg) {}
 
     /// Underlying page store handle (shared with `Db` for free-list
     /// inspection, etc.).
@@ -345,8 +341,8 @@ impl PagedL2p {
     fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
         // Read the page's immutable `birth_lsn` ONCE, only when needed: clones
         // need it for the livelist FREE classification; non-clones with a live
-        // snapshot need it for the S1 birth COW-kill decision; and a non-clone
-        // CLONE SOURCE (S3: `clone_cow_pinners` non-empty even with no own
+        // snapshot need it for the snapshot watermark birth COW-kill decision; and a non-clone
+        // CLONE SOURCE (page-rc removal: `clone_cow_pinners` non-empty even with no own
         // snapshot — see `clone_cow_pinners_from`) needs it so the clone-source
         // pin compares the REAL birth, not 0. Omitting `clone_cow_pinners` here
         // would read `birth = 0`, making `0 <= youngest_clone_pinner` ALWAYS
@@ -369,11 +365,11 @@ impl PagedL2p {
             None
         };
 
-        // ZFS port Phase 4 Step 4 (S1): the COW-kill decision. A page is
+        // BFG: the COW-kill decision. A page is
         // "snapshot-pinned" — its old version must be PRESERVED on overwrite
         // (it "dies off the head" and stays alive for a snapshot) — vs PRIVATE
         // to the live volume (recyclable in place).
-        //   * CLONE (`clone_birth_lsn.is_some()`): S1c — page-rc-INDEPENDENT
+        //   * CLONE (`clone_birth_lsn.is_some()`): clone COW-kill — page-rc-INDEPENDENT
         //     pinner-LSN operand, `birth <= youngest_clone_pinner_below(lsn)`.
         //     The pinner set
         //     (`clone_cow_pinners`, fed by `Db::clone_cow_pinners`) is
@@ -383,11 +379,11 @@ impl PagedL2p {
         //     (`birth <= B_C`, shared with the parent); the descendant branch
         //     points pin born>B_C pages a survivor clone (incl. a PROMOTED
         //     ex-clone whose `parent_vol_ord` is cleared) still references after
-        //     C's own snapshot is dropped — the G6 premature-free P0 a pure-birth
+        //     C's own snapshot is dropped — the descendant-share premature-free case a pure-birth
         //     `max(B_C, youngest_snap(C))` operand misses (`clone_birth_shadow`).
-        //     S3 dropped the legacy `effective_rc > 1` floor (page-rc deleted):
+        //     page-rc removal dropped the legacy `effective_rc > 1` floor (page-rc deleted):
         //     the pinner-set term is now the sole, authoritative clone operand.
-        //     Benign G8 over-COW: an origin page that
+        //     Benign origin-fallthrough over-COW: an origin page that
         //     became C-exclusive (`birth <= B_C`, rc==1) is preserved rather than
         //     recycled — correctness-safe, reclaimed by orphan-reclaim; the
         //     shadow does NOT flag this direction. NO drain perturbation: the
@@ -421,7 +417,7 @@ impl PagedL2p {
         //     RECYCLE, leaking an orphan the drop-time page-deadlist later tries
         //     to free (the premature-free the structural shadow rejects). page-rc
         //     never hit this: a private page had `effective_rc == 1`.
-        // S3 COW-kill (non-clone): the birth-pin `birth <= youngest_snap_below(lsn)
+        // page-rc removal COW-kill (non-clone): the birth-pin `birth <= youngest_snap_below(lsn)
         // && !private` is the SOLE operand — the legacy `effective_rc > 1` page-rc
         // floor is DELETED. The birth term equals the old `rc > 1` pinning on
         // every reachable state: a snapshot `S` captures page `P` iff
@@ -436,19 +432,19 @@ impl PagedL2p {
         // page-rc-INDEPENDENT `check_birth_shadow` / `check_page_deadlist_shadow`
         // oracles are the HARD tripwire now that the inverted shadow is gone.
         let snapshot_pinned = match self.clone_birth_lsn {
-            // S1c CLONE arm: the page-rc-independent clone pinner-set term.
+            // clone COW-kill CLONE arm: the page-rc-independent clone pinner-set term.
             // `youngest_clone_pinner_below` reads `clone_cow_pinners` ({B_C} ∪
-            // own-snaps ∪ descendant branches), NOT `snapshot_wms`. S3 dropped
+            // own-snaps ∪ descendant branches), NOT `snapshot_wms`. page-rc removal dropped
             // the legacy `effective_rc > 1` floor (page-rc is deleted): the
             // pinner-set is now the sole, authoritative clone COW-kill operand.
             Some(_) => match self.youngest_clone_pinner_below(lsn) {
                 None => false,
                 Some(s) => birth <= s && !self.private_pages.contains(&pid),
             },
-            // NON-CLONE arm: birth-authoritative. S3 dropped the `effective_rc
+            // NON-CLONE arm: birth-authoritative. page-rc removal dropped the `effective_rc
             // > 1` floor; the pin is `birth <= max(youngest_snap_below(lsn),
             // youngest_clone_pinner_below(lsn)) && !private`. The clone term is
-            // the S3 replacement for the rc floor's clone-SOURCE coverage: a
+            // the page-rc removal replacement for the rc floor's clone-SOURCE coverage: a
             // non-clone volume that shares L2P pages with a clone (of a possibly
             // already-dropped snapshot) is fed every clone's branch point in
             // `clone_cow_pinners` (see `clone_cow_pinners_from`), so an origin
@@ -521,7 +517,7 @@ impl PagedL2p {
         // head" here. Capture `(pid, birth, death=lsn)` BEFORE the COW consumes
         // the slot; the apply / fold layer drains it into the HEAD page-deadlist.
         // `PageBuf::cow_for_write` always copies now (per-L2P-page refcounting
-        // was deleted, ZFS port S3): the birth decision above is the sole,
+        // was deleted, BFG): the birth decision above is the sole,
         // authoritative "shared" test, so the copy is unconditional — `new_pid`
         // is always a fresh page (`new_pid != pid`), the `cow_displaced` record
         // is always captured, and the old version is preserved for the snapshot.
@@ -545,7 +541,7 @@ impl PagedL2p {
     }
 
     /// Drain the page-deadlist witness accumulated by this op's shared
-    /// COWs (ZFS port Phase 2). Called by the apply / compactor-fold layer
+    /// COWs (BFG). Called by the apply / compactor-fold layer
     /// after the op's rc deltas commit; each record whose
     /// `birth_lsn <= youngest_snap` is appended to the volume's HEAD
     /// page-deadlist. Records carry the dying `PageId` in `DeadRecord.pba`.
@@ -553,7 +549,7 @@ impl PagedL2p {
         std::mem::take(&mut self.cow_displaced)
     }
 
-    /// ZFS port Phase 3b: arm (or disarm) this shard's per-clone livelist
+    /// BFG: arm (or disarm) this shard's per-clone livelist
     /// capture threshold. `Some(B)` makes alloc/COW/free of its clone-private
     /// pages (`birth > B`) emit `LiveRecord`s. Sticky: set once at clone build
     /// / reopen, never cleared (covers promoted ex-clones). Idempotent.
@@ -569,12 +565,12 @@ impl PagedL2p {
         self.clone_birth_lsn.is_some()
     }
 
-    /// ZFS port Phase 4 Step 4 (S1): set this shard's live-snapshot
+    /// BFG: set this shard's live-snapshot
     /// `capture_watermark`s (the operand of the birth-authoritative non-clone
     /// COW-kill decision in [`cow_for_write`](Self::cow_for_write)). Caller
     /// passes the watermarks in any order; stored SORTED ascending for
     /// [`youngest_snap_below`](Self::youngest_snap_below). Set per-op by the
-    /// apply / fold layer (alongside [`set_current_txg`]) from the durable
+    /// apply / fold layer (alongside [`set_current_bfg`]) from the durable
     /// `SnapshotEntry::capture_watermark`s so the COW decision is identical live
     /// and on replay. No-op effect for clones (the COW path keeps page-rc when
     /// `clone_birth_lsn.is_some()`).
@@ -598,7 +594,7 @@ impl PagedL2p {
         }
     }
 
-    /// ZFS port Phase 4 Step 4 (S1c): set this clone shard's COW-kill pinner-LSN
+    /// BFG: set this clone shard's COW-kill pinner-LSN
     /// set (`{B_C} ∪ own-snap watermarks ∪ descendant branch points`, built by
     /// [`Db::clone_cow_pinners`]). Stored SORTED ascending for
     /// [`youngest_clone_pinner_below`](Self::youngest_clone_pinner_below). Fed
@@ -627,7 +623,7 @@ impl PagedL2p {
     }
 
     /// Drain the page-livelist witness accumulated by this op's clone-private
-    /// allocs / COWs / frees (ZFS port Phase 3b). Called by the apply / fold
+    /// allocs / COWs / frees (BFG). Called by the apply / fold
     /// layer after the op's rc deltas commit; each record is appended to the
     /// clone's in-memory `page_live_list`. Always empty for non-clones.
     pub(crate) fn take_live_events(&mut self) -> Vec<crate::livelist::LiveRecord> {
@@ -1232,7 +1228,7 @@ impl PagedL2p {
     /// Finalize the op: on success, return `result` after `finish_op`
     /// bookkeeping; on error, drop the COW-death / livelist witnesses so a
     /// retry won't replay them. (Per-L2P-page refcount delta commit was
-    /// deleted, ZFS port S3 — `lsn` is now unused by the success arm but
+    /// deleted, BFG — `lsn` is now unused by the success arm but
     /// kept for signature stability with the deferred variants.)
     fn finalize_rc_deltas<T>(&mut self, lsn: Lsn, result: Result<T>) -> Result<T> {
         let result = self.finalize_rc_deltas_deferred_finish(lsn, result);
@@ -1394,7 +1390,7 @@ impl PagedL2p {
     /// entries are the decref-only shared boundary (a page still pinned by
     /// another root, decremented but kept).
     ///
-    /// ZFS port S3: per-L2P-page refcounting was DELETED, so the rc no longer
+    /// BFG: per-L2P-page refcounting was DELETED, so the rc no longer
     /// comes from a page-rc array. The caller supplies `structural_rc` — the
     /// number of parent edges pointing at each page in the live global L2P
     /// graph (every surviving volume head + every snapshot root, plus this
@@ -1486,7 +1482,7 @@ impl PagedL2p {
     /// disk, dropping the local page cache so stale dirty-bit tracking
     /// can't misroute a later write.
     ///
-    /// Used by Phase 7 `CloneVolume` apply: the clone target's shard is
+    /// Used by `CloneVolume` apply: the clone target's shard is
     /// initialised pointing at one of the source snapshot's shard roots,
     /// with the page-store-level refcount incref already performed by the
     /// caller (so `pid`'s on-disk header carries the updated rc). The
@@ -1514,7 +1510,7 @@ impl PagedL2p {
     /// Streaming range scan. **Today this materialises its result upfront**
     /// (same implementation as [`PagedL2p::range`]) — the public surface is
     /// exposed now so callers can code against the "stream" API while a
-    /// Phase C commit swaps the body to a lazy frame-stack walker without
+    /// buffer-journal replay commit swaps the body to a lazy frame-stack walker without
     /// touching any callsite. The `PagedRangeIter` yields items in
     /// ascending key order either way.
     ///

@@ -8,9 +8,9 @@
 //!
 //! Every scenario runs three times: once via `tx.commit_with_outcomes()`
 //! (sync delivery), once via `tx.commit_deferred_with_outcomes()`
-//! + a forced compactor pass (ZFS-TXG-clone Phase 2 deferred
+//! + a forced compactor pass (BFG deferred
 //! delivery), and once via the same deferred path with
-//! `wal_async_commits_enabled=true` (Phase 3 async WAL — submit acked
+//! `wal_async_commits_enabled=true` (async WAL — submit acked
 //! pre-fsync, durability via the next `flush()` barrier). All three
 //! must produce identical seq_guard outcomes because the apply itself
 //! is the same code in all paths; only outcome delivery timing and
@@ -26,7 +26,7 @@ use tempfile::TempDir;
 
 const VOL: u16 = 0; // bootstrap volume
 
-/// ZFS-TXG-clone Phase 2/3 axis: which commit-with-outcomes shape the
+/// BFG axis: which commit-with-outcomes shape the
 /// test should drive. All three modes share the same apply pipeline
 /// (only outcome delivery and WAL fsync timing shift), so identical
 /// behaviour is the load-bearing invariant.
@@ -61,7 +61,7 @@ fn mode_config(path: &std::path::Path, mode: Mode) -> Config {
     cfg.commit_direct_apply_enabled = true;
     cfg.commit_deferred_outcomes_enabled =
         matches!(mode, Mode::Deferred | Mode::AsyncWal);
-    // Phase 3: async WAL only flips on in AsyncWal mode. The
+    // async WAL only flips on in AsyncWal mode. The
     // deferred-outcome guard in `commit_ops_deferred` requires both
     // flags to be on before it threads `SubmitOptions::async_` into
     // the WAL submit.
@@ -388,8 +388,8 @@ fn seq_guard_survives_reopen_deferred() {
 
 #[test]
 fn seq_guard_survives_reopen_async_wal() {
-    // Phase 3: the pre-reopen `db.flush()` call inside `survives_reopen`
-    // exercises the new `fsync_all_lanes` TXG-sync barrier — without
+    // the pre-reopen `db.flush()` call inside `survives_reopen`
+    // exercises the new `fsync_all_lanes` BFG-sync barrier — without
     // it, async-submitted WAL bytes would still sit in OS page cache
     // and the reopen would see an OLD checkpoint.
     survives_reopen(Mode::AsyncWal);

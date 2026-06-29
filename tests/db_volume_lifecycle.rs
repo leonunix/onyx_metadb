@@ -1,4 +1,4 @@
-//! Phase 7 commit 8 integration: per-volume `create_volume` /
+//! commit 8 integration: per-volume `create_volume` /
 //! `drop_volume` lifecycle. Covers create/drop/read isolation and
 //! flush + manifest persistence.
 
@@ -47,13 +47,13 @@ fn create_drop_flush_reopen_sees_only_bootstrap() {
     assert_eq!(db.volumes(), vec![0]);
 }
 
-// Phase D.5: `create_insert_reopen_wal_replay` exercised WAL replay
+// WAL-free recovery: `create_insert_reopen_wal_replay` exercised WAL replay
 // of data-plane inserts; Buffer-mode coverage is in
 // `tests/db_buffer_journal_replay.rs::replay_recovers_create_volume_without_flush`.
 
 #[test]
 fn create_drop_reopen_wal_replay() {
-    // Phase D: drop_volume is durable via the lifecycle journal even
+    // lifecycle journal cutover: drop_volume is durable via the lifecycle journal even
     // without an explicit flush. Reopen folds the DropVolume record
     // back in, leaving only the bootstrap volume — the same outcome
     // the WAL path used to deliver.
@@ -101,7 +101,7 @@ fn ord_is_not_reused_after_drop() {
     assert!(b > a, "new ord {b} must exceed dropped ord {a}");
 }
 
-// Phase D.5: `multi_volume_crash_recovery_without_flush` exercised
+// WAL-free recovery: `multi_volume_crash_recovery_without_flush` exercised
 // WAL replay of inserts on multiple volumes. Buffer-mode lifecycle
 // replay across multiple volumes is covered by the create/drop
 // tests in `tests/db_buffer_journal_replay.rs`; data-plane replay
@@ -115,7 +115,7 @@ fn bootstrap_volume_is_untouchable() {
     assert_eq!(db.volumes(), vec![0]);
 }
 
-// -------- Phase 2 dedup-shard lifecycle ---------------------------------
+// -------- dedup-shard lifecycle ---------------------------------
 
 #[test]
 fn create_with_dedup_shards_n4_round_trips_through_reopen() {
@@ -132,7 +132,7 @@ fn create_with_dedup_shards_n4_round_trips_through_reopen() {
             let mut hash = [0u8; 8];
             hash[0] = byte0;
             // `head_pba()` decodes the leading 8 bytes big-endian and
-            // Phase 5 stages an `rc.stage(+1)` against it; encode a
+            // stages an `rc.stage(+1)` against it; encode a
             // small PBA so the refcount array doesn't OOM.
             let mut value = [0u8; 28];
             value[..8].copy_from_slice(&(byte0 as u64).to_be_bytes());

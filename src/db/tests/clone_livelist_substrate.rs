@@ -1,12 +1,11 @@
-//! ZFS port Phase 3b: per-clone page-livelist SUBSTRATE + POPULATION
+//! BFG: per-clone page-livelist SUBSTRATE + POPULATION
 //! (SHADOW). The clone's COW/alloc/free witness logs ALLOC/FREE `LiveRecord`s
 //! for its clone-private L2P pages (`birth > branched_at_lsn`) into a
 //! persistent `LiveListSegment` chain. Page-rc stays authoritative; these
 //! tests prove the substrate is populated, survives reopen, costs nothing for
 //! non-clones, covers promoted ex-clones, and — the make-or-break invariant —
 //! its live-ALLOC set (ALLOC minus matched FREE) equals the clone-private
-//! reachable subtree (`reachable(C) ∩ {birth > B}`), the equality Phase 4
-//! relies on to free a dropped clone's private pages without page-rc.
+//! reachable subtree (`reachable(C) ∩ {birth > B}`), the equality //! relies on to free a dropped clone's private pages without page-rc.
 
 use std::sync::Arc;
 
@@ -215,7 +214,7 @@ fn livelist_equals_clone_private_reachable() {
 
 /// A promoted ex-clone keeps recording (the capture threshold is sticky past
 /// `PromotionComplete`, which only clears `parent_vol_ord`). The equality
-/// audit still holds for it — the Phase-4 prerequisite "cover promoted
+/// audit still holds for it — the prerequisite "cover promoted
 /// ex-clones".
 #[test]
 fn livelist_covers_promoted_ex_clone() {
@@ -289,7 +288,7 @@ fn non_clone_volume_emits_no_livelist() {
     assert_livelist_clean(dir.path());
 }
 
-/// ZFS port Phase 3b condense: a multi-segment chain is rewritten to ONE
+/// BFG condense: a multi-segment chain is rewritten to ONE
 /// segment holding exactly `live_allocs(chain)`. The live-ALLOC set is
 /// unchanged (condense makes no free decision) and the next flush links off
 /// the condensed segment, staying verify-clean.
@@ -428,7 +427,7 @@ fn livelist_condense_fault_post_manifest_is_recoverable() {
     assert_livelist_clean(dir.path());
 }
 
-/// ZFS port Phase 3b — Bug 3 regression: the flush-seal ↔ `LivelistCondenser`
+/// BFG — Bug 3 regression: the flush-seal ↔ `LivelistCondenser`
 /// re-anchor LOST-UPDATE race. Flush samples the live tail GATELESS, builds its
 /// new segment off it, then commits under `apply_gate.write()`. The condenser
 /// samples the SAME tail gatelessly, then under the SAME gate re-anchors the
@@ -522,7 +521,7 @@ fn livelist_flush_bails_on_condenser_reanchor_race() {
     assert_livelist_clean(dir.path());
 }
 
-/// Part A: dropping a clone eagerly frees its page-livelist segment chain (the
+/// livelist-chain cleanup: dropping a clone eagerly frees its page-livelist segment chain (the
 /// page-rc decref cascade can't reach segment pages — rc 0). The volume's
 /// anchors are gone and the store stays verify-clean.
 #[test]
@@ -565,15 +564,15 @@ fn promote_volume_public_api_drives_to_completion() {
 }
 
 /// Combined deterministic churn — the in-process analogue of the
-/// clone+promotion-churn soak, exercising the three Phase-3b additions
+/// clone+promotion-churn soak, exercising the three additions
 /// TOGETHER: clone / write / overwrite / flush (append livelist segments) /
-/// synchronous CONDENSE / public `promote_volume` / clone DROP (Part A chain
+/// synchronous CONDENSE / public `promote_volume` / clone DROP (livelist-chain cleanup chain
 /// free). Read-back integrity guards data; a false-premature clone-drop shadow
 /// surfaces as `drop_volume → Err`; the final `verify --clone-livelist` proves
 /// the live-ALLOC set stayed equal to the clone-private reachable subtree
 /// across all of it (condense never drifted it, drop-free never corrupted).
 /// A forever-base-snapshot is the only clone source (no snapshot DROPS) so the
-/// run never trips the deferred Phase-2b snapshot-deadlist churn.
+/// run never trips the deferred snapshot-deadlist churn.
 #[test]
 fn clone_promote_condense_drop_churn() {
     use rand::{Rng, SeedableRng};
@@ -636,10 +635,10 @@ fn clone_promote_condense_drop_churn() {
     assert_livelist_clean(dir.path());
 }
 
-/// ZFS port Phase 4 Step 4 (S0) substrate: promoting a clone records every
+/// BFG substrate: promoting a clone records every
 /// PBA the promotion walker increfs into the per-volume promoted-PBA log; the
 /// chain + anchors survive a reopen, and verify keeps the segment pages live
-/// (no orphan-reclaim corruption). `drop_volume` (S0 actuator, next step) will
+/// (no orphan-reclaim corruption). `drop_volume` (promoted-PBA reclaim actuator, next step) will
 /// read this log to decref those PBAs survivor-gated, closing the promotion
 /// over-pin leak.
 #[test]
@@ -692,7 +691,7 @@ fn promoted_pba_log_records_promotion_and_survives_reopen() {
     assert_livelist_clean(dir.path());
 }
 
-/// ZFS port Phase 4 Step 4 (S0) ACTUATOR: dropping a promoted clone decrefs
+/// BFG ACTUATOR: dropping a promoted clone decrefs
 /// every promotion +1 edge survivor-GATED. A PBA the parent (a survivor) still
 /// maps is decref'd but NEVER surfaced (no premature free); a clone-private PBA
 /// no survivor maps is decref'd to 0 and surfaced to onyx.
@@ -781,7 +780,7 @@ fn drop_clone_promoted_pba_decrefs_to_floor_no_surface() {
     assert_livelist_clean(dir.path());
 }
 
-/// CRASH-SAFETY (the `stamp_replay_watermarks` P0): after a promote-then-drop
+/// CRASH-SAFETY (the `stamp_replay_watermarks` case): after a promote-then-drop
 /// with NO intervening checkpoint, a reopen must NOT re-replay the promotion
 /// increfs on top of the now-durable post-decref refcount array. The drop's
 /// manifest commit advances `lifecycle_replay_seq` past the PromotionChunks, so
@@ -801,7 +800,7 @@ fn drop_clone_promotion_decref_survives_reopen() {
         let clone = db.clone_volume(snap).unwrap();
         db.insert(clone, 100, v(0xC0)).unwrap(); // clone-private PBA 192
         // NO flush between promote and drop — exercises the stale-
-        // lifecycle_replay_seq path the P0 lives on.
+        // lifecycle_replay_seq path the case lives on.
         db.promote_volume(clone).unwrap();
         let report = db.drop_volume(clone).unwrap().expect("clone dropped");
         assert!(report.freed_pbas.contains(&192), "private PBA should surface");
@@ -832,7 +831,7 @@ fn drop_clone_promotion_decref_survives_reopen() {
     assert_livelist_clean(dir.path());
 }
 
-/// Under rc-authoritative reclaim the S0 actuator is OFF: the hot path already
+/// Under rc-authoritative reclaim the promoted-PBA reclaim actuator is OFF: the hot path already
 /// increfs per mapping (and onyx's `range_delete` decrefs them at delete), so a
 /// promotion-edge decref here would double-decref a still-parent-mapped PBA.
 /// The drop must surface nothing and leave the promotion edges intact.
@@ -855,13 +854,13 @@ fn drop_clone_rc_authoritative_skips_promotion_decref() {
     let report = db.drop_volume(clone).unwrap().expect("clone dropped");
     assert!(
         report.freed_pbas.is_empty(),
-        "S0 must surface nothing under rc-authoritative reclaim"
+        "promoted-PBA reclaim must surface nothing under rc-authoritative reclaim"
     );
-    // S0 did not touch PBA-rc (drop frees only metadb pages via page-rc here).
+    // Promoted-PBA reclaim did not touch PBA-rc (drop frees only metadb pages via page-rc here).
     assert_eq!(
         db.get_refcount(192).unwrap(),
         rc_before,
-        "S0 must not decref under rc-authoritative reclaim"
+        "promoted-PBA reclaim must not decref under rc-authoritative reclaim"
     );
     drop(db);
 }

@@ -9,8 +9,8 @@
 //! - `flush_memtable` (freeze → write L0 SST → release)
 //! - `load_levels` / `rewrite_levels` for manifest integration
 //!
-//! Compaction lands in phase 5d; this phase only handles memtable → L0
-//! flushes. Until compaction runs, L0 grows unboundedly.
+//! This layer handles memtable → L0 flushes. Background compaction owns
+//! the later level rewrites so L0 does not grow without bound.
 //!
 //! # Concurrency
 //!
@@ -374,7 +374,7 @@ impl Lsm {
     /// Used by `dedup_reverse` to find all (pba, hash) rows that a
     /// given PBA owns. Cost: one read + scan of every memtable plus
     /// every SST whose min/max hash range overlaps the prefix. Not
-    /// optimal — a real range iterator lands in phase 8.
+    /// optimal — a real range iterator lands in .
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Hash32, DedupValue)>> {
         let _drain = self.reader_drain.read();
         let snapshot = self.levels.read().clone();
@@ -569,7 +569,7 @@ impl Lsm {
         // Disjoint levels can be binary-searched by (min, max); for the
         // expected small per-level sizes a linear scan is fine and
         // cache-friendly. Revisit once levels grow past a few hundred
-        // SSTs (phase 8).
+        // SSTs ().
         for handle in handles {
             if hash < &handle.min_hash || hash > &handle.max_hash {
                 continue;

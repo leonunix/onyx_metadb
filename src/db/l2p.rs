@@ -105,14 +105,14 @@ impl Db {
                 // Absent falls through to a batched tree.multi_get_into
                 // on the remaining indices.
                 let buffer = &volume.shards[sid].l2p_buffer;
-                // Phase 4: read path uses the LIVE open_txg snapshot so
+                // read path uses the LIVE open_bfg snapshot so
                 // we walk the newest 3 ring slots; no pinned commit
                 // guard here. Re-read per shard's batch — the cost is
                 // one atomic load.
-                let open_txg = self.txg.open_txg();
+                let open_bfg = self.bfg.open_bfg();
                 let mut tree_indices: Vec<usize> = Vec::with_capacity(end - start);
                 for &idx in &order[start..end] {
-                    match buffer.lookup_for_open_txg(open_txg, lbas[idx]) {
+                    match buffer.lookup_for_open_bfg(open_bfg, lbas[idx]) {
                         crate::db::l2p_buffer::BufferLookup::Present(v) => {
                             out[idx] = Some(v);
                             self.metrics.record_l2p_buffer_lookup_hit();
@@ -158,10 +158,10 @@ impl Db {
         let sid = shard_for_key_l2p(&volume.shards, lba);
         let shard = &volume.shards[sid];
         if shard.use_buffer {
-            // Phase 4: read path uses the LIVE open_txg (no pinned commit
+            // read path uses the LIVE open_bfg (no pinned commit
             // guard here) so we walk the newest 3 ring slots.
-            let open_txg = self.txg.open_txg();
-            match shard.l2p_buffer.lookup_for_open_txg(open_txg, lba) {
+            let open_bfg = self.bfg.open_bfg();
+            match shard.l2p_buffer.lookup_for_open_bfg(open_bfg, lba) {
                 crate::db::l2p_buffer::BufferLookup::Present(v) => {
                     self.metrics.record_l2p_buffer_lookup_hit();
                     self.metrics.record_l2p_get(pin_wait, Duration::ZERO);
@@ -362,7 +362,7 @@ impl Db {
     ///
     /// Pairs with [`Self::scan_range_unordered_chunked`], which sees only
     /// the folded read view: a remap that has committed into the
-    /// open/quiescing/syncing buffer slot but whose TXG hasn't folded yet
+    /// open/quiescing/syncing buffer slot but whose BFG hasn't folded yet
     /// is **invisible** to the read-view scan. A reclaim that decides "no
     /// live mapping references PBA P" on the read-view scan alone can
     /// therefore free a PBA a committed-but-unfolded remap still points
@@ -383,7 +383,7 @@ impl Db {
 
     /// **Fold-consistent** live-L2P scan for reclaim reference checks (onyx
     /// `referenced_extents`): per shard, hold `tree.read()` across BOTH the
-    /// folded read-view scan AND the `l2p_buffer` scan, so a concurrent TXG
+    /// folded read-view scan AND the `l2p_buffer` scan, so a concurrent BFG
     /// fold cannot interleave between the two structures and make a migrating
     /// entry transiently invisible.
     ///
@@ -455,8 +455,8 @@ impl Db {
     /// Freed pba lists (for onyx's `SpaceAllocator` callback) are not
     /// exposed on this return; callers that need them can route a
     /// single-chunk range through a `Transaction::commit_with_outcomes`-
-    /// style helper in a later session. S3 keeps the entry-point
-    /// signature minimal; freed_pba observability is S6 / S3 follow-up.
+    /// style helper in a later session. page-rc removal keeps the entry-point
+    /// signature minimal; freed_pba observability is S6 / page-rc removal follow-up.
     pub fn range_delete(&self, vol_ord: VolumeOrdinal, start: Lba, end: Lba) -> Result<Lsn> {
         let total_started = std::time::Instant::now();
         self.metrics.record_range_delete_call();
@@ -472,19 +472,16 @@ impl Db {
         self.metrics
             .record_range_delete_drop_gate_wait(drop_gate_started.elapsed());
 
-        // Phase B (A3 follow-up): NO forced TXG sync at entry. This path
-        // used to run `flush_with_gate(Forced)` here to drain in-flight
-        // flush IO so `apply_l2p_range_delete`'s rc mutation could not be
-        // clobbered by a concurrent flush IO phase. The PBA refcount apply
-        // `stage`s its decrefs into the OPEN TXG slot while flush writes the
-        // FROZEN syncing slot, so there is nothing left to clobber (and ZFS
-        // port S3 deleted per-L2P-page refcounting entirely). This mirrors
-        // the same removal already done for `take_snapshot` /
-        // `drop_snapshot` / `clone_volume`.
+        // No forced BFG sync at entry. This path used to run
+        // `flush_with_gate(Forced)` here to drain in-flight flush IO so
+        // `apply_l2p_range_delete`'s rc mutation could not be clobbered by a
+        // concurrent flush IO phase. PBA refcount apply stages decrefs into
+        // the OPEN group while flush writes the FROZEN syncing group, so there
+        // is nothing left to clobber. Per-L2P-page refcounting is gone.
         //
         // The removed force-sync was the root of the "range_delete stalls
         // the whole commit pipeline" stall: it held `drop_gate.write`
-        // across a FULL forced TXG sync, parking every `commit_ops` writer
+        // across a FULL forced BFG sync, parking every `commit_ops` writer
         // at `drop_gate.read` for that entire duration (multi-second at
         // high pipeline depth / large dirty set — the "22-94s stall /
         // buffer head stuck" class). The `force_compact_l2p_buffers()`
@@ -493,16 +490,16 @@ impl Db {
         // Discard lifecycle journal record (gen-stamped idempotent on
         // replay) and is captured by the next natural background sync.
         //
-        // Phase 4 gate-shrink: `_txg_guard.record_lsn(lsn)` (per chunk
-        // below) records this op's WAL LSNs into `slot_max_lsn(open_txg)`
+        // gate-shrink: `_bfg_guard.record_lsn(lsn)` (per chunk
+        // below) records this op's WAL LSNs into `slot_max_lsn(open_bfg)`
         // so `run_sync_cycle_body`'s `wal_checkpoint` watermark reflects
         // them and the WAL segment is eventually pruned. `closing_open`
         // makes `enter()` wait out (not race) a concurrent background roll,
-        // so entering the current Open TXG without rolling it ourselves is
+        // so entering the current Open BFG without rolling it ourselves is
         // safe. Range delete submits one WAL record per chunk; the guard is
         // entered once and `record_lsn` is called per chunk inside the
         // submit loop.
-        let _txg_guard = self.txg.enter();
+        let _bfg_guard = self.bfg.enter();
 
         let apply_gate_started = std::time::Instant::now();
         let _apply_guard = self.apply_gate.write();
@@ -511,7 +508,7 @@ impl Db {
 
         // Drain THIS volume's L2P buffer into its tree so the per-shard
         // `tree.range` scan below sees buffer-only entries. With the entry
-        // force-sync removed (Phase B above), this drain is LOAD-BEARING
+        // force-sync removed (buffer-backed journal above), this drain is LOAD-BEARING
         // (it was a defensive no-op while the forced sync drained first).
         // Scoped to `vol_ord` — range_delete reads/mutates only this
         // volume, so folding every volume's buffer here (the old full
@@ -538,7 +535,7 @@ impl Db {
         // submit + cvar wait pair (mirrors `commit_ops`).
         let volumes_map = self.volumes.read().clone();
 
-        // Phase 1: scan each shard under its own mutex, collect
+        // scan each shard under its own mutex, collect
         // (lba, full_value) for every live mapping in the range. Full
         // value is needed so the apply-time snap-pin check can match
         // audit semantics (distinct (V, lba, value_28B) tuples). Locks
@@ -571,7 +568,7 @@ impl Db {
             start,
             end,
             &captured,
-            &_txg_guard,
+            &_bfg_guard,
             total_started,
         );
         if result.is_ok() {
@@ -613,7 +610,7 @@ impl Db {
         start: Lba,
         end: Lba,
         captured: &[(Lba, L2pValue)],
-        txg_guard: &crate::txg::TxgGuard<'_>,
+        bfg_guard: &crate::bfg::BfgGuard<'_>,
         total_started: std::time::Instant,
     ) -> Result<Lsn> {
         let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
@@ -684,7 +681,7 @@ impl Db {
                     return Err(err);
                 }
             };
-            txg_guard.record_lsn(lsn);
+            bfg_guard.record_lsn(lsn);
             if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
                 self.metrics
                     .record_range_delete_error(total_started.elapsed());
@@ -707,7 +704,7 @@ impl Db {
                 volumes_map,
                 &self.refcount_shards,
                 lsn,
-                txg_guard.txg(),
+                bfg_guard.bfg(),
                 vol_ord,
                 chunk_captured,
                 &snap_lookup(vol_ord),

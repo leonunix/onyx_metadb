@@ -1,18 +1,18 @@
 //! Background clone-promotion walker.
 //!
-//! [[no-refcount-hot-path-design]] Phase 4 Step 5. A clone created by
+//! . A clone created by
 //! [`Db::clone_volume`] starts life COW-sharing the parent snapshot's
 //! L2P pages. Hot-path writes that diverge from the parent's mapping
 //! force per-page COW on demand; pages the clone never touches stay
 //! shared with the parent.
 //!
-//! Phase 4 keeps the legacy `incref(new) / decref(old)` on the hot path
+//! keeps the legacy `incref(new) / decref(old)` on the hot path
 //! unchanged, so global rc still reflects "how many distinct pointers
 //! exist" for shared PBAs. The job of the promotion walker is purely
 //! lineage bookkeeping: for every PBA the clone references at the
 //! moment of cloning, bump global rc by one so the parent can
 //! eventually be dropped without dragging the clone's data with it.
-//! Phase 5 will then flip the hot path to skip the per-write rc
+//! will then flip the hot path to skip the per-write rc
 //! mutations, at which point this walker becomes the only producer of
 //! "shared PBA" rc edges.
 //!
@@ -28,7 +28,7 @@
 //!   lineage GC stop treating this clone's `branched_at_lsn` as a pin
 //!   point.
 //!
-//! Decision A (from the Phase 4 plan): the walker only mutates global
+//! Decision A (from the plan): the walker only mutates global
 //! rc. Exclusive PBAs (not yet in `dedup_index`) are *not* promoted
 //! into the dedup table here — that upgrade is deferred to the next
 //! dedup-on-write hit. Keeping the walker purely metadb-internal
@@ -99,7 +99,7 @@ impl Db {
         // K live mappings costs O(K) memory across the whole walker
         // run, not per call. For the typical clone-then-promote
         // workload this is dwarfed by the WAL body bytes the walker
-        // is about to emit anyway. Phase 5 can swap in a streaming
+        // is about to emit anyway. can swap in a streaming
         // shard walker if production traces show the materialisation
         // is a problem.
         let chunk = collect_chunk(self, vol_ord, &volume, start_lba)?;
@@ -160,20 +160,20 @@ impl Db {
         pba_increfs: Vec<Pba>,
         next_cursor: Option<Lba>,
     ) -> Result<()> {
-        // drop_gate.read() BEFORE txg.enter() — deadlock-free lock order (see
+        // drop_gate.read() BEFORE bfg.enter() — deadlock-free lock order (see
         // commit_free_pbas / commit_ops): a commit parked at drop_gate.read
-        // must hold no txg inflight, else a force-syncing lifecycle op
+        // must hold no bfg inflight, else a force-syncing lifecycle op
         // (take_snapshot / create_volume) deadlocks on roll_to_quiescing's
         // inflight drain. promote_volume drives this autonomously.
         let _drop_guard = self.drop_gate.read();
-        let _txg_guard = self.txg.enter();
+        let _bfg_guard = self.bfg.enter();
         let lifecycle_op = LifecycleOp::PromotionChunk {
             vol_ord,
             pba_increfs: pba_increfs.clone(),
             next_cursor,
         };
         let lsn = self.submit_lifecycle_op_with_dispatch(&lifecycle_op)?;
-        _txg_guard.record_lsn(lsn);
+        _bfg_guard.record_lsn(lsn);
 
         let _apply_guard = self.acquire_commit_apply_gate(lsn);
         let _active = self.enter_active_apply(lsn);
@@ -182,13 +182,13 @@ impl Db {
             &self.volumes.read(),
             &self.refcount_shards,
             lsn,
-            _txg_guard.txg(),
+            _bfg_guard.bfg(),
             vol_ord,
             &pba_increfs,
             next_cursor,
         )?;
 
-        // v20 (S0): durably record the PBAs this chunk incref'd into the
+        // v20 (promoted-PBA reclaim): durably record the PBAs this chunk incref'd into the
         // volume's promoted-PBA log so `drop_volume` can later decref them
         // survivor-gated (closing the promotion over-pin leak). Synchronous
         // append (promotion is an admin op, not the hot path); the segment
@@ -211,7 +211,7 @@ impl Db {
         // over-pin for those edges. The full fix is a buffered-seal-at-flush
         // (atomic with the manifest, like the page-livelist) or a replay
         // re-emit; both deferred — the leak is data-safe and strictly smaller
-        // than the pre-S0 behaviour where NO promoted PBA was ever reclaimable.
+        // than the pre-promoted-PBA reclaim behaviour where NO promoted PBA was ever reclaimable.
         if let Err(e) = self.emit_promoted_pba_log(vol_ord, &pba_increfs, lsn) {
             tracing::warn!(
                 vol_ord,
@@ -251,7 +251,7 @@ impl Db {
         Ok(())
     }
 
-    /// v20 (ZFS port Phase 4 Step 4 / S0): append `pbas` as one segment to the
+    /// v20 (BFG): append `pbas` as one segment to the
     /// volume's promoted-PBA log chain (reusing the `LiveListSegment` codec with
     /// the raw `Pba` stored in the record's `pid` slot). Writes + fsyncs the
     /// segment page(s) and advances the in-memory `promoted_log_{head,tail}_pid`
@@ -304,15 +304,15 @@ impl Db {
     }
 
     pub(crate) fn commit_promotion_complete(&self, vol_ord: VolumeOrdinal) -> Result<()> {
-        // drop_gate.read() BEFORE txg.enter() — deadlock-free lock order (see
+        // drop_gate.read() BEFORE bfg.enter() — deadlock-free lock order (see
         // commit_free_pbas / commit_ops). PromotionComplete is emitted at the
         // tail of every promote_volume run; an enter-before-read here would
         // leave the deadlock live on the completion record.
         let _drop_guard = self.drop_gate.read();
-        let _txg_guard = self.txg.enter();
+        let _bfg_guard = self.bfg.enter();
         let lifecycle_op = LifecycleOp::PromotionComplete { vol_ord };
         let lsn = self.submit_lifecycle_op_with_dispatch(&lifecycle_op)?;
-        _txg_guard.record_lsn(lsn);
+        _bfg_guard.record_lsn(lsn);
 
         let _apply_guard = self.acquire_commit_apply_gate(lsn);
         let _active = self.enter_active_apply(lsn);

@@ -1,4 +1,4 @@
-//! ZFS-TXG-clone Phase 2 — deferred commit outcome plumbing.
+//! BFG — deferred commit outcome plumbing.
 //!
 //! ## Responsibility
 //!
@@ -7,15 +7,14 @@
 //! `(Lsn, DeferredOutcomeHandle)` once WAL is durable and the L2pBuffer
 //! insertions have completed.
 //!
-//! ## Phase 4 simplification (post-`L2pCompactor` retirement)
+//! ## simplification (post-`L2pCompactor` retirement)
 //!
-//! The original Phase 2 design parked outcomes in a per-LSN aggregator
-//! and released them on the `L2pCompactor`'s per-pass drain. After Step
-//! 8 of ZFS-TXG-clone Phase 4 retires the compactor (replaced by
-//! `TxgSyncThread` driving real per-TXG flush work), the
+//! The original design parked outcomes in a per-LSN aggregator
+//! and released them on the `L2pCompactor`'s per-pass drain. Once BFG retired
+//! the compactor and moved real per-BFG flush work into `BfgSyncThread`, the
 //! commit-frequency "wake the compactor" channel that used to drain
 //! these handles no longer exists. Hooking the wake onto the sync
-//! thread would tie outcome delivery to the 5 s TXG quiesce timer —
+//! thread would tie outcome delivery to the 5 s BFG quiesce timer —
 //! orders of magnitude slower than the onyx commit_worker pipeline
 //! requires.
 //!
@@ -46,7 +45,7 @@ use crate::types::Lsn;
 
 /// One-shot receiver returned by [`crate::Db::commit_ops_deferred`].
 ///
-/// Since the Phase 4 simplification, outcomes are populated before the
+/// Since the simplification, outcomes are populated before the
 /// handle is constructed, so `recv` / `try_recv` never block under
 /// normal operation. The handle remains a `Receiver`-backed type so
 /// callers using the `recv()` API don't need to change.
@@ -75,8 +74,7 @@ impl DeferredOutcomeHandle {
 
     /// Non-consuming readiness probe. Returns `true` when the channel
     /// has the staged outcome (or has been disconnected — `recv` /
-    /// `try_recv` will then resolve without blocking). With the Phase 4
-    /// inline delivery this is always true; kept for API compatibility
+    /// `try_recv` will then resolve without blocking). With the     /// inline delivery this is always true; kept for API compatibility
     /// with onyx's commit_worker chunk drainer.
     pub fn is_ready(&self) -> bool {
         !self.rx.is_empty()
@@ -97,7 +95,7 @@ impl DeferredOutcomeHandle {
         }
     }
 
-    /// Blocking wait for the staged outcome. With Phase 4 inline
+    /// Blocking wait for the staged outcome. With inline
     /// delivery this returns immediately.
     pub fn recv(self) -> Result<Vec<ApplyOutcome>> {
         match self.rx.recv() {
@@ -109,9 +107,9 @@ impl DeferredOutcomeHandle {
     }
 }
 
-/// Phase 4 thin shell over [`DeferredOutcomeHandle::ready`].
+/// thin shell over [`DeferredOutcomeHandle::ready`].
 ///
-/// Pre-Phase-4 this owned a per-LSN parking lot drained by the
+/// Pre-this owned a per-LSN parking lot drained by the
 /// `L2pCompactor`. The compactor is gone; outcomes are delivered
 /// inline. The aggregator is kept as a public type so the existing
 /// `db.deferred_outcomes.stage(...)` call site (and a handful of
@@ -140,7 +138,7 @@ impl DeferredOutcomeAggregator {
     }
 
     /// Build a handle whose channel is already populated with
-    /// `outcomes`. The pre-Phase-4 aggregator parked the entry and
+    /// `outcomes`. The pre-aggregator parked the entry and
     /// released it on the next compactor pass; with the compactor
     /// retired, delivery is inline (every guarantee the deferred path
     /// promised — apply complete, last_applied_lsn bumped, L2pBuffer
@@ -152,25 +150,25 @@ impl DeferredOutcomeAggregator {
         outcomes: Vec<ApplyOutcome>,
     ) -> DeferredOutcomeHandle {
         self.metrics.record_deferred_outcomes_staged();
-        // Phase 4: zero pending depth at all times.
+        // zero pending depth at all times.
         self.metrics.record_deferred_outcomes_pending(0);
         self.metrics.record_deferred_outcomes_released(1);
         DeferredOutcomeHandle::ready(lsn, Ok(outcomes))
     }
 
-    /// Watermark-based drain. Phase 4 leaves this as a no-op since
+    /// Watermark-based drain. leaves this as a no-op since
     /// every entry is delivered inline. Kept for API parity with the
-    /// pre-Phase-4 surface; always returns 0.
+    /// pre-surface; always returns 0.
     pub(crate) fn drain_up_to_lsn(&self, _watermark: Lsn) -> usize {
         0
     }
 
-    /// Always 0 under Phase 4 inline delivery.
+    /// Always 0 under inline delivery.
     pub(crate) fn pending_depth(&self) -> usize {
         0
     }
 
-    /// No-op under Phase 4 inline delivery (no waiters parked in this
+    /// No-op under inline delivery (no waiters parked in this
     /// aggregator).
     pub(crate) fn poison_all(&self, _msg: &str) {}
 }
@@ -187,7 +185,7 @@ mod tests {
         DeferredOutcomeAggregator::new(metrics(), FaultController::disabled())
     }
 
-    /// Phase 4: stage delivers inline. The handle's channel resolves
+    /// stage delivers inline. The handle's channel resolves
     /// before stage returns; aggregator depth stays at 0.
     #[test]
     fn stage_delivers_inline() {
@@ -200,7 +198,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
     }
 
-    /// drain_up_to_lsn is a no-op (Phase 4).
+    /// drain_up_to_lsn is a no-op ().
     #[test]
     fn drain_up_to_lsn_is_noop() {
         let agg = fresh_agg();
@@ -209,7 +207,7 @@ mod tests {
         assert_eq!(agg.pending_depth(), 0);
     }
 
-    /// poison_all is a no-op (Phase 4).
+    /// poison_all is a no-op ().
     #[test]
     fn poison_all_is_noop() {
         let agg = fresh_agg();

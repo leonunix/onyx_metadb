@@ -2,7 +2,7 @@ struct Model {
     l2p: BTreeMap<VolumeOrdinal, BTreeMap<u64, L2pValue>>,
     dedup: BTreeMap<Hash8, DedupValue>,
     refcount: BTreeMap<u64, u32>,
-    /// ZFS port Phase 3b: ords of clones not yet promoted to independence.
+    /// BFG: ords of clones not yet promoted to independence.
     /// A clone enters on `CLONE_VOLUME`, leaves on `PROMOTE` (now
     /// independent) or `DROP_VOLUME`. Promotion is metadb-internal lite
     /// bookkeeping (bumps global PBA rc + clears `parent_vol_ord`) and does

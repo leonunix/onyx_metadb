@@ -65,7 +65,7 @@ pub(super) fn apply_op_bare(
     dedup_index: &crate::dedup::DedupIndex,
     page_store: &Arc<PageStore>,
     lsn: Lsn,
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     op: &WalOp,
     snap_info_for_vol: &dyn Fn(VolumeOrdinal) -> Vec<SnapInfo>,
     // rc-authoritative (serial / replay path): every applied L2P install does
@@ -89,17 +89,17 @@ pub(super) fn apply_op_bare(
             let sid = shard_for_key_l2p(&volume.shards, *lba);
             let use_buffer = volume.shards[sid].use_buffer;
             let mut tree = volume.shards[sid].tree.write();
-            // ZFS port Phase 4 Step 4 (S1): fetch the volume's snapshots BEFORE
+            // BFG: fetch the volume's snapshots BEFORE
             // the COW so the birth-authoritative non-clone COW-kill can be armed;
             // reused for the page-deadlist drain below. An L2pPut takes no
             // snapshot, so the pre/post-put snapshot set is identical.
             let snap_infos = snap_info_for_vol(*vol_ord);
-            // A3 cutover: tree-mode COW stages page-rc deltas into this
-            // commit's TXG slot (no-op for the buffered path).
-            tree.set_current_txg(txg);
+            // Tree-mode COW stages page-rc deltas into this commit's BFG slot
+            // (no-op for the buffered path).
+            tree.set_current_bfg(bfg);
             let snap_wms = l2p::snapshot_wms_of(&snap_infos);
             tree.set_snapshot_wms(snap_wms.clone());
-            // ZFS port Phase 4 S1c: the page-rc-independent clone COW-kill pinner
+            // BFG: the page-rc-independent clone COW-kill pinner
             // set ({B_C} ∪ own-snap wms ∪ descendant branch points), built from
             // the borrowed volume map. Empty for non-clones (this serial path is
             // tree-mode; the clone arm of `cow_for_write` is its only reader).
@@ -110,7 +110,7 @@ pub(super) fn apply_op_bare(
             // caller distinguishes accept vs reject by comparing
             // `value.seq()` against `cur.seq()`.
             let cur = if use_buffer {
-                match volume.shards[sid].l2p_buffer.lookup_for_open_txg(txg, *lba) {
+                match volume.shards[sid].l2p_buffer.lookup_for_open_bfg(bfg, *lba) {
                     crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
                     crate::db::l2p_buffer::BufferLookup::Tombstone => None,
                     crate::db::l2p_buffer::BufferLookup::Absent => tree.get(*lba)?,
@@ -125,7 +125,7 @@ pub(super) fn apply_op_bare(
             let prev = if use_buffer {
                 volume.shards[sid]
                     .l2p_buffer
-                    .insert_at_txg(txg, *lba, stamped, lsn);
+                    .insert_at_bfg(bfg, *lba, stamped, lsn);
                 cur
             } else {
                 let p = tree.insert_at_lsn(*lba, stamped, lsn)?;
@@ -135,12 +135,12 @@ pub(super) fn apply_op_bare(
             // rc-authoritative: incref(new) + decref(old) inline, with
             // snap-pin decref suppression (`stage_remap_rc`). `L2pPrev` has no
             // freed-pba slot, so a net rc==0 here is reclaimed by onyx's GC
-            // paths (rc stays authoritative). Phase-5 (flag off): dead-list +
-            // lineage GC. (`snap_infos` hoisted above for the S1 COW-kill arm.)
+            // paths (rc stays authoritative). dead-list +
+            // lineage GC. (`snap_infos` hoisted above for the snapshot watermark COW-kill arm.)
             if rc_authoritative {
                 stage_remap_rc(
                     refcount_shards,
-                    txg,
+                    bfg,
                     &tree,
                     sid,
                     *lba,
@@ -152,7 +152,7 @@ pub(super) fn apply_op_bare(
             } else {
                 record_dead(volume, prev, lsn);
             }
-            // ZFS port Phase 2: L2pPut COWs the root→leaf path on a direct
+            // BFG: L2pPut COWs the root→leaf path on a direct
             // (non-buffer) write; record any page it displaced off the
             // head. Buffer mode COWs in the fold (witness empty here).
             l2p::drain_page_deaths(volume, sid, &mut tree, &snap_infos);
@@ -166,26 +166,26 @@ pub(super) fn apply_op_bare(
             let sid = shard_for_key_l2p(&volume.shards, *lba);
             let use_buffer = volume.shards[sid].use_buffer;
             let mut tree = volume.shards[sid].tree.write();
-            // ZFS port Phase 4 Step 4 (S1): snapshots before the COW (armed for
+            // BFG: snapshots before the COW (armed for
             // the birth-authoritative non-clone COW-kill, reused for the drain).
             let snap_infos = snap_info_for_vol(*vol_ord);
-            // A3 cutover: tree-mode COW (delete) stages page-rc deltas here.
-            tree.set_current_txg(txg);
+            // Tree-mode COW (delete) stages page-rc deltas here.
+            tree.set_current_bfg(bfg);
             let snap_wms = l2p::snapshot_wms_of(&snap_infos);
             tree.set_snapshot_wms(snap_wms.clone());
-            // ZFS port Phase 4 S1c: clone COW-kill pinner set (empty for non-clones).
+            // BFG: clone COW-kill pinner set (empty for non-clones).
             tree.set_clone_cow_pinners(crate::db::volume::clone_cow_pinners_from(
                 volumes, *vol_ord, snap_wms,
             ));
             let prev = if use_buffer {
-                let cur = match volume.shards[sid].l2p_buffer.lookup_for_open_txg(txg, *lba) {
+                let cur = match volume.shards[sid].l2p_buffer.lookup_for_open_bfg(bfg, *lba) {
                     crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
                     crate::db::l2p_buffer::BufferLookup::Tombstone => None,
                     crate::db::l2p_buffer::BufferLookup::Absent => tree.get(*lba)?,
                 };
                 volume.shards[sid]
                     .l2p_buffer
-                    .insert_tombstone_at_txg(txg, *lba, lsn);
+                    .insert_tombstone_at_bfg(bfg, *lba, lsn);
                 cur
             } else {
                 let p = tree.delete_at_lsn(*lba, lsn)?;
@@ -193,19 +193,18 @@ pub(super) fn apply_op_bare(
                 p
             };
             // rc-authoritative: decref the deleted reference inline, suppressed
-            // when a live snapshot still pins it (`stage_delete_rc`). Phase-5
-            // (flag off): dead-list + lineage GC drives reclaim. (`snap_infos`
-            // hoisted above for the S1 COW-kill arm.)
+            // when a live snapshot still pins it (`stage_delete_rc`).             // (flag off): dead-list + lineage GC drives reclaim. (`snap_infos`
+            // hoisted above for the snapshot watermark COW-kill arm.)
             if rc_authoritative {
-                stage_delete_rc(refcount_shards, txg, &tree, sid, *lba, prev, &snap_infos, lsn)?;
+                stage_delete_rc(refcount_shards, bfg, &tree, sid, *lba, prev, &snap_infos, lsn)?;
             }
-            // ZFS port Phase 2: a direct delete COWs the path to the
+            // BFG: a direct delete COWs the path to the
             // deleted leaf; record any displaced page.
             l2p::drain_page_deaths(volume, sid, &mut tree, &snap_infos);
             l2p::drain_live_events(volume, &mut tree);
             Ok(ApplyOutcome::L2pPrev(prev))
         }
-        // [[no-refcount-hot-path-design]] Phase 5: `DedupPut` is now the
+        // `DedupPut` is now the
         // only event that bumps global rc — the hot-path L2P apply arms
         // were stripped of inline incref/decref. The contract is:
         //   - inserting a fresh `(hash → pba)` entry         → incref(pba) by 1
@@ -229,7 +228,7 @@ pub(super) fn apply_op_bare(
                 dedup_index,
                 refcount_shards,
                 lsn,
-                txg,
+                bfg,
                 *hash,
                 *value,
                 *old_pba,
@@ -249,7 +248,7 @@ pub(super) fn apply_op_bare(
                     dedup_index,
                     refcount_shards,
                     lsn,
-                    txg,
+                    bfg,
                     *hash,
                     *value,
                     *old_pba,
@@ -258,7 +257,7 @@ pub(super) fn apply_op_bare(
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupDelete { hash, old_pba } => {
-            apply_dedup_delete_with_rc(dedup_index, refcount_shards, lsn, txg, hash, *old_pba)?;
+            apply_dedup_delete_with_rc(dedup_index, refcount_shards, lsn, bfg, hash, *old_pba)?;
             Ok(ApplyOutcome::Dedup)
         }
         WalOp::DedupCompareDelete { hash, old_value } => {
@@ -273,7 +272,7 @@ pub(super) fn apply_op_bare(
                     dedup_index,
                     refcount_shards,
                     lsn,
-                    txg,
+                    bfg,
                     hash,
                     Some(old_value.head_pba()),
                 )?;
@@ -292,7 +291,7 @@ pub(super) fn apply_op_bare(
                     dedup_index,
                     refcount_shards,
                     lsn,
-                    txg,
+                    bfg,
                     *hash,
                     *new_value,
                     Some(old_value.head_pba()),
@@ -309,7 +308,7 @@ pub(super) fn apply_op_bare(
             volumes,
             refcount_shards,
             lsn,
-            txg,
+            bfg,
             *vol_ord,
             *lba,
             *new_value,
@@ -325,7 +324,7 @@ pub(super) fn apply_op_bare(
             volumes,
             refcount_shards,
             lsn,
-            txg,
+            bfg,
             *vol_ord,
             *start_lba,
             values,
@@ -369,7 +368,7 @@ pub(super) fn shard_for_key_l2p(shards: &[L2pShard], key: u64) -> usize {
 }
 
 /// Returns true if the batch contains any op whose apply has manifest
-/// or volume-lifecycle side effects. With Buffer-as-sole-journal D.5b
+/// or volume-lifecycle side effects. After the lifecycle journal cutover,
 /// the only ops `commit_ops` accepts are data-plane variants, so this
 /// is always `false`. The function is kept so the bucketed path's
 /// defensive `if batch_contains_lifecycle_op { serial }` fallback

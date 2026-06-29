@@ -1,4 +1,4 @@
-//! Phase 7 commit 10 integration: VDO-style `clone_volume`. Covers the
+//! commit 10 integration: VDO-style `clone_volume`. Covers the
 //! read-path (clone mirrors snapshot state), CoW divergence on writes,
 //! and drop ordering between snapshots, source volumes, and clones.
 
@@ -72,7 +72,7 @@ fn clone_survives_reopen_after_flush() {
     assert_eq!(snaps[0].vol_ord, src);
 }
 
-// Phase D.5: `clone_survives_reopen_via_wal_replay` exercised WAL
+// WAL-free recovery: `clone_survives_reopen_via_wal_replay` exercised WAL
 // replay of CloneVolume + data-plane inserts. Buffer-mode
 // equivalent: tests/db_buffer_journal_replay.rs::replay_recovers_clone_volume_without_flush.
 

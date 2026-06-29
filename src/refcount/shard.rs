@@ -1,21 +1,21 @@
-//! Refcount shard: a [`PagedRefcountArray`] fronted by a 4-slot TXG ring
+//! Refcount shard: a [`PagedRefcountArray`] fronted by a 4-slot BFG ring
 //! of [`DeltaMap`]s.
 //!
-//! ## Why a TXG-slot ring (mirrors L2P)
+//! ## Why a BFG-slot ring (mirrors L2P)
 //!
 //! Under `rc_authoritative_reclaim` the refcount is *derived* from L2P
 //! remaps (`incref(new) + decref(old)`). L2P buffers its updates in a
-//! 4-slot TXG ring ([`crate::db::l2p_buffer::L2pBuffer`]) and the sync
+//! 4-slot BFG ring ([`crate::db::l2p_buffer::L2pBuffer`]) and the sync
 //! folds only the frozen Syncing slot, so L2P durability is keyed to a
-//! clean per-TXG `checkpoint_lsn` prefix. refcount must fold on the SAME
+//! clean per-BFG `checkpoint_lsn` prefix. refcount must fold on the SAME
 //! boundary: metadb has no data-plane WAL, so on crash onyx re-derives
 //! the data plane by replaying its LV2 buffer and re-issuing the L2P
 //! remaps; rc net-zero idempotency on replay holds ONLY when rc-durable
 //! reflects exactly the same commit set as L2P-durable. A free-running rc
 //! fold (the old drainer) could make rc durable ahead of L2P for
-//! open-TXG commits → replay double-count. Keying rc deltas by TXG and
+//! open-BFG commits → replay double-count. Keying rc deltas by BFG and
 //! folding only the Syncing slot closes that, and bounds each fold to one
-//! TXG (killing the unbounded force-drain commit spike).
+//! BFG (killing the unbounded force-drain commit spike).
 //!
 //! ## Read path (`get` / `lookup_entry`)
 //!
@@ -27,7 +27,7 @@
 //!
 //! ## Apply path (`stage`)
 //!
-//! `stage(txg, …)` merges its delta into `delta_slots[txg & 3]`, after
+//! `stage(bfg, …)` merges its delta into `delta_slots[bfg & 3]`, after
 //! reading the cumulative prev. It holds only the open slot's lock across
 //! its own read+merge; the other slots are read under brief individual
 //! locks. Concurrent commits on a shard all target the same open slot and
@@ -35,7 +35,7 @@
 //!
 //! ## Fold path (`begin_checkpoint`)
 //!
-//! `begin_checkpoint(txg)` folds ONLY `delta_slots[txg & 3]` (the frozen
+//! `begin_checkpoint(bfg)` folds ONLY `delta_slots[bfg & 3]` (the frozen
 //! Syncing slot — `promote_to_syncing` required `inflight == 0`, so it
 //! receives no concurrent inserts). It is **publish-before-clear**: it
 //! folds the slot's entries into the array (via `stage_deltas_in_memory`,
@@ -44,9 +44,9 @@
 //! (slot still full + array already folded) but never *under*-count — the
 //! safe direction (no spurious `freed_pba`).
 //!
-//! Because the Syncing slot holds exactly TXG `txg`'s rc deltas, and every
-//! commit with `lsn <= wal_checkpoint(txg)` is stamped to `txg` or an
-//! earlier (already-folded) TXG, folding the slot makes rc durable to
+//! Because the Syncing slot holds exactly BFG `bfg`'s rc deltas, and every
+//! commit with `lsn <= wal_checkpoint(bfg)` is stamped to `bfg` or an
+//! earlier (already-folded) BFG, folding the slot makes rc durable to
 //! `wal_checkpoint` — the SAME boundary L2P's `drain_syncing_slot_into_trees`
 //! reaches. So the flush's existing per-shard `durable_seq =
 //! wal_checkpoint.max(prev)` (selected) / `prev` (unselected) is already
@@ -75,22 +75,22 @@ use super::delta::{DeltaMap, Pending};
 use crate::cache::PageCache;
 use crate::error::Result;
 use crate::page_store::PageStore;
-use crate::types::{Lsn, PageId, Pba, Txg};
+use crate::types::{Lsn, PageId, Pba, Bfg};
 
-/// Number of TXG ring slots. Matches `crate::db::l2p_buffer::TXG_SIZE`.
-const TXG_SLOTS: usize = 4;
+/// Number of BFG ring slots. Matches `crate::db::l2p_buffer::BFG_SIZE`.
+const BFG_SLOTS: usize = 4;
 
 #[inline]
-fn slot_index(txg: Txg) -> usize {
-    (txg as usize) & (TXG_SLOTS - 1)
+fn slot_index(bfg: Bfg) -> usize {
+    (bfg as usize) & (BFG_SLOTS - 1)
 }
 
 pub struct RcShard {
-    /// Pending deltas keyed by TXG ring slot (`txg & 3`). A commit
-    /// stamped to TXG `t` merges into `delta_slots[t & 3]`; the sync
+    /// Pending deltas keyed by BFG ring slot (`bfg & 3`). A commit
+    /// stamped to BFG `t` merges into `delta_slots[t & 3]`; the sync
     /// folds only the Syncing slot. Reads sum across all four (refcount
     /// is cumulative).
-    delta_slots: [Mutex<DeltaMap>; TXG_SLOTS],
+    delta_slots: [Mutex<DeltaMap>; BFG_SLOTS],
     pub(super) array: PagedRefcountArray,
     /// Serialises the fold's [publish, clear] inconsistency window
     /// against a *consistent* read ([`Self::get_consistent`]). The fold
@@ -119,7 +119,7 @@ pub struct RcCheckpoint {
     /// The slot's drained entries + which slot they came from — restored
     /// by `abort_checkpoint` so a retry redoes the fold.
     drained_deltas: Vec<(Pba, Pending)>,
-    /// Slot indices folded by this checkpoint (one for the per-TXG path,
+    /// Slot indices folded by this checkpoint (one for the per-BFG path,
     /// up to four for `begin_checkpoint_all_slots`). Abort restores
     /// `drained_deltas` into the first of these (they were merged on the
     /// way in, so a single restore slot is sufficient and correct — the
@@ -241,7 +241,7 @@ impl RcShard {
     /// `out[i] = rc(pbas[idxs[i]])` for each `idxs` entry. Equivalent to
     /// calling [`get_consistent`] per PBA, but the lock is amortized: the GC
     /// reclaim gate reads up to a full per-cycle block budget, and a per-PBA
-    /// `fold_lock` acquisition (O(pbas)) contended the TXG fold under sustained
+    /// `fold_lock` acquisition (O(pbas)) contended the BFG fold under sustained
     /// reclaim, making reclaim cost super-linear in retired depth. One read
     /// guard per shard bounds the fold-blocking window to this shard's slice.
     /// Consistency is unchanged — even stronger: every PBA in the batch
@@ -285,18 +285,18 @@ impl RcShard {
         super::merge_read_or_floor(base, net, max_lsn)
     }
 
-    /// Stage one op into the pending delta for `txg`'s slot. Returns the
+    /// Stage one op into the pending delta for `bfg`'s slot. Returns the
     /// cumulative `(prev_rc, new_rc)` (callers surface `freed_pba` on
     /// `new == 0 && prev > 0`).
     ///
     /// A decref past zero is a benign double-decref — skipped (count
     /// left at its floor) rather than poisoning the commit pipeline.
     /// Overflow (delta >= 0) is fatal.
-    pub fn stage(&self, txg: Txg, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
-        self.stage_inner(txg, pba, delta, lsn, true)
+    pub fn stage(&self, bfg: Bfg, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
+        self.stage_inner(bfg, pba, delta, lsn, true)
     }
 
-    /// Stage one op into `txg`'s slot WITHOUT the per-op `page_lsn >= lsn`
+    /// Stage one op into `bfg`'s slot WITHOUT the per-op `page_lsn >= lsn`
     /// replay-skip early-return that [`stage`](Self::stage) applies, for
     /// NON-WAL callers (the snapshot-take root incref / drop decref /
     /// tree-create root +1 relocated from the page header in
@@ -315,8 +315,8 @@ impl RcShard {
     /// generation to `lsn` never poisons a future op (which has a strictly
     /// higher lsn) or a replayed op (which starts above the checkpoint).
     /// Returns `(prev_rc, new_rc)`.
-    pub fn stage_unskippable(&self, txg: Txg, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
-        self.stage_inner(txg, pba, delta, lsn, false)
+    pub fn stage_unskippable(&self, bfg: Bfg, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
+        self.stage_inner(bfg, pba, delta, lsn, false)
     }
 
     /// Shared body for [`stage`] / [`stage_unskippable`]. `replay_skip`
@@ -326,13 +326,13 @@ impl RcShard {
     /// left at its floor (overflow on `delta >= 0` is fatal).
     fn stage_inner(
         &self,
-        txg: Txg,
+        bfg: Bfg,
         pba: Pba,
         delta: i64,
         lsn: Lsn,
         replay_skip: bool,
     ) -> Result<(u32, u32)> {
-        let idx = slot_index(txg);
+        let idx = slot_index(bfg);
         // Read the other three slots first (brief individual locks), then
         // hold the open slot across read-own + array read + merge so a
         // concurrent stage targeting the same open slot serialises here.
@@ -363,28 +363,28 @@ impl RcShard {
         Ok((merged_prev.rc, post.rc))
     }
 
-    /// Fold ONLY the Syncing slot (`txg & 3`). Caller has frozen the slot
-    /// by promoting `txg` to Syncing (`inflight == 0`). After the fold rc
-    /// is durable up to that TXG's `wal_checkpoint` (the slot held exactly
-    /// this TXG's deltas), so the flush's `wal_checkpoint.max(prev)`
+    /// Fold ONLY the Syncing slot (`bfg & 3`). Caller has frozen the slot
+    /// by promoting `bfg` to Syncing (`inflight == 0`). After the fold rc
+    /// is durable up to that BFG's `wal_checkpoint` (the slot held exactly
+    /// this BFG's deltas), so the flush's `wal_checkpoint.max(prev)`
     /// durable_seq is correct — no separate watermark to record.
-    pub fn begin_checkpoint(&self, txg: Txg) -> Result<RcCheckpoint> {
-        self.checkpoint_slots(&[slot_index(txg)], false, &[])
+    pub fn begin_checkpoint(&self, bfg: Bfg) -> Result<RcCheckpoint> {
+        self.checkpoint_slots(&[slot_index(bfg)], false, &[])
     }
 
     /// Like [`Self::begin_checkpoint`] but additionally force-increfs
     /// `force_increfs` (an unconditional `+1` that always applies and does
-    /// NOT raise any data page's generation). Used by the L2P-page-rc fold
-    /// in the ZFS `dsl_sync_task` snapshot path: the snapshot-root incref
-    /// rides THIS cycle's page-rc checkpoint, durable atomically with the
-    /// manifest commit that records the `SnapshotEntry`. See
+    /// NOT raise any data page's generation). Used by the L2P-page-rc fold for
+    /// snapshot-root increfs: the incref rides this cycle's page-rc checkpoint,
+    /// durable atomically with the manifest commit that records the
+    /// `SnapshotEntry`. See
     /// [`PagedRefcountArray::stage_deltas_in_memory_with_force_increfs`].
     pub fn begin_checkpoint_with_increfs(
         &self,
-        txg: Txg,
+        bfg: Bfg,
         force_increfs: &[Pba],
     ) -> Result<RcCheckpoint> {
-        self.checkpoint_slots(&[slot_index(txg)], false, force_increfs)
+        self.checkpoint_slots(&[slot_index(bfg)], false, force_increfs)
     }
 
     /// Fold every slot. Used by the threads-OFF inline flush and by

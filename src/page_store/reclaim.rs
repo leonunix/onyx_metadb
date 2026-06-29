@@ -227,7 +227,7 @@ impl PageStore {
             idx = end;
         }
 
-        // Phase B: parallel Free-stamp via IoSubmitter. Fan out every
+        // buffer-backed journal: parallel Free-stamp via IoSubmitter. Fan out every
         // run as one `IORING_OP_WRITEV` SQE and drain replies — the
         // old serial `write_page_run_bytes` loop was the dominant
         // cost (39 s `flush_reclaim_max_us` on nvme-box) when the
@@ -278,7 +278,7 @@ impl PageStore {
             }
         }
 
-        // Phase C: punch_hole sweep. `fallocate` is a syscall (no
+        // buffer-journal replay: punch_hole sweep. `fallocate` is a syscall (no
         // io_uring fast path in our build); the cost per call is
         // ~5 µs on NVMe so the serial loop is not the bottleneck.
         for (start, count) in punch_jobs {

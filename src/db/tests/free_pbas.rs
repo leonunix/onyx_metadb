@@ -1,24 +1,24 @@
-//! [[no-refcount-hot-path-design]] Phase 4 Step 3: FreePbas apply path
+//! FreePbas apply path
 //! with exclusive/shared split.
 //!
-//! Contract (post Step 3): `apply_free_pbas` classifies each PBA by
+//! Contract (post FreePbas split): `apply_free_pbas` classifies each PBA by
 //! current refcount.
 //!
 //! - `rc > 0` ⇒ **shared** (referenced by dedup_index or by a
 //!   pending hot-path incref/decref pair). Decref by 1; surface if it
 //!   reaches 0.
 //! - `rc == 0` ⇒ **exclusive** (never put_dedup'd; hot-path either
-//!   already decref'd it to 0 in Phase 4, or never touched rc in
-//!   Phase 5). Surface directly; do not touch rc.
+//!   already decref'd it to 0 in , or never touched rc in
+//!   ). Surface directly; do not touch rc.
 //!
-//! Phase 3's old "skip on rc=0" defensive branch is gone — that
-//! branch collapsed Phase 5's exclusive surface (the primary retire
-//! signal once hot-path RC goes away) with Phase 4's "already
-//! retired by hot path" no-op. Step 3 separates them so onyx-side
-//! retire is the union of L2pRemap surfaces (Phase 4) **plus**
-//! exclusive FreePbas surfaces (Phase 5).
+//! 's old "skip on rc=0" defensive branch is gone — that
+//! branch collapsed 's exclusive surface (the primary retire
+//! signal once hot-path RC goes away) with 's "already
+//! retired by hot path" no-op. FreePbas split separates them so onyx-side
+//! retire is the union of L2pRemap surfaces () **plus**
+//! exclusive FreePbas surfaces ().
 //!
-//! Phase D.5b: `FreePbas` lives entirely outside the WAL — `commit_ops`
+//! lifecycle journal cutover: `FreePbas` lives entirely outside the WAL — `commit_ops`
 //! never carries it. The unit tests drive `Db::commit_free_pbas`
 //! directly, which is the same entry point production GC uses.
 

@@ -9,7 +9,7 @@
 //! data-plane mutation, and an internal lifecycle journal carries the
 //! rare non-data-plane ops (volume create/drop/clone, snapshot drop,
 //! promotion cursor, discard). The legacy metadb-internal WAL has been
-//! retired (Phase D.5b).
+//! retired (lifecycle journal cutover).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -37,7 +37,7 @@ pub mod paged_meta;
 pub mod refcount;
 pub mod testing;
 pub mod tx;
-pub mod txg;
+pub mod bfg;
 pub mod types;
 pub mod verify;
 

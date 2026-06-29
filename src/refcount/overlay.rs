@@ -3,7 +3,7 @@
 //! [`DrainerState`] + [`DrainerHandle`] are a generic "park a background
 //! worker, let a checkpoint preempt it, then resume it" pair. The
 //! refcount shard no longer runs a background drainer (rc folds inline
-//! per-TXG; see [`crate::refcount::shard`]), but the async dedup-index
+//! per-BFG; see [`crate::refcount::shard`]), but the async dedup-index
 //! drainer ([`crate::dedup::drainer`]) reuses this proven primitive, so
 //! it lives here.
 

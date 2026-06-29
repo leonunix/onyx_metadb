@@ -5,11 +5,11 @@
 //!
 //! ## History
 //! Before the fix, metadb's `take_snapshot` ran commit-concurrent (no
-//! `drop_gate.write`, a Part-B latency choice), so a writer COULD overlap a
+//! `drop_gate.write`, a forced-sync latency choice), so a writer COULD overlap a
 //! `take_snapshot` in flight and that cycle's reclaim freed a still-referenced
 //! page → reopen / drop-shadow `Corruption("… got Free")`. The gap was
-//! pre-existing (reproduced IDENTICALLY on pre-S3 `c6c3377` — the deleted
-//! page-rc never guarded it, so it is NOT an S3 regression). onyx masked it in
+//! pre-existing (reproduced IDENTICALLY on `c6c3377` — the deleted
+//! page-rc never guarded it, so it is not a page-rc removal regression). onyx masked it in
 //! production by serializing every flusher commit (`with_read_lock(volume)`)
 //! against `create_snapshot`/`delete_snapshot` (`with_write_lock(volume)`) in
 //! its `VolumeLifecycleManager`.

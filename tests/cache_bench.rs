@@ -1,4 +1,4 @@
-//! Phase-6.5 exit-criterion microbench: warm cache vs. cold cache on
+//! .5 exit-criterion microbench: warm cache vs. cold cache on
 //! the dedup read path.
 //!
 //! The roadmap requires that a `put_dedup → get_dedup` loop against a
@@ -45,7 +45,7 @@ fn h(n: u64) -> Hash8 {
 
 fn dv(n: u64) -> DedupValue {
     // Big-endian leading 8 bytes so `head_pba()` decodes to `n`
-    // (Phase 5 routes `DedupPut` through `rc.stage(head_pba, +1)`,
+    // (routes `DedupPut` through `rc.stage(head_pba, +1)`,
     // and an LE-encoded value would decode to a 56-bit shifted PBA
     // that OOMs the refcount array).
     let mut x = [0u8; 28];

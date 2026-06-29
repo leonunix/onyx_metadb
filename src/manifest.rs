@@ -1,9 +1,8 @@
 //! Double-buffered manifest living in pages 0 and 1 of the page store.
 //!
-//! Phase 7 commit 6 stepped the wire format from v5 to v6 (per-volume
-//! L2P roots). Phase 2 of dedup-lane sharding bumps it to v8 by
-//! N-way-sharding `dedup_index` and `dedup_reverse`: each LSM is now a
-//! list of independent shard-level chains rather than one flat chain.
+//! v6 introduced per-volume L2P roots. v8 added dedup-lane sharding:
+//! `dedup_index` and `dedup_reverse` are now N-way sharded, so each LSM
+//! is stored as independent shard-level chains rather than one flat chain.
 //!
 //! v8 body layout:
 //! - fixed header (52 bytes); the slot that v7 used for the single
@@ -29,7 +28,7 @@ use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::testing::faults::{FaultController, FaultPoint};
 use crate::types::{
-    Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, SnapshotId, Txg, VolumeOrdinal,
+    Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, SnapshotId, Bfg, VolumeOrdinal,
 };
 
 /// Version of the current manifest body layout.
@@ -42,18 +41,19 @@ use crate::types::{
 /// v12 (compact leaf v4): added per-leaf `base_birth_lsn` (8 B) to the
 /// header and per-unit `birth_delta` (4 B) to the unit dict, growing
 /// `LEAF_VALUE_SIZE` 36 → 44 B and tightening `MAX_UNITS_PER_LEAF`
-/// from 128 → 110. Powers Phase 1 of the
-/// [[no-refcount-hot-path-design]] dead-list mechanism. Old v11 (and
+/// from 128 → 110. This gives the dead-list enough birth metadata to decide
+/// which displaced pages remain snapshot-pinned. Old v11 (and
 /// earlier) manifests are hard-rejected on open — no on-disk migration.
 ///
 /// v13 (per-volume dead-list): added `dead_list_head_pid` and
 /// `dead_list_tail_pid` (16 B total) to each `VolumeEntry`'s fixed
 /// header. Anchors the append-only chain of segment pages that records
-/// every L2P overwrite's `(pba, birth_lsn, death_lsn)` triple for
-/// Phase 2 of the [[no-refcount-hot-path-design]]. Old v12 manifests
+/// every L2P overwrite's `(pba, birth_lsn, death_lsn)` triple so lineage GC can
+/// retire overwritten PBAs only after snapshots and descendants stop pinning
+/// them. Old v12 manifests
 /// are hard-rejected on open — no on-disk migration.
 ///
-/// v14 (Phase 4 lineage tracking): grew each `VolumeEntry`'s fixed
+/// v14 (lineage tracking): grew each `VolumeEntry`'s fixed
 /// header by 20 B for the trio `parent_vol_ord` (2 B + 2 B pad),
 /// `branched_at_lsn` (8 B), `promotion_cursor` (8 B). These power
 /// cross-volume snap_pin in Lineage GC and the background promotion
@@ -61,13 +61,12 @@ use crate::types::{
 /// lineages by incref'ing the global rc per shared PBA. Old v13
 /// manifests are hard-rejected on open — no on-disk migration.
 ///
-/// v15 (ZFS-TXG-clone Phase 4): added `checkpoint_txg: u64` at the end
+/// v15: added `checkpoint_bfg: u64` at the end
 /// of the fixed header (offset 52). `OFF_VARIABLE_START` shifts from
 /// 52 → 60. `checkpoint_lsn` is retained and continues to drive WAL
-/// prune + recovery; `checkpoint_txg` is the durable TXG counter
-/// maintained by the [`crate::txg::TxgStateMachine`]. Old v14 manifests
-/// are hard-rejected on open — no on-disk migration (zfs-txg-clone.md
-/// explicitly waives backcompat).
+/// prune + recovery; `checkpoint_bfg` is the durable BFG epoch counter
+/// maintained by the [`crate::bfg::BfgStateMachine`]. Old v14 manifests
+/// are hard-rejected on open — no on-disk migration.
 ///
 /// (Compact leaf format independently bumped from v4 → v5: per-leaf
 /// `base_pba` (8 B) added to the leaf header and per-unit `base_pba`
@@ -77,7 +76,7 @@ use crate::types::{
 /// `paged::leaf_compact`; manifest body version stays at 14 because
 /// no manifest field changes.)
 ///
-/// v16 (buffer-as-sole-journal Phase A): added two u64 fields to the
+/// v16: added two u64 fields for buffer-backed recovery to the
 /// fixed header at offsets 60 and 68:
 ///
 /// - `last_processed_buffer_seq` (offset 60): the highest LV2 buffer
@@ -96,11 +95,9 @@ use crate::types::{
 ///   recovery replays records with seq > this value.
 ///
 /// `OFF_VARIABLE_START` shifts from 60 → 76. Old v15 manifests are
-/// hard-rejected on open — no on-disk migration (see plan
-/// `ethereal-exploring-pretzel.md` Phase A; backcompat is explicitly
-/// waived for the WAL-removal track).
+/// hard-rejected on open — no on-disk migration.
 ///
-/// v17 (snapshot-scaling Phase A2: relocate L2P page-rc): added a
+/// v17: added a
 /// second top-level shard group — the per-L2P-page refcount store
 /// (`crate::l2p_page_rc::L2pPageRc`, the eventual replacement for the
 /// page-header `refcount` byte). The fixed-header `OFF_RESERVED_28`
@@ -109,57 +106,42 @@ use crate::types::{
 /// `l2p_page_rc_shard_roots [count × 8]` then
 /// `l2p_page_rc_durable_seq [count × 8]`. The page-rc shard count
 /// equals the refcount/L2P shard count (`shards_per_partition`) and
-/// the fold rides the SAME TXG boundary, so its per-shard durable_seq
+/// the fold rides the SAME BFG boundary, so its per-shard durable_seq
 /// mirrors the refcount durable_seq and joins the
 /// `min(durable_seq[]) == checkpoint_lsn` invariant. `OFF_VARIABLE_START`
 /// is unchanged (the count reuses the existing reserved header slot).
-/// Old v16 manifests are hard-rejected on open — no on-disk migration
-/// (see plan `peaceful-finding-neumann.md` Phase A; backcompat is
-/// waived pre-release, onyx rebuilds metadb on schema change).
+/// Old v16 manifests are hard-rejected on open — no on-disk migration; onyx
+/// rebuilds metadb on schema change.
 ///
-/// v18 (ZFS birth-txg port Phase 2: per-snapshot page-deadlist): adds a
-/// SECOND, independent dead-list of L2P metadata `PageId`s (the existing
-/// per-volume dead-list tracks data `Pba`s and is untouched). The head
-/// volume accumulates page-deaths during COW into a live chain anchored
-/// by `VolumeEntry.page_dead_list_{head,tail}_pid` (+16 B fixed header);
+/// v18: adds a per-snapshot page-deadlist, a second independent dead-list of
+/// L2P metadata `PageId`s. The existing per-volume dead-list tracks data
+/// `Pba`s and is untouched. The head volume accumulates page-deaths during COW
+/// into a live chain anchored by `VolumeEntry.page_dead_list_{head,tail}_pid`;
 /// each snapshot seals its slice into an immutable chain anchored by
-/// `SnapshotEntry.page_dead_list_tail_pid` (grows `SNAPSHOT_ENTRY_SIZE`
-/// 32 → 40). Both reuse the `DeadListSegment` codec; PAGE vs PBA is
-/// distinguished only by which anchor owns the chain, never by format.
-/// The page-deadlist lets `drop_snapshot` free the right L2P pages
-/// without the explicit page-rc (which Phase 4 deletes). Net manifest
-/// cost: +16 B/volume +8 B/snapshot on the single 4 KiB page — tightens
-/// the R7 capacity wall; Phase 5 moves the anchors off the inline
-/// catalog. Old v17 manifests are hard-rejected on open — no on-disk
-/// migration (onyx rebuilds metadb on schema change).
+/// `SnapshotEntry.page_dead_list_tail_pid`. Both reuse the `DeadListSegment`
+/// codec; PAGE vs PBA is distinguished only by which anchor owns the chain,
+/// never by format. The page-deadlist lets `drop_snapshot` free the right L2P
+/// pages without the explicit page-rc. Old v17 manifests are hard-rejected.
 ///
-/// v19 (ZFS birth-txg port Phase 3b: per-clone page-livelist): adds a
-/// THIRD, independent chain — the per-clone page-livelist (ALLOC/FREE log
-/// of a clone's clone-private L2P pages) anchored by
-/// `VolumeEntry.page_live_list_{head,tail}_pid` (+16 B fixed header), plus
-/// the sticky `VOLUME_FLAG_CLONE_LINEAGE` flag (reuses a spare `flags`
-/// bit, no row growth). Uses the new `LiveListSegment` codec (own "LIVS"
-/// magic + an ALLOC/FREE kind byte). The livelist is the ZFS `dd_livelist`
-/// analogue Phase 4 reads to free a dropped clone's private subtree without
-/// the explicit page-rc; Phase 3b only populates + verifies it in SHADOW.
-/// Net manifest cost: +16 B/volume; old v18 manifests are hard-rejected.
+/// v19: adds a per-clone page-livelist, a third independent chain. It records
+/// ALLOC/FREE events for a clone's clone-private L2P pages and is anchored by
+/// `VolumeEntry.page_live_list_{head,tail}_pid`. Also adds the sticky
+/// `VOLUME_FLAG_CLONE_LINEAGE` flag. Dropping a clone reads this log to free
+/// the clone's private subtree without the explicit page-rc. Old v18 manifests
+/// are hard-rejected.
 ///
-/// v20 (ZFS birth-txg port Phase 4 Step 4 / S0: promotion-rc-leak fix): adds a
-/// FOURTH, independent per-volume chain — the promoted-PBA log (raw `Pba`s the
-/// promotion walker incref'd into the global refcount) anchored by
-/// `VolumeEntry.promoted_log_{head,tail}_pid` (+16 B fixed header). Reuses the
-/// `LiveListSegment` codec (pba stored in the record's pid slot), a distinct
-/// chain from the page-livelist. `drop_volume` of a clone-lineage volume reads
-/// it to decref those PBAs survivor-gated, closing the permanent promotion
-/// over-pin leak. Net manifest cost: +16 B/volume; old v19 manifests are
-/// hard-rejected (fresh rebuild, no migration).
+/// v20: adds the promoted-PBA log, a fourth independent per-volume chain of raw
+/// `Pba`s the promotion walker incref'd into the global refcount. It is
+/// anchored by `VolumeEntry.promoted_log_{head,tail}_pid` and reuses the
+/// `LiveListSegment` codec. `drop_volume` of a clone-lineage volume reads it to
+/// decref those PBAs survivor-gated, closing the permanent promotion over-pin
+/// leak. Old v19 manifests are hard-rejected.
 ///
-/// v21 (ZFS birth-txg port Phase 4 Step 4 / S1: snapshot capture-watermark):
-/// appends `SnapshotEntry.capture_watermark: Lsn` at offset 40 (grows
+/// v21: appends `SnapshotEntry.capture_watermark: Lsn` at offset 40 (grows
 /// `SNAPSHOT_ENTRY_SIZE` 40 → 48). It is the EXACT highest lsn folded into the
 /// snapshot's captured roots (`max(root.birth_lsn)`), NOT `created_lsn`
 /// (=last_applied, an UPPER bound that races ahead of the fold under concurrent
-/// writers + background TXG threads). The birth COW-kill oracle
+/// writers + background BFG threads). The birth COW-kill oracle
 /// (`tree.set_youngest_snap`) feeds on `max(capture_watermark)` so
 /// `birth_lsn(P) <= youngest ⟺ P ∈ a snapshot's roots` stays exact —
 /// `created_lsn` keeps its `last_applied` value for its other consumers
@@ -167,15 +149,15 @@ use crate::types::{
 /// replay reproduces the same gate (SnapInfo rebuilt from this on reopen). Net
 /// cost: +8 B/snapshot; old v20 manifests are hard-rejected (fresh rebuild).
 ///
-/// v22 (ZFS birth-txg port S3: delete per-L2P-page refcount): the per-L2P-page
-/// refcount store added in v17 is DELETED. The two variable-region arrays
+/// v22: deletes the per-L2P-page refcount store added in v17. The two
+/// variable-region arrays
 /// (`l2p_page_rc_shard_roots`, `l2p_page_rc_durable_seq`) are gone, and the
 /// `OFF_L2P_PAGE_RC_SHARDS` header slot (offset 28) reverts to reserved
 /// (zero-filled). All other offsets are unchanged. Old v21-and-earlier
 /// manifests are hard-rejected on open — no on-disk migration (fresh rebuild;
 /// onyx rebuilds metadb on schema change). page-rc free decisions were
-/// replaced by the page-rc-INDEPENDENT deadlist / livelist / reachability
-/// shadows (S1–S2c), so nothing reads the deleted store.
+/// replaced by page-rc-independent deadlist / livelist / reachability data, so
+/// nothing reads the deleted store.
 pub const MANIFEST_BODY_VERSION: u32 = 22;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
@@ -205,11 +187,11 @@ const OFF_NEXT_VOLUME_ORD: usize = 40;
 // 42..44 reserved for alignment / future flags
 const OFF_SNAPSHOT_COUNT: usize = 44;
 const OFF_VOLUME_COUNT: usize = 48;
-// v15 inserts `checkpoint_txg: u64` at offset 52. All earlier offsets are
+// v15 inserts `checkpoint_bfg: u64` at offset 52. All earlier offsets are
 // unchanged so v14 readers reject the new layout via the version field at
 // offset 0 (decode hard-rejects v14).
-const OFF_CHECKPOINT_TXG: usize = 52;
-// v16 inserts two more u64 fields after `checkpoint_txg`:
+const OFF_CHECKPOINT_BFG: usize = 52;
+// v16 inserts two more u64 fields after `checkpoint_bfg`:
 //   offset 60: `last_processed_buffer_seq` (onyx LV2 buffer replay watermark)
 //   offset 68: `lifecycle_replay_seq` (metadb lifecycle-log replay watermark)
 // See `MANIFEST_BODY_VERSION` doc comment for the contract.
@@ -218,7 +200,7 @@ const OFF_LIFECYCLE_REPLAY_SEQ: usize = 68;
 const OFF_VARIABLE_START: usize = 76;
 
 /// Per-snapshot row size on disk. v6 packs: id(8) + vol_ord(2) + 6 pad +
-/// l2p_roots_page(8) + created_lsn(8). v18 (ZFS port Phase 2) appends
+/// l2p_roots_page(8) + created_lsn(8). v18 (BFG) appends
 /// `page_dead_list_tail_pid(8)` at offset 32, growing the row 32 → 40.
 /// The 6 bytes at 10..16 stay reserved for future per-snapshot flags.
 const SNAPSHOT_ENTRY_SIZE: usize = 48;
@@ -237,8 +219,8 @@ const _: () = {
     assert!(OFF_NEXT_SNAPSHOT_ID + 8 == OFF_NEXT_VOLUME_ORD);
     assert!(OFF_NEXT_VOLUME_ORD + 4 == OFF_SNAPSHOT_COUNT);
     assert!(OFF_SNAPSHOT_COUNT + 4 == OFF_VOLUME_COUNT);
-    assert!(OFF_VOLUME_COUNT + 4 == OFF_CHECKPOINT_TXG);
-    assert!(OFF_CHECKPOINT_TXG + 8 == OFF_LAST_PROCESSED_BUFFER_SEQ);
+    assert!(OFF_VOLUME_COUNT + 4 == OFF_CHECKPOINT_BFG);
+    assert!(OFF_CHECKPOINT_BFG + 8 == OFF_LAST_PROCESSED_BUFFER_SEQ);
     assert!(OFF_LAST_PROCESSED_BUFFER_SEQ + 8 == OFF_LIFECYCLE_REPLAY_SEQ);
     assert!(OFF_LIFECYCLE_REPLAY_SEQ + 8 == OFF_VARIABLE_START);
     assert!(SNAPSHOT_ENTRY_SIZE == 48);
@@ -310,7 +292,7 @@ pub fn max_snapshots_for_layout(
 /// One snapshot's manifest entry. v6 tracks the owning volume's
 /// ordinal and the snapshot's L2P shard-root vector (materialised via
 /// a [`PageType::SnapshotRoots`] page). Refcount state is global and
-/// never snapshotted — Phase 6.5b retired it. Commit 6 always stamps
+/// never snapshotted — .5b retired it. Commit 6 always stamps
 /// `vol_ord = 0`; commit 9 picks it up for per-volume snapshots.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotEntry {
@@ -319,7 +301,7 @@ pub struct SnapshotEntry {
     pub l2p_roots_page: PageId,
     pub created_lsn: Lsn,
     pub l2p_shard_roots: Box<[PageId]>,
-    /// v18 (ZFS port Phase 2): tail of this snapshot's immutable
+    /// v18 (BFG): tail of this snapshot's immutable
     /// page-deadlist chain — the L2P metadata `PageId`s that died off the
     /// head while this snapshot pinned them. `NULL_PAGE` while empty. The
     /// head is implicit at `prev_seg_pid == NULL_PAGE`; walk it backward
@@ -327,7 +309,7 @@ pub struct SnapshotEntry {
     /// consumes it (free-or-merge by birth). Not persisted in
     /// `SnapshotRoots`; lives inline in the snapshot row.
     pub page_dead_list_tail_pid: PageId,
-    /// v21 (ZFS port Phase 4 S1): the EXACT fold-watermark of this snapshot's
+    /// v21 (BFG): the EXACT fold-watermark of this snapshot's
     /// captured roots = `max(root.birth_lsn)` over its shard roots. The
     /// birth-authoritative COW-kill oracle uses `max(capture_watermark)` (NOT
     /// `created_lsn`, an upper bound that races ahead of the fold under
@@ -342,13 +324,11 @@ impl SnapshotEntry {
     }
 }
 
-// ---- Phase 7 / manifest v6 building blocks -------------------------------
+// ---- Manifest v6 building blocks ---------------------------------------
 //
 // Not plugged into the live encode/decode path yet — the write path still
-// emits v5. These types + codecs land now so Phase B can flip the wire
-// format in one atomic change. Keeping them as standalone additive code
-// during Phase A means the 8a soak can keep running against v5 without
-// drift.
+// emits v5. These types + codecs let the wire format flip in one atomic
+// change while the current v5 soak keeps running without drift.
 
 mod snapshot_roots;
 mod store;
@@ -367,20 +347,18 @@ pub struct Manifest {
     pub body_version: u32,
     /// Greatest LSN whose WAL record has been applied to durable state.
     pub checkpoint_lsn: Lsn,
-    /// ZFS-TXG-clone Phase 4: greatest TXG that the `TxgSyncThread` has
-    /// marked synced. Always satisfies `checkpoint_txg + 1 <= open_txg`
+    /// BFG: greatest BFG that the `BfgSyncThread` has
+    /// marked synced. Always satisfies `checkpoint_bfg + 1 <= open_bfg`
     /// at runtime. Persisted in the v15 fixed header (offset 52);
-    /// recovery reconstructs `TxgStateMachine` from this value.
-    pub checkpoint_txg: Txg,
-    /// Buffer-as-sole-journal Phase A: the highest LV2 buffer entry seq
-    /// whose flusher-derived metadata mutations are covered by this
+    /// recovery reconstructs `BfgStateMachine` from this value.
+    pub checkpoint_bfg: Bfg,
+    /// Highest LV2 buffer entry seq whose flusher-derived metadata mutations are covered by this
     /// checkpoint's page roots. Zero while `metadb_journal_mode = "wal"`
     /// (the WAL is still authoritative); set by onyx's checkpoint hook
     /// in `"buffer"` mode. On recovery, onyx replays buffer entries
     /// with seq > this value through the flusher pipeline.
     pub last_processed_buffer_seq: u64,
-    /// Buffer-as-sole-journal Phase A: the highest lifecycle-log record
-    /// seq whose effects are covered by this checkpoint. Records with
+    /// Highest lifecycle-log record seq whose effects are covered by this checkpoint. Records with
     /// seq > this value are replayed before the buffer.
     pub lifecycle_replay_seq: u64,
     /// Head of the persisted free-list page chain, or [`NULL_PAGE`].
@@ -394,11 +372,11 @@ pub struct Manifest {
     /// highest LSN whose refcount-shard `i` deltas are on disk. Same
     /// length as `refcount_shard_roots`.
     ///
-    /// Stage 1 (Tier 2.B) of the manifest v11 schema: the global
+    /// durable-seq rollout (per-shard durable-seq) of the manifest v11 schema: the global
     /// `checkpoint_lsn` equals `min(refcount_durable_seq[..] ∪ each
     /// volume's l2p_shard_durable_seq[..])`. WAL prune, recovery, and
     /// onyx buffer reclaim still consume `checkpoint_lsn`, so this
-    /// array is observability-only for now. Stage 2 will flip
+    /// array is observability-only for now. follow-up amortization will flip
     /// consumers to per-shard reads so partial sample can re-enable
     /// without pinning the global floor on cold shards.
     pub refcount_durable_seq: Box<[Lsn]>,
@@ -430,7 +408,7 @@ impl Manifest {
         Self {
             body_version: MANIFEST_BODY_VERSION,
             checkpoint_lsn: 0,
-            checkpoint_txg: 0,
+            checkpoint_bfg: 0,
             last_processed_buffer_seq: 0,
             lifecycle_replay_seq: 0,
             free_list_head: NULL_PAGE,
@@ -473,7 +451,7 @@ impl Manifest {
         self.encode(&mut probe)
     }
 
-    /// Stage 1 (Tier 2.B) tripwire: `checkpoint_lsn` must equal the
+    /// durable-seq rollout (per-shard durable-seq) tripwire: `checkpoint_lsn` must equal the
     /// min of every per-shard `durable_seq` (refcount + each volume's
     /// L2P shards) that this manifest carries. Returns `Err` so the
     /// debug build can fail the commit before writing a drifted page;
@@ -627,8 +605,8 @@ impl Manifest {
             .copy_from_slice(&(self.snapshots.len() as u32).to_le_bytes());
         p[OFF_VOLUME_COUNT..OFF_VOLUME_COUNT + 4]
             .copy_from_slice(&(self.volumes.len() as u32).to_le_bytes());
-        p[OFF_CHECKPOINT_TXG..OFF_CHECKPOINT_TXG + 8]
-            .copy_from_slice(&self.checkpoint_txg.to_le_bytes());
+        p[OFF_CHECKPOINT_BFG..OFF_CHECKPOINT_BFG + 8]
+            .copy_from_slice(&self.checkpoint_bfg.to_le_bytes());
         p[OFF_LAST_PROCESSED_BUFFER_SEQ..OFF_LAST_PROCESSED_BUFFER_SEQ + 8]
             .copy_from_slice(&self.last_processed_buffer_seq.to_le_bytes());
         p[OFF_LIFECYCLE_REPLAY_SEQ..OFF_LIFECYCLE_REPLAY_SEQ + 8]
@@ -686,13 +664,13 @@ impl Manifest {
             22 => Self::decode_v22(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
                 "unsupported manifest body version {other}; only v22 \
-                 (ZFS birth-txg port S3: per-L2P-page refcount deleted) is \
+                 (per-L2P-page refcount deleted) is \
                  readable — older databases (v7/v8 carried the retired \
                  dedup_reverse section; v9 carried compact leaf v2 with the \
                  100-unit cap; v10/v11 used compact leaf v3 which predates \
                  birth_lsn; v12 had birth_lsn but no per-volume dead-list \
                  anchor; v13 had dead-list but no lineage tracking; v14 had \
-                 lineage tracking but no checkpoint_txg; v15 had checkpoint_txg \
+                 lineage tracking but no checkpoint_bfg; v15 had checkpoint_bfg \
                  but no buffer-replay watermarks; v16 had the buffer-replay \
                  watermarks but no l2p_page_rc shard group; v17 had the \
                  l2p_page_rc shard group but no page-deadlist anchors; v18 had \
@@ -716,8 +694,8 @@ impl Manifest {
                 .try_into()
                 .unwrap(),
         );
-        let checkpoint_txg = u64::from_le_bytes(
-            p[OFF_CHECKPOINT_TXG..OFF_CHECKPOINT_TXG + 8]
+        let checkpoint_bfg = u64::from_le_bytes(
+            p[OFF_CHECKPOINT_BFG..OFF_CHECKPOINT_BFG + 8]
                 .try_into()
                 .unwrap(),
         );
@@ -765,7 +743,7 @@ impl Manifest {
         let refcount_shard_roots = read_u64_vec(p, &mut off, refcount_shard_count);
         // v11 stores per-refcount-shard durable_seq right after the
         // roots array; v10 has no on-disk array and we synthesise it
-        // from `checkpoint_lsn` (Stage 1 upgrade path: next manifest
+        // from `checkpoint_lsn` (durable-seq rollout upgrade path: next manifest
         // commit re-encodes with the actual atomics).
         let refcount_durable_seq: Box<[Lsn]> = if version >= 11 {
             read_u64_vec(p, &mut off, refcount_shard_count)
@@ -811,7 +789,7 @@ impl Manifest {
         Ok(Self {
             body_version: MANIFEST_BODY_VERSION,
             checkpoint_lsn,
-            checkpoint_txg,
+            checkpoint_bfg,
             last_processed_buffer_seq,
             lifecycle_replay_seq,
             free_list_head,

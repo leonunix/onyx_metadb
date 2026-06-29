@@ -30,8 +30,8 @@ pub(in crate::db) fn seq_guard_rejects(new_seq: u64, cur: Option<&L2pValue>) -> 
 /// `birth_lsn` if the caller did not already attach one (sentinel 0).
 /// Promote / dedup-hit / scanner-remap callers carry the source PBA's
 /// original birth_lsn in the value and want it preserved; fresh writes
-/// arrive with birth_lsn=0 and get stamped here so Phase 2's per-volume
-/// dead-list emitter ([[no-refcount-hot-path-design]]) can read it
+/// arrive with birth_lsn=0 and get stamped here so 's per-volume
+/// dead-list emitter () can read it
 /// directly off `ApplyOutcome::L2pRemap.prev` without an extra
 /// refcount-shard lookup.
 #[inline]
@@ -66,9 +66,9 @@ pub(in crate::db) fn record_dead(volume: &Volume, prev: Option<L2pValue>, death_
 /// The live snapshots' `capture_watermark`s across `snap_infos`, the operand of
 /// the birth COW-kill decision (fed to `tree.set_snapshot_wms`).
 ///
-/// v21 (Phase 4 S1): MUST be the fold-watermarks (`max(root.birth_lsn)`), NOT
+/// v21 (snapshot watermark): MUST be the fold-watermarks (`max(root.birth_lsn)`), NOT
 /// `created_lsn`. `created_lsn` (= last_applied) races ahead of the fold under
-/// concurrent writers + background TXG threads, so a page with
+/// concurrent writers + background BFG threads, so a page with
 /// `birth <= created_lsn` need NOT be in any snapshot's roots — using it
 /// over-pins HEAD-only transients into the page-deadlist, surfacing as
 /// premature-frees the drop shadow rejects. `capture_watermark` is exactly what
@@ -79,7 +79,7 @@ pub(in crate::db) fn snapshot_wms_of(snap_infos: &[SnapInfo]) -> Vec<Lsn> {
     snap_infos.iter().map(|s| s.capture_watermark).collect()
 }
 
-/// ZFS port Phase 2: drain the tree's page-deadlist witness (L2P pages
+/// BFG: drain the tree's page-deadlist witness (L2P pages
 /// displaced off the head by a shared COW this op) and append the
 /// snapshot-pinned survivors to the volume's HEAD page-deadlist. ALWAYS drains
 /// the witness (so it never leaks into the next op even when no snapshot is
@@ -135,7 +135,7 @@ pub(in crate::db) fn drain_page_deaths_into(
     }
 }
 
-/// ZFS port Phase 3b: drain the tree's page-livelist witness (ALLOC/FREE
+/// BFG: drain the tree's page-livelist witness (ALLOC/FREE
 /// events for this clone's clone-private L2P pages this op) into the clone's
 /// `page_live_list`. Peer of [`drain_page_deaths`]; called at every same
 /// site. ALWAYS drains the witness (clears it so it can't leak into the next
@@ -208,7 +208,7 @@ fn any_snap_pins(
 /// (buffer or tree, depending on the B2 toggle).
 ///
 /// Two rc regimes, selected by `rc_authoritative`:
-/// * **Off (Phase 5)** — hot-path L2P remaps are **rc-neutral**; only
+/// * **Off ()** — hot-path L2P remaps are **rc-neutral**; only
 ///   `PromotionChunk` / `FreePbas` / the `DedupPut`/`Dedup*` family move rc.
 ///   `snap_infos` is unused; the prev mapping rides the dead-list via
 ///   `record_dead` and lineage GC drives reclaim.
@@ -229,7 +229,7 @@ pub(in crate::db) fn apply_l2p_remap(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     lsn: Lsn,
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     vol_ord: VolumeOrdinal,
     lba: Lba,
     new_value: L2pValue,
@@ -251,16 +251,16 @@ pub(in crate::db) fn apply_l2p_remap(
     // this lock prevents commits from racing the compactor's
     // `tree.write()` mid-cycle.
     let mut tree = volume.shards[l2p_sid].tree.write();
-    // A3 cutover: tree-mode COW stages page-rc deltas into this commit's
-    // TXG slot. (Buffer mode COWs later in the drain, which sets its own
-    // sync txg; this set is then a harmless no-op for the buffered path.)
-    tree.set_current_txg(txg);
-    // ZFS port Phase 4 Step 4 (S1): arm the birth-authoritative non-clone
+    // Tree-mode COW stages page-rc deltas into this commit's BFG slot. Buffer
+    // mode COWs later in the drain, which sets its own sync bfg; this set is
+    // then a harmless no-op for the buffered path.
+    tree.set_current_bfg(bfg);
+    // BFG: arm the birth-authoritative non-clone
     // COW-kill decision with this op's youngest-snapshot lsn (same source the
     // `drain_page_deaths` below uses; identical live and on replay).
     let snap_wms = snapshot_wms_of(snap_infos);
     tree.set_snapshot_wms(snap_wms.clone());
-    // ZFS port Phase 4 S1c: arm the page-rc-independent CLONE COW-kill operand
+    // BFG: arm the page-rc-independent CLONE COW-kill operand
     // (empty for non-clones). Both callers (live serial apply + the open-time
     // range-delete replay) pass real `snap_infos`, so the real pinner set is
     // correct here — there is no empty-on-replay path through this function.
@@ -284,7 +284,7 @@ pub(in crate::db) fn apply_l2p_remap(
     let cur = if use_buffer {
         match volume.shards[l2p_sid]
             .l2p_buffer
-            .lookup_for_open_txg(txg, lba)
+            .lookup_for_open_bfg(bfg, lba)
         {
             crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
             crate::db::l2p_buffer::BufferLookup::Tombstone => None,
@@ -308,7 +308,7 @@ pub(in crate::db) fn apply_l2p_remap(
     let prev = if use_buffer {
         volume.shards[l2p_sid]
             .l2p_buffer
-            .insert_at_txg(txg, lba, new_value, lsn);
+            .insert_at_bfg(bfg, lba, new_value, lsn);
         cur
     } else {
         tree.insert_at_lsn(lba, new_value, lsn)?
@@ -318,7 +318,7 @@ pub(in crate::db) fn apply_l2p_remap(
     if rc_authoritative {
         freed_pba = stage_remap_rc(
             refcount_shards,
-            txg,
+            bfg,
             &tree,
             l2p_sid,
             lba,
@@ -338,7 +338,7 @@ pub(in crate::db) fn apply_l2p_remap(
     if !use_buffer {
         publish_l2p_read_view(&volume.shards[l2p_sid], &tree);
     }
-    // ZFS port Phase 2: record any L2P page this remap's COW displaced
+    // BFG: record any L2P page this remap's COW displaced
     // off the head into the HEAD page-deadlist. Direct mode COWs at
     // `tree.insert_at_lsn` above; buffer mode COWs later in the fold (the
     // witness is empty here, drained by the fold instead).
@@ -361,7 +361,7 @@ pub(in crate::db) fn apply_l2p_remap(
 /// `Some(pba)` iff a pba's net rc reached 0.
 fn stage_rc_net(
     refcount_shards: &[Shard],
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     new_value: L2pValue,
     prev: Option<L2pValue>,
     snap_pins_old: bool,
@@ -391,7 +391,7 @@ fn stage_rc_net(
     touched.sort_by_key(|(sid, _, _)| *sid);
     let mut freed_pba = None;
     for (sid, pba, delta) in touched {
-        let (pre, new) = refcount_shards[sid].rc.stage(txg, pba, delta, lsn)?;
+        let (pre, new) = refcount_shards[sid].rc.stage(bfg, pba, delta, lsn)?;
         if new == 0 && pre > 0 {
             freed_pba = Some(pba);
         }
@@ -408,7 +408,7 @@ fn stage_rc_net(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::db) fn stage_remap_rc(
     refcount_shards: &[Shard],
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     tree: &PagedL2p,
     snap_sid: usize,
     lba: Lba,
@@ -434,7 +434,7 @@ pub(in crate::db) fn stage_remap_rc(
     };
     stage_rc_net(
         refcount_shards,
-        txg,
+        bfg,
         new_value,
         prev,
         snap_pins_old,
@@ -451,7 +451,7 @@ pub(in crate::db) fn stage_remap_rc(
 /// `None` contribute nothing.
 pub(in crate::db) fn stage_delete_rc(
     refcount_shards: &[Shard],
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     tree: &PagedL2p,
     snap_sid: usize,
     lba: Lba,
@@ -473,7 +473,7 @@ pub(in crate::db) fn stage_delete_rc(
     let rsid = shard_for_key(refcount_shards, old.head_pba());
     let (pre, new) = refcount_shards[rsid]
         .rc
-        .stage(txg, old.head_pba(), -1, lsn)?;
+        .stage(bfg, old.head_pba(), -1, lsn)?;
     Ok(if new == 0 && pre > 0 {
         Some(old.head_pba())
     } else {
@@ -502,20 +502,20 @@ pub(in crate::db) fn stage_delete_rc(
 /// Range ops are always unguarded; the dedup-hit path that needs a
 /// guard keeps emitting per-LBA `L2pRemap`. The snap-pin check stays
 /// per-LBA inside the range — a range-aware snap-pin walk is the
-/// Stage 2 amortization tracked as `metadb_leaf_pin_todo`.
+/// follow-up amortization amortization tracked as `metadb_leaf_pin_todo`.
 ///
 /// rc-authoritative: each applied LBA does the inline incref(new)+decref(old)
 /// pair (`stage_rc_net` / `stage_remap_rc`); net `rc==0` pbas surface in
 /// `freed_pbas`. The lock-light buffer path is kept for the common
 /// snapshot-free case; when a snapshot is present the per-LBA snap-pin probe
 /// needs the tree, so the bucket takes `tree.write()` (matching
-/// `apply_l2p_remap`). Phase-5 (flag off): rc-neutral, `freed_pbas` empty.
+/// `apply_l2p_remap`). rc-neutral, `freed_pbas` empty.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::db) fn apply_l2p_remap_range(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     lsn: Lsn,
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     vol_ord: VolumeOrdinal,
     start_lba: Lba,
     values: &[L2pValue],
@@ -558,7 +558,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
             // (the grouped/≥8-op path), which deliberately does NOT take
             // `tree.write()`. The mutation lands in `l2p_buffer`
             // (its own per-slot mutex), and fallthrough reads consult the
-            // published `read_view`, re-fetched per LBA: the TxgSync
+            // published `read_view`, re-fetched per LBA: the BfgSync
             // compactor publishes the read view *before* clearing the
             // synced slot (publish-before-clear), so a `read_view.read()`
             // snapshot is always consistent and a commit never observes a
@@ -570,7 +570,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
                 let lba = start_lba + i as u64;
                 let new_value = values[i];
 
-                let cur = match shard.l2p_buffer.lookup_for_open_txg(txg, lba) {
+                let cur = match shard.l2p_buffer.lookup_for_open_bfg(bfg, lba) {
                     crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
                     crate::db::l2p_buffer::BufferLookup::Tombstone => None,
                     crate::db::l2p_buffer::BufferLookup::Absent => {
@@ -583,10 +583,10 @@ pub(in crate::db) fn apply_l2p_remap_range(
                     continue;
                 }
                 let new_value = stamp_birth_lsn(new_value, lsn);
-                shard.l2p_buffer.insert_at_txg(txg, lba, new_value, lsn);
+                shard.l2p_buffer.insert_at_bfg(bfg, lba, new_value, lsn);
                 if rc_authoritative {
                     if let Some(f) =
-                        stage_rc_net(refcount_shards, txg, new_value, cur, false, false, lsn)?
+                        stage_rc_net(refcount_shards, bfg, new_value, cur, false, false, lsn)?
                     {
                         freed_pbas.push(f);
                     }
@@ -605,12 +605,12 @@ pub(in crate::db) fn apply_l2p_remap_range(
         // (rc-authoritative needs the tree for the snap-pin probe). One tree
         // write lock per shard bucket.
         let mut tree = shard.tree.write();
-        // A3 cutover: tree-mode COW stages page-rc deltas into this TXG slot.
-        tree.set_current_txg(txg);
-        // ZFS port Phase 4 Step 4 (S1): birth-authoritative non-clone COW-kill.
+        // Tree-mode COW stages page-rc deltas into this BFG slot.
+        tree.set_current_bfg(bfg);
+        // BFG: birth-authoritative non-clone COW-kill.
         let snap_wms = snapshot_wms_of(snap_infos);
         tree.set_snapshot_wms(snap_wms.clone());
-        // ZFS port Phase 4 S1c: page-rc-independent clone COW-kill operand.
+        // BFG: page-rc-independent clone COW-kill operand.
         tree.set_clone_cow_pinners(crate::db::volume::clone_cow_pinners_from(
             volumes, vol_ord, snap_wms,
         ));
@@ -619,7 +619,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
             let new_value = values[i];
 
             let cur = if shard.use_buffer {
-                match shard.l2p_buffer.lookup_for_open_txg(txg, lba) {
+                match shard.l2p_buffer.lookup_for_open_bfg(bfg, lba) {
                     crate::db::l2p_buffer::BufferLookup::Present(v) => Some(v),
                     crate::db::l2p_buffer::BufferLookup::Tombstone => None,
                     crate::db::l2p_buffer::BufferLookup::Absent => tree.get(lba)?,
@@ -633,7 +633,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
             }
             let new_value = stamp_birth_lsn(new_value, lsn);
             let prev = if shard.use_buffer {
-                shard.l2p_buffer.insert_at_txg(txg, lba, new_value, lsn);
+                shard.l2p_buffer.insert_at_bfg(bfg, lba, new_value, lsn);
                 cur
             } else {
                 tree.insert_at_lsn(lba, new_value, lsn)?
@@ -641,7 +641,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
             if rc_authoritative {
                 if let Some(f) = stage_remap_rc(
                     refcount_shards,
-                    txg,
+                    bfg,
                     &tree,
                     l2p_sid,
                     lba,
@@ -661,7 +661,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
         if !shard.use_buffer {
             publish_l2p_read_view(shard, &tree);
         }
-        // ZFS port Phase 2: drain this bucket's COW page-deaths. Only the
+        // BFG: drain this bucket's COW page-deaths. Only the
         // tree-locked path COWs (the lock-light buffer path `continue`d
         // above without touching the tree); buffer-mode COW happens in
         // the fold.
@@ -678,7 +678,7 @@ pub(in crate::db) fn apply_l2p_remap_range(
 
 /// Scan one volume's L2P over `[start, end)` and return every live
 /// `(lba, value)` pair, sorted by lba. Used by `Db::range_delete`
-/// (live path) and by the Phase C.4 lifecycle replay for
+/// (live path) and by the lifecycle replay lifecycle replay for
 /// [`crate::lifecycle_log::LifecycleOp::Discard`] — both need the
 /// same captured list before calling
 /// [`apply_l2p_range_delete`]. Takes a `write` lock on each shard's
@@ -706,7 +706,7 @@ pub(in crate::db) fn scan_l2p_range(
 /// Apply one [`LifecycleOp::Discard`]. Walks the `captured` list and
 /// deletes each lba from its volume's L2P shard.
 ///
-/// * **Off (Phase 5)** — rc-neutral; a discard does not touch PBA rc.
+/// * **Off ()** — rc-neutral; a discard does not touch PBA rc.
 ///   Physical reuse is driven by the onyx-side retired-extent path /
 ///   lineage GC.
 /// * **On (rc-authoritative)** — each deleted live reference does an inline
@@ -727,7 +727,7 @@ pub(in crate::db) fn apply_l2p_range_delete(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     lsn: Lsn,
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     vol_ord: VolumeOrdinal,
     captured: &[(Lba, L2pValue)],
     snap_infos: &[SnapInfo],
@@ -751,14 +751,14 @@ pub(in crate::db) fn apply_l2p_range_delete(
             continue;
         }
         let mut tree = volume.shards[sid].tree.write();
-        // A3 cutover: tree-mode COW (delete) stages page-rc deltas here.
-        tree.set_current_txg(txg);
-        // ZFS port Phase 4 Step 4 (S1): birth-authoritative non-clone COW-kill.
+        // Tree-mode COW (delete) stages page-rc deltas here.
+        tree.set_current_bfg(bfg);
+        // BFG: birth-authoritative non-clone COW-kill.
         // This is also the Discard REPLAY COW site; `snap_infos` is rebuilt from
         // the in-memory manifest at the replay point, so youngest is consistent.
         let snap_wms = snapshot_wms_of(snap_infos);
         tree.set_snapshot_wms(snap_wms.clone());
-        // ZFS port Phase 4 S1c: page-rc-independent clone COW-kill operand. The
+        // BFG: page-rc-independent clone COW-kill operand. The
         // open-time range-delete replay (open.rs) rebuilds real `snap_infos`, so
         // the real pinner set is correct on both the live and replay paths.
         tree.set_clone_cow_pinners(crate::db::volume::clone_cow_pinners_from(
@@ -771,14 +771,14 @@ pub(in crate::db) fn apply_l2p_range_delete(
             let prev = tree.delete_at_lsn(lba, lsn)?;
             if rc_authoritative {
                 if let Some(f) =
-                    stage_delete_rc(refcount_shards, txg, &tree, sid, lba, prev, snap_infos, lsn)?
+                    stage_delete_rc(refcount_shards, bfg, &tree, sid, lba, prev, snap_infos, lsn)?
                 {
                     freed_pbas.push(f);
                 }
             }
         }
         publish_l2p_read_view(&volume.shards[sid], &tree);
-        // ZFS port Phase 2: a range delete COWs the path to each deleted
+        // BFG: a range delete COWs the path to each deleted
         // leaf; record any page displaced off the head.
         drain_page_deaths(volume, sid, &mut tree, snap_infos);
         drain_live_events(volume, &mut tree);

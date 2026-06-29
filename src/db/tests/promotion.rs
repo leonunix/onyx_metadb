@@ -1,4 +1,4 @@
-//! [[no-refcount-hot-path-design]] Phase 4 Step 5 promotion walker
+//! promotion walker
 //! end-to-end tests.
 //!
 //! These exercise [`Db::run_promotion_chunk`] through the
@@ -213,7 +213,7 @@ fn promotion_walker_skips_lbas_overwritten_by_clone() {
 
 #[test]
 fn drop_parent_with_descendant_in_promotion_rejects() {
-    // Phase 4 Step 6: while a clone still names `parent_vol_ord =
+    // while a clone still names `parent_vol_ord =
     // Some(parent)`, dropping the parent must be rejected. Otherwise
     // we'd free the COW-shared L2P pages the clone still relies on
     // for any LBA it hasn't yet diverged from.

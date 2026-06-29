@@ -1,4 +1,4 @@
-//! Background per-clone page-livelist condense (ZFS port Phase 3b).
+//! Background per-clone page-livelist condense (BFG).
 //!
 //! Under clone-overwrite churn each overwrite of a clone-private L2P page
 //! emits an ALLOC then later a FREE, so the on-disk livelist chain grows
@@ -6,7 +6,7 @@
 //! at READ time. This worker rewrites a clone's whole persisted chain down
 //! to ONE segment holding only the surviving live-ALLOC set, bounding chain
 //! growth. It changes NO free decision — page-rc stays authoritative and the
-//! livelist is SHADOW through Phase 3b — so verify's `check_clone_livelist`
+//! livelist is SHADOW through — so verify's `check_clone_livelist`
 //! equality still holds after a condense.
 //!
 //! ## Why a dedicated worker

@@ -1,11 +1,11 @@
 //! Informational bench: foreground insert tail latency while the
-//! background TXG syncing-slot fold runs, one-shot hold
+//! background BFG syncing-slot fold runs, one-shot hold
 //! (`l2p_drain_chunk_entries = 0`) vs bounded chunks (default 4096).
 //!
 //! The fold holds each shard's `tree.write()`; `Db::insert` commits
 //! through direct apply which takes the same lock, so an unbounded
 //! fold shows up directly as insert tail latency. A long
-//! `txg_timeout_ms` + few shards concentrates a large slot per shard,
+//! `bfg_timeout_ms` + few shards concentrates a large slot per shard,
 //! approximating the sustained-load fold size seen on hardware. Run:
 //!
 //! ```text
@@ -56,12 +56,12 @@ impl Lat {
 fn run_arm(chunk_entries: usize, secs: u64, writers: usize) -> String {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());
-    cfg.txg_threads_enabled = true;
+    cfg.bfg_threads_enabled = true;
     cfg.l2p_buffer_enabled = true;
-    // Long TXG + few shards → each syncing slot carries a large
+    // Long BFG + few shards → each syncing slot carries a large
     // per-shard backlog, so the fold's lock hold is big enough to
     // measure (mirrors the sustained-load shape on hardware).
-    cfg.txg_timeout_ms = 3_000;
+    cfg.bfg_timeout_ms = 3_000;
     cfg.shards_per_partition = 2;
     cfg.l2p_drain_chunk_entries = chunk_entries;
     let db = Db::create_with_config(cfg).unwrap();

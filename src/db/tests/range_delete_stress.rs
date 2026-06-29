@@ -1,9 +1,9 @@
-//! Reproduction harness for the OnyxConcurrent `range_delete` / txg
+//! Reproduction harness for the OnyxConcurrent `range_delete` / bfg
 //! stall (the "22-94s stall / buffer head stuck" class the nvme-box
 //! concurrent smoke hit; original gdb bt evidence was lost).
 //!
 //! ROOT CAUSE (confirmed by this harness): `range_delete` holds
-//! `drop_gate.write` across a FULL forced TXG sync ([l2p.rs] the
+//! `drop_gate.write` across a FULL forced BFG sync ([l2p.rs] the
 //! `flush_with_gate(Forced)` at entry). Every `commit_ops` writer parks
 //! at `drop_gate.read` for the whole duration of that sync, so a single
 //! range_delete stalls the entire commit pipeline. At high pipeline
@@ -11,7 +11,7 @@
 //! nvme-box (96 cores feeding one sync + a wall-clock skew that defeated
 //! timeout recovery) it presented as a permanent deadlock. snapshot /
 //! drop_snapshot / clone already dropped their entry force-sync in
-//! Phase B (post-A3 rc mutations stage into the L2pPageRc array, so a
+//! buffer-backed journal (rc mutations stage into the L2pPageRc array, so a
 //! concurrent flush IO phase has nothing to clobber); range_delete is
 //! the leftover.
 //!
@@ -127,9 +127,9 @@ fn range_delete_concurrent_stall() {
     cfg.l2p_buffer_enabled = true;
     cfg.l2p_buffer_soft_entries = 64;
     cfg.l2p_buffer_max_interval_ms = 5;
-    cfg.txg_threads_enabled = true;
+    cfg.bfg_threads_enabled = true;
     cfg.rc_authoritative_reclaim = true;
-    cfg.txg_timeout_ms = 5;
+    cfg.bfg_timeout_ms = 5;
     let db = Db::create_with_config(cfg).unwrap();
 
     // Volume 0 exists by default; mint the rest.

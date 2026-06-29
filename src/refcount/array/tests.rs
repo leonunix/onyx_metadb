@@ -176,7 +176,7 @@ fn reapply_idempotency_via_page_lsn_skip_is_callers_job() {
     assert_eq!(a.get(0).unwrap().rc, 2);
 }
 
-// ---- dirty-staged overlay (the 2026-06-11 rc_authoritative P0) ----
+// ---- dirty-staged overlay (the 2026-06-11 rc_authoritative case) ----
 //
 // `stage_deltas_in_memory` publishes the pid in `page_table` and seeds
 // the shared LRU, but the disk write happens later (the flush's

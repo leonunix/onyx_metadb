@@ -21,7 +21,7 @@ use rand_chacha::ChaCha8Rng;
 const KEY_SLOTS_PER_THREAD: u64 = 256;
 /// Max concurrently-live volumes the admin driver keeps (create/clone gated on
 /// `live < this`). Default 4; raise via `METADB_SOAK_MAX_LIVE_VOLUMES` to make
-/// clone/promote/drop churn DENSE for the S1c clone-COW-kill gate — pair with a
+/// clone/promote/drop churn DENSE for the clone COW-kill clone-COW-kill gate — pair with a
 /// low `METADB_SOAK_SHARDS` so the extra volumes fit the single-page manifest.
 fn max_live_volumes() -> usize {
     std::env::var("METADB_SOAK_MAX_LIVE_VOLUMES")

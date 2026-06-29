@@ -1,12 +1,12 @@
-//! ZFS port Part B: a faulted forced TXG sync (e.g. `ManifestFsyncBefore`) must
-//! NOT hang the next `take_snapshot`. A failed `run_sync_cycle` leaves its slot
-//! stuck in `Syncing` forever (`mark_synced` never runs); before the fix the
-//! next forced flush blocked permanently in `promote_to_syncing` (threads-off)
-//! or `wait_until_synced` (threads-on). The fix poisons the sync subsystem
-//! (TXG `aborted` flag + `sync_poison` latch) so subsequent forced-sync ops
-//! fail fast with a "restart required" error, and a reopen recovers cleanly
-//! from the prior durable manifest (the faulted commit never toggled the
-//! double-buffered manifest slot).
+//! A faulted forced BFG sync (e.g. `ManifestFsyncBefore`) must not hang the next
+//! `take_snapshot`. A failed `run_sync_cycle` leaves its slot stuck in `Syncing`
+//! forever (`mark_synced` never runs); before the fix the next forced flush
+//! blocked permanently in `promote_to_syncing` (threads-off) or
+//! `wait_until_synced` (threads-on). The fix poisons the sync subsystem (BFG
+//! `aborted` flag + `sync_poison` latch) so subsequent forced-sync ops fail fast
+//! with a "restart required" error, and a reopen recovers cleanly from the prior
+//! durable manifest (the faulted commit never toggled the double-buffered
+//! manifest slot).
 //!
 //! There is NO test-harness timeout in this repo, so a regression would HANG
 //! the binary rather than fail. Every hang-prone call runs on a spawned thread
@@ -23,7 +23,8 @@ use crate::types::{SnapshotId, VolumeOrdinal};
 use crate::verify::{VerifyOptions, verify_path};
 
 /// Run `take_snapshot` on a spawned thread; PANIC if it does not return within
-/// ~3s (a hang = the Part B regression). Returns the snapshot result.
+/// ~3s (a hang means forced-sync poisoning regressed). Returns the snapshot
+/// result.
 fn take_snapshot_no_hang(
     db: &Arc<Db>,
     vol: VolumeOrdinal,
@@ -37,7 +38,7 @@ fn take_snapshot_no_hang(
         }
         thread::sleep(Duration::from_millis(10));
     }
-    panic!("take_snapshot ({what}) hung > 3s — ZFS port Part B regression (faulted-sync deadlock)");
+    panic!("take_snapshot ({what}) hung > 3s — BFG faulted-sync deadlock regression");
 }
 
 fn no_hang_after_faulted_sync(threads: bool) {
@@ -45,10 +46,10 @@ fn no_hang_after_faulted_sync(threads: bool) {
     let faults = FaultController::new();
     let mut cfg = crate::config::Config::new(dir.path());
     cfg.shards_per_partition = 1;
-    cfg.txg_threads_enabled = threads;
+    cfg.bfg_threads_enabled = threads;
     // Long timeout so the background quiesce worker (threads-on) doesn't roll a
-    // spurious TXG into the fault window.
-    cfg.txg_timeout_ms = 60_000;
+    // spurious BFG into the fault window.
+    cfg.bfg_timeout_ms = 60_000;
     let db = Db::create_with_config_and_faults(cfg, faults.clone()).unwrap();
     let vol = db.create_volume().unwrap();
     for i in 0u64..8 {
@@ -93,14 +94,14 @@ fn no_hang_after_faulted_sync(threads: bool) {
     drop(db);
 
     // Strict page-rc verify in threads-OFF only — that is the soak/production
-    // default (`txg_threads_enabled` defaults false) and the mode whose
+    // default (`bfg_threads_enabled` defaults false) and the mode whose
     // take_snapshot deadlock blocks the soak. threads-ON has a SEPARATE,
     // PRE-EXISTING, data-safe page-rc-array under-count on snapshot+reopen that
     // reproduces with NO fault at all (the inverted-shadow page-rc is not
     // authoritative for snapshot frees; DATA + reachability stay correct). It is
-    // orthogonal to this deadlock fix — exposed, not caused, by Part B making the
+    // orthogonal to this deadlock fix — exposed, not caused, by making the
     // threads-on path reachable — so the strict page-rc audit is not asserted
-    // here. See memory `zfs_port_phase4_partb_take_snapshot_deadlock` follow-up.
+    // here; this guards the faulted-sync deadlock regression.
     if !threads {
         let report = verify_path(
             dir.path(),
@@ -140,7 +141,7 @@ fn concurrent_take_snapshots_no_hang_no_corruption_on_faulted_sync() {
         let faults = FaultController::new();
         let mut cfg = crate::config::Config::new(dir.path());
         cfg.shards_per_partition = 1;
-        cfg.txg_threads_enabled = false;
+        cfg.bfg_threads_enabled = false;
         let db = Db::create_with_config_and_faults(cfg, faults.clone()).unwrap();
         let vol = db.create_volume().unwrap();
         for i in 0u64..8 {
@@ -163,7 +164,10 @@ fn concurrent_take_snapshots_no_hang_no_corruption_on_faulted_sync() {
                 }
                 thread::sleep(Duration::from_millis(10));
             }
-            assert!(done, "concurrent {n} hung > 3s (attempt {attempt}) — Part B regression");
+            assert!(
+                done,
+                "concurrent {n} hung > 3s (attempt {attempt}) — forced-sync poison regression"
+            );
         }
         let r1 = h1.join().expect("racer-1 panicked");
         let r2 = h2.join().expect("racer-2 panicked");

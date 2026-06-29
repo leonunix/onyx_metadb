@@ -13,11 +13,11 @@
 //! Numeric encoding is little-endian (matches manifest convention).
 //! Variable-length lists are prefixed by a `u32` count.
 //!
-//! # Phase A
+//! # Lifecycle Journal
 //!
-//! The op enum and codec are pinned in Phase A so Phase B can write
-//! the shadow-validation path without further shape churn. Apply
-//! functions live in `crate::db::apply_lifecycle` (added in Phase B).
+//! The op enum and codec are pinned so buffer-backed recovery can write the
+//! shadow-validation path without more shape churn. Apply functions live in
+//! `crate::db::apply_lifecycle`.
 
 use crate::error::{MetaDbError, Result};
 use crate::types::{Lba, PageId, Pba, SnapshotId, VolumeOrdinal};
@@ -78,11 +78,11 @@ pub enum LifecycleOp {
     /// retire the snapshot entry. Replay-idempotent via the
     /// `page.generation >= lsn` check in `apply_op`.
     ///
-    /// ZFS port Phase 4 (S2): `free_pages` is the explicit, page-rc-
+    /// BFG: `free_pages` is the explicit, page-rc-
     /// INDEPENDENT free-set frozen pre-commit. `Some(set)` (non-clone
     /// drops) ⇒ apply frees exactly `set` (the deadlist-derived set)
     /// and the `pages` decref is page-rc bookkeeping only. `None`
-    /// (clone-involved drops, R5/S2c) ⇒ apply keeps the legacy page-rc
+    /// (clone-involved drops, cross-volume clone sharing/clone-involved snapshot drop) ⇒ apply keeps the legacy page-rc
     /// cascade (free at rc→0). See `apply_drop_snapshot_pages`.
     DropSnapshot {
         id: SnapshotId,
@@ -109,7 +109,7 @@ pub enum LifecycleOp {
     /// Drop volume `ord`, decref every page in `pages`. Same
     /// idempotency protocol as `DropSnapshot`.
     ///
-    /// ZFS port Phase 4 (S2): `free_pages` mirrors `DropSnapshot` —
+    /// BFG: `free_pages` mirrors `DropSnapshot` —
     /// `Some(set)` (CLONE_LINEAGE drops) ⇒ free the reachability
     /// `exclusive` set; `None` (unflagged drops) ⇒ legacy page-rc
     /// cascade. NB the `DropVolume` recovery replay arm is a no-op
@@ -132,7 +132,7 @@ pub enum LifecycleOp {
         src_shard_roots: Vec<PageId>,
     },
     /// One chunk of the background clone-promotion walker (
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 5). Apply increfs
+    /// ). Apply increfs
     /// every PBA in `pba_increfs` and bumps `promotion_cursor` to
     /// `next_cursor` (`None` ⇒ walker reached end of clone).
     /// Idempotency rides on the cursor: a replay where the cursor is
@@ -296,7 +296,7 @@ pub fn encode(op: &LifecycleOp) -> Vec<u8> {
 /// final segment's last record, or as a torn-tail truncation if at the
 /// final position (mirrors the WAL convention).
 ///
-/// ⚠ Body-format change (ZFS port S2 + the deadlist crash-recovery fix):
+/// ⚠ Body-format change (BFG + the deadlist crash-recovery fix):
 /// `DropSnapshot`/`DropVolume` gained a trailing `free_pages` Option, and
 /// `DropSnapshot` additionally gained a trailing `merge` Option. The decode is
 /// sequential + `is_at_end`-strict, so an OLDER drop record (missing a trailing

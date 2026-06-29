@@ -5,11 +5,11 @@
 //! 1. **Deferred-free reclaim**: keeps the page_store's deferred_free
 //!    queue draining off the `flush_with_gate` critical path. Same
 //!    semantics as the original priority-1 worker.
-//! 2. **Lineage GC planning**: Phase 5 cannot use the historical
+//! 2. **Lineage GC planning**: cannot use the historical
 //!    background worker path because it only advanced the dead-list chain
 //!    and had no `Db` handle to emit `commit_free_pbas`. With rc-neutral
 //!    L2P remaps, that would drop the only retire signal. The worker
-//!    therefore refuses to run chain-truncation-only lineage GC in Phase 5.
+//!    therefore refuses to run chain-truncation-only lineage GC in .
 //!
 //! ## Correctness
 //!
@@ -55,7 +55,7 @@ use crate::refcount::RcShard;
 use crate::testing::faults::{FaultController, FaultPoint};
 use crate::types::{Lsn, NULL_PAGE, PageId, Pba, VolumeOrdinal};
 
-/// Background-worker view of the Db state Phase 3's Lineage GC pass
+/// Background-worker view of the Db state 's Lineage GC pass
 /// needs. All fields are `Arc`-cloneable so the worker can hold its
 /// own handles without an `Arc<Db>` cycle.
 pub(super) struct LineageGcCtx {
@@ -63,24 +63,21 @@ pub(super) struct LineageGcCtx {
     pub manifest_state: Arc<Mutex<crate::db::ManifestState>>,
     pub apply_gate: Arc<ApplyGate>,
     /// `rc.clone()` for every refcount shard, in shard-index order. The
-    /// GC pass reads `rc.get(pba)` to skip records whose hot-path
-    /// refcount hasn't yet dropped to 0 (Phase 3 plumbing-only — Phase
-    /// 5 will move the decref into GC and remove this check).
+    /// GC pass reads `rc.get(pba)` to skip records that are still shared by a
+    /// dedup hit or clone-promotion edge. Once the count reaches 0, lineage GC
+    /// can emit `FreePbas` for the retired PBA.
     pub refcount_shards_rc: Vec<Arc<RcShard>>,
     pub faults: Arc<FaultController>,
     /// Metrics sink so `gc_plan_head_advance` can attribute every
     /// head-advance decision (advanced / snap-pinned / descendant-pinned
     /// / rc>0 bail + the rc==0 reclaim debt stuck behind an rc>0 sibling).
     pub metrics: Arc<MetaMetrics>,
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 4. When true, the
-    /// FreePbas-emitting GC driver (`Db::run_lineage_gc_cycle_inner`,
-    /// reachable from `Db::test_run_lineage_gc_cycle` today and from
-    /// the background worker in Phase 5) emits a
-    /// `FreePbas` lifecycle-style commit for every dead record retired
-    /// before truncating the chain. The background worker on its own
-    /// (this module's `lineage_gc_cycle`) cannot reach `Db::commit_ops`,
-    /// so it keeps Phase 3 behavior regardless of this flag — Phase 5
-    /// will replace that path with a Weak<Db> bridge.
+    /// When true, the FreePbas-emitting GC driver
+    /// (`Db::run_lineage_gc_cycle_inner`, reachable from
+    /// `Db::test_run_lineage_gc_cycle`) emits a `FreePbas` lifecycle-style commit
+    /// for every dead record it retires before truncating the chain. This
+    /// module's background-only `lineage_gc_cycle` cannot reach `Db::commit_ops`,
+    /// so callers must not use that path when this flag is set.
     pub emit_freepbas: bool,
     /// When true, head-advance drops `rc > 0` (dedup-membership) records and
     /// advances past them, surfacing only the `rc == 0` exclusive records,
@@ -124,7 +121,7 @@ struct AsyncReclaimInner {
     /// only — not part of correctness — but lets dashboards
     /// confirm the worker is actually running.
     last_cycle_us: AtomicU64,
-    /// Optional lineage GC context. Phase 5 uses this only as a guard:
+    /// Optional lineage GC context. uses this only as a guard:
     /// the old background worker cannot emit FreePbas, so it must not
     /// advance chains while `emit_freepbas` is true.
     lineage_gc: Option<LineageGcCtx>,
@@ -229,7 +226,7 @@ fn run_worker(inner: Arc<AsyncReclaimInner>) {
                 }
             }
         }
-        // PASS 2: Historical Phase 3 lineage GC is disabled in Phase 5.
+        // PASS 2: Historical lineage GC is disabled in .
         // It can only truncate dead-list chains; it cannot emit FreePbas
         // because this worker intentionally doesn't hold an Arc<Db>. Since
         // rc-neutral L2P remaps rely on FreePbas as the retire signal, do
@@ -251,7 +248,7 @@ fn run_worker(inner: Arc<AsyncReclaimInner>) {
     }
 }
 
-/// Historical Phase 3 Lineage GC: try to advance every volume's
+/// Historical Lineage GC: try to advance every volume's
 /// `dead_list_head_pid` by one segment when the head segment is
 /// fully reclaim-eligible. Returns the number of volumes whose head
 /// advanced. Per-volume failures are logged and don't abort the
@@ -281,11 +278,11 @@ fn lineage_gc_cycle(page_store: &Arc<PageStore>, ctx: &LineageGcCtx) -> Result<u
 
 /// Output of [`gc_plan_head_advance`]. Carries everything
 /// [`gc_execute_head_advance`] needs to actually advance the chain,
-/// plus the list of PBAs that the Phase 5 FreePbas-emitting driver wants
+/// plus the list of PBAs that the FreePbas-emitting driver wants
 /// to surface to onyx before the chain is truncated.
 ///
 /// `dead_pbas` is collected in segment order from the head segment's
-/// records, with no dedup. Phase 4 currently retires whole segments
+/// records, with no dedup. currently retires whole segments
 /// at a time, so duplicates within a single segment are not expected;
 /// downstream `apply_free_pbas` is set-typed regardless.
 pub(super) struct HeadAdvancePlan {
@@ -347,7 +344,7 @@ pub(super) fn gc_plan_head_advance(
     // and the descendant set are stable during this critical
     // section.
     //
-    // Phase 4: a descendant whose `parent_vol_ord == Some(vol_ord)`
+    // a descendant whose `parent_vol_ord == Some(vol_ord)`
     // has not yet had its background promotion walker complete; the
     // global rc has therefore not yet been bumped for the parent's
     // shared PBAs. The descendant still observes the parent's L2P
@@ -399,7 +396,7 @@ pub(super) fn gc_plan_head_advance(
             if ctx.drop_dedup_shared {
                 // Guarded Option 3 (`Config::lineage_gc_drop_dedup_shared`):
                 // in a DB that never creates snapshots/clones, every rc>0
-                // dead-list record is a dedup-membership PBA (Phase 5 bumps rc
+                // dead-list record is a dedup-membership PBA (bumps rc
                 // only via DedupPut/PromotionChunk, and PromotionChunk needs a
                 // clone, which this mode forbids). Its reclaim is owned by the
                 // client's dedup orphan-reclaim path (DedupDelete → rc 0 →
@@ -436,7 +433,7 @@ pub(super) fn gc_plan_head_advance(
 
     // 4. Locate the tail anchor up front so the execute phase can
     // walk the chain under the gate. tail being NULL with head set
-    // is a Phase 2 invariant violation — bail rather than execute
+    // is a invariant violation — bail rather than execute
     // a corrupt manifest.
     let tail = vol.dead_list_tail_pid.load(Ordering::Acquire);
     if tail == NULL_PAGE {
@@ -467,7 +464,7 @@ pub(super) fn gc_plan_head_advance(
 /// duplicate idempotently in `PbaLifecycle::free_lineage_gc_proven`).
 /// A crash inside execute (after manifest commit, before
 /// page_store free) leaks segment pages to recovery's free-list
-/// scan, same as Phase 3.
+/// scan, same as .
 pub(super) fn gc_execute_head_advance(
     page_store: &Arc<PageStore>,
     ctx: &LineageGcCtx,
@@ -495,11 +492,11 @@ fn try_advance_head_one(
     let Some(plan) = gc_plan_head_advance(page_store, ctx, vol, vol_ord)? else {
         return Ok(false);
     };
-    // Phase 3 worker path: no FreePbas emission, chain truncation only.
-    // Phase 5 callers must not reach this path with emit_freepbas=true.
+    // worker path: no FreePbas emission, chain truncation only.
+    // callers must not reach this path with emit_freepbas=true.
     if ctx.emit_freepbas {
         return Err(MetaDbError::InvalidArgument(
-            "Phase 5 forbids background lineage GC chain truncation without FreePbas emission"
+            "rc-neutral lineage GC forbids background chain truncation without FreePbas emission"
                 .into(),
         ));
     }
@@ -529,7 +526,7 @@ fn advance_head_pid_durable(
 
     // Re-read head under the gate. Only this worker mutates
     // head_pid, so it should be unchanged — but if another GC
-    // cycle (or a future Phase 4 step) advanced it, bail out
+    // cycle (or a future step) advanced it, bail out
     // cleanly rather than overwrite.
     let cur_head = vol.dead_list_head_pid.load(Ordering::Acquire);
     if cur_head != old_head {
@@ -540,7 +537,7 @@ fn advance_head_pid_durable(
     // by `old_head` so we don't try to read freed pages from a
     // prior GC advance (the new head's `prev_seg_pid` still points
     // at the freed older segment until a future flush rewrites the
-    // segment header, which Phase 3 doesn't do). If the chain has
+    // segment header, which doesn't do). If the chain has
     // a single segment (head == tail) we'll be returning both
     // anchors to NULL_PAGE.
     let segs = walk_chain_segments(tail_pid, old_head, |pid| page_store.read_page(pid))?;
@@ -610,8 +607,8 @@ fn advance_head_pid_durable(
     // pages haven't been deferred-freed yet. Recovery sees the
     // new head_pid in the manifest; the old segment pages are
     // orphans in the page_store free-list scan and get reclaimed
-    // at next open. Phase 5 page_store GC reconciliation closes
-    // this leak window properly; Phase 3 accepts it.
+    // at next open. page_store GC reconciliation closes
+    // this leak window properly; accepts it.
     ctx.faults
         .inject(FaultPoint::LineageGcPostHeadAdvanceBeforeFree)?;
 
@@ -644,7 +641,7 @@ fn mstate_checkpoint_lsn(ctx: &LineageGcCtx) -> Lsn {
     ctx.manifest_state.lock().manifest.checkpoint_lsn
 }
 
-/// Test-only synchronous driver for the Phase 3 Lineage GC pass.
+/// Test-only synchronous driver for the Lineage GC pass.
 /// Identical to what the background worker runs once per cycle;
 /// exposed so `db::tests::lineage_gc` can assert head_pid
 /// advancement without racing the worker.

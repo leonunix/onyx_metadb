@@ -57,9 +57,9 @@ pub(crate) const OFF_KEY_COUNT: usize = 6;
 pub(crate) const OFF_CRC: usize = 8;
 pub(crate) const OFF_FLAGS: usize = 12;
 pub(crate) const OFF_GENERATION: usize = 16;
-// `birth_lsn` (8B) occupies the post-A3-dead header `refcount` slot (24..28)
-// plus the formerly-reserved span (28..32). It is the immutable birth-txg of an
-// L2P page version (ZFS birth-txg analogue): stamped once at page-version
+// `birth_lsn` (8B) occupies the former header `refcount` slot (24..28)
+// plus the formerly-reserved span (28..32). It is the immutable birth-LSN of an
+// L2P page version (BFG birth tracking analogue): stamped once at page-version
 // creation, never mutated. `generation` (offset 16) is left untouched and keeps
 // serving the WAL/COW idempotency guards.
 pub(crate) const OFF_BIRTH: usize = 24;
@@ -133,7 +133,7 @@ pub enum PageType {
     /// continuation pages within the same segment-run are all records.
     /// Layout owned by [`crate::deadlist`].
     DeadListSegment = 13,
-    /// Per-clone page-livelist segment (ZFS port Phase 3b): append-only
+    /// Per-clone page-livelist segment (BFG): append-only
     /// chain of `(pid, birth_lsn, event_lsn, kind: ALLOC|FREE)` records
     /// logging the lifecycle of a clone's clone-private L2P pages
     /// (`birth_lsn > branched_at_lsn`). Same segment shape as
@@ -173,11 +173,11 @@ pub struct PageHeader {
     pub key_count: u16,
     pub flags: u32,
     pub generation: Lsn,
-    /// Immutable birth-txg of this page version (ZFS birth-txg analogue):
+    /// Immutable birth-LSN of this page version (BFG birth tracking analogue):
     /// the LSN at which this exact version was created. Stamped once and
     /// never mutated. Meaningful for L2P paged pages; carries an incidental
-    /// value for other page types (ignored). Replaces the post-A3-dead
-    /// header `refcount` field (rc now lives in the `L2pPageRc` array).
+    /// value for other page types (ignored). Replaces the old header
+    /// `refcount` field.
     pub birth_lsn: Lsn,
 }
 
@@ -349,7 +349,7 @@ impl Page {
         put_u64_le(&mut *self.bytes, OFF_GENERATION, lsn);
     }
 
-    /// Current `birth_lsn` (immutable birth-txg) from the header.
+    /// Current `birth_lsn` (immutable birth-LSN) from the header.
     pub fn birth_lsn(&self) -> Lsn {
         u64_le(&*self.bytes, OFF_BIRTH)
     }

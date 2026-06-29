@@ -134,7 +134,7 @@ impl PageBuf {
 
     /// Buffer sharing an existing `PageCache`. The sole non-private ctor:
     /// both the Db path and standalone/test trees use this — per-L2P-page
-    /// refcounting was deleted (ZFS port S3), so there is no longer a
+    /// refcounting was deleted (BFG), so there is no longer a
     /// page-rc handle to thread.
     pub fn with_cache(page_store: Arc<PageStore>, page_cache: Arc<PageCache>) -> Self {
         Self {
@@ -352,7 +352,7 @@ impl PageBuf {
         }
         page.set_generation(generation);
         // The clone is a NEW page version born at this COW lsn — stamp its
-        // immutable birth-txg.
+        // immutable birth-LSN.
         page.set_birth_lsn(generation);
         self.pages_insert(new_pid, Slot::Dirty(Arc::new(page)));
         Ok(new_pid)
@@ -362,8 +362,8 @@ impl PageBuf {
     /// `page.generation = 0` so the WAL-apply idempotency guard treats
     /// newly-allocated tree pages as untouched by any WAL op; stamps the
     /// immutable `birth_lsn = generation` (the creating LSN of this page
-    /// version, ZFS birth-txg analogue — read by the birth-shadow verify
-    /// invariant, never by the hot path in Phase 1).
+    /// version, BFG birth tracking analogue — read by the birth-shadow verify
+    /// invariant, never by the hot path in ).
     pub fn alloc_leaf(&mut self, generation: Lsn) -> Result<PageId> {
         let pid = self.allocate_local()?;
         let mut page = Page::zeroed();
@@ -394,7 +394,7 @@ impl PageBuf {
 
     /// Drop every page from the local cache without touching the shared
     /// `PageCache` or the on-disk refcounts. Used by `attach_subtree_root`
-    /// (Phase 7) when the tree's root is swapped out from under it: every
+    /// () when the tree's root is swapped out from under it: every
     /// page pid held in `self.pages` is about to refer to a different
     /// subtree, so the dirty-flag tracking would be wrong. The caller is
     /// responsible for making sure the old root was already flushed.
@@ -423,9 +423,9 @@ impl PageBuf {
 
     /// Copy-on-write: allocate a fresh copy of `pid`, leaving the
     /// original untouched (it is preserved for a snapshot). Returns the
-    /// new pid. Per-L2P-page refcounting was deleted (ZFS port S3): the
+    /// new pid. Per-L2P-page refcounting was deleted (BFG): the
     /// snapshot-pin decision is made by the caller
-    /// ([`PagedL2p::cow_for_write`]) on the birth-txg, so this layer
+    /// ([`PagedL2p::cow_for_write`]) on the birth-LSN, so this layer
     /// always copies and never reads/writes a page refcount.
     pub fn cow_for_write(&mut self, pid: PageId, lsn: Lsn) -> Result<PageId> {
         debug_assert!(pid != NULL_PAGE, "cow_for_write called on NULL_PAGE");
@@ -459,7 +459,7 @@ impl PageBuf {
             .copy_from_slice(self.read(pid)?.bytes());
         new_page.set_generation(0);
         // This clone is a NEW page version born at this COW lsn — stamp its
-        // immutable birth-txg, overriding the copied source birth.
+        // immutable birth-LSN, overriding the copied source birth.
         new_page.set_birth_lsn(lsn);
         self.pages_insert(new_pid, Slot::Dirty(Arc::new(new_page)));
 

@@ -1,7 +1,6 @@
 //! Sharded embedded metadata database: the glue between `PageStore`,
 //! `ManifestStore`, and one `BTree` per shard.
 //!
-//! Phase 4 scope:
 //! - N independent COW B+tree shards behind one `Db`
 //! - xxh3-based shard router
 //! - thread-safe point writes via one mutex per shard
@@ -39,10 +38,8 @@ use crate::tx::{ApplyOutcome, Transaction};
 use crate::types::{FIRST_DATA_PAGE, Lba, Lsn, PageId, Pba, SnapshotId, VolumeOrdinal};
 use crate::verify;
 
-/// Ordinal of the always-present bootstrap volume. Phase B commit 5 keeps the
-/// surface API single-volume, so every L2P routing decision lands here. Later
-/// commits take per-volume arguments from callers and route through the map
-/// directly.
+/// Ordinal of the always-present bootstrap volume. Legacy single-volume entry
+/// points route here; volume-aware APIs route through the volume map directly.
 const BOOTSTRAP_VOLUME_ORD: VolumeOrdinal = 0;
 
 /// Embedded metadata database.
@@ -57,17 +54,12 @@ pub struct Db {
     /// All access still goes through the same `Mutex<ManifestState>`,
     /// so lock semantics are unchanged.
     manifest_state: Arc<Mutex<ManifestState>>,
-    /// Per-volume L2P paged radix-tree shard groups. Phase B commit 5 always
-    /// contains exactly one entry for [`BOOTSTRAP_VOLUME_ORD`]; commit 6/7
-    /// introduce real `create_volume` / `drop_volume` / `clone_volume` traffic
-    /// that mutates this map. The map lives behind an `RwLock` so the hot
-    /// path (commit / get / range) takes `.read()` — contention happens only
-    /// against the rare volume-lifecycle writer.
+    /// Per-volume L2P paged radix-tree shard groups. The map lives behind an
+    /// `RwLock` so the hot path (commit / get / range) takes `.read()`; contention
+    /// happens only against rare volume-lifecycle writers.
     ///
     /// Each volume owns its own `Vec<L2pShard>`; xxh3 routing divides by
-    /// `volume.shards.len()`, so shard routing is identical to the pre-7
-    /// flat-shard layout as long as every volume is created with the same
-    /// shard count.
+    /// `volume.shards.len()`.
     ///
     /// Wrapped in `Arc` so background workers (e.g. the L2P streaming
     /// writeback in [`streaming_flush`]) can hold a reference and iterate
@@ -77,11 +69,9 @@ pub struct Db {
     /// refcount, remaining 24 bytes reserved). Refcount is a global running
     /// tally — not per-volume — and stays at the top level for that reason.
     refcount_shards: Vec<Shard>,
-    /// Global dedup index: 32-byte SHA-256 content hash → 28-byte opaque
-    /// `DedupValue`. Backed by [`crate::dedup::DedupIndex`] so the apply path can
-    /// fan writes across multiple LSMs once Phase 3 wires per-shard
-    /// apply lanes; in Phase 1 the wrapper holds a single shard and
-    /// behaves identically to `Arc<Lsm>`.
+    /// Global dedup index: content hash -> opaque `DedupValue`. Backed by
+    /// [`crate::dedup::DedupIndex`] so the apply path can fan writes across
+    /// independent dedup shards.
     dedup_index: Arc<crate::dedup::DedupIndex>,
     /// One FIFO apply lane per dedup shard. Each shard's lane
     /// preserves WAL-order apply for ops within that shard; ops in
@@ -99,13 +89,12 @@ pub struct Db {
     /// background flush jobs once the active LSM crosses its
     /// threshold.
     dedup_maintenance_queued: Box<[Arc<AtomicBool>]>,
-    /// LSN allocator. Buffer-as-sole-journal Phase D.5b retired the WAL
-    /// writer; data-plane durability rides on onyx's LV2 buffer, lifecycle
-    /// records ride on [`crate::lifecycle_log`]. The allocator just bumps
-    /// a monotonic counter under a mutex while the caller registers its
-    /// dispatch footprint in the same critical section, preserving the
-    /// "every lower LSN's footprint is known before a higher LSN can be
-    /// assigned" invariant the dispatch scheduler relies on.
+    /// LSN allocator. Data-plane durability rides on onyx's LV2 buffer;
+    /// lifecycle records ride on [`crate::lifecycle_log`]. The allocator bumps a
+    /// monotonic counter under a mutex while the caller registers its dispatch
+    /// footprint in the same critical section, preserving the "every lower
+    /// LSN's footprint is known before a higher LSN can be assigned" invariant
+    /// the dispatch scheduler relies on.
     lsn_alloc: LsnAllocator,
     /// Highest unlogged LSN applied in memory but not yet covered by a
     /// durable checkpoint. This is only for embedder fast paths whose
@@ -122,18 +111,17 @@ pub struct Db {
     /// the Db. Drives the WAL vs unlogged routing in
     /// `commit_ops_with_options`.
     journal_mode: crate::config::MetaDbJournalMode,
-    /// ZFS-TXG-clone Phase 1: when true, L2P-only commits skip the
-    /// apply-lane channel hop and apply directly on the caller
-    /// thread. See `Config::commit_direct_apply_enabled`.
+    /// When true, L2P-only commits skip the apply-lane channel hop and apply
+    /// directly on the caller thread. See
+    /// `Config::commit_direct_apply_enabled`.
     commit_direct_apply_enabled: bool,
     /// Excludes apply phases from flush / snapshot. Commit takes
     /// `.read()` across the apply + bump; flush / take_snapshot /
     /// drop_snapshot take `.write()` so they observe a quiescent tree
-    /// state matching `last_applied_lsn`. Replaces the phase-6
-    /// `commit_lock`: submission to the WAL now happens **outside** any
-    /// lock, so concurrent submitters land in the same WAL group-commit
-    /// batch. Apply order is restored by the LSN-ordered condvar queue
-    /// below, not by serialising WAL submits.
+    /// state matching `last_applied_lsn`. WAL submission happens **outside**
+    /// this lock, so concurrent submitters can land in the same WAL
+    /// group-commit batch. Apply order is restored by the LSN-ordered condvar
+    /// queue below, not by serialising WAL submits.
     /// Wrapped in `Arc` for the same reason as `manifest_state`: lets
     /// background workers clone the handle and acquire `read()` /
     /// `write()` without depending on `Arc<Db>`.
@@ -190,15 +178,13 @@ pub struct Db {
     /// commit fails after a higher-LSN commit has already been durably
     /// acked by another WAL lane.
     commit_poison: Mutex<Option<String>>,
-    /// ZFS port Part B — sticky failure set when a forced TXG sync cycle fails
-    /// non-recoverably (e.g. a faulted manifest fsync), via `poison_sync`. Once
-    /// set, forced-sync lifecycle ops (`take_snapshot`, `flush_with_gate`,
-    /// `create_volume`, restore) fail fast instead of blocking on the slot the
-    /// failed sync left stuck in Syncing. A failed inline sync may have left
-    /// deferred RC apply state un-retryable, so recovery is a process restart;
-    /// never cleared in-process (reset only by a fresh `Db` constructor on
-    /// reopen). Paired with `TxgStateMachine::aborted` (which unblocks the txg
-    /// waiters); this field surfaces the human-readable "restart required" error.
+    /// Sticky failure set when a forced BFG sync fails non-recoverably, for
+    /// example a faulted manifest fsync. Once set, forced-sync lifecycle ops
+    /// (`take_snapshot`, `flush_with_gate`, `create_volume`, restore) fail fast
+    /// instead of blocking on the slot the failed sync left stuck in Syncing. A
+    /// failed inline sync may have left deferred RC apply state un-retryable, so
+    /// recovery is a process restart. Paired with `BfgStateMachine::aborted`,
+    /// which unblocks the BFG waiters.
     sync_poison: Mutex<Option<String>>,
     /// Scheduler for post-WAL dispatch into apply lanes. It lets a higher
     /// LSN bypass lower LSNs only when their declared lane footprints are
@@ -280,15 +266,15 @@ pub struct Db {
     /// Wrapped in `Mutex` so `Drop` can take + stop the worker
     /// even from a `&self` context.
     async_reclaim: Mutex<Option<async_reclaim::AsyncReclaim>>,
-    /// ZFS port Phase 3b: background per-clone page-livelist condense
-    /// worker. Bounds livelist chain growth under clone-overwrite churn.
+    /// Background per-clone page-livelist condense worker. Bounds livelist
+    /// chain growth under clone-overwrite churn.
     /// `None` when `cfg.livelist_condense_min_segments == 0`. Mirrors
     /// `async_reclaim`'s `Mutex<Option<…>>` so `Drop` can take + stop it
     /// from a `&self` context. Independent of `async_reclaim_enabled`.
     livelist_condense: Mutex<Option<livelist_condense::LivelistCondenser>>,
     /// Background Lineage GC driver — the sole production trigger for
     /// FreePbas-emitting PBA reclaim. Mirrors `async_reclaim` /
-    /// `txg_sync`: wrapped in `Mutex` so `Drop` can take + stop it from a
+    /// `bfg_sync`: wrapped in `Mutex` so `Drop` can take + stop it from a
     /// `&self` context. `None` when `cfg.lineage_gc_enabled = false`
     /// (metadb-standalone default; onyx defaults it on).
     lineage_gc_worker: Mutex<Option<lineage_gc::LineageGcWorker>>,
@@ -296,14 +282,13 @@ pub struct Db {
     /// and read paths to decide whether to consult the L2P buffer or
     /// go straight to the tree. When `true`, the per-shard ring buffer
     /// in [`crate::db::l2p_buffer::L2pBuffer`] stamps commits by their
-    /// `TxgGuard.txg`; the [`crate::db::txg_sync::TxgSyncThread`]
-    /// drains each Syncing TXG's slot into the tree (or
-    /// `flush_with_gate` does so inline when `txg_threads_enabled =
+    /// `BfgGuard.bfg`; the [`crate::db::bfg_sync::BfgSyncThread`]
+    /// drains each Syncing BFG's slot into the tree (or
+    /// `flush_with_gate` does so inline when `bfg_threads_enabled =
     /// false`).
     l2p_buffer_enabled: bool,
-    /// [[no-refcount-hot-path-design]] Phase 5. Cached copy of
-    /// `Config::lineage_gc_emit_freepbas`. Create/open reject the old
-    /// Phase 3 flag-off mode; this stays as a compatibility field for
+    /// Cached copy of `Config::lineage_gc_emit_freepbas`. Create/open reject
+    /// the old flag-off mode; this stays as a compatibility field for
     /// config/wire stability.
     lineage_gc_emit_freepbas: bool,
     /// Cached copy of `Config::lineage_gc_drop_dedup_shared`. When true the
@@ -312,57 +297,46 @@ pub struct Db {
     /// Only safe in a DB that never creates snapshots/clones (see the config
     /// field doc); onyx sets it, metadb standalone defaults false.
     lineage_gc_drop_dedup_shared: bool,
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 7. Optional sink
-    /// invoked when a `commit_free_pbas` apply produces a non-empty
-    /// `ApplyOutcome::FreePbas.freed_pbas`. Onyx registers a sink at
-    /// startup so the engine-side cleanup (`SpaceAllocator::retire_*`
-    /// + dedup candidate cache invalidation) can drain reclamation
-    /// signals out of metadb's internal lineage-GC commit path.
-    /// Internal `commit_ops` calls (e.g. `run_lineage_gc_cycle_inner`)
-    /// invoke the sink synchronously after a successful commit; the
-    /// sink must not call back into metadb's commit path. None when
-    /// no consumer has subscribed (the default — keeps Phase 4 tests
-    /// that drive the GC directly free of side effects).
+    /// Optional sink invoked when a `commit_free_pbas` apply produces a
+    /// non-empty `ApplyOutcome::FreePbas.freed_pbas`. Onyx registers a sink at
+    /// startup so engine-side cleanup (`SpaceAllocator::retire_*` + dedup
+    /// candidate cache invalidation) can drain reclamation signals out of
+    /// metadb's internal lineage-GC commit path. Internal `commit_ops` calls
+    /// invoke the sink synchronously after a successful commit; the sink must
+    /// not call back into metadb's commit path. None when no consumer has
+    /// subscribed.
     freed_pbas_sink: Mutex<Option<FreedPbasSink>>,
-    /// ZFS-TXG-clone Phase 2: staged-outcome map shared between
-    /// `commit_ops_deferred` (stager) and the L2P compactor's per-pass
-    /// drain. Always constructed even when
-    /// `Config::commit_deferred_outcomes_enabled = false`, so the sync
-    /// path can transparently route through the deferred entry point
-    /// without an extra branch on the hot path. See
-    /// [`crate::db::commit::outcomes`] and
-    /// `/root/.claude/plans/soft-doodling-snail.md`.
+    /// Staged-outcome map shared between `commit_ops_deferred` and the L2P
+    /// compactor's per-pass drain. Always constructed even when
+    /// `Config::commit_deferred_outcomes_enabled = false`, so the sync path can
+    /// route through the deferred entry point without an extra branch on the
+    /// hot path. See [`crate::db::commit::outcomes`].
     deferred_outcomes: Arc<crate::db::commit::DeferredOutcomeAggregator>,
     /// Cached copy of `Config::commit_deferred_outcomes_enabled` so the
     /// commit path can decide whether to park the outcome vec
     /// (`deferred=true`) or send it through the channel immediately
-    /// (`deferred=false`, restoring the pre-Phase-2 latency profile).
+    /// (`deferred=false`, synchronous delivery).
     commit_deferred_outcomes_enabled: bool,
-    /// ZFS-TXG-clone Phase 3: cached copy of
-    /// `Config::wal_async_commits_enabled`. Only consulted by
-    /// `commit_ops_deferred` and only when
-    /// `commit_deferred_outcomes_enabled` is also true — async WAL on
-    /// the synchronous outcome path is an untested combination. When
-    /// both flags are on, the deferred-outcome commit path threads
-    /// `SubmitOptions { synchronous: false }` into the WAL so the
-    /// writer thread acks after `seg.append` and skips the per-batch
-    /// fsync. Durability is restored at the next `flush_with_gate`
-    /// via `WalSet::fsync_all_lanes` before the manifest commit.
+    /// Cached copy of `Config::wal_async_commits_enabled`. Only consulted by
+    /// `commit_ops_deferred` and only when `commit_deferred_outcomes_enabled`
+    /// is also true. When both flags are on, the deferred-outcome commit path
+    /// threads `SubmitOptions { synchronous: false }` into the WAL so the
+    /// writer thread acks after `seg.append` and skips the per-batch fsync.
+    /// Durability is restored at the next `flush_with_gate` via
+    /// `WalSet::fsync_all_lanes` before the manifest commit.
     wal_async_commits_enabled: bool,
-    /// ZFS-TXG-clone Phase 4: global TXG epoch state machine. Commit
-    /// path acquires a [`crate::txg::TxgGuard`] before applying ops so
-    /// the eventual `TxgSyncThread` can drain a frozen TXG slot.
-    /// Initialised from `manifest.checkpoint_txg` so a re-open resumes
-    /// accounting where the previous run's last sync left off.
-    pub(crate) txg: Arc<crate::txg::TxgStateMachine>,
-    /// Cached copy of `Config::txg_threads_enabled`. When `true`, the
-    /// background TXG quiesce + sync workers are spawned at open time
+    /// Global BFG epoch state machine. Commit path acquires a
+    /// [`crate::bfg::BfgGuard`] before applying ops so `BfgSyncThread` can drain
+    /// a frozen slot. Initialised from `manifest.checkpoint_bfg` so a re-open
+    /// resumes accounting where the previous run's last sync left off.
+    pub(crate) bfg: Arc<crate::bfg::BfgStateMachine>,
+    /// Cached copy of `Config::bfg_threads_enabled`. When `true`, the
+    /// background BFG quiesce + sync workers are spawned at open time
     /// and `flush_with_gate` reaches durability via `force_roll +
-    /// wait_until_synced`. Step 7 lands the threading scaffold;
-    /// Step 8 retargets the actual sync work at it.
-    pub(crate) txg_threads_enabled: bool,
+    /// wait_until_synced`.
+    pub(crate) bfg_threads_enabled: bool,
     /// Cached copy of `Config::parallel_l2p_drain_enabled`. Fans the
-    /// per-TXG L2P syncing-slot drain out across shards when `true`.
+    /// per-BFG L2P syncing-slot drain out across shards when `true`.
     pub(crate) parallel_l2p_drain_enabled: bool,
     /// Cached copy of `Config::l2p_drain_chunk_entries`. Bounds buffered
     /// entries folded per `tree.write()` hold in the syncing-slot drain
@@ -375,18 +349,18 @@ pub struct Db {
     /// Notifier always allocated so `flush_with_gate` can hand a clone
     /// to the (optional) quiesce worker without taking a mutex. Cheap —
     /// just a `Mutex<bool> + Condvar`.
-    pub(crate) txg_quiesce_notifier: Arc<txg_quiesce::QuiesceNotifier>,
+    pub(crate) bfg_quiesce_notifier: Arc<bfg_quiesce::QuiesceNotifier>,
     /// Sync-side notifier, always allocated; see above.
-    pub(crate) txg_sync_notifier: Arc<txg_sync::SyncNotifier>,
-    /// Quiesce worker handle. `Some` iff `txg_threads_enabled`. `Mutex`
+    pub(crate) bfg_sync_notifier: Arc<bfg_sync::SyncNotifier>,
+    /// Quiesce worker handle. `Some` iff `bfg_threads_enabled`. `Mutex`
     /// so `Drop` can take + stop it from a `&self` context.
-    pub(crate) txg_quiesce: Mutex<Option<txg_quiesce::TxgQuiesceThread>>,
-    /// Sync worker handle. `Some` iff `txg_threads_enabled`. Stop order
-    /// in `Drop` is quiesce → sync so no new TXG enters Syncing after
+    pub(crate) bfg_quiesce: Mutex<Option<bfg_quiesce::BfgQuiesceThread>>,
+    /// Sync worker handle. `Some` iff `bfg_threads_enabled`. Stop order
+    /// in `Drop` is quiesce → sync so no new BFG enters Syncing after
     /// the quiesce side is gone, and the sync side drains whatever it
     /// has before exiting.
-    pub(crate) txg_sync: Mutex<Option<txg_sync::TxgSyncThread>>,
-    /// Buffer-as-sole-journal Phase B watermark hook. The onyx engine
+    pub(crate) bfg_sync: Mutex<Option<bfg_sync::BfgSyncThread>>,
+    /// Buffer-backed journal watermark hook. The onyx engine
     /// stamps this atomic to "the highest LV2 buffer entry seq whose
     /// flusher-derived mutations are now in metadb's in-memory state".
     /// The next checkpoint commit copies it into
@@ -401,29 +375,27 @@ pub struct Db {
     /// lifecycle-log seq whose effects are in memory. Persisted as
     /// `manifest.lifecycle_replay_seq`.
     pub(crate) lifecycle_applied_watermark: AtomicU64,
-    /// Buffer-as-sole-journal Phase C.3 lifecycle journal. `Some` iff
-    /// the embedder selected a non-WAL [`crate::config::MetaDbJournalMode`]:
-    /// in that mode lifecycle ops (`CreateVolume`, `DropVolume`,
-    /// `CloneVolume`, `DropSnapshot`, promotion records) bypass the WAL
-    /// and append a single [`crate::lifecycle_log::op::LifecycleOp`]
-    /// record per fsync. WAL mode leaves the field `None` and the
-    /// existing `submit_wal_ops` path is unchanged.
+    /// Buffer-backed lifecycle journal. `Some` iff the embedder selected a
+    /// non-WAL [`crate::config::MetaDbJournalMode`]: in that mode lifecycle ops
+    /// (`CreateVolume`, `DropVolume`, `CloneVolume`, `DropSnapshot`, promotion
+    /// records) bypass the WAL and append a single
+    /// [`crate::lifecycle_log::op::LifecycleOp`] record per fsync. WAL mode
+    /// leaves the field `None` and the existing `submit_wal_ops` path is
+    /// unchanged.
     pub(crate) lifecycle_journal: Option<Mutex<crate::lifecycle_log::LifecycleJournal>>,
-    /// ZFS `dsl_sync_task` port: snapshot-lifecycle ops that ride the TXG
-    /// sync cycle instead of blocking the write path. `take_snapshot`
-    /// pushes a [`PendingSyncTask`] here under a `txg.enter()` guard,
-    /// forces the open TXG to sync, and blocks on `wait_until_synced`;
-    /// [`Db::drain_pending_sync_tasks`] (called from
-    /// [`Db::run_sync_cycle_body`]'s manifest window) does the real work
-    /// in syncing context — durable atomically with that TXG's manifest
-    /// commit — and fills each task's `result` slot. Writers join the
-    /// next open TXG and never block on the snapshot.
+    /// Snapshot-lifecycle ops that ride the BFG sync cycle instead of blocking
+    /// the write path. `take_snapshot` pushes a [`PendingSyncTask`] here under
+    /// a `bfg.enter()` guard, forces the open group to sync, and blocks on
+    /// `wait_until_synced`; [`Db::drain_pending_sync_tasks`] (called from
+    /// [`Db::run_sync_cycle_body`]'s manifest window) does the real work in
+    /// syncing context, durable atomically with that group's manifest commit,
+    /// and fills each task's `result` slot. Writers join the next open group
+    /// and never block on the snapshot.
     pub(crate) pending_sync_tasks: Mutex<Vec<PendingSyncTask>>,
 }
 
-/// A snapshot-lifecycle op queued to ride the TXG sync cycle (see
-/// [`Db::pending_sync_tasks`]). Stage 1 carries only `TakeSnapshot`;
-/// Stage 2/3 extend [`SyncTaskOp`] with drop / clone.
+/// A snapshot-lifecycle op queued to ride the BFG sync cycle (see
+/// [`Db::pending_sync_tasks`]).
 ///
 /// The take is **manifest-only**: the sync cycle folds the snapshot-root
 /// incref into its OWN page-rc checkpoint, atomic with the manifest
@@ -432,22 +404,21 @@ pub struct Db {
 /// idempotent across the cycle's phases.
 pub(crate) struct PendingSyncTask {
     pub(crate) op: SyncTaskOp,
-    /// Open TXG at enqueue time. The cycle processes the task only when
-    /// it is syncing exactly this TXG, so the forced sync the caller
+    /// Open BFG at enqueue time. The cycle processes the task only when
+    /// it is syncing exactly this BFG, so the forced sync the caller
     /// triggered is the one that runs it.
-    pub(crate) target_txg: crate::types::Txg,
+    pub(crate) target_bfg: crate::types::Bfg,
     /// Outcome, filled by the cycle. The caller reads it after
     /// `wait_until_synced` (threads-on) or after driving the inline
     /// `flush_with_gate(Forced)` (threads-off) returns. No condvar: the
-    /// TXG-sync completion the caller already waits on happens-after the
+    /// BFG-sync completion the caller already waits on happens-after the
     /// cycle fills this.
     pub(crate) result: Arc<Mutex<Option<Result<SnapshotId>>>>,
     /// `Some` once the cycle has assigned the id + written the SnapshotRoots
     /// page + built the `SnapshotEntry` (done once, the first attempt). It
-    /// carries the exact entry to insert into the committed manifest (A4)
-    /// and the stable snapshot-root set the force-incref is recomputed from
-    /// on every cycle attempt. The take is manifest-only; the path-B
-    /// force-incref needs no reserved lsn.
+    /// carries the exact entry to insert into the committed manifest and the
+    /// stable snapshot-root set the force-incref is recomputed from on every
+    /// cycle attempt. The take is manifest-only and needs no reserved LSN.
     pub(crate) committed_entry: Option<SnapshotEntry>,
 }
 
@@ -490,13 +461,11 @@ struct DispatchState {
     pending: BTreeMap<Lsn, DispatchEntry>,
 }
 
-/// Monotonic LSN allocator. Replaces the WAL set's `reserve_unlogged`
-/// path after [[buffer-as-sole-journal-d-progress]] Phase D.5b retired
-/// the WAL writer. Allocation runs under a short mutex so the caller's
-/// `reserve` callback (which registers the commit's dispatch footprint)
-/// completes before any higher LSN is handed out — the dispatch
-/// scheduler relies on every lower-LSN footprint being visible before a
-/// higher LSN can race ahead.
+/// Monotonic LSN allocator for buffer-backed commits. Allocation runs under a
+/// short mutex so the caller's `reserve` callback (which registers the commit's
+/// dispatch footprint) completes before any higher LSN is handed out. The
+/// dispatch scheduler relies on every lower-LSN footprint being visible before
+/// a higher LSN can race ahead.
 pub(crate) struct LsnAllocator {
     next_lsn: Mutex<Lsn>,
 }
@@ -528,17 +497,17 @@ struct DispatchEntry {
     durable: bool,
 }
 
-/// Snapshot view info cached per volume. Kept for remap-era compatibility
-/// and future snapshot-aware consumers; Phase 5 RangeDelete no longer uses
-/// it for PBA refcount decisions.
+/// Snapshot view info cached per volume. Kept for snapshot-aware readers and
+/// compatibility with older remap code; RangeDelete no longer uses it for PBA
+/// refcount decisions.
 #[derive(Clone, Debug)]
 struct SnapInfo {
     created_lsn: Lsn,
-    /// v21 (ZFS port Phase 4 S1): the snapshot's fold-watermark
-    /// (`max(root.birth_lsn)` over its captured roots). The birth COW-kill
-    /// oracle (`youngest_snap_lsn`) feeds on `max(capture_watermark)`, NOT
-    /// `created_lsn` — see `SnapshotEntry::capture_watermark`. Rebuilt from the
-    /// durable `SnapshotEntry` on reopen so replay reproduces the same gate.
+    /// The snapshot's fold-watermark (`max(root.birth_lsn)` over captured
+    /// roots). The birth COW-kill oracle (`youngest_snap_lsn`) feeds on
+    /// `max(capture_watermark)`, NOT `created_lsn`; see
+    /// `SnapshotEntry::capture_watermark`. Rebuilt from the durable
+    /// `SnapshotEntry` on reopen so replay reproduces the same gate.
     capture_watermark: Lsn,
     /// Per-shard root page ids. Indexed by `shard_for_key_l2p(...)`,
     /// matching the volume's live shard layout (snapshot's roots are
@@ -1090,12 +1059,7 @@ struct L2pShard {
 
 /// L2P home for one user-facing volume. Owns its own shard group; shard
 /// routing inside a volume uses `xxh3_64(lba) % shards.len()`, identical to
-/// the pre-7 flat layout.
-///
-/// Fields beyond `shards` are placeholders for commit 6/7 semantics:
-/// `created_lsn` will be stamped by `CreateVolume` / `CloneVolume` so
-/// recovery can skip L2P ops for volumes that hadn't been created yet at a
-/// given LSN; `flags` is reserved for the drop-pending bit.
+/// the old flat layout when there is only one volume.
 #[allow(dead_code)]
 struct Volume {
     ord: VolumeOrdinal,
@@ -1108,21 +1072,21 @@ struct Volume {
     dead_list: Arc<crate::deadlist::DeadListState>,
     /// Persistent anchor of the volume's dead-list chain (oldest segment).
     /// Loaded from `VolumeEntry.dead_list_head_pid` on `Db::open`, advanced
-    /// by Phase 3 GC. `NULL_PAGE` while the chain is empty.
+    /// by Lineage GC. `NULL_PAGE` while the chain is empty.
     dead_list_head_pid: AtomicU64,
     /// Persistent anchor of the volume's dead-list chain (newest segment).
     /// Loaded from `VolumeEntry.dead_list_tail_pid` on `Db::open`, advanced
     /// on every checkpoint flush that writes a new segment.
     dead_list_tail_pid: AtomicU64,
-    /// v18 (ZFS port Phase 2): in-memory HEAD page-deadlist append buffer.
+    /// In-memory HEAD page-deadlist append buffer.
     /// Holds `(PageId, birth_lsn, death_lsn)` for L2P metadata pages that
     /// died off the head during COW while pinned by a snapshot. Separate
     /// from `dead_list` (PBAs) above; same [`crate::deadlist`] codec.
     /// Pushed by the apply-layer / compactor-fold emitter, drained at
     /// checkpoint, sealed into a snapshot on `take_snapshot`.
     ///
-    /// H1 (ZFS port Phase 4): **one accumulator per L2P shard** (`len ==
-    /// shards.len()`), not one per volume. The steady flush drains each
+    /// **One accumulator per L2P shard** (`len == shards.len()`), not one per
+    /// volume. The steady flush drains each
     /// shard under its OWN durable-root watermark `root_birth_lsn(shard)`
     /// (`flush.rs`), which is the exact crash-complete seal bound — a
     /// single per-volume bound is provably unsound (max over-seals a
@@ -1139,11 +1103,10 @@ struct Volume {
     /// v18: newest segment of the HEAD page-deadlist chain (apply-time
     /// append anchor). Loaded from `VolumeEntry.page_dead_list_tail_pid`.
     page_dead_list_tail_pid: AtomicU64,
-    /// v19 (ZFS port Phase 3b): in-memory per-clone page-livelist append
-    /// buffer. Holds ALLOC/FREE `LiveRecord`s for this clone's clone-private
-    /// L2P pages (`birth > branched_at_lsn`). Empty / unused for non-clone
-    /// volumes (their shard trees have `clone_birth_lsn == None`, so nothing
-    /// is captured). Drained at checkpoint into the livelist chain.
+    /// In-memory per-clone page-livelist append buffer. Holds ALLOC/FREE
+    /// `LiveRecord`s for this clone's clone-private L2P pages
+    /// (`birth > branched_at_lsn`). Empty / unused for non-clone volumes.
+    /// Drained at checkpoint into the livelist chain.
     page_live_list: Arc<crate::livelist::LiveListState>,
     /// v19: oldest segment of the per-clone page-livelist chain. Loaded from
     /// `VolumeEntry.page_live_list_head_pid`; advanced by condense.
@@ -1151,14 +1114,14 @@ struct Volume {
     /// v19: newest segment of the page-livelist chain (apply-time append
     /// anchor). Loaded from `VolumeEntry.page_live_list_tail_pid`.
     page_live_list_tail_pid: AtomicU64,
-    /// v20 (ZFS port Phase 4 Step 4 / S0): oldest segment of this volume's
-    /// promoted-PBA log chain. Loaded from `VolumeEntry.promoted_log_head_pid`.
+    /// Oldest segment of this volume's promoted-PBA log chain. Loaded from
+    /// `VolumeEntry.promoted_log_head_pid`.
     promoted_log_head_pid: AtomicU64,
     /// v20: newest segment of the promoted-PBA log (append anchor for the
     /// promotion walker). Loaded from `VolumeEntry.promoted_log_tail_pid`.
     promoted_log_tail_pid: AtomicU64,
-    /// Phase 4 lineage tracking — mirrors
-    /// [`VolumeEntry::parent_vol_ord`]. `INVALID_VOLUME` encodes
+    /// Clone-lineage tracking; mirrors [`VolumeEntry::parent_vol_ord`].
+    /// `INVALID_VOLUME` encodes
     /// `Option::None`. Loaded on `Db::open`; mutated only by clone /
     /// promotion-complete paths under `apply_gate.write()` (single
     /// writer, so a relaxed atomic is sufficient).
@@ -1238,21 +1201,18 @@ impl Volume {
         }
     }
 
-    /// Variant of [`with_dead_list_anchor`] that also carries Phase 4
-    /// lineage fields. Used by `Db::open` to seed clones from the
-    /// persisted `VolumeEntry` and by `Db::clone_volume` to mark a
-    /// freshly-minted clone before its background promotion walker
-    /// starts. `branched_at_lsn` is immutable for the volume's lifetime
-    /// (it pins the slice of parent history the clone shares); the
-    /// other two move only on explicit lineage events.
+    /// Variant of [`with_dead_list_anchor`] that also carries clone-lineage
+    /// fields. Used by `Db::open` to seed clones from the persisted
+    /// `VolumeEntry` and by `Db::clone_volume` to mark a freshly-minted clone
+    /// before its background promotion walker starts. `branched_at_lsn` is
+    /// immutable for the volume's lifetime; the other fields move only on
+    /// explicit lineage events.
     ///
-    /// v19 (ZFS port Phase 3b): also carries the persisted `flags` (so the
-    /// sticky `VOLUME_FLAG_CLONE_LINEAGE` survives reopen — `refresh_manifest_*`
-    /// writes `flags.load()` back, so a hardcoded 0 would wipe it), the
-    /// per-clone page-livelist anchors, and `clone_birth_lsn` — the sticky
-    /// capture threshold (`Some(branched_at_lsn)` for clones, including
-    /// promoted ex-clones; `None` otherwise) which is armed on every shard
-    /// tree here so the COW witness logs ALLOC/FREE for `birth > B` pages.
+    /// Also carries the persisted `flags` so the sticky
+    /// `VOLUME_FLAG_CLONE_LINEAGE` survives reopen, the per-clone page-livelist
+    /// anchors, and `clone_birth_lsn`: the sticky capture threshold armed on
+    /// every shard tree so the COW witness logs ALLOC/FREE for pages born after
+    /// the clone branched.
     #[allow(clippy::too_many_arguments)]
     fn with_lineage(
         ord: VolumeOrdinal,
@@ -1457,8 +1417,8 @@ mod livelist_condense;
 mod promotion;
 mod snapshot;
 mod streaming_flush;
-mod txg_quiesce;
-mod txg_sync;
+mod bfg_quiesce;
+mod bfg_sync;
 mod volume;
 
 pub use commit::DeferredOutcomeHandle;
@@ -1478,13 +1438,10 @@ impl Drop for Db {
         if let Some(mut flusher) = self.l2p_writeback.lock().take() {
             flusher.stop();
         }
-        // ZFS-TXG-clone Phase 4 Step 8: stop the TXG worker pair before
-        // volume trees / page cache go away. Quiesce stops first so no
-        // new TXG enters Syncing; sync drains any in-flight cycle.
-        // Inert when `txg_threads_enabled = false`. With the legacy
-        // `L2pCompactor` retired this is the only background owner of
-        // `tree.write()` + `publish_l2p_read_view` per shard.
-        self.stop_txg_threads();
+        // Stop the BFG worker pair before volume trees / page cache go away.
+        // Quiesce stops first so no new group enters Syncing; sync drains any
+        // in-flight cycle. Inert when `bfg_threads_enabled = false`.
+        self.stop_bfg_threads();
         // Stop the Lineage GC driver before page_store / refcount / dedup
         // teardown — its cycle calls `run_lineage_gc_cycle_inner` which
         // touches commit_ops, page_store, the refcount shards and the
@@ -1493,8 +1450,8 @@ impl Drop for Db {
         if let Some(mut worker) = self.lineage_gc_worker.lock().take() {
             worker.stop();
         }
-        // Phase 4 inline-delivery: nothing parks in the aggregator, so
-        // poison_all is a no-op kept only for API parity.
+        // Inline-delivery mode parks nothing in the aggregator, so poison_all is
+        // a no-op kept only for API parity.
         self.deferred_outcomes
             .poison_all("metadb: db shutting down");
         // Stop the async reclaim worker before page_store /
@@ -1504,10 +1461,8 @@ impl Drop for Db {
         if let Some(mut worker) = self.async_reclaim.lock().take() {
             worker.stop();
         }
-        // ZFS port Phase 3b: stop the livelist-condense worker before
-        // page_store / page_cache go away — it holds clones of both and may
-        // be mid-rewrite. Joining here serializes its teardown ahead of the
-        // page-store drop.
+        // Stop the livelist-condense worker before page_store / page_cache go
+        // away; it holds clones of both and may be mid-rewrite.
         if let Some(mut worker) = self.livelist_condense.lock().take() {
             worker.stop();
         }
@@ -1517,7 +1472,7 @@ impl Drop for Db {
         // never drop and the threads would run forever — the same
         // circular-shutdown shape as the refcount drainers below.
         self.dedup_index.detach_drainers();
-        // The refcount fold is inline + per-TXG-slot now — no background rc
+        // The refcount fold is inline + per-BFG-slot now — no background rc
         // drainer threads to detach (see `refcount::shard`).
         // ApplyLanes have their own Drop that joins their workers;
         // they fire automatically when the Box goes out of scope.
@@ -1532,27 +1487,22 @@ impl Db {
         self.rc_authoritative_reclaim
     }
 
-    /// Test helper: synchronously drain every L2P shard's TXG ring
-    /// buffer into the on-disk tree on the caller thread. Pre-Phase-4
-    /// this drove the `L2pCompactor`'s force-pass; after Step 8 the
-    /// compactor is retired, so this is now a thin alias for
-    /// [`Db::force_compact_l2p_buffers`] (the same helper the
-    /// snapshot / range_delete / [`Db::flush_with_gate`] inline path
-    /// uses to make the tree reflect every buffered LSN before
-    /// reading). Kept under the `test_*` name so the existing
-    /// commit / wal-async / deferred-outcomes proptest harnesses
-    /// continue to compile without modification.
+    /// Test helper: synchronously drain every L2P shard's BFG ring buffer into
+    /// the on-disk tree on the caller thread. This is a thin alias for
+    /// [`Db::force_compact_l2p_buffers`], the same helper used by snapshot,
+    /// range_delete, and inline flush paths before they read tree state. Kept
+    /// under the `test_*` name so existing proptest harnesses continue to
+    /// compile without modification.
     pub fn test_force_compact_pass(&self) {
         // Inert when `l2p_buffer_enabled = false`; otherwise loops
         // shards and drains their slots into the tree.
         let _ = self.force_compact_l2p_buffers();
     }
 
-    /// ZFS-TXG-clone Phase 4 inspection hook used by the
-    /// `db_phase4_txg` integration test. Returns the in-memory state
-    /// machine's `checkpoint_txg` snapshot.
-    pub fn txg_checkpoint_for_test(&self) -> u64 {
-        self.txg.checkpoint_txg()
+    /// BFG inspection hook used by integration tests. Returns the in-memory
+    /// state machine's `checkpoint_bfg` snapshot.
+    pub fn bfg_checkpoint_for_test(&self) -> u64 {
+        self.bfg.checkpoint_bfg()
     }
 
     /// Test helper: directly commit a `PromotionChunk` lifecycle record
@@ -1580,9 +1530,9 @@ impl Db {
 
 #[cfg(test)]
 impl Db {
-    /// Test helper: drain and return the in-memory dead-list buffer
-    /// for one volume. Used by Phase 2 tests in `db::tests::dead_list`
-    /// to inspect per-emit records without going through a flush.
+    /// Test helper: drain and return the in-memory dead-list buffer for one
+    /// volume, so tests can inspect per-emit records without going through a
+    /// flush.
     pub(crate) fn test_drain_dead_list(
         &self,
         vol_ord: VolumeOrdinal,
@@ -1611,9 +1561,9 @@ impl Db {
         })
     }
 
-    /// ZFS port Phase 2 test helper: number of buffered records in the
-    /// HEAD page-deadlist (L2P-page deaths captured but not yet drained
-    /// to a segment). Used to prove the COW witness actually populates.
+    /// Test helper: number of buffered records in the HEAD page-deadlist
+    /// (L2P-page deaths captured but not yet drained to a segment). Used to
+    /// prove the COW witness actually populates.
     pub(crate) fn test_page_dead_list_len(&self, vol_ord: VolumeOrdinal) -> Option<usize> {
         self.volumes
             .read()
@@ -1622,8 +1572,8 @@ impl Db {
             .map(|v| v.page_dead_list.iter().map(|a| a.len()).sum())
     }
 
-    /// ZFS port Phase 2 test helper: the volume's HEAD page-deadlist
-    /// `(head_pid, tail_pid)` anchors.
+    /// Test helper: the volume's HEAD page-deadlist `(head_pid, tail_pid)`
+    /// anchors.
     pub(crate) fn test_page_dead_list_anchors(
         &self,
         vol_ord: VolumeOrdinal,
@@ -1638,10 +1588,9 @@ impl Db {
         })
     }
 
-    /// ZFS port Phase 3b test helper: number of buffered records in the
-    /// per-clone page-livelist (ALLOC/FREE captured but not yet drained to
-    /// a segment). `None` for an unknown volume; `Some(0)` for a non-clone
-    /// (its trees never capture).
+    /// Test helper: number of buffered records in the per-clone page-livelist
+    /// (ALLOC/FREE captured but not yet drained to a segment). `None` for an
+    /// unknown volume; `Some(0)` for a non-clone.
     pub(crate) fn test_page_live_list_len(&self, vol_ord: VolumeOrdinal) -> Option<usize> {
         self.volumes
             .read()
@@ -1649,8 +1598,7 @@ impl Db {
             .map(|v| v.page_live_list.len())
     }
 
-    /// ZFS port Phase 3b test helper: the volume's page-livelist
-    /// `(head_pid, tail_pid)` anchors.
+    /// Test helper: the volume's page-livelist `(head_pid, tail_pid)` anchors.
     pub(crate) fn test_page_live_list_anchors(
         &self,
         vol_ord: VolumeOrdinal,
@@ -1665,11 +1613,11 @@ impl Db {
         })
     }
 
-    /// ZFS port Phase 3b test helper: drain + reconstruct the live-ALLOC set
-    /// (ALLOC minus matched FREE) from a volume's page-livelist — both the
-    /// durable chain and the not-yet-drained in-memory buffer — as a set of
-    /// `(pid, birth)` pairs. Lets a test assert the substrate equals the
-    /// clone-private reachable subtree without going through `verify_path`.
+    /// Test helper: drain + reconstruct the live-ALLOC set (ALLOC minus matched
+    /// FREE) from a volume's page-livelist — both the durable chain and the
+    /// not-yet-drained in-memory buffer — as a set of `(pid, birth)` pairs.
+    /// Lets a test assert clone-private reachability without going through
+    /// `verify_path`.
     pub(crate) fn test_clone_live_allocs(
         &self,
         vol_ord: VolumeOrdinal,
@@ -1687,10 +1635,9 @@ impl Db {
             .collect())
     }
 
-    /// ZFS port Phase 4 Step 4 (S0) test helper: the raw PBAs recorded in a
-    /// volume's promoted-PBA log chain (the global-rc edges promotion incref'd),
-    /// most-recent segment first. Reads the durable chain via the in-memory tail
-    /// anchor.
+    /// Test helper: raw PBAs recorded in a volume's promoted-PBA log chain
+    /// (the global-rc edges promotion incref'd), most-recent segment first.
+    /// Reads the durable chain via the in-memory tail anchor.
     #[cfg(test)]
     pub(crate) fn test_promoted_log_pbas(&self, vol_ord: VolumeOrdinal) -> Result<Vec<Pba>> {
         let vol = self.volume(vol_ord)?;
@@ -1703,8 +1650,7 @@ impl Db {
         Ok(records.into_iter().map(|r| r.pid).collect())
     }
 
-    /// ZFS port Phase 4 Step 4 (S0) test helper: the volume's promoted-PBA log
-    /// `(head, tail)` anchors.
+    /// Test helper: the volume's promoted-PBA log `(head, tail)` anchors.
     #[cfg(test)]
     pub(crate) fn test_promoted_log_anchors(
         &self,
@@ -1720,11 +1666,10 @@ impl Db {
         })
     }
 
-    /// ZFS port Phase 4 Step 4 (S1c) test helper: run the read-only clone
-    /// COW-kill birth-operand shadow over the current in-memory manifest +
-    /// page store, returning the safety-direction findings (empty == the
-    /// pure-birth clone operand is safe for the current state). Flush first so
-    /// the manifest reflects committed roots.
+    /// Test helper: run the read-only clone COW-kill birth-operand audit over
+    /// the current in-memory manifest + page store, returning safety-direction
+    /// findings. Empty means the birth-based clone operand is safe for the
+    /// current state. Flush first so the manifest reflects committed roots.
     #[cfg(test)]
     pub(crate) fn test_clone_birth_shadow_findings(&self) -> Result<Vec<String>> {
         crate::verify::clone_birth_shadow_findings(
@@ -1733,8 +1678,8 @@ impl Db {
         )
     }
 
-    /// ZFS port Phase 2 test helper: a snapshot's sealed page-deadlist
-    /// tail anchor, by snapshot id.
+    /// Test helper: a snapshot's sealed page-deadlist tail anchor, by snapshot
+    /// id.
     pub(crate) fn test_snapshot_page_dead_list_tail(&self, id: SnapshotId) -> Option<PageId> {
         self.manifest_state
             .lock()
@@ -1764,12 +1709,11 @@ impl Db {
         }
     }
 
-    /// S1c teeth helper: corrupt a volume's manifest `branched_at_lsn` so the
+    /// Test helper: corrupt a volume's manifest `branched_at_lsn` so the
     /// offline `clone_birth_shadow` operand drops that descendant from another
-    /// clone's pinner set WITHOUT touching the reachability ground truth — i.e.
-    /// simulate a regression where a descendant pin is missing/wrong. Manifest
-    /// only (the offline oracle reads `manifest_state.lock().manifest`); the
-    /// in-memory `Volume.branched_at_lsn` is immutable so it is left alone.
+    /// clone's pinner set without touching the reachability ground truth.
+    /// Manifest only; the in-memory `Volume.branched_at_lsn` is immutable so it
+    /// is left alone.
     #[cfg(test)]
     pub(crate) fn test_set_manifest_branched_at_lsn(&self, vol_ord: VolumeOrdinal, lsn: Lsn) {
         let mut mst = self.manifest_state.lock();
@@ -1778,11 +1722,9 @@ impl Db {
         }
     }
 
-    /// Test helper: drive one step of the
-    /// [[no-refcount-hot-path-design]] Phase 4 Step 5 promotion walker
-    /// for `vol_ord`. Returns the step outcome so tests can assert
-    /// whether a chunk was committed, completion has been reached, or
-    /// the volume isn't a clone.
+    /// Test helper: drive one step of the promotion walker for `vol_ord`.
+    /// Returns the step outcome so tests can assert whether a chunk was
+    /// committed, completion has been reached, or the volume isn't a clone.
     ///
     /// The production walker would call [`Db::run_promotion_chunk`] in
     /// a loop until [`promotion::PromotionStep::Completed`]; tests
@@ -1796,10 +1738,9 @@ impl Db {
         self.run_promotion_chunk(vol_ord)
     }
 
-    /// ZFS port Phase 3b test helper: synchronously run one livelist
-    /// condense scan with the given segment threshold, so tests assert
-    /// chain shrinkage deterministically without racing the background
-    /// worker. Mirrors [`Db::test_run_lineage_gc_cycle`].
+    /// Test helper: synchronously run one livelist condense scan with the given
+    /// segment threshold, so tests assert chain shrinkage deterministically
+    /// without racing the background worker.
     #[cfg(test)]
     pub(crate) fn test_run_livelist_condense(&self, min_segments: usize) -> Result<()> {
         livelist_condense::run_condense_scan_once(
@@ -1821,11 +1762,11 @@ impl Db {
     /// `db::tests::lineage_gc` to assert chain truncation without
     /// racing the background worker.
     ///
-    /// Phase 5 mode: each volume's plan + execute is interleaved with a
-    /// `commit_free_pbas` call carrying the segment's dead-record PBAs.
-    /// The plan's `rc==0` gate remains load-bearing because ordinary
-    /// shared refcounts should not reach zero unless the refcount event
-    /// ledger has already released them.
+    /// In rc-neutral lineage mode, each volume's plan + execute is interleaved
+    /// with a `commit_free_pbas` call carrying the segment's dead-record PBAs.
+    /// The plan's `rc==0` gate remains load-bearing because ordinary shared
+    /// refcounts should not reach zero unless the refcount event ledger has
+    /// already released them.
     pub(crate) fn test_run_lineage_gc_cycle(&self) -> Result<usize> {
         self.run_lineage_gc_cycle_inner()
     }
@@ -1853,8 +1794,8 @@ impl Db {
         };
         if !self.lineage_gc_emit_freepbas {
             return Err(MetaDbError::InvalidArgument(
-                "lineage_gc_emit_freepbas=false is no longer supported: Phase 5 forbids \
-                 the old Phase 3 chain-truncation-only GC mode"
+                "lineage_gc_emit_freepbas=false is no longer supported: rc-neutral \
+                 lineage GC requires FreePbas emission"
                     .into(),
             ));
         }
@@ -1877,7 +1818,7 @@ impl Db {
                         tracing::warn!(
                             vol_ord = vol_ord,
                             error = %err,
-                            "lineage GC: Phase 5 plan failed"
+                            "lineage GC: rc-neutral plan failed"
                         );
                         continue;
                     }

@@ -5,7 +5,7 @@
 //! at which point they are written through the underlying [`PageStore`]
 //! and reinserted into the shared cache as clean entries.
 //!
-//! Phase 6.5b stripped the COW / refcount / drop_subtree machinery:
+//! .5b stripped the COW / refcount / drop_subtree machinery:
 //! snapshots are an L2P concept now, and L2P moved to [`crate::paged`].
 //! The refcount B+tree this cache backs does in-place updates only, so
 //! `incref` / `decref` / `cow_for_write` / `DecrefOutcome` are gone.

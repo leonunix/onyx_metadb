@@ -34,7 +34,7 @@ pub struct OnyxRefModel {
     next_snapshot_id: SnapshotId,
     /// Volumes minted via `clone_volume` that have not yet been promoted
     /// or dropped. Drives the soak's PROMOTE op selection (the concurrent
-    /// clone-churn the ZFS port Phase 3b livelist shadow needs). A sticky
+    /// clone-churn the BFG livelist shadow needs). A sticky
     /// set, mirroring the Legacy `Model.clones`.
     clones: BTreeSet<VolumeOrdinal>,
 }

@@ -1,11 +1,11 @@
-//! ZFS-TXG-clone Phase 4 sync thread.
+//! BFG sync thread.
 //!
-//! `TxgSyncThread` is the worker driven by [`super::txg_quiesce::TxgQuiesceThread`].
-//! Each cycle persists one Syncing TXG by invoking the `sync_work`
+//! `BfgSyncThread` is the worker driven by [`super::bfg_quiesce::BfgQuiesceThread`].
+//! Each cycle persists one Syncing BFG by invoking the `sync_work`
 //! callback (the body of [`crate::db::Db::run_sync_cycle`]) which:
 //!
 //! 1. Drains the syncing slot of every L2P shard into the tree
-//!    (`L2pBuffer::take_syncing_slot(txg)`) — the slot is frozen by
+//!    (`L2pBuffer::take_syncing_slot(bfg)`) — the slot is frozen by
 //!    quiesce so no commit can insert into it.
 //! 2. Performs the refcount + dead-list checkpoint (per-shard
 //!    `begin_checkpoint`).
@@ -13,21 +13,21 @@
 //! 4. Manifest commit (briefly holds `apply_gate.write`).
 //!
 //! After a successful callback the worker calls
-//! [`TxgStateMachine::mark_synced`] to advance `checkpoint_txg` and
-//! wake any [`TxgStateMachine::wait_until_synced`] waiters (in
+//! [`BfgStateMachine::mark_synced`] to advance `checkpoint_bfg` and
+//! wake any [`BfgStateMachine::wait_until_synced`] waiters (in
 //! particular `flush_with_gate`'s threaded path).
 //!
 //! Concurrency:
 //! - Single worker thread, parked on a `Condvar`. A wake from
-//!   `TxgQuiesceThread` (or shutdown) is the only event the worker
+//!   `BfgQuiesceThread` (or shutdown) is the only event the worker
 //!   responds to.
 //! - The wake is **edge-triggered + level-checked**: every wake-up the
-//!   worker re-reads `txg.snapshot().syncing_txg` to find work, so a
-//!   stale notification (no Syncing TXG) is a cheap no-op.
+//!   worker re-reads `bfg.snapshot().syncing_bfg` to find work, so a
+//!   stale notification (no Syncing BFG) is a cheap no-op.
 //! - `Drop` issues a shutdown signal and joins the worker.
 //!
 //! This module also owns [`compact_drain_into_tree`], the per-shard
-//! buffer → tree fold helper that both the `TxgSyncThread`'s
+//! buffer → tree fold helper that both the `BfgSyncThread`'s
 //! per-slot drain and the inline
 //! [`crate::db::Db::force_compact_l2p_buffers`] path share.
 
@@ -40,8 +40,8 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::error::Result;
 use crate::metrics::MetaMetrics;
-use crate::txg::TxgStateMachine;
-use crate::types::Txg;
+use crate::bfg::BfgStateMachine;
+use crate::types::Bfg;
 
 /// One leaf's worth of fold work, prepared off-lock by
 /// [`build_drain_plan`]. Inserts are pre-sorted by lba and all share
@@ -116,28 +116,21 @@ pub(crate) fn build_drain_plan(
 pub(crate) fn apply_drain_ops(
     tree: &mut crate::paged::PagedL2p,
     ops: &[LeafDrainOp],
-    txg: Txg,
+    bfg: Bfg,
     snapshot_wms: Vec<crate::types::Lsn>,
     clone_cow_pinners: Vec<crate::types::Lsn>,
 ) -> Result<()> {
-    // A3 cutover: the buffer-drain COW stages page-rc deltas into this
-    // sync cycle's TXG slot (so the page-rc fold `begin_checkpoint(txg)`
-    // captures them, on the SAME boundary as the L2P + PBA-rc folds).
-    tree.set_current_txg(txg);
-    // ZFS port Phase 4 Step 4 (S1): this is the ONLY COW point for buffered
-    // writes, so the birth-authoritative non-clone COW-kill decision needs the
-    // volume's live snapshot `capture_watermark`s here. The COW-kill filters
-    // them per dying-page lsn (`youngest_snap_below`), so a death folded LATE
-    // here is not pinned by a snapshot captured after it died. Fed by the caller
-    // from the SAME `self.snapshot_wms(vol)` the matching `drain_page_deaths_into`
-    // reads via the tree, so COW-time and deadlist-drain agree (and replay
-    // reproduces it from the durable `capture_watermark`s).
+    // Buffer-drain COW stages page-rc deltas into this sync cycle's BFG slot,
+    // so the page-rc fold `begin_checkpoint(bfg)` captures them on the same
+    // boundary as the L2P + PBA-rc folds.
+    tree.set_current_bfg(bfg);
+    // Buffered writes only COW pages here, while the syncing slot is folded.
+    // Use the volume's live snapshot watermarks so page-death classification
+    // matches the dead-list drain and can be replayed from durable metadata.
     tree.set_snapshot_wms(snapshot_wms);
-    // ZFS port Phase 4 Step 4 (S1c): the page-rc-independent CLONE COW-kill
-    // pinner set ({B_C} ∪ own-snap wms ∪ descendant branch points). Kept SEPARATE
-    // from `snapshot_wms` so the deadlist drain (`drain_page_deaths_into`, which
-    // reads `snapshot_wms`) keeps classifying by C's OWN snapshots only. Empty for
-    // non-clones (the clone arm is the only reader).
+    // Clone-private pinners: branch point, the clone's own snapshots, and
+    // descendant branch points. Keep these separate from `snapshot_wms`; the
+    // dead-list drain must classify by the clone's own snapshots only.
     tree.set_clone_cow_pinners(clone_cow_pinners);
     for op in ops {
         if !op.inserts.is_empty() {
@@ -158,13 +151,13 @@ pub(crate) fn apply_drain_ops(
 ///
 /// Used by the "merge every slot" inline drain
 /// (`force_compact_l2p_buffers`), whose callers run quiesced (no
-/// tree-lock contention to bound). The per-TXG syncing-slot drain
+/// tree-lock contention to bound). The per-BFG syncing-slot drain
 /// instead builds the plan off-lock and folds it in bounded chunks —
 /// see `Db::drain_one_syncing_shard`.
 pub(crate) fn compact_drain_into_tree(
     tree: &mut crate::paged::PagedL2p,
     draining: &HashMap<u64, super::l2p_buffer::BufferEntry>,
-    txg: Txg,
+    bfg: Bfg,
     snapshot_wms: Vec<crate::types::Lsn>,
     clone_cow_pinners: Vec<crate::types::Lsn>,
 ) -> Result<()> {
@@ -174,19 +167,19 @@ pub(crate) fn compact_drain_into_tree(
     apply_drain_ops(
         tree,
         &build_drain_plan(draining),
-        txg,
+        bfg,
         snapshot_wms,
         clone_cow_pinners,
     )
 }
 
-/// Callback that performs the actual per-TXG sync work for one cycle.
+/// Callback that performs the actual per-BFG sync work for one cycle.
 ///
 /// Returns `Ok(())` on success; the worker calls
-/// [`TxgStateMachine::mark_synced`] after a successful invocation.
-/// `Err` is logged and the TXG is left in Syncing state so a subsequent
+/// [`BfgStateMachine::mark_synced`] after a successful invocation.
+/// `Err` is logged and the BFG is left in Syncing state so a subsequent
 /// notify can retry (a degraded mode used for transient IO errors).
-pub type SyncWorkFn = Arc<dyn Fn(Txg) -> Result<()> + Send + Sync>;
+pub type SyncWorkFn = Arc<dyn Fn(Bfg) -> Result<()> + Send + Sync>;
 
 /// Notifier shared between the quiesce side (producer of wake-ups) and
 /// the sync worker (consumer). Edge-triggered with a level recheck
@@ -233,13 +226,13 @@ impl Default for SyncNotifier {
     }
 }
 
-pub struct TxgSyncThread {
+pub struct BfgSyncThread {
     inner: Arc<Inner>,
     handle: Option<JoinHandle<()>>,
 }
 
 struct Inner {
-    state: Arc<TxgStateMachine>,
+    state: Arc<BfgStateMachine>,
     notifier: Arc<SyncNotifier>,
     sync_work: SyncWorkFn,
     shutdown: AtomicBool,
@@ -247,23 +240,23 @@ struct Inner {
     metrics: Arc<MetaMetrics>,
 }
 
-impl TxgSyncThread {
+impl BfgSyncThread {
     /// Spawn the sync worker.
     ///
     /// `sync_work` is invoked by the worker thread once per notification
-    /// (when a Syncing TXG is present). It must:
+    /// (when a Syncing BFG is present). It must:
     ///
-    /// - drain the L2P shards for the given TXG into the trees,
+    /// - drain the L2P shards for the given BFG into the trees,
     /// - perform refcount checkpoint + page IO + WAL fsync,
     /// - briefly hold `apply_gate.write()` to commit the manifest
-    ///   (updating both `checkpoint_lsn` and `checkpoint_txg`),
+    ///   (updating both `checkpoint_lsn` and `checkpoint_bfg`),
     ///
     /// after which this worker calls
-    /// [`TxgStateMachine::mark_synced`] to advance the in-memory
-    /// `checkpoint_txg` and notify ring-full / `wait_until_synced`
+    /// [`BfgStateMachine::mark_synced`] to advance the in-memory
+    /// `checkpoint_bfg` and notify ring-full / `wait_until_synced`
     /// waiters.
     pub fn start(
-        state: Arc<TxgStateMachine>,
+        state: Arc<BfgStateMachine>,
         notifier: Arc<SyncNotifier>,
         sync_work: SyncWorkFn,
         metrics: Arc<MetaMetrics>,
@@ -277,9 +270,9 @@ impl TxgSyncThread {
         });
         let worker = Arc::clone(&inner);
         let handle = thread::Builder::new()
-            .name("metadb-txg-sync".into())
+            .name("metadb-bfg-sync".into())
             .spawn(move || run_worker(worker))
-            .expect("metadb: failed to spawn txg sync worker");
+            .expect("metadb: failed to spawn bfg sync worker");
         Self {
             inner,
             handle: Some(handle),
@@ -302,44 +295,42 @@ impl TxgSyncThread {
     }
 }
 
-impl Drop for TxgSyncThread {
+impl Drop for BfgSyncThread {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
 fn run_worker(inner: Arc<Inner>) {
-    // Pin to the dedicated TxgSync CPU set (`l2p_compactor_cpus`). This
+    // Pin to the dedicated BfgSync CPU set (`l2p_compactor_cpus`). This
     // is the heavy drain+checkpoint worker; without pinning the kernel
     // co-locates it on the hot front-end / apply-lane CPUs and its
     // `write_dirty_pages` work steals cycles from the commit path. In
     // the threads-off model this work ran on the (pinned)
     // metadb-checkpoint thread, so binding here restores that placement.
-    crate::affinity::bind_current(crate::affinity::ThreadRole::TxgSync, 0);
+    crate::affinity::bind_current(crate::affinity::ThreadRole::BfgSync, 0);
     while !inner.shutdown.load(Ordering::Acquire) {
         inner.notifier.wait();
         if inner.shutdown.load(Ordering::Acquire) {
             break;
         }
-        // ZFS port Part B: once a cycle has failed and aborted the subsystem,
-        // NEVER re-invoke sync_work on the stuck Syncing slot. A re-run would
-        // be the exact unsafe retry-on-possibly-inconsistent-state the poison
-        // refuses, and could resurrect a snapshot whose take_snapshot caller
-        // was already told the subsystem failed. Recovery is a process restart.
+        // Once a cycle has poisoned the subsystem, never re-run sync_work on
+        // the stuck Syncing slot. Retrying could publish metadata from a failed
+        // snapshot that the caller already treated as rolled back.
         if inner.state.is_aborted() {
             continue;
         }
-        // Level check: is there actually a Syncing TXG to process?
-        let Some(txg) = inner.state.snapshot().syncing_txg else {
+        // Level check: is there actually a Syncing BFG to process?
+        let Some(bfg) = inner.state.snapshot().syncing_bfg else {
             continue;
         };
-        match (inner.sync_work)(txg) {
+        match (inner.sync_work)(bfg) {
             Ok(()) => {
-                inner.state.mark_synced(txg);
+                inner.state.mark_synced(bfg);
             }
             Err(err) => {
-                tracing::error!(error = %err, txg, "metadb: TxgSyncThread cycle failed; TXG stays Syncing (sync subsystem poisoned; restart required)");
-                // Do NOT advance checkpoint_txg and do NOT retry. `sync_work`
+                tracing::error!(error = %err, bfg, "metadb: BfgSyncThread cycle failed; BFG stays Syncing (sync subsystem poisoned; restart required)");
+                // Do NOT advance checkpoint_bfg and do NOT retry. `sync_work`
                 // (the run_sync_cycle wrapper) already called `poison_sync`,
                 // which aborted the state machine so parked waiters get a
                 // restart-required error; the `is_aborted` guard above stops
@@ -360,71 +351,71 @@ mod tests {
     }
 
     #[test]
-    fn wakes_and_processes_syncing_txg() {
-        let state = Arc::new(TxgStateMachine::new(0));
+    fn wakes_and_processes_syncing_bfg() {
+        let state = Arc::new(BfgStateMachine::new(0));
         let notifier = Arc::new(SyncNotifier::new());
         let processed = Arc::new(AtomicU64::new(0));
         let processed_clone = Arc::clone(&processed);
-        let work: SyncWorkFn = Arc::new(move |txg| {
-            processed_clone.store(txg, Ordering::Release);
+        let work: SyncWorkFn = Arc::new(move |bfg| {
+            processed_clone.store(bfg, Ordering::Release);
             Ok(())
         });
-        let mut sync = TxgSyncThread::start(
+        let mut sync = BfgSyncThread::start(
             Arc::clone(&state),
             Arc::clone(&notifier),
             work,
             noop_metrics(),
         );
-        // Set up a Syncing TXG.
+        // Set up a Syncing BFG.
         let q = state.roll_to_quiescing();
         state.promote_to_syncing(q);
         notifier.notify();
         // Wait for worker.
         for _ in 0..100 {
-            if state.checkpoint_txg() == q {
+            if state.checkpoint_bfg() == q {
                 break;
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(state.checkpoint_txg(), q);
+        assert_eq!(state.checkpoint_bfg(), q);
         assert_eq!(processed.load(Ordering::Acquire), q);
         sync.stop();
     }
 
     #[test]
-    fn spurious_notify_with_no_syncing_txg_is_noop() {
-        let state = Arc::new(TxgStateMachine::new(0));
+    fn spurious_notify_with_no_syncing_bfg_is_noop() {
+        let state = Arc::new(BfgStateMachine::new(0));
         let notifier = Arc::new(SyncNotifier::new());
         let calls = Arc::new(AtomicU64::new(0));
         let calls_clone = Arc::clone(&calls);
-        let work: SyncWorkFn = Arc::new(move |_txg| {
+        let work: SyncWorkFn = Arc::new(move |_bfg| {
             calls_clone.fetch_add(1, Ordering::AcqRel);
             Ok(())
         });
-        let mut sync = TxgSyncThread::start(
+        let mut sync = BfgSyncThread::start(
             Arc::clone(&state),
             Arc::clone(&notifier),
             work,
             noop_metrics(),
         );
-        // No syncing_txg, just notify.
+        // No syncing_bfg, just notify.
         notifier.notify();
         thread::sleep(Duration::from_millis(30));
         assert_eq!(calls.load(Ordering::Acquire), 0);
-        assert_eq!(state.checkpoint_txg(), 0);
+        assert_eq!(state.checkpoint_bfg(), 0);
         sync.stop();
     }
 
     #[test]
-    fn failed_sync_leaves_txg_in_syncing_state() {
-        let state = Arc::new(TxgStateMachine::new(0));
+    fn failed_sync_leaves_bfg_in_syncing_state() {
+        let state = Arc::new(BfgStateMachine::new(0));
         let notifier = Arc::new(SyncNotifier::new());
-        let work: SyncWorkFn = Arc::new(|_txg| {
+        let work: SyncWorkFn = Arc::new(|_bfg| {
             Err(crate::error::MetaDbError::Corruption(
                 "test-induced failure".into(),
             ))
         });
-        let mut sync = TxgSyncThread::start(
+        let mut sync = BfgSyncThread::start(
             Arc::clone(&state),
             Arc::clone(&notifier),
             work,
@@ -434,19 +425,19 @@ mod tests {
         state.promote_to_syncing(q);
         notifier.notify();
         thread::sleep(Duration::from_millis(40));
-        // checkpoint_txg did NOT advance because mark_synced was not called.
-        assert_eq!(state.checkpoint_txg(), 0);
-        // syncing_txg is still set so a retry can pick it up.
-        assert_eq!(state.snapshot().syncing_txg, Some(q));
+        // checkpoint_bfg did NOT advance because mark_synced was not called.
+        assert_eq!(state.checkpoint_bfg(), 0);
+        // syncing_bfg is still set so a retry can pick it up.
+        assert_eq!(state.snapshot().syncing_bfg, Some(q));
         sync.stop();
     }
 
     #[test]
     fn stop_joins_worker_cleanly() {
-        let state = Arc::new(TxgStateMachine::new(0));
+        let state = Arc::new(BfgStateMachine::new(0));
         let notifier = Arc::new(SyncNotifier::new());
         let work: SyncWorkFn = Arc::new(|_| Ok(()));
-        let mut sync = TxgSyncThread::start(
+        let mut sync = BfgSyncThread::start(
             Arc::clone(&state),
             Arc::clone(&notifier),
             work,
@@ -458,11 +449,11 @@ mod tests {
     }
 
     #[test]
-    fn multiple_txg_cycles_advance_checkpoint() {
-        let state = Arc::new(TxgStateMachine::new(0));
+    fn multiple_bfg_cycles_advance_checkpoint() {
+        let state = Arc::new(BfgStateMachine::new(0));
         let notifier = Arc::new(SyncNotifier::new());
         let work: SyncWorkFn = Arc::new(|_| Ok(()));
-        let mut sync = TxgSyncThread::start(
+        let mut sync = BfgSyncThread::start(
             Arc::clone(&state),
             Arc::clone(&notifier),
             work,
@@ -473,12 +464,12 @@ mod tests {
             state.promote_to_syncing(q);
             notifier.notify();
             for _ in 0..100 {
-                if state.checkpoint_txg() == expected_cp {
+                if state.checkpoint_bfg() == expected_cp {
                     break;
                 }
                 thread::sleep(Duration::from_millis(5));
             }
-            assert_eq!(state.checkpoint_txg(), expected_cp);
+            assert_eq!(state.checkpoint_bfg(), expected_cp);
         }
         sync.stop();
     }

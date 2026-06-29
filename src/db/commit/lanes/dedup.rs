@@ -9,12 +9,12 @@ impl Db {
         ops: &[WalOp],
         indices: Vec<usize>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
     ) -> Result<Vec<(usize, ApplyOutcome)>> {
         let batch_started = std::time::Instant::now();
         let mut outcomes = Vec::with_capacity(indices.len());
         let mut pending_puts: Vec<(Hash8, DedupValue, Option<Pba>, usize)> = Vec::new();
-        // Phase 5: dedup-table mutations drive the global PBA refcount
+        // dedup-table mutations drive the global PBA refcount
         // (shared-page bookkeeping). The hot path no longer stages rc
         // deltas on L2P remaps, so any rc movement for a shared pba has
         // to ride along with the DedupPut/Delete/Compare* that gained
@@ -28,10 +28,10 @@ impl Db {
         };
         let stage_rc = |pba: Pba, delta: i64| -> Result<()> {
             let sid = rc_shard_for(pba);
-            refcount_shards[sid].stage(txg, pba, delta, lsn)?;
+            refcount_shards[sid].stage(bfg, pba, delta, lsn)?;
             Ok(())
         };
-        // Phase 5 stale-entry tolerance: a dedup_index row can point to
+        // stale-entry tolerance: a dedup_index row can point to
         // a PBA whose rc has been driven to 0 by lineage GC without
         // cleanup removing the row. The matching put/delete must then
         // skip the decref instead of underflowing the rc table — see
@@ -42,12 +42,11 @@ impl Db {
         let stage_rc_decref_if_live = |pba: Pba| -> Result<()> {
             let sid = rc_shard_for(pba);
             if refcount_shards[sid].get(pba)? > 0 {
-                refcount_shards[sid].stage(txg, pba, -1, lsn)?;
+                refcount_shards[sid].stage(bfg, pba, -1, lsn)?;
             }
             Ok(())
         };
-        // [[no-refcount-hot-path-design]] Phase 5 (WAL schema 0xB8):
-        // every dedup put / delete carries an embedded `old_pba`
+        //         // every dedup put / delete carries an embedded `old_pba`
         // captured at `Transaction::commit` time. The live apply path
         // here uses it directly so that replay and live apply produce
         // the same rc deltas — apply is deterministic from the WAL

@@ -1,6 +1,6 @@
 use super::*;
 
-/// [[no-refcount-hot-path-design]] Phase 5 helper: put a `(hash, value)`
+/// helper: put a `(hash, value)`
 /// into the dedup_index and reconcile the global refcount of the head
 /// PBA. `DedupPut` is one of the three remaining rc-mutating events
 /// (the others are `PromotionChunk` and `FreePbas`), so this helper is
@@ -26,7 +26,7 @@ pub(in crate::db) fn apply_dedup_put_with_rc(
     dedup_index: &crate::dedup::DedupIndex,
     refcount_shards: &[Shard],
     lsn: Lsn,
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     hash: Hash8,
     value: DedupValue,
     old_pba: Option<Pba>,
@@ -40,7 +40,7 @@ pub(in crate::db) fn apply_dedup_put_with_rc(
     if old_pba != Some(new_pba) {
         if let Some(op) = old_pba {
             let sid = shard_for_key(refcount_shards, op);
-            // Phase 5: dedup_index entries can become stale when
+            // dedup_index entries can become stale when
             // lineage GC's `FreePbas` decrefs a PBA without first
             // invoking onyx-side `delete_dedup_index_if_matches`
             // cleanup (the cleanup path is best-effort). A subsequent
@@ -48,11 +48,11 @@ pub(in crate::db) fn apply_dedup_put_with_rc(
             // — the entry never represented a live shared reference
             // by the time we got here.
             if refcount_shards[sid].rc.get(op)? > 0 {
-                refcount_shards[sid].rc.stage(txg, op, -1, lsn)?;
+                refcount_shards[sid].rc.stage(bfg, op, -1, lsn)?;
             }
         }
         let sid = shard_for_key(refcount_shards, new_pba);
-        refcount_shards[sid].rc.stage(txg, new_pba, 1, lsn)?;
+        refcount_shards[sid].rc.stage(bfg, new_pba, 1, lsn)?;
     }
     // rc deltas above stay inline (correctness); only the cuckoo write is
     // deferred. `stage_put` is the eager `put` verbatim when the drainer
@@ -61,7 +61,7 @@ pub(in crate::db) fn apply_dedup_put_with_rc(
     Ok(())
 }
 
-/// [[no-refcount-hot-path-design]] Phase 5 helper: drop a hash from the
+/// helper: drop a hash from the
 /// dedup_index and decref the head PBA's global refcount. Pair with
 /// [`apply_dedup_put_with_rc`]. `old_pba` is the captured `head_pba()`
 /// from the WAL record; `None` means there was no prior entry, in
@@ -70,7 +70,7 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
     dedup_index: &crate::dedup::DedupIndex,
     refcount_shards: &[Shard],
     lsn: Lsn,
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     hash: &Hash8,
     old_pba: Option<Pba>,
 ) -> Result<()> {
@@ -81,7 +81,7 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
         // to 0 by lineage GC is stale, and removing it must not
         // underflow the rc table.
         if refcount_shards[sid].rc.get(pba)? > 0 {
-            refcount_shards[sid].rc.stage(txg, pba, -1, lsn)?;
+            refcount_shards[sid].rc.stage(bfg, pba, -1, lsn)?;
         }
     }
     dedup_index.stage_delete(hash, lsn)?;
@@ -89,50 +89,42 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
 }
 
 /// Apply a batched `commit_free_pbas` with exclusive/shared split
-/// ([[no-refcount-hot-path-design]] Phase 4 Step 3).
+/// ().
 ///
 /// For each PBA we classify by **current refcount**:
 ///
 /// - **Shared** (`rc > 0`): some other lineage still references this
-///   PBA via the dedup_index (in Phase 5 only `DedupPut` and the
-///   promotion walker bump global rc, so `rc > 0` is the definitive
-///   "shared via dedup" signal). Decref by 1; if the staged result
-///   reaches 0 the PBA surfaces in `freed_pbas` and onyx-side cleanup
-///   retires it + deletes the dedup_index entry.
+///   PBA via the dedup index or a clone-promotion edge. Decref by 1; if
+///   the staged result reaches 0 the PBA surfaces in `freed_pbas` and
+///   onyx-side cleanup retires it + deletes the dedup_index entry.
 /// - **Exclusive** (`rc == 0`): no other lineage references this PBA
 ///   — it was never put into `dedup_index` and the hot path never
-///   bumped its rc (Phase 5) or has already brought it to 0 (Phase
-///   4). Surface directly **without** touching rc. Touching it would
-///   underflow.
+///   bumped its rc, or a previous retire already brought it to 0. Surface
+///   directly **without** touching rc. Touching it would underflow.
 ///
-/// Phase 4 default: hot-path RC is still on, so a Phase-4-built GC
-/// segment's records arrive here with rc already 0 (hot path's
-/// `L2pRemap` decref ran). They take the **exclusive** branch and
-/// surface so onyx can do the retire that previously rode on the
-/// `L2pRemap` outcome.
+/// In normal lineage-GC flow, records for exclusive PBAs arrive here with
+/// rc already 0. They take the **exclusive** branch and surface so onyx can do
+/// the retire that used to ride on the `L2pRemap` outcome.
 ///
 /// Replay idempotency: re-applying the same `commit_free_pbas` after a
 /// crash sees rc=0 for everything it already drained on the first
 /// pass; those PBAs surface again. Onyx consumes the surface via
 /// `PbaLifecycle::free_lineage_gc_proven`, which absorbs a duplicate
 /// idempotently (`is_extent_free`/`is_retired` precheck), so duplicate
-/// surfaces are harmless. The previous Phase 3 defensive
-/// `if cur == 0 { continue }` guard collapsed exclusive PBAs with
-/// already-freed shared PBAs into a single "skip" — Phase 4 separates
-/// them because Phase 5 will need the exclusive surface to be the
-/// **primary** retire signal (the hot-path `L2pRemap` retire path
-/// goes away).
+/// surfaces are harmless. The old defensive `if cur == 0 { continue }` guard
+/// collapsed exclusive PBAs with already-freed shared PBAs into a single
+/// "skip"; the current path keeps exclusive PBAs visible because that surface is
+/// now the primary retire signal.
 ///
 /// We don't query `dedup_index.contains(pba)` here even though the
 /// design says `is_shared = dedup_index.contains(pba) || rc > 0`:
 /// the on-disk dedup_index is hash-keyed with no PBA-reverse lookup,
-/// and in Phase 5 only `DedupPut` bumps rc, so `rc > 0` already
-/// implies "in dedup_index". The OR is redundant given the
-/// promotion-walker discipline planned in Step 5.
+/// and only `DedupPut` plus clone promotion bump rc, so `rc > 0` is already the
+/// durable "shared elsewhere" signal.
 pub(in crate::db) fn apply_free_pbas(
     refcount_shards: &[Shard],
     lsn: Lsn,
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     pbas: &[Pba],
 ) -> Result<ApplyOutcome> {
     let mut freed: Vec<Pba> = Vec::new();
@@ -147,7 +139,7 @@ pub(in crate::db) fn apply_free_pbas(
             freed.push(pba);
             continue;
         }
-        let (_, new) = refcount_shards[sid].rc.stage(txg, pba, -1, lsn)?;
+        let (_, new) = refcount_shards[sid].rc.stage(bfg, pba, -1, lsn)?;
         if new == 0 {
             freed.push(pba);
         }

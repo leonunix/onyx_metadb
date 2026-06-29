@@ -1,6 +1,6 @@
 use super::*;
 
-/// [[no-refcount-hot-path-design]] Phase 4 Step 5 walker chunk apply.
+/// walker chunk apply.
 /// Increfs each PBA in `pba_increfs` by 1 against the global refcount
 /// table (the increfs are batched into the WAL-record group commit,
 /// not into a separate per-incref record). Advances the volume's
@@ -16,7 +16,7 @@ pub(in crate::db) fn apply_promotion_chunk(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     lsn: Lsn,
-    txg: crate::types::Txg,
+    bfg: crate::types::Bfg,
     vol_ord: VolumeOrdinal,
     pba_increfs: &[Pba],
     next_cursor: Option<crate::types::Lba>,
@@ -27,7 +27,7 @@ pub(in crate::db) fn apply_promotion_chunk(
     let mut applied = 0usize;
     for &pba in pba_increfs {
         let sid = shard_for_key(refcount_shards, pba);
-        refcount_shards[sid].rc.stage(txg, pba, 1, lsn)?;
+        refcount_shards[sid].rc.stage(bfg, pba, 1, lsn)?;
         applied += 1;
     }
     *volume.promotion_cursor.write() = next_cursor;
@@ -37,7 +37,7 @@ pub(in crate::db) fn apply_promotion_chunk(
     })
 }
 
-/// [[no-refcount-hot-path-design]] Phase 4 Step 5 walker finish apply.
+/// walker finish apply.
 /// Clears the clone's in-memory `parent_vol_ord` and `promotion_cursor`
 /// — after this record the parent volume's Lineage GC stops treating
 /// this clone's `branched_at_lsn` as a pin point.

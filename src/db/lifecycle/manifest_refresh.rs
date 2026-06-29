@@ -85,7 +85,7 @@ pub(in crate::db::lifecycle) fn refresh_manifest_from_checkpoints(
                     .load(std::sync::atomic::Ordering::Acquire),
             ),
         };
-        // v18 HEAD page-deadlist anchors (ZFS port Phase 2), mirroring
+        // v18 HEAD page-deadlist anchors (BFG), mirroring
         // the PBA `dead_list_overrides` logic above: this flush's freshly
         // drained page segment is in the override map; volumes with no
         // page drain this round fall back to the live atomics (promoted
@@ -102,7 +102,7 @@ pub(in crate::db::lifecycle) fn refresh_manifest_from_checkpoints(
                         .load(std::sync::atomic::Ordering::Acquire),
                 ),
             };
-        // v19 per-clone page-livelist anchors (ZFS port Phase 3b), same
+        // v19 per-clone page-livelist anchors (BFG), same
         // override-or-atomics fallback as the page-deadlist above.
         let (page_live_list_head_pid, page_live_list_tail_pid) =
             match page_live_list_overrides.get(&volume.ord) {
@@ -147,7 +147,7 @@ pub(in crate::db::lifecycle) fn refresh_manifest_from_checkpoints(
     Ok(())
 }
 
-/// Tier 2.B Stage 1: rewrite every per-shard `durable_seq` in the
+/// per-shard durable-seq durable-seq rollout: rewrite every per-shard `durable_seq` in the
 /// manifest to reflect the durable state we're about to commit. This
 /// mirrors the inputs to [`Db::compute_min_last_flushed_lsn_after`]:
 /// selected shards advance to `wal_checkpoint`; unselected shards keep
@@ -156,7 +156,7 @@ pub(in crate::db::lifecycle) fn refresh_manifest_from_checkpoints(
 /// already shaped correctly, and BEFORE the manifest store commit so
 /// the new arrays land on disk.
 ///
-/// Stage 1 invariant: `checkpoint_lsn == min(all durable_seq[])`. The
+/// durable-seq rollout invariant: `checkpoint_lsn == min(all durable_seq[])`. The
 /// `Manifest::assert_durable_seq_invariant` tripwire fires on the next
 /// `encode` if this is violated.
 pub(in crate::db::lifecycle) fn refresh_manifest_durable_seq(
@@ -187,7 +187,7 @@ pub(in crate::db::lifecycle) fn refresh_manifest_durable_seq(
         }
         for (s_idx, shard) in vol.shards.iter().enumerate() {
             let prev = shard.last_flushed_lsn.load(Ordering::Acquire);
-            // Phase 4 gate-shrink: `wal_checkpoint = slot_max_lsn(txg)`
+            // gate-shrink: `wal_checkpoint = slot_max_lsn(bfg)`
             // can be 0 if the Syncing slot had no commits. Use
             // `max(wal_checkpoint, prev)` for selected shards so
             // durable_seq is monotonically non-decreasing — matches
@@ -216,7 +216,7 @@ pub(in crate::db::lifecycle) fn refresh_manifest_durable_seq(
     }
     for (s_idx, shard) in refcount_shards.iter().enumerate() {
         let prev = shard.last_flushed_lsn.load(Ordering::Acquire);
-        // The per-TXG-slot rc fold makes a selected rc shard durable to
+        // The per-BFG-slot rc fold makes a selected rc shard durable to
         // `wal_checkpoint` (like a non-buffered L2P shard), so no buffer-term
         // cap is needed — matches `compute_min_last_flushed_lsn_after` so the
         // `min(durable_seq[]) == checkpoint_lsn` invariant holds.

@@ -59,7 +59,7 @@ impl Db {
         // Per shard (ascending index, per the cross-shard lock order), take the
         // shard's `fold_lock` ONCE and read its whole bucket — vs once per PBA
         // in `get_consistent`. The per-PBA acquisition made the GC reclaim
-        // recheck contend the TXG fold and grow super-linearly with retired
+        // recheck contend the BFG fold and grow super-linearly with retired
         // depth; amortizing per shard bounds the fold-blocking window.
         for (sid, idxs) in buckets.into_iter().enumerate() {
             if idxs.is_empty() {
@@ -73,7 +73,7 @@ impl Db {
     }
 
     /// Test-only helper to seed PBA refcount state ahead of FreePbas /
-    /// PromotionChunk apply scenarios. Phase 5 removed the per-write
+    /// PromotionChunk apply scenarios. removed the per-write
     /// refcount path, so production code no longer needs an incref WAL
     /// op; the rc shard is still backed by the same paged-array. Tests
     /// drive `PromotionChunk` (the only remaining `rc.stage(+)` caller)
@@ -89,8 +89,7 @@ impl Db {
         }
         const BOOTSTRAP_VOL_ORD: crate::types::VolumeOrdinal = 0;
         // Pack `delta` copies of `pba` into PromotionChunks so one rc
-        // bucket sees back-to-back stages — matches the pre-Phase-5
-        // `tx.incref_pba(pba, delta)` shape. Each chunk is capped by
+        // bucket sees back-to-back stages — matches the pre-        // `tx.incref_pba(pba, delta)` shape. Each chunk is capped by
         // `MAX_PROMOTION_CHUNK_PBAS`; large deltas split across chunks.
         let mut remaining = delta as usize;
         while remaining > 0 {
@@ -171,7 +170,7 @@ impl Db {
         self.dedup_index.get(hash)
     }
 
-    /// [[no-refcount-hot-path-design]] Phase 5 helper: read the current
+    /// helper: read the current
     /// `head_pba()` for `hash` from the dedup_index, used by
     /// `Transaction::resolve_dedup_old_pbas` to embed the prior PBA in
     /// `DedupPut` / `DedupPutGuarded` / `DedupDelete` WAL records so

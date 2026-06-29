@@ -10,7 +10,7 @@ impl Db {
         page_store: &Arc<PageStore>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         ops: &[WalOp],
         snap_info_for_vol: &dyn Fn(VolumeOrdinal) -> Vec<SnapInfo>,
         rc_authoritative: bool,
@@ -27,7 +27,7 @@ impl Db {
                     dedup_index.as_ref(),
                     page_store,
                     lsn,
-                    txg,
+                    bfg,
                     op,
                     snap_info_for_vol,
                     rc_authoritative,
@@ -42,7 +42,7 @@ impl Db {
             dedup_index,
             metrics,
             lsn,
-            txg,
+            bfg,
             ops,
             rc_authoritative,
         )
@@ -56,7 +56,7 @@ impl Db {
         dedup_index: &Arc<crate::dedup::DedupIndex>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         ops: &[WalOp],
         rc_authoritative: bool,
     ) -> Result<Vec<ApplyOutcome>> {
@@ -144,19 +144,19 @@ impl Db {
                         sid,
                         indices,
                         lsn,
-                        txg,
+                        bfg,
                         apply_ops.as_slice(),
                         refcount_shards_arc.as_slice(),
                         metrics.as_ref(),
                         rc_authoritative,
-                        // ZFS port Phase 2/4: WAL replay does not re-record page
+                        // BFG: WAL replay does not re-record page
                         // deaths (recorded + sealed/drained pre-crash); empty wms
                         // drains+discards the witness (no pin, no record) so it
                         // cannot leak or double-record. Durable snapshot pages are
                         // `checkpoint_protected`, so the recycle path still copies
                         // (never clobbers) them.
                         Vec::new(),
-                        // S1c clone COW-kill pinners: same replay rationale — empty.
+                        // clone COW-kill clone COW-kill pinners: same replay rationale — empty.
                         Vec::new(),
                     );
                     let _ = tx.send(result);
@@ -207,7 +207,7 @@ impl Db {
                 lsn,
                 Box::new(move || {
                     let result =
-                        Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn, txg);
+                        Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn, bfg);
                     let _ = tx.send(result);
                 }),
             );
@@ -263,7 +263,7 @@ impl Db {
             ops.as_slice(),
             dedup_idxs,
             lsn,
-            txg,
+            bfg,
         )? {
             outcomes[idx] = Some(outcome);
         }
@@ -281,7 +281,7 @@ impl Db {
         dedup_index: &Arc<crate::dedup::DedupIndex>,
         metrics: &Arc<MetaMetrics>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         ops: &[WalOp],
         rc_authoritative: bool,
     ) -> Result<Vec<ApplyOutcome>> {
@@ -356,14 +356,14 @@ impl Db {
                 sid,
                 indices,
                 lsn,
-                txg,
+                bfg,
                 ops,
                 &refcount_shards_vec,
                 metrics.as_ref(),
                 rc_authoritative,
-                // ZFS port Phase 2/4: replay does not re-record page deaths.
+                // BFG: replay does not re-record page deaths.
                 Vec::new(),
-                // S1c clone COW-kill pinners: empty on replay (same rationale).
+                // clone COW-kill clone COW-kill pinners: empty on replay (same rationale).
                 Vec::new(),
             )?;
             for (idx, outcome) in result.outcomes {
@@ -384,7 +384,7 @@ impl Db {
                 metrics.clone(),
                 actions,
                 lsn,
-                txg,
+                bfg,
             )?;
             for (idx, new) in result.refcount_outcomes {
                 outcomes[idx] = Some(ApplyOutcome::RefcountNew(new));
@@ -414,7 +414,7 @@ impl Db {
             ops,
             dedup_idxs,
             lsn,
-            txg,
+            bfg,
         )? {
             outcomes[idx] = Some(outcome);
         }
@@ -433,7 +433,7 @@ impl Db {
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         ops: &[WalOp],
     ) -> Result<Vec<ApplyOutcome>> {
         Self::apply_ops_grouped_to(
@@ -442,7 +442,7 @@ impl Db {
             &self.dedup_index,
             &self.metrics,
             lsn,
-            txg,
+            bfg,
             ops,
             self.rc_authoritative_reclaim,
         )

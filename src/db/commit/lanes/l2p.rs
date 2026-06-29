@@ -74,7 +74,7 @@ impl Db {
         sid: usize,
         indices: Vec<L2pBucketEntry>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         ops: &[WalOp],
         refcount_shards: &[Arc<crate::refcount::RcShard>],
         metrics: &MetaMetrics,
@@ -82,15 +82,15 @@ impl Db {
         // (Put/Remap/RemapRange) pushes a +1 `RcApplyAction` for its new
         // head_pba so refcount counts live L2P references. Must mirror the
         // planner footprint in `build_lane_dispatch_plan`. Default-off path
-        // (Phase-5) emits nothing — `rc_actions` stays empty.
+        // () emits nothing — `rc_actions` stays empty.
         rc_authoritative: bool,
-        // ZFS port Phase 4 S1: this volume's live snapshot `capture_watermark`s,
+        // BFG: this volume's live snapshot `capture_watermark`s,
         // captured by the dispatcher before the lane runs. Arms the birth COW-kill
         // (filtered per dying-page lsn via `youngest_snap_below`) and gates which
         // COW-displaced L2P pages enter the HEAD page-deadlist. Empty (no live
         // snapshot, or the replay path) records nothing.
         snapshot_wms: Vec<Lsn>,
-        // ZFS port Phase 4 S1c: this volume's clone COW-kill pinner set
+        // BFG: this volume's clone COW-kill pinner set
         // ({B_C} ∪ own-snap wms ∪ descendant branch points), captured by the
         // dispatcher. Empty for non-clones and on replay. Only read by the
         // tree-mode clone arm of `cow_for_write`; the buffered path returns early.
@@ -105,7 +105,7 @@ impl Db {
                 sid,
                 indices,
                 lsn,
-                txg,
+                bfg,
                 ops,
                 refcount_shards,
                 metrics,
@@ -114,13 +114,13 @@ impl Db {
         }
         let tree_lock_started = std::time::Instant::now();
         let mut tree = shard.tree.write();
-        // ZFS port Phase 4 Step 4 (S1): arm the birth-authoritative non-clone
+        // BFG: arm the birth-authoritative non-clone
         // COW-kill decision with this commit's youngest-snapshot lsn (captured
         // by the dispatcher, same value the matching `drain_page_deaths_into`
         // uses below). The buffered shards returned early above; this is the
         // tree-locked laned COW path.
         tree.set_snapshot_wms(snapshot_wms);
-        // S1c: the page-rc-independent clone COW-kill pinner set (separate field
+        // clone COW-kill: the page-rc-independent clone COW-kill pinner set (separate field
         // so the deadlist drain keeps reading `snapshot_wms`; empty for non-clones).
         tree.set_clone_cow_pinners(clone_cow_pinners);
         let tree_lock_wait = tree_lock_started.elapsed();
@@ -149,10 +149,10 @@ impl Db {
         let bucket_started = std::time::Instant::now();
         let ops_started = std::time::Instant::now();
         let ops_result = (|| -> Result<()> {
-            // Stage 1.6 unification: flatten every unguarded `L2pRemap`
+            // lane unification unification: flatten every unguarded `L2pRemap`
             // (`Single`) and every `RangeSlice` LBA into one batch list,
             // then leaf-run-batch ACROSS entry-kind boundaries. The
-            // previous Stage 1.5 path leaf-run-grouped each RangeSlice
+            // previous previous range-slice path path leaf-run-grouped each RangeSlice
             // independently, so multiple range ops in the same bucket
             // landing on the same leaf each paid their own tree descend +
             // leaf-page modify. With sequential writes (the common
@@ -333,7 +333,7 @@ impl Db {
                 ));
             }
 
-            // Phase D: non-batchable ops (Put / Delete / guarded
+            // lifecycle journal cutover: non-batchable ops (Put / Delete / guarded
             // L2pRemap). Each goes through its own tree primitive; no
             // sharing with leaf-run batching above.
             for pos in nonbatch_positions {
@@ -363,8 +363,7 @@ impl Db {
                     WalOp::L2pDelete { lba, .. } => {
                         let prev = tree.delete_at_lsn_deferred_finish(*lba, lsn)?;
                         // rc-authoritative: decref the deleted reference's PBA
-                        // inline (paired with the increfs at install). Phase-5
-                        // (flag off): no rc movement; the deleted PBA's reclaim
+                        // inline (paired with the increfs at install).                         // (flag off): no rc movement; the deleted PBA's reclaim
                         // rode the now-removed reverify scan.
                         if rc_authoritative {
                             push_rc_delete(&mut rc_actions, idx, prev);
@@ -452,13 +451,13 @@ impl Db {
             } else {
                 super::apply::publish_l2p_read_view(shard, &tree);
             }
-            // ZFS port Phase 2: the laned tree-mode apply COWs each
+            // BFG: the laned tree-mode apply COWs each
             // root→leaf path; drain the page-death witness into the HEAD
             // page-deadlist. This is the dominant write path (single +
             // batched L2pPut/L2pDelete/unguarded L2pRemap all land here),
             // so it MUST drain — otherwise the witness leaks across ops.
             super::apply::drain_page_deaths_into(&volume.page_dead_list[sid], &mut tree);
-            // ZFS port Phase 3b: same site for the per-clone page-livelist
+            // BFG: same site for the per-clone page-livelist
             // witness (empty for non-clones).
             super::apply::drain_live_events_into(&volume.page_live_list, &mut tree);
         }
@@ -544,7 +543,7 @@ impl Db {
     /// takes ownership of the bucket's entries; each `RangeSlice`
     /// entry contributes a partial `ApplyOutcome::L2pRemapRange` to be
     /// merged in `apply_ops_laned`.
-    /// Visible to the rest of `db::commit` so the Phase 1 direct-apply
+    /// Visible to the rest of `db::commit` so the direct-apply
     /// fast path in `commit.rs` can invoke it on the caller thread,
     /// skipping the apply-lane channel hop. Buffer mode never produces
     /// `rc_actions`, so the returned `L2pBucketApplyResult.rc_actions`
@@ -555,7 +554,7 @@ impl Db {
         sid: usize,
         indices: Vec<L2pBucketEntry>,
         lsn: Lsn,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         ops: &[WalOp],
         refcount_shards: &[Arc<crate::refcount::RcShard>],
         metrics: &MetaMetrics,
@@ -575,7 +574,7 @@ impl Db {
         // bucket start and a later `buffer.lookup`, at which point the
         // entry is gone from `draining` and the stale snapshot does not
         // yet see it in the tree, yielding a spurious None `prev`.
-        // [[zfs-txg-clone-phase2-remaining]] #3a reproducer hits this
+        // BFG deferred-outcome follow-up #3a reproducer hits this
         // deterministically with overlapping L2pRemapRange + an aggressive
         // compactor.
         let read_view_prepare = std::time::Duration::ZERO;
@@ -608,7 +607,7 @@ impl Db {
                     for &off in lba_offsets.iter() {
                         let lba = range_start_lba + off as u64;
                         let new_value = range_values[off as usize];
-                        let cur = match shard.l2p_buffer.lookup_for_open_txg(txg, lba) {
+                        let cur = match shard.l2p_buffer.lookup_for_open_bfg(bfg, lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
                             BufferLookup::Absent => load_view().get(lba)?,
@@ -618,7 +617,7 @@ impl Db {
                             prevs_box[off as usize] = cur;
                             continue;
                         }
-                        shard.l2p_buffer.insert_at_txg(txg, lba, new_value, lsn);
+                        shard.l2p_buffer.insert_at_bfg(bfg, lba, new_value, lsn);
                         // rc-authoritative: incref(new) + decref(old), paired
                         // (range_op so a net rc==0 surfaces into L2pRemapRange).
                         if rc_authoritative {
@@ -647,7 +646,7 @@ impl Db {
                 };
                 let outcome = match &ops[idx] {
                     WalOp::L2pPut { lba, value, .. } => {
-                        let cur = match shard.l2p_buffer.lookup_for_open_txg(txg, *lba) {
+                        let cur = match shard.l2p_buffer.lookup_for_open_bfg(bfg, *lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
                             BufferLookup::Absent => load_view().get(*lba)?,
@@ -657,7 +656,7 @@ impl Db {
                             outcomes.push((idx, ApplyOutcome::L2pPrev(cur)));
                             continue;
                         }
-                        shard.l2p_buffer.insert_at_txg(txg, *lba, *value, lsn);
+                        shard.l2p_buffer.insert_at_bfg(bfg, *lba, *value, lsn);
                         if rc_authoritative {
                             push_rc_install(&mut rc_actions, idx, *value, cur, false, false);
                         } else {
@@ -667,14 +666,14 @@ impl Db {
                         ApplyOutcome::L2pPrev(cur)
                     }
                     WalOp::L2pDelete { lba, .. } => {
-                        let cur = match shard.l2p_buffer.lookup_for_open_txg(txg, *lba) {
+                        let cur = match shard.l2p_buffer.lookup_for_open_bfg(bfg, *lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
                             BufferLookup::Absent => load_view().get(*lba)?,
                         };
-                        shard.l2p_buffer.insert_tombstone_at_txg(txg, *lba, lsn);
+                        shard.l2p_buffer.insert_tombstone_at_bfg(bfg, *lba, lsn);
                         // rc-authoritative: decref the deleted reference inline
-                        // (see tree path). Phase-5 (flag off): no rc movement.
+                        // (see tree path). no rc movement.
                         if rc_authoritative {
                             push_rc_delete(&mut rc_actions, idx, cur);
                         }
@@ -708,7 +707,7 @@ impl Db {
                                 continue;
                             }
                         }
-                        let cur = match shard.l2p_buffer.lookup_for_open_txg(txg, *lba) {
+                        let cur = match shard.l2p_buffer.lookup_for_open_bfg(bfg, *lba) {
                             BufferLookup::Present(v) => Some(v),
                             BufferLookup::Tombstone => None,
                             BufferLookup::Absent => load_view().get(*lba)?,
@@ -725,7 +724,7 @@ impl Db {
                             ));
                             continue;
                         }
-                        shard.l2p_buffer.insert_at_txg(txg, *lba, *new_value, lsn);
+                        shard.l2p_buffer.insert_at_bfg(bfg, *lba, *new_value, lsn);
                         // rc-authoritative: incref(new) + decref(old), paired
                         // (guarded dedup-hit included).
                         if rc_authoritative {

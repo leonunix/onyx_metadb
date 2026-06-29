@@ -65,7 +65,7 @@ fn multi_get_dedup_hits_memtable_and_sst() {
 
 #[test]
 fn multi_dedup_entries_are_live_matches_forward_and_refcount() {
-    // Phase 5: `put_dedup` issues `WalOp::DedupPut`, whose apply
+    // `put_dedup` issues `WalOp::DedupPut`, whose apply
     // increfs the head PBA's rc by 1. The "zero_rc" arm therefore
     // has to drive the rc back down explicitly via FreePbas (the
     // `decref_pba` test helper) to model a forward entry whose
@@ -114,7 +114,7 @@ fn multi_dedup_entries_are_live_matches_forward_and_refcount() {
 /// Bucketed apply must produce the same per-op outcomes and the
 /// same final state as the serial path, regardless of shard
 /// routing. Batch is sized above BUCKET_THRESHOLD so the bucket
-/// branch is exercised. Phase 5 retired the standalone Incref /
+/// branch is exercised. retired the standalone Incref /
 /// Decref WAL ops, so the mixed batch here covers L2P + dedup only.
 #[test]
 fn bucketed_apply_matches_serial_for_mixed_batch() {
@@ -164,7 +164,7 @@ fn bucketed_apply_preserves_intra_bucket_order() {
     );
 }
 
-// Phase 5 retired the standalone Incref / Decref WAL ops, so the
+// retired the standalone Incref / Decref WAL ops, so the
 // "intra-bucket rc order" test no longer has a code path to exercise
 // — refcount mutations now arrive only via PromotionChunk / FreePbas /
 // volume-lifecycle ops, and each of those orders its own work.
@@ -217,7 +217,7 @@ fn rv(pba: Pba, tag: u8) -> L2pValue {
 
 #[test]
 fn bucketed_apply_large_remap_batch_updates_refcounts_and_freed_outcome() {
-    // Phase 5: L2pRemap no longer touches global rc; freed_pba is
+    // L2pRemap no longer touches global rc; freed_pba is
     // always None. The L2P state still progresses through the bucketed
     // apply correctly — that is the load-bearing invariant for batch
     // dispatch.
@@ -242,7 +242,7 @@ fn bucketed_apply_large_remap_batch_updates_refcounts_and_freed_outcome() {
                 applied, freed_pba, ..
             } => {
                 assert!(applied);
-                assert_eq!(freed_pba, None, "Phase 5: L2pRemap never surfaces freed_pba");
+                assert_eq!(freed_pba, None, "L2pRemap never surfaces freed_pba");
             }
             other => panic!("expected L2pRemap outcome, got {other:?}"),
         }
@@ -260,7 +260,7 @@ fn bucketed_apply_large_remap_batch_updates_refcounts_and_freed_outcome() {
 
 #[test]
 fn bucketed_apply_remap_preserves_same_lba_order() {
-    // Phase 5: rc unchanged; the test verifies last-write-wins L2P
+    // rc unchanged; the test verifies last-write-wins L2P
     // ordering inside the bucketed apply.
     let (_d, db) = mk_db_with_shards(4);
     let mut tx = db.begin();
@@ -280,7 +280,7 @@ fn bucketed_apply_remap_preserves_same_lba_order() {
 
 #[test]
 fn bucketed_apply_remap_preserves_same_lba_order_when_leaf_grouped() {
-    // Phase 5: rc unchanged across bucket apply.
+    // rc unchanged across bucket apply.
     let (_d, db) = mk_db_with_shards(1);
     let mut tx = db.begin();
     for i in 0..8u64 {
@@ -306,7 +306,7 @@ fn bucketed_apply_remap_preserves_same_lba_order_when_leaf_grouped() {
 
 #[test]
 fn bucketed_apply_remap_batch_handles_shared_new_pba() {
-    // Phase 5: rc unchanged; the test verifies all 32 LBAs land on the
+    // rc unchanged; the test verifies all 32 LBAs land on the
     // shared PBA after the bucketed apply.
     let (_d, db) = mk_db_with_shards(8);
     let mut tx = db.begin();
@@ -325,7 +325,7 @@ fn bucketed_apply_remap_batch_handles_shared_new_pba() {
 }
 
 /// `commit_ops` only ever receives data-plane ops in Buffer-mode
-/// (Phase D.5b). `batch_contains_lifecycle_op` is kept as a defensive
+/// (lifecycle journal cutover). `batch_contains_lifecycle_op` is kept as a defensive
 /// `false`-returning shim so future variants don't silently bypass the
 /// fallback; this test pins that behaviour.
 #[test]

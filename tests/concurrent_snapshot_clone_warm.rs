@@ -1,18 +1,18 @@
-//! ZFS port Phase 4 S3 — CONCURRENT coverage the phase-serialized soak misses,
+//! BFG — concurrent coverage the serialized soak misses,
 //! driven under onyx's REAL concurrency contract.
 //!
-//! The `--onyx-concurrent-mix` soak PHASE-SERIALIZES its Phase-2 worker writes
-//! against the Phase-3 snapshot/clone admin verbs, so it never interleaves a
+//! The `--onyx-concurrent-mix` soak serializes its worker writes
+//! against the snapshot/clone admin verbs, so it never interleaves a
 //! commit (a `cow_for_write` against a freshly-snapshotted / clone-shared
 //! volume) with the snapshot/clone lifecycle the way a live engine does. These
-//! tests close that gap for the two paths S3 made load-bearing:
+//! tests close that gap for the two paths that became load-bearing after
+//! page-rc removal:
 //!
 //!  1. **flush snapshot-cache-warm** (the /code-review fix): the per-volume
 //!     `SnapInfo` cache that feeds `snapshot_wms` is warmed by
-//!     `finish_pending_snapshots`, which S3 moved INSIDE the `apply_gate.write`
-//!     window so every commit after a snapshot finalize observes it.
-//!  2. **interleaved clone-source overwrite** (M2: dropping the `effective_rc>1`
-//!     COW-kill floor): a NON-clone volume that is a clone SOURCE keeps sharing
+//!     `finish_pending_snapshots` inside the `apply_gate.write` window so every
+//!     commit after a snapshot finalize observes it.
+//!  2. **interleaved clone-source overwrite**: a NON-clone volume that is a clone SOURCE keeps sharing
 //!     L2P pages with its clone after the linking snapshot is dropped (promotion
 //!     is lite). The replacement pin is `clone_cow_pinners`. A regression there
 //!     premature-frees a page the clone still reads; `drop_volume` on the clone
@@ -29,7 +29,8 @@
 //! mutually exclusive (commits interleave BETWEEN admin ops, never DURING one).
 //! These tests model that exact contract with a shared `RwLock`: the writer
 //! takes the read side per op, each admin op takes the write side. That is the
-//! realistic concurrency the S3 warm-fix + M2 pin must survive. The companion
+//! realistic concurrency the snapshot-cache warm path and clone-source pin must
+//! survive. The companion
 //! `concurrent_snapshot_clone_warm_unguarded.rs` DROPS this caller-side lock to
 //! prove metadb is now self-sufficiently safe (a true mid-`take_snapshot`
 //! overlap stays sound because `take_snapshot` holds `drop_gate.write`).
@@ -61,7 +62,7 @@ fn db_with_shards(dir: &TempDir, shards: u32) -> Arc<Db> {
     Db::create_with_config(cfg).unwrap()
 }
 
-/// Full S3 HARD oracle set: `check_birth_shadow` also drives
+/// Full hard-oracle set: `check_birth_shadow` also drives
 /// `check_page_deadlist`; the two clone oracles cover the clone-lineage paths.
 /// `strict:false` keeps the bounded benign orphan leak a warning (matches the
 /// dead_list suite); a real premature free still trips `issues`.
@@ -197,7 +198,7 @@ fn concurrent_writer_vs_snapshot_flush_warm_stays_sound() {
 
 /// Test 2 — writer COWs the clone SOURCE (vol0, read-locked) interleaved with
 /// clone_volume / drop_snapshot(linking) / promote / drop_volume churn (each
-/// write-locked). The M2 clone-source pin (`clone_cow_pinners`) must hold across
+/// write-locked). The clone-source pin (`clone_cow_pinners`) must hold across
 /// the dropped linking snapshot while the source keeps being overwritten.
 #[test]
 fn concurrent_clone_source_overwrite_stays_sound() {
@@ -214,7 +215,7 @@ fn concurrent_clone_source_overwrite_stays_sound() {
 
         let stop = Arc::new(AtomicBool::new(false));
         // The source overwriter: vol0 is the clone SOURCE; these read-locked
-        // writes are the M2 path that must COW against pages a live clone still
+        // writes must COW against pages a live clone still
         // shares after the linking snapshot is dropped.
         let src_writer = spawn_overwriter(&db, &lock, &stop, 0, 0xC0DE_0002);
 

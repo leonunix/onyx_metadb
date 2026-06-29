@@ -1,4 +1,4 @@
-//! ZFS-TXG-clone Phase 2 soak gate — sync vs deferred outcome equivalence.
+//! BFG soak gate — sync vs deferred outcome equivalence.
 //!
 //! ## What this gates
 //!
@@ -13,9 +13,9 @@
 //!    handle must still carry the same `applied=false, prev=Some(cur)`
 //!    payload as the sync caller would have observed.
 //!
-//! `freed_pba` / `freed_pbas` must stay empty under Phase 5's
+//! `freed_pba` / `freed_pbas` must stay empty under 's
 //! `lineage_gc_emit_freepbas = true` default: any populated freed-PBA
-//! field is treated as a Phase 5 regression and the proptest fails.
+//! field is treated as a regression and the proptest fails.
 //!
 //! ## Why this is a soak gate
 //!
@@ -24,9 +24,9 @@
 //! (metadb) + onyx `FlushConfig::commit_worker_deferred_outcomes` to
 //! `true` by default. Both flags must stay opt-in until the 8h nvme-box
 //! concurrent soak built around this property passes; see
-//! `[[zfs-txg-clone-phase2-remaining]]` in memory for the bigger picture.
+//! `BFG deferred-outcome follow-up` in memory for the bigger picture.
 //!
-//! ## Phase 4 Step 8 follow-up
+//! ## follow-up
 //!
 //! `DeferredOutcomeAggregator` was simplified to inline delivery (the
 //! `L2pCompactor` it used to wake is gone). The
@@ -163,22 +163,22 @@ fn outcomes_eq(a: &[ApplyOutcome], b: &[ApplyOutcome]) -> Result<(), String> {
                 "outcome[{i}] divergence:\n  sync={oa:?}\n  deferred={ob:?}"
             ));
         }
-        // Phase 5 invariant: freed_pba / freed_pbas must always be
+        // invariant: freed_pba / freed_pbas must always be
         // empty under lineage_gc_emit_freepbas = true (the master
         // default). Any populated freed entry is a regression of
-        // [[zfs-txg-clone-phase2-first-cut-landed]].
+        // BFG deferred-outcome rollout.
         match oa {
             ApplyOutcome::L2pRemap { freed_pba, .. } => {
                 if freed_pba.is_some() {
                     return Err(format!(
-                        "outcome[{i}] L2pRemap.freed_pba populated under Phase 5"
+                        "outcome[{i}] L2pRemap.freed_pba populated in rc-neutral mode"
                     ));
                 }
             }
             ApplyOutcome::L2pRemapRange { freed_pbas, .. } => {
                 if !freed_pbas.is_empty() {
                     return Err(format!(
-                        "outcome[{i}] L2pRemapRange.freed_pbas non-empty under Phase 5"
+                        "outcome[{i}] L2pRemapRange.freed_pbas non-empty in rc-neutral mode"
                     ));
                 }
             }
@@ -309,7 +309,7 @@ proptest! {
 
 // -------- fault injection: DeferredOutcomeDrainMidway --------
 //
-// ZFS-TXG-clone Phase 4 Step 8: the `DeferredOutcomeAggregator` no
+// BFG: the `DeferredOutcomeAggregator` no
 // longer parks staged outcomes — `stage()` populates the handle's
 // channel inline and returns. There is no later drain to inject a
 // fault into, so the `DeferredOutcomeDrainMidway` fault point is
@@ -318,7 +318,7 @@ proptest! {
 // aggregator's pending map. See `src/db/commit/outcomes.rs` for
 // the inline-delivery rationale.
 
-/// Investigation test for [[zfs-txg-clone-phase2-remaining]] follow-up
+/// Investigation test for BFG deferred-outcome follow-up follow-up
 /// #3a: the `sync_vs_deferred_outcomes_match` proptest needed
 /// `db_sync.test_force_compact_pass()` to be called between batches
 /// alongside the deferred db's pass, otherwise `prev` values for an
@@ -333,7 +333,7 @@ proptest! {
 ///
 /// If this assertion fires, the metadb buffer-vs-tree apply layers
 /// observe stale state at different timing windows — that would be a
-/// real correctness gap independent of Phase 2. If it passes, the
+/// real correctness gap independent of . If it passes, the
 /// proptest divergence was actually noise from the background
 /// compactor racing with apply, and the workaround
 /// (`db_sync.test_force_compact_pass()` per batch) is purely a test

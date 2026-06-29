@@ -611,7 +611,7 @@ fn crash_safety_allocate_without_write_is_not_leaked_after_reopen() {
     assert_eq!(pid, FIRST_DATA_PAGE + 2);
 }
 
-/// Phase B parallel-submit path: a multi-run reclaim must still
+/// buffer-backed journal parallel-submit path: a multi-run reclaim must still
 /// (a) stamp every selected pid as `Free` on disk, (b) extend
 /// `free_list` with the full set, and (c) re-allocate them in
 /// pid-sorted order. A multi-run batch is built by interleaving

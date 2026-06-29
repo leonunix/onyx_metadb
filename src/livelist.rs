@@ -1,17 +1,13 @@
-//! Per-clone page-livelist (ZFS port Phase 3b): append-only log of
+//! Per-clone page-livelist: append-only log of
 //! `(pid, birth_lsn, event_lsn, kind: ALLOC|FREE)` records emitted as a
 //! clone allocates / frees its clone-private L2P metadata pages
-//! (`birth_lsn > branched_at_lsn`). The ZFS `dd_livelist` analogue: at
-//! `drop_volume` the live-ALLOC set (ALLOC not cancelled by a matching
-//! `(pid, birth)` FREE) is the clone's privately-allocated, still-live
-//! subtree — the set Phase 4 will read instead of walking the tree.
+//! (`birth_lsn > branched_at_lsn`). At `drop_volume` the live-ALLOC set
+//! (ALLOC not cancelled by a matching `(pid, birth)` FREE) is the clone's
+//! privately-allocated, still-live subtree.
 //!
-//! Phase 3b keeps this in SHADOW (page-rc stays authoritative); the
-//! substrate is only populated + offline-verified here. Background
-//! condense (ALLOC/FREE pair cancellation to bound chain growth) and
-//! drop-time chain freeing are deferred to a Phase-3b follow-up — for now
-//! `live_allocs` cancels pairs at read time and dropped clones' segments
-//! ride orphan-reclaim on the next open, mirroring the page-deadlist.
+//! Background condense cancels ALLOC/FREE pairs to bound chain growth.
+//! `live_allocs` also cancels pairs at read time, and dropped clones' segments
+//! are reclaimed idempotently with the rest of the page store.
 //!
 //! # Concurrency
 //!
@@ -61,9 +57,8 @@ impl LiveKind {
     }
 }
 
-/// One ALLOC/FREE event captured at apply time. `pid` + `birth_lsn`
-/// identify the exact page version (matching ZFS keying on the full
-/// blkptr); `event_lsn` orders the record in the chain.
+/// One ALLOC/FREE event captured at apply time. `pid` + `birth_lsn` identify
+/// the exact page version; `event_lsn` orders the record in the chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveRecord {
     pub pid: PageId,
@@ -404,7 +399,7 @@ where
 /// Walk a clone's livelist segment chain from `tail_pid` backward and
 /// return every page id owned by the chain. Used by `verify`'s
 /// `collect_live_pages` to mark the chain's segment pages live (so
-/// orphan-reclaim does not free them), and (Phase-3b follow-up) by condense
+/// orphan-reclaim does not free them), and (follow-up) by condense
 /// to reclaim the old chain.
 pub fn walk_chain_pages<F>(tail_pid: PageId, read_page: F) -> Result<Vec<PageId>>
 where

@@ -3,7 +3,7 @@
 //! Single-writer, in-place, no snapshots. Each shard owns one B+tree
 //! keyed by 8-byte big-endian PBAs with 12-byte values
 //! ([`RcEntry`] = `(rc: u32, birth_lsn: u64)`). L2P moved to
-//! [`crate::paged`] in phase 6.5a; `DiffEntry` and `L2pValue` moved
+//! [`crate::paged`] in .5a; `DiffEntry` and `L2pValue` moved
 //! with it.
 //!
 //! Pages are 4 KiB and live in the shared page store. 201 entries per

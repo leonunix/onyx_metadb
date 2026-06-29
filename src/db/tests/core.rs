@@ -294,7 +294,7 @@ fn b2_buffer_overwrite_visible_to_get() {
     assert_eq!(db.get(0, 10).unwrap(), Some(v(8)));
 }
 
-// Repro for the A3 page-rc cutover premature-free found by the nvme-box
+// Repro for the page-rc staging page-rc cutover premature-free found by the nvme-box
 // snapshot-churn soak (2026-06-17). In buffer mode the COW increfs of
 // pages that become shared with a live snapshot are staged into the
 // `L2pPageRc` array; if any of those increfs is wrongly dropped (the
@@ -432,8 +432,8 @@ fn create_volume_root_page_rc_survives_reopen() {
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
 
-// ZFS `dsl_sync_task` port regression: `take_snapshot` stages the
-// snapshot-root incref into the OPEN TXG, so it folds in a LATER sync
+// BFG sync-task regression: `take_snapshot` stages the
+// snapshot-root incref into the OPEN BFG, so it folds in a LATER sync
 // cycle — NOT the take's own cycle. If the process closes right after
 // `take_snapshot` (before that fold), the incref is durable ONLY via the
 // journaled `LifecycleOp::TakeSnapshot` record + replay. A reopen MUST
@@ -457,7 +457,7 @@ fn take_snapshot_incref_survives_close_before_fold() {
         db.flush().unwrap();
         let _s = db.take_snapshot(0).unwrap();
         // Deliberately NO flush after take → the incref is staged in the
-        // open TXG, never folded. Closing here is the crash-equivalent.
+        // open BFG, never folded. Closing here is the crash-equivalent.
         drop(db);
     }
     // Reopen: lifecycle replay must restore the incref BEFORE the writes
@@ -496,7 +496,7 @@ fn take_snapshot_incref_survives_close_before_fold() {
 
 // Concurrent version — this is the shape the nvme-box soak actually ran
 // (writers hammering the volume while snapshots are taken/dropped). The
-// serial test above proved quiesced A3 is correct; the soak's
+// serial test above proved quiesced page-rc staging is correct; the soak's
 // premature-free needs live COW racing the snapshot force-flush / buffer
 // drain. Writers `.unwrap()` so a corruption-class Err (a freed page
 // reused as the wrong type) fails the test in the writer thread; the
@@ -509,10 +509,10 @@ fn buffer_mode_concurrent_snapshot_churn_no_corruption() {
     cfg.l2p_buffer_enabled = true;
     cfg.l2p_buffer_soft_entries = 4;
     cfg.l2p_buffer_max_interval_ms = 5;
-    // Mirror the nvme-box soak config: background TXG sync threads make
+    // Mirror the nvme-box soak config: background BFG sync threads make
     // the page-rc fold/drain run CONCURRENTLY with commits + the
     // snapshot force-flush — the race the serial path can't hit.
-    cfg.txg_threads_enabled = true;
+    cfg.bfg_threads_enabled = true;
     cfg.rc_authoritative_reclaim = true;
     let db = Db::create_with_config(cfg).unwrap();
 
@@ -646,12 +646,12 @@ fn b2_buffer_flush_reopen_round_trip() {
     }
 }
 
-// Phase D.5: `b2_buffer_no_flush_reopen_replays_from_wal` exercised
+// WAL-free recovery: `b2_buffer_no_flush_reopen_replays_from_wal` exercised
 // WAL replay of an unflushed L2P buffer — covered for the Buffer
 // path by `tests/db_buffer_journal_replay.rs`'s lifecycle journal
 // tests + the embedder-side LV2 buffer replay. Test deleted.
 
-// -------- B2 Phase 4: snapshot + range_delete with buffer --------
+// -------- B2 snapshot + range_delete with buffer --------
 
 #[test]
 fn b2_buffer_take_snapshot_force_compacts_target() {
@@ -750,7 +750,7 @@ fn b2_buffer_range_delete_drains_buffer() {
     // `range_delete` calls `force_compact_l2p_buffers` so the scan
     // sees buffer-only entries that haven't compacted yet.
     //
-    // Phase 5: hot-path `L2pRemap` no longer maintains global rc, and
+    // hot-path `L2pRemap` no longer maintains global rc, and
     // RangeDelete is PBA rc-neutral too. Seed rc explicitly so the test
     // can assert the delete drains buffer-only L2P entries without
     // mutating PBA rc.
@@ -778,7 +778,7 @@ fn b2_buffer_range_delete_drains_buffer() {
     for i in 40u64..50 {
         assert_eq!(db.get(0, i).unwrap(), Some(remap_val(100 + i, i as u8)));
     }
-    // Phase 5: RangeDelete is PBA rc-neutral — it drains the L2P entries but
+    // RangeDelete is PBA rc-neutral — it drains the L2P entries but
     // does NOT decref PBA rc. So every seeded pba stays rc=1, *including* the
     // deleted range. This is exactly the shared/dedup-safety property: deleting
     // one LBA mapping must never knock a (possibly shared) PBA's rc toward 0.
@@ -814,7 +814,7 @@ fn b2_buffer_range_delete_drains_buffer() {
 // `page N has level 1, expected 0`).
 //
 // To reproduce we must BUILD THE BACKLOG: a large `soft_entries` +
-// `txg_threads_enabled = false` so the background compactor does not
+// `bfg_threads_enabled = false` so the background compactor does not
 // drain, churn many COW overwrites of pages shared with a live
 // snapshot across several explicit `flush()`es (each flush folds the
 // L2P buffer + advances the page-rc array generation, but leaves later
@@ -839,7 +839,7 @@ fn drop_snapshot_force_fold_over_buffer_backlog_no_premature_free() {
     cfg.l2p_buffer_soft_entries = 1_000_000;
     cfg.l2p_buffer_hard_entries = 4_000_000;
     cfg.l2p_buffer_max_interval_ms = 600_000;
-    cfg.txg_threads_enabled = false;
+    cfg.bfg_threads_enabled = false;
     let db = Db::create_with_config(cfg).unwrap();
 
     // Span many leaves + interior/index pages so many pids land on each
@@ -895,7 +895,7 @@ fn drop_snapshot_force_fold_over_buffer_backlog_no_premature_free() {
 
     // Now DROP the snapshot. This is the soak trigger:
     //   force_compact_l2p_buffers (drain remaining buffered COW into the
-    //     open TXG slot → fresh page-rc decrefs)
+    //     open BFG slot → fresh page-rc decrefs)
     //   then l2p_page_rc.flush() → RcShard::flush()
     //     → begin_checkpoint_all_slots(force=true)
     //   which RE-APPLIES every slot delta bypassing the
@@ -934,11 +934,11 @@ fn drop_snapshot_force_fold_over_buffer_backlog_no_premature_free() {
 }
 
 // =====================================================================
-// BIRTH-TXG SHADOW (ZFS birth-txg port, Phase 1). These prove R1: the
-// immutable `birth_lsn` is a reliable birth-txg substrate — for every
+// BIRTH-LSN SHADOW (BFG: These prove birth-shadow equivalence: the
+// immutable `birth_lsn` is a reliable birth-LSN substrate — for every
 // head-reachable L2P page P, `birth_lsn(P) <= youngest_snap(V)` ⟺ P is
 // reachable from the youngest snapshot's tree (the exact COW kill decision
-// Phase 2 will use). The oracle is `verify_path(.., check_birth_shadow)`.
+// will use). The oracle is `verify_path(.., check_birth_shadow)`.
 // Page-rc stays authoritative throughout (zero behavior change).
 //
 // All run the check WITH A LIVE SNAPSHOT and a PARTIAL overwrite, so the
@@ -1012,7 +1012,7 @@ fn birth_shadow_partial_overwrite_live_snapshot_direct() {
 
 #[test]
 fn birth_shadow_partial_overwrite_live_snapshot_buffer() {
-    // BUFFER mode is the make-or-break for R1: COW (and thus birth
+    // BUFFER mode is the make-or-break for birth-shadow equivalence: COW (and thus birth
     // stamping) happens at DRAIN time, in radix-key order with per-entry
     // (non-monotone) lsns. If birth were stamped from the drain lsn or a
     // per-leaf-max instead of the page version's creating lsn, a shared
@@ -1049,7 +1049,7 @@ fn birth_shadow_partial_overwrite_live_snapshot_buffer() {
 
 #[test]
 fn birth_shadow_non_monotone_drain_large_backlog() {
-    // The force-fold P0's exact condition: a large un-folded page-rc
+    // The force-fold case's exact condition: a large un-folded page-rc
     // backlog with NON-MONOTONE lsns (strided/reversed writes drained in
     // radix-key order), under a LIVE snapshot. The birth substrate must
     // stay correct regardless of drain/fold order.
@@ -1060,7 +1060,7 @@ fn birth_shadow_non_monotone_drain_large_backlog() {
     cfg.l2p_buffer_soft_entries = 1_000_000; // never auto-drain
     cfg.l2p_buffer_hard_entries = 4_000_000;
     cfg.l2p_buffer_max_interval_ms = 600_000;
-    cfg.txg_threads_enabled = false;
+    cfg.bfg_threads_enabled = false;
     let db = Db::create_with_config(cfg).unwrap();
 
     for i in 0..BIRTH_N {
@@ -1157,8 +1157,8 @@ fn birth_shadow_layered_snapshots_youngest_is_threshold() {
 
 #[test]
 fn youngest_snap_tracks_max_created_lsn() {
-    // `Db::youngest_snap` (ZFS prev_snap_txg analogue) is the COW kill
-    // threshold the birth-txg port (Phase 2) will read. It must return the
+    // `Db::youngest_snap` is the COW kill
+    // threshold the BFG birth tracking () will read. It must return the
     // max live snapshot `created_lsn`, `None` when none, and never decrease
     // while snapshots accumulate.
     let (_d, db) = mk_db();
@@ -1176,4 +1176,4 @@ fn youngest_snap_tracks_max_created_lsn() {
     assert!(y3 <= y2 && y3 >= y1, "after dropping the youngest, threshold falls back");
 }
 
-// -------- phase 7 commit 8: volume lifecycle --------
+// -------- commit 8: volume lifecycle --------

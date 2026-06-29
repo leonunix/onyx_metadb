@@ -74,7 +74,7 @@ impl MetaMetrics {
         record_duration(&self.commit_apply_us, &self.commit_apply_max_us, elapsed);
     }
 
-    /// ZFS-TXG-clone Phase 1: tracks the L2P-only direct-apply fast
+    /// BFG: tracks the L2P-only direct-apply fast
     /// path. Wall time recorded is a subset of `commit_apply_us`
     /// (this path replaces the lane-recv stretch). Counter increments
     /// per commit taking the fast path.
@@ -88,7 +88,7 @@ impl MetaMetrics {
         );
     }
 
-    /// ZFS-TXG-clone Phase 2: increment per-stage counter and update
+    /// BFG: increment per-stage counter and update
     /// the pending depth gauge. Pending depth is recorded as a
     /// `Store` (last value wins) plus a `fetch_max` tracking
     /// observed peak.
@@ -99,13 +99,13 @@ impl MetaMetrics {
         fetch_max(&self.commit_deferred_outcomes_pending_max, d);
     }
 
-    /// ZFS-TXG-clone Phase 2: per-stage call counter.
+    /// BFG: per-stage call counter.
     pub(crate) fn record_deferred_outcomes_staged(&self) {
         self.commit_deferred_outcomes_count
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// ZFS-TXG-clone Phase 2: count of entries released by the
+    /// BFG: count of entries released by the
     /// compactor's step-6 drain. Used to verify the drain is keeping
     /// up with the stage rate during soak.
     pub(crate) fn record_deferred_outcomes_released(&self, count: u64) {

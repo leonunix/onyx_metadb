@@ -182,7 +182,7 @@ fn verify_reopened_db(
         }
     }
     drop(db);
-    // Birth-txg port Phase 1: the soak is the R1 gate — run the birth-shadow
+    // BFG birth tracking: the soak is the birth-shadow equivalence gate — run the birth-shadow
     // invariant on every soak-end verify (page-rc stays authoritative).
     verify_path(
         path,
@@ -190,7 +190,7 @@ fn verify_reopened_db(
             strict: true,
             check_birth_shadow: true,
             check_clone_livelist: true,
-            // ZFS port Phase 4 S1c: validate the page-rc-independent clone COW-kill
+            // BFG: validate the page-rc-independent clone COW-kill
             // operand on every soak-end verify (the flip's tripwire).
             check_clone_birth_shadow: true,
         },

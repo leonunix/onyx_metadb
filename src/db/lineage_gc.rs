@@ -1,4 +1,4 @@
-//! Background driver for Phase 5 FreePbas-emitting Lineage GC.
+//! Background driver for FreePbas-emitting Lineage GC.
 //!
 //! [`Db::run_lineage_gc_cycle_inner`](super::Db) is the only path that
 //! surfaces dead LV3 PBAs to onyx: per advancing volume it commits a
@@ -15,7 +15,7 @@
 //! This worker is the single production mutator of every volume's
 //! `dead_list_head_pid` (the GC execute phase re-acquires
 //! `apply_gate.write()` to serialise against flush). It mirrors the
-//! [`crate::db::txg_sync::TxgSyncThread`] `Weak<Db>` pattern so the
+//! [`crate::db::bfg_sync::BfgSyncThread`] `Weak<Db>` pattern so the
 //! thread never extends `Db`'s lifetime: `Db::drop` calls
 //! [`LineageGcWorker::stop`] (joining the thread) before `page_store` /
 //! refcount / dedup teardown, and the strong refcount the caller holds

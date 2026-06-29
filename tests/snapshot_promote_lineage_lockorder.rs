@@ -2,14 +2,14 @@
 //! lock-order hazard (found in /code-review of `5f5696e`).
 //!
 //! `take_snapshot` / `create_volume` hold `drop_gate.write()` across a forced
-//! TXG sync whose `roll_to_quiescing` waits for `slots[cur].inflight == 0`.
+//! BFG sync whose `roll_to_quiescing` waits for `slots[cur].inflight == 0`.
 //! Three commit paths — `commit_free_pbas` (autonomous LineageGcWorker),
 //! `commit_promotion_chunk`, and `commit_promotion_complete` (both on the
-//! `promote_volume` drive path) — used to acquire `txg.enter()` (which bumps
+//! `promote_volume` drive path) — used to acquire `bfg.enter()` (which bumps
 //! inflight) BEFORE `drop_gate.read()`. So a commit that entered just before a
 //! `take_snapshot` grabbed `drop_gate.write` would pin inflight while parked at
 //! `drop_gate.read`, and the snapshot's roll could never drain → hard 3-way
-//! deadlock. The fix swaps all three to `drop_gate.read()` BEFORE `txg.enter()`
+//! deadlock. The fix swaps all three to `drop_gate.read()` BEFORE `bfg.enter()`
 //! (matching `commit_ops`), so a parked commit holds no inflight.
 //!
 //! This test drives the exact concurrency the 8h dense soak missed (its
@@ -79,7 +79,7 @@ fn snapshot_vs_promote_and_lineage_gc_no_deadlock() {
             }
             eprintln!(
                 "DEADLOCK: snapshot_vs_promote_and_lineage_gc_no_deadlock did not finish \
-                 in {WATCHDOG_SECS}s — likely a txg.enter()-before-drop_gate.read() \
+                 in {WATCHDOG_SECS}s — likely a bfg.enter()-before-drop_gate.read() \
                  lock-order regression (commit_free_pbas / commit_promotion_chunk / \
                  commit_promotion_complete)."
             );

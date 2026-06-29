@@ -1,4 +1,4 @@
-//! ZFS port Phase 3a: per-clone page-livelist SHADOW (`drop_volume`
+//! BFG: per-clone page-livelist SHADOW (`drop_volume`
 //! clone-drop cross-check). Page-rc stays authoritative; the shadow asserts
 //! that the page-rc free-set (`collect_drop_pages` rc==1) equals an
 //! independent C-exclusive reachability walk, aborting HARD on a premature
@@ -34,7 +34,7 @@ fn allocs(pairs: &[(crate::types::PageId, crate::types::Lsn)]) -> Vec<LiveRecord
         .collect()
 }
 
-/// G2/G3/G4: sibling clones share the snapshot's pages, each writes a private
+/// merge-reanchor/G3/G4: sibling clones share the snapshot's pages, each writes a private
 /// page, then both are dropped in each order. The shadow must stay green
 /// (premature never fires; the shared pages a survivor still references are
 /// not freed) regardless of drop order.
@@ -69,13 +69,14 @@ fn sibling_clones_drop_both_orders_shadow_stays_green() {
     }
 }
 
-/// G6 (PREMATURE load-bearing): clone-of-clone. C diverges (clone-private
-/// pages born > B1), a snapshot S2 of C is cloned into D, then S2 is dropped
+/// descendant-share (PREMATURE load-bearing): clone-of-clone. C diverges
+/// (clone-private pages born > B1), a snapshot `s2` of C is cloned into D, then
+/// `s2` is dropped
 /// and D is promoted — making `drop_volume(C)` *legal* while D still shares
 /// C's `birth > B1` pages. The exclusive-reachability shadow must NOT fire
 /// premature (those pages are reachable from D, a survivor, so page-rc keeps
 /// them); a naive `birth > B` predicate WOULD free them = the premature-free
-/// P0 the port exists to kill. D's data must survive C's drop.
+/// case the port exists to kill. D's data must survive C's drop.
 #[test]
 fn clone_of_clone_drop_middle_after_promote_shadow_stays_green() {
     let (_d, db) = mk_db();
@@ -92,12 +93,12 @@ fn clone_of_clone_drop_middle_after_promote_shadow_stays_green() {
     }
     let s2 = db.take_snapshot(c).unwrap();
     let d = db.clone_volume(s2).unwrap();
-    // D shares C's born>B1 pages via S2's roots.
+    // D shares C's born>B1 pages via s2's roots.
     for i in 0u64..8 {
         assert_eq!(db.get(d, i).unwrap(), Some(v(0xC0 | i as u8)));
     }
 
-    // Legalize C's drop: drop S2 (C has no live snapshot) + promote D (clears
+    // Legalize C's drop: drop s2 (C has no live snapshot) + promote D (clears
     // D.parent_vol_ord so C has no pending descendant) — while D still
     // physically shares C's born>B1 L2P pages (page-rc, invisible to birth).
     let _ = db.drop_snapshot(s2).unwrap().unwrap();
@@ -117,7 +118,7 @@ fn clone_of_clone_drop_middle_after_promote_shadow_stays_green() {
     }
 }
 
-/// G8-shape: the parent diverges over a shared LBA and the source snapshot is
+/// origin-fallthrough-shape: the parent diverges over a shared LBA and the source snapshot is
 /// dropped, so some origin pages (`birth <= B`) fall sole-owned to the clone.
 /// Dropping the clone must stay GREEN under all three detectors: those origin
 /// pages are freed by page-rc (rc==1) AND C-exclusive by reachability (no
@@ -252,7 +253,7 @@ fn clone_drop_shadow_fires_on_premature_divergence() {
 
 /// TEETH (missing → HARD): a free-set that frees NOTHING while the clone has
 /// C-exclusive reachable pages is a page-rc leak — the C-exclusive reachability
-/// walk frees pages page-rc keeps live. Phase 4 Step 1 escalates this from a
+/// walk frees pages page-rc keeps live. escalates this from a
 /// soft warn to HARD `Corruption` (its soundness rests on `surviving_roots`
 /// being complete, which it is for a still-clone drop).
 #[test]
@@ -425,9 +426,9 @@ fn clone_churn_shadow_stress() {
     use std::collections::{HashMap, HashSet};
 
     // Base/clone separation keeps this CLONE-shadow stress isolated from the
-    // SNAPSHOT page-deadlist shadow (Phase 2b), whose two known/deferred,
+    // SNAPSHOT page-deadlist shadow (), whose two known/deferred,
     // data-safe bugs (created_lsn tie → premature, chain → missing; see memory
-    // zfs_port_phase2b_deadlist_two_bugs) trip on snapshot DROPS. So this test
+    // the earlier snapshot-deadlist regressions trip on snapshot DROPS. So this test
     // NEVER drops a snapshot: a small fixed set of base volumes + base
     // snapshots lives forever; the churn only creates/writes/promotes/DROPS
     // CLONES, whose drops run `check_clone_livelist_shadow`. The failure signal
@@ -579,7 +580,7 @@ fn clone_churn_shadow_stress() {
             .unwrap();
     }
 
-    // S1c: the page-rc-INDEPENDENT clone COW-kill operand must stay a complete
+    // clone COW-kill: the page-rc-INDEPENDENT clone COW-kill operand must stay a complete
     // superset of "pinned" across the whole clone+promote+drop churn — every page
     // a surviving pinner reaches is COW'd by the operand (no clobber). Flush so the
     // manifest reflects committed roots, then run the shadow over the final state.
@@ -592,14 +593,14 @@ fn clone_churn_shadow_stress() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4 Step 3 (DAG correctness): the clone-drop shadow gate widened from
+// the clone-drop shadow gate widened from
 // `parent_vol_ord.is_some()` (still-clones) to the sticky
 // `VOLUME_FLAG_CLONE_LINEAGE` flag, so dropping a PROMOTED ex-clone also runs
 // the 3-arm cross-check. Promotion is lite (clears parent_vol_ord, bumps only
 // global PBA rc, never restructures the page tree), so a promoted ex-clone may
 // still page-rc-SHARE L2P pages with its lineage. These tests prove the widened
 // gate fires for promoted ex-clones and that the birth-agnostic reachability
-// arms handle the DAG hazards (G6 descendant-share, G8 origin-fallthrough)
+// arms handle the DAG hazards (descendant-share descendant-share, origin-fallthrough origin-fallthrough)
 // without false-firing. page-rc stays authoritative — shadow only.
 // ---------------------------------------------------------------------------
 
@@ -633,8 +634,9 @@ fn promoted_exclone_drop_shadow_runs_and_stays_green() {
     db.insert(c, 0, v(0xC0)).unwrap(); // diverge only lba0; lba1..7 shared with P/snap
     promote_to_completion(&db, c);
 
-    // We are genuinely in the newly-covered category: the Step-1 gate
-    // (parent_vol_ord.is_some()) would SKIP this; the Step-3 flag gate runs it.
+    // We are genuinely in the promoted-ex-clone category: the old
+    // `parent_vol_ord.is_some()` gate would skip this; the sticky clone-lineage
+    // flag gate runs it.
     let entry = db
         .manifest()
         .volumes
@@ -665,7 +667,7 @@ fn promoted_exclone_drop_shadow_runs_and_stays_green() {
     }
 }
 
-/// G6 for a PROMOTED ex-clone: C's born>B1 pages are still shared with a
+/// descendant-share for a PROMOTED ex-clone: C's born>B1 pages are still shared with a
 /// promoted descendant D. Dropping the promoted ex-clone C must NOT premature —
 /// those pages are reachable from survivor D, so `exclusive` excludes them and
 /// page-rc keeps them (rc>1). Extends the still-clone middle-drop test to
@@ -701,11 +703,11 @@ fn promoted_exclone_g6_descendant_share_no_premature() {
     }
 }
 
-/// G8 for a PROMOTED ex-clone: a born<=B origin page falls sole-owned to C
+/// origin-fallthrough for a PROMOTED ex-clone: a born<=B origin page falls sole-owned to C
 /// after the parent diverges + the source snapshot is dropped. Dropping the
 /// promoted ex-clone must NOT abort missing — the page is in both
 /// `structural_free` (rc==1) and `exclusive` (no survivor), and being born<=B it
-/// drops out of both livelist sides. Extends the still-clone G8 test to the
+/// drops out of both livelist sides. Extends the still-clone origin-fallthrough test to the
 /// promoted case (now that missing is HARD).
 #[test]
 fn promoted_exclone_g8_origin_fallthrough_no_missing() {
@@ -723,7 +725,7 @@ fn promoted_exclone_g8_origin_fallthrough_no_missing() {
 
     assert!(
         db.drop_volume(c).unwrap().is_some(),
-        "promoted-ex-clone G8 drop must not abort missing"
+        "promoted-ex-clone origin-fallthrough drop must not abort missing"
     );
     assert_eq!(db.get(p, 0).unwrap(), Some(v(0xF0)));
     for i in 1u64..8 {
@@ -786,7 +788,7 @@ fn drop_promoted_exclones_former_parent() {
     }
 }
 
-/// ZFS port Phase 4 S2: a CLONE drop frees the reachability `exclusive` set
+/// BFG: a CLONE drop frees the reachability `exclusive` set
 /// via `DropVolume.free_pages = Some(...)` (the flip), NOT the implicit page-rc
 /// rc→0 cascade. End-to-end durable read-back: the clone's C-exclusive pages
 /// are freed, the surviving source keeps every shared page, and reopen + strict
@@ -798,8 +800,8 @@ fn drop_promoted_exclones_former_parent() {
 /// submit, so `volumes.contains_key` is false on reopen) and the crash backstop
 /// is `reclaim_orphan_pages`. We flush after the drop so the page-rc decref of
 /// the kept boundary pages folds durably (a no-flush volume drop leaves that
-/// decref unfolded — a pre-existing, data-safe over-count, out of S2 scope and
-/// removed by S3).
+/// decref unfolded — a pre-existing, data-safe over-count unrelated to this
+/// free-set path).
 #[test]
 fn s2_drop_clone_frees_exclusive_reachability_set() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -938,7 +940,7 @@ fn teeth_still_fire_through_widened_gate() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4 Step 4 (S1c): READ-ONLY clone COW-kill birth-operand shadow. page-rc
+// READ-ONLY clone COW-kill birth-operand shadow. page-rc
 // stays authoritative; these characterize where the candidate post-page-rc
 // clone COW-kill operand `birth(P) <= max(branched_at_lsn, youngest_snap(C))`
 // is safe vs insufficient (it cannot see cross-volume DAG sharing).
@@ -967,7 +969,7 @@ fn clone_birth_shadow_clean_on_simple_clone() {
     );
 }
 
-/// S1c (the fix): the operand now consults DESCENDANT BRANCH POINTS, so the G6
+/// clone COW-kill (the fix): the operand now consults DESCENDANT BRANCH POINTS, so the descendant-share
 /// shape the pure-birth operand mishandled is CLEAN. C's born>B1 pages are shared
 /// with a survivor descendant D; after C's own snapshot s2 is dropped, the
 /// pure-birth `B_eff = max(B1, youngest_snap(C))` falls to B1 (< their birth) and
@@ -999,15 +1001,15 @@ fn clone_birth_shadow_clean_under_descendant_pinner() {
     let findings = db.test_clone_birth_shadow_findings().unwrap();
     assert!(
         findings.is_empty(),
-        "S1c operand consults descendant branch points, so C's born>B1 pages shared with survivor \
+        "clone COW-kill operand consults descendant branch points, so C's born>B1 pages shared with survivor \
          D must stay COW'd (no clobber). findings={findings:?}"
     );
 }
 
-/// S1c END-TO-END (the data-survival proof): the runtime clone COW-kill must
+/// clone COW-kill END-TO-END (the data-survival proof): the runtime clone COW-kill must
 /// PRESERVE a born>B page a survivor descendant still references when the clone
 /// overwrites it in place — even after the clone's own snapshot is dropped. This
-/// is the G6 shape driven through the real write path: build C, snapshot s2,
+/// is the descendant-share shape driven through the real write path: build C, snapshot s2,
 /// clone D from s2 (D shares C's born>B pages), drop s2, then OVERWRITE those
 /// LBAs on C and assert D still reads the OLD values. (With the page-rc floor
 /// kept this also passes via rc, but the structural `clone_birth_shadow` gate
@@ -1050,7 +1052,7 @@ fn clone_cow_kill_preserves_descendant_shared_page_after_snap_drop() {
 }
 
 /// TEETH: the `clone_birth_shadow` HARD gate must FIRE when a descendant pin is
-/// missing from the operand. Build the G6 DAG (clean), then corrupt D's manifest
+/// missing from the operand. Build the descendant-share DAG (clean), then corrupt D's manifest
 /// `branched_at_lsn` DOWN to B_C — dropping D from C's operand pinner set WITHOUT
 /// changing the reachability ground truth (D's roots still reach C's born>B
 /// pages). The operand now under-pins → the safety direction `pinned ∧ ¬COW`
@@ -1089,7 +1091,7 @@ fn clone_birth_shadow_fires_when_descendant_pinner_missing() {
 }
 
 // ============================================================================
-// ZFS port Phase 4 S2c — clone-involved snapshot-drop free-source (R5).
+// BFG — clone-involved snapshot-drop free-source (cross-volume clone sharing).
 // drop_snapshot of a clone-involved volume now frees the page-rc-independent
 // reachability difference (not the single-vol deadlist, which can't model
 // cross-volume page sharing), routed by the sticky CLONE_LINEAGE flag (covers
@@ -1175,7 +1177,11 @@ fn s2c_promoted_exclone_sharer_routes_drop_to_reachability_not_deadlist() {
     }
     drop(db);
     let report = s2c_verify_all(dir.path());
-    assert!(report.is_clean(), "verify after S2c clone-involved drop: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "verify after clone-involved drop: {:?}",
+        report.issues
+    );
 }
 
 /// T3 (frees): a promoted-ex-clone snapshot whose pinned pages NOTHING else
@@ -1211,14 +1217,19 @@ fn s2c_clone_involved_snapshot_drop_frees_exclusive_pages() {
     drop(db);
     // Reopen so `reclaim_orphan_pages` sweeps the drop's deferred orphans (old
     // deadlist segment chains + the snapshot's SnapshotRoots page) before the
-    // offline verify — the same flush→drop→reopen→verify the S2 deadlist test uses.
+    // offline verify — the same flush→drop→reopen→verify flow the deadlist test
+    // uses.
     let db = crate::Db::open(dir.path()).unwrap();
     for i in 0u64..8 {
         assert_eq!(db.get(c, i).unwrap(), Some(v(0xD0 | i as u8)), "reopen C lba {i}");
     }
     drop(db);
     let report = s2c_verify_all(dir.path());
-    assert!(report.is_clean(), "verify after S2c exclusive free: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "verify after clone-involved exclusive free: {:?}",
+        report.issues
+    );
 }
 
 /// T5 (the make-or-break, RED-without-the-always-merge): the MERGE must run on

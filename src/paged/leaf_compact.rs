@@ -1,6 +1,6 @@
 //! Onyx-aware compact leaf encoding (v5 — adds per-unit `base_pba`
 //! delta against a leaf-local `base_pba`, restoring the v3 worst-case
-//! `MAX_UNITS_PER_LEAF = 128` after Phase 1 v4 tightened it to 110).
+//! `MAX_UNITS_PER_LEAF = 128` after v4 tightened it to 110).
 //!
 //! The legacy dense leaf format stored 128 × 28 B `BlockmapValue` records
 //! back-to-back. Onyx's packer puts consecutive LBAs into the same
@@ -38,9 +38,9 @@
 //!   birth_delta     (u32 BE; v4. The full per-PBA `birth_lsn` is
 //!                    `header.base_birth_lsn + birth_delta`. Sentinel
 //!                    `u32::MAX` encodes the "no birth recorded" case
-//!                    (full_birth_lsn = 0). Powers Phase 2's per-volume
+//!                    (full_birth_lsn = 0). Powers 's per-volume
 //!                    dead-list emission — see
-//!                    [[no-refcount-hot-path-design]] memory.)
+//!                    memory.)
 //!
 //! # On-disk layout (within the 4032 B leaf payload)
 //!
@@ -97,7 +97,7 @@
 //!
 //! `MAX_UNITS_PER_LEAF = 128 = LEAF_ENTRY_COUNT`. The pathological
 //! "every slot a unique unit" case fits exactly (same headroom v3 had
-//! pre-Phase-1). Workloads that legitimately span > 4 G PBA blocks
+//! pre-). Workloads that legitimately span > 4 G PBA blocks
 //! within a single 128-LBA leaf range will trip the v5 rebase fallback
 //! in `compact_in_place_full` (mirrors birth_delta's > 4 G LSN edge);
 //! the continuation-page overflow mechanism remains the long-term

@@ -1,7 +1,7 @@
-//! Phase 1 end-to-end: page store + manifest reopen round-trip.
+//! end-to-end: page store + manifest reopen round-trip.
 //!
-//! The original Phase 1 fixture also wove the WAL into the flow, but
-//! the buffer-as-sole-journal refactor (Phase D.5) retired the metadb
+//! The original fixture also wove the WAL into the flow, but
+//! the buffer-as-sole-journal refactor (WAL-free recovery) retired the metadb
 //! WAL — durability for data-plane ops lives in the LV2 buffer and
 //! durability for lifecycle ops lives in `lifecycle_log/`. What's
 //! retained here is the persistence layer that survives both refactors:

@@ -1,4 +1,4 @@
-//! Buffer-as-sole-journal Phase B.2: watermark plumbing tests.
+//! Buffer-as-sole-journal buffer watermark: watermark plumbing tests.
 //!
 //! The flusher publishes `last_processed_buffer_seq` (and the
 //! lifecycle-log equivalent) via `Db::set_buffer_applied_watermark`.
@@ -16,7 +16,7 @@ fn v(n: u8) -> L2pValue {
     L2pValue(x)
 }
 
-// Phase D.5: `watermarks_default_to_zero_on_fresh_create` pinned the
+// WAL-free recovery: `watermarks_default_to_zero_on_fresh_create` pinned the
 // Wal-mode invariant that neither watermark moved without explicit
 // publish. With Wal mode gone the invariant no longer applies —
 // `create_volume` always bumps `lifecycle_replay_seq` because every

@@ -83,7 +83,7 @@ fn drop_volume_removes_ord_from_map_and_manifest() {
     }
 }
 
-// Phase D.5: `volume_lifecycle_survives_reopen_without_flush` exercised
+// WAL-free recovery: `volume_lifecycle_survives_reopen_without_flush` exercised
 // data-plane WAL replay, which is gone. Buffer-mode reopens of an
 // unflushed `create_volume` are covered by
 // `tests/db_buffer_journal_replay.rs::replay_recovers_create_volume_without_flush`.
@@ -151,7 +151,7 @@ fn create_volume_persists_through_flush_and_reopen() {
     assert_eq!(db.get(ord, 1).unwrap(), Some(v(9)));
 }
 
-// -------- phase 7 commit 9: per-volume snapshot --------
+// -------- commit 9: per-volume snapshot --------
 
 #[test]
 fn take_snapshot_stamps_vol_ord_on_entry() {
@@ -283,7 +283,7 @@ fn diff_across_volumes_rejected() {
     }
 }
 
-// -------- phase 7 commit 10: clone_volume --------
+// -------- commit 10: clone_volume --------
 
 #[test]
 fn clone_volume_produces_readable_copy() {
@@ -408,7 +408,7 @@ fn clone_assigns_fresh_monotonic_ord() {
     assert_eq!(db.manifest().next_volume_ord, clone_b + 1);
 }
 
-// Phase D.5: `clone_survives_reopen_wal_replay` exercised data-plane
+// WAL-free recovery: `clone_survives_reopen_wal_replay` exercised data-plane
 // WAL replay across a clone barrier; covered for Buffer mode by
 // `tests/db_buffer_journal_replay.rs::replay_recovers_clone_volume_without_flush`.
 
@@ -423,7 +423,7 @@ fn clone_of_empty_volume_is_empty_and_writable() {
     assert_eq!(db.get(clone, 1).unwrap(), Some(v(7)));
 }
 
-// -------- phase 4 step 1: lineage tracking on VolumeEntry --------
+// -------- lineage tracking on VolumeEntry --------
 
 // Fresh top-level volumes (bootstrap + `create_volume`) must record
 // `parent_vol_ord = None` / `branched_at_lsn = 0` / `promotion_cursor = None`.
@@ -431,7 +431,7 @@ fn clone_of_empty_volume_is_empty_and_writable() {
 // arm the lineage fields, so downstream Lineage GC / cross-volume
 // snap_pin doesn't pick up stray parent edges.
 #[test]
-fn phase4_top_level_volume_has_no_lineage() {
+fn top_level_volume_has_no_lineage() {
     let (_d, db) = mk_db();
     let ord = db.create_volume().unwrap();
     let m = db.manifest();
@@ -445,10 +445,10 @@ fn phase4_top_level_volume_has_no_lineage() {
 
 // A fast clone (`clone_volume`) must record `parent_vol_ord = Some(src)`
 // and `branched_at_lsn = snapshot.created_lsn`. `promotion_cursor` stays
-// `None` in Step 1 — Step 5's background walker is what arms it.
+// `None` in lineage tracking — background promotion walker is what arms it.
 // Round-trips through flush + reopen.
 #[test]
-fn phase4_clone_records_parent_and_branched_lsn() {
+fn clone_records_parent_and_branched_lsn() {
     let dir = TempDir::new().unwrap();
     let (src, clone, expected_branched_at) = {
         let db = Db::create(dir.path()).unwrap();
@@ -493,4 +493,4 @@ fn phase4_clone_records_parent_and_branched_lsn() {
     assert_eq!(clone_entry.promotion_cursor, None);
 }
 
-// -------- phase 7 commit 11: streaming iterators --------
+// -------- commit 11: streaming iterators --------

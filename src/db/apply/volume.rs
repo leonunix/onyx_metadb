@@ -70,8 +70,8 @@ pub(in crate::db) fn apply_create_volume(
 /// Apply a `DropVolume` op's page free. Reuses [`apply_drop_snapshot_pages`];
 /// `DropVolume` has the same per-page semantics and just doesn't need the
 /// freed-leaf-values vec the snapshot path surfaces in its report. `free_pages`
-/// is the S2/S3 explicit reachability free-set (always `Some` post-S3 — both
-/// CLONE_LINEAGE and non-clone drops freeze it); see the core for the contract.
+/// is the explicit reachability free-set (always `Some`; both CLONE_LINEAGE and
+/// non-clone drops freeze it); see the core for the contract.
 pub(in crate::db) fn apply_drop_volume(
     page_store: &Arc<PageStore>,
     lsn: Lsn,
@@ -184,7 +184,7 @@ fn harvest_and_free(
     Ok(())
 }
 
-/// Core of the `DropSnapshot` / `DropVolume` page free (ZFS port Phase 4 S3).
+/// Core of the `DropSnapshot` / `DropVolume` page free (BFG).
 ///
 /// Frees exactly `free_pages` — the explicit, page-rc-INDEPENDENT free-set the
 /// producer froze under the held gates and a HARD shadow validated before the
@@ -205,16 +205,16 @@ pub(in crate::db) fn apply_drop_snapshot_pages(
     let mut freed_leaf_values: Vec<L2pValue> = Vec::new();
     let mut pages_freed: usize = 0;
 
-    // ZFS port Phase 4 S3: page-rc is deleted. Every drop op now freezes an
+    // BFG: page-rc is deleted. Every drop op now freezes an
     // explicit, page-rc-INDEPENDENT free-set (deadlist for non-clone snapshots,
     // reachability `exclusive` for CLONE_LINEAGE / non-clone volumes + clone-
     // involved snapshots — all proven HARD by the page-rc-independent shadows
     // before the WAL submit). The legacy `None` page-rc cascade is gone; a None
-    // here can only be a corrupt/pre-S3 op (impossible on a fresh-metadb v22
+    // here can only be a corrupt legacy op (impossible on a fresh-metadb v22
     // rebuild).
     let set = free_pages.ok_or_else(|| {
         MetaDbError::Corruption(
-            "post-S3 DropVolume/DropSnapshot must carry an explicit free_pages set \
+            "DropVolume/DropSnapshot must carry an explicit free_pages set \
              (page-rc cascade deleted)"
                 .to_string(),
         )
@@ -229,7 +229,7 @@ pub(in crate::db) fn apply_drop_snapshot_pages(
             let frontier: std::collections::HashSet<PageId> = pages.iter().copied().collect();
             set.iter().all(|p| frontier.contains(p))
         },
-        "S3 free_pages must be a subset of the cascade `pages`"
+        "free_pages must be a subset of the cascade `pages`"
     );
     for &pid in set {
         harvest_and_free(
@@ -247,7 +247,7 @@ pub(in crate::db) fn apply_drop_snapshot_pages(
 }
 
 /// Apply a full `LifecycleOp::DropSnapshot`: free the op's explicit
-/// `free_pages` set. Phase 5 ignores `pba_decrefs`: global PBA rc is not a
+/// `free_pages` set. ignores `pba_decrefs`: global PBA rc is not a
 /// per-live-LBA counter, so dropping a snapshot must not subtract one PBA
 /// rc entry per logical LBA in the snapshot diff.
 pub(in crate::db) fn apply_drop_snapshot_pages_and_decrefs(

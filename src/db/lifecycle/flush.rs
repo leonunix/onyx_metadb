@@ -89,13 +89,11 @@ impl Db {
     /// `force_all = true` (forced flush / snapshot / shutdown drain)
     /// also returns a full selection regardless of budget.
     ///
-    /// `force_volume_ords` (ZFS `dsl_sync_task` port, subtlety #2): every
-    /// volume whose ordinal is in this set gets ALL its L2P shards
-    /// selected unconditionally, on every path. A pending `take_snapshot`
-    /// task needs the target volume's roots flushed durable THIS cycle so
-    /// the committed `SnapshotEntry` references on-disk pages — and the
-    /// cycle that drains the task is not guaranteed to be `Forced` (a
-    /// racing `Steady` `try_flush` could roll+sync the task's TXG first).
+    /// Every volume in `force_volume_ords` gets all of its L2P shards selected
+    /// unconditionally. A pending `take_snapshot` task needs the target
+    /// volume's roots flushed durable this cycle so the committed
+    /// `SnapshotEntry` references on-disk pages; the cycle that drains the task
+    /// is not guaranteed to be `Forced`.
     fn select_shards_for_flush(
         &self,
         volumes: &[Arc<Volume>],
@@ -124,7 +122,7 @@ impl Db {
         // Force-select the L2P shards of every volume with a pending
         // sync task this round (roots must be flushed durable before the
         // manifest entry references them). RC shards are NOT forced: the
-        // snapshot incref stages into the OPEN TXG slot and folds in a
+        // snapshot incref stages into the OPEN BFG slot and folds in a
         // future cycle, so it does not need this cycle's rc fold.
         let force_l2p = |l2p: &mut Vec<Vec<bool>>| {
             if force_volume_ords.is_empty() {
@@ -215,53 +213,53 @@ impl Db {
         self.flush_with_gate(crate::metrics::FlushKind::Steady)
     }
 
-    /// ZFS-TXG-clone Phase 4 Step 8: `flush_with_gate` is now a thin
-    /// shell. The actual per-TXG sync work lives in
+    /// BFG: `flush_with_gate` is now a thin
+    /// shell. The actual per-BFG sync work lives in
     /// [`Db::run_sync_cycle`]. Two modes:
     ///
-    /// - **`txg_threads_enabled = true`** (production default): force
-    ///   the [`crate::db::txg_quiesce::TxgQuiesceThread`] to roll the
-    ///   current Open TXG immediately, then park on
-    ///   [`crate::txg::TxgStateMachine::wait_until_synced`] until the
-    ///   [`crate::db::txg_sync::TxgSyncThread`] has finished
-    ///   `run_sync_cycle` for that TXG (which is what
-    ///   `start_txg_threads` wired the worker's `sync_work` callback
+    /// - **`bfg_threads_enabled = true`** (production default): force
+    ///   the [`crate::db::bfg_quiesce::BfgQuiesceThread`] to roll the
+    ///   current Open BFG immediately, then park on
+    ///   [`crate::bfg::BfgStateMachine::wait_until_synced`] until the
+    ///   [`crate::db::bfg_sync::BfgSyncThread`] has finished
+    ///   `run_sync_cycle` for that BFG (which is what
+    ///   `start_bfg_threads` wired the worker's `sync_work` callback
     ///   to).
-    /// - **`txg_threads_enabled = false`**: the worker threads are not
-    ///   spawned. `flush_with_gate` drives the TXG state machine and
+    /// - **`bfg_threads_enabled = false`**: the worker threads are not
+    ///   spawned. `flush_with_gate` drives the BFG state machine and
     ///   `run_sync_cycle` synchronously on the caller thread,
     ///   recreating the legacy stop-the-world flush semantics.
     ///
     /// Returns `Ok(false)` only on the threads-off `Steady` path when
     /// `apply_gate.try_write()` does not immediately succeed (the same
-    /// best-effort behaviour `try_flush` had pre-Step-8).
+    /// best-effort behaviour `try_flush` had before threaded sync).
     pub(in crate::db) fn flush_with_gate(
         &self,
         kind: crate::metrics::FlushKind,
     ) -> Result<bool> {
-        // ZFS port Part B: a prior forced sync that failed non-recoverably
-        // poisoned the subsystem. Fail fast here BEFORE touching the TXG state
-        // machine — its slot is stuck in Syncing forever, so rolling/promoting
-        // would block (the deadlock this fixes). Covers every forced-sync entry
-        // (take_snapshot, create_volume, restore, plain flush) in both modes.
+        // A prior forced sync failed non-recoverably and poisoned the
+        // subsystem. Fail fast before touching the BFG state machine: its slot
+        // is stuck in Syncing forever, so rolling or promoting would block.
+        // Covers every forced-sync entry (take_snapshot, create_volume,
+        // restore, plain flush) in both modes.
         if let Some(err) = self.sync_poison_error() {
             return Err(err);
         }
-        if self.txg_threads_enabled {
+        if self.bfg_threads_enabled {
             // Threads-on: hand off to the sync thread and wait.
             // `signal_force` only sets the quiesce notifier flag; the
             // quiesce worker then calls `roll_to_quiescing`, which
             // does its own inflight-drain wait. No
             // `apply_gate.try_write` race here — the threaded path
             // always runs to completion.
-            let target = self.txg.open_txg();
-            self.txg_quiesce_notifier.signal_force(target);
-            if !self.txg.wait_until_synced(target) {
+            let target = self.bfg.open_bfg();
+            self.bfg_quiesce_notifier.signal_force(target);
+            if !self.bfg.wait_until_synced(target) {
                 // Aborted: the sync thread's cycle failed and poisoned the
                 // subsystem. Surface the restart-required error instead of
                 // reporting a clean flush.
                 return Err(self.sync_poison_error().unwrap_or_else(|| {
-                    MetaDbError::Corruption("txg sync aborted; restart required".into())
+                    MetaDbError::Corruption("bfg sync aborted; restart required".into())
                 }));
             }
             self.metrics
@@ -275,11 +273,11 @@ impl Db {
                 .record_flush_total(kind, std::time::Duration::from_micros(0));
             return Ok(true);
         }
-        // Threads-off: drive the TXG state machine ourselves so the
-        // sync metadata bookkeeping (slot.max_lsn, open_txg advance,
-        // checkpoint_txg / wait_until_synced cv release) stays in
+        // Threads-off: drive the BFG state machine ourselves so the
+        // sync metadata bookkeeping (slot.max_lsn, open_bfg advance,
+        // checkpoint_bfg / wait_until_synced cv release) stays in
         // lock-step with what the threaded path would have done.
-        // `roll_to_quiescing` waits for any in-flight commits' txg
+        // `roll_to_quiescing` waits for any in-flight commits' bfg
         // guards to drop, mirroring the apply-gate barrier the body
         // would have taken anyway. After `mark_synced` returns,
         // `wait_until_synced(target)` (used by any concurrent
@@ -300,62 +298,57 @@ impl Db {
         // We don't actually hold `apply_gate.write()` here — the
         // run_sync_cycle body re-acquires it for the sample phase.
         // The try-write above is purely a "should we even bother
-        // rolling" gate matching pre-Step-8 try_flush behaviour.
-        let target = self.txg.roll_to_quiescing();
+        // rolling" gate matching the legacy try_flush behaviour.
+        let target = self.bfg.roll_to_quiescing();
         // `roll_to_quiescing` is idempotent under shutdown (returns
         // current open without advancing). Re-check whether the slot
         // actually moved to Quiescing before promoting; mismatch
         // means shutdown raced and we should skip.
-        if self.txg.snapshot().quiescing_txg != Some(target) {
+        if self.bfg.snapshot().quiescing_bfg != Some(target) {
             return Ok(false);
         }
-        self.txg.promote_to_syncing(target);
-        // ZFS port Part B: if a concurrent forced-sync's cycle aborted the
-        // subsystem WHILE we were parked in `promote_to_syncing` (or just before
-        // it), `promote_to_syncing` breaks on `aborted` and returns leaving
-        // `target` in Quiescing (NOT promoted to Syncing). Driving
-        // `run_sync_cycle(target)` then would `mark_synced` a non-Syncing slot
-        // and corrupt the ring (the `concurrent_take_snapshots_*` test catches
-        // this via a racer-2 debug_assert / dirty reopen). Re-check and bail with
-        // the restart-required error before touching the cycle.
-        if self.txg.is_aborted() {
+        self.bfg.promote_to_syncing(target);
+        // If a concurrent forced-sync cycle aborted the subsystem while we were
+        // parked in `promote_to_syncing`, the slot may still be Quiescing rather
+        // than Syncing. Driving `run_sync_cycle(target)` would then mark the
+        // wrong state as synced and corrupt the ring, so re-check and return the
+        // restart-required error before touching the cycle.
+        if self.bfg.is_aborted() {
             return Err(self.sync_poison_error().unwrap_or_else(|| {
-                MetaDbError::Corruption("txg sync aborted; restart required".into())
+                MetaDbError::Corruption("bfg sync aborted; restart required".into())
             }));
         }
         let result = self.run_sync_cycle(target, kind);
         match result {
             Ok(()) => {
-                self.txg.mark_synced(target);
+                self.bfg.mark_synced(target);
                 Ok(true)
             }
             Err(err) => {
-                // ZFS port Part B: the sync cycle failed and may have left
-                // deferred RC apply state un-retryable. Leave the slot in
-                // Syncing (preserves the `failed_sync_leaves_txg_in_syncing_state`
-                // contract) but POISON the sync subsystem: `poison_sync` aborts
-                // the TXG state machine so the next forced flush / take_snapshot
-                // fails fast with a clear error instead of HANGING in
-                // `promote_to_syncing` on the stuck slot. Recovery = process
-                // restart (do NOT retry on possibly-inconsistent state).
+                // The sync cycle failed and may have left deferred RC apply
+                // state un-retryable. Leave the slot in Syncing (preserves the
+                // `failed_sync_leaves_bfg_in_syncing_state` contract), but
+                // poison the sync subsystem so the next forced flush /
+                // take_snapshot fails fast instead of hanging on the stuck slot.
+                // Recovery is process restart.
                 self.poison_sync(&err);
                 Err(err)
             }
         }
     }
 
-    /// Per-TXG sync work: drain L2P buffers, sample + IO + manifest
-    /// commit. Extracted from `flush_with_gate`'s pre-Step-8 body so
-    /// the `TxgSyncThread`'s `sync_work` callback can drive it via
+    /// Per-BFG sync work: drain L2P buffers, sample + IO + manifest
+    /// commit. Shared by the inline path and the `BfgSyncThread` callback so
+    /// the `BfgSyncThread`'s `sync_work` callback can drive it via
     /// `Weak<Db>` upgrade.
     ///
-    /// `txg` identifies the slot the caller has already promoted to
+    /// `bfg` identifies the slot the caller has already promoted to
     /// Syncing in the state machine.
     ///
     /// The body NO LONGER holds `apply_gate.write()` across the sample
     /// phase. Every lifecycle op (`take_snapshot`, `drop_snapshot`,
     /// `drop_volume`, `clone_volume`, `range_delete`, `create_volume`)
-    /// now drives a forced TXG sync at entry, so by the time it does
+    /// now drives a forced BFG sync at entry, so by the time it does
     /// any rc-mutating whole-page write, the in-flight flush IO phase
     /// has finished and `drop_gate.write` is preventing new Dirty Arcs
     /// from forming. The remaining serialisation is per-shard
@@ -367,60 +360,60 @@ impl Db {
     /// `(manifest, last_flushed_lsn)` pair stays consistent against
     /// other `apply_gate.write()` holders.
     ///
-    /// `txg` is threaded through to the body. `wal_checkpoint` is now
-    /// read from `self.txg.slot_max_lsn(txg)` (was
+    /// `bfg` is threaded through to the body. `wal_checkpoint` is now
+    /// read from `self.bfg.slot_max_lsn(bfg)` (was
     /// `last_applied_lsn`). Reasons:
     ///
-    /// - `slot_max_lsn(txg)` is **frozen** for the Syncing slot:
+    /// - `slot_max_lsn(bfg)` is **frozen** for the Syncing slot:
     ///   `promote_to_syncing` precondition is `inflight == 0` and
     ///   `record_lsn` cannot fire on a non-Open slot. By contrast
     ///   `last_applied_lsn` can advance during the gateless sample if
-    ///   a commit stamped to a later TXG completes its apply.
-    /// - `slot_max_lsn(txg)` precisely delineates "the LSNs in THIS
-    ///   TXG"; any commit stamped to TXG > `txg` belongs to a future
+    ///   a commit stamped to a later BFG completes its apply.
+    /// - `slot_max_lsn(bfg)` precisely delineates "the LSNs in THIS
+    ///   BFG"; any commit stamped to BFG > `bfg` belongs to a future
     ///   sync, not this one.
     ///
     /// Post-recovery: `apply_replay_batch` does NOT go through
-    /// `TxgGuard::record_lsn`, so without intervention
-    /// `slot_max_lsn(open_txg)` would be 0 after replay.
+    /// `BfgGuard::record_lsn`, so without intervention
+    /// `slot_max_lsn(open_bfg)` would be 0 after replay.
     /// [`Db::open_with_config_and_faults`] stamps the open slot with
     /// the post-replay `last_applied` LSN right after constructing the
-    /// `TxgStateMachine`, closing that gap. The
+    /// `BfgStateMachine`, closing that gap. The
     /// `compute_min_last_flushed_lsn_after` projection still uses
     /// `max(wal_checkpoint, prev)` per shard as defense-in-depth.
     ///
     /// Lifecycle ops (drop_snapshot / drop_volume / clone_volume /
     /// create_volume / range_delete) symmetrically enter
-    /// `self.txg.enter()` after their forced sync barrier and call
-    /// `_txg_guard.record_lsn(lsn)` after `submit_wal_ops`, so their
-    /// LSNs land in `slot_max_lsn(open_txg)` exactly like the
+    /// `self.bfg.enter()` after their forced sync barrier and call
+    /// `_bfg_guard.record_lsn(lsn)` after `submit_wal_ops`, so their
+    /// LSNs land in `slot_max_lsn(open_bfg)` exactly like the
     /// `commit_ops` hot path. Without that, the lifecycle WAL records
     /// would never reach `wal_checkpoint` and `prune_all_segments`
     /// would leave their segments alive forever.
     pub(crate) fn run_sync_cycle(
         &self,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         kind: crate::metrics::FlushKind,
     ) -> Result<()> {
-        self.run_sync_cycle_body(txg, kind)?;
+        self.run_sync_cycle_body(bfg, kind)?;
         Ok(())
     }
 
     fn run_sync_cycle_body(
         &self,
-        txg: crate::types::Txg,
+        bfg: crate::types::Bfg,
         kind: crate::metrics::FlushKind,
     ) -> Result<()> {
-        // ZFS-TXG-clone Phase 4 gate-shrink (final): the SAMPLE phase
+        // BFG gate-shrink (final): the SAMPLE phase
         // runs gateless. The serialisation it used to get from
         // `apply_gate.write()` is now provided by:
         //
         // - Lifecycle ops hold `drop_gate.write` for the duration, which
-        //   keeps the syncing slot empty (no new Dirty Arcs form). ZFS port
-        //   S3 deleted per-L2P-page refcounting, so lifecycle ops no longer
+        //   keeps the syncing slot empty (no new Dirty Arcs form). BFG
+        //   page-rc removal deleted per-L2P-page refcounting, so lifecycle ops no longer
         //   RMW any whole-page rc — a concurrent flush IO phase has nothing
         //   to clobber, which is why `take_snapshot` / `drop_snapshot` /
-        //   `clone_volume` no longer force-sync at entry (Phase B).
+        //   `clone_volume` no longer force-sync at entry (buffer-backed journal).
         //   (`range_delete` / `drop_volume` / `create_volume` still
         //   force-sync; their removal is a later step.)
         // - Per-shard `tree.write()` held during this flush's
@@ -428,7 +421,7 @@ impl Db {
         //   `lock_all_l2p_shards_for` from racing the sample.
         // - `RcShard`'s internal delta-lock orchestration handles the
         //   commit-side `RcShard::stage` race (see
-        //   [`refcount_drainer_layer_atomicity`](memory) for the P0
+        //   [`refcount_drainer_layer_atomicity`](memory) for the case
         //   invariants).
         // - `apply_gate.write()` is RE-acquired around the manifest
         //   commit + post-manifest atomics bump so the on-disk
@@ -457,7 +450,7 @@ impl Db {
         self.metrics
             .record_flush_gate_wait(std::time::Duration::ZERO);
 
-        // The refcount fold is now inline + per-TXG-slot (no background rc
+        // The refcount fold is now inline + per-BFG-slot (no background rc
         // drainer to preempt/resume — see `refcount::shard`), so no RAII
         // resume guard is needed here. The dedup-index drainer below still
         // has its own.
@@ -465,10 +458,10 @@ impl Db {
         // Dedup checkpoint barrier: preempt the async dedup drainers and
         // synchronously final-drain all staged cuckoo mutations BEFORE
         // the rc/L2P sample, the dedup manifest update / `flush_meta`,
-        // and the buffer-seq sample below. The TXG syncing slot is
+        // and the buffer-seq sample below. The BFG syncing slot is
         // frozen (quiesce waited for all its commits, so every staged
         // entry <= `checkpoint_lsn` is present and drained here); newer
-        // open-txg commits (lsn > checkpoint_lsn) stay staged for the
+        // open-bfg commits (lsn > checkpoint_lsn) stay staged for the
         // next checkpoint, so `checkpoint_lsn` never advances past an
         // undrained staged entry. Placed before any checkpoint is taken
         // so a drain IO error returns cleanly with nothing to abort; the
@@ -483,64 +476,60 @@ impl Db {
         // Fold the buffered L2P updates into the tree so the sample
         // phase observes them. Two drains:
         //
-        // - **threads-ON** (`TxgSyncThread` driving this for one TXG):
-        //   `drain_syncing_slot_into_trees(txg)` folds ONLY the frozen
-        //   syncing slot, publish-before-clear (the ZFS per-TXG
-        //   separation). Open/Quiescing slots stay buffered and drain on
-        //   their own future cycles, bounding each sync to one TXG's
-        //   writes.
+        // - **threads-ON** (`BfgSyncThread` driving this for one BFG group):
+        //   `drain_syncing_slot_into_trees(bfg)` folds ONLY the frozen
+        //   syncing slot, publish-before-clear. Open/Quiescing slots stay
+        //   buffered and drain on their own future cycles, bounding each sync
+        //   to one group's writes.
         // - **threads-OFF** (inline `flush_with_gate` is the sole
         //   drainer): `force_compact_l2p_buffers` folds ALL slots so a
         //   single flush persists everything. Lifecycle ops also use the
         //   drain-all path under `drop_gate.write`.
-        if self.txg_threads_enabled {
-            self.drain_syncing_slot_into_trees(txg)?;
+        if self.bfg_threads_enabled {
+            self.drain_syncing_slot_into_trees(bfg)?;
         } else {
             self.force_compact_l2p_buffers()?;
         }
 
         let sample_started = std::time::Instant::now();
-        // `slot_max_lsn(txg)` is the TXG-frozen high-water LSN of
+        // `slot_max_lsn(bfg)` is the BFG-frozen high-water LSN of
         // commits stamped to the Syncing slot. `promote_to_syncing`
         // closed the slot to new `record_lsn` calls before this body
         // runs, and `roll_to_quiescing` already drained the inflight
-        // commits (each commit holds its `TxgGuard` across submit +
+        // commits (each commit holds its `BfgGuard` across submit +
         // apply + finish_global_apply), so by the time we read this
-        // every commit in TXG `txg` has completed its tree mutation
+        // every commit in BFG `bfg` has completed its tree mutation
         // and the value is stable for the rest of the sync cycle.
         //
         // We deliberately do NOT read `self.last_applied_lsn` here —
-        // it can include commits stamped to TXGs > `txg` (the new
+        // it can include commits stamped to BFGs > `bfg` (the new
         // Open slot opened by `roll_to_quiescing`), which belong to a
-        // future sync, not this one. Using `slot_max_lsn(txg)` keeps
-        // each TXG's WAL prune watermark cleanly bounded by its own
+        // future sync, not this one. Using `slot_max_lsn(bfg)` keeps
+        // each BFG's WAL prune watermark cleanly bounded by its own
         // stamps.
         //
         // Recovery: `apply_replay_batch` does NOT call `record_lsn`
-        // on a TxgGuard, so without intervention `slot_max_lsn(open_txg)`
+        // on a BfgGuard, so without intervention `slot_max_lsn(open_bfg)`
         // would be 0 after replay. `Db::open_with_config_and_faults`
         // stamps the open slot with the post-replay `last_applied` LSN
         // (see Cut 2 below). The `compute_min_last_flushed_lsn_after`
         // projection still uses `max(wal_checkpoint, prev)` per shard
         // as defense-in-depth.
         //
-        // ZFS `dsl_sync_task` (path B): the snapshot-root incref is a
-        // FORCE-incref folded into this cycle's page-rc checkpoint (see the
-        // page-rc loop below) — it always applies and never bumps a page
-        // generation, so it needs NO reserved lsn (no `lsn_alloc` reserve,
-        // no `finish_global_apply` hole, no dependence on `wal_checkpoint`).
-        let wal_checkpoint = self.txg.slot_max_lsn(txg);
+        // Snapshot-root increfs are folded into this cycle's page-rc checkpoint.
+        // They always apply and never bump a page generation, so they need no
+        // reserved LSN, no `finish_global_apply` hole, and no dependence on
+        // `wal_checkpoint`.
+        let wal_checkpoint = self.bfg.slot_max_lsn(bfg);
         let volumes = self.volumes_snapshot();
-        // ZFS `dsl_sync_task`: volumes with a `take_snapshot` task queued
-        // for THIS txg. Their L2P shards are force-selected below so the
-        // roots the snapshot entry will reference are flushed durable this
-        // cycle (the draining cycle is not guaranteed to be `Forced` — a
-        // racing `Steady` `try_flush` could roll+sync this txg first).
+        // Volumes with a `take_snapshot` task queued for this bfg. Their L2P
+        // shards are force-selected below so the roots the snapshot entry will
+        // reference are flushed durable this cycle.
         let snapshot_force_ords: std::collections::HashSet<VolumeOrdinal> = {
             let tasks = self.pending_sync_tasks.lock();
             tasks
                 .iter()
-                .filter(|t| t.target_txg == txg)
+                .filter(|t| t.target_bfg == bfg)
                 .map(|t| match &t.op {
                     crate::db::SyncTaskOp::TakeSnapshot { vol_ord } => *vol_ord,
                 })
@@ -583,7 +572,7 @@ impl Db {
                 page_provenance: Vec::new(),
             });
         }
-        // ZFS port Phase 2 + H1: the second, independent chain — L2P page
+        // BFG + H1: the second, independent chain — L2P page
         // deaths — is drained LATER, after the per-shard L2P root capture
         // loop below. Unlike the PBA / Live chains (bounded by the single
         // `wal_checkpoint`), each page accumulator must be sealed under its
@@ -592,7 +581,7 @@ impl Db {
         // leave those durable-in-root deaths unsealed → lost on crash). That
         // watermark is only available once the guard walk has sampled each
         // selected shard's root, so the drain is deferred to just after it.
-        // ZFS port Phase 3b: the THIRD, independent chain — the per-clone
+        // BFG: the THIRD, independent chain — the per-clone
         // page-livelist (ALLOC/FREE of clone-private L2P pages). Same
         // `drain_up_to_lsn` filter + segment build / IO / rollback /
         // promotion machinery, tagged `Live` so it routes to the
@@ -637,15 +626,14 @@ impl Db {
         // carries over and their `last_flushed_lsn` is unchanged.
         let mut l2p_checkpoints: Vec<Vec<Option<crate::paged::tree::Checkpoint>>> =
             Vec::with_capacity(volumes.len());
-        // ZFS `dsl_sync_task`: capture the per-shard roots of every
-        // snapshot-target volume, in shard order, under the same
-        // `tree.write()` this loop holds. These are exactly the roots this
-        // cycle flushes durable (the snapshot entry references them). The
-        // volume was force-selected, so every one of its shards yields a
+        // Capture the per-shard roots of every snapshot-target volume, in shard
+        // order, under the same `tree.write()` this loop holds. These are
+        // exactly the roots this cycle flushes durable and the snapshot entry
+        // references. The volume was force-selected, so every one of its shards yields a
         // guard here.
         let mut snapshot_roots: std::collections::HashMap<VolumeOrdinal, Vec<PageId>> =
             std::collections::HashMap::new();
-        // ZFS port Phase 4 (S1): per-snapshot-target-volume fold watermark =
+        // BFG: per-snapshot-target-volume fold watermark =
         // max root `birth_lsn` over its captured shards = the exact highest lsn
         // folded into the captured roots. Stamped as the snapshot's durable
         // `capture_watermark` (the birth COW-kill oracle's operand, NOT
@@ -688,7 +676,7 @@ impl Db {
                         // HOLE. `next_generation()` is advanced only at fold time
                         // (insert/delete/COW), never for buffered-but-unfolded
                         // writes, so it is tight: threads-ON it equals the syncing
-                        // slot's max lsn (open-slot writes stay unfolded ⇒ no S1
+                        // slot's max lsn (open-slot writes stay unfolded ⇒ no snapshot watermark
                         // over-pin); threads-OFF the force-fold drains every slot
                         // ⇒ it covers every reachable page. Strictly
                         // `>= root_birth_lsn` (the root was folded at its own
@@ -705,7 +693,7 @@ impl Db {
                     // accumulator was pushed AFTER its COW under this same
                     // `tree.write()`, so it is folded into the root this cycle
                     // makes durable — sealing all of them is exactly crash-complete
-                    // and never premature. A concurrent open-txg fold cannot race a
+                    // and never premature. A concurrent open-bfg fold cannot race a
                     // post-checkpoint death into the drain because it would need
                     // this very guard. (The earlier `root_birth_lsn`-bounded
                     // attempt under-sealed: once a shard root forks private off the
@@ -762,18 +750,18 @@ impl Db {
         // transition-1/2 ordering, strict `>` replay-skip in
         // drainer-mode) are what carry the race; the gate was
         // redundant. See `refcount_drainer_layer_atomicity` memory
-        // for the P0 invariants.
+        // for the case invariants.
         //
         // Sparse over `selected.rc`: only spawn threads for selected
         // shards; unselected slots remain `None`. Failure handling
         // preserves the "first error wins, the rest are individually
         // aborted" semantics from the pre-partial code.
-        // TXG-slot fold: threads-ON folds ONLY this sync's frozen Syncing
-        // slot (`begin_checkpoint(txg, wal_checkpoint)`), so rc durability
-        // is keyed to the same per-TXG `checkpoint_lsn` prefix as L2P's
+        // BFG-slot fold: threads-ON folds ONLY this sync's frozen Syncing
+        // slot (`begin_checkpoint(bfg, wal_checkpoint)`), so rc durability
+        // is keyed to the same per-BFG `checkpoint_lsn` prefix as L2P's
         // `drain_syncing_slot_into_trees`. threads-OFF (inline flush is the
         // sole drainer) folds every slot, mirroring `force_compact_l2p_buffers`.
-        let txg_threads_enabled = self.txg_threads_enabled;
+        let bfg_threads_enabled = self.bfg_threads_enabled;
         let rc_drain_started = std::time::Instant::now();
         let rc_results: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> =
             std::thread::scope(|scope| {
@@ -781,8 +769,8 @@ impl Db {
                 for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
                     if selected.rc[s_idx] {
                         let h = scope.spawn(move || {
-                            if txg_threads_enabled {
-                                shard.rc.begin_checkpoint(txg)
+                            if bfg_threads_enabled {
+                                shard.rc.begin_checkpoint(bfg)
                             } else {
                                 shard.rc.begin_checkpoint_all_slots(false)
                             }
@@ -868,17 +856,15 @@ impl Db {
             return Err(err);
         }
 
-        // ZFS `dsl_sync_task` phase A3 (path B): process each pending
-        // `take_snapshot` — capacity-probe, write its SnapshotRoots page,
-        // build its `SnapshotEntry` — and return the per-page-rc-shard set
-        // of root pids to FORCE-incref. Runs AFTER the L2P/refcount sample
-        // (tree guards released, so the capacity probe can lock
-        // `manifest_state`) and BEFORE the page-rc `begin_checkpoint` below,
-        // so the increfs fold into THIS cycle's page-rc checkpoint — durable
-        // atomically with the manifest entry (added in A4). On error, roll
+        // Process each pending `take_snapshot`: capacity-probe, write its
+        // SnapshotRoots page, build its `SnapshotEntry`, and return the
+        // per-page-rc-shard set of root pids to force-incref. Runs after the
+        // L2P/refcount sample and before the page-rc `begin_checkpoint` below,
+        // so the increfs fold into this cycle's page-rc checkpoint and become
+        // durable atomically with the manifest entry. On error, roll
         // back the L2P + refcount checkpoints (nothing page-rc folded yet).
         if let Err(err) = self.prepare_pending_snapshot_entries(
-            txg,
+            bfg,
             &snapshot_roots,
             &snapshot_watermarks,
         ) {
@@ -889,7 +875,7 @@ impl Db {
             return Err(err);
         }
 
-        // ZFS port S3: per-L2P-page refcounting was deleted, so there is no
+        // BFG: per-L2P-page refcounting was deleted, so there is no
         // page-rc checkpoint fold here. Snapshot roots stay referenced because
         // the source volume's tree keeps pointing at the shared roots (COW
         // preserves them on the next write); the snapshot's pages are reachable
@@ -955,11 +941,9 @@ impl Db {
                 total_pages_written += sealed_pages.len() - before;
             }
         }
-        // A3: the L2P-page-rc fold now stages real data pages too — fold
-        // them into the SAME write batch (in A2 these checkpoints were
-        // always empty, so this loop was a no-op and was omitted; A3 must
-        // write them or the freshly-allocated array data pages are never
-        // persisted → orphan / zeroed on reopen).
+        // The L2P-page-rc fold can stage real data pages too; fold them into
+        // the same write batch or freshly-allocated array data pages would be
+        // lost on reopen.
         // Build the per-shard meta chains in memory (no IO) and fold
         // every sealed chain page into the global `sealed_pages` batch.
         // The shard's head meta page id is stable across rewrites
@@ -1009,7 +993,7 @@ impl Db {
         }
         // Build per-volume dead-list segments and fold them into the
         // same `sealed_pages` batch as L2P + RC. Allocate contiguous
-        // runs per volume (Phase 2 / [[no-refcount-hot-path-design]]).
+        // runs per volume .
         // The plan vector is owned across the IO + manifest section
         // so failures can restore drained records back into the
         // buffers and free the allocated page runs.
@@ -1118,9 +1102,9 @@ impl Db {
         // Dead-list segment pages are now durable on disk. The
         // manifest still references the OLD tails until the commit
         // below; if it fails we restore drained records to the
-        // buffer and free the just-allocated runs. Phase 2 leaves
+        // buffer and free the just-allocated runs. leaves
         // the on-disk segment bytes as orphans if the manifest
-        // never commits (Phase 5 page_store GC reconciliation).
+        // never commits (page_store GC reconciliation).
         if let Err(err) = self
             .faults
             .inject(FaultPoint::DeadListPostSegWriteBeforeManifest)
@@ -1166,21 +1150,21 @@ impl Db {
         };
         let dead_list_overrides = build_overrides(DeadListKind::Pba);
         let mut page_dead_list_overrides = build_overrides(DeadListKind::Page);
-        // ZFS port Phase 3b: per-clone page-livelist anchor overrides.
+        // BFG: per-clone page-livelist anchor overrides.
         // `mut` because Bug 3's gate-window re-validation may drop a vol whose
         // tail a concurrent condenser re-anchored (see
         // `bail_condenser_raced_live_lists`).
         let mut page_live_list_overrides = build_overrides(DeadListKind::Live);
-        // ZFS port Phase 2: seal this cycle's pending snapshots' page
+        // BFG: seal this cycle's pending snapshots' page
         // deadlists. Each take inherits the head volume's page-deadlist
         // chain (rewriting its override to (NULL,NULL) so the head resets)
         // and stamps the inherited tail onto its pending `SnapshotEntry`.
         // Returns the volumes whose in-memory atomics to reset post-commit.
         let page_seal_resets =
-            self.seal_pending_snapshot_page_deadlists(txg, &volumes, &mut page_dead_list_overrides);
+            self.seal_pending_snapshot_page_deadlists(bfg, &volumes, &mut page_dead_list_overrides);
 
         let manifest_started = std::time::Instant::now();
-        // ZFS-TXG-clone Phase 4 gate-shrink: this is the only point in
+        // BFG gate-shrink: this is the only point in
         // `run_sync_cycle_body` that acquires `apply_gate.write()`. The
         // window covers manifest commit prep, `wal.fsync_all_lanes()`,
         // `manifest_state.store.commit`, dead-list head/tail promotion,
@@ -1203,7 +1187,7 @@ impl Db {
         let gate_started = std::time::Instant::now();
         let apply_guard = self.apply_gate.write();
         self.metrics.record_flush_gate_wait(gate_started.elapsed());
-        // ZFS port Phase 3b — Bug 3: now that we hold the gate (which excludes
+        // BFG — Bug 3: now that we hold the gate (which excludes
         // the `LivelistCondenser`), re-validate every drained per-clone Live
         // chain against a condenser re-anchor that may have committed since our
         // GATELESS tail sample. A raced vol is dropped from THIS flush's
@@ -1273,15 +1257,14 @@ impl Db {
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
-        // ZFS `dsl_sync_task` phase A4: insert each processed `take_snapshot`'s
-        // `SnapshotEntry` into the manifest about to be committed. The
-        // matching per-root incref was already staged + folded into THIS
-        // cycle's page-rc checkpoint (phase A3, before the page-rc
-        // `begin_checkpoint`), so the entry lands durable atomically with
-        // the incref + roots. Infallible (a pure push); id-idempotent on
-        // this body's abort-retry. The take is manifest-only — no lifecycle
+        // Insert each processed `take_snapshot`'s `SnapshotEntry` into the
+        // manifest about to be committed. The matching per-root incref was
+        // already staged and folded into this cycle's page-rc checkpoint, so
+        // the entry lands durable atomically with the incref + roots.
+        // Infallible (a pure push); id-idempotent on this body's abort-retry.
+        // The take is manifest-only — no lifecycle
         // journal record, so `lifecycle_replay_seq` below is unaffected.
-        self.add_pending_snapshot_entries(&mut manifest_state.manifest, txg);
+        self.add_pending_snapshot_entries(&mut manifest_state.manifest, bfg);
         // Compute the new global checkpoint_lsn as
         // `min(per-shard last_flushed_lsn)`, treating every shard
         // selected this round as if its atomic were already at
@@ -1298,7 +1281,7 @@ impl Db {
         let new_checkpoint_lsn =
             self.compute_min_last_flushed_lsn_after(&volumes, &selected, wal_checkpoint);
         manifest_state.manifest.checkpoint_lsn = new_checkpoint_lsn;
-        // Buffer-as-sole-journal Phase B / C: persist the buffer +
+        // Persist the buffer and
         // lifecycle replay watermarks alongside `checkpoint_lsn`. Both
         // are sampled here, inside `apply_gate.write()`, so the values
         // are exactly consistent with the page roots this checkpoint
@@ -1315,24 +1298,24 @@ impl Db {
         manifest_state.manifest.lifecycle_replay_seq = self
             .lifecycle_applied_watermark
             .load(std::sync::atomic::Ordering::Acquire);
-        // ZFS-TXG-clone Phase 4/5: persist `checkpoint_txg = txg` — the
-        // TXG this sync cycle is actually syncing. The pages this
-        // manifest commits carry exactly `txg`'s data (the syncing slot
-        // folded above + everything ≤ `txg` already on disk), so
-        // `checkpoint_txg` must name `txg`.
+        // BFG: persist `checkpoint_bfg = bfg` — the
+        // BFG this sync cycle is actually syncing. The pages this
+        // manifest commits carry exactly `bfg`'s data (the syncing slot
+        // folded above + everything ≤ `bfg` already on disk), so
+        // `checkpoint_bfg` must name `bfg`.
         //
-        // Do NOT use `open_txg() - 1`: under `txg_threads_enabled` the
-        // background `TxgQuiesceThread` can roll the Open TXG forward
-        // while this body runs, so `open_txg - 1` may be `txg + 1` even
-        // though this manifest only persisted `txg`'s pages. Persisting
-        // `txg + 1` would make a re-open's `TxgStateMachine::new(txg+1)`
-        // skip `txg+1`'s accounting. `txg` keeps the manifest invariant
-        // `checkpoint_txg + 1 <= open_txg` and stays consistent with the
-        // `checkpoint_lsn` computed from this same TXG's `slot_max_lsn`.
-        // (Threads-off is unaffected: there `open_txg - 1 == txg` because
+        // Do NOT use `open_bfg() - 1`: under `bfg_threads_enabled` the
+        // background `BfgQuiesceThread` can roll the Open BFG forward
+        // while this body runs, so `open_bfg - 1` may be `bfg + 1` even
+        // though this manifest only persisted `bfg`'s pages. Persisting
+        // `bfg + 1` would make a re-open's `BfgStateMachine::new(bfg+1)`
+        // skip `bfg+1`'s accounting. `bfg` keeps the manifest invariant
+        // `checkpoint_bfg + 1 <= open_bfg` and stays consistent with the
+        // `checkpoint_lsn` computed from this same BFG's `slot_max_lsn`.
+        // (Threads-off is unaffected: there `open_bfg - 1 == bfg` because
         // nothing rolls between promote and mark_synced.)
-        manifest_state.manifest.checkpoint_txg = txg;
-        // Tier 2.B Stage 1: persist per-shard durable_seq alongside
+        manifest_state.manifest.checkpoint_bfg = bfg;
+        // per-shard durable-seq durable-seq rollout: persist per-shard durable_seq alongside
         // the global checkpoint_lsn. Same inputs as the min()
         // computation above, but expanded into per-shard arrays.
         // `assert_durable_seq_invariant` (called from `encode`) will
@@ -1356,12 +1339,12 @@ impl Db {
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
-        // Buffer-as-sole-journal Phase D.5b retired the WAL TXG-sync
+        // Buffer-as-sole-journal lifecycle journal cutover retired the WAL BFG-sync
         // barrier: there is no WAL page cache to flush. The lifecycle
         // journal already fsyncs each record at append time, and
         // data-plane durability rides on onyx's LV2 buffer (which
         // restarts replay from its own state on crash).
-        if let Err(err) = self.faults.inject(FaultPoint::TxgSyncMidway) {
+        if let Err(err) = self.faults.inject(FaultPoint::BfgSyncMidway) {
             self.metrics
                 .record_flush_manifest(manifest_started.elapsed());
             self.metrics
@@ -1413,7 +1396,7 @@ impl Db {
             }
             tail_atomic.store(plan.start_pid, std::sync::atomic::Ordering::Release);
         }
-        // ZFS port Phase 2: snapshots sealed this cycle transferred the
+        // BFG: snapshots sealed this cycle transferred the
         // head's page-deadlist chain to themselves, so reset the head's
         // in-memory page anchors to NULL (the manifest VolumeEntry already
         // carries NULL via the (NULL,NULL) override). Runs AFTER the
@@ -1438,7 +1421,7 @@ impl Db {
         // Acquire load in `compute_min_last_flushed_lsn`.
         //
         // `fetch_max` (rather than `store`) preserves monotonicity
-        // when `wal_checkpoint = slot_max_lsn(txg) = 0` (no commits
+        // when `wal_checkpoint = slot_max_lsn(bfg) = 0` (no commits
         // in this Syncing slot): the shard's atomic stays at the
         // higher value a previous flush established. Matches the
         // `wal_checkpoint.max(prev)` projection in
@@ -1468,14 +1451,14 @@ impl Db {
                 *unlogged = None;
             }
         }
-        // ZFS `dsl_sync_task` drain (post-commit): the manifest (with the new
-        // `SnapshotEntry`s) is durable now, so report success to the queued
+        // Post-commit snapshot task drain: the manifest with the new
+        // `SnapshotEntry`s is durable now, so report success to queued
         // `take_snapshot` callers, warm the per-volume `SnapInfo` cache, and
         // dequeue the tasks.
         //
-        // ZFS port S3 — MUST run INSIDE the `apply_gate.write()` window (before
+        // Must run inside the `apply_gate.write()` window (before
         // the drop below), NOT after it. The COW-kill reads each volume's live
-        // snapshot watermarks from `snap_info_cache` (`snapshot_wms`), and S3
+        // snapshot watermarks from `snap_info_cache` (`snapshot_wms`), and page-rc removal
         // deleted the page-rc force-incref + `effective_rc > 1` floor that used
         // to pin a freshly-taken snapshot's root regardless of when the cache
         // warmed. If this warm ran AFTER the gate dropped, a backlogged commit
@@ -1488,7 +1471,7 @@ impl Db {
         // `apply_gate -> snap_info_cache` order the read path uses — no
         // inversion), and the woken `take_snapshot` caller does not re-acquire
         // the gate.
-        self.finish_pending_snapshots(txg);
+        self.finish_pending_snapshots(bfg);
 
         // End of the narrow `apply_gate.write()` window. Everything
         // below this point (RC meta install, L2P checkpoint install
@@ -1685,7 +1668,7 @@ impl Db {
         }
     }
 
-    /// ZFS port Phase 3b — Bug 3: under `apply_gate.write()`, drop any drained
+    /// BFG — Bug 3: under `apply_gate.write()`, drop any drained
     /// `Live` (per-clone page-livelist) chain whose tail atomic moved since
     /// this flush's GATELESS sample — i.e. a concurrent [`LivelistCondenser`]
     /// re-anchored it.
@@ -1871,8 +1854,8 @@ impl Db {
     /// can't happen before the commit because a commit failure
     /// would leave them lying).
     ///
-    /// Phase 4 gate-shrink note: with `wal_checkpoint =
-    /// txg.slot_max_lsn(txg)`, a flush whose Syncing slot had no
+    /// gate-shrink note: with `wal_checkpoint =
+    /// bfg.slot_max_lsn(bfg)`, a flush whose Syncing slot had no
     /// commits gets `wal_checkpoint = 0`. The selected-shard
     /// projection therefore takes `max(wal_checkpoint, prev_atomic)`
     /// so the per-shard contribution to `min_last_flushed_lsn` never
@@ -1921,7 +1904,7 @@ impl Db {
             if candidate < min_lsn {
                 min_lsn = candidate;
             }
-            // No rc buffer-term: the per-TXG-slot fold makes a selected rc
+            // No rc buffer-term: the per-BFG-slot fold makes a selected rc
             // shard durable to `wal_checkpoint` (and an unselected one stays
             // at `prev`), exactly like a non-buffered L2P shard — so
             // `candidate` already bounds rc correctly. See `refcount::shard`.
