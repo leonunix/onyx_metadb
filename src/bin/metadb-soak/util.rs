@@ -50,6 +50,22 @@ fn open_or_create_with_faults(
     if matches!(std::env::var("METADB_SOAK_TXG_THREADS").as_deref(), Ok("1") | Ok("true")) {
         cfg.txg_threads_enabled = true;
     }
+    // take_snapshot deadlock fix (commit 6cc1bae) gate: the bg LineageGcWorker
+    // drives `commit_free_pbas` (a read-before-enter commit path) autonomously
+    // — the production-reachable counterparty to take_snapshot's force-sync
+    // `drop_gate.write`. The soak defaults to `lineage_gc_enabled=false`, so
+    // commit_free_pbas never fires and the lock-order deadlock window stays shut
+    // (exactly why the 8h soak missed the deadlock). METADB_SOAK_LINEAGE_GC=1
+    // turns it on with a short interval so it overlaps the snapshot/promote
+    // churn; pair with METADB_SOAK_TXG_THREADS=1 for the bg quiesce/sync path
+    // that take_snapshot's forced sync drives.
+    if matches!(std::env::var("METADB_SOAK_LINEAGE_GC").as_deref(), Ok("1") | Ok("true")) {
+        cfg.lineage_gc_enabled = true;
+        cfg.lineage_gc_interval_ms = std::env::var("METADB_SOAK_LINEAGE_GC_INTERVAL_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(5);
+    }
     match Db::open_with_config_and_faults(cfg.clone(), faults.clone()) {
         Ok(db) => Ok(db),
         Err(_) => Db::create_with_config_and_faults(cfg, faults),

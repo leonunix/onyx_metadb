@@ -28,8 +28,17 @@ fn run_parent(cfg: ParentConfig) -> Result<ExitCode, String> {
     let mut child = None;
     let mut child_fault = None;
     let mut last_restart = Instant::now();
+    // METADB_SOAK_MAX_CYCLES caps the run at N cycles (0 = unbounded default) so
+    // a short pressure run covers exactly a few cycles regardless of how long
+    // each cycle takes as the dataset grows.
+    let max_cycles: u64 = std::env::var("METADB_SOAK_MAX_CYCLES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(0);
 
-    while started.elapsed() < Duration::from_secs(cfg.duration_secs) {
+    while started.elapsed() < Duration::from_secs(cfg.duration_secs)
+        && (max_cycles == 0 || cycles < max_cycles)
+    {
         cycles += 1;
         if child.is_none() {
             child_fault = choose_fault(&mut cycle_rng, cfg.fault_density_pct);
