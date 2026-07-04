@@ -382,7 +382,7 @@ pub struct Db {
     /// [`crate::lifecycle_log::op::LifecycleOp`] record per fsync. WAL mode
     /// leaves the field `None` and the existing `submit_wal_ops` path is
     /// unchanged.
-    pub(crate) lifecycle_journal: Option<Mutex<crate::lifecycle_log::LifecycleJournal>>,
+    pub(crate) lifecycle_journal: Option<Mutex<crate::lifecycle_log::LifecycleWriter>>,
     /// Snapshot-lifecycle ops that ride the BFG sync cycle instead of blocking
     /// the write path. `take_snapshot` pushes a [`PendingSyncTask`] here under
     /// a `bfg.enter()` guard, forces the open group to sync, and blocks on

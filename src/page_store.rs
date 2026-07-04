@@ -58,7 +58,7 @@ mod reclaim;
 mod submitter;
 mod sync;
 
-pub use device::{FileDevice, MemDevice, PageDevice};
+pub use device::{BlockPageDevice, FileDevice, MemDevice, PageBlockIo, PageDevice};
 use raw_io::{is_zero_page, take_contiguous_free_run};
 pub use submitter::{DEFAULT_IO_SUBMITTER_POOL_SIZE, IoLaneClass};
 

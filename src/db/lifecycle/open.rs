@@ -1,4 +1,29 @@
 use super::*;
+use crate::lifecycle_log::{JournalDevice, LifecycleWriter, RingJournal};
+use crate::page_store::PageDevice;
+
+/// Selects the physical backing for a `Db`'s persistent metadata. The
+/// create/open cores are backing-agnostic except at a few divergent points
+/// (page-store construction, lifecycle-journal construction/replay, and — on
+/// the device path only — the bounded free-list rebuild). Everything else
+/// (manifest, shards, dedup, recovery flush, worker spawn) is identical.
+enum MetaBacking {
+    /// Default path: a flat page file + directory of journal segments under
+    /// `cfg.path`.
+    File,
+    /// Device path (onyx over a chunklet meta LogicalDisk): a fixed-capacity
+    /// page window + a fixed-ring journal window. `cfg.path` is not touched.
+    Device {
+        page_device: Arc<dyn PageDevice>,
+        journal_device: Arc<dyn JournalDevice>,
+    },
+}
+
+impl MetaBacking {
+    fn is_device(&self) -> bool {
+        matches!(self, MetaBacking::Device { .. })
+    }
+}
 
 impl Db {
     /// Create a fresh database in `root_dir` using the default config.
@@ -22,16 +47,68 @@ impl Db {
         cfg: Config,
         faults: Arc<FaultController>,
     ) -> Result<Arc<Self>> {
+        Self::create_core(cfg, faults, MetaBacking::File)
+    }
+
+    /// Create a fresh database over caller-supplied devices (the fixed-capacity
+    /// device path — onyx over a chunklet meta LogicalDisk). `page_device`
+    /// backs the page store; `journal_device` backs the lifecycle-journal ring.
+    /// `cfg.path` is ignored for persistence (no files are created). The manifest
+    /// A/B slots + all metadata live inside `page_device`; the caller frames the
+    /// two windows (page window, journal ring) out of the meta LD.
+    pub fn create_on_device(
+        cfg: Config,
+        page_device: Arc<dyn PageDevice>,
+        journal_device: Arc<dyn JournalDevice>,
+    ) -> Result<Arc<Self>> {
+        Self::create_on_device_with_faults(
+            cfg,
+            FaultController::disabled(),
+            page_device,
+            journal_device,
+        )
+    }
+
+    /// As [`create_on_device`](Self::create_on_device) but with an injectable
+    /// fault controller (device fault-injection tests).
+    pub fn create_on_device_with_faults(
+        cfg: Config,
+        faults: Arc<FaultController>,
+        page_device: Arc<dyn PageDevice>,
+        journal_device: Arc<dyn JournalDevice>,
+    ) -> Result<Arc<Self>> {
+        Self::create_core(
+            cfg,
+            faults,
+            MetaBacking::Device {
+                page_device,
+                journal_device,
+            },
+        )
+    }
+
+    fn create_core(
+        cfg: Config,
+        faults: Arc<FaultController>,
+        backing: MetaBacking,
+    ) -> Result<Arc<Self>> {
         validate_rc_neutral_refcount_mode(&cfg)?;
         let shard_count = validate_shard_count(cfg.shards_per_partition)?;
         let dedup_shards = validate_dedup_shards(cfg.dedup_shards)?;
-        std::fs::create_dir_all(&cfg.path)?;
-        let pages_path = page_file(&cfg.path);
-        let page_store = Arc::new(PageStore::create_with_grow_chunk_and_bg_cap(
-            &pages_path,
-            cfg.page_grow_chunk_pages,
-            cfg.io_submitter_bg_inflight_cap,
-        )?);
+        let page_store = Arc::new(match &backing {
+            MetaBacking::File => {
+                std::fs::create_dir_all(&cfg.path)?;
+                let pages_path = page_file(&cfg.path);
+                PageStore::create_with_grow_chunk_and_bg_cap(
+                    &pages_path,
+                    cfg.page_grow_chunk_pages,
+                    cfg.io_submitter_bg_inflight_cap,
+                )?
+            }
+            MetaBacking::Device { page_device, .. } => {
+                PageStore::create_on_device(page_device.clone())?
+            }
+        });
         let page_cache = Arc::new(PageCache::new_with_pin_budget(
             page_store.clone(),
             cfg.page_cache_bytes,
@@ -109,14 +186,21 @@ impl Db {
 
         let lsn_alloc = LsnAllocator::new(manifest.checkpoint_lsn + 1);
 
-        // Open a fresh lifecycle journal. Fresh DB → no segments
-        // yet, so `next_seq` is 1 and `LifecycleJournal::open` simply
-        // creates the directory and its first segment.
-        let lifecycle_journal = Some(Mutex::new(crate::lifecycle_log::LifecycleJournal::open(
-            &lifecycle_log_dir(&cfg.path),
-            1,
-            cfg.wal_segment_bytes,
-        )?));
+        // Open a fresh lifecycle journal. Fresh DB → no records yet, so
+        // `next_seq` is 1. File: creates the directory + first segment. Ring:
+        // opens at `ring_head = 0` over a freshly-framed (all-zero) journal
+        // window; `RingJournal::open` scans from 0, finds the first block
+        // never-written, and starts the tail there.
+        let lifecycle_journal = Some(Mutex::new(match &backing {
+            MetaBacking::File => LifecycleWriter::File(crate::lifecycle_log::LifecycleJournal::open(
+                &lifecycle_log_dir(&cfg.path),
+                1,
+                cfg.wal_segment_bytes,
+            )?),
+            MetaBacking::Device { journal_device, .. } => {
+                LifecycleWriter::Ring(RingJournal::open(journal_device.clone(), 0, 1)?)
+            }
+        }));
 
         let volume_zero = Arc::new(Volume::new(BOOTSTRAP_VOLUME_ORD, l2p_shards, 0));
         let mut volumes = HashMap::with_capacity(1);
@@ -297,20 +381,76 @@ impl Db {
         cfg: Config,
         faults: Arc<FaultController>,
     ) -> Result<Arc<Self>> {
+        Self::open_core(cfg, faults, MetaBacking::File)
+    }
+
+    /// Open an existing database over caller-supplied devices (the fixed-capacity
+    /// device path — onyx over a chunklet meta LogicalDisk). Mirror of
+    /// [`create_on_device`](Self::create_on_device). `cfg.path` is ignored for
+    /// persistence. The device path always rebuilds the free list by a bounded
+    /// scan (a fixed LD has no EOF to trust and no hole-punch to reclaim leaked
+    /// pages), so `cfg.rebuild_free_list_on_open` is not consulted here.
+    pub fn open_on_device(
+        cfg: Config,
+        page_device: Arc<dyn PageDevice>,
+        journal_device: Arc<dyn JournalDevice>,
+    ) -> Result<Arc<Self>> {
+        Self::open_on_device_with_faults(
+            cfg,
+            FaultController::disabled(),
+            page_device,
+            journal_device,
+        )
+    }
+
+    /// As [`open_on_device`](Self::open_on_device) but with an injectable fault
+    /// controller (device fault-injection tests).
+    pub fn open_on_device_with_faults(
+        cfg: Config,
+        faults: Arc<FaultController>,
+        page_device: Arc<dyn PageDevice>,
+        journal_device: Arc<dyn JournalDevice>,
+    ) -> Result<Arc<Self>> {
+        Self::open_core(
+            cfg,
+            faults,
+            MetaBacking::Device {
+                page_device,
+                journal_device,
+            },
+        )
+    }
+
+    fn open_core(
+        cfg: Config,
+        faults: Arc<FaultController>,
+        backing: MetaBacking,
+    ) -> Result<Arc<Self>> {
         validate_rc_neutral_refcount_mode(&cfg)?;
-        let pages_path = page_file(&cfg.path);
-        let page_store = Arc::new(if cfg.rebuild_free_list_on_open {
-            PageStore::open_with_grow_chunk_and_bg_cap(
-                &pages_path,
-                cfg.page_grow_chunk_pages,
-                cfg.io_submitter_bg_inflight_cap,
-            )?
-        } else {
-            PageStore::open_fast_with_grow_chunk_and_bg_cap(
-                &pages_path,
-                cfg.page_grow_chunk_pages,
-                cfg.io_submitter_bg_inflight_cap,
-            )?
+        let page_store = Arc::new(match &backing {
+            MetaBacking::File => {
+                let pages_path = page_file(&cfg.path);
+                if cfg.rebuild_free_list_on_open {
+                    PageStore::open_with_grow_chunk_and_bg_cap(
+                        &pages_path,
+                        cfg.page_grow_chunk_pages,
+                        cfg.io_submitter_bg_inflight_cap,
+                    )?
+                } else {
+                    PageStore::open_fast_with_grow_chunk_and_bg_cap(
+                        &pages_path,
+                        cfg.page_grow_chunk_pages,
+                        cfg.io_submitter_bg_inflight_cap,
+                    )?
+                }
+            }
+            // Trust-capacity open: high_water starts at device capacity so the
+            // manifest + its catalog chains (which live anywhere below capacity)
+            // are addressable. The true frontier + free list are recovered by the
+            // bounded scan below, AFTER the manifest + dedup index are loaded.
+            MetaBacking::Device { page_device, .. } => {
+                PageStore::open_on_device(page_device.clone())?
+            }
         });
         let page_cache = Arc::new(PageCache::new_with_pin_budget(
             page_store.clone(),
@@ -421,6 +561,38 @@ impl Db {
             cfg.dedup_drainer_enabled,
         )?);
 
+        // Device path only: recover the true frontier + free list by a bounded
+        // scan. `open_on_device` above set high_water to device capacity so the
+        // manifest + shard + dedup opens could address their pages; now that the
+        // manifest and dedup index are loaded we can lower high_water to the real
+        // frontier and reclaim freed interior pages (a fixed LD has no EOF to
+        // trust and no hole-punch — without this the meta region leaks until
+        // full).
+        //
+        // The ceiling is `max(page_high_water, dedup.max_referenced_page_id()+1)`,
+        // NOT just `page_high_water`: every per-generation root (refcount / L2P /
+        // catalog / deadlists) is COW and `< page_high_water` by construction, but
+        // the cuckoo dedup meta chain is generation-stable + mutated in place, so
+        // on a crash-to-older-generation it can still reference a page a newer
+        // flush made durable above `page_high_water`. Scanning short of that page
+        // would let the allocator re-hand-out a page the live dedup index points
+        // at (silent double-allocation). Must run BEFORE lifecycle replay, which
+        // allocates pages (`cow_for_write` during L2pPut apply). See the
+        // `rebuild_free_list_bounded` caller contract.
+        if backing.is_device() {
+            let frontier = manifest
+                .page_high_water
+                .max(dedup_index.max_referenced_page_id().saturating_add(1));
+            page_store.rebuild_free_list_bounded(frontier)?;
+            tracing::info!(
+                page_high_water = manifest.page_high_water,
+                dedup_max_ref = dedup_index.max_referenced_page_id(),
+                frontier,
+                recovered_high_water = page_store.high_water(),
+                "metadb device open: bounded free-list rebuild complete"
+            );
+        }
+
         // Buffer-as-sole-journal lifecycle journal cutover retired the WAL writer.
         // Recovery now starts from `manifest.checkpoint_lsn` (the last
         // durable manifest commit) and folds the lifecycle journal
@@ -449,11 +621,21 @@ impl Db {
         let mut last_applied = manifest.checkpoint_lsn;
         let mut lifecycle_max_seq = manifest.lifecycle_replay_seq;
         let mut lifecycle_replayed_anything = false;
-        let lifecycle_dir = lifecycle_log_dir(&cfg.path);
-        if lifecycle_dir.exists() {
+        // File: replay only when the segment directory exists (a fresh DB opened
+        // with no lifecycle ops yet has none). Device: the journal ring always
+        // exists inside the meta LD, so always attempt replay (an empty ring
+        // scans to zero records).
+        let should_replay = match &backing {
+            MetaBacking::File => lifecycle_log_dir(&cfg.path).exists(),
+            MetaBacking::Device { .. } => true,
+        };
+        if should_replay {
             let from_seq = manifest.lifecycle_replay_seq;
+            let ring_head = manifest.journal_ring_head;
             let outcome = replay_lifecycle_journal_into(
-                &lifecycle_dir,
+                &backing,
+                &cfg.path,
+                ring_head,
                 &mut manifest,
                 &mut volumes,
                 &refcount_shards,
@@ -495,11 +677,20 @@ impl Db {
         // `manifest.lifecycle_replay_seq`.
         let lifecycle_journal = {
             let next_seq = lifecycle_max_seq.saturating_add(1);
-            Some(Mutex::new(crate::lifecycle_log::LifecycleJournal::open(
-                &lifecycle_dir,
-                next_seq,
-                cfg.wal_segment_bytes,
-            )?))
+            Some(Mutex::new(match &backing {
+                MetaBacking::File => LifecycleWriter::File(
+                    crate::lifecycle_log::LifecycleJournal::open(
+                        &lifecycle_log_dir(&cfg.path),
+                        next_seq,
+                        cfg.wal_segment_bytes,
+                    )?,
+                ),
+                // Reopen the ring at the persisted prune boundary; the tail +
+                // live-block count are rediscovered by scanning from there.
+                MetaBacking::Device { journal_device, .. } => LifecycleWriter::Ring(
+                    RingJournal::open(journal_device.clone(), manifest.journal_ring_head, next_seq)?,
+                ),
+            }))
         };
 
         // If anything was replayed, flush every tree + dedup memtable,
@@ -906,7 +1097,9 @@ struct LifecycleReplayOutcome {
 /// apply finished before the crash.
 #[allow(clippy::too_many_arguments)]
 fn replay_lifecycle_journal_into(
-    dir: &Path,
+    backing: &MetaBacking,
+    root_path: &Path,
+    ring_head: u64,
     manifest: &mut Manifest,
     volumes: &mut HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
@@ -921,18 +1114,20 @@ fn replay_lifecycle_journal_into(
     rc_authoritative: bool,
     from_seq: u64,
 ) -> Result<LifecycleReplayOutcome> {
-    use crate::lifecycle_log::{LifecycleJournal, op as lifecycle_op};
+    use crate::lifecycle_log::{LifecycleJournal, LifecycleRecord, op as lifecycle_op};
     let mut outcome = LifecycleReplayOutcome {
         max_seq: from_seq,
         lsns_consumed: 0,
         mutated_volumes: false,
         replayed_drop_snapshot: false,
     };
-    LifecycleJournal::replay(dir, from_seq, |rec| {
+    // The per-record apply is backend-agnostic; only the driver (segment-file
+    // walk vs block-ring scan) differs. `&mut apply` (an `&mut FnMut`) is itself
+    // `FnMut`, so the same closure feeds either driver.
+    let mut apply = |rec: LifecycleRecord| -> Result<()> {
         if rec.seq <= from_seq {
-            // `LifecycleJournal::replay` already filters at this
-            // threshold; the defensive check keeps the apply path
-            // immune to a future relaxation of that contract.
+            // The driver already filters at this threshold; the defensive check
+            // keeps the apply path immune to a future relaxation of that contract.
             return Ok(());
         }
         let op = lifecycle_op::decode(&rec.body)?;
@@ -961,7 +1156,15 @@ fn replay_lifecycle_journal_into(
         )?;
         outcome.max_seq = outcome.max_seq.max(rec.seq);
         Ok(())
-    })?;
+    };
+    match backing {
+        MetaBacking::File => {
+            LifecycleJournal::replay(&lifecycle_log_dir(root_path), from_seq, &mut apply)?;
+        }
+        MetaBacking::Device { journal_device, .. } => {
+            RingJournal::replay(journal_device, ring_head, from_seq, &mut apply)?;
+        }
+    }
     Ok(outcome)
 }
 

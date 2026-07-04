@@ -190,6 +190,14 @@ impl LifecycleJournal {
         self.next_seq
     }
 
+    /// Instance-level [`prune`](Self::prune) against this journal's own
+    /// directory. The currently-open segment (always the newest) is retained,
+    /// so pruning never disturbs the append cursor. Used by the checkpoint path
+    /// via [`super::LifecycleWriter`].
+    pub fn prune_covered(&self, checkpoint_seq: u64) -> Result<usize> {
+        Self::prune(&self.dir, checkpoint_seq)
+    }
+
     fn rotate_to(&mut self, start_seq: u64) -> Result<()> {
         if let Some(mut old) = self.current.take() {
             old.sync_all()?;

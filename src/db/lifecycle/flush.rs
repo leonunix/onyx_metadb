@@ -1351,9 +1351,34 @@ impl Db {
         manifest_state.manifest.last_processed_buffer_seq = self
             .buffer_applied_watermark
             .load(std::sync::atomic::Ordering::Acquire);
-        manifest_state.manifest.lifecycle_replay_seq = self
+        let lifecycle_prune_seq = self
             .lifecycle_applied_watermark
             .load(std::sync::atomic::Ordering::Acquire);
+        manifest_state.manifest.lifecycle_replay_seq = lifecycle_prune_seq;
+        // Ring lifecycle journal (device path): stamp the head the ring will
+        // advance to when we prune AFTER this commit is durable. Computing the
+        // target here (non-mutating) and freeing the blocks only post-commit is
+        // the crash-safe ordering — see `RingJournal::prune_target`. The file
+        // journal returns `None` (segment journals persist no ring head), so
+        // `journal_ring_head` stays 0 there. `do_lifecycle_prune` gates the
+        // post-commit free: if we cannot compute the target here we must NOT
+        // advance the in-memory head later, or it would run ahead of the durable
+        // head (the reuse-below-durable-head hazard). A skipped prune only leaks
+        // journal space and self-heals next checkpoint.
+        let mut do_lifecycle_prune = false;
+        if let Some(journal) = self.lifecycle_journal.as_ref() {
+            match journal.lock().prune_target(lifecycle_prune_seq) {
+                Ok(Some(head)) => {
+                    manifest_state.manifest.journal_ring_head = head;
+                    do_lifecycle_prune = true;
+                }
+                Ok(None) => do_lifecycle_prune = true, // file journal: segment delete
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "run_sync_cycle_body: lifecycle prune_target failed; skipping prune this cycle"
+                ),
+            }
+        }
         // BFG: persist `checkpoint_bfg = bfg` — the
         // BFG this sync cycle is actually syncing. The pages this
         // manifest commits carry exactly `bfg`'s data (the syncing slot
@@ -1534,6 +1559,32 @@ impl Db {
         // via apply lanes, reclaim, WAL prune) takes its own per-shard
         // locks and does not need the global gate.
         drop(apply_guard);
+
+        // Lifecycle journal prune. The manifest carrying
+        // `lifecycle_replay_seq`/`journal_ring_head` is now durable, so it is
+        // safe to free the covered journal blocks/segments. Ring: advances the
+        // in-memory head to exactly the head we stamped above (frees blocks for
+        // reuse) — re-deriving from the same `lifecycle_prune_seq` yields that
+        // same head. File: deletes segments wholly covered by the checkpoint
+        // (the production caller the file journal never had until now — segments
+        // used to accumulate unbounded). Gated on `do_lifecycle_prune`: if the
+        // pre-commit `prune_target` failed we did NOT stamp a new head, so we
+        // must leave the in-memory head where it is (never ahead of the durable
+        // head). Best-effort: a prune failure only leaks journal space (the
+        // durable head already names the boundary; a lagging in-memory head is
+        // the conservative direction and self-heals next checkpoint), so it must
+        // not fail an already-durable flush.
+        if do_lifecycle_prune {
+            if let Some(journal) = self.lifecycle_journal.as_ref() {
+                if let Err(err) = journal.lock().prune(lifecycle_prune_seq) {
+                    tracing::warn!(
+                        checkpoint_seq = lifecycle_prune_seq,
+                        error = %err,
+                        "run_sync_cycle_body: lifecycle journal prune failed (space leak only)"
+                    );
+                }
+            }
+        }
 
         // Manifest is durable. Install refcount meta chains in memory
         // so subsequent `begin_checkpoint` sees the new chain when

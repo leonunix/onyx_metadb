@@ -310,28 +310,61 @@ impl RingJournal {
         Ok(seq)
     }
 
+    /// Non-mutating counterpart of [`prune`](Self::prune): the `ring_head` this
+    /// journal *would* advance to if pruned at `checkpoint_seq`, without freeing
+    /// any block.
+    ///
+    /// This is the load-bearing half of the crash-safe prune ordering. The
+    /// checkpoint path must: (1) `prune_target` → stamp the result into
+    /// `manifest.journal_ring_head`; (2) commit the manifest durably; (3) only
+    /// **then** call [`prune`](Self::prune) to free the blocks in memory. If it
+    /// freed blocks before the head was durable, a wrapped append could reuse a
+    /// block below the *persisted* head and a crash would leave replay scanning
+    /// from a head that no longer starts a valid record. Deferring the in-memory
+    /// free until the target head is durable keeps the persisted head pointing at
+    /// a block that is never reused out from under it.
+    pub fn prune_target(&self, checkpoint_seq: u64) -> Result<u64> {
+        Ok(self.scan_prune(checkpoint_seq)?.0)
+    }
+
     /// Advance the prune boundary past every record with `seq <= checkpoint_seq`,
-    /// freeing their blocks for reuse. Returns the new `ring_head` for the caller
-    /// to persist in the next manifest commit. Rewrites nothing.
+    /// freeing their blocks for reuse. Returns the new `ring_head`. Rewrites
+    /// nothing. Call ONLY after a manifest commit carrying
+    /// [`prune_target`](Self::prune_target)'s head is durable (see that method).
     pub fn prune(&mut self, checkpoint_seq: u64) -> Result<u64> {
+        let (target, freed) = self.scan_prune(checkpoint_seq)?;
+        self.head = target;
+        self.used -= freed;
+        Ok(self.head)
+    }
+
+    /// Walk covered records from `head` at `checkpoint_seq`, returning
+    /// `(target_head, freed_blocks)` without mutating. Appends only touch the
+    /// tail, so this is stable against concurrent appends and identical whether
+    /// called before or after the intervening manifest commit.
+    fn scan_prune(&self, checkpoint_seq: u64) -> Result<(u64, u64)> {
+        let mut pos = self.head;
+        let mut remaining = self.used;
+        let mut freed = 0u64;
         let mut block = vec![0u8; BLOCK_SIZE];
         loop {
-            if self.used == 0 {
+            if remaining == 0 {
                 break;
             }
-            self.device.read_block(self.head, &mut block)?;
+            self.device.read_block(pos, &mut block)?;
             let (seq, len, _crc) = parse_header(&block);
             if seq == 0 || seq > checkpoint_seq {
                 break;
             }
             let run = run_blocks(len as usize);
-            if run > self.used {
+            if run > remaining {
                 break; // defensive: never advance past the tail.
             }
-            self.head = (self.head + run) % self.block_count;
-            self.used -= run;
+            pos = (pos + run) % self.block_count;
+            remaining -= run;
+            freed += run;
         }
-        Ok(self.head)
+        Ok((pos, freed))
     }
 
     /// Next seq the ring will hand out.

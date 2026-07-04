@@ -592,3 +592,180 @@ impl PageDevice for MemDevice {
 
     fn attach_metrics(&self, _metrics: Arc<MetaMetrics>) {}
 }
+
+/// Byte-level, fixed-capacity block window backing a [`BlockPageDevice`].
+///
+/// This is the seam a host (onyx over a chunklet meta LogicalDisk) implements to
+/// put the page store on a device without depending on any of metadb's internal
+/// page types ([`Page`], [`IoLaneClass`], [`IoPriority`], [`MetaMetrics`]):
+/// [`BlockPageDevice`] owns the page framing + verification and issues only
+/// aligned byte IO through this trait. Offsets are window-relative (`page_id *
+/// PAGE_SIZE`); the host adds any base offset of the window within its device.
+/// Every offset/length is a multiple of [`PAGE_SIZE`]. Implementations should
+/// chunk oversized batches themselves if their device has a per-call cost.
+pub trait PageBlockIo: Send + Sync {
+    /// Read exactly `buf.len()` bytes at window offset `offset`.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
+    /// Write exactly `buf.len()` bytes at window offset `offset` (durable only
+    /// after a subsequent [`flush`](PageBlockIo::flush)).
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()>;
+    /// Batched read; default loops [`read_at`](PageBlockIo::read_at). A striped
+    /// device overrides this to fan the batch across members in one submit.
+    fn read_many_at(&self, ops: &mut [(u64, &mut [u8])]) -> Result<()> {
+        for (offset, buf) in ops.iter_mut() {
+            self.read_at(*offset, buf)?;
+        }
+        Ok(())
+    }
+    /// Batched write; default loops [`write_at`](PageBlockIo::write_at).
+    fn write_many_at(&self, ops: &[(u64, &[u8])]) -> Result<()> {
+        for (offset, buf) in ops {
+            self.write_at(*offset, buf)?;
+        }
+        Ok(())
+    }
+    /// Durability fence — every prior write is durable on return.
+    fn flush(&self) -> Result<()>;
+    /// Total addressable bytes of the window (a multiple of [`PAGE_SIZE`]).
+    fn capacity_bytes(&self) -> u64;
+}
+
+/// Fixed-capacity [`PageDevice`] over a caller-supplied byte-level
+/// [`PageBlockIo`] window. This is the production device path (onyx frames a
+/// window out of a chunklet meta LogicalDisk and implements [`PageBlockIo`] over
+/// it). Semantics match [`MemDevice`] — no EOF, no hole-punch, capacity is a
+/// hard wall — but the bytes live behind the host's device instead of a `Vec`.
+pub struct BlockPageDevice {
+    io: Arc<dyn PageBlockIo>,
+    capacity_pages: u64,
+}
+
+impl BlockPageDevice {
+    /// Wrap a byte window. The window must be a whole number of pages and cover
+    /// at least the reserved manifest region ([`FIRST_DATA_PAGE`]).
+    pub fn new(io: Arc<dyn PageBlockIo>) -> Result<Self> {
+        let cap_bytes = io.capacity_bytes();
+        if cap_bytes % PAGE_SIZE as u64 != 0 {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "page block window capacity {cap_bytes} is not a multiple of page size {PAGE_SIZE}",
+            )));
+        }
+        let capacity_pages = cap_bytes / PAGE_SIZE as u64;
+        if capacity_pages < FIRST_DATA_PAGE {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "page block window is {capacity_pages} pages, shorter than the reserved \
+                 manifest region ({FIRST_DATA_PAGE} pages)",
+            )));
+        }
+        Ok(Self { io, capacity_pages })
+    }
+
+    fn page_offset(page_id: PageId) -> Result<u64> {
+        (page_id)
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(MetaDbError::PageOutOfRange(page_id))
+    }
+}
+
+impl PageDevice for BlockPageDevice {
+    fn read_page(&self, page_id: PageId) -> Result<Page> {
+        let mut page = Page::zeroed();
+        self.io
+            .read_at(Self::page_offset(page_id)?, page.bytes_mut())?;
+        page.verify(page_id)?;
+        Ok(page)
+    }
+
+    fn read_pages(&self, page_ids: &[PageId]) -> Result<Vec<Page>> {
+        let mut pages: Vec<Page> = (0..page_ids.len()).map(|_| Page::zeroed()).collect();
+        {
+            let mut ops: Vec<(u64, &mut [u8])> = Vec::with_capacity(page_ids.len());
+            for (page, &pid) in pages.iter_mut().zip(page_ids.iter()) {
+                ops.push((Self::page_offset(pid)?, page.bytes_mut()));
+            }
+            self.io.read_many_at(&mut ops)?;
+        }
+        // Returned unverified, mirroring the file path (the caller runs
+        // `Page::verify`).
+        Ok(pages)
+    }
+
+    fn read_page_unchecked(&self, page_id: PageId) -> Result<Page> {
+        let mut page = Page::zeroed();
+        self.io
+            .read_at(Self::page_offset(page_id)?, page.bytes_mut())?;
+        Ok(page)
+    }
+
+    fn write_page(&self, page_id: PageId, page: &Page, _class: IoLaneClass) -> Result<()> {
+        self.io.write_at(Self::page_offset(page_id)?, page.bytes())
+    }
+
+    fn write_page_run_bytes(&self, start_page: PageId, bytes: &[u8]) -> Result<()> {
+        self.io.write_at(Self::page_offset(start_page)?, bytes)
+    }
+
+    fn write_page_runs_parallel(&self, runs: Vec<(PageId, Vec<u8>)>) -> Result<()> {
+        let mut ops: Vec<(u64, &[u8])> = Vec::with_capacity(runs.len());
+        for (start, bytes) in runs.iter() {
+            ops.push((Self::page_offset(*start)?, bytes.as_slice()));
+        }
+        self.io.write_many_at(&ops)
+    }
+
+    fn write_sealed_page_runs(
+        &self,
+        mut pages: Vec<(PageId, Arc<Page>)>,
+        _class: IoLaneClass,
+        _priority: IoPriority,
+    ) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        pages.sort_unstable_by_key(|(pid, _)| *pid);
+        let mut ops: Vec<(u64, &[u8])> = Vec::with_capacity(pages.len());
+        for (pid, page) in pages.iter() {
+            ops.push((Self::page_offset(*pid)?, page.bytes()));
+        }
+        self.io.write_many_at(&ops)
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.io.flush()
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        self.io.flush()
+    }
+
+    fn len_pages(&self) -> Result<u64> {
+        Ok(self.capacity_pages)
+    }
+
+    fn ensure_covers(&self, target_pages: u64) -> Result<()> {
+        if target_pages > self.capacity_pages {
+            return Err(MetaDbError::CapacityExhausted {
+                requested_pages: target_pages,
+                capacity_pages: self.capacity_pages,
+            });
+        }
+        Ok(())
+    }
+
+    fn truncate_to(&self, _pages: u64) -> Result<()> {
+        // Fixed capacity: the page store lowers its own high-water mark; no
+        // physical shrink.
+        Ok(())
+    }
+
+    fn punch_run(&self, _start_page: PageId, _count: usize) -> Result<()> {
+        // No hole-punch on a fixed device; the Free-stamp is the reuse marker.
+        Ok(())
+    }
+
+    fn capacity_pages(&self) -> Option<u64> {
+        Some(self.capacity_pages)
+    }
+
+    fn attach_metrics(&self, _metrics: Arc<MetaMetrics>) {}
+}

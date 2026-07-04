@@ -55,9 +55,10 @@ pub use manifest::{
     VOLUME_FLAG_CLONE_LINEAGE, VOLUME_FLAG_DROP_PENDING, VolumeEntry, decode_volume_entry_inline,
     encode_volume_entry_inline, max_snapshots_for_shards, volume_entry_inline_size,
 };
+pub use lifecycle_log::{JournalDevice, RING_BLOCK_SIZE};
 pub use metrics::{FlushKind, MetaMetrics, MetaMetricsSnapshot};
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
-pub use page_store::{PageStore, ReclaimOutcome};
+pub use page_store::{BlockPageDevice, PageBlockIo, PageDevice, PageStore, ReclaimOutcome};
 pub use paged::{DiffEntry, L2pValue, PagedL2p};
 pub use tx::{ApplyOutcome, Transaction};
 pub use types::{

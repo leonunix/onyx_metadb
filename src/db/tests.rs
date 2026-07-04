@@ -177,6 +177,7 @@ mod clone_livelist_shadow;
 mod clone_livelist_substrate;
 mod core;
 mod dead_list;
+mod device;
 mod free_pbas;
 mod indexes;
 mod lineage_gc;

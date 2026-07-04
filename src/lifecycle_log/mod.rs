@@ -40,6 +40,7 @@ pub mod journal;
 pub mod op;
 pub mod record;
 pub mod ring;
+pub mod writer;
 
 #[cfg(test)]
 mod tests;
@@ -47,3 +48,4 @@ mod tests;
 pub use journal::{LifecycleJournal, LifecycleRecord};
 pub use op::{DropMergeTarget, LifecycleOp};
 pub use ring::{BLOCK_SIZE as RING_BLOCK_SIZE, JournalDevice, MemJournalDevice, RingJournal};
+pub use writer::LifecycleWriter;
