@@ -217,18 +217,18 @@ pub(super) fn write_sealed_pages_raw(
         return Ok(());
     }
     let Some(write_uring) = write_uring else {
-        return super::PageStore::write_sealed_page_runs_pwrite(file, pages);
+        return write_sealed_page_runs_pwrite(file, pages);
     };
     let mut guard = write_uring.lock();
     let Some(ring) = guard.as_mut() else {
-        return super::PageStore::write_sealed_page_runs_pwrite(file, pages);
+        return write_sealed_page_runs_pwrite(file, pages);
     };
     match write_sealed_pages_raw_uring(file, &pages, ring) {
         Ok(()) => Ok(()),
         Err(err) if is_uring_setup_error(&err) => {
             tracing::debug!(error = %err, "page_store sealed write io_uring failed; falling back to pwrite");
             *guard = None;
-            super::PageStore::write_sealed_page_runs_pwrite(file, pages)
+            write_sealed_page_runs_pwrite(file, pages)
         }
         Err(err) => Err(err),
     }
@@ -240,7 +240,45 @@ pub(super) fn write_sealed_pages_raw(
     pages: Vec<(PageId, Arc<Page>)>,
     _write_uring: Option<&()>,
 ) -> Result<()> {
-    super::PageStore::write_sealed_page_runs_pwrite(file, pages)
+    write_sealed_page_runs_pwrite(file, pages)
+}
+
+/// Fallback writer for sealed pages. Keeps only one coalesced byte run in
+/// memory at a time, rather than materialising every dirty checkpoint page
+/// into a second full-size buffer.
+pub(super) fn write_sealed_page_runs_pwrite(
+    file: &File,
+    pages: Vec<(PageId, Arc<Page>)>,
+) -> Result<()> {
+    let mut run_start: Option<PageId> = None;
+    let mut run_next = 0;
+    let mut run_bytes = Vec::with_capacity(MAX_SEALED_WRITE_RUN_PAGES * PAGE_SIZE);
+
+    fn flush_run(
+        file: &File,
+        run_start: &mut Option<PageId>,
+        run_bytes: &mut Vec<u8>,
+    ) -> Result<()> {
+        if let Some(start) = run_start.take() {
+            file.write_all_at(run_bytes, start * PAGE_SIZE as u64)?;
+            run_bytes.clear();
+        }
+        Ok(())
+    }
+
+    for (pid, page) in pages {
+        let run_pages = run_bytes.len() / PAGE_SIZE;
+        if run_start.is_some() && (pid != run_next || run_pages >= MAX_SEALED_WRITE_RUN_PAGES) {
+            flush_run(file, &mut run_start, &mut run_bytes)?;
+        }
+        if run_start.is_none() {
+            run_start = Some(pid);
+        }
+        run_bytes.extend_from_slice(page.bytes());
+        run_next = pid + 1;
+    }
+    flush_run(file, &mut run_start, &mut run_bytes)?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

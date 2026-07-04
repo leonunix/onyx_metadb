@@ -34,28 +34,22 @@
 
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-#[cfg(target_os = "linux")]
-use io_uring::IoUring;
-
 use crate::config::PAGE_SIZE;
 use crate::epoch::EpochManager;
 use crate::error::{MetaDbError, Result};
-use crate::io_submitter::IoSubmitter;
 use crate::metrics::MetaMetrics;
 use crate::page::{Page, PageHeader, PageType};
 use crate::types::{FIRST_DATA_PAGE, Lsn, PageId};
 
 mod accessors;
 mod allocation;
+mod device;
 mod open;
 mod page_io;
 mod raw_io;
@@ -64,13 +58,8 @@ mod reclaim;
 mod submitter;
 mod sync;
 
-use raw_io::{
-    MAX_SEALED_WRITE_RUN_PAGES, coalesce_sealed_runs, is_zero_page, new_read_uring,
-    new_write_uring, punch_hole, read_page_raw, read_pages_raw, take_contiguous_free_run,
-    write_page_runs_raw, write_sealed_pages_raw,
-};
-use read_pool::PageReadPool;
-use submitter::make_io_submitters;
+pub use device::{FileDevice, PageDevice};
+use raw_io::{is_zero_page, take_contiguous_free_run};
 pub use submitter::{DEFAULT_IO_SUBMITTER_POOL_SIZE, IoLaneClass};
 
 const MAX_RECLAIM_RUN_PAGES: usize = 1024;
@@ -81,40 +70,22 @@ const MIN_PUNCH_HOLE_RUN_PAGES: usize = 16;
 /// sync with `Config::page_grow_chunk_pages`'s documented default.
 pub const DEFAULT_GROW_CHUNK_PAGES: u64 = 512;
 
-/// Flat page file.
+/// Flat page store over a pluggable [`PageDevice`].
+///
+/// The store owns only device-independent bookkeeping — free list,
+/// high-water mark, deferred-free epoch reclaim, metrics. The physical
+/// bytes (and the fd / io_uring / hole-punch / `set_len` machinery for the
+/// file path) live behind [`Self::device`].
 pub struct PageStore {
+    /// Label for diagnostics (the file path, or a device identifier).
     path: PathBuf,
-    file: File,
-    read_pool: PageReadPool,
-    /// Pool of io_uring submitters. Each entry owns its own ring +
-    /// worker thread, so concurrent writers from different shards /
-    /// background workers don't share an SQ — a writeback burst on
-    /// one submitter cannot stall commit-apply writes routed to a
-    /// different submitter.
-    ///
-    /// Routing: every write API hashes its `PageId` into the pool
-    /// (`io_submitter_for(pid) = io_submitters[pid as usize % len]`).
-    /// Allocation is sequential, so adjacent pids land on the same
-    /// submitter and coalesce into the same `IORING_OP_WRITEV` SQE;
-    /// non-adjacent runs from disparate shards naturally spread across
-    /// rings. `sync()` fans out `IORING_OP_FSYNC` to every submitter
-    /// in parallel because io_uring fsync only orders writes on the
-    /// same ring.
-    ///
-    /// Empty when io_uring is unavailable (old kernel, sandboxed
-    /// environment); callers fall back to direct pwrite + fdatasync.
-    io_submitters: Box<[IoSubmitter]>,
-    #[cfg(target_os = "linux")]
-    read_uring: Mutex<Option<IoUring>>,
-    #[cfg(target_os = "linux")]
-    write_uring: Mutex<Option<IoUring>>,
+    /// Physical backing store. [`FileDevice`] by default; a fixed-capacity
+    /// block window (onyx over chunklet) on the device path.
+    device: Arc<dyn PageDevice>,
     inner: Mutex<Inner>,
     high_water_pages: AtomicU64,
     free_list_pages: AtomicUsize,
     deferred_free_pages: AtomicUsize,
-    /// Batch size for pre-extending the backing file in `allocate` /
-    /// `allocate_run`. Frozen at construction; never mutated.
-    grow_chunk: u64,
     /// Epoch coordinator shared with lock-free L2P readers. Reader
     /// `pin()` records its starting epoch in a slot; [`free`] /
     /// [`free_idempotent`] tag deferred work with the pre-bump epoch
@@ -169,13 +140,9 @@ impl std::fmt::Debug for PageStore {
 
 struct Inner {
     /// Smallest page id that has *not* yet been allocated. Always
-    /// `<= committed_file_pages`; the gap between them is pre-extended
-    /// zero-init growth tail.
+    /// `<= device.len_pages()`; the gap is pre-extended zero-init growth
+    /// tail (file) or unused capacity (device).
     high_water: u64,
-    /// File length in pages. `file.metadata().len() == committed_file_pages
-    /// * PAGE_SIZE` at all times outside `allocate` / `allocate_run` /
-    /// `open`, and `committed_file_pages >= high_water` always.
-    committed_file_pages: u64,
     /// Explicitly-freed pages available for reuse. LIFO.
     free_list: Vec<PageId>,
 }

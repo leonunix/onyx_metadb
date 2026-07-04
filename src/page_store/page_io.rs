@@ -6,16 +6,16 @@ impl PageStore {
     pub fn read_page(&self, page_id: PageId) -> Result<Page> {
         self.check_in_range(page_id)?;
         let started = Instant::now();
-        let page = self.read_pool.read_page(page_id)?;
+        let page = self.device.read_page(page_id)?;
         if let Some(metrics) = self.metrics() {
             metrics.record_meta_io_read_batch(1, PAGE_SIZE, started.elapsed());
         }
         Ok(page)
     }
 
-    /// Read and verify several pages. On Linux this uses one io_uring submit
-    /// per chunk, so callers with many cache misses can raise device queue
-    /// depth instead of serialising `pread` calls.
+    /// Read and verify several pages. On Linux the file device uses one
+    /// io_uring submit per chunk, so callers with many cache misses can
+    /// raise device queue depth instead of serialising `pread` calls.
     pub(crate) fn read_pages(&self, page_ids: &[PageId]) -> Result<Vec<Page>> {
         if page_ids.is_empty() {
             return Ok(Vec::new());
@@ -24,7 +24,7 @@ impl PageStore {
             self.check_in_range(page_id)?;
         }
         let started = Instant::now();
-        let pages = read_pages_raw(&self.file, page_ids, self.read_uring())?;
+        let pages = self.device.read_pages(page_ids)?;
         if let Some(metrics) = self.metrics() {
             metrics.record_meta_io_read_batch(
                 page_ids.len(),
@@ -43,7 +43,7 @@ impl PageStore {
     /// erroring out.
     pub fn read_page_unchecked(&self, page_id: PageId) -> Result<Page> {
         self.check_in_range(page_id)?;
-        read_page_raw(&self.file, page_id)
+        self.device.read_page_unchecked(page_id)
     }
 
     /// Write `page` at `page_id`. The caller is responsible for having
@@ -64,14 +64,7 @@ impl PageStore {
     ) -> Result<()> {
         self.check_in_range(page_id)?;
         let started = Instant::now();
-        if let Some(submitter) = self.io_submitter_for_class(class) {
-            submitter.submit_write(page_id, Arc::new(page.clone()))?;
-        } else if let Some(submitter) = self.io_submitter_for(page_id) {
-            submitter.submit_write(page_id, Arc::new(page.clone()))?;
-        } else {
-            self.file
-                .write_all_at(page.bytes(), page_id * PAGE_SIZE as u64)?;
-        }
+        self.device.write_page(page_id, page, class)?;
         if let Some(metrics) = self.metrics() {
             metrics.record_meta_io_write_batch(1, PAGE_SIZE, started.elapsed());
         }
@@ -94,8 +87,7 @@ impl PageStore {
             .ok_or(MetaDbError::OutOfSpace)?;
         self.check_in_range(last)?;
         let started = Instant::now();
-        self.file
-            .write_all_at(bytes, start_page * PAGE_SIZE as u64)?;
+        self.device.write_page_run_bytes(start_page, bytes)?;
         if let Some(metrics) = self.metrics() {
             metrics.record_meta_io_write_batch(pages as usize, bytes.len(), started.elapsed());
         }
@@ -109,7 +101,7 @@ impl PageStore {
             (o + run.len() / PAGE_SIZE, b + run.len())
         });
         let started = Instant::now();
-        write_page_runs_raw(&self.file, runs, self.write_uring())?;
+        self.device.write_page_runs_parallel(runs)?;
         if let Some(metrics) = self.metrics() {
             metrics.record_meta_io_write_batch(ops, bytes, started.elapsed());
         }
@@ -150,7 +142,7 @@ impl PageStore {
 
     pub fn write_sealed_page_runs_for_class_and_priority(
         &self,
-        mut pages: Vec<(PageId, Arc<Page>)>,
+        pages: Vec<(PageId, Arc<Page>)>,
         class: IoLaneClass,
         priority: crate::io_submitter::IoPriority,
     ) -> Result<()> {
@@ -159,110 +151,11 @@ impl PageStore {
         }
         let ops = pages.len();
         let bytes = ops * PAGE_SIZE;
-        pages.sort_unstable_by_key(|(pid, _)| *pid);
         let started = Instant::now();
-        // Route through the lane-class submitter so dedup / refcount /
-        // L2p write streams cannot saturate one another's SQ. Falls
-        // back to hash routing (legacy behaviour) when the pool is
-        // smaller than expected, and to pwrite when io_uring is
-        // unavailable.
-        let class_submitter = self.io_submitter_for_class(class);
-        if class_submitter.is_some() || !self.io_submitters.is_empty() {
-            let runs = coalesce_sealed_runs(pages, MAX_SEALED_WRITE_RUN_PAGES);
-            let receivers: Vec<_> = runs
-                .into_iter()
-                .map(|(start, run_pages)| {
-                    let submitter = class_submitter
-                        .or_else(|| self.io_submitter_for(start))
-                        .expect("io_submitters non-empty above");
-                    submitter.submit_write_run_async_with_priority(start, run_pages, priority)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut first_err: Option<MetaDbError> = None;
-            for rx in receivers {
-                match rx.recv() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        if first_err.is_none() {
-                            first_err = Some(err);
-                        }
-                    }
-                    Err(_) => {
-                        if first_err.is_none() {
-                            first_err = Some(MetaDbError::Io(io::Error::other(
-                                "io submitter dropped reply for write run",
-                            )));
-                        }
-                    }
-                }
-            }
-            if let Some(err) = first_err {
-                return Err(err);
-            }
-        } else {
-            write_sealed_pages_raw(&self.file, pages, self.write_uring())?;
-        }
+        self.device.write_sealed_page_runs(pages, class, priority)?;
         if let Some(metrics) = self.metrics() {
             metrics.record_meta_io_write_batch(ops, bytes, started.elapsed());
         }
         Ok(())
-    }
-
-    /// Fallback writer for sealed pages. It keeps only one coalesced
-    /// byte run in memory at a time, rather than materialising every
-    /// dirty checkpoint page into a second full-size buffer.
-    pub(super) fn write_sealed_page_runs_pwrite(
-        file: &File,
-        pages: Vec<(PageId, Arc<Page>)>,
-    ) -> Result<()> {
-        let mut run_start: Option<PageId> = None;
-        let mut run_next = 0;
-        let mut run_bytes = Vec::with_capacity(MAX_SEALED_WRITE_RUN_PAGES * PAGE_SIZE);
-
-        fn flush_run(
-            file: &File,
-            run_start: &mut Option<PageId>,
-            run_bytes: &mut Vec<u8>,
-        ) -> Result<()> {
-            if let Some(start) = run_start.take() {
-                file.write_all_at(run_bytes, start * PAGE_SIZE as u64)?;
-                run_bytes.clear();
-            }
-            Ok(())
-        }
-
-        for (pid, page) in pages {
-            let run_pages = run_bytes.len() / PAGE_SIZE;
-            if run_start.is_some() && (pid != run_next || run_pages >= MAX_SEALED_WRITE_RUN_PAGES) {
-                flush_run(file, &mut run_start, &mut run_bytes)?;
-            }
-            if run_start.is_none() {
-                run_start = Some(pid);
-            }
-            run_bytes.extend_from_slice(page.bytes());
-            run_next = pid + 1;
-        }
-        flush_run(file, &mut run_start, &mut run_bytes)?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    fn read_uring(&self) -> Option<&Mutex<Option<IoUring>>> {
-        Some(&self.read_uring)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn write_uring(&self) -> Option<&Mutex<Option<IoUring>>> {
-        Some(&self.write_uring)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn read_uring(&self) -> Option<&()> {
-        None
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn write_uring(&self) -> Option<&()> {
-        None
     }
 }

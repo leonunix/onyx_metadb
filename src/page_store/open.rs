@@ -1,7 +1,33 @@
 use super::*;
+use device::FileDevice;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 impl PageStore {
+    /// Assemble a store from an already-constructed device plus recovered
+    /// bookkeeping. `path` is a diagnostic label only.
+    pub(super) fn from_parts(
+        path: PathBuf,
+        device: Arc<dyn PageDevice>,
+        high_water: u64,
+        free_list: Vec<PageId>,
+    ) -> Self {
+        let free_list_pages = free_list.len();
+        Self {
+            path,
+            device,
+            inner: Mutex::new(Inner {
+                high_water,
+                free_list,
+            }),
+            high_water_pages: AtomicU64::new(high_water),
+            free_list_pages: AtomicUsize::new(free_list_pages),
+            deferred_free_pages: AtomicUsize::new(0),
+            epoch: Arc::new(EpochManager::new()),
+            deferred_free: Mutex::new(BTreeMap::new()),
+            metrics: OnceLock::new(),
+        }
+    }
+
     /// Create a brand-new page store at `path` with the default batch
     /// grow chunk ([`DEFAULT_GROW_CHUNK_PAGES`]). Fails if the file
     /// already exists.
@@ -47,47 +73,14 @@ impl PageStore {
         grow_chunk: u64,
         bg_inflight_cap: usize,
     ) -> Result<Self> {
-        if grow_chunk == 0 {
-            return Err(MetaDbError::InvalidArgument(
-                "page store grow_chunk must be >= 1".into(),
-            ));
-        }
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        // Pre-size to FIRST_DATA_PAGE so the manifest slot offsets are
-        // immediately addressable, even though we leave those pages zeroed
-        // (the manifest layer will populate them). First data allocation
-        // will pre-extend to FIRST_DATA_PAGE + grow_chunk.
-        file.set_len(FIRST_DATA_PAGE * PAGE_SIZE as u64)?;
-        let read_pool = PageReadPool::start(&file)?;
-        let io_submitters =
-            make_io_submitters(&file, DEFAULT_IO_SUBMITTER_POOL_SIZE, bg_inflight_cap);
-        Ok(Self {
+        let device = FileDevice::create(&path, grow_chunk, bg_inflight_cap)?;
+        Ok(Self::from_parts(
             path,
-            file,
-            read_pool,
-            io_submitters,
-            #[cfg(target_os = "linux")]
-            read_uring: Mutex::new(new_read_uring()),
-            #[cfg(target_os = "linux")]
-            write_uring: Mutex::new(new_write_uring()),
-            inner: Mutex::new(Inner {
-                high_water: FIRST_DATA_PAGE,
-                committed_file_pages: FIRST_DATA_PAGE,
-                free_list: Vec::new(),
-            }),
-            high_water_pages: AtomicU64::new(FIRST_DATA_PAGE),
-            free_list_pages: AtomicUsize::new(0),
-            deferred_free_pages: AtomicUsize::new(0),
-            grow_chunk,
-            epoch: Arc::new(EpochManager::new()),
-            deferred_free: Mutex::new(BTreeMap::new()),
-            metrics: OnceLock::new(),
-        })
+            Arc::new(device),
+            FIRST_DATA_PAGE,
+            Vec::new(),
+        ))
     }
 
     /// Fast-open an existing page store with the caller's grow chunk. See
@@ -108,57 +101,22 @@ impl PageStore {
         grow_chunk: u64,
         bg_inflight_cap: usize,
     ) -> Result<Self> {
-        if grow_chunk == 0 {
-            return Err(MetaDbError::InvalidArgument(
-                "page store grow_chunk must be >= 1".into(),
-            ));
-        }
         let open_started = std::time::Instant::now();
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let size = file.metadata()?.len();
-        if size % PAGE_SIZE as u64 != 0 {
-            return Err(MetaDbError::Corruption(format!(
-                "page file size {size} is not a multiple of page size {PAGE_SIZE}",
-            )));
-        }
-        if size < FIRST_DATA_PAGE * PAGE_SIZE as u64 {
-            return Err(MetaDbError::Corruption(format!(
-                "page file size {size} is shorter than the reserved manifest region",
-            )));
-        }
-        let file_end_pages = size / PAGE_SIZE as u64;
-        let read_pool = PageReadPool::start(&file)?;
-        let io_submitters =
-            make_io_submitters(&file, DEFAULT_IO_SUBMITTER_POOL_SIZE, bg_inflight_cap);
+        let (device, file_end_pages) =
+            FileDevice::open_existing(&path, grow_chunk, bg_inflight_cap)?;
         tracing::info!(
             path = %path.display(),
             high_water_pages = file_end_pages,
             elapsed_ms = open_started.elapsed().as_millis(),
             "metadb page store fast-open complete"
         );
-        Ok(Self {
+        Ok(Self::from_parts(
             path,
-            file,
-            read_pool,
-            io_submitters,
-            #[cfg(target_os = "linux")]
-            read_uring: Mutex::new(new_read_uring()),
-            #[cfg(target_os = "linux")]
-            write_uring: Mutex::new(new_write_uring()),
-            inner: Mutex::new(Inner {
-                high_water: file_end_pages,
-                committed_file_pages: file_end_pages,
-                free_list: Vec::new(),
-            }),
-            high_water_pages: AtomicU64::new(file_end_pages),
-            free_list_pages: AtomicUsize::new(0),
-            deferred_free_pages: AtomicUsize::new(0),
-            grow_chunk,
-            epoch: Arc::new(EpochManager::new()),
-            deferred_free: Mutex::new(BTreeMap::new()),
-            metrics: OnceLock::new(),
-        })
+            Arc::new(device),
+            file_end_pages,
+            Vec::new(),
+        ))
     }
 
     /// Open an existing page store. `grow_chunk` is the batch size used
@@ -183,53 +141,18 @@ impl PageStore {
         grow_chunk: u64,
         bg_inflight_cap: usize,
     ) -> Result<Self> {
-        if grow_chunk == 0 {
-            return Err(MetaDbError::InvalidArgument(
-                "page store grow_chunk must be >= 1".into(),
-            ));
-        }
         let open_started = std::time::Instant::now();
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let size = file.metadata()?.len();
-        if size % PAGE_SIZE as u64 != 0 {
-            return Err(MetaDbError::Corruption(format!(
-                "page file size {size} is not a multiple of page size {PAGE_SIZE}",
-            )));
-        }
-        if size < FIRST_DATA_PAGE * PAGE_SIZE as u64 {
-            return Err(MetaDbError::Corruption(format!(
-                "page file size {size} is shorter than the reserved manifest region",
-            )));
-        }
-        let file_end_pages = size / PAGE_SIZE as u64;
-        let read_pool = PageReadPool::start(&file)?;
-        let io_submitters =
-            make_io_submitters(&file, DEFAULT_IO_SUBMITTER_POOL_SIZE, bg_inflight_cap);
+        let (device, file_end_pages) =
+            FileDevice::open_existing(&path, grow_chunk, bg_inflight_cap)?;
         // Walk every page in [FIRST_DATA_PAGE, file_end_pages). Typed pages
         // extend the recovered `high_water`; Free pages and all-zero punched
         // holes are reusable. A zero suffix past the last typed page is
         // growth tail and is truncated below.
-        let mut high_water = FIRST_DATA_PAGE;
-        let mut free_list = Vec::new();
-        for page_id in FIRST_DATA_PAGE..file_end_pages {
-            let page = read_page_raw(&file, page_id)?;
-            if let Ok(h) = page.header() {
-                high_water = page_id + 1;
-                if h.page_type == PageType::Free {
-                    free_list.push(page_id);
-                }
-            } else if is_zero_page(&page) {
-                free_list.push(page_id);
-            }
-            // Torn pages are left in place below high_water; the verifier
-            // flags them later.
-        }
+        let (high_water, free_list) = scan_free_list(&device, FIRST_DATA_PAGE, file_end_pages)?;
         if high_water < file_end_pages {
-            file.set_len(high_water * PAGE_SIZE as u64)?;
+            device.truncate_to(high_water)?;
         }
-        free_list.retain(|pid| *pid < high_water);
-        let free_list_pages = free_list.len();
         tracing::info!(
             path = %path.display(),
             scanned_pages = file_end_pages.saturating_sub(FIRST_DATA_PAGE),
@@ -238,27 +161,33 @@ impl PageStore {
             elapsed_ms = open_started.elapsed().as_millis(),
             "metadb page store open scan complete"
         );
-        Ok(Self {
-            path,
-            file,
-            read_pool,
-            io_submitters,
-            #[cfg(target_os = "linux")]
-            read_uring: Mutex::new(new_read_uring()),
-            #[cfg(target_os = "linux")]
-            write_uring: Mutex::new(new_write_uring()),
-            inner: Mutex::new(Inner {
-                high_water,
-                committed_file_pages: high_water,
-                free_list,
-            }),
-            high_water_pages: AtomicU64::new(high_water),
-            free_list_pages: AtomicUsize::new(free_list_pages),
-            deferred_free_pages: AtomicUsize::new(0),
-            grow_chunk,
-            epoch: Arc::new(EpochManager::new()),
-            deferred_free: Mutex::new(BTreeMap::new()),
-            metrics: OnceLock::new(),
-        })
+        Ok(Self::from_parts(path, Arc::new(device), high_water, free_list))
     }
+}
+
+/// Scan pages `[scan_from, scan_to)` on `device` to recover the high-water
+/// mark and the reusable free list. Typed pages push `high_water` past
+/// them; `Free`-stamped pages and all-zero (punched / never-written) pages
+/// join the free list. Torn pages are left in place below high_water; the
+/// verifier flags them later.
+pub(super) fn scan_free_list(
+    device: &dyn PageDevice,
+    scan_from: PageId,
+    scan_to: PageId,
+) -> Result<(u64, Vec<PageId>)> {
+    let mut high_water = scan_from;
+    let mut free_list = Vec::new();
+    for page_id in scan_from..scan_to {
+        let page = device.read_page_unchecked(page_id)?;
+        if let Ok(h) = page.header() {
+            high_water = page_id + 1;
+            if h.page_type == PageType::Free {
+                free_list.push(page_id);
+            }
+        } else if is_zero_page(&page) {
+            free_list.push(page_id);
+        }
+    }
+    free_list.retain(|pid| *pid < high_water);
+    Ok((high_water, free_list))
 }

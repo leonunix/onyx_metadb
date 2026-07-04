@@ -19,7 +19,7 @@ impl PageStore {
             .high_water
             .checked_add(1)
             .ok_or(MetaDbError::OutOfSpace)?;
-        self.ensure_file_covers(&mut inner, new_high)?;
+        self.device.ensure_covers(new_high)?;
         inner.high_water = new_high;
         self.high_water_pages.store(new_high, Ordering::Relaxed);
         Ok(page_id)
@@ -53,7 +53,7 @@ impl PageStore {
             .high_water
             .checked_add(count)
             .ok_or(MetaDbError::OutOfSpace)?;
-        self.ensure_file_covers(&mut inner, new_high)?;
+        self.device.ensure_covers(new_high)?;
         inner.high_water = new_high;
         self.high_water_pages.store(new_high, Ordering::Relaxed);
         Ok(start)
@@ -100,7 +100,7 @@ impl PageStore {
                 .high_water
                 .checked_add(missing_u64)
                 .ok_or(MetaDbError::OutOfSpace)?;
-            self.ensure_file_covers(&mut inner, new_high)?;
+            self.device.ensure_covers(new_high)?;
             inner.high_water = new_high;
             self.high_water_pages.store(new_high, Ordering::Relaxed);
             // Store new tail pages in reverse so `pop()` yields ascending ids.
@@ -110,35 +110,5 @@ impl PageStore {
         // into the newly extended tail.
         pages.extend(reused);
         Ok(pages)
-    }
-
-    /// Ensure the backing file covers at least `target` pages. Rounds
-    /// up to the next `grow_chunk` boundary so subsequent allocations
-    /// within the chunk avoid `set_len`. Called with `inner` already
-    /// locked.
-    fn ensure_file_covers(&self, inner: &mut Inner, target: u64) -> Result<()> {
-        if target <= inner.committed_file_pages {
-            return Ok(());
-        }
-        // Round target up to the next grow_chunk boundary.
-        let chunk = self.grow_chunk;
-        let span = target
-            .checked_sub(inner.committed_file_pages)
-            .expect("target > committed by the early return above");
-        let chunks_needed = span.div_ceil(chunk);
-        let add = chunks_needed
-            .checked_mul(chunk)
-            .ok_or(MetaDbError::OutOfSpace)?;
-        let new_committed = inner
-            .committed_file_pages
-            .checked_add(add)
-            .ok_or(MetaDbError::OutOfSpace)?;
-        self.file.set_len(
-            new_committed
-                .checked_mul(PAGE_SIZE as u64)
-                .ok_or(MetaDbError::OutOfSpace)?,
-        )?;
-        inner.committed_file_pages = new_committed;
-        Ok(())
     }
 }

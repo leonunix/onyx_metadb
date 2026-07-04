@@ -12,40 +12,12 @@ impl PageStore {
     /// the same handle is fine; calling with different handles is a
     /// no-op after the first.
     pub fn attach_metrics(&self, metrics: Arc<MetaMetrics>) {
-        for submitter in self.io_submitters.iter() {
-            submitter.attach_metrics(Arc::clone(&metrics));
-        }
+        self.device.attach_metrics(Arc::clone(&metrics));
         let _ = self.metrics.set(metrics);
     }
 
     pub(super) fn metrics(&self) -> Option<&Arc<MetaMetrics>> {
         self.metrics.get()
-    }
-
-    /// Pick an `IoSubmitter` for a write of `pid`. Returns `None` when
-    /// io_uring is unavailable (callers fall back to pwrite).
-    ///
-    /// Legacy hash routing kept for callers that have no natural lane
-    /// class (recovery, verifier tooling, single-writer test
-    /// fixtures). Production hot writers should go through
-    /// [`Self::io_submitter_for_class`] so they pin to their own
-    /// submitter and cannot saturate the SQ of a sibling lane.
-    pub(super) fn io_submitter_for(&self, pid: PageId) -> Option<&IoSubmitter> {
-        if self.io_submitters.is_empty() {
-            None
-        } else {
-            let idx = (pid as usize) % self.io_submitters.len();
-            Some(&self.io_submitters[idx])
-        }
-    }
-
-    /// Pick the [`IoSubmitter`] reserved for `class`. Returns `None`
-    /// when io_uring is unavailable, or when the pool is smaller than
-    /// expected (pre-upgrade installs / test fixtures that build
-    /// `PageStore` with a forced pool size). In both fallbacks the
-    /// caller drops to `pwrite`, preserving the on-disk contract.
-    pub(super) fn io_submitter_for_class(&self, class: IoLaneClass) -> Option<&IoSubmitter> {
-        self.io_submitters.get(class.index())
     }
 
     /// Shared epoch coordinator. Lock-free L2P readers `pin()` here
