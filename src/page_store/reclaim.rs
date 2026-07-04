@@ -229,8 +229,11 @@ impl PageStore {
         // submitters, or pwrite fallback). The old serial
         // `write_page_run_bytes` loop was the dominant cost (39 s
         // `flush_reclaim_max_us` on nvme-box) when the backlog exceeded
-        // ~1M pages.
-        self.write_sealed_page_runs_for_class_and_priority(
+        // ~1M pages. Route straight to the device (not the metric-recording
+        // PageStore wrapper) so these background Free-stamps don't pollute the
+        // foreground `meta_io_write` latency/batch gauges — matching the
+        // pre-refactor io_uring reclaim path, which recorded nothing.
+        self.device.write_sealed_page_runs(
             sealed,
             IoLaneClass::L2p,
             crate::io_submitter::IoPriority::Sync,
