@@ -42,8 +42,9 @@ use crate::page::Page;
 use crate::types::{FIRST_DATA_PAGE, PageId};
 
 use super::raw_io::{
-    MAX_SEALED_WRITE_RUN_PAGES, coalesce_sealed_runs, new_read_uring, new_write_uring, punch_hole,
-    read_page_raw, read_pages_raw, write_page_runs_raw, write_sealed_pages_raw,
+    MAX_SEALED_WRITE_RUN_PAGES, coalesce_sealed_runs, fallocate_extend, new_read_uring,
+    new_write_uring, punch_hole, read_page_raw, read_pages_raw, write_page_runs_raw,
+    write_sealed_pages_raw,
 };
 use super::read_pool::PageReadPool;
 use super::submitter::{DEFAULT_IO_SUBMITTER_POOL_SIZE, IoLaneClass, make_io_submitters};
@@ -412,11 +413,15 @@ impl PageDevice for FileDevice {
             .checked_mul(chunk)
             .ok_or(MetaDbError::OutOfSpace)?;
         let new_committed = committed.checked_add(add).ok_or(MetaDbError::OutOfSpace)?;
-        self.file.set_len(
-            new_committed
-                .checked_mul(PAGE_SIZE as u64)
-                .ok_or(MetaDbError::OutOfSpace)?,
-        )?;
+        let from_bytes = committed
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(MetaDbError::OutOfSpace)?;
+        let to_bytes = new_committed
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(MetaDbError::OutOfSpace)?;
+        // Reserve real blocks for the new tail so a later page write into it
+        // cannot ENOSPC; the failure (if any) surfaces here, before content.
+        fallocate_extend(&self.file, from_bytes, to_bytes)?;
         *committed = new_committed;
         Ok(())
     }
@@ -452,4 +457,138 @@ impl PageDevice for FileDevice {
             submitter.attach_metrics(Arc::clone(&metrics));
         }
     }
+}
+
+/// Fixed-capacity in-memory [`PageDevice`]. Models the semantics of a block
+/// window (no file EOF, no hole-punch, capacity is a hard wall) so the device
+/// path — bounded-scan open, [`MetaDbError::CapacityExhausted`] on overflow —
+/// can be exercised without a real chunklet LogicalDisk. Also a genuine
+/// zero-dependency backing for embedded / test use.
+pub struct MemDevice {
+    bytes: Mutex<Vec<u8>>,
+    capacity_pages: u64,
+}
+
+impl MemDevice {
+    /// A device with `capacity_pages` of zeroed 4 KiB pages.
+    pub fn new(capacity_pages: u64) -> Self {
+        let len = (capacity_pages as usize).saturating_mul(PAGE_SIZE);
+        Self {
+            bytes: Mutex::new(vec![0u8; len]),
+            capacity_pages,
+        }
+    }
+
+    fn read_page_bytes(&self, page_id: PageId) -> Result<Page> {
+        let off = (page_id as usize)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(MetaDbError::PageOutOfRange(page_id))?;
+        let bytes = self.bytes.lock();
+        let end = off
+            .checked_add(PAGE_SIZE)
+            .ok_or(MetaDbError::PageOutOfRange(page_id))?;
+        if end > bytes.len() {
+            return Err(MetaDbError::PageOutOfRange(page_id));
+        }
+        let mut page = Page::zeroed();
+        page.bytes_mut().copy_from_slice(&bytes[off..end]);
+        Ok(page)
+    }
+
+    fn write_page_bytes(&self, page_id: PageId, src: &[u8]) -> Result<()> {
+        let off = (page_id as usize)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(MetaDbError::PageOutOfRange(page_id))?;
+        let mut bytes = self.bytes.lock();
+        let end = off
+            .checked_add(src.len())
+            .ok_or(MetaDbError::PageOutOfRange(page_id))?;
+        if end > bytes.len() {
+            return Err(MetaDbError::PageOutOfRange(page_id));
+        }
+        bytes[off..end].copy_from_slice(src);
+        Ok(())
+    }
+}
+
+impl PageDevice for MemDevice {
+    fn read_page(&self, page_id: PageId) -> Result<Page> {
+        let page = self.read_page_bytes(page_id)?;
+        page.verify(page_id)?;
+        Ok(page)
+    }
+
+    fn read_pages(&self, page_ids: &[PageId]) -> Result<Vec<Page>> {
+        page_ids.iter().map(|&pid| self.read_page_bytes(pid)).collect()
+    }
+
+    fn read_page_unchecked(&self, page_id: PageId) -> Result<Page> {
+        self.read_page_bytes(page_id)
+    }
+
+    fn write_page(&self, page_id: PageId, page: &Page, _class: IoLaneClass) -> Result<()> {
+        self.write_page_bytes(page_id, page.bytes())
+    }
+
+    fn write_page_run_bytes(&self, start_page: PageId, bytes: &[u8]) -> Result<()> {
+        self.write_page_bytes(start_page, bytes)
+    }
+
+    fn write_page_runs_parallel(&self, runs: Vec<(PageId, Vec<u8>)>) -> Result<()> {
+        for (start, bytes) in runs {
+            self.write_page_bytes(start, &bytes)?;
+        }
+        Ok(())
+    }
+
+    fn write_sealed_page_runs(
+        &self,
+        pages: Vec<(PageId, Arc<Page>)>,
+        _class: IoLaneClass,
+        _priority: IoPriority,
+    ) -> Result<()> {
+        for (pid, page) in pages {
+            self.write_page_bytes(pid, page.bytes())?;
+        }
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn len_pages(&self) -> Result<u64> {
+        Ok(self.capacity_pages)
+    }
+
+    fn ensure_covers(&self, target_pages: u64) -> Result<()> {
+        if target_pages > self.capacity_pages {
+            return Err(MetaDbError::CapacityExhausted {
+                requested_pages: target_pages,
+                capacity_pages: self.capacity_pages,
+            });
+        }
+        Ok(())
+    }
+
+    fn truncate_to(&self, _pages: u64) -> Result<()> {
+        // Fixed capacity: shrink is a pure-bookkeeping no-op (the page store
+        // lowers its own high-water mark).
+        Ok(())
+    }
+
+    fn punch_run(&self, _start_page: PageId, _count: usize) -> Result<()> {
+        // No hole-punch on a fixed device; the Free-stamp is the reuse marker.
+        Ok(())
+    }
+
+    fn capacity_pages(&self) -> Option<u64> {
+        Some(self.capacity_pages)
+    }
+
+    fn attach_metrics(&self, _metrics: Arc<MetaMetrics>) {}
 }

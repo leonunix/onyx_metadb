@@ -665,3 +665,95 @@ fn reclaim_handles_multi_run_batch_via_io_submitter() {
     got.sort();
     assert_eq!(got, to_free.to_vec());
 }
+
+// ---- fixed-capacity device path (MemDevice) --------------------------------
+
+/// A fixed-capacity device returns `CapacityExhausted` (not a panic, not a
+/// generic IO error) once allocation would cross `capacity_pages`, so the
+/// caller can abort the in-flight checkpoint cleanly.
+#[test]
+fn mem_device_capacity_exhaustion_is_clean() {
+    // capacity 6 pages: 2 reserved for the manifest slots, 4 allocatable.
+    let device: Arc<dyn PageDevice> = Arc::new(MemDevice::new(6));
+    let ps = PageStore::create_on_device(device).unwrap();
+    for _ in 0..4 {
+        ps.allocate().expect("first 4 allocations fit");
+    }
+    match ps.allocate() {
+        Err(MetaDbError::CapacityExhausted {
+            requested_pages,
+            capacity_pages,
+        }) => {
+            assert_eq!(requested_pages, 7);
+            assert_eq!(capacity_pages, 6);
+        }
+        other => panic!("expected CapacityExhausted past capacity, got {other:?}"),
+    }
+    // The store's high-water did not advance past the failed allocation.
+    assert_eq!(ps.high_water(), 6);
+}
+
+/// Bounded-scan open over a device rebuilds the free list from `Free`-stamped
+/// interior pages, exactly like the file open scan but bounded by
+/// `page_high_water` instead of EOF.
+#[test]
+fn mem_device_bounded_scan_recovers_free_list() {
+    let device: Arc<dyn PageDevice> = Arc::new(MemDevice::new(64));
+    let ps = PageStore::create_on_device(device.clone()).unwrap();
+    let mut all = Vec::new();
+    for _ in 0..10 {
+        all.push(ps.allocate().unwrap());
+    }
+    for pid in &all {
+        ps.write_page(*pid, &mk_page(5, 0xcd)).unwrap();
+    }
+    // Free three interior pages (never the tail) so the frontier stays put.
+    let to_free = [all[1], all[3], all[5]];
+    for pid in to_free {
+        ps.free(pid, 42).unwrap();
+    }
+    ps.try_reclaim().unwrap();
+    let frontier = ps.high_water();
+    drop(ps);
+
+    // Reopen over the SAME device and rebuild the free list bounded by the
+    // frontier — the three Free pages must reappear.
+    let ps2 = PageStore::open_on_device(device).unwrap();
+    ps2.rebuild_free_list_bounded(frontier).unwrap();
+    assert_eq!(ps2.high_water(), frontier);
+    assert_eq!(ps2.free_list_len(), 3);
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        got.push(ps2.allocate().unwrap());
+    }
+    got.sort();
+    assert_eq!(got, to_free.to_vec());
+}
+
+/// The bounded scan must never touch a prior tenant's garbage sitting above
+/// `page_high_water`: a device is not zeroed on (re)allocation, so stale
+/// but structurally-valid pages can live past the frontier.
+#[test]
+fn mem_device_bounded_scan_ignores_garbage_above_frontier() {
+    let device: Arc<dyn PageDevice> = Arc::new(MemDevice::new(64));
+    let ps = PageStore::create_on_device(device.clone()).unwrap();
+    for _ in 0..5 {
+        let pid = ps.allocate().unwrap();
+        ps.write_page(pid, &mk_page(9, 0x11)).unwrap();
+    }
+    let frontier = ps.high_water(); // == 7 (FIRST_DATA_PAGE + 5)
+    // Plant a structurally-valid but out-of-frontier page (a prior tenant's
+    // leftover) at pid 20, far above the frontier.
+    let garbage = mk_page(999, 0xff);
+    device.write_page_run_bytes(20, garbage.bytes()).unwrap();
+    drop(ps);
+
+    let ps2 = PageStore::open_on_device(device).unwrap();
+    ps2.rebuild_free_list_bounded(frontier).unwrap();
+    // The scan stopped at the frontier: garbage at pid 20 is invisible, the
+    // frontier is unchanged, and the next allocation resumes at the frontier
+    // (NOT at 21).
+    assert_eq!(ps2.high_water(), frontier);
+    assert_eq!(ps2.free_list_len(), 0);
+    assert_eq!(ps2.allocate().unwrap(), frontier);
+}

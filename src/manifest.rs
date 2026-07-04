@@ -174,7 +174,28 @@ use crate::types::{
 /// [`crate::manifest::store::ManifestStore::commit`]). Old v22-and-earlier
 /// manifests are hard-rejected on open — no on-disk migration (fresh rebuild;
 /// onyx rebuilds metadb on schema change).
-pub const MANIFEST_BODY_VERSION: u32 = 23;
+///
+/// v24 (fixed-capacity device support, Phase 3): appends two u64 fields to the
+/// fixed header after the catalog anchors — `page_high_water` (offset 92) and
+/// `journal_ring_head` (offset 100). `OFF_VARIABLE_START` shifts 92 → 108.
+///
+/// - `page_high_water`: an upper bound on every page id this manifest's roots
+///   reach, sampled at commit time after all page allocations. On a
+///   fixed-capacity (chunklet) device — which has no file length to trust and
+///   no filesystem hole-punch to reclaim leaked pages — the open path rebuilds
+///   the free list by a **bounded** scan `[FIRST_DATA_PAGE, page_high_water)`
+///   instead of trusting EOF, closing the "forced open_fast leaks freed pages
+///   until the region fills" hole. Harmless on the file path (the file open
+///   still scans to EOF).
+///
+/// - `journal_ring_head`: the prune boundary of the lifecycle-journal ring on
+///   a device-backed journal (Phase 3c). Reserved here (bumped in the same
+///   version) so the journal-ring work needs no second manifest bump; `0` on a
+///   file-backed journal.
+///
+/// Old v23-and-earlier manifests are hard-rejected on open — no on-disk
+/// migration (fresh rebuild; onyx rebuilds metadb on schema change).
+pub const MANIFEST_BODY_VERSION: u32 = 24;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -221,7 +242,12 @@ const OFF_LIFECYCLE_REPLAY_SEQ: usize = 68;
 // snapshots — now starts at 92.
 const OFF_VOLUME_CATALOG_HEAD: usize = 76;
 const OFF_SNAPSHOT_CATALOG_HEAD: usize = 84;
-const OFF_VARIABLE_START: usize = 92;
+// v24 appends two u64 fields to the fixed header (see `MANIFEST_BODY_VERSION`):
+//   offset 92:  `page_high_water`    (bounded-scan upper bound on device open)
+//   offset 100: `journal_ring_head`  (lifecycle-journal ring prune boundary; v3c)
+const OFF_PAGE_HIGH_WATER: usize = 92;
+const OFF_JOURNAL_RING_HEAD: usize = 100;
+const OFF_VARIABLE_START: usize = 108;
 
 /// Per-snapshot row size on disk. v6 packs: id(8) + vol_ord(2) + 6 pad +
 /// l2p_roots_page(8) + created_lsn(8). v18 (BFG) appends
@@ -248,7 +274,9 @@ const _: () = {
     assert!(OFF_LAST_PROCESSED_BUFFER_SEQ + 8 == OFF_LIFECYCLE_REPLAY_SEQ);
     assert!(OFF_LIFECYCLE_REPLAY_SEQ + 8 == OFF_VOLUME_CATALOG_HEAD);
     assert!(OFF_VOLUME_CATALOG_HEAD + 8 == OFF_SNAPSHOT_CATALOG_HEAD);
-    assert!(OFF_SNAPSHOT_CATALOG_HEAD + 8 == OFF_VARIABLE_START);
+    assert!(OFF_SNAPSHOT_CATALOG_HEAD + 8 == OFF_PAGE_HIGH_WATER);
+    assert!(OFF_PAGE_HIGH_WATER + 8 == OFF_JOURNAL_RING_HEAD);
+    assert!(OFF_JOURNAL_RING_HEAD + 8 == OFF_VARIABLE_START);
     assert!(SNAPSHOT_ENTRY_SIZE == 48);
     assert!(OFF_SNAP_PAGE_DEADLIST_TAIL + 8 == OFF_SNAP_CAPTURE_WATERMARK);
     assert!(OFF_SNAP_CAPTURE_WATERMARK + 8 == SNAPSHOT_ENTRY_SIZE);
@@ -422,6 +450,17 @@ pub struct Manifest {
     /// [`volume_catalog_head_pid`](Self::volume_catalog_head_pid) for
     /// [`snapshots`](Self::snapshots).
     pub snapshot_catalog_head_pid: PageId,
+    /// v24: an upper bound on every page id this manifest's roots reach,
+    /// sampled at commit time after all page allocations. On a fixed-capacity
+    /// device the open path rebuilds the free list by a bounded scan
+    /// `[FIRST_DATA_PAGE, page_high_water)` instead of trusting file EOF (which
+    /// doesn't exist on a raw block window). `0` in a never-committed
+    /// [`Manifest::empty`]; the file path also carries it but doesn't depend on
+    /// it (the file open scans to EOF).
+    pub page_high_water: u64,
+    /// v24: prune boundary (ring head block) of a device-backed
+    /// lifecycle-journal ring (Phase 3c). `0` on a file-backed journal.
+    pub journal_ring_head: u64,
     /// Head of the persisted free-list page chain, or [`NULL_PAGE`].
     pub free_list_head: PageId,
     /// Current per-shard PBA-refcount B+tree roots. Refcount is a global
@@ -474,6 +513,8 @@ impl Manifest {
             lifecycle_replay_seq: 0,
             volume_catalog_head_pid: NULL_PAGE,
             snapshot_catalog_head_pid: NULL_PAGE,
+            page_high_water: 0,
+            journal_ring_head: 0,
             free_list_head: NULL_PAGE,
             refcount_shard_roots: Vec::new().into_boxed_slice(),
             refcount_durable_seq: Vec::new().into_boxed_slice(),
@@ -680,6 +721,11 @@ impl Manifest {
             .copy_from_slice(&vol_head.to_le_bytes());
         p[OFF_SNAPSHOT_CATALOG_HEAD..OFF_SNAPSHOT_CATALOG_HEAD + 8]
             .copy_from_slice(&snap_head.to_le_bytes());
+        // v24: bounded-scan upper bound + device journal-ring prune boundary.
+        p[OFF_PAGE_HIGH_WATER..OFF_PAGE_HIGH_WATER + 8]
+            .copy_from_slice(&self.page_high_water.to_le_bytes());
+        p[OFF_JOURNAL_RING_HEAD..OFF_JOURNAL_RING_HEAD + 8]
+            .copy_from_slice(&self.journal_ring_head.to_le_bytes());
 
         let mut off = OFF_VARIABLE_START;
         for root in self.refcount_shard_roots.iter().copied() {
@@ -764,18 +810,17 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            23 => Self::decode_v23(page, page_store),
+            24 => Self::decode_v24(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v23 (volume \
-                 catalog + snapshot table chained out-of-line) is readable — \
-                 older databases (v22-and-earlier inlined both tables in the \
-                 single manifest page) must be rebuilt"
+                "unsupported manifest body version {other}; only v24 (v23 \
+                 out-of-line catalog + v24 page_high_water / journal_ring_head) \
+                 is readable — older databases must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v23(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 23)
+    fn decode_v24(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 24)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {
@@ -872,6 +917,17 @@ impl Manifest {
                 .try_into()
                 .unwrap(),
         );
+        // v24 fixed-header additions.
+        let page_high_water = u64::from_le_bytes(
+            p[OFF_PAGE_HIGH_WATER..OFF_PAGE_HIGH_WATER + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let journal_ring_head = u64::from_le_bytes(
+            p[OFF_JOURNAL_RING_HEAD..OFF_JOURNAL_RING_HEAD + 8]
+                .try_into()
+                .unwrap(),
+        );
         let volume_bytes =
             catalog::read_catalog_chain(page_store, volume_catalog_head_pid, CatalogKind::Volumes)?;
         let volumes = decode_volume_catalog_bytes(&volume_bytes, volume_count, version)?;
@@ -890,6 +946,8 @@ impl Manifest {
             lifecycle_replay_seq,
             volume_catalog_head_pid,
             snapshot_catalog_head_pid,
+            page_high_water,
+            journal_ring_head,
             free_list_head,
             refcount_shard_roots,
             refcount_durable_seq,

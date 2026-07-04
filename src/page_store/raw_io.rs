@@ -715,3 +715,52 @@ pub(super) fn punch_hole(file: &File, offset: u64, len: u64) -> Result<()> {
 pub(super) fn punch_hole(_file: &File, _offset: u64, _len: u64) -> Result<()> {
     Ok(())
 }
+
+/// Grow the backing file to `to_bytes`, **reserving real blocks** for the new
+/// tail `[from_bytes, to_bytes)` rather than leaving a sparse hole.
+///
+/// This is the ENOSPC-atomic fix: `fallocate(mode=0)` allocates the blocks
+/// (and extends the file length) up front, so a subsequent page write into
+/// the reserved region can never ENOSPC. When the filesystem runs out of
+/// space the failure surfaces **here**, before any page content is written,
+/// so the manifest never comes to reference a page whose bytes the kernel
+/// silently dropped (the durable-corruption class fixed in Phase 3).
+///
+/// Filesystems without `fallocate` (tmpfs, some overlay configs) return
+/// `EOPNOTSUPP` / `ENOSYS` / `EINVAL`; there we fall back to `set_len`, which
+/// keeps the old sparse-growth behaviour (no worse than before this change).
+#[cfg(target_os = "linux")]
+pub(super) fn fallocate_extend(file: &File, from_bytes: u64, to_bytes: u64) -> Result<()> {
+    if to_bytes <= from_bytes {
+        return Ok(());
+    }
+    let len = to_bytes - from_bytes;
+    let rc = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            0, // mode 0: allocate real blocks and extend the file size
+            from_bytes as libc::off_t,
+            len as libc::off_t,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL) => {
+            file.set_len(to_bytes)?;
+            Ok(())
+        }
+        _ => Err(err.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn fallocate_extend(file: &File, from_bytes: u64, to_bytes: u64) -> Result<()> {
+    if to_bytes <= from_bytes {
+        return Ok(());
+    }
+    file.set_len(to_bytes)?;
+    Ok(())
+}

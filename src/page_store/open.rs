@@ -119,6 +119,57 @@ impl PageStore {
         ))
     }
 
+    /// Create a fresh page store over an already-constructed [`PageDevice`]
+    /// (the fixed-capacity device path — onyx over a chunklet LogicalDisk).
+    /// The device must cover at least the reserved manifest region.
+    pub fn create_on_device(device: Arc<dyn PageDevice>) -> Result<Self> {
+        device.ensure_covers(FIRST_DATA_PAGE)?;
+        Ok(Self::from_parts(
+            PathBuf::from("<device>"),
+            device,
+            FIRST_DATA_PAGE,
+            Vec::new(),
+        ))
+    }
+
+    /// Open a page store over an existing [`PageDevice`] **without** scanning:
+    /// the high-water mark is set to the device capacity so the manifest and
+    /// its catalog chains (which live anywhere below capacity) are addressable.
+    /// The caller must load the manifest and then call
+    /// [`rebuild_free_list_bounded`](Self::rebuild_free_list_bounded) with the
+    /// manifest's `page_high_water` to recover the true frontier + free list.
+    pub fn open_on_device(device: Arc<dyn PageDevice>) -> Result<Self> {
+        let capacity = device.len_pages()?.max(FIRST_DATA_PAGE);
+        Ok(Self::from_parts(
+            PathBuf::from("<device>"),
+            device,
+            capacity,
+            Vec::new(),
+        ))
+    }
+
+    /// Rebuild the free list + high-water mark by a **bounded** scan of
+    /// `[FIRST_DATA_PAGE, page_high_water)`. This is the device-path
+    /// counterpart of the file open scan: a fixed device has no EOF to bound
+    /// the walk and no hole-punch to reclaim leaked pages, so the manifest's
+    /// `page_high_water` (a strict upper bound on every reachable page) bounds
+    /// the scan and recovers freed pages that a trust-capacity open would have
+    /// leaked. Garbage from a prior tenant above the frontier is never touched.
+    pub fn rebuild_free_list_bounded(&self, page_high_water: u64) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let capacity = self.device.len_pages()?;
+        let scan_to = page_high_water.min(capacity);
+        let (high_water, free_list) =
+            scan_free_list(self.device.as_ref(), FIRST_DATA_PAGE, scan_to)?;
+        let free_list_len = free_list.len();
+        let mut inner = self.inner.lock();
+        inner.high_water = high_water;
+        inner.free_list = free_list;
+        self.high_water_pages.store(high_water, Ordering::Relaxed);
+        self.free_list_pages.store(free_list_len, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Open an existing page store. `grow_chunk` is the batch size used
     /// for subsequent file extensions (does not affect the scan). The
     /// scan rebuilds the in-memory free list by walking pages from

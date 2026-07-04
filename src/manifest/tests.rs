@@ -50,6 +50,10 @@ fn roundtrip(dir: &TempDir, ps: Arc<PageStore>, m: Manifest) -> Manifest {
 fn without_catalog_heads(mut m: Manifest) -> Manifest {
     m.volume_catalog_head_pid = NULL_PAGE;
     m.snapshot_catalog_head_pid = NULL_PAGE;
+    // v24 `page_high_water` is a commit-derived upper bound (sampled from the
+    // page store's high-water at commit time), not part of the logical manifest
+    // identity — normalise it out of round-trip equality checks.
+    m.page_high_water = 0;
     m
 }
 
@@ -135,6 +139,8 @@ fn commit_then_reopen_recovers_manifest() {
         lifecycle_replay_seq: 0,
         volume_catalog_head_pid: NULL_PAGE,
         snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
         free_list_head: 99,
         refcount_shard_roots: bx(&[17, 18, 19, 20]),
         refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
@@ -304,6 +310,8 @@ fn encode_decode_round_trip_with_refcount_and_dedup() {
         lifecycle_replay_seq: 0,
         volume_catalog_head_pid: NULL_PAGE,
         snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
         free_list_head: 1234,
         refcount_shard_roots: bx(&[142, 143, 144, 145]),
         refcount_durable_seq: bx(&[
@@ -399,6 +407,8 @@ fn v6_volumes_table_round_trip() {
         lifecycle_replay_seq: 0,
         volume_catalog_head_pid: NULL_PAGE,
         snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[50, 51]),
         refcount_durable_seq: bx(&[10, 10]),
@@ -470,6 +480,8 @@ fn dedup_n4_encode_decode_round_trip() {
         lifecycle_replay_seq: 0,
         volume_catalog_head_pid: NULL_PAGE,
         snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
         refcount_durable_seq: bx(&[100, 100]),
@@ -748,6 +760,8 @@ fn v11_per_shard_durable_seq_round_trip() {
         lifecycle_replay_seq: 0,
         volume_catalog_head_pid: NULL_PAGE,
         snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 11, 12, 13]),
         refcount_durable_seq: bx(&[5, 7, 6, 9]),
@@ -800,6 +814,8 @@ fn encode_rejects_durable_seq_drift_from_checkpoint_lsn() {
         lifecycle_replay_seq: 0,
         volume_catalog_head_pid: NULL_PAGE,
         snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
         // Intentionally lower than checkpoint_lsn — drift the
@@ -838,6 +854,8 @@ fn encode_rejects_refcount_durable_seq_length_mismatch() {
         lifecycle_replay_seq: 0,
         volume_catalog_head_pid: NULL_PAGE,
         snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2, 3]),
         refcount_durable_seq: bx(&[0, 0]), // wrong length
@@ -933,6 +951,8 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
         lifecycle_replay_seq: 0,
         volume_catalog_head_pid: NULL_PAGE,
         snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2, 3]),
         refcount_durable_seq: bx(&[]),
@@ -1065,8 +1085,8 @@ fn v13_manifest_is_rejected_after_flag_day_to_v14() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v22"),
-                "expected v13-rejection message mentioning v22, got: {msg}"
+                msg.contains("unsupported manifest body version") && msg.contains("v23"),
+                "expected v13-rejection message mentioning v23, got: {msg}"
             );
         }
         e => panic!("expected Corruption from v13 manifest, got {e}"),
@@ -1089,8 +1109,8 @@ fn v14_manifest_is_rejected_after_flag_day_to_v15() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v22"),
-                "expected v14-rejection message mentioning v22, got: {msg}"
+                msg.contains("unsupported manifest body version") && msg.contains("v23"),
+                "expected v14-rejection message mentioning v23, got: {msg}"
             );
         }
         e => panic!("expected Corruption from v14 manifest, got {e}"),
@@ -1111,6 +1131,8 @@ fn v15_round_trip_carries_checkpoint_bfg() {
         lifecycle_replay_seq: 0,
         volume_catalog_head_pid: NULL_PAGE,
         snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 20, 30, 40]),
         refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
@@ -1140,6 +1162,8 @@ fn v15_checkpoint_bfg_zero_round_trips() {
         lifecycle_replay_seq: 0,
         volume_catalog_head_pid: NULL_PAGE,
         snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[NULL_PAGE; 4]),
         refcount_durable_seq: bx(&[0; 4]),
@@ -1172,8 +1196,8 @@ fn v21_manifest_is_rejected_after_flag_day_to_v22() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v22"),
-                "expected v21-rejection message mentioning v22, got: {msg}"
+                msg.contains("unsupported manifest body version") && msg.contains("v23"),
+                "expected v21-rejection message mentioning v23, got: {msg}"
             );
         }
         e => panic!("expected Corruption from v21 manifest, got {e}"),

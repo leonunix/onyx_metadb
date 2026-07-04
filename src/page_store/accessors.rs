@@ -45,6 +45,12 @@ impl PageStore {
         self.free_list_pages.load(Ordering::Relaxed)
     }
 
+    /// Fixed capacity in pages for a device-backed store (`Some`), or `None`
+    /// for a growable file. Feeds the meta-region water-level status.
+    pub fn capacity_pages(&self) -> Option<u64> {
+        self.device.capacity_pages()
+    }
+
     pub(super) fn check_in_range(&self, page_id: PageId) -> Result<()> {
         let inner = self.inner.lock();
         if page_id >= inner.high_water {

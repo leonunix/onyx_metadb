@@ -284,6 +284,12 @@ impl ManifestStore {
         // 3. Manifest slot, pointing at the chain heads.
         manifest.volume_catalog_head_pid = vol_chain[0];
         manifest.snapshot_catalog_head_pid = snap_chain[0];
+        // v24: sample the page high-water AFTER every allocation this commit
+        // made (checkpoint roots + the catalog chains just built above), so it
+        // is a strict upper bound on every page id these roots reach. On a
+        // fixed-capacity device the next open bounded-scans `[FIRST_DATA_PAGE,
+        // page_high_water)` to rebuild the free list. Harmless on the file path.
+        manifest.page_high_water = self.page_store.high_water();
         let mut page = Page::new(PageHeader::new(PageType::Manifest, new_sequence));
         manifest.encode(&mut page, vol_chain[0], snap_chain[0])?;
         page.seal();

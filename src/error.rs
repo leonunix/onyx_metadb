@@ -44,6 +44,18 @@ pub enum MetaDbError {
     #[error("page store out of space")]
     OutOfSpace,
 
+    /// A fixed-capacity backing device cannot satisfy a page allocation:
+    /// the request would cross `capacity_pages`. Distinct from
+    /// [`OutOfSpace`](Self::OutOfSpace) (address-space exhaustion) — this
+    /// is a physical capacity wall on a device-backed page store, and it
+    /// must abort the in-flight checkpoint cleanly (roll back, leave the
+    /// prior manifest generation intact) rather than corrupt.
+    #[error("meta device capacity exhausted: need {requested_pages} pages, capacity {capacity_pages}")]
+    CapacityExhausted {
+        requested_pages: u64,
+        capacity_pages: u64,
+    },
+
     /// Invalid or inconsistent argument passed to the API.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
