@@ -149,16 +149,27 @@ impl PageStore {
     }
 
     /// Rebuild the free list + high-water mark by a **bounded** scan of
-    /// `[FIRST_DATA_PAGE, page_high_water)`. This is the device-path
-    /// counterpart of the file open scan: a fixed device has no EOF to bound
-    /// the walk and no hole-punch to reclaim leaked pages, so the manifest's
-    /// `page_high_water` (a strict upper bound on every reachable page) bounds
-    /// the scan and recovers freed pages that a trust-capacity open would have
+    /// `[FIRST_DATA_PAGE, frontier)`. This is the device-path counterpart of
+    /// the file open scan: a fixed device has no EOF to bound the walk and no
+    /// hole-punch to reclaim leaked pages, so a recovered upper bound bounds the
+    /// scan and recovers freed pages that a trust-capacity open would have
     /// leaked. Garbage from a prior tenant above the frontier is never touched.
-    pub fn rebuild_free_list_bounded(&self, page_high_water: u64) -> Result<()> {
+    ///
+    /// ⚠ **Caller contract:** `frontier` must be a strict upper bound on every
+    /// page id ANY live durable structure references — NOT merely
+    /// `manifest.page_high_water`. Every root recorded per-manifest-generation
+    /// (refcount / L2P / catalog / deadlists) is already `< page_high_water` by
+    /// construction, BUT the cuckoo dedup meta chain is generation-stable +
+    /// mutated in place, so on a crash-to-older-generation it can reference
+    /// pages a newer flush made durable above `page_high_water`. The device
+    /// open MUST pass `max(manifest.page_high_water,
+    /// dedup_index.max_referenced_page_id() + 1)` or the allocator will
+    /// double-allocate a page the live dedup index still points at (the file
+    /// path is immune because EOF covers those pages).
+    pub fn rebuild_free_list_bounded(&self, frontier: u64) -> Result<()> {
         use std::sync::atomic::Ordering;
         let capacity = self.device.len_pages()?;
-        let scan_to = page_high_water.min(capacity);
+        let scan_to = frontier.min(capacity);
         let (high_water, free_list) =
             scan_free_list(self.device.as_ref(), FIRST_DATA_PAGE, scan_to)?;
         let free_list_len = free_list.len();

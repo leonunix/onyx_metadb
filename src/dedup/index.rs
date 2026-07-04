@@ -651,6 +651,15 @@ impl DedupIndex {
         self.cuckoo.data_page_ids()
     }
 
+    /// Highest page id the dedup index physically references (meta chain + data
+    /// pages). The device-path open MUST fold this into the bounded-scan
+    /// ceiling — the cuckoo meta chain is generation-stable + in-place, so it
+    /// can recover ahead of an older manifest's `page_high_water`. See
+    /// [`crate::dedup::cuckoo::CuckooHash::max_referenced_page_id`].
+    pub fn max_referenced_page_id(&self) -> PageId {
+        self.cuckoo.max_referenced_page_id()
+    }
+
     /// Approximate live entry count. Tracks the cuckoo's running
     /// counter; for an exact figure call [`recount`].
     pub fn approx_len(&self) -> u64 {

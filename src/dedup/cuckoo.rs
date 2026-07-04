@@ -504,6 +504,32 @@ impl CuckooHash {
             .collect()
     }
 
+    /// Highest page id this index physically references — the max over the
+    /// meta chain pages and the data page table.
+    ///
+    /// This exists for the **device-path bounded-scan ceiling**. Unlike every
+    /// other durable structure (which is COW'd + recorded per manifest
+    /// generation), the cuckoo meta chain is anchored by a generation-stable
+    /// head pid and rewritten IN PLACE. A crash that recovers an OLDER manifest
+    /// generation can therefore observe an in-place meta chain (and the data
+    /// pages it references) that a newer flush already made durable ABOVE that
+    /// manifest's `page_high_water`. On a file store EOF covers those pages; on
+    /// a fixed device the bounded scan must lift its ceiling to
+    /// `max(page_high_water, max_referenced_page_id + 1)` or the allocator
+    /// double-allocates a page the live dedup index still points at.
+    pub fn max_referenced_page_id(&self) -> PageId {
+        let inner = self.inner.lock();
+        let chain_max = inner.meta_chain.iter().copied().max().unwrap_or(0);
+        let data_max = inner
+            .page_table
+            .iter()
+            .copied()
+            .filter(|&pid| pid != 0)
+            .max()
+            .unwrap_or(0);
+        chain_max.max(data_max).max(self.meta_page_id)
+    }
+
     // ---- private ---------------------------------------------------
 
     fn flush_meta_locked(&self, inner: &mut parking_lot::MutexGuard<'_, Inner>) -> Result<()> {
