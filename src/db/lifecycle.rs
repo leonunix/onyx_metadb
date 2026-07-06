@@ -985,6 +985,17 @@ impl Db {
         self.page_store.high_water()
     }
 
+    /// Widen the page-window ceiling online after the host extended the meta LD
+    /// (`extend_ld`). `new_window_bytes` is the new page-window size in bytes
+    /// (onyx recomputes it from the grown LD capacity + OMET layout). Lifts the
+    /// `CapacityExhausted` ceiling so commits that were stalling on a full
+    /// device resume. On the file backend / a device that cannot grow in place
+    /// this errors (`PageDevice::grow_capacity_pages`).
+    pub fn grow_device_capacity(&self, new_window_bytes: u64) -> Result<()> {
+        let new_pages = new_window_bytes / crate::config::PAGE_SIZE as u64;
+        self.page_store.grow_device_capacity(new_pages)
+    }
+
     /// Number of reclaimed pages currently available for reuse.
     pub fn free_list_len(&self) -> usize {
         self.page_store.free_list_len()

@@ -51,6 +51,15 @@ impl PageStore {
         self.device.capacity_pages()
     }
 
+    /// Widen the fixed device ceiling online to `new_pages` after the host
+    /// extended the backing store (meta LD `extend_ld`). Errors on a device
+    /// that cannot grow in place (see [`PageDevice::grow_capacity_pages`]). The
+    /// in-memory `high_water` is unaffected — this only lifts the ceiling that
+    /// `ensure_covers` enforces, so stalled allocations resume.
+    pub fn grow_device_capacity(&self, new_pages: u64) -> Result<()> {
+        self.device.grow_capacity_pages(new_pages)
+    }
+
     pub(super) fn check_in_range(&self, page_id: PageId) -> Result<()> {
         let inner = self.inner.lock();
         if page_id >= inner.high_water {

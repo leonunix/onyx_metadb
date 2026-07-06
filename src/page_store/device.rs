@@ -27,6 +27,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -119,6 +120,16 @@ pub trait PageDevice: Send + Sync {
 
     /// `Some(n)` for a fixed-capacity device, `None` for a growable file.
     fn capacity_pages(&self) -> Option<u64>;
+
+    /// Widen a fixed-capacity device's ceiling to `new_pages` after the host has
+    /// extended the backing store online (onyx `extend_ld` on the meta LD).
+    /// Default: unsupported — a growable file uses [`ensure_covers`] instead,
+    /// and only the block-window device can widen a fixed ceiling in place.
+    fn grow_capacity_pages(&self, _new_pages: u64) -> Result<()> {
+        Err(MetaDbError::InvalidArgument(
+            "device does not support online capacity grow".into(),
+        ))
+    }
 
     /// Attach the parent `Db`'s metrics handle (fans out to any io_uring
     /// submitters so their loop counters record).
@@ -628,6 +639,13 @@ pub trait PageBlockIo: Send + Sync {
     fn flush(&self) -> Result<()>;
     /// Total addressable bytes of the window (a multiple of [`PAGE_SIZE`]).
     fn capacity_bytes(&self) -> u64;
+    /// Widen the window to at least `new_bytes` (a multiple of [`PAGE_SIZE`])
+    /// after the host has extended the backing device online. Default: no-op
+    /// (fixed windows); a resizable window (onyx meta LD after `extend_ld`)
+    /// overrides to widen its span so `capacity_bytes` reports the new size.
+    fn grow_capacity_bytes(&self, _new_bytes: u64) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Fixed-capacity [`PageDevice`] over a caller-supplied byte-level
@@ -637,7 +655,10 @@ pub trait PageBlockIo: Send + Sync {
 /// hard wall — but the bytes live behind the host's device instead of a `Vec`.
 pub struct BlockPageDevice {
     io: Arc<dyn PageBlockIo>,
-    capacity_pages: u64,
+    /// Fixed ceiling in pages. Atomic so [`grow_capacity_pages`] can widen it
+    /// online (meta LD `extend_ld`) while concurrent `ensure_covers`/`len_pages`
+    /// read it lock-free. Grow-only.
+    capacity_pages: AtomicU64,
 }
 
 impl BlockPageDevice {
@@ -657,7 +678,10 @@ impl BlockPageDevice {
                  manifest region ({FIRST_DATA_PAGE} pages)",
             )));
         }
-        Ok(Self { io, capacity_pages })
+        Ok(Self {
+            io,
+            capacity_pages: AtomicU64::new(capacity_pages),
+        })
     }
 
     fn page_offset(page_id: PageId) -> Result<u64> {
@@ -739,14 +763,15 @@ impl PageDevice for BlockPageDevice {
     }
 
     fn len_pages(&self) -> Result<u64> {
-        Ok(self.capacity_pages)
+        Ok(self.capacity_pages.load(Ordering::Relaxed))
     }
 
     fn ensure_covers(&self, target_pages: u64) -> Result<()> {
-        if target_pages > self.capacity_pages {
+        let capacity_pages = self.capacity_pages.load(Ordering::Relaxed);
+        if target_pages > capacity_pages {
             return Err(MetaDbError::CapacityExhausted {
                 requested_pages: target_pages,
-                capacity_pages: self.capacity_pages,
+                capacity_pages,
             });
         }
         Ok(())
@@ -764,7 +789,31 @@ impl PageDevice for BlockPageDevice {
     }
 
     fn capacity_pages(&self) -> Option<u64> {
-        Some(self.capacity_pages)
+        Some(self.capacity_pages.load(Ordering::Relaxed))
+    }
+
+    fn grow_capacity_pages(&self, new_pages: u64) -> Result<()> {
+        // Widen the underlying window first (onyx grows the meta-LD page-window
+        // slice after `extend_ld`), then re-derive the ceiling from it. Grow-only.
+        let new_bytes = new_pages
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| MetaDbError::InvalidArgument("grow pages overflow".into()))?;
+        self.io.grow_capacity_bytes(new_bytes)?;
+        let cap_bytes = self.io.capacity_bytes();
+        if cap_bytes % PAGE_SIZE as u64 != 0 {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "grown window capacity {cap_bytes} is not a multiple of page size {PAGE_SIZE}",
+            )));
+        }
+        let cap_pages = cap_bytes / PAGE_SIZE as u64;
+        let prev = self.capacity_pages.load(Ordering::Relaxed);
+        if cap_pages < prev {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "grown window {cap_pages} pages is smaller than current ceiling {prev}",
+            )));
+        }
+        self.capacity_pages.store(cap_pages, Ordering::Release);
+        Ok(())
     }
 
     fn attach_metrics(&self, _metrics: Arc<MetaMetrics>) {}
