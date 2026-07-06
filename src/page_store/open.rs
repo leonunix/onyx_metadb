@@ -227,11 +227,23 @@ impl PageStore {
     }
 }
 
+/// Pages per batched `read_pages` call during the open scan. 1024 * 4 KiB =
+/// 4 MiB, matching the meta-LD device batch cap (`MAX_DEVICE_IO_BYTES`) so one
+/// submit fans across the RAID's PDs at depth instead of issuing QD1 single
+/// reads — the difference between a ~75 s and a few-second reopen on a large
+/// meta LD.
+const SCAN_CHUNK_PAGES: usize = 1024;
+
 /// Scan pages `[scan_from, scan_to)` on `device` to recover the high-water
 /// mark and the reusable free list. Typed pages push `high_water` past
 /// them; `Free`-stamped pages and all-zero (punched / never-written) pages
 /// join the free list. Torn pages are left in place below high_water; the
 /// verifier flags them later.
+///
+/// Reads are issued in [`SCAN_CHUNK_PAGES`]-page batches via
+/// [`PageDevice::read_pages`] (returned **unverified**, exactly like the
+/// per-page `read_page_unchecked` this replaced), so the classification below
+/// is byte-for-byte identical while the device sees batched, high-QD IO.
 pub(super) fn scan_free_list(
     device: &dyn PageDevice,
     scan_from: PageId,
@@ -239,16 +251,24 @@ pub(super) fn scan_free_list(
 ) -> Result<(u64, Vec<PageId>)> {
     let mut high_water = scan_from;
     let mut free_list = Vec::new();
-    for page_id in scan_from..scan_to {
-        let page = device.read_page_unchecked(page_id)?;
-        if let Ok(h) = page.header() {
-            high_water = page_id + 1;
-            if h.page_type == PageType::Free {
+    let mut ids: Vec<PageId> = Vec::with_capacity(SCAN_CHUNK_PAGES);
+    let mut chunk_start = scan_from;
+    while chunk_start < scan_to {
+        let chunk_end = (chunk_start + SCAN_CHUNK_PAGES as u64).min(scan_to);
+        ids.clear();
+        ids.extend(chunk_start..chunk_end);
+        let pages = device.read_pages(&ids)?;
+        for (page_id, page) in ids.iter().copied().zip(pages.iter()) {
+            if let Ok(h) = page.header() {
+                high_water = page_id + 1;
+                if h.page_type == PageType::Free {
+                    free_list.push(page_id);
+                }
+            } else if is_zero_page(page) {
                 free_list.push(page_id);
             }
-        } else if is_zero_page(&page) {
-            free_list.push(page_id);
         }
+        chunk_start = chunk_end;
     }
     free_list.retain(|pid| *pid < high_water);
     Ok((high_water, free_list))
