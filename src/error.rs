@@ -71,5 +71,68 @@ pub enum MetaDbError {
     InjectedFault(&'static str),
 }
 
+impl MetaDbError {
+    /// True for a transient underlying device IO failure ([`Self::Io`]). A
+    /// chunklet member EIO on a *redundant* LD (RAID10/5/6) surfaces here, and
+    /// is recoverable once the bad PD is isolated and the LD reopens degraded —
+    /// as opposed to the fatal, restart-required classes.
+    ///
+    /// NOTE: this is a *classification* helper for callers. It does NOT change
+    /// metadb's own sync policy: a sync-cycle failure still fails hard (a
+    /// half-applied sync can leave deferred apply state inconsistent — see
+    /// `Db::poison_sync`), so metadb relies on the backend (chunklet inline
+    /// degrade) to keep a single member EIO from ever reaching the sync path.
+    pub fn is_transient_io(&self) -> bool {
+        matches!(self, MetaDbError::Io(_))
+    }
+
+    /// True for a failure the database cannot recover from in place — presumed
+    /// corruption, a physical capacity wall, or a structural page error. The
+    /// caller must abort / roll back / restart rather than retry.
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            MetaDbError::Corruption(_)
+                | MetaDbError::CapacityExhausted { .. }
+                | MetaDbError::OutOfSpace
+                | MetaDbError::PageChecksumMismatch { .. }
+                | MetaDbError::PageMagicMismatch { .. }
+                | MetaDbError::PageVersionUnsupported { .. }
+                | MetaDbError::UnknownPageType(_)
+                | MetaDbError::PageOutOfRange(_)
+        )
+    }
+}
+
 /// Shorthand for `std::result::Result<T, MetaDbError>`.
 pub type Result<T> = std::result::Result<T, MetaDbError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_io_vs_fatal_classification() {
+        // A device IO error (where a chunklet member EIO lands) is transient.
+        let io = MetaDbError::Io(std::io::Error::from_raw_os_error(5));
+        assert!(io.is_transient_io());
+        assert!(!io.is_fatal());
+
+        // Corruption / capacity / page-structure errors are fatal, not transient.
+        for e in [
+            MetaDbError::Corruption("bad".into()),
+            MetaDbError::CapacityExhausted {
+                requested_pages: 2,
+                capacity_pages: 1,
+            },
+            MetaDbError::OutOfSpace,
+            MetaDbError::PageMagicMismatch {
+                page_id: 1,
+                found: 0,
+            },
+        ] {
+            assert!(e.is_fatal(), "{e} should be fatal");
+            assert!(!e.is_transient_io(), "{e} is not transient IO");
+        }
+    }
+}
