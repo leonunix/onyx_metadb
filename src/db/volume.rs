@@ -387,11 +387,33 @@ impl Db {
             let tail = volume
                 .dead_list_tail_pid
                 .load(std::sync::atomic::Ordering::Acquire);
+            let head = volume
+                .dead_list_head_pid
+                .load(std::sync::atomic::Ordering::Acquire);
             if tail == crate::types::NULL_PAGE {
                 Vec::new()
             } else {
+                // Bound the walk by `dead_list_head_pid`. An autonomous lineage
+                // GC cycle may have advanced the head and freed the older
+                // segments, leaving the current head's `prev_seg_pid` pointing
+                // at a freed (or later recycled) page — see
+                // `advance_head_pid_durable`, which walks with the SAME head
+                // boundary for exactly this reason. The unbounded
+                // `walk_chain_pages` would follow that stale link past the head
+                // into a `Free` page and abort with `wrong page_type`. We hold
+                // `apply_gate.write`, which the head advance also requires for
+                // its manifest commit + atomic promotion, so `(tail, head)` is a
+                // consistent pair and every segment in `[head..tail]` is live
+                // (lineage GC only frees strictly below the current head).
                 let page_store = self.page_store.clone();
-                crate::deadlist::walk_chain_pages(tail, |pid| page_store.read_page(pid))?
+                let segs = crate::deadlist::walk_chain_segments(tail, head, |pid| {
+                    page_store.read_page(pid)
+                })?;
+                segs.iter()
+                    .flat_map(|s| {
+                        (0..s.seg_page_count as u64).map(move |i| s.page_id + i)
+                    })
+                    .collect()
             }
         };
         // Discard the volume's outstanding dead-list buffer — it

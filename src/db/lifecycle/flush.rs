@@ -1157,7 +1157,7 @@ impl Db {
                 })
                 .collect()
         };
-        let dead_list_overrides = build_overrides(DeadListKind::Pba);
+        let mut dead_list_overrides = build_overrides(DeadListKind::Pba);
         let mut page_dead_list_overrides = build_overrides(DeadListKind::Page);
         // BFG: per-clone page-livelist anchor overrides.
         // `mut` because Bug 3's gate-window re-validation may drop a vol whose
@@ -1196,16 +1196,17 @@ impl Db {
         let gate_started = std::time::Instant::now();
         let apply_guard = self.apply_gate.write();
         self.metrics.record_flush_gate_wait(gate_started.elapsed());
-        // BFG — Bug 3: now that we hold the gate (which excludes
-        // the `LivelistCondenser`), re-validate every drained per-clone Live
-        // chain against a condenser re-anchor that may have committed since our
-        // GATELESS tail sample. A raced vol is dropped from THIS flush's
-        // livelist commit before `refresh_manifest_from_checkpoints` reads the
-        // override map. Pba/Page chains have no concurrent background freer, so
-        // they are untouched.
-        self.bail_condenser_raced_live_lists(
+        // BFG — Bug 3 (+ lineage-GC extension): now that we hold the gate
+        // (which excludes both the `LivelistCondenser` and the
+        // `LineageGcWorker`), re-validate every drained chain whose committed
+        // segments have a concurrent background freer against a re-anchor / head
+        // advance that may have committed since our GATELESS head/tail sample.
+        // A raced vol is dropped from THIS flush's commit before
+        // `refresh_manifest_from_checkpoints` reads the override maps.
+        self.bail_raced_chain_appends(
             &mut drained_deadlists,
             &mut dead_list_plans,
+            &mut dead_list_overrides,
             &mut page_live_list_overrides,
             wal_checkpoint,
         );
@@ -1775,67 +1776,91 @@ impl Db {
         }
     }
 
-    /// BFG — Bug 3: under `apply_gate.write()`, drop any drained
-    /// `Live` (per-clone page-livelist) chain whose tail atomic moved since
-    /// this flush's GATELESS sample — i.e. a concurrent [`LivelistCondenser`]
-    /// re-anchored it.
+    /// BFG — Bug 3 (+ lineage-GC extension): under `apply_gate.write()`, drop
+    /// any drained chain whose committed segments have a concurrent background
+    /// freer and whose head/tail anchor moved since this flush's GATELESS
+    /// sample. Two such chains exist:
     ///
-    /// The condenser samples the live tail gatelessly, then under the SAME gate
-    /// this flush now holds it commits a re-anchored (head=tail=condensed)
-    /// manifest, promotes the in-memory tail atomic, drops the gate, and frees
-    /// the OLD chain — INCLUDING the `old_tail` this flush captured into its
-    /// plan. If the condenser won the gate first, committing our override would
-    /// link `S_flush.prev = old_tail (now freed)` — a dangling chain that walks
-    /// into a `Free` page (`livelist::read_chain_records` → `wrong page_type
-    /// Free`) — AND overwrite the condenser's just-committed anchor, orphaning
-    /// its condensed segment. This mirrors the condenser's own symmetric bail
+    /// - `Live` (per-clone page-livelist): the [`LivelistCondenser`] samples the
+    ///   live tail gatelessly, then under the SAME gate this flush now holds it
+    ///   commits a re-anchored (head=tail=condensed) manifest, promotes the
+    ///   in-memory anchors, drops the gate, and frees the OLD chain.
+    /// - `Pba` (PBA dead-list): the [`LineageGcWorker`]'s
+    ///   `advance_head_pid_durable` walks the chain under the gate, commits an
+    ///   advanced (or emptied) head, promotes the anchors, drops the gate, and
+    ///   `free_many`s the reclaimed segment(s) — INCLUDING, when it empties the
+    ///   chain, the `old_tail` this flush captured.
+    ///
+    /// In both cases, if the background op won the gate first, committing our
+    /// override would link `S_flush.prev = old_tail (now freed)` — a dangling
+    /// chain that walks into a `Free` page (`wrong page_type Free`) — and/or
+    /// promote a stale `old_head` (a freed page) into the manifest, wedging the
+    /// head/tail bookkeeping. This mirrors the condenser's own symmetric bail
     /// (`livelist_condense.rs`: `cur_tail != tail0`): whichever side loses the
     /// gate race detects the other's promotion and backs its append out.
     ///
-    /// For each raced Live plan: restore its records to the accumulator (a
-    /// later flush re-drains them off the condensed anchor), free this flush's
-    /// now-orphan `S_flush` segment, drop its override (so
-    /// [`refresh_manifest_from_checkpoints`] keeps the condenser's committed
+    /// For each raced plan: restore its records to the accumulator (a later
+    /// flush re-drains them off the advanced/condensed anchor), free this
+    /// flush's now-orphan `S_flush` segment, drop its override (so
+    /// [`refresh_manifest_from_checkpoints`] keeps the background op's committed
     /// anchor via the live-atomic fallback) and drop its plan (so the
-    /// post-commit promotion loop leaves the atomic at the condensed anchor).
+    /// post-commit promotion loop leaves the atomic at that anchor).
     ///
-    /// ONLY `Live`: the `Pba` / `Page` chains have no concurrent background
-    /// freer of their committed segments, so their gateless sample is always
-    /// safe to commit. The check is conservative — any tail change defers the
-    /// append to a later flush, which is harmless — so it never needs to prove
-    /// the condenser is the *only* possible writer. Must run AFTER
-    /// `apply_gate.write()` and BEFORE `refresh_manifest_from_checkpoints`.
-    fn bail_condenser_raced_live_lists(
+    /// `Page` (L2P page dead-list) is NOT checked: its committed segments are
+    /// transferred to snapshots (never freed) under the same gate, so a
+    /// gateless-sampled append is always safe to commit. The check is
+    /// conservative — any head/tail change defers the append to a later flush,
+    /// which is harmless — so it never needs to prove the background op is the
+    /// *only* possible writer. Must run AFTER `apply_gate.write()` and BEFORE
+    /// `refresh_manifest_from_checkpoints`.
+    fn bail_raced_chain_appends(
         &self,
         drained: &mut Vec<DeadListDrainEntry>,
         plans: &mut Vec<DeadListSegmentPlan>,
+        dead_list_overrides: &mut HashMap<VolumeOrdinal, (PageId, PageId)>,
         page_live_list_overrides: &mut HashMap<VolumeOrdinal, (PageId, PageId)>,
         free_lsn: Lsn,
     ) {
         use std::sync::atomic::Ordering;
-        let raced: Vec<VolumeOrdinal> = plans
+        // A plan is stale iff its chain's live head OR tail anchor moved since
+        // the gateless drain. Tail moves catch a full reclaim (chain emptied) /
+        // condenser re-anchor; head moves catch a partial lineage-GC advance
+        // (head advanced past the freed oldest segment, tail unchanged) whose
+        // override would otherwise promote the freed `old_head`.
+        let raced: Vec<(VolumeOrdinal, DeadListKind)> = plans
             .iter()
-            .filter(|p| {
-                p.kind == DeadListKind::Live
-                    && p.vol.page_live_list_tail_pid.load(Ordering::Acquire) != p.old_tail
+            .filter(|p| match p.kind {
+                DeadListKind::Live => {
+                    p.vol.page_live_list_tail_pid.load(Ordering::Acquire) != p.old_tail
+                        || p.vol.page_live_list_head_pid.load(Ordering::Acquire) != p.old_head
+                }
+                DeadListKind::Pba => {
+                    p.vol.dead_list_tail_pid.load(Ordering::Acquire) != p.old_tail
+                        || p.vol.dead_list_head_pid.load(Ordering::Acquire) != p.old_head
+                }
+                DeadListKind::Page => false,
             })
-            .map(|p| p.vol.ord)
+            .map(|p| (p.vol.ord, p.kind))
             .collect();
         if raced.is_empty() {
             return;
         }
-        for vol_ord in raced {
-            // Keep the condenser's committed anchor: dropping the override
+        for (vol_ord, kind) in raced {
+            // Keep the background op's committed anchor: dropping the override
             // makes `refresh_manifest_from_checkpoints` fall back to the (now
-            // condensed) live atomic for this vol.
-            page_live_list_overrides.remove(&vol_ord);
+            // advanced/condensed) live atomic for this vol.
+            match kind {
+                DeadListKind::Live => page_live_list_overrides.remove(&vol_ord),
+                DeadListKind::Pba => dead_list_overrides.remove(&vol_ord),
+                DeadListKind::Page => None,
+            };
             // Free this flush's now-orphan new segment and drop its plan so the
             // post-commit promotion loop never stores its stale tail.
             // `free_idempotent` (vs `free`) is defensive: the run was just
             // allocated + synced this flush so a plain free would suffice, but
             // idempotence keeps a second pass a no-op rather than a hard error.
             plans.retain(|p| {
-                let drop_it = p.kind == DeadListKind::Live && p.vol.ord == vol_ord;
+                let drop_it = p.kind == kind && p.vol.ord == vol_ord;
                 if drop_it {
                     for i in 0..p.page_count as u64 {
                         if let Err(err) = self.page_store.free_idempotent(p.start_pid + i, free_lsn)
@@ -1843,28 +1868,38 @@ impl Db {
                             tracing::warn!(
                                 page_id = p.start_pid + i,
                                 vol_ord = u32::from(vol_ord),
+                                kind = ?kind,
                                 error = %err,
-                                "flush_with_gate: failed to free condenser-raced livelist segment"
+                                "flush_with_gate: failed to free background-raced chain segment"
                             );
                         }
                     }
                 }
                 !drop_it
             });
-            // Restore the drained records to the live accumulator and remove the
+            // Restore the drained records to the accumulator and remove the
             // entry so no later abort path re-processes it. `restore_front`
             // pushes them back at the head so ordering is preserved for the
             // next flush's drain.
             if let Some(pos) = drained
                 .iter()
-                .position(|e| e.kind == DeadListKind::Live && e.vol.ord == vol_ord)
+                .position(|e| e.kind == kind && e.vol.ord == vol_ord)
             {
                 let mut entry = drained.swap_remove(pos);
-                if let DrainRecords::Live(recs) = &mut entry.records {
-                    let records = std::mem::take(recs);
-                    if !records.is_empty() {
-                        entry.vol.page_live_list.restore_front(records);
+                match (kind, &mut entry.records) {
+                    (DeadListKind::Live, DrainRecords::Live(recs)) => {
+                        let records = std::mem::take(recs);
+                        if !records.is_empty() {
+                            entry.vol.page_live_list.restore_front(records);
+                        }
                     }
+                    (DeadListKind::Pba, DrainRecords::Dead(recs)) => {
+                        let records = std::mem::take(recs);
+                        if !records.is_empty() {
+                            entry.vol.dead_list.restore_front(records);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
