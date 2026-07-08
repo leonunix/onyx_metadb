@@ -45,6 +45,30 @@ impl PageStore {
         self.free_list_pages.load(Ordering::Relaxed)
     }
 
+    /// Atomically snapshot `(high_water, free_list)` under a single `inner`
+    /// lock, so the pair is internally consistent even if a background reclaim
+    /// worker (which also only takes `inner`) mutates the free list / high-water
+    /// concurrently. Used to persist the free-list bitmap at manifest commit:
+    /// the returned `high_water` is the authoritative bitmap range and MUST be
+    /// the value written to `manifest.page_high_water`.
+    pub fn snapshot_free_list_and_high_water(&self) -> (u64, Vec<PageId>) {
+        let inner = self.inner.lock();
+        (inner.high_water, inner.free_list.clone())
+    }
+
+    /// Install a recovered `(high_water, free_list)` directly, bypassing the
+    /// open-time scan. The device path uses this after loading the persisted
+    /// free-list bitmap (see `db::lifecycle::open`); it is the no-scan
+    /// counterpart to [`rebuild_free_list_bounded`](Self::rebuild_free_list_bounded).
+    pub fn install_free_list(&self, high_water: u64, free_list: Vec<PageId>) {
+        let free_list_len = free_list.len();
+        let mut inner = self.inner.lock();
+        inner.high_water = high_water;
+        inner.free_list = free_list;
+        self.high_water_pages.store(high_water, Ordering::Relaxed);
+        self.free_list_pages.store(free_list_len, Ordering::Relaxed);
+    }
+
     /// Fixed capacity in pages for a device-backed store (`Some`), or `None`
     /// for a growable file. Feeds the meta-region water-level status.
     pub fn capacity_pages(&self) -> Option<u64> {

@@ -59,6 +59,28 @@ impl PageStore {
         Ok(start)
     }
 
+    /// Append `count` fresh page ids at the frontier, **bypassing the free
+    /// list** (unlike [`allocate`](Self::allocate) / [`allocate_batch`], which
+    /// pop reusable interior pages first). Used to reserve the persisted
+    /// free-list bitmap chain: that chain's bytes are built from a free-list
+    /// snapshot taken after this call, so the allocation must not itself
+    /// add/remove any free-list entry. Returns the appended ids in ascending
+    /// order. Bumps `high_water` by exactly `count`.
+    pub fn allocate_frontier_pages(&self, count: usize) -> Result<Vec<PageId>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let count_u64 =
+            u64::try_from(count).map_err(|_| MetaDbError::InvalidArgument("page run too large".into()))?;
+        let mut inner = self.inner.lock();
+        let start = inner.high_water;
+        let new_high = start.checked_add(count_u64).ok_or(MetaDbError::OutOfSpace)?;
+        self.device.ensure_covers(new_high)?;
+        inner.high_water = new_high;
+        self.high_water_pages.store(new_high, Ordering::Relaxed);
+        Ok((start..new_high).collect())
+    }
+
     /// Allocate up to `count` page ids as a local scratch batch.
     ///
     /// Unlike [`allocate_run`](Self::allocate_run), this does not require

@@ -660,6 +660,14 @@ impl DedupIndex {
         self.cuckoo.max_referenced_page_id()
     }
 
+    /// Every page id the dedup index physically references (meta head + meta
+    /// chain + data pages). The device-path open removes these from the
+    /// persisted free-list bitmap so `allocate()` never re-hands a live dedup
+    /// page — see [`crate::dedup::cuckoo::CuckooHash::referenced_page_ids`].
+    pub fn referenced_page_ids(&self) -> Vec<PageId> {
+        self.cuckoo.referenced_page_ids()
+    }
+
     /// Approximate live entry count. Tracks the cuckoo's running
     /// counter; for an exact figure call [`recount`].
     pub fn approx_len(&self) -> u64 {

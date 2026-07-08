@@ -580,17 +580,43 @@ impl Db {
         // allocates pages (`cow_for_write` during L2pPut apply). See the
         // `rebuild_free_list_bounded` caller contract.
         if backing.is_device() {
-            let frontier = manifest
-                .page_high_water
-                .max(dedup_index.max_referenced_page_id().saturating_add(1));
-            page_store.rebuild_free_list_bounded(frontier)?;
-            tracing::info!(
-                page_high_water = manifest.page_high_water,
-                dedup_max_ref = dedup_index.max_referenced_page_id(),
-                frontier,
-                recovered_high_water = page_store.high_water(),
-                "metadb device open: bounded free-list rebuild complete"
-            );
+            let dedup_max = dedup_index.max_referenced_page_id();
+            let frontier = manifest.page_high_water.max(dedup_max.saturating_add(1));
+            if manifest.free_list_head != crate::types::NULL_PAGE {
+                // Fast path: the free list was persisted as a bitmap
+                // (`free_list_head`), so load it in O(bitmap pages) instead of a
+                // ~O(meta size) page scan (~75 s → <5 s on a large meta LD). See
+                // `load_persisted_free_list` for the dedup reconciliation that
+                // preserves the frontier invariant.
+                let started = std::time::Instant::now();
+                let free_list = load_persisted_free_list(
+                    &page_store,
+                    manifest.free_list_head,
+                    manifest.page_high_water,
+                    frontier,
+                    &dedup_index,
+                )?;
+                let free_list_len = free_list.len();
+                page_store.install_free_list(frontier, free_list);
+                tracing::info!(
+                    page_high_water = manifest.page_high_water,
+                    dedup_max_ref = dedup_max,
+                    frontier,
+                    free_list_len,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "metadb device open: persisted free-list load complete (no scan)"
+                );
+            } else {
+                // Fallback (old db / never-persisted): bounded scan, as before.
+                page_store.rebuild_free_list_bounded(frontier)?;
+                tracing::info!(
+                    page_high_water = manifest.page_high_water,
+                    dedup_max_ref = dedup_max,
+                    frontier,
+                    recovered_high_water = page_store.high_water(),
+                    "metadb device open: bounded free-list rebuild complete"
+                );
+            }
         }
 
         // Buffer-as-sole-journal lifecycle journal cutover retired the WAL writer.
@@ -1046,6 +1072,43 @@ impl Db {
         }
         Ok(db)
     }
+}
+
+/// Recover the device page-store free list from the persisted bitmap chain
+/// (`free_list_head`) instead of scanning every page in the meta region.
+///
+/// The bitmap covers `[FIRST_DATA_PAGE, page_high_water)`; the tiny tail
+/// `[page_high_water, frontier)` (non-empty only after a crash where an
+/// uncommitted newer generation grew the dedup index past the committed
+/// high-water) is recovered with a bounded scan. Finally every page the live
+/// dedup index references is removed from the result — this is the sole
+/// correctness reconciliation and it preserves the frontier invariant
+/// (`device_open_lifts_frontier_past_dedup_pages`): the persisted bitmap was
+/// consistent with the loaded manifest generation, but a dedup meta chain is
+/// generation-stable + mutated in place, so a durable-but-uncommitted newer
+/// generation could have popped an interior free page the bitmap still marks
+/// free. Removing the dedup-referenced set (read from memory — the meta chain +
+/// page table were loaded from the durable chain at open) drops exactly those.
+fn load_persisted_free_list(
+    page_store: &Arc<PageStore>,
+    free_list_head: PageId,
+    page_high_water: u64,
+    frontier: u64,
+    dedup_index: &crate::dedup::DedupIndex,
+) -> Result<Vec<PageId>> {
+    use std::collections::HashSet;
+
+    let bitmap = crate::manifest::catalog::read_free_list_run(page_store, free_list_head)?;
+    let mut free: Vec<PageId> =
+        crate::manifest::catalog::decode_free_list_bitmap(&bitmap, page_high_water);
+    // Tail above the bitmap's range (usually empty).
+    if frontier > page_high_water {
+        free.extend(page_store.scan_free_range(page_high_water, frontier)?);
+    }
+    // Reconcile: a page the live dedup index points at must never be reusable.
+    let dedup_pages: HashSet<PageId> = dedup_index.referenced_page_ids().into_iter().collect();
+    free.retain(|pid| *pid < frontier && !dedup_pages.contains(pid));
+    Ok(free)
 }
 
 fn validate_rc_neutral_refcount_mode(cfg: &Config) -> Result<()> {

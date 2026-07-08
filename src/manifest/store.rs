@@ -29,6 +29,12 @@ pub struct ManifestStore {
     /// Per-slot snapshot-table chain pids (head first); mirror of
     /// [`slot_volume_chain`](Self::slot_volume_chain).
     slot_snapshot_chain: [Vec<PageId>; 2],
+    /// Per-slot persisted free-list bitmap RUN pids (contiguous, `[start,
+    /// start+capacity)`, including the growth reserve). Reused in place across
+    /// commits; relocated (geometric grow) only when the bitmap outgrows the
+    /// reserve. Empty on the file path (the bitmap is device-only) and until the
+    /// first device commit.
+    slot_free_list_run: [Vec<PageId>; 2],
     faults: Arc<FaultController>,
 }
 
@@ -52,14 +58,16 @@ fn other_slot(slot: PageId) -> PageId {
     }
 }
 
-/// Read the two catalog chain-head pids out of a slot's fixed header WITHOUT a
-/// full [`Manifest::decode`]. Header-only on purpose: the OTHER (non-winning)
-/// generation's body may reference `SnapshotRoots` / L2P pages the engine has
-/// since reclaimed — a full decode would then fail and we'd lose track of that
-/// slot's (still-intact) catalog chains, leaking + mis-flagging them. The
-/// catalog chains themselves are never freed except on shrink, so they stay
-/// walkable regardless of the rest of the body's validity.
-fn slot_catalog_heads(page_store: &PageStore, slot: PageId) -> Option<(PageId, PageId)> {
+/// Read the catalog + free-list chain-head pids out of a slot's fixed header
+/// WITHOUT a full [`Manifest::decode`]. Header-only on purpose: the OTHER
+/// (non-winning) generation's body may reference `SnapshotRoots` / L2P pages the
+/// engine has since reclaimed — a full decode would then fail and we'd lose
+/// track of that slot's (still-intact) chains, leaking + mis-flagging them. The
+/// chains themselves are never freed except on shrink, so they stay walkable
+/// regardless of the rest of the body's validity. Returns `(volume_head,
+/// snapshot_head, free_list_head)`; `free_list_head` is [`NULL_PAGE`] on a slot
+/// written by the file path (no persisted bitmap).
+fn slot_catalog_heads(page_store: &PageStore, slot: PageId) -> Option<(PageId, PageId, PageId)> {
     let page = page_store.read_page_unchecked(slot).ok()?;
     page.verify(slot).ok()?;
     let header = page.header().ok()?;
@@ -81,7 +89,12 @@ fn slot_catalog_heads(page_store: &PageStore, slot: PageId) -> Option<(PageId, P
             .try_into()
             .ok()?,
     );
-    Some((vol, snap))
+    let free_list = u64::from_le_bytes(
+        p[OFF_FREE_LIST_HEAD..OFF_FREE_LIST_HEAD + 8]
+            .try_into()
+            .ok()?,
+    );
+    Some((vol, snap, free_list))
 }
 
 /// Enumerate the catalog chain pids referenced by BOTH manifest slots. Both
@@ -93,13 +106,19 @@ fn slot_catalog_heads(page_store: &PageStore, slot: PageId) -> Option<(PageId, P
 pub(crate) fn catalog_chain_pids_all_slots(page_store: &PageStore) -> Vec<PageId> {
     let mut pids = Vec::new();
     for slot in [MANIFEST_PAGE_A, MANIFEST_PAGE_B] {
-        let Some((vol_head, snap_head)) = slot_catalog_heads(page_store, slot) else {
+        let Some((vol_head, snap_head, free_list_head)) = slot_catalog_heads(page_store, slot) else {
             continue;
         };
         for (head, kind) in [(vol_head, CatalogKind::Volumes), (snap_head, CatalogKind::Snapshots)] {
             if let Ok(p) = catalog::chain_pids(page_store, head, kind) {
                 pids.extend(p);
             }
+        }
+        // The persisted free-list bitmap run (incl. its growth reserve) is a live
+        // per-slot anchor too: orphan-reclaim must not free it. NULL_PAGE = file
+        // path / not yet persisted → no run.
+        if let Ok(p) = catalog::free_list_run_pids(page_store, free_list_head) {
+            pids.extend(p);
         }
     }
     pids
@@ -145,6 +164,7 @@ impl ManifestStore {
             next_slot: other_slot(loaded.slot),
             slot_volume_chain: [Vec::new(), Vec::new()],
             slot_snapshot_chain: [Vec::new(), Vec::new()],
+            slot_free_list_run: [Vec::new(), Vec::new()],
             faults,
         };
         // Seed BOTH slots' chains so the next commit (to the OTHER slot) reuses
@@ -156,10 +176,13 @@ impl ManifestStore {
             loaded.slot,
             loaded.manifest.volume_catalog_head_pid,
             loaded.manifest.snapshot_catalog_head_pid,
+            loaded.manifest.free_list_head,
         );
         let other = other_slot(loaded.slot);
-        if let Some((vol_head, snap_head)) = slot_catalog_heads(&store.page_store, other) {
-            store.seed_slot_chains(other, vol_head, snap_head);
+        if let Some((vol_head, snap_head, free_list_head)) =
+            slot_catalog_heads(&store.page_store, other)
+        {
+            store.seed_slot_chains(other, vol_head, snap_head, free_list_head);
         }
         store
     }
@@ -199,6 +222,7 @@ impl ManifestStore {
             next_slot: MANIFEST_PAGE_A,
             slot_volume_chain: [Vec::new(), Vec::new()],
             slot_snapshot_chain: [Vec::new(), Vec::new()],
+            slot_free_list_run: [Vec::new(), Vec::new()],
             faults,
         };
         let mut empty = Manifest::empty();
@@ -209,13 +233,21 @@ impl ManifestStore {
     /// Record the chain pids a slot references (walked from its head anchors).
     /// Used to seed both slots at open so subsequent commits reuse pids in
     /// place rather than leaking the slot's existing chain.
-    fn seed_slot_chains(&mut self, slot: PageId, vol_head: PageId, snap_head: PageId) {
+    fn seed_slot_chains(
+        &mut self,
+        slot: PageId,
+        vol_head: PageId,
+        snap_head: PageId,
+        free_list_head: PageId,
+    ) {
         let idx = slot_index(slot);
         self.slot_volume_chain[idx] =
             catalog::chain_pids(&self.page_store, vol_head, CatalogKind::Volumes).unwrap_or_default();
         self.slot_snapshot_chain[idx] =
             catalog::chain_pids(&self.page_store, snap_head, CatalogKind::Snapshots)
                 .unwrap_or_default();
+        self.slot_free_list_run[idx] =
+            catalog::free_list_run_pids(&self.page_store, free_list_head).unwrap_or_default();
     }
 
     /// Current in-memory sequence number; bumped by each successful
@@ -229,10 +261,12 @@ impl ManifestStore {
         self.next_slot
     }
 
-    /// Durably commit `manifest`. v23 writes, in order:
+    /// Durably commit `manifest`. Writes, in order:
     ///
     /// 1. the target slot's volume + snapshot catalog chains (reusing their pids
-    ///    in place, growing/shrinking continuations), then fsync;
+    ///    in place, growing/shrinking continuations), plus — on a fixed-capacity
+    ///    device — the persisted free-list bitmap chain (`free_list_head`), then
+    ///    fsync;
     /// 2. the manifest slot page (pointing at the chain heads), then fsync.
     ///
     /// Only the target slot's chains + body are touched, so the other slot's
@@ -274,22 +308,77 @@ impl ManifestStore {
             generation,
         )?;
 
+        // 1b. [device path only] Build the persisted free-list bitmap chain so
+        //     the next open loads the free list in O(bitmap pages) instead of a
+        //     ~O(meta size) bounded page scan (~75 s → <5 s on a large meta LD).
+        //     Its own chain pages are frontier-appended (see
+        //     `alloc_free_list_chain`): they MUST NOT perturb the free list they
+        //     encode, so this is the LAST allocation of the commit and the
+        //     `(high_water, free_list)` pair snapshotted right after is what the
+        //     bitmap + `page_high_water` are built from. The file path keeps its
+        //     EOF-scan open and never persists a bitmap (`free_list_head` stays
+        //     NULL) — zero regression.
+        let is_device = self.page_store.capacity_pages().is_some();
+        let (fl_run, fl_sealed, fl_free, device_high_water) = if is_device {
+            let existing = self.slot_free_list_run[idx].clone();
+            // Pages the bitmap needs to cover [FIRST_DATA_PAGE, high_water); +1
+            // slack so the frontier-append below (when relocating) can't push the
+            // bitmap past the run it's sized for.
+            let needed = catalog::free_list_run_data_pages(
+                catalog::free_list_bitmap_len(self.page_store.high_water()),
+            ) + 1;
+            let (fl_run, fl_free) = if existing.len() >= needed {
+                // Reuse the whole run in place (steady state — no allocation, so
+                // the free-list snapshot below is untouched).
+                (existing, Vec::new())
+            } else {
+                // Relocate: allocate a fresh CONTIGUOUS run with geometric reserve
+                // (bounds lifetime relocation churn to O(N)), free the old run.
+                // Frontier-append never pops the interior free list, so the
+                // snapshot stays consistent.
+                let new_cap = needed.max(existing.len().saturating_mul(2));
+                let fresh = self.page_store.allocate_frontier_pages(new_cap)?;
+                (fresh, existing)
+            };
+            // Consistent snapshot of the free list as of this commit. Pages the
+            // flush reclaims AFTER commit (the post-commit inline/async reclaim
+            // pass, which cannot run before the manifest is durable) are not in
+            // this bitmap — they stay in the running free list and are captured
+            // by the next commit's bitmap. The bitmap is therefore a SAFE
+            // (never marks a used page free) but possibly-conservative snapshot;
+            // a crash in that narrow window Free-stamps those pages on disk but
+            // leaves them unlisted until a future flush re-persists them.
+            let (h2, free_list) = self.page_store.snapshot_free_list_and_high_water();
+            let bitmap = catalog::encode_free_list_bitmap(h2, &free_list);
+            let fl_sealed = catalog::seal_free_list_run(&fl_run, &bitmap, generation)?;
+            (fl_run, fl_sealed, fl_free, h2)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), 0)
+        };
+
         // 2. Chain pages durable BEFORE the manifest slot references them (same
         //    "external pages first" discipline as L2P / RC / deadlist).
         let mut sealed = vol_sealed;
         sealed.extend(snap_sealed);
+        sealed.extend(fl_sealed);
         self.page_store.write_sealed_page_runs(sealed)?;
         self.page_store.sync()?;
 
         // 3. Manifest slot, pointing at the chain heads.
         manifest.volume_catalog_head_pid = vol_chain[0];
         manifest.snapshot_catalog_head_pid = snap_chain[0];
-        // v24: sample the page high-water AFTER every allocation this commit
-        // made (checkpoint roots + the catalog chains just built above), so it
-        // is a strict upper bound on every page id these roots reach. On a
-        // fixed-capacity device the next open bounded-scans `[FIRST_DATA_PAGE,
-        // page_high_water)` to rebuild the free list. Harmless on the file path.
-        manifest.page_high_water = self.page_store.high_water();
+        if is_device {
+            // Authoritative pair from the post-allocation snapshot above; the
+            // bitmap covers `[FIRST_DATA_PAGE, page_high_water)`.
+            manifest.free_list_head = fl_run[0];
+            manifest.page_high_water = device_high_water;
+        } else {
+            // v24: sample the page high-water AFTER every allocation this commit
+            // made (checkpoint roots + the catalog chains just built above), so
+            // it is a strict upper bound on every page id these roots reach. The
+            // file open scans to EOF and doesn't depend on it.
+            manifest.page_high_water = self.page_store.high_water();
+        }
         let mut page = Page::new(PageHeader::new(PageType::Manifest, new_sequence));
         manifest.encode(&mut page, vol_chain[0], snap_chain[0])?;
         page.seal();
@@ -304,12 +393,15 @@ impl ManifestStore {
         self.next_slot = other_slot(target_slot);
         self.slot_volume_chain[idx] = vol_chain;
         self.slot_snapshot_chain[idx] = snap_chain;
+        if is_device {
+            self.slot_free_list_run[idx] = fl_run;
+        }
 
         // 5. Free trailing continuation pages a shrink dropped (this slot's own
         //    former pages, now referenced by nobody). Best-effort: a free error
         //    only leaks pages (reclaimed at next open). Invalidate the cache
         //    before releasing each pid so a recycled page can't be read stale.
-        for pid in vol_free.into_iter().chain(snap_free) {
+        for pid in vol_free.into_iter().chain(snap_free).chain(fl_free) {
             self.page_cache.invalidate(pid);
             if let Err(err) = self.page_store.free(pid, generation) {
                 tracing::warn!(

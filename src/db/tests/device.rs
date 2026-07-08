@@ -320,3 +320,319 @@ fn block_page_device_roundtrip_through_db() {
         assert_eq!(db.get_dedup(&h(n)).unwrap(), Some(dv(n as u8)), "reopen dedup {n}");
     }
 }
+
+/// Reclaim `n` interior free pages into the page-store free list without letting
+/// `truncate_free_tail` pull them back off `high_water`: allocate `n + 1`
+/// scratch pages, keep the topmost one allocated (so the tail is not free), then
+/// free + reclaim the rest. Returns the freed pids.
+fn make_interior_free_pages(db: &Db, n: usize) -> Vec<PageId> {
+    let mut scratch = Vec::with_capacity(n + 1);
+    for _ in 0..n + 1 {
+        scratch.push(db.page_store.allocate().unwrap());
+    }
+    let _keep_tail = scratch.pop().unwrap(); // topmost stays allocated
+    for &pid in &scratch {
+        db.page_store.free(pid, 1).unwrap();
+    }
+    db.page_store.try_reclaim().unwrap();
+    scratch
+}
+
+/// The persisted free-list bitmap replaces the open-time page scan: a device
+/// flush writes `free_list_head`, and reopen recovers `high_water` + the free
+/// list from it (no scan), byte-faithfully round-tripping the store's own free
+/// list.
+#[test]
+fn device_persisted_free_list_roundtrips_without_scan() {
+    let dir = TempDir::new().unwrap();
+    let (page_dev, journal_dev, db) = mk_db_on_device(&dir, 8192, 512);
+
+    for i in 0u64..300 {
+        db.insert(0, i, v((i / 32) as u8)).unwrap();
+    }
+    for n in 1u64..40 {
+        db.put_dedup(h(n), dv(n as u8)).unwrap();
+    }
+    // Interior free pages so the persisted bitmap carries a non-empty free list.
+    make_interior_free_pages(&db, 200);
+    db.flush().unwrap();
+
+    let hw = db.page_store.high_water();
+    let fll = db.page_store.free_list_len();
+    assert!(fll > 0, "test setup produced no persisted free pages");
+    assert_ne!(
+        db.manifest().free_list_head,
+        crate::types::NULL_PAGE,
+        "device flush must persist a free-list bitmap head"
+    );
+    drop(db);
+
+    let db = Db::open_on_device_with_faults(
+        device_cfg(&dir),
+        FaultController::disabled(),
+        page_dev,
+        journal_dev,
+    )
+    .unwrap();
+
+    // Fast path (no scan) recovers high_water exactly, and a free list that is a
+    // safe snapshot: non-empty and never larger than the store held at close
+    // (the bitmap never invents free pages; it may omit the few pages the flush
+    // reclaimed after its commit snapshot — see `ManifestStore::commit`).
+    assert_eq!(db.page_store.high_water(), hw, "high_water regressed on bitmap reopen");
+    let reopened_fll = db.page_store.free_list_len();
+    assert!(
+        reopened_fll > 0 && reopened_fll <= fll,
+        "bitmap-recovered free_list_len {reopened_fll} not in (0, {fll}]"
+    );
+    for i in 0u64..300 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v((i / 32) as u8)), "reopen lba {i}");
+    }
+    for n in 1u64..40 {
+        assert_eq!(db.get_dedup(&h(n)).unwrap(), Some(dv(n as u8)), "reopen dedup {n}");
+    }
+
+    // Every recovered free page is genuinely reusable: draining the free list
+    // hands out only pages below high_water and no live dedup page.
+    let dedup_pages: std::collections::HashSet<PageId> =
+        db.dedup_index.referenced_page_ids().into_iter().collect();
+    let base_hw = db.page_store.high_water();
+    for _ in 0..reopened_fll {
+        let p = db.page_store.allocate().unwrap();
+        assert!(p >= FIRST_DATA_PAGE && p < base_hw, "handed out out-of-range page {p}");
+        assert!(!dedup_pages.contains(&p), "handed out live dedup page {p}");
+    }
+}
+
+/// The bitmap decode is a deterministic fixed point: two consecutive reopens of
+/// the same on-disk bitmap (no flush between, so the bytes never change) recover
+/// an identical free list — i.e. the bitmap round-trips its own content exactly.
+#[test]
+fn device_persisted_free_list_reopen_is_a_fixed_point() {
+    let dir = TempDir::new().unwrap();
+    let (page_dev, journal_dev, db) = mk_db_on_device(&dir, 8192, 512);
+    for i in 0u64..120 {
+        db.insert(0, i, v((i / 16) as u8)).unwrap();
+    }
+    make_interior_free_pages(&db, 128);
+    db.flush().unwrap();
+    drop(db);
+
+    let db = Db::open_on_device_with_faults(
+        device_cfg(&dir),
+        FaultController::disabled(),
+        page_dev.clone(),
+        journal_dev.clone(),
+    )
+    .unwrap();
+    let (hw1, fll1) = (db.page_store.high_water(), db.page_store.free_list_len());
+    drop(db); // no flush → on-disk bitmap unchanged
+
+    let db =
+        Db::open_on_device_with_faults(device_cfg(&dir), FaultController::disabled(), page_dev, journal_dev)
+            .unwrap();
+    assert_eq!(db.page_store.high_water(), hw1, "high_water not a fixed point");
+    assert_eq!(db.page_store.free_list_len(), fll1, "free list not a fixed point");
+}
+
+/// The bitmap run relocates (geometric grow) when the free list outgrows its
+/// reserve, and the batched reopen still recovers it. Push high_water past a
+/// data-page boundary (every ~32 128 pages) between two flushes so the second
+/// commit takes the relocation branch, then reopen and confirm integrity.
+#[test]
+fn device_persisted_free_list_run_relocates_on_growth() {
+    let dir = TempDir::new().unwrap();
+    // ~70 000 pages ≈ 287 MiB MemDevice — room to push high_water past a
+    // data-page boundary (~32 128 pages) with headroom for the run + reserve.
+    let page_dev = Arc::new(MemDevice::new(70_000));
+    let journal_dev = Arc::new(MemJournalDevice::new(512));
+    let db = Db::create_on_device_with_faults(
+        device_cfg(&dir),
+        FaultController::disabled(),
+        page_dev.clone(),
+        journal_dev.clone(),
+    )
+    .unwrap();
+
+    for i in 0u64..64 {
+        db.insert(0, i, v(1)).unwrap();
+    }
+    db.flush().unwrap(); // commit 1: small run capacity
+
+    // Grow high_water past a data-page boundary → forces the relocation branch.
+    make_interior_free_pages(&db, 62_000);
+    db.flush().unwrap(); // commit 2: run relocates + grows
+
+    let hw = db.page_store.high_water();
+    let fll = db.page_store.free_list_len();
+    assert!(fll > 30_000, "expected a large free list, got {fll}");
+    drop(db);
+
+    let db = Db::open_on_device_with_faults(
+        device_cfg(&dir),
+        FaultController::disabled(),
+        page_dev,
+        journal_dev,
+    )
+    .unwrap();
+    assert_eq!(db.page_store.high_water(), hw, "high_water regressed after relocation reopen");
+    assert!(db.page_store.free_list_len() <= fll && db.page_store.free_list_len() > 30_000);
+    for i in 0u64..64 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v(1)), "reopen lba {i} after relocation");
+    }
+}
+
+/// The persisted-free-list fast path must preserve the dedup-frontier invariant
+/// through the reconciliation (not the bounded scan). Setup: gen N persists a
+/// bitmap that includes interior free pages, THEN an uncommitted newer
+/// generation's dedup growth pops those interior pages (`P < page_high_water`)
+/// and makes them durable without a manifest commit. On reopen the gen-N bitmap
+/// still marks `P` free — the fix removes every live-dedup-referenced page from
+/// the loaded free list, so the allocator can never re-hand-out `P`.
+#[test]
+fn device_persisted_free_list_preserves_dedup_frontier() {
+    let dir = TempDir::new().unwrap();
+    let (page_dev, journal_dev, db) = mk_db_on_device(&dir, 8192, 512);
+
+    // Gen N cohort + a pool of interior free pages, all persisted in the bitmap.
+    for n in 1u64..30 {
+        db.put_dedup(h(n), dv(n as u8)).unwrap();
+    }
+    make_interior_free_pages(&db, 200);
+    db.flush().unwrap();
+    let high_water_n = db.manifest().page_high_water;
+    assert_ne!(db.manifest().free_list_head, crate::types::NULL_PAGE);
+    let free_before = db.page_store.free_list_len();
+    assert!(free_before > 0);
+
+    // Between-flush cohort: fresh fingerprints allocate cuckoo pages, popping the
+    // interior free pages (all `< high_water_n`) the gen-N bitmap marks free.
+    for n in 200u64..400 {
+        db.put_dedup(hash_full(n, n.wrapping_mul(7)), dv((n % 250) as u8)).unwrap();
+    }
+    db.dedup_index.flush_meta().unwrap();
+    db.page_store.sync().unwrap();
+
+    // Precondition: dedup now references at least one page BELOW gen-N's
+    // high-water — i.e. an interior page the persisted bitmap still lists free.
+    let interior_dedup = db
+        .dedup_index
+        .referenced_page_ids()
+        .into_iter()
+        .any(|p| p < high_water_n);
+    assert!(
+        interior_dedup,
+        "test precondition not met: no dedup page landed below gen-N high_water {high_water_n} \
+         (free pool exhausted?)"
+    );
+    assert_eq!(db.manifest().page_high_water, high_water_n, "manifest advanced unexpectedly");
+
+    // Crash: manifest stays at gen N (with the gen-N bitmap).
+    drop(db);
+
+    let db = Db::open_on_device_with_faults(
+        device_cfg(&dir),
+        FaultController::disabled(),
+        page_dev,
+        journal_dev,
+    )
+    .unwrap();
+
+    // The reconciliation dropped every live dedup page from the loaded free list,
+    // so no allocation aliases a page the dedup index still points at — including
+    // the interior pages the gen-N bitmap wrongly marked free.
+    let dedup_pages: std::collections::HashSet<PageId> =
+        db.dedup_index.referenced_page_ids().into_iter().collect();
+    assert!(
+        dedup_pages.iter().any(|&p| p < high_water_n),
+        "recovered dedup index lost its interior references"
+    );
+    for _ in 0..db.page_store.free_list_len() + 8 {
+        let p = db.page_store.allocate().unwrap();
+        assert!(
+            !dedup_pages.contains(&p),
+            "allocator handed out live dedup page {p} after bitmap reopen"
+        );
+    }
+}
+
+/// Zero regression on the file backend: it keeps its EOF-bounded open scan and
+/// never persists a free-list bitmap, so `free_list_head` stays `NULL_PAGE`.
+#[test]
+fn file_backend_never_persists_free_list_head() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::create_with_config(device_cfg(&dir)).unwrap();
+    for i in 0u64..128 {
+        db.insert(0, i, v(1)).unwrap();
+    }
+    db.flush().unwrap();
+    assert_eq!(
+        db.manifest().free_list_head,
+        crate::types::NULL_PAGE,
+        "file backend must not persist a free-list bitmap"
+    );
+    drop(db);
+
+    let db = Db::open_with_config(device_cfg(&dir)).unwrap();
+    assert_eq!(db.manifest().free_list_head, crate::types::NULL_PAGE);
+    for i in 0u64..128 {
+        assert_eq!(db.get(0, i).unwrap(), Some(v(1)), "file reopen lba {i}");
+    }
+}
+
+/// `--ignored` fault-injection: a free-list-bitmap commit that fails at the
+/// manifest fsync (after the bitmap chain is durable) must not corrupt free-list
+/// recovery — the DB reopens and the dedup-frontier invariant still holds.
+#[test]
+#[ignore]
+fn device_free_list_commit_fault_reopens_consistent() {
+    let dir = TempDir::new().unwrap();
+    let page_dev = Arc::new(MemDevice::new(8192));
+    let journal_dev = Arc::new(MemJournalDevice::new(512));
+    let faults = FaultController::new();
+    let db = Db::create_on_device_with_faults(
+        device_cfg(&dir),
+        faults.clone(),
+        page_dev.clone(),
+        journal_dev.clone(),
+    )
+    .unwrap();
+
+    for n in 1u64..30 {
+        db.put_dedup(h(n), dv(n as u8)).unwrap();
+    }
+    make_interior_free_pages(&db, 200);
+    db.flush().unwrap();
+
+    // Arm a failure at the manifest fsync of the NEXT commit (after the bitmap
+    // chain has been written + synced).
+    faults.install(
+        crate::testing::faults::FaultPoint::ManifestFsyncBefore,
+        1,
+        crate::testing::faults::FaultAction::Error,
+    );
+    for n in 200u64..260 {
+        db.put_dedup(hash_full(n, n.wrapping_mul(7)), dv((n % 250) as u8)).ok();
+    }
+    let _ = db.flush(); // expected to error at the injected fault
+    faults.clear();
+    drop(db);
+
+    let db = Db::open_on_device_with_faults(
+        device_cfg(&dir),
+        FaultController::disabled(),
+        page_dev,
+        journal_dev,
+    )
+    .unwrap();
+    // Whichever generation won, no allocation may alias a live dedup page.
+    let dedup_pages: std::collections::HashSet<PageId> =
+        db.dedup_index.referenced_page_ids().into_iter().collect();
+    for _ in 0..db.page_store.free_list_len() + 8 {
+        let p = db.page_store.allocate().unwrap();
+        assert!(!dedup_pages.contains(&p), "handed out live dedup page {p} after fault reopen");
+    }
+    for n in 1u64..30 {
+        assert_eq!(db.get_dedup(&h(n)).unwrap(), Some(dv(n as u8)), "gen-N dedup {n} lost");
+    }
+}

@@ -181,6 +181,22 @@ impl PageStore {
         Ok(())
     }
 
+    /// Classify pages in `[from, to)` as free (`Free`-typed or all-zero) WITHOUT
+    /// mutating any store state or `high_water`. The device open uses this to
+    /// recover only the tiny tail `[page_high_water, frontier)` above the
+    /// persisted free-list bitmap's range — usually empty (it is non-empty only
+    /// when an uncommitted newer generation grew the dedup index past the
+    /// committed high-water before a crash). See `db::lifecycle::open`.
+    pub fn scan_free_range(&self, from: PageId, to: PageId) -> Result<Vec<PageId>> {
+        let capacity = self.device.len_pages()?;
+        let to = to.min(capacity);
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        let (_high_water, free_list) = scan_free_list(self.device.as_ref(), from, to)?;
+        Ok(free_list)
+    }
+
     /// Open an existing page store. `grow_chunk` is the batch size used
     /// for subsequent file extensions (does not affect the scan). The
     /// scan rebuilds the in-memory free list by walking pages from

@@ -530,6 +530,22 @@ impl CuckooHash {
         chain_max.max(data_max).max(self.meta_page_id)
     }
 
+    /// Every page id this index physically references — the meta chain pages,
+    /// the stable meta head, and all allocated data pages. The device-path open
+    /// reconciles the persisted free-list bitmap against this set so a page the
+    /// live dedup index points at can never be re-handed-out by `allocate()`
+    /// (the same per-page invariant the bounded scan enforced by reading page
+    /// headers). Read from memory — the meta chain + page table were loaded from
+    /// the durable chain at open — so this is O(referenced pages), no disk IO.
+    pub fn referenced_page_ids(&self) -> Vec<PageId> {
+        let inner = self.inner.lock();
+        let mut pids: Vec<PageId> = Vec::with_capacity(inner.meta_chain.len() + 1);
+        pids.push(self.meta_page_id);
+        pids.extend(inner.meta_chain.iter().copied());
+        pids.extend(inner.page_table.iter().copied().filter(|&pid| pid != 0));
+        pids
+    }
+
     // ---- private ---------------------------------------------------
 
     fn flush_meta_locked(&self, inner: &mut parking_lot::MutexGuard<'_, Inner>) -> Result<()> {
