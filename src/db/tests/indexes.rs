@@ -535,6 +535,89 @@ fn apply_lane_h2_metrics_record_wakeups_and_bursts() {
     );
 }
 
+// -------- saturation backstop (Step 1: online-resize prerequisite) ----------
+
+#[test]
+fn saturated_cuckoo_drops_promote_without_failing_commit() {
+    // P0 backstop: when the on-disk cuckoo is saturated
+    // (`MAX_CUCKOO_CHAIN` exceeded), a `DedupPut` must NOT fail the
+    // enclosing commit (which also carries the L2P remap) and must not
+    // wedge recovery. Instead the promote is dropped (a future dedup
+    // miss), the L2P remap still lands, and rc is left untouched.
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    // Tiny modulus → a single 112-slot page saturates fast.
+    cfg.dedup_cuckoo_buckets = 4;
+    let db = Db::create_with_config(cfg.clone()).unwrap();
+
+    // Saturate the single cuckoo page. 300 distinct hashes is well past a
+    // page's capacity, so `put_dedup` (auto-commit) starts dropping — and,
+    // per the P0 fix, dropping never errors the commit.
+    for i in 1u64..=300 {
+        db.put_dedup(h(i), dv(1)).unwrap();
+    }
+    let dropped_before = db.metrics_snapshot().dedup_promote_dropped_saturated;
+    assert!(
+        dropped_before > 0,
+        "the fill must have saturated the page (drops observed)",
+    );
+
+    // A promote co-committed with the L2P remap that points the same LBA
+    // at the same PBA (mirroring the real promote path). The cuckoo is
+    // full, so the promote must be dropped — but the commit (and its L2P
+    // remap) must still succeed.
+    let sat_hash = h(999_999);
+    let lba: Lba = 7;
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, lba, v(200), None);
+    tx.put_dedup(sat_hash, dv(200));
+    tx.commit()
+        .expect("commit must succeed even when the cuckoo is saturated");
+
+    // Co-committed L2P remap landed.
+    assert_eq!(
+        db.multi_get(BOOTSTRAP_VOLUME_ORD, &[lba]).unwrap()[0].map(|x| x.head_pba()),
+        Some(200),
+        "the co-committed L2P remap must land even though the promote dropped",
+    );
+    // Promote dropped: absent from the index, and rc(200) was NOT
+    // incremented. The dropped insert is genuinely new (`old_pba == None`),
+    // so skipping the +1 incref keeps rc consistent with the unchanged
+    // cuckoo — no leak, no underflow.
+    assert_eq!(db.get_dedup(&sat_hash).unwrap(), None);
+    assert_eq!(db.get_refcount(200).unwrap(), 0);
+    assert!(
+        db.metrics_snapshot().dedup_promote_dropped_saturated > dropped_before,
+        "the dropped promote must be counted",
+    );
+
+    // Checkpoint the saturated table + reopen. Recovery must not wedge and
+    // the persisted state must be consistent: the placed fills survive, the
+    // dropped promote is still absent (no phantom un-rc'd entry), and rc is
+    // still consistent. (Before the P0 fix, a saturating DedupPut on the
+    // apply/flush path returned `Err`, which failed the commit/checkpoint.)
+    db.flush().unwrap();
+    drop(db);
+    let db2 = Db::open_with_config(cfg).unwrap();
+    assert_eq!(
+        db2.get_dedup(&h(1)).unwrap(),
+        Some(dv(1)),
+        "a placed fill entry must survive flush + reopen",
+    );
+    assert_eq!(
+        db2.get_dedup(&sat_hash).unwrap(),
+        None,
+        "the dropped promote must stay absent across reopen (no phantom entry)",
+    );
+    assert_eq!(
+        db2.get_refcount(200).unwrap(),
+        0,
+        "rc must stay consistent for the dropped promote across reopen",
+    );
+    // The reopened DB is fully usable.
+    db2.put_dedup(h(1), dv(1)).unwrap();
+}
+
 // The "dedup_reverse" test block (round_trip / register_and_scan /
 // unregister / scan_sees_entries / tx_atomically / survives_reopen) retired
 // alongside the paged_reverse module + DedupReverse WAL ops (manifest v9 /

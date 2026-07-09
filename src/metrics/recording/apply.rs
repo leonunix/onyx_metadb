@@ -455,6 +455,16 @@ impl MetaMetrics {
         );
     }
 
+    /// Dedup promotes dropped because the cuckoo table was saturated
+    /// (`MAX_CUCKOO_CHAIN` exceeded). See the field doc in `metrics/mod.rs`.
+    pub(crate) fn record_dedup_promote_dropped_saturated(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.dedup_promote_dropped_saturated
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_dedup_put_stages(&self, timings: DedupPutStageTimings) {
         record_duration(
             &self.dedup_put_l0_insert_us,

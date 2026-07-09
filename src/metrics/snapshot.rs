@@ -222,6 +222,7 @@ pub struct MetaMetricsSnapshot {
     pub dedup_apply_forward_put_count: u64,
     pub dedup_apply_forward_put_us: u64,
     pub dedup_apply_forward_put_max_us: u64,
+    pub dedup_promote_dropped_saturated: u64,
     pub dedup_apply_forward_delete_count: u64,
     pub dedup_apply_forward_delete_us: u64,
     pub dedup_apply_forward_delete_max_us: u64,

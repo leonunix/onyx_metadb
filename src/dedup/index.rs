@@ -260,14 +260,20 @@ impl DedupIndex {
         Ok(())
     }
 
+    /// Returns `Ok(true)` if placed, `Ok(false)` if the cuckoo was
+    /// saturated and the entry was dropped (see `CuckooHash::put_with_metrics`).
+    /// L0/L1 are warmed only on a real placement — an L0 fp reservation
+    /// with no backing L3 entry would shadow fingerprint siblings.
     pub(crate) fn put_with_metrics(
         &self,
         hash: Hash8,
         value: DedupValue,
         lsn: Lsn,
         timings: &mut DedupPutStageTimings,
-    ) -> Result<()> {
-        self.cuckoo.put_with_metrics(hash, value, lsn, timings)?;
+    ) -> Result<bool> {
+        if !self.cuckoo.put_with_metrics(hash, value, lsn, timings)? {
+            return Ok(false);
+        }
         let fp = fp_of(&hash);
         let started = std::time::Instant::now();
         self.sketch.insert(fp);
@@ -275,17 +281,20 @@ impl DedupIndex {
         let started = std::time::Instant::now();
         self.l1.put(fp, hash, value);
         timings.l1_put += started.elapsed();
-        Ok(())
+        Ok(true)
     }
 
+    /// Batch put. Returns the set of hashes DROPPED because the cuckoo
+    /// was saturated (empty = all placed). L0/L1 are warmed only for
+    /// placed entries.
     pub(crate) fn put_many_with_metrics(
         &self,
         entries: &[(Hash8, DedupValue)],
         lsn: Lsn,
         timings: &mut DedupPutStageTimings,
-    ) -> Result<()> {
+    ) -> Result<Vec<Hash8>> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let cuckoo_entries: Vec<CuckooPutEntry> = entries
             .iter()
@@ -294,9 +303,13 @@ impl DedupIndex {
                 value: *value,
             })
             .collect();
-        self.cuckoo
+        let dropped = self
+            .cuckoo
             .put_many_with_metrics(&cuckoo_entries, lsn, timings)?;
         for (hash, value) in entries {
+            if !dropped.is_empty() && dropped.contains(hash) {
+                continue;
+            }
             let fp = fp_of(hash);
             let started = std::time::Instant::now();
             self.sketch.insert(fp);
@@ -305,7 +318,7 @@ impl DedupIndex {
             self.l1.put(fp, *hash, *value);
             timings.l1_put += started.elapsed();
         }
-        Ok(())
+        Ok(dropped)
     }
 
     pub fn delete(&self, hash: &Hash8, lsn: Lsn) -> Result<()> {
@@ -354,13 +367,17 @@ impl DedupIndex {
         Ok(())
     }
 
+    /// Returns `Ok(true)` if placed/accepted, `Ok(false)` if dropped on
+    /// cuckoo saturation. Drainer-off: mirrors `put_with_metrics`.
+    /// Drainer-on: staging always accepts (`Ok(true)`); any saturation
+    /// drop happens later in `drain_shard_once`.
     pub(crate) fn stage_put_with_metrics(
         &self,
         hash: Hash8,
         value: DedupValue,
         lsn: Lsn,
         timings: &mut DedupPutStageTimings,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if !self.drainer_enabled {
             return self.put_with_metrics(hash, value, lsn, timings);
         }
@@ -368,17 +385,21 @@ impl DedupIndex {
         let started = std::time::Instant::now();
         self.sketch.insert(fp_of(&hash));
         timings.l0_insert += started.elapsed();
-        Ok(())
+        Ok(true)
     }
 
+    /// Batch stage. Returns hashes DROPPED on cuckoo saturation (empty =
+    /// none). Drainer-off: mirrors `put_many_with_metrics`. Drainer-on:
+    /// staging accepts everything (returns empty); saturation drops
+    /// happen at drain time.
     pub(crate) fn stage_put_many_with_metrics(
         &self,
         entries: &[(Hash8, DedupValue)],
         lsn: Lsn,
         timings: &mut DedupPutStageTimings,
-    ) -> Result<()> {
+    ) -> Result<Vec<Hash8>> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if !self.drainer_enabled {
             return self.put_many_with_metrics(entries, lsn, timings);
@@ -389,7 +410,7 @@ impl DedupIndex {
             self.sketch.insert(fp_of(hash));
             timings.l0_insert += started.elapsed();
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     /// Stage a delete (tombstone).
@@ -442,9 +463,26 @@ impl DedupIndex {
                 // Cuckoo only — L0 already carries each fp from
                 // `stage_put`; warm L1 with the drained value separately
                 // so post-drain reads hit memory.
-                self.cuckoo
+                let dropped = self
+                    .cuckoo
                     .put_many_with_metrics(&cuckoo_entries, max_put_lsn, &mut timings)?;
+                if !dropped.is_empty() {
+                    // Table saturated during drain: drop these promotes
+                    // (a future dedup miss, not a failure). Their rc was
+                    // already staged at apply time, so this is a bounded
+                    // rc OVER-count (leak, the safe direction) until the
+                    // entry is re-promoted or reclaimed by GC. Critically,
+                    // we must NOT re-stage or error — that would wedge the
+                    // flush/checkpoint barrier (`preempt_and_drain_for_checkpoint`).
+                    tracing::warn!(
+                        dropped = dropped.len(),
+                        "dedup cuckoo saturated during drain; promotes dropped (bounded rc over-count)"
+                    );
+                }
                 for entry in &cuckoo_entries {
+                    if !dropped.is_empty() && dropped.contains(&entry.hash) {
+                        continue;
+                    }
                     self.l1.put(fp_of(&entry.hash), entry.hash, entry.value);
                 }
             }

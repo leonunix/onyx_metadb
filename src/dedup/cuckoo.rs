@@ -233,22 +233,40 @@ impl CuckooHash {
 
     /// Insert / overwrite `hash → value`. Returns `Ok(())` on
     /// success; `Err(Corruption("cuckoo full"))` only if the
-    /// eviction chain exceeds [`MAX_CUCKOO_CHAIN`].
+    /// eviction chain exceeds [`MAX_CUCKOO_CHAIN`]. This hard-error
+    /// contract is preserved for the verifier / tests / direct callers;
+    /// the apply path uses `put_with_metrics`, which reports saturation
+    /// as a dropped entry instead (a skipped dedup promote, never a
+    /// failed commit — see `put_with_metrics`).
     pub fn put(&self, hash: Hash8, value: DedupValue, lsn: Lsn) -> Result<()> {
         let mut timings = DedupPutStageTimings::default();
-        self.put_with_metrics(hash, value, lsn, &mut timings)
+        if !self.put_with_metrics(hash, value, lsn, &mut timings)? {
+            return Err(MetaDbError::Corruption(format!(
+                "cuckoo eviction chain exceeded MAX_CUCKOO_CHAIN={MAX_CUCKOO_CHAIN}; \
+                 load factor too high — increase bucket_count and rebuild"
+            )));
+        }
+        Ok(())
     }
 
+    /// Returns `Ok(true)` if the entry was placed (or overwrote an
+    /// existing one), `Ok(false)` if the table is saturated for this
+    /// hash (`MAX_CUCKOO_CHAIN` exceeded) and the entry was dropped.
+    /// A dropped entry is NOT a hard error: the apply path turns it
+    /// into a skipped dedup promote (a future dedup miss) so the
+    /// commit — and its co-committed L2P remap — still succeeds.
     pub(crate) fn put_with_metrics(
         &self,
         hash: Hash8,
         value: DedupValue,
         lsn: Lsn,
         timings: &mut DedupPutStageTimings,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Idempotent overwrite: if the entry already exists, replace
         // the value in place and return. This keeps semantics
-        // identical to the LSM `put` we are replacing.
+        // identical to the LSM `put` we are replacing. An overwrite
+        // never reaches `evict_and_insert`, so saturation only ever
+        // affects genuinely-new inserts.
         let (b1, b2) = self.candidate_buckets(&hash);
         let candidate_count = if bucket_offset(b1).0 == bucket_offset(b2).0 {
             1
@@ -261,7 +279,7 @@ impl CuckooHash {
             let updated = self.update_existing(bucket, &hash, value, lsn, Some(&mut *timings))?;
             timings.cuckoo_update_existing += started.elapsed();
             if updated {
-                return Ok(());
+                return Ok(true);
             }
         }
 
@@ -292,25 +310,31 @@ impl CuckooHash {
             timings.cuckoo_try_insert_empty += started.elapsed();
             if inserted {
                 self.bump_len(1);
-                return Ok(());
+                return Ok(true);
             }
         }
         // Both candidate pages are full — kick off a cuckoo chain.
         let started = std::time::Instant::now();
-        self.evict_and_insert(insert_order[0], hash, value, lsn, Some(&mut *timings))?;
+        let placed = self.evict_and_insert(insert_order[0], hash, value, lsn, Some(&mut *timings))?;
         timings.cuckoo_evict_and_insert += started.elapsed();
-        self.bump_len(1);
-        Ok(())
+        if placed {
+            self.bump_len(1);
+        }
+        Ok(placed)
     }
 
+    /// Batch put. Returns the set of hashes that were DROPPED because the
+    /// table was saturated (`MAX_CUCKOO_CHAIN` exceeded); an empty vec
+    /// means everything was placed. Dropping is not a hard error — see
+    /// `put_with_metrics`.
     pub(crate) fn put_many_with_metrics(
         &self,
         entries: &[CuckooPutEntry],
         lsn: Lsn,
         timings: &mut DedupPutStageTimings,
-    ) -> Result<()> {
+    ) -> Result<Vec<Hash8>> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut positions: HashMap<Hash8, usize> = HashMap::new();
         let mut unique = Vec::with_capacity(entries.len());
@@ -331,10 +355,13 @@ impl CuckooHash {
         }
         let use_batch = affected_pages.len().saturating_mul(2) <= unique.len();
         if !use_batch {
+            let mut dropped = Vec::new();
             for entry in &unique {
-                self.put_with_metrics(entry.hash, entry.value, lsn, timings)?;
+                if !self.put_with_metrics(entry.hash, entry.value, lsn, timings)? {
+                    dropped.push(entry.hash);
+                }
             }
-            return Ok(());
+            return Ok(dropped);
         }
 
         self.put_many_grouped_by_page(&unique, lsn, timings)
@@ -738,6 +765,11 @@ impl CuckooHash {
         .map(|result| result.unwrap_or(false))
     }
 
+    /// Returns `Ok(true)` if the entry found a home within
+    /// `MAX_CUCKOO_CHAIN` evictions, `Ok(false)` if the chain was
+    /// exceeded (table saturated for this hash → drop). No longer
+    /// errors on saturation; `CuckooHash::put` re-raises the hard
+    /// error for callers that want it.
     fn evict_and_insert(
         &self,
         start_bucket: u64,
@@ -745,8 +777,18 @@ impl CuckooHash {
         mut value: DedupValue,
         lsn: Lsn,
         mut timings: Option<&mut DedupPutStageTimings>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut current_bucket = start_bucket;
+        // Record each victim we displace so a SATURATED (failed) chain can
+        // be rolled back to leave the table byte-for-byte as it was. This
+        // is load-bearing for correctness, not just tidiness: `put_with_metrics`
+        // reporting `false` means the apply path skips this hash's rc incref,
+        // so the hash must NOT be left lingering in the table — otherwise it
+        // would be a live dedup entry whose PBA was never incref'd, and a
+        // later decref could drive rc to 0 and premature-free a referenced
+        // block (CRC corruption). On the SUCCESS path (empty slot found) the
+        // swaps are legitimate relocations and are kept.
+        let mut undo: Vec<(u64, usize, Hash8, DedupValue)> = Vec::new();
         for step in 0..MAX_CUCKOO_CHAIN {
             // Try empty slot first (unlikely but cheap to check).
             let inserted = match timings.as_deref_mut() {
@@ -756,22 +798,28 @@ impl CuckooHash {
                 None => self.try_insert_empty_in_page(current_bucket, hash, value, lsn, None)?,
             };
             if inserted {
-                return Ok(());
+                return Ok(true);
             }
-            let victim = match timings.as_deref_mut() {
+            let (victim_hash, victim_value, slot) = match timings.as_deref_mut() {
                 Some(t) => {
                     self.swap_into_victim_slot(current_bucket, hash, value, step, lsn, Some(t))?
                 }
                 None => self.swap_into_victim_slot(current_bucket, hash, value, step, lsn, None)?,
             };
-            hash = victim.0;
-            value = victim.1;
+            undo.push((current_bucket, slot, victim_hash, victim_value));
+            hash = victim_hash;
+            value = victim_value;
             current_bucket = self.alternate_bucket_for_page(&hash, current_bucket);
         }
-        Err(MetaDbError::Corruption(format!(
-            "cuckoo eviction chain exceeded MAX_CUCKOO_CHAIN={MAX_CUCKOO_CHAIN}; \
-             load factor too high — increase bucket_count and rebuild"
-        )))
+        // Chain exceeded: table saturated for this hash. Roll back every
+        // swap in reverse order so each displaced victim returns to its
+        // original slot and the new entry is left absent — the net table
+        // state is unchanged. Then report the drop (not a hard error) so
+        // the apply path degrades it to a skipped dedup promote.
+        for (bucket_id, slot, victim_hash, victim_value) in undo.into_iter().rev() {
+            self.restore_slot(bucket_id, slot, victim_hash, victim_value, lsn)?;
+        }
+        Ok(false)
     }
 
     fn swap_into_victim_slot(
@@ -782,14 +830,32 @@ impl CuckooHash {
         step: usize,
         lsn: Lsn,
         timings: Option<&mut DedupPutStageTimings>,
-    ) -> Result<(Hash8, DedupValue)> {
+    ) -> Result<(Hash8, DedupValue, usize)> {
         self.with_bucket_mut(bucket_id, lsn, timings, |_bitmap, page, bucket_in_page| {
             let start = bucket_in_page * ENTRIES_PER_BUCKET;
             let seed = hash[step % hash.len()] as usize;
             let slot = (start + seed + step) % SLOTS_PER_PAGE;
             let (victim_hash, victim_value) = read_slot(page, slot);
             write_slot(page, slot, &hash, &value);
-            Ok((victim_hash, victim_value))
+            Ok((victim_hash, victim_value, slot))
+        })
+    }
+
+    /// Rewrite `slot` (already occupied) back to `(hash, value)` — used to
+    /// roll back an eviction chain that exceeded `MAX_CUCKOO_CHAIN`. The
+    /// bitmap bit is already set (the slot was occupied throughout the
+    /// chain), so only the slot payload is restored.
+    fn restore_slot(
+        &self,
+        bucket_id: u64,
+        slot: usize,
+        hash: Hash8,
+        value: DedupValue,
+        lsn: Lsn,
+    ) -> Result<()> {
+        self.with_bucket_mut(bucket_id, lsn, None, |_bitmap, page, _bucket_in_page| {
+            write_slot(page, slot, &hash, &value);
+            Ok(())
         })
     }
 
@@ -921,7 +987,7 @@ impl CuckooHash {
         entries: &[CuckooPutEntry],
         lsn: Lsn,
         timings: &mut DedupPutStageTimings,
-    ) -> Result<()> {
+    ) -> Result<Vec<Hash8>> {
         let mut page_ops: HashMap<usize, Vec<CuckooPutEntry>> = HashMap::new();
         for entry in entries {
             let (b1, b2) = self.candidate_buckets(&entry.hash);
@@ -1007,10 +1073,16 @@ impl CuckooHash {
         if inserted != 0 {
             self.bump_len(inserted as i64);
         }
+        // Entries that didn't fit any page in the batch fall back to the
+        // single-put cuckoo-chain path; that path can saturate, so collect
+        // whatever it drops.
+        let mut dropped = Vec::new();
         for entry in remaining {
-            self.put_with_metrics(entry.hash, entry.value, lsn, timings)?;
+            if !self.put_with_metrics(entry.hash, entry.value, lsn, timings)? {
+                dropped.push(entry.hash);
+            }
         }
-        Ok(())
+        Ok(dropped)
     }
 
     fn update_put_candidates_on_page_locked(

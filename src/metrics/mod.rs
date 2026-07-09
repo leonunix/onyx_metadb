@@ -379,6 +379,11 @@ pub struct MetaMetrics {
     dedup_apply_forward_put_count: AtomicU64,
     dedup_apply_forward_put_us: AtomicU64,
     dedup_apply_forward_put_max_us: AtomicU64,
+    // Dedup promotes DROPPED because the on-disk cuckoo was saturated
+    // (`MAX_CUCKOO_CHAIN` exceeded). The apply path degrades a saturated
+    // promote to a future dedup miss instead of failing the commit; a
+    // rising value means the modulus needs to grow (Step 2 online resize).
+    dedup_promote_dropped_saturated: AtomicU64,
     dedup_apply_forward_delete_count: AtomicU64,
     dedup_apply_forward_delete_us: AtomicU64,
     dedup_apply_forward_delete_max_us: AtomicU64,

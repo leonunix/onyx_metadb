@@ -238,6 +238,7 @@ impl MetaMetrics {
             dedup_apply_forward_put_count: load(&self.dedup_apply_forward_put_count),
             dedup_apply_forward_put_us: load(&self.dedup_apply_forward_put_us),
             dedup_apply_forward_put_max_us: load(&self.dedup_apply_forward_put_max_us),
+            dedup_promote_dropped_saturated: load(&self.dedup_promote_dropped_saturated),
             dedup_apply_forward_delete_count: load(&self.dedup_apply_forward_delete_count),
             dedup_apply_forward_delete_us: load(&self.dedup_apply_forward_delete_us),
             dedup_apply_forward_delete_max_us: load(&self.dedup_apply_forward_delete_max_us),

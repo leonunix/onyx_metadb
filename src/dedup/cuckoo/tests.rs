@@ -76,6 +76,92 @@ fn many_inserts_below_load_factor() {
 }
 
 #[test]
+fn saturation_drops_instead_of_erroring() {
+    // `bucket_count=1` collapses every hash onto a single page. Cuckoo
+    // eviction can't reach 100% fill, so at some point a fresh distinct
+    // hash has nowhere to go and the eviction chain is exceeded. That is
+    // the saturation case — and it must DROP, not error.
+    let (_d, c) = make_index(1);
+    let mut timings = crate::metrics::DedupPutStageTimings::default();
+    let mut placed = 0u64;
+    let mut dropped = 0u64;
+    let mut placed_hashes = Vec::new();
+    // Push well past a single page's capacity so saturation is certain.
+    for i in 0..400u64 {
+        // `put_with_metrics` NEVER errors — it reports a drop as Ok(false).
+        if c
+            .put_with_metrics(h64(i), dv64(1), (100 + i) as Lsn, &mut timings)
+            .unwrap()
+        {
+            placed += 1;
+            placed_hashes.push(h64(i));
+        } else {
+            dropped += 1;
+        }
+    }
+    assert!(dropped > 0, "the page must saturate and drop some inserts");
+    assert!(placed > 0, "some inserts must be placed before saturation");
+    // A dropped insert must not bump the live count.
+    assert_eq!(c.approx_len(), placed);
+    // Everything reported as placed is still readable.
+    for hash in &placed_hashes {
+        assert_eq!(c.get(hash).unwrap(), Some(dv64(1)));
+    }
+    // The public `put` preserves the hard-error contract for the
+    // verifier / direct callers once the table is saturated.
+    assert!(
+        c.put(h64(1_000_000), dv64(1), 999).is_err(),
+        "CuckooHash::put must still hard-error on saturation"
+    );
+}
+
+#[test]
+fn batch_put_reports_dropped_hashes_on_saturation() {
+    // Saturate the single page, then batch-put a mix of an overwrite of
+    // a known-present hash (placed) and fresh distinct hashes (dropped),
+    // and confirm the returned dropped set is exactly the fresh ones.
+    let (_d, c) = make_index(1);
+    let mut timings = crate::metrics::DedupPutStageTimings::default();
+    // h64(0) is guaranteed placed (first insert into an empty page).
+    assert!(c
+        .put_with_metrics(h64(0), dv64(7), 100, &mut timings)
+        .unwrap());
+    // Saturate the rest of the page.
+    for i in 1..400u64 {
+        c.put_with_metrics(h64(i), dv64(1), (100 + i) as Lsn, &mut timings)
+            .unwrap();
+    }
+    // Fresh hashes far outside the placed set — certain to be dropped.
+    let fresh_a = h64(9_000_001);
+    let fresh_b = h64(9_000_002);
+    let batch = vec![
+        CuckooPutEntry {
+            hash: h64(0),
+            value: dv64(200),
+        }, // overwrite of a present hash → placed
+        CuckooPutEntry {
+            hash: fresh_a,
+            value: dv64(201),
+        }, // fresh → dropped (page full)
+        CuckooPutEntry {
+            hash: fresh_b,
+            value: dv64(202),
+        }, // fresh → dropped
+    ];
+    let dropped = c.put_many_with_metrics(&batch, 500, &mut timings).unwrap();
+    let dropped_set: std::collections::HashSet<Hash8> = dropped.into_iter().collect();
+    assert_eq!(
+        dropped_set,
+        [fresh_a, fresh_b]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>(),
+    );
+    // The overwrite landed; the fresh drops did not.
+    assert_eq!(c.get(&h64(0)).unwrap(), Some(dv64(200)));
+    assert_eq!(c.get(&fresh_a).unwrap(), None);
+}
+
+#[test]
 fn iter_returns_all_live_pairs() {
     let (_d, c) = make_index(64);
     for i in 0..50u8 {

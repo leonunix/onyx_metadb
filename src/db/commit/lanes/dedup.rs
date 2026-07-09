@@ -69,11 +69,25 @@ impl Db {
                     .collect();
                 let mut put_timings = DedupPutStageTimings::default();
                 let started = std::time::Instant::now();
-                dedup_index.stage_put_many_with_metrics(&entries, lsn, &mut put_timings)?;
+                let dropped =
+                    dedup_index.stage_put_many_with_metrics(&entries, lsn, &mut put_timings)?;
                 metrics
                     .record_dedup_forward_put_batch(pending_puts.len() as u64, started.elapsed());
                 metrics.record_dedup_put_stages(put_timings);
-                for (_, value, old_pba, idx) in pending_puts.drain(..) {
+                for (hash, value, old_pba, idx) in pending_puts.drain(..) {
+                    // A promote dropped on cuckoo saturation: skip its rc
+                    // delta entirely and count it. Saturation only hits
+                    // genuinely-new inserts (overwrites short-circuit before
+                    // the eviction chain), so `old_pba` is None here and
+                    // there is nothing to decref — skipping the +1 incref
+                    // keeps rc consistent with the unchanged cuckoo. The
+                    // co-committed L2P remap (separate op / lane) still
+                    // lands; this is a future dedup miss, not a failed commit.
+                    if !dropped.is_empty() && dropped.contains(&hash) {
+                        metrics.record_dedup_promote_dropped_saturated(1);
+                        outcomes.push((idx, ApplyOutcome::Dedup));
+                        continue;
+                    }
                     let new_pba = value.head_pba();
                     if old_pba != Some(new_pba) {
                         if let Some(op) = old_pba {
@@ -112,15 +126,22 @@ impl Db {
                     if rc >= *min_rc {
                         let mut put_timings = DedupPutStageTimings::default();
                         let started = std::time::Instant::now();
-                        dedup_index.stage_put_with_metrics(*hash, *value, lsn, &mut put_timings)?;
+                        let placed = dedup_index
+                            .stage_put_with_metrics(*hash, *value, lsn, &mut put_timings)?;
                         metrics.record_dedup_forward_put(started.elapsed());
                         metrics.record_dedup_put_stages(put_timings);
-                        let new_pba = value.head_pba();
-                        if *old_pba != Some(new_pba) {
-                            if let Some(op) = *old_pba {
-                                stage_rc_decref_if_live(op)?;
+                        if placed {
+                            let new_pba = value.head_pba();
+                            if *old_pba != Some(new_pba) {
+                                if let Some(op) = *old_pba {
+                                    stage_rc_decref_if_live(op)?;
+                                }
+                                stage_rc(new_pba, 1)?;
                             }
-                            stage_rc(new_pba, 1)?;
+                        } else {
+                            // Dropped on saturation: skip rc (new insert ⇒
+                            // old_pba None ⇒ nothing to decref, no incref).
+                            metrics.record_dedup_promote_dropped_saturated(1);
                         }
                     }
                     outcomes.push((idx, ApplyOutcome::Dedup));
@@ -158,14 +179,22 @@ impl Db {
                     let applied = cur.as_ref() == Some(old_value);
                     if applied {
                         let mut put_timings = DedupPutStageTimings::default();
-                        dedup_index.stage_put_with_metrics(*hash, *new_value, lsn, &mut put_timings)?;
+                        let placed = dedup_index
+                            .stage_put_with_metrics(*hash, *new_value, lsn, &mut put_timings)?;
                         metrics.record_dedup_forward_put(started.elapsed());
                         metrics.record_dedup_put_stages(put_timings);
-                        let old_pba = old_value.head_pba();
-                        let new_pba = new_value.head_pba();
-                        if old_pba != new_pba {
-                            stage_rc_decref_if_live(old_pba)?;
-                            stage_rc(new_pba, 1)?;
+                        if placed {
+                            let old_pba = old_value.head_pba();
+                            let new_pba = new_value.head_pba();
+                            if old_pba != new_pba {
+                                stage_rc_decref_if_live(old_pba)?;
+                                stage_rc(new_pba, 1)?;
+                            }
+                        } else {
+                            // Defensive: a compare-put overwrites an existing
+                            // (matched) entry, which cannot saturate. Count it
+                            // and skip rc so we stay consistent if it ever does.
+                            metrics.record_dedup_promote_dropped_saturated(1);
                         }
                     }
                     outcomes.push((idx, ApplyOutcome::DedupCompare { applied }));
