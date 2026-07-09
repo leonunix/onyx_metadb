@@ -636,3 +636,46 @@ fn device_free_list_commit_fault_reopens_consistent() {
         assert_eq!(db.get_dedup(&h(n)).unwrap(), Some(dv(n as u8)), "gen-N dedup {n} lost");
     }
 }
+
+/// `verify::verify_page_store` (the device-generic counterpart of
+/// `verify_path`, added so a chunklet-backed metadb instance can be audited
+/// offline the same way a plain-file one can via `metadb-verify`) must work
+/// against a `MemDevice`-backed store exactly like it does against a file —
+/// `PageStore` only ever sees the device through the `PageDevice` trait, so
+/// there is nothing file-specific left for this check to exercise.
+#[test]
+fn device_verify_page_store_reports_clean() {
+    let dir = TempDir::new().unwrap();
+    let (page_dev, journal_dev, db) = mk_db_on_device(&dir, 8192, 512);
+
+    for i in 0u64..300 {
+        db.insert(0, i, v((i / 32) as u8)).unwrap();
+    }
+    for n in 1u64..40 {
+        db.put_dedup(h(n), dv(n as u8)).unwrap();
+    }
+    db.flush().unwrap();
+    drop(db);
+
+    // Reopen over the SAME device bytes through the normal recovery path
+    // (WAL replay + frontier reconciliation) — an offline audit must see
+    // exactly the state a live engine would recover to, not a hand-rolled
+    // reopen that skips generation/frontier bookkeeping. `Db::verify` then
+    // runs the same reachability scan `verify_path` runs for the file
+    // backend, just against the already-open `Db`.
+    let db = Db::open_on_device_with_faults(
+        device_cfg(&dir),
+        FaultController::disabled(),
+        page_dev,
+        journal_dev,
+    )
+    .unwrap();
+    let report = db.verify(crate::verify::VerifyOptions::default()).unwrap();
+    assert!(report.is_clean(), "unexpected issues: {:?}", report.issues);
+    assert!(
+        report.orphan_pages.is_empty(),
+        "unexpected orphans: {:?}",
+        report.orphan_pages
+    );
+    assert!(report.high_water > FIRST_DATA_PAGE);
+}

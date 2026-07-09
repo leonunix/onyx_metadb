@@ -93,6 +93,12 @@ fn print_human(report: &VerifyReport) {
     println!("live_pages: {}", report.live_pages);
     println!("free_pages: {}", report.free_pages);
     println!("orphans: {}", report.orphan_pages.len());
+    if !report.orphan_page_types.is_empty() {
+        println!("orphan_page_types:");
+        for (pid, page_type) in &report.orphan_page_types {
+            println!("  - {pid}: {page_type:?}");
+        }
+    }
     if !report.warnings.is_empty() {
         println!("warnings:");
         for warning in &report.warnings {
@@ -128,6 +134,15 @@ fn print_json(report: &VerifyReport) {
     println!(
         "  \"orphan_pages\": {},",
         json_u64_array(&report.orphan_pages)
+    );
+    let orphan_type_strs: Vec<String> = report
+        .orphan_page_types
+        .iter()
+        .map(|(pid, page_type)| format!("{pid}:{page_type:?}"))
+        .collect();
+    println!(
+        "  \"orphan_page_types\": {},",
+        json_string_array(&orphan_type_strs)
     );
     println!("  \"warnings\": {},", json_string_array(&report.warnings));
     println!("  \"issues\": {}", json_string_array(&report.issues));

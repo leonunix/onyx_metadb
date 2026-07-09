@@ -1419,6 +1419,7 @@ mod snapshot;
 mod streaming_flush;
 mod bfg_quiesce;
 mod bfg_sync;
+mod verify_audit;
 mod volume;
 
 pub use commit::DeferredOutcomeHandle;

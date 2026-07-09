@@ -53,6 +53,12 @@ pub struct VerifyReport {
     pub live_pages: usize,
     pub free_pages: usize,
     pub orphan_pages: Vec<PageId>,
+    /// `(page_id, page_type)` for every entry in `orphan_pages` whose header
+    /// decoded cleanly — a bare page id isn't actionable; knowing it's e.g. a
+    /// paged-tree leaf vs. a cuckoo bucket page tells us what is actually
+    /// leaking. Parallel diagnostic to `orphan_pages`, not a replacement (an
+    /// orphan with an undecodable header has no entry here).
+    pub orphan_page_types: Vec<(PageId, PageType)>,
     pub issues: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -81,32 +87,59 @@ impl LivePages {
 pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<VerifyReport> {
     let path = path.as_ref();
     let page_store = Arc::new(PageStore::open(path.join("pages.onyx_meta"))?);
-    let mut report = VerifyReport {
-        path: path.to_path_buf(),
-        high_water: page_store.high_water(),
-        ..VerifyReport::default()
-    };
-
     let manifest = match ManifestStore::load_latest(&page_store)? {
-        Some(loaded) => {
-            report.manifest_slot = Some(loaded.slot);
-            report.manifest_sequence = Some(loaded.sequence);
-            report.checkpoint_lsn = Some(loaded.manifest.checkpoint_lsn);
-            loaded
-        }
+        Some(loaded) => loaded,
         None => {
+            let mut report = VerifyReport {
+                path: path.to_path_buf(),
+                high_water: page_store.high_water(),
+                ..VerifyReport::default()
+            };
             report
                 .issues
                 .push("no valid manifest slot could be decoded".into());
             return Ok(report);
         }
     };
+    let mut report = verify_page_store(&page_store, &manifest, options)?;
+    report.path = path.to_path_buf();
+    Ok(report)
+}
+
+/// Device-generic counterpart of [`verify_path`]: audits an already-open
+/// `page_store` against an already-loaded `manifest` instead of opening a
+/// plain-file page store from a path. This is what lets a chunklet-backed (or
+/// any other [`PageDevice`]-backed) metadb instance be audited — `PageStore`
+/// and every check below only ever touch the device through the `PageDevice`
+/// trait, never a file path.
+pub fn verify_page_store(
+    page_store: &Arc<PageStore>,
+    manifest: &LoadedManifest,
+    options: VerifyOptions,
+) -> Result<VerifyReport> {
+    let mut report = VerifyReport {
+        high_water: page_store.high_water(),
+        manifest_slot: Some(manifest.slot),
+        manifest_sequence: Some(manifest.sequence),
+        checkpoint_lsn: Some(manifest.manifest.checkpoint_lsn),
+        ..VerifyReport::default()
+    };
 
     let mut free_pages = BTreeSet::new();
+    // Never-written pages (all-zero, no header ever stamped) — a SUBSET of
+    // `free_pages`. Distinguished from explicitly `PageType::Free`-typed
+    // pages because a live anchor's reserved-but-not-yet-grown-into headroom
+    // (e.g. the device-path free-list bitmap's growth reserve, see
+    // `manifest::catalog_chain_pids_all_slots` / `catalog::free_list_run_pids`)
+    // is legitimately both "live" (anchored, must survive orphan reclaim) and
+    // all-zero (never actually used yet) — that is not a conflict, unlike a
+    // page that WAS written+freed and is somehow still reachable.
+    let mut zero_never_written: BTreeSet<PageId> = BTreeSet::new();
     // BFG: per-L2P-page refcounting was DELETED, so verify no longer
     // cross-checks an array rc. The scan just records which pids passed verify
     // (used below to flag a live page that didn't survive the byte scan).
     let mut scanned_pids: HashSet<PageId> = HashSet::new();
+    let mut typed_pages: BTreeMap<PageId, PageType> = BTreeMap::new();
     for pid in FIRST_DATA_PAGE..page_store.high_water() {
         report.scanned_pages += 1;
         let raw = match page_store.read_page_unchecked(pid) {
@@ -118,6 +151,7 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
         };
         if raw.bytes().iter().all(|b| *b == 0) {
             free_pages.insert(pid);
+            zero_never_written.insert(pid);
             continue;
         }
         if let Err(err) = raw.verify(pid) {
@@ -131,6 +165,7 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
                 if header.page_type == PageType::Free {
                     free_pages.insert(pid);
                 }
+                typed_pages.insert(pid, header.page_type);
                 scanned_pids.insert(pid);
             }
             Err(err) => report
@@ -147,10 +182,16 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
     // (pages reachable from no live root). The page-rc-INDEPENDENT shadows
     // (`check_birth_shadow` / `check_page_deadlist_shadow` /
     // `check_clone_livelist_shadow`) are the structural-soundness oracles now.
-    match collect_live_pages(&page_store, &manifest) {
+    match collect_live_pages(page_store, manifest) {
         Ok(live) => {
             report.live_pages = live.refs.len();
             for (pid, _expected) in &live.refs {
+                if zero_never_written.contains(pid) {
+                    // Reserved-but-unused growth headroom of a live anchor
+                    // (e.g. free-list bitmap reserve) — expected, not a
+                    // conflict; nothing has ever been written here.
+                    continue;
+                }
                 if free_pages.contains(pid) {
                     report
                         .issues
@@ -169,6 +210,9 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
                     continue;
                 }
                 report.orphan_pages.push(pid);
+                if let Some(page_type) = typed_pages.get(&pid) {
+                    report.orphan_page_types.push((pid, *page_type));
+                }
             }
         }
         Err(err) => report.issues.push(format!("live-page walk failed: {err}")),
@@ -184,12 +228,12 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
     }
 
     if options.check_birth_shadow {
-        if let Err(err) = check_birth_shadow(&page_store, &manifest.manifest, &mut report) {
+        if let Err(err) = check_birth_shadow(page_store, &manifest.manifest, &mut report) {
             report
                 .issues
                 .push(format!("birth-shadow check failed: {err}"));
         }
-        if let Err(err) = check_page_deadlist(&page_store, &manifest.manifest, &mut report) {
+        if let Err(err) = check_page_deadlist(page_store, &manifest.manifest, &mut report) {
             report
                 .issues
                 .push(format!("page-deadlist check failed: {err}"));
@@ -197,7 +241,7 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
     }
 
     if options.check_clone_livelist
-        && let Err(err) = check_clone_livelist(&page_store, &manifest.manifest, &mut report)
+        && let Err(err) = check_clone_livelist(page_store, &manifest.manifest, &mut report)
     {
         report
             .issues
@@ -205,7 +249,7 @@ pub fn verify_path(path: impl AsRef<Path>, options: VerifyOptions) -> Result<Ver
     }
 
     if options.check_clone_birth_shadow
-        && let Err(err) = check_clone_birth_shadow(&page_store, &manifest.manifest, &mut report)
+        && let Err(err) = check_clone_birth_shadow(page_store, &manifest.manifest, &mut report)
     {
         report
             .issues
