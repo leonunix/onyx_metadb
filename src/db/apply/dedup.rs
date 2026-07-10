@@ -25,6 +25,7 @@ use super::*;
 pub(in crate::db) fn apply_dedup_put_with_rc(
     dedup_index: &crate::dedup::DedupIndex,
     refcount_shards: &[Shard],
+    metrics: &MetaMetrics,
     lsn: Lsn,
     bfg: crate::types::Bfg,
     hash: Hash8,
@@ -32,11 +33,31 @@ pub(in crate::db) fn apply_dedup_put_with_rc(
     old_pba: Option<Pba>,
 ) -> Result<()> {
     let new_pba = value.head_pba();
-    // Stage rc deltas BEFORE the dedup_index put so a stale-entry skip
-    // (see below) doesn't leave the index ahead of the rc table on
-    // error. Within a single apply LSN every op is serialized for the
-    // hash's shard, so the `get(old_pba)` floor check below cannot race
-    // with a concurrent rc mutation.
+    // Put the cuckoo entry FIRST so we know whether it was placed or dropped on
+    // saturation, then reconcile rc only for a real placement. A saturating
+    // drop only hits a genuinely-new insert (an overwrite of an existing hash
+    // short-circuits before the eviction chain), so on a drop `old_pba` is
+    // `None` and there is nothing to decref — skipping the +1 incref leaves rc
+    // consistent with the (unchanged) cuckoo. A dropped promote is a future
+    // dedup miss, never a failed apply, so this path can never hard-error and
+    // wedge WAL replay. This matches the lane path's `flush_pending_puts`
+    // (put-many first, rc after, skip rc for dropped hashes).
+    //
+    // Ordering note: the cuckoo write no longer errors on saturation, so
+    // doing it before the rc stage is safe — the only remaining error source
+    // (an rc-shard fault) is a genuine corruption, not the routine full-table
+    // case the old "rc before put" ordering was guarding against.
+    let placed = dedup_index.stage_put(hash, value, lsn)?;
+    if !placed {
+        // Dropped on cuckoo saturation. Same accounting as the lane path's
+        // `flush_pending_puts`: a saturating drop is a genuinely-new insert
+        // (`old_pba == None`), so there is no decref, and skipping the +1
+        // incref keeps rc consistent with the unchanged cuckoo. Count it so the
+        // drop is observable (it otherwise looks like a silent success to the
+        // onyx promote caller).
+        metrics.record_dedup_promote_dropped_saturated(1);
+        return Ok(());
+    }
     if old_pba != Some(new_pba) {
         if let Some(op) = old_pba {
             let sid = shard_for_key(refcount_shards, op);
@@ -54,10 +75,6 @@ pub(in crate::db) fn apply_dedup_put_with_rc(
         let sid = shard_for_key(refcount_shards, new_pba);
         refcount_shards[sid].rc.stage(bfg, new_pba, 1, lsn)?;
     }
-    // rc deltas above stay inline (correctness); only the cuckoo write is
-    // deferred. `stage_put` is the eager `put` verbatim when the drainer
-    // is disabled.
-    dedup_index.stage_put(hash, value, lsn)?;
     Ok(())
 }
 

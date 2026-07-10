@@ -141,6 +141,7 @@ fn commit_then_reopen_recovers_manifest() {
         snapshot_catalog_head_pid: NULL_PAGE,
         page_high_water: 0,
         journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
         free_list_head: 99,
         refcount_shard_roots: bx(&[17, 18, 19, 20]),
         refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
@@ -312,6 +313,7 @@ fn encode_decode_round_trip_with_refcount_and_dedup() {
         snapshot_catalog_head_pid: NULL_PAGE,
         page_high_water: 0,
         journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
         free_list_head: 1234,
         refcount_shard_roots: bx(&[142, 143, 144, 145]),
         refcount_durable_seq: bx(&[
@@ -409,6 +411,7 @@ fn v6_volumes_table_round_trip() {
         snapshot_catalog_head_pid: NULL_PAGE,
         page_high_water: 0,
         journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[50, 51]),
         refcount_durable_seq: bx(&[10, 10]),
@@ -482,6 +485,7 @@ fn dedup_n4_encode_decode_round_trip() {
         snapshot_catalog_head_pid: NULL_PAGE,
         page_high_water: 0,
         journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
         refcount_durable_seq: bx(&[100, 100]),
@@ -762,6 +766,7 @@ fn v11_per_shard_durable_seq_round_trip() {
         snapshot_catalog_head_pid: NULL_PAGE,
         page_high_water: 0,
         journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 11, 12, 13]),
         refcount_durable_seq: bx(&[5, 7, 6, 9]),
@@ -816,6 +821,7 @@ fn encode_rejects_durable_seq_drift_from_checkpoint_lsn() {
         snapshot_catalog_head_pid: NULL_PAGE,
         page_high_water: 0,
         journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
         // Intentionally lower than checkpoint_lsn — drift the
@@ -856,6 +862,7 @@ fn encode_rejects_refcount_durable_seq_length_mismatch() {
         snapshot_catalog_head_pid: NULL_PAGE,
         page_high_water: 0,
         journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2, 3]),
         refcount_durable_seq: bx(&[0, 0]), // wrong length
@@ -953,6 +960,7 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
         snapshot_catalog_head_pid: NULL_PAGE,
         page_high_water: 0,
         journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2, 3]),
         refcount_durable_seq: bx(&[]),
@@ -1133,6 +1141,7 @@ fn v15_round_trip_carries_checkpoint_bfg() {
         snapshot_catalog_head_pid: NULL_PAGE,
         page_high_water: 0,
         journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 20, 30, 40]),
         refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
@@ -1164,6 +1173,7 @@ fn v15_checkpoint_bfg_zero_round_trips() {
         snapshot_catalog_head_pid: NULL_PAGE,
         page_high_water: 0,
         journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[NULL_PAGE; 4]),
         refcount_durable_seq: bx(&[0; 4]),
@@ -1227,6 +1237,68 @@ fn v22_manifest_is_rejected_after_flag_day_to_v23() {
         }
         e => panic!("expected Corruption from v22 manifest, got {e}"),
     }
+}
+
+// ── v25: online cuckoo dedup-index resize ───────────────────
+
+/// The immediate prior on-disk version (v24, no `dedup_migration_old_head`) is
+/// flag-day rejected by the v25 decoder — the field insert at offset 108 shifts
+/// the whole variable region, so a v24 body is not layout-compatible.
+#[test]
+fn v24_manifest_is_rejected_after_flag_day_to_v25() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
+    {
+        let p = page.payload_mut();
+        p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].copy_from_slice(&24u32.to_le_bytes());
+    }
+    page.seal();
+    match Manifest::decode(&page, &ps).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(
+                msg.contains("unsupported manifest body version") && msg.contains("v25"),
+                "expected v24-rejection message mentioning v25, got: {msg}"
+            );
+        }
+        e => panic!("expected Corruption from v24 manifest, got {e}"),
+    }
+}
+
+/// A Growing-phase manifest (non-NULL `dedup_migration_old_head` anchoring the
+/// OLD cuckoo table) must round-trip the new field byte-equivalent through
+/// encode + decode. `NULL_PAGE` (Single phase) is already exercised by every
+/// other round-trip test via `Manifest::empty()`.
+#[test]
+fn v25_round_trip_carries_dedup_migration_old_head() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let m = Manifest {
+        body_version: MANIFEST_BODY_VERSION,
+        checkpoint_lsn: 4242,
+        checkpoint_bfg: 0,
+        last_processed_buffer_seq: 0,
+        lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
+        // Growing: the NEW table head rides `dedup_index_shard_heads[0][0]`
+        // (77 below); this anchors the OLD (frozen) table being drained.
+        dedup_migration_old_head: 55,
+        free_list_head: NULL_PAGE,
+        refcount_shard_roots: bx(&[10, 20, 30, 40]),
+        refcount_durable_seq: bx(&[4242, 4242, 4242, 4242]),
+        dedup_shards: 1,
+        dedup_index_shard_heads: one_shard(&[77]),
+        next_snapshot_id: 1,
+        next_volume_ord: 1,
+        snapshots: Vec::new(),
+        volumes: vec![boot_vol_at(4, &[1, 2, 3, 4], 4242)],
+    };
+    let decoded = roundtrip(&dir, ps, m);
+    assert_eq!(decoded.dedup_migration_old_head, 55);
+    assert_eq!(decoded.dedup_index_shard_heads[0].as_ref(), &[77]);
 }
 
 /// The load-bearing crash-safety invariant: every commit COWs both chains to

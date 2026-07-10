@@ -26,6 +26,20 @@ fn open_or_create_with_faults(
             cfg.livelist_condense_min_segments = n;
         }
     }
+    // Cuckoo online-resize gate: a SMALL initial modulus so the resizer thread
+    // (see `spawn_cuckoo_resizer`) actually crosses the grow watermark under the
+    // onyx-mix dedup keyspace and drives real two-table migrations against the
+    // reference model. Only consulted at CREATE (reopen reads the modulus from
+    // the cuckoo meta head); the parent's create env is inherited by children,
+    // so a mid-migration child restart resumes the same Growing db. Unset =
+    // engine default (1M), which never resizes under the soak keyspace.
+    if let Ok(raw) = std::env::var("METADB_SOAK_CUCKOO_BUCKETS") {
+        if let Ok(n) = raw.parse::<u64>() {
+            if n >= 1 {
+                cfg.dedup_cuckoo_buckets = n;
+            }
+        }
+    }
     // BFG gate: the soak defaults to direct-fold
     // (l2p_buffer_enabled=false), but every onyx/production config runs BUFFER
     // mode (l2p_buffer_enabled=true; nvme-detailed.toml etc.). Setting

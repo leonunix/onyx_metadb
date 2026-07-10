@@ -1501,10 +1501,20 @@ impl Db {
         // stable across opens — the manifest slot only needs to be
         // re-stamped to the same value. (The legacy `dedup_reverse`
         // / `paged_reverse` half is gone as of manifest v9.)
+        // Flushes BOTH cuckoo tables' meta during an online resize (no-op for
+        // the frozen OLD table unless a page was allocated).
         self.dedup_index.flush_meta()?;
         let _ = generation;
         manifest.dedup_index_shard_heads =
             vec![vec![self.dedup_index.meta_page_id()].into_boxed_slice()].into_boxed_slice();
+        // v25: persist the online-resize phase. `Some(old_head)` ⇒ Growing;
+        // `None` ⇒ Single. This single choke point (also hit by flush + snapshot
+        // ops) means every manifest commit records the current phase, so a crash
+        // recovers exactly Single(old) / Growing(new+old) / Single(new).
+        manifest.dedup_migration_old_head = self
+            .dedup_index
+            .old_meta_page_id()
+            .unwrap_or(crate::types::NULL_PAGE);
         Ok(DedupManifestUpdate {
             old_dedup_heads: Vec::new(),
         })
@@ -1519,6 +1529,109 @@ impl Db {
         // is stable across opens and data pages are owned inline.
         let _ = update.old_dedup_heads;
         Ok(())
+    }
+
+    // ---- online dedup-index modulus resize (driven by the onyx scanner) ----
+    //
+    // These fire the incremental two-table migration. `begin` / `finish` mutate
+    // the `DedupIndex` phase under `apply_gate.write()` (no in-flight apply
+    // during the table swap) and make the transition durable via a
+    // dedup-phase-only manifest commit (same standalone-commit discipline as the
+    // volume-lifecycle ops). `migrate_step` runs under `apply_gate.read()`
+    // concurrently with the front end. The Single→Growing→Single manifest states
+    // are the only durable resize state, so a crash recovers exactly one of
+    // them; `open_growing` resumes an interrupted migration idempotently.
+
+    /// Commit a manifest that differs from the last only in the dedup-index
+    /// heads + migration phase. Everything else (volume roots, refcount roots,
+    /// `checkpoint_lsn`, replay watermarks) is carried forward unchanged. Caller
+    /// holds `apply_gate.write()`.
+    fn commit_dedup_phase_manifest(&self) -> Result<()> {
+        let mut mstate = self.manifest_state.lock();
+        let update = self.prepare_dedup_manifest_update(&mut mstate.manifest, 0)?;
+        let mut manifest = mstate.manifest.clone();
+        mstate.store.commit(&mut manifest)?;
+        drop(mstate);
+        self.finish_dedup_manifest_update(update, 0)
+    }
+
+    /// Enter the Growing phase: allocate a `target_bucket_count`-bucket table,
+    /// demote the current one to OLD, and persist the transition. Idempotent —
+    /// a no-op if a resize is already in progress. `target_bucket_count` must
+    /// exceed the current modulus (else `DedupIndex::begin_grow` errors).
+    pub fn dedup_resize_begin(&self, target_bucket_count: u64) -> Result<()> {
+        {
+            let _apply = self.apply_gate.write();
+            if self.dedup_index.is_growing() {
+                return Ok(());
+            }
+            let (s1, s2) = self.dedup_index.current_seeds();
+            // Fast under the gate: allocate the empty NEW table, demote current
+            // to OLD, flip the phase, persist Growing. `begin_grow` deliberately
+            // does NOT walk OLD to reseed L0 here (that walk is what froze
+            // commits for seconds on a large table); the retained pre-grow
+            // sketch keeps reads correct in the meantime.
+            self.dedup_index.begin_grow(target_bucket_count, s1, s2)?;
+            self.commit_dedup_phase_manifest()?;
+        }
+        // OFF the apply gate: rebuild a NEW-capacity L0 from the OLD ∪ NEW union
+        // to restore a low false-positive rate. Runs concurrently with commits
+        // (no gate held), so a large table no longer stalls the front end. A
+        // crash here is harmless — reopen resumes Growing and rebuilds L0 in
+        // `open_growing`.
+        self.dedup_index.reseed_l0_after_grow()
+    }
+
+    /// Copy up to `max_pages` OLD pages (from `start_page`, wrapping) into NEW.
+    /// Returns progress + the resume cursor + `wrapped` (a full pass completed →
+    /// the caller may call [`Self::dedup_resize_finish`]). No-op (`growing =
+    /// false`) when not resizing. Bound `max_pages` so the `apply_gate.read()`
+    /// held here stays short (it blocks flush / snapshot writers).
+    pub fn dedup_migrate_step(
+        &self,
+        start_page: usize,
+        max_pages: usize,
+    ) -> Result<crate::dedup::MigrateStepStats> {
+        let _apply = self.apply_gate.read();
+        let lsn = self.last_applied_lsn_best_effort();
+        self.dedup_index.migrate_step(start_page, max_pages, lsn)
+    }
+
+    /// Complete the resize: drop OLD, persist the Single-phase manifest durably,
+    /// then free OLD's now-unreferenced pages. No-op when not resizing. The page
+    /// free is epoch-deferred (bytes stay valid until no reader could walk them),
+    /// so a lagging `migrate_step` reader is safe; and it happens only AFTER the
+    /// Single manifest is durable, so a crash before the free reclaims the pages
+    /// on the next open instead of orphaning a still-referenced OLD table.
+    pub fn dedup_resize_finish(&self) -> Result<()> {
+        let freed = {
+            let _apply = self.apply_gate.write();
+            if !self.dedup_index.is_growing() {
+                return Ok(());
+            }
+            let freed = self.dedup_index.finish_swap()?;
+            self.commit_dedup_phase_manifest()?;
+            freed
+        };
+        if !freed.is_empty() {
+            let generation = self.last_applied_lsn_best_effort();
+            for pid in &freed {
+                self.page_cache.invalidate(*pid);
+            }
+            if let Err(err) = self.page_store.free_many(&freed, generation) {
+                tracing::warn!(
+                    freed = freed.len(),
+                    error = %err,
+                    "dedup resize: failed to free OLD cuckoo pages (reclaimed on next open)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Online-resize status for `onyx status` / the scanner's grow trigger.
+    pub fn dedup_migration_status(&self) -> crate::dedup::DedupMigrationStatus {
+        self.dedup_index.migration_status()
     }
 
     /// Paged-array refcount no longer needs per-shard guards held

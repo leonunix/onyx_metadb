@@ -474,6 +474,114 @@ fn dangling_unwritten_page_without_writer_still_errors() {
     );
 }
 
+// ── online-resize migration primitives (put_if_absent / migrate_page_into) ──
+
+#[test]
+fn put_if_absent_does_not_overwrite_or_duplicate() {
+    let (_d, c) = make_index(64);
+    // Absent → inserted.
+    assert_eq!(
+        c.put_if_absent(h64(1), dv64(10), 100).unwrap(),
+        PutIfAbsentOutcome::Inserted
+    );
+    assert_eq!(c.get(&h64(1)).unwrap(), Some(dv64(10)));
+    // Present → left untouched (walker never clobbers a fresher value),
+    // reported AlreadyPresent.
+    assert_eq!(
+        c.put_if_absent(h64(1), dv64(999), 101).unwrap(),
+        PutIfAbsentOutcome::AlreadyPresent
+    );
+    assert_eq!(c.get(&h64(1)).unwrap(), Some(dv64(10)));
+    // A subsequent front-end overwrite is also respected as "present".
+    c.put(h64(1), dv64(20), 102).unwrap();
+    assert_eq!(
+        c.put_if_absent(h64(1), dv64(7), 103).unwrap(),
+        PutIfAbsentOutcome::AlreadyPresent
+    );
+    assert_eq!(c.get(&h64(1)).unwrap(), Some(dv64(20)));
+    // Never duplicated: still exactly one live entry.
+    assert_eq!(c.approx_len(), 1);
+}
+
+#[test]
+fn put_if_absent_drops_when_candidate_pages_full() {
+    // bucket_count=1 collapses every hash onto a single page. Fill it via the
+    // normal (evicting) put path, then a fresh put_if_absent has nowhere to go
+    // — it does NOT evict, so it drops (never errors).
+    let (_d, c) = make_index(1);
+    let mut timings = crate::metrics::DedupPutStageTimings::default();
+    let mut placed = Vec::new();
+    for i in 0..400u64 {
+        if c
+            .put_with_metrics(h64(i), dv64(i), 100 + i, &mut timings)
+            .unwrap()
+        {
+            placed.push(i);
+        }
+    }
+    assert!(!placed.is_empty());
+    // A fresh distinct hash on the saturated page must drop.
+    assert_eq!(
+        c.put_if_absent(h64(9_999_999), dv64(1), 1000).unwrap(),
+        PutIfAbsentOutcome::Dropped
+    );
+    // A hash already present is reported present, never re-inserted or evicted.
+    assert_eq!(
+        c.put_if_absent(h64(placed[0]), dv64(2), 1001).unwrap(),
+        PutIfAbsentOutcome::AlreadyPresent
+    );
+}
+
+#[test]
+fn migrate_page_into_copies_all_live_entries_idempotently() {
+    // OLD: 60 buckets → 3 data pages. NEW: 200 buckets → 8 data pages, so the
+    // bucket geometry (and thus each hash's candidate pages) genuinely differs
+    // between the two tables — exercising the remap, not a trivial page copy.
+    let (_do, old) = make_index(60);
+    let (_dn, new) = make_index(200);
+    for i in 0..100u64 {
+        old.put(h64(i), dv64(i), 100 + i).unwrap();
+    }
+    assert_eq!(old.recount().unwrap(), 100);
+
+    let old_pages = old.inner.lock().page_table.len();
+    for pi in 0..old_pages {
+        old.migrate_page_into(&new, pi, 1000).unwrap();
+    }
+    // Every OLD entry now lives in NEW with its exact value.
+    for i in 0..100u64 {
+        assert_eq!(new.get(&h64(i)).unwrap(), Some(dv64(i)), "i={i}");
+    }
+    assert_eq!(new.recount().unwrap(), 100);
+
+    // Re-walking OLD is idempotent: nothing inserted, everything already present.
+    let mut already = 0u64;
+    for pi in 0..old_pages {
+        let s = old.migrate_page_into(&new, pi, 1001).unwrap();
+        assert_eq!(s.inserted, 0, "no fresh inserts on re-walk (page {pi})");
+        already += s.already_present;
+    }
+    assert_eq!(already, 100);
+    assert_eq!(new.recount().unwrap(), 100);
+}
+
+#[test]
+fn migrate_preserves_fresher_new_value_over_stale_old() {
+    // The delete/overwrite-during-migration invariant in miniature: a value
+    // already in NEW is never clobbered by the OLD copy the walker carries.
+    let (_do, old) = make_index(32);
+    let (_dn, new) = make_index(64);
+    old.put(h64(5), dv64(500), 100).unwrap(); // stale value in OLD
+    new.put(h64(5), dv64(999), 200).unwrap(); // fresher value already in NEW
+    let old_pages = old.inner.lock().page_table.len();
+    for pi in 0..old_pages {
+        old.migrate_page_into(&new, pi, 300).unwrap();
+    }
+    // NEW keeps its fresher value; the stale OLD copy did not win.
+    assert_eq!(new.get(&h64(5)).unwrap(), Some(dv64(999)));
+    assert_eq!(new.recount().unwrap(), 1);
+}
+
 #[test]
 fn page_associative_insert_avoids_sub_bucket_false_full() {
     let (_d, c) = make_index(32);
@@ -488,4 +596,77 @@ fn page_associative_insert_avoids_sub_bucket_false_full() {
         hash[..8].copy_from_slice(&i.to_be_bytes());
         assert_eq!(c.get(&hash).unwrap(), Some(dv((i & 0xff) as u8)));
     }
+}
+
+#[test]
+fn referenced_page_ids_returns_distinct_pages() {
+    // Regression for the box-found OLD-page leak. `referenced_page_ids` used to
+    // push `meta_page_id` AND extend with `meta_chain`, whose element 0 IS
+    // `meta_page_id` (the chain is rooted at the stable head) — so the head was
+    // returned TWICE. `finish_swap` feeds the OLD table's referenced pages to
+    // `page_store.free_many`, which rejects a batch containing a duplicate page
+    // id ("duplicate free of page N in one batch") and then leaks the entire
+    // OLD table on every resize swap. Every physical page must appear once.
+    //
+    // A modulus large enough to need a multi-page meta chain, so the chain
+    // pages beyond the head are exercised too.
+    let (_d, c) = make_index(20_000);
+    for i in 0..400u64 {
+        let mut hash = [0u8; 8];
+        hash.copy_from_slice(&i.to_be_bytes());
+        c.put(hash, dv((i & 0xff) as u8), 100 + i).unwrap();
+    }
+    c.flush_meta().unwrap();
+
+    let ids = c.referenced_page_ids();
+    let mut deduped = ids.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        ids.len(),
+        "referenced_page_ids must contain no duplicate page ids (got {ids:?})",
+    );
+    assert_eq!(
+        ids.iter().filter(|&&p| p == c.meta_page_id()).count(),
+        1,
+        "the stable meta head page id must appear exactly once",
+    );
+}
+
+#[test]
+fn put_if_absent_many_grouped_skips_present_inserts_absent_no_dup() {
+    // The batched migration primitive (Issue D fix: one coalesced page write
+    // per OLD page instead of per entry) must match single-entry put-if-absent
+    // semantics: skip hashes already present (fresher NEW value wins), insert
+    // the absent ones exactly once, count each, and never duplicate a hash.
+    let (_d, c) = make_index(600);
+    c.put_if_absent(h(1), dv(1), 100).unwrap();
+    c.put_if_absent(h(2), dv(2), 101).unwrap();
+
+    let entries = vec![
+        // present — a fresher value is offered but must be IGNORED (put-if-absent)
+        CuckooPutEntry { hash: h(1), value: dv(99) },
+        CuckooPutEntry { hash: h(2), value: dv(99) },
+        // absent — must be inserted
+        CuckooPutEntry { hash: h(3), value: dv(3) },
+        CuckooPutEntry { hash: h(4), value: dv(4) },
+        CuckooPutEntry { hash: h(5), value: dv(5) },
+    ];
+    let stats = c.put_if_absent_many_grouped(&entries, 200).unwrap();
+    assert_eq!(stats.already_present, 2, "h1,h2 present → skipped");
+    assert_eq!(stats.inserted, 3, "h3,h4,h5 inserted");
+    assert_eq!(stats.dropped, 0);
+
+    assert_eq!(c.get(&h(1)).unwrap(), Some(dv(1)), "present entry NOT overwritten");
+    assert_eq!(c.get(&h(2)).unwrap(), Some(dv(2)), "present entry NOT overwritten");
+    assert_eq!(c.get(&h(3)).unwrap(), Some(dv(3)));
+    assert_eq!(c.get(&h(5)).unwrap(), Some(dv(5)));
+    assert_eq!(c.recount().unwrap(), 5, "exactly 5 entries, no duplicates");
+
+    // Idempotent re-run: everything present now, nothing inserted.
+    let again = c.put_if_absent_many_grouped(&entries, 201).unwrap();
+    assert_eq!(again.inserted, 0);
+    assert_eq!(again.already_present, 5);
+    assert_eq!(c.recount().unwrap(), 5);
 }

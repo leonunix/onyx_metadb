@@ -91,6 +91,42 @@ pub(crate) struct CuckooPutEntry {
     pub value: DedupValue,
 }
 
+/// Outcome of [`CuckooHash::put_if_absent`] — the online-resize migration
+/// walker's insert primitive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PutIfAbsentOutcome {
+    /// The hash was absent from NEW and is now placed.
+    Inserted,
+    /// The hash already lived in NEW (a fresher front-end write won, or a
+    /// prior copy already landed). Left byte-for-byte untouched — the walker
+    /// NEVER overwrites, because the OLD value it carries may be stale.
+    AlreadyPresent,
+    /// Both candidate pages were full and the copy was dropped (a future dedup
+    /// miss, not an error). Unreachable in practice: NEW is provisioned at
+    /// `grow_factor×` the OLD bucket count, so its migration-time load factor
+    /// is far below saturation.
+    Dropped,
+}
+
+/// Per-OLD-page tally returned by [`CuckooHash::migrate_page_into`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MigratePageStats {
+    pub inserted: u64,
+    pub already_present: u64,
+    pub dropped: u64,
+}
+
+/// Internal result of the shared atomic-candidate-insert core.
+enum AtomicInsertOutcome {
+    /// Placed into a fresh slot.
+    Inserted,
+    /// The hash was already present (overwritten in place if `overwrite`, else
+    /// left untouched).
+    Present,
+    /// Both candidate pages full; dropped (no eviction).
+    Dropped,
+}
+
 pub struct CuckooHash {
     bucket_count: u64,
     seed1: u64,
@@ -204,6 +240,13 @@ impl CuckooHash {
 
     pub fn bucket_count(&self) -> u64 {
         self.bucket_count
+    }
+
+    /// Number of entries in the page table = total data pages this modulus
+    /// spans (allocated or not). Used by the online-resize walker to bound its
+    /// pass over the OLD table.
+    pub(crate) fn page_count(&self) -> usize {
+        self.inner.lock().page_table.len()
     }
 
     pub fn seeds(&self) -> (u64, u64) {
@@ -365,6 +408,286 @@ impl CuckooHash {
         }
 
         self.put_many_grouped_by_page(&unique, lsn, timings)
+    }
+
+    /// Online-resize migration primitive: insert `hash → value` into this
+    /// (NEW) table ONLY if `hash` is absent from both its candidate pages.
+    /// NEVER overwrites — a concurrent front-end write to NEW is always fresher
+    /// than the (possibly stale) value the walker carries out of OLD, so an
+    /// already-present hash is left untouched ([`PutIfAbsentOutcome::AlreadyPresent`]).
+    ///
+    /// Atomicity: the ≤2 distinct candidate-page shard locks are held across
+    /// the presence check AND the insert, so a concurrent same-hash inserter
+    /// (another walker step, or the Growing-phase front-end insert via
+    /// [`Self::put_overwrite_atomic`], which takes the same locks) can't slip a
+    /// second copy in between. A duplicate across a hash's two candidate pages
+    /// would resurrect on delete — `delete` clears only the first match — so
+    /// this "at most one copy per hash" invariant is load-bearing for
+    /// correctness, not just tidiness.
+    ///
+    /// Does NOT run an eviction chain: if both candidate pages are full the
+    /// entry is dropped. Bounding the lock set to exactly the (≤2) candidate
+    /// pages is what keeps the cross-table lock ordering tractable; eviction
+    /// would pull in arbitrary third pages. NEW's provisioned load factor makes
+    /// a drop unreachable in practice.
+    /// Single-entry put-if-absent. The migration walker now uses the batched
+    /// [`Self::put_if_absent_many_grouped`] (one coalesced page write per OLD
+    /// page instead of per entry), so in production this single-entry form is
+    /// unused — it is retained as the unit-tested reference for the put-if-
+    /// absent contract (presence-skip / no-eviction / drop-when-both-full) that
+    /// the batched path implements. Kept `#[allow(dead_code)]` rather than
+    /// `#[cfg(test)]` so `PutIfAbsentOutcome` stays a normal type.
+    #[allow(dead_code)]
+    pub(crate) fn put_if_absent(
+        &self,
+        hash: Hash8,
+        value: DedupValue,
+        lsn: Lsn,
+    ) -> Result<PutIfAbsentOutcome> {
+        match self.atomic_candidate_insert(hash, value, lsn, false)? {
+            AtomicInsertOutcome::Inserted => Ok(PutIfAbsentOutcome::Inserted),
+            AtomicInsertOutcome::Present => Ok(PutIfAbsentOutcome::AlreadyPresent),
+            AtomicInsertOutcome::Dropped => Ok(PutIfAbsentOutcome::Dropped),
+        }
+    }
+
+    /// Growing-phase front-end insert: overwrite-or-insert `hash → value` in
+    /// this (NEW) table with the SAME ≤2-candidate-page atomicity as
+    /// [`Self::put_if_absent`], so a front-end write and a concurrent migration
+    /// copy of the same hash serialise (whoever runs last wins/skips) and never
+    /// duplicate the hash across its two pages. Returns `Ok(true)` if placed
+    /// (inserted or overwrote), `Ok(false)` if both candidate pages were full
+    /// and the entry was dropped. No eviction chain (see `put_if_absent`);
+    /// dropping is a future dedup miss, unreachable at NEW's provisioned load.
+    ///
+    /// Used ONLY during a resize; the steady-state hot path keeps the evicting
+    /// `put_with_metrics` for zero regression.
+    pub(crate) fn put_overwrite_atomic(
+        &self,
+        hash: Hash8,
+        value: DedupValue,
+        lsn: Lsn,
+    ) -> Result<bool> {
+        match self.atomic_candidate_insert(hash, value, lsn, true)? {
+            AtomicInsertOutcome::Inserted | AtomicInsertOutcome::Present => Ok(true),
+            AtomicInsertOutcome::Dropped => Ok(false),
+        }
+    }
+
+    /// Shared core for [`Self::put_if_absent`] / [`Self::put_overwrite_atomic`]:
+    /// holds the ≤2 distinct candidate-page shard locks across the presence
+    /// check AND the (non-evicting) insert. `overwrite` decides the
+    /// already-present branch — rewrite the value in place (`true`, front-end)
+    /// or leave it untouched (`false`, migration walker). Either way returns
+    /// [`AtomicInsertOutcome::Present`] for a hit.
+    fn atomic_candidate_insert(
+        &self,
+        hash: Hash8,
+        value: DedupValue,
+        lsn: Lsn,
+        overwrite: bool,
+    ) -> Result<AtomicInsertOutcome> {
+        let (b1, b2) = self.candidate_buckets(&hash);
+        let (p1, bip1) = bucket_offset(b1);
+        let (p2, bip2) = bucket_offset(b2);
+        // Distinct candidate pages, each carrying its bucket-in-page.
+        let mut candidates: Vec<(usize, usize)> = vec![(p1, bip1)];
+        if p2 != p1 {
+            candidates.push((p2, bip2));
+        }
+
+        // Lock the distinct shards these pages fall in (sorted + deduped so two
+        // pages that hash to the same shard don't deadlock), and hold them for
+        // the whole check-and-insert.
+        let mut lock_shards: Vec<usize> = candidates
+            .iter()
+            .map(|(pi, _)| pi & (BUCKET_LOCK_SHARDS - 1))
+            .collect();
+        lock_shards.sort_unstable();
+        lock_shards.dedup();
+        let _guards: Vec<MutexGuard<'_, ()>> = lock_shards
+            .iter()
+            .map(|&shard| self.bucket_locks[shard].lock())
+            .collect();
+
+        // Resolve current pids (bounds-checked); page_table is fixed-length so
+        // a single read is a stable snapshot for the locked pages.
+        let pids: Vec<PageId> = {
+            let inner = self.inner.lock();
+            let mut out = Vec::with_capacity(candidates.len());
+            for &(pi, _) in &candidates {
+                let pid = *inner.page_table.get(pi).ok_or_else(|| {
+                    MetaDbError::Corruption(format!(
+                        "cuckoo atomic insert page_idx {pi} outside page_table len {}",
+                        inner.page_table.len(),
+                    ))
+                })?;
+                out.push(pid);
+            }
+            out
+        };
+
+        // Load the allocated candidate pages and run the presence check. An
+        // unallocated candidate page (pid == 0) trivially can't hold the hash.
+        struct Cand {
+            page_idx: usize,
+            bip: usize,
+            pid: PageId,
+            page: Option<Page>,
+            bitmap: u128,
+            free: usize,
+        }
+        let mut cands: Vec<Cand> = Vec::with_capacity(candidates.len());
+        for (i, &(pi, bip)) in candidates.iter().enumerate() {
+            let pid = pids[i];
+            if pid == 0 {
+                cands.push(Cand {
+                    page_idx: pi,
+                    bip,
+                    pid: 0,
+                    page: None,
+                    bitmap: 0,
+                    free: SLOTS_PER_PAGE,
+                });
+                continue;
+            }
+            let mut page = self.page_cache.get_for_modify(pid)?;
+            let bitmap = read_bitmap(&page);
+            if let Some(slot) = find_slot_in_loaded_page(&page, bitmap, &hash) {
+                if overwrite {
+                    write_slot(&mut page, slot, &hash, &value);
+                    let mut header = page.header()?;
+                    header.generation = lsn.max(header.generation);
+                    page.write_header(&header);
+                    page.seal();
+                    self.page_store
+                        .write_page_for_class(pid, &page, IoLaneClass::Dedup)?;
+                    self.page_cache.replace_or_insert(pid, Arc::new(page));
+                }
+                return Ok(AtomicInsertOutcome::Present);
+            }
+            let free = SLOTS_PER_PAGE - bitmap.count_ones() as usize;
+            cands.push(Cand {
+                page_idx: pi,
+                bip,
+                pid,
+                page: Some(page),
+                bitmap,
+                free,
+            });
+        }
+
+        // Target selection (no eviction): pack into an already-allocated
+        // candidate page that has room (most free first) to minimise the NEW
+        // table's page count; only allocate a fresh page when neither
+        // allocated candidate has a free slot; drop when both are full.
+        let allocated_target = cands
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.pid != 0 && c.free > 0)
+            .max_by_key(|(_, c)| c.free)
+            .map(|(idx, _)| idx);
+        let target_idx = match allocated_target {
+            Some(idx) => idx,
+            None => match cands.iter().position(|c| c.pid == 0) {
+                Some(idx) => idx,
+                None => return Ok(AtomicInsertOutcome::Dropped),
+            },
+        };
+
+        // Materialise the target page, allocating on disk if it was empty.
+        let (target_pid, mut page, mut bitmap) = {
+            let c = &mut cands[target_idx];
+            if c.pid == 0 {
+                let pid = self.page_store.allocate()?;
+                {
+                    let mut inner = self.inner.lock();
+                    inner.page_table[c.page_idx] = pid;
+                    inner.meta_dirty = true;
+                }
+                (pid, new_data_page(), 0u128)
+            } else {
+                (c.pid, c.page.take().expect("allocated page loaded"), c.bitmap)
+            }
+        };
+
+        let start = cands[target_idx].bip * ENTRIES_PER_BUCKET;
+        let mut inserted = false;
+        for offset in 0..SLOTS_PER_PAGE {
+            let slot = (start + offset) % SLOTS_PER_PAGE;
+            if bitmap & (1u128 << slot) == 0 {
+                write_slot(&mut page, slot, &hash, &value);
+                bitmap |= 1u128 << slot;
+                inserted = true;
+                break;
+            }
+        }
+        if !inserted {
+            // Only reachable if the chosen page filled between the free-slot
+            // count and here — impossible while we hold the shard lock — so
+            // treat as a drop defensively rather than panicking.
+            return Ok(AtomicInsertOutcome::Dropped);
+        }
+        write_bitmap(&mut page, bitmap);
+        let mut header = page.header()?;
+        header.generation = lsn.max(header.generation);
+        page.write_header(&header);
+        page.seal();
+        self.page_store
+            .write_page_for_class(target_pid, &page, IoLaneClass::Dedup)?;
+        self.page_cache.replace_or_insert(target_pid, Arc::new(page));
+        self.bump_len(1);
+        Ok(AtomicInsertOutcome::Inserted)
+    }
+
+    /// Migrate every live entry on OLD page `old_page_idx` into `new`, one
+    /// [`Self::put_if_absent`] per entry. Called on the OLD (frozen) table
+    /// during an online resize.
+    ///
+    /// Lock ordering (load-bearing): this holds OLD's `old_page_idx` page-shard
+    /// lock across the NEW inserts, and `put_if_absent` then takes NEW's shard
+    /// locks — always **OLD-before-NEW**. Delete-during-Growing takes the same
+    /// OLD page-shard lock before touching NEW, so a delete and a copy of the
+    /// same hash serialise: whichever runs first, the other sees the settled
+    /// state (delete-first → copy re-reads OLD and skips the now-absent entry;
+    /// copy-first → delete clears both tables). This closes the only dangerous
+    /// migration race (delete-vs-copy resurrection). OLD is insert-frozen during
+    /// Growing, so reading its live slots under the shard lock sees a stable
+    /// set — the NEW/OLD tables are distinct `CuckooHash` instances with
+    /// distinct `bucket_locks`, so holding an OLD lock while taking a NEW lock
+    /// is not reentrant.
+    pub(crate) fn migrate_page_into(
+        &self,
+        new: &CuckooHash,
+        old_page_idx: usize,
+        lsn: Lsn,
+    ) -> Result<MigratePageStats> {
+        let _shard = self.bucket_locks[old_page_idx & (BUCKET_LOCK_SHARDS - 1)].lock();
+        let pid = {
+            let inner = self.inner.lock();
+            inner.page_table.get(old_page_idx).copied().unwrap_or(0)
+        };
+        if pid == 0 {
+            return Ok(MigratePageStats::default());
+        }
+        let page = self.page_cache.get(pid)?;
+        let bitmap = read_bitmap(&page);
+        // Collect this OLD page's live entries, then insert them into NEW in ONE
+        // batched, single-`write_sealed_page_runs` operation instead of a
+        // synchronous page write per entry. The OLD page-shard lock is held
+        // across the whole batch (OLD-before-NEW), so a concurrent
+        // delete-from-OLD still can't interleave and resurrect a copy.
+        let mut entries: Vec<CuckooPutEntry> = Vec::new();
+        for slot in 0..SLOTS_PER_PAGE {
+            if bitmap & (1u128 << slot) != 0 {
+                let (h, v) = read_slot(&page, slot);
+                entries.push(CuckooPutEntry {
+                    hash: h,
+                    value: v,
+                });
+            }
+        }
+        new.put_if_absent_many_grouped(&entries, lsn)
     }
 
     /// Remove the entry for `hash`. Returns `true` iff a matching slot
@@ -566,8 +889,20 @@ impl CuckooHash {
     /// the durable chain at open — so this is O(referenced pages), no disk IO.
     pub fn referenced_page_ids(&self) -> Vec<PageId> {
         let inner = self.inner.lock();
+        // `meta_chain[0]` IS `self.meta_page_id` — the chain is rooted at the
+        // stable head (`build_chain_pages`/`read_chain` both anchor element 0 at
+        // the head; see the paged_meta round-trip tests). So the head is already
+        // covered by extending `meta_chain`; pushing `meta_page_id` again would
+        // return the head TWICE. That is harmless for the max/membership callers
+        // but fatal for `finish_swap` → `page_store.free_many`, which rejects a
+        // batch containing a duplicate page id ("duplicate free of page N") and
+        // then leaks the whole OLD table on every resize swap. Each physical
+        // page must appear exactly once.
+        debug_assert!(
+            inner.meta_chain.first().copied() == Some(self.meta_page_id),
+            "meta_chain must be rooted at the stable head page id"
+        );
         let mut pids: Vec<PageId> = Vec::with_capacity(inner.meta_chain.len() + 1);
-        pids.push(self.meta_page_id);
         pids.extend(inner.meta_chain.iter().copied());
         pids.extend(inner.page_table.iter().copied().filter(|&pid| pid != 0));
         pids
@@ -1085,6 +1420,170 @@ impl CuckooHash {
         Ok(dropped)
     }
 
+    /// Batched put-if-absent for the online-resize migration walker. Places
+    /// every entry from ONE OLD page into NEW, writing each touched NEW page
+    /// **once** (a single coalesced `write_sealed_page_runs`) instead of one
+    /// synchronous page write per entry.
+    ///
+    /// Semantics match [`Self::put_if_absent`]: presence-skip (a hash already in
+    /// either candidate page is left untouched — the front end's fresher value
+    /// wins), no eviction, and drop when both candidate pages are full
+    /// (unreachable at NEW's provisioned ≤0.5 load, but counted). Batching only
+    /// changes the IO pattern — the per-entry synchronous write storm was
+    /// saturating the shared chunklet meta LD and starving foreground writes for
+    /// the whole (minutes-long) migration.
+    ///
+    /// Concurrency: this locks every touched NEW page-shard for the whole
+    /// check-and-insert (so a concurrent same-hash inserter can't duplicate a
+    /// hash across its two pages), exactly like the single-entry path. The
+    /// caller ([`Self::migrate_page_into`]) holds the OLD page-shard lock across
+    /// this call, preserving the OLD-before-NEW order that stops a concurrent
+    /// delete-from-OLD from resurrecting a copied entry.
+    pub(crate) fn put_if_absent_many_grouped(
+        &self,
+        entries: &[CuckooPutEntry],
+        lsn: Lsn,
+    ) -> Result<MigratePageStats> {
+        let mut stats = MigratePageStats::default();
+        if entries.is_empty() {
+            return Ok(stats);
+        }
+        let mut timings = DedupPutStageTimings::default();
+
+        // Group each entry under BOTH its candidate pages (mirrors
+        // `put_many_grouped_by_page`).
+        let mut page_ops: HashMap<usize, Vec<CuckooPutEntry>> = HashMap::new();
+        for entry in entries {
+            let (b1, b2) = self.candidate_buckets(&entry.hash);
+            page_ops
+                .entry(bucket_offset(b1).0)
+                .or_default()
+                .push(*entry);
+            if bucket_offset(b2).0 != bucket_offset(b1).0 {
+                page_ops
+                    .entry(bucket_offset(b2).0)
+                    .or_default()
+                    .push(*entry);
+            }
+        }
+        let mut page_indices: Vec<usize> = page_ops.keys().copied().collect();
+        page_indices.sort_unstable();
+        // Lock every touched NEW shard (sorted + deduped → no self-deadlock).
+        // NEW's `bucket_locks` array is distinct from OLD's; the caller already
+        // holds OLD's lock, so this is OLD-before-NEW globally.
+        let mut lock_shards: Vec<usize> = page_indices
+            .iter()
+            .map(|page_idx| page_idx & (BUCKET_LOCK_SHARDS - 1))
+            .collect();
+        lock_shards.sort_unstable();
+        lock_shards.dedup();
+        let _guards: Vec<MutexGuard<'_, ()>> = lock_shards
+            .iter()
+            .map(|&shard| self.bucket_locks[shard].lock())
+            .collect();
+
+        let mut pages: HashMap<usize, BatchPageState> = HashMap::new();
+        // Phase 1 (read-only presence scan): a hash present in EITHER candidate
+        // page is skipped and counted `already_present` (put-if-absent).
+        let mut applied: HashSet<Hash8> = HashSet::new();
+        for page_idx in page_indices.iter().copied() {
+            let Some(candidates) = page_ops.get(&page_idx) else {
+                continue;
+            };
+            for hash in
+                self.scan_present_on_page_locked(page_idx, candidates, &mut timings, &mut pages)?
+            {
+                applied.insert(hash);
+            }
+        }
+        let already_present = applied.len() as u64;
+        // Phase 2: insert the absent entries (no eviction), accumulating dirty
+        // pages; `applied` grows so each hash is inserted into only one page.
+        let mut inserted_total = 0u64;
+        for page_idx in page_indices.iter().copied() {
+            let Some(candidates) = page_ops.get(&page_idx) else {
+                continue;
+            };
+            let (inserted_here, hashes) = self.insert_put_candidates_on_page_locked(
+                page_idx,
+                candidates,
+                &applied,
+                &mut timings,
+                &mut pages,
+            )?;
+            inserted_total = inserted_total.saturating_add(inserted_here);
+            for hash in hashes {
+                applied.insert(hash);
+            }
+        }
+        // Write every dirtied NEW page ONCE (coalesced writev submission).
+        let mut dirty_pages = Vec::new();
+        for state in pages.values_mut() {
+            if !state.dirty {
+                continue;
+            }
+            write_bitmap(&mut state.page, state.bitmap);
+            let mut header = state.page.header()?;
+            header.generation = lsn.max(header.generation);
+            state.page.write_header(&header);
+            state.page.seal();
+            dirty_pages.push((state.page_id, Arc::new(state.page.clone())));
+        }
+        self.page_store.write_sealed_page_runs(dirty_pages.clone())?;
+        for (page_id, page) in dirty_pages {
+            self.page_cache.replace_or_insert(page_id, page);
+        }
+        drop(_guards);
+        if inserted_total != 0 {
+            self.bump_len(inserted_total as i64);
+        }
+
+        stats.already_present = already_present;
+        stats.inserted = inserted_total;
+        // Every unique input entry is present, inserted, or dropped (both
+        // candidate pages full).
+        stats.dropped = (entries.len() as u64).saturating_sub(already_present + inserted_total);
+        Ok(stats)
+    }
+
+    /// Read-only presence scan of `candidates` against the loaded page
+    /// `page_idx`. Returns the hashes already stored there. Used by
+    /// [`Self::put_if_absent_many_grouped`] to implement put-if-absent's skip
+    /// without the overwrite that [`Self::update_put_candidates_on_page_locked`]
+    /// performs.
+    fn scan_present_on_page_locked(
+        &self,
+        page_idx: usize,
+        candidates: &[CuckooPutEntry],
+        timings: &mut DedupPutStageTimings,
+        pages: &mut HashMap<usize, BatchPageState>,
+    ) -> Result<Vec<Hash8>> {
+        let page_id = {
+            let inner = self.inner.lock();
+            if page_idx >= inner.page_table.len() {
+                return Err(MetaDbError::Corruption(format!(
+                    "cuckoo page_idx {page_idx} is outside page_table len {}",
+                    inner.page_table.len(),
+                )));
+            }
+            inner.page_table[page_idx]
+        };
+        if page_id == 0 {
+            return Ok(Vec::new());
+        }
+        self.ensure_batch_page_loaded(page_idx, page_id, timings, pages)?;
+        let state = pages
+            .get(&page_idx)
+            .expect("batch page state must exist after ensure");
+        let mut present = Vec::new();
+        for entry in candidates {
+            if find_slot_in_loaded_page(&state.page, state.bitmap, &entry.hash).is_some() {
+                present.push(entry.hash);
+            }
+        }
+        Ok(present)
+    }
+
     fn update_put_candidates_on_page_locked(
         &self,
         page_idx: usize,
@@ -1323,6 +1822,22 @@ fn update_existing_in_loaded_page(
         }
     }
     false
+}
+
+/// Page-associative slot lookup on an already-loaded page: scan every live slot
+/// (not just one 4-slot sub-bucket) for `hash`, mirroring `read_bucket_for` /
+/// `get`, returning the slot index if present. Used by
+/// [`CuckooHash::atomic_candidate_insert`] under the page-shard lock.
+fn find_slot_in_loaded_page(page: &Page, bitmap: u128, hash: &Hash8) -> Option<usize> {
+    for slot in 0..SLOTS_PER_PAGE {
+        if bitmap & (1u128 << slot) != 0 {
+            let (stored, _) = read_slot(page, slot);
+            if &stored == hash {
+                return Some(slot);
+            }
+        }
+    }
+    None
 }
 
 fn first_empty_slot_in_loaded_page(bitmap: &u128, bucket_in_page: usize) -> Option<usize> {

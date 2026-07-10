@@ -896,6 +896,15 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
     if dedup_index_meta_pid != NULL_PAGE {
         walk_cuckoo_dedup_index(page_store, dedup_index_meta_pid, &mut live)?;
     }
+    // v25 online resize: during a Growing phase the OLD (frozen) cuckoo table is
+    // still live — reads fall through to it and the migration walker drains it —
+    // but it is anchored by `dedup_migration_old_head`, NOT the primary head
+    // above. Walk it too, or orphan reclaim on open would free the OLD table's
+    // meta + data pages and the allocator would re-hand them out, clobbering
+    // still-referenced dedup entries (silent data loss).
+    if manifest.dedup_migration_old_head != NULL_PAGE {
+        walk_cuckoo_dedup_index(page_store, manifest.dedup_migration_old_head, &mut live)?;
+    }
     Ok(live)
 }
 

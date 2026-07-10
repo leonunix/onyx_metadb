@@ -25,6 +25,7 @@ impl Db {
                     volumes,
                     refcount_shards,
                     dedup_index.as_ref(),
+                    metrics,
                     page_store,
                     lsn,
                     bfg,

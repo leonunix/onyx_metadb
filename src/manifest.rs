@@ -195,7 +195,29 @@ use crate::types::{
 ///
 /// Old v23-and-earlier manifests are hard-rejected on open — no on-disk
 /// migration (fresh rebuild; onyx rebuilds metadb on schema change).
-pub const MANIFEST_BODY_VERSION: u32 = 24;
+///
+/// v25 (online cuckoo dedup-index resize): appends one `PageId` to the fixed
+/// header — `dedup_migration_old_head` (offset 108) — so the cuckoo dedup index
+/// can grow its bucket modulus online with zero downtime via an incremental
+/// two-table migration. `OFF_VARIABLE_START` shifts 108 → 116.
+///
+/// - `dedup_migration_old_head`: [`NULL_PAGE`] in the steady state (a single
+///   cuckoo table, phase = Single). During a resize (phase = Growing) it is the
+///   meta-page id of the OLD (smaller, frozen) cuckoo table, while
+///   `dedup_index_shard_heads[0][0]` points at the NEW (larger) table that all
+///   live writes now target. The migration walker copies OLD's entries into NEW
+///   and the swap-to-Single (drop OLD, clear this field) happens atomically at a
+///   checkpoint barrier — so a crash-recovered manifest is always exactly one of
+///   Single(old) / Growing(new+old) / Single(new). This is the ONLY new durable
+///   state the resize needs; each table's `bucket_count` already lives in its
+///   own cuckoo meta `head_extra`, and the migration cursor is not persisted
+///   (idempotent put-if-absent re-walks from 0 on reopen).
+///
+/// Old v24-and-earlier manifests are hard-rejected on open — no on-disk
+/// migration (fresh rebuild; onyx rebuilds metadb on schema change). This is the
+/// last "rebuild to change the dedup modulus": once on v25 the modulus grows
+/// online.
+pub const MANIFEST_BODY_VERSION: u32 = 25;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -247,7 +269,11 @@ const OFF_SNAPSHOT_CATALOG_HEAD: usize = 84;
 //   offset 100: `journal_ring_head`  (lifecycle-journal ring prune boundary; v3c)
 const OFF_PAGE_HIGH_WATER: usize = 92;
 const OFF_JOURNAL_RING_HEAD: usize = 100;
-const OFF_VARIABLE_START: usize = 108;
+// v25 appends one PageId to the fixed header (see `MANIFEST_BODY_VERSION`):
+//   offset 108: `dedup_migration_old_head`  (OLD cuckoo table head during an
+//               online resize; NULL_PAGE when not migrating)
+const OFF_DEDUP_MIGRATION_OLD_HEAD: usize = 108;
+const OFF_VARIABLE_START: usize = 116;
 
 /// Per-snapshot row size on disk. v6 packs: id(8) + vol_ord(2) + 6 pad +
 /// l2p_roots_page(8) + created_lsn(8). v18 (BFG) appends
@@ -276,7 +302,8 @@ const _: () = {
     assert!(OFF_VOLUME_CATALOG_HEAD + 8 == OFF_SNAPSHOT_CATALOG_HEAD);
     assert!(OFF_SNAPSHOT_CATALOG_HEAD + 8 == OFF_PAGE_HIGH_WATER);
     assert!(OFF_PAGE_HIGH_WATER + 8 == OFF_JOURNAL_RING_HEAD);
-    assert!(OFF_JOURNAL_RING_HEAD + 8 == OFF_VARIABLE_START);
+    assert!(OFF_JOURNAL_RING_HEAD + 8 == OFF_DEDUP_MIGRATION_OLD_HEAD);
+    assert!(OFF_DEDUP_MIGRATION_OLD_HEAD + 8 == OFF_VARIABLE_START);
     assert!(SNAPSHOT_ENTRY_SIZE == 48);
     assert!(OFF_SNAP_PAGE_DEADLIST_TAIL + 8 == OFF_SNAP_CAPTURE_WATERMARK);
     assert!(OFF_SNAP_CAPTURE_WATERMARK + 8 == SNAPSHOT_ENTRY_SIZE);
@@ -419,7 +446,7 @@ pub use volume::{
     decode_volume_entry_inline, encode_volume_entry_inline, volume_entry_inline_size,
 };
 
-/// Decoded manifest body (v16).
+/// Decoded manifest body (v25).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub body_version: u32,
@@ -461,6 +488,15 @@ pub struct Manifest {
     /// v24: prune boundary (ring head block) of a device-backed
     /// lifecycle-journal ring (Phase 3c). `0` on a file-backed journal.
     pub journal_ring_head: u64,
+    /// v25: OLD cuckoo dedup-index table head during an online modulus resize,
+    /// or [`NULL_PAGE`] in the steady state (phase = Single). When set (phase =
+    /// Growing) `dedup_index_shard_heads[0][0]` points at the NEW (larger)
+    /// table that live writes target, and this anchors the OLD (smaller, frozen)
+    /// table the migration walker is draining. The Single→Growing→Single
+    /// transitions are driven solely by manifest commit, so recovery sees a
+    /// clean 3-state machine. Each table's `bucket_count` lives in its own
+    /// cuckoo meta `head_extra`; the migration cursor is not persisted.
+    pub dedup_migration_old_head: PageId,
     /// Head of the persisted free-list page chain, or [`NULL_PAGE`].
     pub free_list_head: PageId,
     /// Current per-shard PBA-refcount B+tree roots. Refcount is a global
@@ -515,6 +551,7 @@ impl Manifest {
             snapshot_catalog_head_pid: NULL_PAGE,
             page_high_water: 0,
             journal_ring_head: 0,
+            dedup_migration_old_head: NULL_PAGE,
             free_list_head: NULL_PAGE,
             refcount_shard_roots: Vec::new().into_boxed_slice(),
             refcount_durable_seq: Vec::new().into_boxed_slice(),
@@ -726,6 +763,9 @@ impl Manifest {
             .copy_from_slice(&self.page_high_water.to_le_bytes());
         p[OFF_JOURNAL_RING_HEAD..OFF_JOURNAL_RING_HEAD + 8]
             .copy_from_slice(&self.journal_ring_head.to_le_bytes());
+        // v25: OLD cuckoo table head during an online resize (NULL_PAGE = none).
+        p[OFF_DEDUP_MIGRATION_OLD_HEAD..OFF_DEDUP_MIGRATION_OLD_HEAD + 8]
+            .copy_from_slice(&self.dedup_migration_old_head.to_le_bytes());
 
         let mut off = OFF_VARIABLE_START;
         for root in self.refcount_shard_roots.iter().copied() {
@@ -810,17 +850,18 @@ impl Manifest {
                 .unwrap(),
         );
         match body_version {
-            24 => Self::decode_v24(page, page_store),
+            25 => Self::decode_v25(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v24 (v23 \
-                 out-of-line catalog + v24 page_high_water / journal_ring_head) \
-                 is readable — older databases must be rebuilt"
+                "unsupported manifest body version {other}; only v25 (v23 \
+                 out-of-line catalog + v24 page_high_water / journal_ring_head + \
+                 v25 dedup_migration_old_head) is readable — older databases \
+                 must be rebuilt"
             ))),
         }
     }
 
-    fn decode_v24(page: &Page, page_store: &PageStore) -> Result<Self> {
-        Self::decode_body(page, page_store, 24)
+    fn decode_v25(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 25)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {
@@ -928,6 +969,12 @@ impl Manifest {
                 .try_into()
                 .unwrap(),
         );
+        // v25 fixed-header addition.
+        let dedup_migration_old_head = u64::from_le_bytes(
+            p[OFF_DEDUP_MIGRATION_OLD_HEAD..OFF_DEDUP_MIGRATION_OLD_HEAD + 8]
+                .try_into()
+                .unwrap(),
+        );
         let volume_bytes =
             catalog::read_catalog_chain(page_store, volume_catalog_head_pid, CatalogKind::Volumes)?;
         let volumes = decode_volume_catalog_bytes(&volume_bytes, volume_count, version)?;
@@ -948,6 +995,7 @@ impl Manifest {
             snapshot_catalog_head_pid,
             page_high_water,
             journal_ring_head,
+            dedup_migration_old_head,
             free_list_head,
             refcount_shard_roots,
             refcount_durable_seq,

@@ -552,14 +552,31 @@ impl Db {
             .first()
             .and_then(|s| s.first().copied())
             .unwrap_or(0);
-        let dedup_index = Arc::new(crate::dedup::DedupIndex::open(
-            page_store.clone(),
-            page_cache.clone(),
-            dedup_index_meta_pid,
-            cfg.dedup_l1_cache_entries,
-            manifest.dedup_shards as usize,
-            cfg.dedup_drainer_enabled,
-        )?);
+        // v25: a non-NULL `dedup_migration_old_head` means the last durable
+        // manifest was mid online-modulus-resize (Growing). Open BOTH tables and
+        // resume; else open the single (Single-phase) table. The device-frontier
+        // computation below reads `dedup_index.max_referenced_page_id()`, which
+        // is union-aware, so BOTH tables' pages are protected from reallocation.
+        let dedup_index = if manifest.dedup_migration_old_head != crate::types::NULL_PAGE {
+            Arc::new(crate::dedup::DedupIndex::open_growing(
+                page_store.clone(),
+                page_cache.clone(),
+                dedup_index_meta_pid,
+                manifest.dedup_migration_old_head,
+                cfg.dedup_l1_cache_entries,
+                manifest.dedup_shards as usize,
+                cfg.dedup_drainer_enabled,
+            )?)
+        } else {
+            Arc::new(crate::dedup::DedupIndex::open(
+                page_store.clone(),
+                page_cache.clone(),
+                dedup_index_meta_pid,
+                cfg.dedup_l1_cache_entries,
+                manifest.dedup_shards as usize,
+                cfg.dedup_drainer_enabled,
+            )?)
+        };
 
         // Device path only: recover the true frontier + free list by a bounded
         // scan. `open_on_device` above set high_water to device capacity so the

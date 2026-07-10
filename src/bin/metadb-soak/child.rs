@@ -20,6 +20,19 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
             )
         })
     });
+    // Cuckoo online-resize driver (mirrors the onyx scanner's 5th sub-pass).
+    // With METADB_SOAK_CUCKOO_RESIZE=1 it polls the migration status and drives
+    // begin/migrate/finish, so the reference-model soak exercises the two-table
+    // migration — including crash-resume across the parent's kill/restart —
+    // against the exact HashMap oracle (`OnyxRefModel` / refcount audit). No-op
+    // unless enabled; pair with a small METADB_SOAK_CUCKOO_BUCKETS.
+    let resizer_stop = Arc::new(AtomicBool::new(false));
+    let resizer = matches!(
+        std::env::var("METADB_SOAK_CUCKOO_RESIZE").as_deref(),
+        Ok("1") | Ok("true")
+    )
+    .then(|| spawn_cuckoo_resizer(db.clone(), resizer_stop.clone()));
+
     let cleanup_batcher = Arc::new(CleanupBatcher::new(cfg.cleanup_batch_size));
 
     let (ack_tx, ack_rx) = crossbeam_channel::unbounded::<Ack>();
@@ -141,8 +154,15 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
 
     deadlock_stop.store(true, Ordering::Release);
     metrics_stop.store(true, Ordering::Release);
+    resizer_stop.store(true, Ordering::Release);
     let _ = monitor.join();
     if let Some(handle) = metrics_reporter {
+        let _ = handle.join();
+    }
+    // Stop the resizer LAST-ish: it may leave the db mid-Growing (crash-safe;
+    // reopen resumes), which is exactly the state the crash-resume path needs
+    // to exercise across restarts.
+    if let Some(handle) = resizer {
         let _ = handle.join();
     }
     if deadlock_seen.load(Ordering::Acquire) {
@@ -157,6 +177,61 @@ fn run_child(cfg: ChildConfig) -> Result<ExitCode, String> {
     drop(admin_ack_tx);
     let _ = writer.join();
     Ok(ExitCode::SUCCESS)
+}
+
+/// Drive the cuckoo dedup-index online modulus resize, mirroring onyx's
+/// `dedup::scanner` 5th sub-pass: while Growing, migrate OLD→NEW a page-budget
+/// at a time and swap when a full pass wraps; while Single, begin a grow once
+/// the live load factor crosses the watermark. This lets the reference-model
+/// soak run real two-table migrations (and, via the parent's kill/restart, the
+/// crash-resume path) under the exact HashMap oracle. Env knobs (all optional):
+/// `METADB_SOAK_CUCKOO_{WATERMARK,FACTOR,MAX_BUCKETS,MIGRATE_PAGES,INTERVAL_MS}`.
+fn spawn_cuckoo_resizer(db: Arc<Db>, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    let env_u64 = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(d)
+    };
+    let watermark = std::env::var("METADB_SOAK_CUCKOO_WATERMARK")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.55);
+    let factor = env_u64("METADB_SOAK_CUCKOO_FACTOR", 2).max(2);
+    let max_buckets = env_u64("METADB_SOAK_CUCKOO_MAX_BUCKETS", 0);
+    let budget = env_u64("METADB_SOAK_CUCKOO_MIGRATE_PAGES", 256) as usize;
+    let interval = Duration::from_millis(env_u64("METADB_SOAK_CUCKOO_INTERVAL_MS", 50));
+    thread::spawn(move || {
+        let mut cursor = 0usize;
+        while !stop.load(Ordering::Acquire) {
+            let status = db.dedup_migration_status();
+            if status.growing {
+                // Always drive an in-flight migration to completion (a resumed-
+                // after-restart Growing db must never stall).
+                if let Ok(step) = db.dedup_migrate_step(cursor, budget) {
+                    cursor = step.next_page;
+                    if step.wrapped {
+                        let _ = db.dedup_resize_finish();
+                        cursor = 0;
+                    }
+                }
+            } else {
+                let cap = status.new_bucket_count.saturating_mul(4);
+                let load = if cap == 0 {
+                    0.0
+                } else {
+                    status.new_len as f64 / cap as f64
+                };
+                let target = status.new_bucket_count.saturating_mul(factor);
+                let under_cap = max_buckets == 0 || target <= max_buckets;
+                if load >= watermark && target > status.new_bucket_count && under_cap {
+                    let _ = db.dedup_resize_begin(target);
+                    cursor = 0;
+                }
+            }
+            thread::sleep(interval);
+        }
+    })
 }
 
 fn spawn_metrics_reporter(

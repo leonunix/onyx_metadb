@@ -618,6 +618,184 @@ fn saturated_cuckoo_drops_promote_without_failing_commit() {
     db2.put_dedup(h(1), dv(1)).unwrap();
 }
 
+#[test]
+fn saturated_promote_via_staged_commit_drops_not_errors() {
+    // Box-found P0 regression. The onyx promote path
+    // (`atomic_batch_dedup_hits_with_promote` → `tx.commit_staged_with_outcomes`
+    // → `Db::stage_ops`) applies small batches (<8 ops) through the BARE apply
+    // path (`apply_op_bare` → `apply_dedup_put_with_rc` → `stage_put`), NOT the
+    // lane path that `saturated_cuckoo_drops_promote_without_failing_commit`
+    // reaches via `tx.commit()`. Before the fix `stage_put` called the
+    // hard-erroring `put`, so a saturating promote FAILED the staged commit
+    // (onyx logged "batch hit + promote commit failed, demoting all to miss",
+    // metadb `commit_errors` climbed) AND would re-error on WAL replay → wedge
+    // recovery. This asserts the bare path now drops the promote exactly like
+    // the lane path, keeps the co-committed L2P remap, and replays cleanly.
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.dedup_cuckoo_buckets = 4; // one 112-slot page saturates fast
+    cfg.l2p_buffer_enabled = true; // match the onyx staged/buffer path
+    let db = Db::create_with_config(cfg.clone()).unwrap();
+
+    for i in 1u64..=300 {
+        db.put_dedup(h(i), dv(1)).unwrap();
+    }
+    let dropped_before = db.metrics_snapshot().dedup_promote_dropped_saturated;
+    assert!(dropped_before > 0, "fill must have saturated the page");
+
+    // L2P remap + a saturating promote in ONE staged commit (<8 ops → bare
+    // apply path). Must succeed, land the remap, drop the promote.
+    let sat_hash = h(999_999);
+    let lba: Lba = 7;
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, lba, v(200), None);
+    tx.put_dedup(sat_hash, dv(200));
+    tx.commit_staged_with_outcomes()
+        .expect("staged commit (bare apply path) must succeed when the cuckoo is saturated");
+
+    assert_eq!(
+        db.multi_get(BOOTSTRAP_VOLUME_ORD, &[lba]).unwrap()[0].map(|x| x.head_pba()),
+        Some(200),
+        "the co-committed L2P remap must land even though the promote dropped",
+    );
+    assert_eq!(
+        db.get_dedup(&sat_hash).unwrap(),
+        None,
+        "the saturated promote must be dropped from the index",
+    );
+    assert_eq!(
+        db.get_refcount(200).unwrap(),
+        0,
+        "a dropped promote must not phantom-incref its head PBA",
+    );
+    assert!(
+        db.metrics_snapshot().dedup_promote_dropped_saturated > dropped_before,
+        "the bare-path drop must be counted (observability parity with the lane path)",
+    );
+
+    // Reopen: WAL replay of the saturating DedupPuts must NOT wedge recovery.
+    db.flush().unwrap();
+    drop(db);
+    let db2 = Db::open_with_config(cfg).unwrap();
+    assert_eq!(db2.get_dedup(&sat_hash).unwrap(), None);
+    assert_eq!(
+        db2.multi_get(BOOTSTRAP_VOLUME_ORD, &[lba]).unwrap()[0].map(|x| x.head_pba()),
+        Some(200),
+    );
+    // A staged commit still applies after replay — the pipeline is not wedged.
+    let mut tx2 = db2.begin();
+    tx2.l2p_remap(BOOTSTRAP_VOLUME_ORD, 8, v(201), None);
+    tx2.commit_staged_with_outcomes()
+        .expect("staged commit after replay must succeed");
+}
+
+// -------- online modulus resize (Step 2: two-table migration) ---------
+
+fn migrate_all(db: &Db, max_pages: usize) {
+    let mut cursor = 0usize;
+    let mut guard = 0;
+    loop {
+        let s = db.dedup_migrate_step(cursor, max_pages).unwrap();
+        assert!(s.growing, "must report growing until the swap");
+        cursor = s.next_page;
+        guard += 1;
+        assert!(guard < 100_000, "migration must terminate");
+        if s.wrapped {
+            break;
+        }
+    }
+}
+
+#[test]
+fn online_resize_migrates_all_entries_and_persists_single() {
+    // Full lifecycle through the public Db API: put → grow → migrate → swap,
+    // with every entry visible throughout (from OLD while Growing, from NEW
+    // after the swap) and across a reopen (durable Single).
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.dedup_cuckoo_buckets = 60; // 3 data pages
+    let db = Db::create_with_config(cfg.clone()).unwrap();
+
+    for i in 1u64..=100 {
+        db.put_dedup(h(i), dv((i & 0xff) as u8)).unwrap();
+    }
+    let check_all = |db: &Db, ctx: &str| {
+        for i in 1u64..=100 {
+            assert_eq!(
+                db.get_dedup(&h(i)).unwrap(),
+                Some(dv((i & 0xff) as u8)),
+                "{ctx} i={i}"
+            );
+        }
+    };
+    check_all(&db, "pre-grow");
+
+    // Enter Growing (4×).
+    db.dedup_resize_begin(240).unwrap();
+    let st = db.dedup_migration_status();
+    assert!(st.growing);
+    assert_eq!(st.new_bucket_count, 240);
+    assert_eq!(st.old_bucket_count, 60);
+    check_all(&db, "growing"); // routed to OLD (NEW starts empty)
+
+    migrate_all(&db, 1);
+    db.dedup_resize_finish().unwrap();
+    let st = db.dedup_migration_status();
+    assert!(!st.growing);
+    assert_eq!(st.new_bucket_count, 240);
+    check_all(&db, "post-swap"); // routed to NEW
+
+    // Reopen: durable Single, every entry served by the 240-bucket table.
+    db.flush().unwrap();
+    drop(db);
+    let db2 = Db::open_with_config(cfg).unwrap();
+    assert!(!db2.dedup_migration_status().growing, "reopen is Single");
+    assert_eq!(db2.dedup_migration_status().new_bucket_count, 240);
+    check_all(&db2, "reopen");
+}
+
+#[test]
+fn online_resize_crash_mid_migration_resumes_on_reopen() {
+    // Persist a Growing manifest with a partially-migrated NEW, "crash" (drop),
+    // and confirm reopen resumes via `open_growing` with no lost entries, then
+    // completes the migration + swap.
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.dedup_cuckoo_buckets = 60;
+    let db = Db::create_with_config(cfg.clone()).unwrap();
+    for i in 1u64..=100 {
+        db.put_dedup(h(i), dv((i & 0xff) as u8)).unwrap();
+    }
+    db.dedup_resize_begin(240).unwrap();
+    // Migrate only ONE page, persist Growing + partial NEW, then drop.
+    db.dedup_migrate_step(0, 1).unwrap();
+    db.flush().unwrap();
+    drop(db);
+
+    let db2 = Db::open_with_config(cfg.clone()).unwrap();
+    assert!(
+        db2.dedup_migration_status().growing,
+        "reopen must resume the interrupted resize"
+    );
+    for i in 1u64..=100 {
+        assert_eq!(
+            db2.get_dedup(&h(i)).unwrap(),
+            Some(dv((i & 0xff) as u8)),
+            "resume visible i={i}"
+        );
+    }
+    migrate_all(&db2, 2);
+    db2.dedup_resize_finish().unwrap();
+    assert!(!db2.dedup_migration_status().growing);
+    for i in 1u64..=100 {
+        assert_eq!(
+            db2.get_dedup(&h(i)).unwrap(),
+            Some(dv((i & 0xff) as u8)),
+            "post-resume-swap i={i}"
+        );
+    }
+}
+
 // The "dedup_reverse" test block (round_trip / register_and_scan /
 // unregister / scan_sees_entries / tx_atomically / survives_reopen) retired
 // alongside the paged_reverse module + DedupReverse WAL ops (manifest v9 /

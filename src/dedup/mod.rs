@@ -26,7 +26,7 @@ pub mod sketch;
 pub(crate) mod staging;
 
 pub use cuckoo::CuckooHash;
-pub use index::{DedupIndex, TierSizes};
+pub use index::{DedupIndex, DedupMigrationStatus, MigrateStepStats, TierSizes};
 pub use l1_cache::L1HotCache;
 pub use sketch::FpSketch;
 

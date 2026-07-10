@@ -1141,6 +1141,7 @@ impl Db {
             volumes,
             &self.refcount_shards,
             &self.dedup_index,
+            &self.metrics,
             &self.page_store,
             lsn,
             bfg,

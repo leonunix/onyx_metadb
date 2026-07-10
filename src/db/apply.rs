@@ -63,6 +63,7 @@ pub(super) fn apply_op_bare(
     volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
     refcount_shards: &[Shard],
     dedup_index: &crate::dedup::DedupIndex,
+    metrics: &MetaMetrics,
     page_store: &Arc<PageStore>,
     lsn: Lsn,
     bfg: crate::types::Bfg,
@@ -227,6 +228,7 @@ pub(super) fn apply_op_bare(
             apply_dedup_put_with_rc(
                 dedup_index,
                 refcount_shards,
+                metrics,
                 lsn,
                 bfg,
                 *hash,
@@ -247,6 +249,7 @@ pub(super) fn apply_op_bare(
                 apply_dedup_put_with_rc(
                     dedup_index,
                     refcount_shards,
+                    metrics,
                     lsn,
                     bfg,
                     *hash,
@@ -290,6 +293,7 @@ pub(super) fn apply_op_bare(
                 apply_dedup_put_with_rc(
                     dedup_index,
                     refcount_shards,
+                    metrics,
                     lsn,
                     bfg,
                     *hash,
