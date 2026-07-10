@@ -70,11 +70,13 @@ impl PageStore {
         if count == 0 {
             return Ok(Vec::new());
         }
-        let count_u64 =
-            u64::try_from(count).map_err(|_| MetaDbError::InvalidArgument("page run too large".into()))?;
+        let count_u64 = u64::try_from(count)
+            .map_err(|_| MetaDbError::InvalidArgument("page run too large".into()))?;
         let mut inner = self.inner.lock();
         let start = inner.high_water;
-        let new_high = start.checked_add(count_u64).ok_or(MetaDbError::OutOfSpace)?;
+        let new_high = start
+            .checked_add(count_u64)
+            .ok_or(MetaDbError::OutOfSpace)?;
         self.device.ensure_covers(new_high)?;
         inner.high_water = new_high;
         self.high_water_pages.store(new_high, Ordering::Relaxed);

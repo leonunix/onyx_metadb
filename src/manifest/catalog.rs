@@ -197,7 +197,9 @@ pub fn free_list_bitmap_len(high_water: u64) -> usize {
 /// header, `PAGE_PAYLOAD_SIZE` bytes per page. Always ≥ 1 (an empty bitmap still
 /// takes one page, so the run start is never the `0` sentinel).
 pub fn free_list_run_data_pages(byte_len: usize) -> usize {
-    (FREE_LIST_RUN_HEADER + byte_len).div_ceil(PAGE_PAYLOAD_SIZE).max(1)
+    (FREE_LIST_RUN_HEADER + byte_len)
+        .div_ceil(PAGE_PAYLOAD_SIZE)
+        .max(1)
 }
 
 /// Seal ONLY the data pages of the contiguous `run` (pids `run[0]..`) holding
@@ -273,7 +275,8 @@ pub fn read_free_list_run(page_store: &PageStore, start: PageId) -> Result<Vec<u
     for (&pid, page) in ids.iter().zip(pages.iter()) {
         page.verify(pid)?;
         let h = page.header()?;
-        if h.page_type != PageType::ManifestCatalog || h.key_count != CatalogKind::FreeList.marker() {
+        if h.page_type != PageType::ManifestCatalog || h.key_count != CatalogKind::FreeList.marker()
+        {
             return Err(MetaDbError::Corruption(format!(
                 "free-list run page {pid} has wrong header (type={:?}, key_count={:#06x})",
                 h.page_type, h.key_count,
@@ -360,7 +363,11 @@ pub fn read_catalog_chain(
 /// Collect every page id in the chain (head first). Used at open to seed
 /// [`super::store::ManifestStore`]'s per-slot chain bookkeeping (so a later
 /// commit reuses pids in place) and by the verifier to mark catalog pages live.
-pub fn chain_pids(page_store: &PageStore, head_pid: PageId, kind: CatalogKind) -> Result<Vec<PageId>> {
+pub fn chain_pids(
+    page_store: &PageStore,
+    head_pid: PageId,
+    kind: CatalogKind,
+) -> Result<Vec<PageId>> {
     let mut pids = Vec::new();
     walk(page_store, head_pid, kind, &mut |pid| pids.push(pid))?;
     Ok(pids)
@@ -426,7 +433,10 @@ mod tests {
         let (chain2, sealed2, free1) =
             build_catalog_chain(&store, CatalogKind::Volumes, &small, &chain, 2).unwrap();
         assert_eq!(chain2.len(), 1);
-        assert_eq!(chain2[0], chain[0], "head pid must be stable across commits");
+        assert_eq!(
+            chain2[0], chain[0],
+            "head pid must be stable across commits"
+        );
         assert_eq!(free1, chain[1..].to_vec(), "trailing pages must be freed");
         store.write_sealed_page_runs(sealed2).unwrap();
         store.sync().unwrap();
@@ -452,7 +462,9 @@ mod tests {
 
     #[test]
     fn exact_page_boundary_round_trips() {
-        let bytes: Vec<u8> = (0..(CATALOG_PAGE_CAPACITY * 2)).map(|i| (i % 97) as u8).collect();
+        let bytes: Vec<u8> = (0..(CATALOG_PAGE_CAPACITY * 2))
+            .map(|i| (i % 97) as u8)
+            .collect();
         round_trip(CatalogKind::Volumes, &bytes);
     }
 
@@ -499,7 +511,11 @@ mod tests {
             (run[0]..run[0] + capacity as u64).collect::<Vec<_>>()
         );
         // NULL head → no run.
-        assert!(free_list_run_pids(&store, crate::types::NULL_PAGE).unwrap().is_empty());
+        assert!(
+            free_list_run_pids(&store, crate::types::NULL_PAGE)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

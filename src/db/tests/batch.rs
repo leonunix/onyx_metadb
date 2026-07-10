@@ -15,7 +15,8 @@ fn multi_get_matches_single_gets_across_shards() {
     // v2 MAX_UNITS_PER_LEAF = 100; share value bytes across 32-LBA
     // groups so each 128-LBA leaf only references ≤ 4 distinct units.
     for i in 0u64..200 {
-        db.insert(0, i, v(((i / 32) as u8).wrapping_mul(3))).unwrap();
+        db.insert(0, i, v(((i / 32) as u8).wrapping_mul(3)))
+            .unwrap();
     }
     // Mix mapped + unmapped + duplicate keys, in non-sorted order.
     let keys = vec![199, 5000, 0, 199, 42, 10_000, 1, 42];

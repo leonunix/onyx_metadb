@@ -24,7 +24,6 @@ pub(super) fn mk_db() -> (TempDir, std::sync::Arc<Db>) {
     (dir, db)
 }
 
-
 pub(super) fn mk_db_with_shards(shards: u32) -> (TempDir, std::sync::Arc<Db>) {
     let dir = TempDir::new().unwrap();
     let mut cfg = Config::new(dir.path());

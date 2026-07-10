@@ -40,7 +40,10 @@ fn sample_ops() -> Vec<LifecycleOp> {
             pba_decrefs: vec![1000, 2000],
             free_pages: Some(vec![11, 13]),
             // Snapshot-inheritor merge re-anchor (crash-recovery completeness).
-            merge: Some((crate::lifecycle_log::DropMergeTarget::Snapshot { id: 99 }, 4242)),
+            merge: Some((
+                crate::lifecycle_log::DropMergeTarget::Snapshot { id: 99 },
+                4242,
+            )),
         },
         LifecycleOp::DropVolume {
             ord: 8,
@@ -177,7 +180,10 @@ fn replay_truncates_torn_tail_in_last_segment() {
     .unwrap();
     assert_eq!(seen, 3, "all three pre-tear records replayed");
     let after = std::fs::metadata(path).unwrap().len();
-    assert_eq!(after, valid_len, "torn tail truncated back to last good frame");
+    assert_eq!(
+        after, valid_len,
+        "torn tail truncated back to last good frame"
+    );
 }
 
 #[test]
@@ -194,7 +200,10 @@ fn prune_drops_segments_wholly_below_checkpoint() {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert!(before.len() >= 2, "expected segment rotation, saw {before:?}");
+    assert!(
+        before.len() >= 2,
+        "expected segment rotation, saw {before:?}"
+    );
 
     // checkpoint covers seq 1 → first segment may go (next segment
     // starts past replay_start). The newest segment is always kept.

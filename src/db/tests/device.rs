@@ -69,10 +69,18 @@ fn device_roundtrip_l2p_and_dedup() {
     )
     .unwrap();
     for i in 0u64..300 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v((i / 32) as u8)), "reopen lba {i}");
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v((i / 32) as u8)),
+            "reopen lba {i}"
+        );
     }
     for n in 1u64..40 {
-        assert_eq!(db.get_dedup(&h(n)).unwrap(), Some(dv(n as u8)), "reopen dedup {n}");
+        assert_eq!(
+            db.get_dedup(&h(n)).unwrap(),
+            Some(dv(n as u8)),
+            "reopen dedup {n}"
+        );
     }
     // Bounded scan must recover a high-water mark that covers the live pages.
     assert!(
@@ -123,7 +131,12 @@ fn device_capacity_exhausted_is_clean_and_reopens() {
         journal_dev,
     )
     .unwrap();
-    assert!(db.manifest().volumes.iter().any(|e| e.ord == BOOTSTRAP_VOLUME_ORD));
+    assert!(
+        db.manifest()
+            .volumes
+            .iter()
+            .any(|e| e.ord == BOOTSTRAP_VOLUME_ORD)
+    );
 }
 
 /// 3d MUST-FIX regression: a crash back to an older manifest generation must not
@@ -154,7 +167,8 @@ fn device_open_lifts_frontier_past_dedup_pages() {
     // Between-flush cohort: allocate more cuckoo pages ABOVE H_N. Distinct
     // fingerprints force fresh bucket/data pages.
     for n in 200u64..400 {
-        db.put_dedup(hash_full(n, n.wrapping_mul(7)), dv((n % 250) as u8)).unwrap();
+        db.put_dedup(hash_full(n, n.wrapping_mul(7)), dv((n % 250) as u8))
+            .unwrap();
     }
     // Make the dedup meta chain (referencing the new pages) + page content
     // durable, but do NOT commit a new manifest — this is exactly the window a
@@ -167,7 +181,11 @@ fn device_open_lifts_frontier_past_dedup_pages() {
     // `page_high_water`. (The dedup meta chain head is generation-stable + was
     // rewritten in place + synced, so gen N's manifest reaches it.)
     let dedup_max = db.dedup_index.max_referenced_page_id();
-    assert_eq!(db.manifest().page_high_water, high_water_n, "manifest advanced unexpectedly");
+    assert_eq!(
+        db.manifest().page_high_water,
+        high_water_n,
+        "manifest advanced unexpectedly"
+    );
     assert!(
         dedup_max > high_water_n,
         "test precondition not met: dedup_max {dedup_max} must exceed gen-N page_high_water {high_water_n}"
@@ -247,7 +265,11 @@ fn device_ring_lifecycle_discard_replays() {
     .unwrap();
     assert_eq!(db.get(0, 15).unwrap(), None, "ring Discard did not replay");
     assert_eq!(db.get(0, 5).unwrap(), Some(v(1)), "replay deleted too much");
-    assert_eq!(db.get(0, 25).unwrap(), Some(v(1)), "replay deleted too much (tail)");
+    assert_eq!(
+        db.get(0, 25).unwrap(),
+        Some(v(1)),
+        "replay deleted too much (tail)"
+    );
 }
 
 /// Vec-backed [`PageBlockIo`] — the byte-level seam onyx implements over a
@@ -314,10 +336,18 @@ fn block_page_device_roundtrip_through_db() {
         Arc::new(BlockPageDevice::new(page_io).unwrap());
     let db = Db::open_on_device(device_cfg(&dir), page_dev, journal_dev).unwrap();
     for i in 0u64..200 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v((i / 16) as u8)), "reopen lba {i}");
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v((i / 16) as u8)),
+            "reopen lba {i}"
+        );
     }
     for n in 1u64..25 {
-        assert_eq!(db.get_dedup(&h(n)).unwrap(), Some(dv(n as u8)), "reopen dedup {n}");
+        assert_eq!(
+            db.get_dedup(&h(n)).unwrap(),
+            Some(dv(n as u8)),
+            "reopen dedup {n}"
+        );
     }
 }
 
@@ -379,17 +409,29 @@ fn device_persisted_free_list_roundtrips_without_scan() {
     // safe snapshot: non-empty and never larger than the store held at close
     // (the bitmap never invents free pages; it may omit the few pages the flush
     // reclaimed after its commit snapshot — see `ManifestStore::commit`).
-    assert_eq!(db.page_store.high_water(), hw, "high_water regressed on bitmap reopen");
+    assert_eq!(
+        db.page_store.high_water(),
+        hw,
+        "high_water regressed on bitmap reopen"
+    );
     let reopened_fll = db.page_store.free_list_len();
     assert!(
         reopened_fll > 0 && reopened_fll <= fll,
         "bitmap-recovered free_list_len {reopened_fll} not in (0, {fll}]"
     );
     for i in 0u64..300 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v((i / 32) as u8)), "reopen lba {i}");
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v((i / 32) as u8)),
+            "reopen lba {i}"
+        );
     }
     for n in 1u64..40 {
-        assert_eq!(db.get_dedup(&h(n)).unwrap(), Some(dv(n as u8)), "reopen dedup {n}");
+        assert_eq!(
+            db.get_dedup(&h(n)).unwrap(),
+            Some(dv(n as u8)),
+            "reopen dedup {n}"
+        );
     }
 
     // Every recovered free page is genuinely reusable: draining the free list
@@ -399,7 +441,10 @@ fn device_persisted_free_list_roundtrips_without_scan() {
     let base_hw = db.page_store.high_water();
     for _ in 0..reopened_fll {
         let p = db.page_store.allocate().unwrap();
-        assert!(p >= FIRST_DATA_PAGE && p < base_hw, "handed out out-of-range page {p}");
+        assert!(
+            p >= FIRST_DATA_PAGE && p < base_hw,
+            "handed out out-of-range page {p}"
+        );
         assert!(!dedup_pages.contains(&p), "handed out live dedup page {p}");
     }
 }
@@ -428,11 +473,23 @@ fn device_persisted_free_list_reopen_is_a_fixed_point() {
     let (hw1, fll1) = (db.page_store.high_water(), db.page_store.free_list_len());
     drop(db); // no flush → on-disk bitmap unchanged
 
-    let db =
-        Db::open_on_device_with_faults(device_cfg(&dir), FaultController::disabled(), page_dev, journal_dev)
-            .unwrap();
-    assert_eq!(db.page_store.high_water(), hw1, "high_water not a fixed point");
-    assert_eq!(db.page_store.free_list_len(), fll1, "free list not a fixed point");
+    let db = Db::open_on_device_with_faults(
+        device_cfg(&dir),
+        FaultController::disabled(),
+        page_dev,
+        journal_dev,
+    )
+    .unwrap();
+    assert_eq!(
+        db.page_store.high_water(),
+        hw1,
+        "high_water not a fixed point"
+    );
+    assert_eq!(
+        db.page_store.free_list_len(),
+        fll1,
+        "free list not a fixed point"
+    );
 }
 
 /// The bitmap run relocates (geometric grow) when the free list outgrows its
@@ -475,10 +532,18 @@ fn device_persisted_free_list_run_relocates_on_growth() {
         journal_dev,
     )
     .unwrap();
-    assert_eq!(db.page_store.high_water(), hw, "high_water regressed after relocation reopen");
+    assert_eq!(
+        db.page_store.high_water(),
+        hw,
+        "high_water regressed after relocation reopen"
+    );
     assert!(db.page_store.free_list_len() <= fll && db.page_store.free_list_len() > 30_000);
     for i in 0u64..64 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v(1)), "reopen lba {i} after relocation");
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v(1)),
+            "reopen lba {i} after relocation"
+        );
     }
 }
 
@@ -508,7 +573,8 @@ fn device_persisted_free_list_preserves_dedup_frontier() {
     // Between-flush cohort: fresh fingerprints allocate cuckoo pages, popping the
     // interior free pages (all `< high_water_n`) the gen-N bitmap marks free.
     for n in 200u64..400 {
-        db.put_dedup(hash_full(n, n.wrapping_mul(7)), dv((n % 250) as u8)).unwrap();
+        db.put_dedup(hash_full(n, n.wrapping_mul(7)), dv((n % 250) as u8))
+            .unwrap();
     }
     db.dedup_index.flush_meta().unwrap();
     db.page_store.sync().unwrap();
@@ -525,7 +591,11 @@ fn device_persisted_free_list_preserves_dedup_frontier() {
         "test precondition not met: no dedup page landed below gen-N high_water {high_water_n} \
          (free pool exhausted?)"
     );
-    assert_eq!(db.manifest().page_high_water, high_water_n, "manifest advanced unexpectedly");
+    assert_eq!(
+        db.manifest().page_high_water,
+        high_water_n,
+        "manifest advanced unexpectedly"
+    );
 
     // Crash: manifest stays at gen N (with the gen-N bitmap).
     drop(db);
@@ -612,7 +682,8 @@ fn device_free_list_commit_fault_reopens_consistent() {
         crate::testing::faults::FaultAction::Error,
     );
     for n in 200u64..260 {
-        db.put_dedup(hash_full(n, n.wrapping_mul(7)), dv((n % 250) as u8)).ok();
+        db.put_dedup(hash_full(n, n.wrapping_mul(7)), dv((n % 250) as u8))
+            .ok();
     }
     let _ = db.flush(); // expected to error at the injected fault
     faults.clear();
@@ -630,10 +701,17 @@ fn device_free_list_commit_fault_reopens_consistent() {
         db.dedup_index.referenced_page_ids().into_iter().collect();
     for _ in 0..db.page_store.free_list_len() + 8 {
         let p = db.page_store.allocate().unwrap();
-        assert!(!dedup_pages.contains(&p), "handed out live dedup page {p} after fault reopen");
+        assert!(
+            !dedup_pages.contains(&p),
+            "handed out live dedup page {p} after fault reopen"
+        );
     }
     for n in 1u64..30 {
-        assert_eq!(db.get_dedup(&h(n)).unwrap(), Some(dv(n as u8)), "gen-N dedup {n} lost");
+        assert_eq!(
+            db.get_dedup(&h(n)).unwrap(),
+            Some(dv(n as u8)),
+            "gen-N dedup {n} lost"
+        );
     }
 }
 

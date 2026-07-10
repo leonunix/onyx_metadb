@@ -373,9 +373,7 @@ pub fn decode(body: &[u8]) -> Result<LifecycleOp> {
                 next_cursor,
             }
         }
-        TAG_PROMOTION_COMPLETE => LifecycleOp::PromotionComplete {
-            vol_ord: c.u16()?,
-        },
+        TAG_PROMOTION_COMPLETE => LifecycleOp::PromotionComplete { vol_ord: c.u16()? },
         TAG_DISCARD => LifecycleOp::Discard {
             vol_ord: c.u16()?,
             start_lba: c.u64()?,

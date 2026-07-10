@@ -23,9 +23,8 @@ impl Db {
         // (`build_lane_dispatch_plan`) and this apply lane agree on
         // which rc shard a PBA lives in — divergence is a deadlock /
         // underflow hazard.
-        let rc_shard_for = |pba: Pba| -> usize {
-            super::rc_shard_of_pba(pba, refcount_shards.len())
-        };
+        let rc_shard_for =
+            |pba: Pba| -> usize { super::rc_shard_of_pba(pba, refcount_shards.len()) };
         let stage_rc = |pba: Pba, delta: i64| -> Result<()> {
             let sid = rc_shard_for(pba);
             refcount_shards[sid].stage(bfg, pba, delta, lsn)?;
@@ -126,8 +125,12 @@ impl Db {
                     if rc >= *min_rc {
                         let mut put_timings = DedupPutStageTimings::default();
                         let started = std::time::Instant::now();
-                        let placed = dedup_index
-                            .stage_put_with_metrics(*hash, *value, lsn, &mut put_timings)?;
+                        let placed = dedup_index.stage_put_with_metrics(
+                            *hash,
+                            *value,
+                            lsn,
+                            &mut put_timings,
+                        )?;
                         metrics.record_dedup_forward_put(started.elapsed());
                         metrics.record_dedup_put_stages(put_timings);
                         if placed {
@@ -179,8 +182,12 @@ impl Db {
                     let applied = cur.as_ref() == Some(old_value);
                     if applied {
                         let mut put_timings = DedupPutStageTimings::default();
-                        let placed = dedup_index
-                            .stage_put_with_metrics(*hash, *new_value, lsn, &mut put_timings)?;
+                        let placed = dedup_index.stage_put_with_metrics(
+                            *hash,
+                            *new_value,
+                            lsn,
+                            &mut put_timings,
+                        )?;
                         metrics.record_dedup_forward_put(started.elapsed());
                         metrics.record_dedup_put_stages(put_timings);
                         if placed {

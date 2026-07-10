@@ -359,17 +359,16 @@ fn buffer_mode_snapshot_churn_no_premature_free() {
     for i in 0..N {
         assert_eq!(db.get(0, i).unwrap(), Some(val(i, 7)), "reopen lba {i}");
     }
-    let report =
-        crate::verify::verify_path(
-            dir.path(),
-            crate::verify::VerifyOptions {
-                strict: true,
-                check_birth_shadow: true,
-                check_clone_livelist: false,
-                check_clone_birth_shadow: false,
-            },
-        )
-            .unwrap();
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+            check_clone_birth_shadow: false,
+        },
+    )
+    .unwrap();
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
 
@@ -416,19 +415,22 @@ fn create_volume_root_page_rc_survives_reopen() {
     drop(db);
     let db = Db::open(dir.path()).unwrap();
     for i in 0..256u64 {
-        assert_eq!(db.get(vol, i).unwrap(), Some(v((i / 32) as u8)), "reopen lba {i}");
+        assert_eq!(
+            db.get(vol, i).unwrap(),
+            Some(v((i / 32) as u8)),
+            "reopen lba {i}"
+        );
     }
-    let report =
-        crate::verify::verify_path(
-            dir.path(),
-            crate::verify::VerifyOptions {
-                strict: true,
-                check_birth_shadow: true,
-                check_clone_livelist: false,
-                check_clone_birth_shadow: false,
-            },
-        )
-            .unwrap();
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+            check_clone_birth_shadow: false,
+        },
+    )
+    .unwrap();
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
 
@@ -477,20 +479,23 @@ fn take_snapshot_incref_survives_close_before_fold() {
 
     let db = Db::open(dir.path()).unwrap();
     for i in 0..256u64 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v((i / 32 + 2) as u8)), "reopen lba {i}");
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v((i / 32 + 2) as u8)),
+            "reopen lba {i}"
+        );
     }
     drop(db);
-    let report =
-        crate::verify::verify_path(
-            dir.path(),
-            crate::verify::VerifyOptions {
-                strict: true,
-                check_birth_shadow: true,
-                check_clone_livelist: false,
-                check_clone_birth_shadow: false,
-            },
-        )
-            .unwrap();
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+            check_clone_birth_shadow: false,
+        },
+    )
+    .unwrap();
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
 
@@ -575,17 +580,16 @@ fn buffer_mode_concurrent_snapshot_churn_no_corruption() {
     for i in 0..N {
         db.get(0, i).expect("get after churn");
     }
-    let report =
-        crate::verify::verify_path(
-            dir.path(),
-            crate::verify::VerifyOptions {
-                strict: true,
-                check_birth_shadow: true,
-                check_clone_livelist: false,
-                check_clone_birth_shadow: false,
-            },
-        )
-            .unwrap();
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+            check_clone_birth_shadow: false,
+        },
+    )
+    .unwrap();
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
 
@@ -919,17 +923,16 @@ fn drop_snapshot_force_fold_over_buffer_backlog_no_premature_free() {
     for i in 0..N {
         assert_eq!(db.get(0, i).unwrap(), Some(val(i, 12)), "reopen lba {i}");
     }
-    let report =
-        crate::verify::verify_path(
-            dir.path(),
-            crate::verify::VerifyOptions {
-                strict: true,
-                check_birth_shadow: true,
-                check_clone_livelist: false,
-                check_clone_birth_shadow: false,
-            },
-        )
-            .unwrap();
+    let report = crate::verify::verify_path(
+        dir.path(),
+        crate::verify::VerifyOptions {
+            strict: true,
+            check_birth_shadow: true,
+            check_clone_livelist: false,
+            check_clone_birth_shadow: false,
+        },
+    )
+    .unwrap();
     assert!(report.is_clean(), "verify issues: {:?}", report.issues);
 }
 
@@ -1165,15 +1168,25 @@ fn youngest_snap_tracks_max_created_lsn() {
     assert_eq!(db.youngest_snap(0), None, "no snapshot → None");
     db.insert(0, 1, v(1)).unwrap();
     let _s1 = db.take_snapshot(0).unwrap();
-    let y1 = db.youngest_snap(0).expect("after first snapshot youngest_snap is Some");
+    let y1 = db
+        .youngest_snap(0)
+        .expect("after first snapshot youngest_snap is Some");
     db.insert(0, 2, v(2)).unwrap();
     let s2 = db.take_snapshot(0).unwrap();
     let y2 = db.youngest_snap(0).expect("Some after second snapshot");
-    assert!(y2 >= y1, "youngest_snap must not decrease as snapshots accrue");
+    assert!(
+        y2 >= y1,
+        "youngest_snap must not decrease as snapshots accrue"
+    );
     // Dropping the youngest reverts the threshold to the older snapshot.
     db.drop_snapshot(s2).unwrap().unwrap();
-    let y3 = db.youngest_snap(0).expect("Some after dropping the youngest");
-    assert!(y3 <= y2 && y3 >= y1, "after dropping the youngest, threshold falls back");
+    let y3 = db
+        .youngest_snap(0)
+        .expect("Some after dropping the youngest");
+    assert!(
+        y3 <= y2 && y3 >= y1,
+        "after dropping the youngest, threshold falls back"
+    );
 }
 
 // -------- commit 8: volume lifecycle --------

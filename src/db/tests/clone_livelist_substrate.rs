@@ -22,7 +22,12 @@ use crate::verify::{VerifyOptions, verify_path};
 /// livelist chain spans several segments. Returns the dir, db, faults handle,
 /// and the clone ord. Each flush round COWs the clone-private leaves afresh →
 /// one appended `LiveListSegment` per round.
-fn multi_segment_clone() -> (tempfile::TempDir, Arc<Db>, Arc<FaultController>, VolumeOrdinal) {
+fn multi_segment_clone() -> (
+    tempfile::TempDir,
+    Arc<Db>,
+    Arc<FaultController>,
+    VolumeOrdinal,
+) {
     let dir = tempfile::TempDir::new().unwrap();
     let faults = FaultController::new();
     let mut cfg = crate::config::Config::new(dir.path());
@@ -37,8 +42,12 @@ fn multi_segment_clone() -> (tempfile::TempDir, Arc<Db>, Arc<FaultController>, V
     let clone = db.clone_volume(snap).unwrap();
     for round in 0u64..5 {
         for i in 0u64..16 {
-            db.insert(clone, i * 256, v((0xC0u8).wrapping_add(round as u8) | (i as u8 & 0x0F)))
-                .unwrap();
+            db.insert(
+                clone,
+                i * 256,
+                v((0xC0u8).wrapping_add(round as u8) | (i as u8 & 0x0F)),
+            )
+            .unwrap();
         }
         db.flush().unwrap();
     }
@@ -151,7 +160,11 @@ fn livelist_segments_survive_reopen() {
         }
         db.flush().unwrap();
         let (_h, tail) = db.test_page_live_list_anchors(clone).unwrap();
-        assert_ne!(tail, crate::types::NULL_PAGE, "livelist chain empty after clone COW");
+        assert_ne!(
+            tail,
+            crate::types::NULL_PAGE,
+            "livelist chain empty after clone COW"
+        );
         // The tail segment must be a LiveListSegment.
         let page = db.test_read_page(tail).unwrap();
         assert_eq!(page.header().unwrap().page_type, PageType::LiveListSegment);
@@ -160,7 +173,11 @@ fn livelist_segments_survive_reopen() {
     let db = Db::open(dir.path()).unwrap();
     // Anchors reloaded from the manifest.
     let (_h, tail) = db.test_page_live_list_anchors(clone).unwrap();
-    assert_ne!(tail, crate::types::NULL_PAGE, "livelist tail lost across reopen");
+    assert_ne!(
+        tail,
+        crate::types::NULL_PAGE,
+        "livelist tail lost across reopen"
+    );
     let live = db.test_clone_live_allocs(clone).unwrap();
     assert!(!live.is_empty(), "live-ALLOC set empty after reopen");
     drop(db);
@@ -242,7 +259,10 @@ fn livelist_covers_promoted_ex_clone() {
             }
         }
         let before = db.test_clone_live_allocs(clone).unwrap().len();
-        assert!(before > 0, "pre-promotion writes did not populate the livelist");
+        assert!(
+            before > 0,
+            "pre-promotion writes did not populate the livelist"
+        );
         // Post-promotion writes must STILL record clone-private allocs (fresh
         // leaves at new leaf indices).
         for i in 0u64..8 {
@@ -303,7 +323,10 @@ fn livelist_condense_shrinks_chain_preserves_live_allocs() {
     db.test_run_livelist_condense(2).unwrap();
 
     let (head2, tail2) = db.test_page_live_list_anchors(clone).unwrap();
-    assert_eq!(head2, tail2, "condense did not collapse the chain to one segment");
+    assert_eq!(
+        head2, tail2,
+        "condense did not collapse the chain to one segment"
+    );
     assert_ne!(
         tail2,
         crate::types::NULL_PAGE,
@@ -383,7 +406,10 @@ fn livelist_condense_fault_post_seg_write_is_recoverable() {
     faults.clear();
 
     // Aborted before commit → chain + live set unchanged.
-    assert_eq!(db.test_page_live_list_anchors(clone).unwrap(), anchors_before);
+    assert_eq!(
+        db.test_page_live_list_anchors(clone).unwrap(),
+        anchors_before
+    );
     assert_eq!(db.test_clone_live_allocs(clone).unwrap(), before);
     drop(db);
 
@@ -416,7 +442,10 @@ fn livelist_condense_fault_post_manifest_is_recoverable() {
 
     // Commit landed → chain re-anchored to one segment; old chain orphaned.
     let (head2, tail2) = db.test_page_live_list_anchors(clone).unwrap();
-    assert_eq!(head2, tail2, "condense commit did not re-anchor to one segment");
+    assert_eq!(
+        head2, tail2,
+        "condense commit did not re-anchor to one segment"
+    );
     assert_eq!(db.test_clone_live_allocs(clone).unwrap(), before);
     drop(db);
 
@@ -451,12 +480,16 @@ fn livelist_flush_bails_on_condenser_reanchor_race() {
     // A multi-segment chain so the condenser has something to collapse, and the
     // tail the next flush will sample.
     let (head0, tail0) = db.test_page_live_list_anchors(clone).unwrap();
-    assert_ne!(head0, tail0, "fixture must leave a multi-segment chain to condense");
+    assert_ne!(
+        head0, tail0,
+        "fixture must leave a multi-segment chain to condense"
+    );
 
     // Dirty the clone again so the pinned flush drains FRESH livelist records
     // and builds a new segment off `tail0`.
     for i in 0u64..16 {
-        db.insert(clone, i * 256, v(0xE0u8 | (i as u8 & 0x0F))).unwrap();
+        db.insert(clone, i * 256, v(0xE0u8 | (i as u8 & 0x0F)))
+            .unwrap();
     }
 
     // Pin the flush right after its new livelist segment is durable but before
@@ -479,7 +512,10 @@ fn livelist_flush_bails_on_condenser_reanchor_race() {
     // segment, promotes the tail atomic, and frees the OLD chain incl. `tail0`.
     db.test_run_livelist_condense(2).unwrap();
     let (_hc, tail_condensed) = db.test_page_live_list_anchors(clone).unwrap();
-    assert_ne!(tail_condensed, tail0, "condense did not re-anchor the live tail");
+    assert_ne!(
+        tail_condensed, tail0,
+        "condense did not re-anchor the live tail"
+    );
 
     // Release the flush: the bail must keep the condenser's anchor rather than
     // overwrite it with a segment dangling into the freed `tail0`.
@@ -511,8 +547,12 @@ fn livelist_flush_bails_on_condenser_reanchor_race() {
     // let the shadow re-converge to the clone-private reachable subtree.
     for round in 0u64..3 {
         for i in 0u64..16 {
-            db.insert(clone, i * 256, v(0xF0u8.wrapping_add(round as u8) | (i as u8 & 0x0F)))
-                .unwrap();
+            db.insert(
+                clone,
+                i * 256,
+                v(0xF0u8.wrapping_add(round as u8) | (i as u8 & 0x0F)),
+            )
+            .unwrap();
         }
         db.flush().unwrap();
     }
@@ -528,8 +568,14 @@ fn livelist_flush_bails_on_condenser_reanchor_race() {
 fn drop_volume_frees_livelist_chain() {
     let (dir, db, _faults, clone) = multi_segment_clone();
     let (_h, tail) = db.test_page_live_list_anchors(clone).unwrap();
-    assert_ne!(tail, crate::types::NULL_PAGE, "clone has no livelist chain to free");
-    db.drop_volume(clone).unwrap().expect("drop returns a report");
+    assert_ne!(
+        tail,
+        crate::types::NULL_PAGE,
+        "clone has no livelist chain to free"
+    );
+    db.drop_volume(clone)
+        .unwrap()
+        .expect("drop returns a report");
     // Volume gone → no anchors. The chain pages were eagerly freed; orphan
     // reclaim is only the crash backstop.
     assert_eq!(db.test_page_live_list_anchors(clone), None);
@@ -605,7 +651,11 @@ fn clone_promote_condense_drop_churn() {
                     let lba = rng.gen_range(0..48u64) * 16;
                     let val = v(rng.r#gen::<u8>());
                     db.insert(c, lba, val).unwrap();
-                    assert_eq!(db.get(c, lba).unwrap(), Some(val), "clone read-back mismatch");
+                    assert_eq!(
+                        db.get(c, lba).unwrap(),
+                        Some(val),
+                        "clone read-back mismatch"
+                    );
                 }
                 50..=59 => {
                     db.flush().unwrap();
@@ -623,8 +673,9 @@ fn clone_promote_condense_drop_churn() {
                     // Drops an un-promoted clone WITH the clone-drop shadow,
                     // or a promoted ex-clone without it; a false-premature
                     // would be Err here.
-                    db.drop_volume(c)
-                        .unwrap_or_else(|e| panic!("clone drop {c} false-premature / error: {e:?}"));
+                    db.drop_volume(c).unwrap_or_else(|e| {
+                        panic!("clone drop {c} false-premature / error: {e:?}")
+                    });
                     clones.remove(idx);
                 }
                 _ => {}
@@ -713,7 +764,11 @@ fn drop_clone_decrefs_promotion_edges_survivor_gated() {
     db.promote_volume(clone).unwrap();
     // Promotion incref'd every clone-mapped PBA by 1 (shared + private).
     for i in 1u64..=8 {
-        assert_eq!(db.get_refcount(i).unwrap(), 1, "shared PBA {i} not promoted");
+        assert_eq!(
+            db.get_refcount(i).unwrap(),
+            1,
+            "shared PBA {i} not promoted"
+        );
     }
     for i in 0u64..8 {
         assert_eq!(
@@ -735,10 +790,19 @@ fn drop_clone_decrefs_promotion_edges_survivor_gated() {
     }
     // rc bookkeeping: every promotion edge undone (back to 0).
     for i in 1u64..=8 {
-        assert_eq!(db.get_refcount(i).unwrap(), 0, "shared PBA {i} rc not restored");
+        assert_eq!(
+            db.get_refcount(i).unwrap(),
+            0,
+            "shared PBA {i} rc not restored"
+        );
     }
     for i in 0u64..8 {
-        assert_eq!(db.get_refcount(192 + i).unwrap(), 0, "private PBA {} rc not 0", 192 + i);
+        assert_eq!(
+            db.get_refcount(192 + i).unwrap(),
+            0,
+            "private PBA {} rc not 0",
+            192 + i
+        );
     }
     // The parent still maps the shared PBAs — NO premature free.
     for i in 1u64..=8 {
@@ -764,7 +828,11 @@ fn drop_clone_promoted_pba_decrefs_to_floor_no_surface() {
     // Seed an extra rc edge on 192 (stands in for a dedup_index membership).
     db.incref_pba(192, 1).unwrap();
     db.promote_volume(clone).unwrap();
-    assert_eq!(db.get_refcount(192).unwrap(), 2, "expected seed + promotion edge");
+    assert_eq!(
+        db.get_refcount(192).unwrap(),
+        2,
+        "expected seed + promotion edge"
+    );
 
     let report = db.drop_volume(clone).unwrap().expect("clone dropped");
     assert!(
@@ -803,10 +871,17 @@ fn drop_clone_promotion_decref_survives_reopen() {
         // lifecycle_replay_seq path the case lives on.
         db.promote_volume(clone).unwrap();
         let report = db.drop_volume(clone).unwrap().expect("clone dropped");
-        assert!(report.freed_pbas.contains(&192), "private PBA should surface");
+        assert!(
+            report.freed_pbas.contains(&192),
+            "private PBA should surface"
+        );
         assert_eq!(db.get_refcount(192).unwrap(), 0);
         for i in 1u64..=4 {
-            assert_eq!(db.get_refcount(i).unwrap(), 0, "shared PBA {i} rc not restored");
+            assert_eq!(
+                db.get_refcount(i).unwrap(),
+                0,
+                "shared PBA {i} rc not restored"
+            );
         }
         drop(db);
     }
@@ -849,7 +924,10 @@ fn drop_clone_rc_authoritative_skips_promotion_decref() {
     db.insert(clone, 100, v(0xC0)).unwrap(); // clone-private PBA 192
     db.promote_volume(clone).unwrap();
     let rc_before = db.get_refcount(192).unwrap();
-    assert!(rc_before > 0, "promotion should have pinned the private PBA");
+    assert!(
+        rc_before > 0,
+        "promotion should have pinned the private PBA"
+    );
 
     let report = db.drop_volume(clone).unwrap().expect("clone dropped");
     assert!(

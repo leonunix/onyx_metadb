@@ -59,8 +59,7 @@ fn mode_config(path: &std::path::Path, mode: Mode) -> Config {
     // forever waiting on a sender no compactor will ever fire.
     cfg.l2p_buffer_enabled = true;
     cfg.commit_direct_apply_enabled = true;
-    cfg.commit_deferred_outcomes_enabled =
-        matches!(mode, Mode::Deferred | Mode::AsyncWal);
+    cfg.commit_deferred_outcomes_enabled = matches!(mode, Mode::Deferred | Mode::AsyncWal);
     // async WAL only flips on in AsyncWal mode. The
     // deferred-outcome guard in `commit_ops_deferred` requires both
     // flags to be on before it threads `SubmitOptions::async_` into
@@ -394,4 +393,3 @@ fn seq_guard_survives_reopen_async_wal() {
     // and the reopen would see an OLD checkpoint.
     survives_reopen(Mode::AsyncWal);
 }
-

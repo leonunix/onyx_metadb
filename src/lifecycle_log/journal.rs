@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 
 use crc32c::crc32c;
 
-use crate::error::{MetaDbError, Result};
 use super::record::{
     DecodeError, WAL_HEADER_SIZE, WAL_MAX_BODY, WalRecordIter, WalRecordRef, encode as encode_frame,
 };
+use crate::error::{MetaDbError, Result};
 
 /// Decoded journal record. `seq` is the monotonic id assigned at
 /// `append` time; `body` is the encoded op.
@@ -90,8 +90,7 @@ impl LifecycleJournal {
         let need_rotate = match self.current.as_ref() {
             Some(seg) => {
                 seg.bytes_written() > 0
-                    && seg.bytes_written().saturating_add(projected as u64)
-                        > self.max_segment_bytes
+                    && seg.bytes_written().saturating_add(projected as u64) > self.max_segment_bytes
             }
             None => true,
         };
@@ -222,7 +221,9 @@ fn segment_filename(start_seq: u64) -> String {
 }
 
 fn parse_segment_filename(name: &str) -> Option<u64> {
-    let s = name.strip_prefix(SEGMENT_PREFIX)?.strip_suffix(SEGMENT_SUFFIX)?;
+    let s = name
+        .strip_prefix(SEGMENT_PREFIX)?
+        .strip_suffix(SEGMENT_SUFFIX)?;
     if s.len() != 20 {
         return None;
     }

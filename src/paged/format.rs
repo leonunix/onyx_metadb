@@ -244,8 +244,7 @@ impl L2pValue {
 
     /// Return a copy with the `birth_lsn` field replaced.
     pub fn with_birth_lsn(mut self, birth_lsn: Lsn) -> Self {
-        self.0[L2P_BIRTH_OFFSET..L2P_BIRTH_OFFSET + 8]
-            .copy_from_slice(&birth_lsn.to_be_bytes());
+        self.0[L2P_BIRTH_OFFSET..L2P_BIRTH_OFFSET + 8].copy_from_slice(&birth_lsn.to_be_bytes());
         self
     }
 }

@@ -15,6 +15,7 @@
 
 pub mod affinity;
 pub mod apply_gate;
+pub mod bfg;
 pub mod cache;
 pub mod config;
 pub mod db;
@@ -37,7 +38,6 @@ pub mod paged_meta;
 pub mod refcount;
 pub mod testing;
 pub mod tx;
-pub mod bfg;
 pub mod types;
 pub mod verify;
 
@@ -50,13 +50,13 @@ pub use db::{
 };
 pub use dedup_types::{DEDUP_VALUE_SIZE, DedupValue, HASH_SIZE, Hash8, LsmStats};
 pub use error::{MetaDbError, Result};
+pub use lifecycle_log::{JournalDevice, RING_BLOCK_SIZE};
 pub use manifest::{
     LoadedManifest, MANIFEST_BODY_VERSION, Manifest, ManifestStore, SnapshotEntry,
     VOLUME_ENTRY_FIXED_SIZE, VOLUME_FLAG_CLONE_LINEAGE, VOLUME_FLAG_DROP_PENDING, VolumeEntry,
     decode_volume_entry_inline, encode_volume_entry_inline, max_snapshots_for_shards,
     volume_entry_inline_size,
 };
-pub use lifecycle_log::{JournalDevice, RING_BLOCK_SIZE};
 pub use metrics::{FlushKind, MetaMetrics, MetaMetricsSnapshot};
 pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 pub use page_store::{BlockPageDevice, PageBlockIo, PageDevice, PageStore, ReclaimOutcome};

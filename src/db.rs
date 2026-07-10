@@ -1406,6 +1406,8 @@ fn ref_bound(bound: &Bound<u64>) -> Bound<&u64> {
 
 mod apply;
 mod async_reclaim;
+mod bfg_quiesce;
+mod bfg_sync;
 mod commit;
 mod helpers;
 mod indexes;
@@ -1417,8 +1419,6 @@ mod livelist_condense;
 mod promotion;
 mod snapshot;
 mod streaming_flush;
-mod bfg_quiesce;
-mod bfg_sync;
 mod verify_audit;
 mod volume;
 

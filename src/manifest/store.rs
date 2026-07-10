@@ -75,7 +75,8 @@ fn slot_catalog_heads(page_store: &PageStore, slot: PageId) -> Option<(PageId, P
         return None;
     }
     let p = page.payload();
-    let body_version = u32::from_le_bytes(p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].try_into().ok()?);
+    let body_version =
+        u32::from_le_bytes(p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].try_into().ok()?);
     if body_version != MANIFEST_BODY_VERSION {
         return None;
     }
@@ -106,10 +107,14 @@ fn slot_catalog_heads(page_store: &PageStore, slot: PageId) -> Option<(PageId, P
 pub(crate) fn catalog_chain_pids_all_slots(page_store: &PageStore) -> Vec<PageId> {
     let mut pids = Vec::new();
     for slot in [MANIFEST_PAGE_A, MANIFEST_PAGE_B] {
-        let Some((vol_head, snap_head, free_list_head)) = slot_catalog_heads(page_store, slot) else {
+        let Some((vol_head, snap_head, free_list_head)) = slot_catalog_heads(page_store, slot)
+        else {
             continue;
         };
-        for (head, kind) in [(vol_head, CatalogKind::Volumes), (snap_head, CatalogKind::Snapshots)] {
+        for (head, kind) in [
+            (vol_head, CatalogKind::Volumes),
+            (snap_head, CatalogKind::Snapshots),
+        ] {
             if let Ok(p) = catalog::chain_pids(page_store, head, kind) {
                 pids.extend(p);
             }
@@ -242,7 +247,8 @@ impl ManifestStore {
     ) {
         let idx = slot_index(slot);
         self.slot_volume_chain[idx] =
-            catalog::chain_pids(&self.page_store, vol_head, CatalogKind::Volumes).unwrap_or_default();
+            catalog::chain_pids(&self.page_store, vol_head, CatalogKind::Volumes)
+                .unwrap_or_default();
         self.slot_snapshot_chain[idx] =
             catalog::chain_pids(&self.page_store, snap_head, CatalogKind::Snapshots)
                 .unwrap_or_default();
@@ -324,9 +330,9 @@ impl ManifestStore {
             // Pages the bitmap needs to cover [FIRST_DATA_PAGE, high_water); +1
             // slack so the frontier-append below (when relocating) can't push the
             // bitmap past the run it's sized for.
-            let needed = catalog::free_list_run_data_pages(
-                catalog::free_list_bitmap_len(self.page_store.high_water()),
-            ) + 1;
+            let needed = catalog::free_list_run_data_pages(catalog::free_list_bitmap_len(
+                self.page_store.high_water(),
+            )) + 1;
             let (fl_run, fl_free) = if existing.len() >= needed {
                 // Reuse the whole run in place (steady state — no allocation, so
                 // the free-list snapshot below is untouched).

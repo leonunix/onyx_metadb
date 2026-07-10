@@ -194,7 +194,10 @@ pub(crate) fn merge_read_or_floor(prev: RcEntry, delta: i64, lsn: Lsn) -> Result
 /// `RcShard::lookup_entry` / `stage` use to merge each of `delta_active`
 /// / `delta_draining` onto the on-disk-or-overlay base.
 #[inline]
-pub(crate) fn merge_pending_read(base: RcEntry, pending: Option<delta::Pending>) -> Result<RcEntry> {
+pub(crate) fn merge_pending_read(
+    base: RcEntry,
+    pending: Option<delta::Pending>,
+) -> Result<RcEntry> {
     match pending {
         Some(p) => merge_read_or_floor(base, p.delta, p.last_lsn),
         None => Ok(base),

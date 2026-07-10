@@ -639,7 +639,10 @@ impl Db {
     /// Correctness is identical to the full drain — volumes are
     /// independent, and range_delete touches only `vol_ord`. No-op when
     /// the buffer is disabled or the volume is gone.
-    pub(super) fn force_compact_l2p_buffers_for_volume(&self, vol_ord: VolumeOrdinal) -> Result<()> {
+    pub(super) fn force_compact_l2p_buffers_for_volume(
+        &self,
+        vol_ord: VolumeOrdinal,
+    ) -> Result<()> {
         if !self.l2p_buffer_enabled {
             return Ok(());
         }
@@ -703,10 +706,7 @@ impl Db {
                     // BFG: harvest page-deaths from this
                     // all-slots fold before releasing the tree lock.
                     // H1: route to this shard's own accumulator.
-                    super::apply::drain_page_deaths_into(
-                        &vol.page_dead_list[shard_idx],
-                        &mut tree,
-                    );
+                    super::apply::drain_page_deaths_into(&vol.page_dead_list[shard_idx], &mut tree);
                     // BFG: same fold site for the per-clone
                     // page-livelist witness (empty for non-clones).
                     super::apply::drain_live_events_into(&vol.page_live_list, &mut tree);

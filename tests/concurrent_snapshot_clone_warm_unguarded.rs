@@ -23,8 +23,8 @@
 //!   cargo test --test concurrent_snapshot_clone_warm_unguarded -- --test-threads=1
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use onyx_metadb::{Config, Db, L2pValue, SnapshotId, VolumeOrdinal};
@@ -94,8 +94,12 @@ fn unguarded_writer_vs_snapshot_flush_warm_stays_sound() {
         db.flush().unwrap();
         live.push_back(snap);
         for i in 0..32u64 {
-            db.insert(0, (i * 7) % SEED_KEYS, v((round as u8).wrapping_add(i as u8)))
-                .unwrap();
+            db.insert(
+                0,
+                (i * 7) % SEED_KEYS,
+                v((round as u8).wrapping_add(i as u8)),
+            )
+            .unwrap();
         }
         if live.len() > LIVE_SNAP_CAP {
             let old = live.pop_front().unwrap();
@@ -107,7 +111,9 @@ fn unguarded_writer_vs_snapshot_flush_warm_stays_sound() {
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
     for snap in live {
-        db.drop_snapshot(snap).unwrap().expect("drain live snapshot");
+        db.drop_snapshot(snap)
+            .unwrap()
+            .expect("drain live snapshot");
     }
     db.flush().unwrap();
     drop(db);
@@ -138,7 +144,9 @@ fn unguarded_clone_source_overwrite_stays_sound() {
                 .unwrap();
         }
         db.flush().unwrap();
-        db.drop_snapshot(s1).unwrap().expect("drop linking snapshot");
+        db.drop_snapshot(s1)
+            .unwrap()
+            .expect("drop linking snapshot");
         thread::yield_now();
         if round % 3 == 0 {
             db.promote_volume(c1).unwrap();

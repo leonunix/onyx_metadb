@@ -131,8 +131,9 @@ fn drainer_rc_and_dedup_match_disabled_reference() {
             }
         }
         db.flush().unwrap();
-        let dedup: Vec<(u8, Option<onyx_metadb::DedupValue>)> =
-            (1u8..=5).map(|hb| (hb, db.get_dedup(&h(hb)).unwrap())).collect();
+        let dedup: Vec<(u8, Option<onyx_metadb::DedupValue>)> = (1u8..=5)
+            .map(|hb| (hb, db.get_dedup(&h(hb)).unwrap()))
+            .collect();
         let rc: Vec<(u64, u32)> = (1000u64..=1004)
             .map(|pba| (pba, db.get_refcount(pba).unwrap()))
             .collect();
@@ -141,7 +142,10 @@ fn drainer_rc_and_dedup_match_disabled_reference() {
 
     let (dedup_off, rc_off) = run(false);
     let (dedup_on, rc_on) = run(true);
-    assert_eq!(dedup_on, dedup_off, "dedup end-state must match the eager reference");
+    assert_eq!(
+        dedup_on, dedup_off,
+        "dedup end-state must match the eager reference"
+    );
     assert_eq!(
         rc_on, rc_off,
         "refcount end-state must be byte-identical to the eager path (rc-safety contract)"
@@ -168,7 +172,9 @@ fn drainer_rc_matches_disabled_randomized() {
         // Deterministic LCG (Numerical Recipes constants).
         let mut state: u64 = 0x1234_5678_9abc_def0;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             state >> 33
         };
         for i in 0..N_OPS {
@@ -185,8 +191,9 @@ fn drainer_rc_matches_disabled_randomized() {
             }
         }
         db.flush().unwrap();
-        let dedup: Vec<Option<onyx_metadb::DedupValue>> =
-            (0u64..N_HASHES).map(|hb| db.get_dedup(&h(hb as u8)).unwrap()).collect();
+        let dedup: Vec<Option<onyx_metadb::DedupValue>> = (0u64..N_HASHES)
+            .map(|hb| db.get_dedup(&h(hb as u8)).unwrap())
+            .collect();
         let rc: Vec<u32> = (0u64..N_PBAS)
             .map(|p| db.get_refcount(PBA_BASE + p).unwrap())
             .collect();
@@ -195,13 +202,19 @@ fn drainer_rc_matches_disabled_randomized() {
 
     let (dedup_off, rc_off) = run(false);
     let (dedup_on, rc_on) = run(true);
-    assert_eq!(dedup_on, dedup_off, "randomized dedup end-state diverged from eager reference");
+    assert_eq!(
+        dedup_on, dedup_off,
+        "randomized dedup end-state diverged from eager reference"
+    );
     assert_eq!(
         rc_on, rc_off,
         "randomized refcount end-state diverged from eager reference (rc-safety contract)"
     );
     // Sanity: the stream actually exercised live refs (not all-zero).
-    assert!(rc_off.iter().any(|&c| c > 0), "test should leave some live PBAs");
+    assert!(
+        rc_off.iter().any(|&c| c > 0),
+        "test should leave some live PBAs"
+    );
 }
 
 #[test]

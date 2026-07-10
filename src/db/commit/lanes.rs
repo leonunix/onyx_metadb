@@ -491,7 +491,11 @@ impl Db {
                     lsn,
                     bfg,
                 );
-                metrics.record_dedup_lane_task(bucket_ops, ready_queue_wait, exec_started.elapsed());
+                metrics.record_dedup_lane_task(
+                    bucket_ops,
+                    ready_queue_wait,
+                    exec_started.elapsed(),
+                );
                 let _ = tx.send(outcomes);
             }));
             dedup_receivers.push(rx);

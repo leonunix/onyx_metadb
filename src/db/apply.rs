@@ -197,7 +197,16 @@ pub(super) fn apply_op_bare(
             // when a live snapshot still pins it (`stage_delete_rc`).             // (flag off): dead-list + lineage GC drives reclaim. (`snap_infos`
             // hoisted above for the snapshot watermark COW-kill arm.)
             if rc_authoritative {
-                stage_delete_rc(refcount_shards, bfg, &tree, sid, *lba, prev, &snap_infos, lsn)?;
+                stage_delete_rc(
+                    refcount_shards,
+                    bfg,
+                    &tree,
+                    sid,
+                    *lba,
+                    prev,
+                    &snap_infos,
+                    lsn,
+                )?;
             }
             // BFG: a direct delete COWs the path to the
             // deleted leaf; record any displaced page.

@@ -50,7 +50,9 @@ pub enum MetaDbError {
     /// is a physical capacity wall on a device-backed page store, and it
     /// must abort the in-flight checkpoint cleanly (roll back, leave the
     /// prior manifest generation intact) rather than corrupt.
-    #[error("meta device capacity exhausted: need {requested_pages} pages, capacity {capacity_pages}")]
+    #[error(
+        "meta device capacity exhausted: need {requested_pages} pages, capacity {capacity_pages}"
+    )]
     CapacityExhausted {
         requested_pages: u64,
         capacity_pages: u64,

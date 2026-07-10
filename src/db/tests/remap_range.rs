@@ -36,7 +36,12 @@ fn rc_authoritative_packed_unit_increfs_n() {
     for lba in 0..n as u64 {
         // Distinct tag per LBA so they are distinct L2pValues sharing one
         // head_pba (the packed-slot contract); each must contribute +1.
-        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, lba, remap_val(base, lba as u8 + 1), None);
+        tx.l2p_remap(
+            BOOTSTRAP_VOLUME_ORD,
+            lba,
+            remap_val(base, lba as u8 + 1),
+            None,
+        );
     }
     tx.commit_with_outcomes().unwrap();
     db.flush().unwrap();
@@ -89,7 +94,12 @@ fn rc_authoritative_packed_unit_decays_to_zero() {
     let n = 6u64; // mirrors the forensic packed unit_lba_count=6
     let mut tx = db.begin();
     for lba in 0..n {
-        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, lba, remap_val(base, lba as u8 + 1), None);
+        tx.l2p_remap(
+            BOOTSTRAP_VOLUME_ORD,
+            lba,
+            remap_val(base, lba as u8 + 1),
+            None,
+        );
     }
     tx.commit_with_outcomes().unwrap();
     db.flush().unwrap();
@@ -951,7 +961,10 @@ fn l2p_remap_range_writes_each_lba_and_increfs_distinct_pbas() {
     assert!(freed.is_empty());
     for i in 0..4u8 {
         let want = remap_val(100 + i as u64, i);
-        assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10 + i as u64).unwrap(), Some(want));
+        assert_eq!(
+            db.get(BOOTSTRAP_VOLUME_ORD, 10 + i as u64).unwrap(),
+            Some(want)
+        );
         assert_eq!(db.get_refcount(100 + i as u64).unwrap(), 0);
     }
 }

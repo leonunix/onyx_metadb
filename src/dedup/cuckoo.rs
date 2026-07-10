@@ -358,7 +358,8 @@ impl CuckooHash {
         }
         // Both candidate pages are full — kick off a cuckoo chain.
         let started = std::time::Instant::now();
-        let placed = self.evict_and_insert(insert_order[0], hash, value, lsn, Some(&mut *timings))?;
+        let placed =
+            self.evict_and_insert(insert_order[0], hash, value, lsn, Some(&mut *timings))?;
         timings.cuckoo_evict_and_insert += started.elapsed();
         if placed {
             self.bump_len(1);
@@ -607,7 +608,11 @@ impl CuckooHash {
                 }
                 (pid, new_data_page(), 0u128)
             } else {
-                (c.pid, c.page.take().expect("allocated page loaded"), c.bitmap)
+                (
+                    c.pid,
+                    c.page.take().expect("allocated page loaded"),
+                    c.bitmap,
+                )
             }
         };
 
@@ -635,7 +640,8 @@ impl CuckooHash {
         page.seal();
         self.page_store
             .write_page_for_class(target_pid, &page, IoLaneClass::Dedup)?;
-        self.page_cache.replace_or_insert(target_pid, Arc::new(page));
+        self.page_cache
+            .replace_or_insert(target_pid, Arc::new(page));
         self.bump_len(1);
         Ok(AtomicInsertOutcome::Inserted)
     }
@@ -681,10 +687,7 @@ impl CuckooHash {
         for slot in 0..SLOTS_PER_PAGE {
             if bitmap & (1u128 << slot) != 0 {
                 let (h, v) = read_slot(&page, slot);
-                entries.push(CuckooPutEntry {
-                    hash: h,
-                    value: v,
-                });
+                entries.push(CuckooPutEntry { hash: h, value: v });
             }
         }
         new.put_if_absent_many_grouped(&entries, lsn)
@@ -788,7 +791,11 @@ impl CuckooHash {
         }
         // Out-of-range cursor (e.g. the table shrank since last call) → restart.
         let mut pi = if page_idx >= n { 0 } else { page_idx };
-        let mut sl = if page_idx >= n { 0 } else { slot.min(SLOTS_PER_PAGE) };
+        let mut sl = if page_idx >= n {
+            0
+        } else {
+            slot.min(SLOTS_PER_PAGE)
+        };
         loop {
             if let Some(page) = self.load_data_page_for_read(pi)? {
                 let bitmap = read_bitmap(&page);
@@ -1529,7 +1536,8 @@ impl CuckooHash {
             state.page.seal();
             dirty_pages.push((state.page_id, Arc::new(state.page.clone())));
         }
-        self.page_store.write_sealed_page_runs(dirty_pages.clone())?;
+        self.page_store
+            .write_sealed_page_runs(dirty_pages.clone())?;
         for (page_id, page) in dirty_pages {
             self.page_cache.replace_or_insert(page_id, page);
         }

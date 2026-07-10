@@ -1,8 +1,6 @@
 use super::*;
 use crate::config::PAGE_SIZE;
-use crate::paged::format::{
-    L2pValue, index_set_child, leaf_bit_set, leaf_set, leaf_value_at,
-};
+use crate::paged::format::{L2pValue, index_set_child, leaf_bit_set, leaf_set, leaf_value_at};
 use tempfile::TempDir;
 
 fn mk_store() -> (TempDir, Arc<PageStore>) {

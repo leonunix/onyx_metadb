@@ -135,7 +135,10 @@ fn read_run(device: &dyn JournalDevice, block_count: u64, start: u64, run: u64) 
     let mut buf = vec![0u8; (run as usize) * BLOCK_SIZE];
     for i in 0..run {
         let idx = (start + i) % block_count;
-        device.read_block(idx, &mut buf[(i as usize) * BLOCK_SIZE..(i as usize + 1) * BLOCK_SIZE])?;
+        device.read_block(
+            idx,
+            &mut buf[(i as usize) * BLOCK_SIZE..(i as usize + 1) * BLOCK_SIZE],
+        )?;
     }
     Ok(buf)
 }
@@ -228,7 +231,8 @@ impl RingJournal {
                 "ring journal head {ring_head} >= block_count {block_count}",
             )));
         }
-        let (tail, max_seq, used) = scan_from(device.as_ref(), block_count, ring_head, |_, _| Ok(()))?;
+        let (tail, max_seq, used) =
+            scan_from(device.as_ref(), block_count, ring_head, |_, _| Ok(()))?;
         Ok(Self {
             device,
             block_count,
@@ -304,7 +308,10 @@ impl RingJournal {
         }
         self.device.flush()?;
 
-        self.next_seq = self.next_seq.checked_add(1).ok_or(MetaDbError::OutOfSpace)?;
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(MetaDbError::OutOfSpace)?;
         self.tail = (self.tail + run) % self.block_count;
         self.used += run;
         Ok(seq)

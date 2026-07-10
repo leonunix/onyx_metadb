@@ -23,9 +23,9 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::bfg::BfgStateMachine;
 use crate::metrics::MetaMetrics;
 use crate::testing::faults::{FaultController, FaultPoint};
-use crate::bfg::BfgStateMachine;
 use crate::types::Bfg;
 
 use super::bfg_sync::SyncNotifier;
@@ -246,7 +246,7 @@ mod tests {
         state: Arc<BfgStateMachine>,
         sync_notifier: Arc<SyncNotifier>,
     ) -> super::super::bfg_sync::BfgSyncThread {
-        use super::super::bfg_sync::{SyncWorkFn, BfgSyncThread};
+        use super::super::bfg_sync::{BfgSyncThread, SyncWorkFn};
         let work: SyncWorkFn = Arc::new(|_| Ok(()));
         BfgSyncThread::start(state, sync_notifier, work, noop_metrics())
     }

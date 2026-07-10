@@ -54,7 +54,10 @@ fn l2p_put_skips_zero_mapping_prev() {
     db.insert(0, 1, v_zero()).unwrap();
     db.insert(0, 1, v(0xCC)).unwrap();
     let records = drain_dead_list(&db, 0);
-    assert!(records.is_empty(), "FLAG_ZERO prev must not emit a dead record");
+    assert!(
+        records.is_empty(),
+        "FLAG_ZERO prev must not emit a dead record"
+    );
 }
 
 #[test]
@@ -136,8 +139,14 @@ fn page_deadlist_segments_survive_reopen() {
 
     let db = Db::open(dir.path()).unwrap();
     let (head_after, tail_after) = db.test_page_dead_list_anchors(0).unwrap();
-    assert_eq!(head_after, head_before, "page-deadlist head anchor lost across reopen");
-    assert_eq!(tail_after, tail_before, "page-deadlist tail anchor lost across reopen");
+    assert_eq!(
+        head_after, head_before,
+        "page-deadlist head anchor lost across reopen"
+    );
+    assert_eq!(
+        tail_after, tail_before,
+        "page-deadlist tail anchor lost across reopen"
+    );
     let page = db.test_read_page(head_after).unwrap();
     assert_eq!(
         page.header().unwrap().page_type,
@@ -156,7 +165,11 @@ fn page_deadlist_segments_survive_reopen() {
         },
     )
     .unwrap();
-    assert!(report.is_clean(), "verify issues after reopen: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "verify issues after reopen: {:?}",
+        report.issues
+    );
 }
 
 #[test]
@@ -242,7 +255,11 @@ fn drop_middle_snapshot_merges_keep_into_s_next() {
     // SnapshotRoots pages); strict verify trips on them otherwise.
     let db = crate::Db::open(dir.path()).unwrap();
     for i in 0u64..300 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v((i as u8).wrapping_add(3))), "reopen lba {i}");
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v((i as u8).wrapping_add(3))),
+            "reopen lba {i}"
+        );
     }
     drop(db);
     let report = crate::verify::verify_path(
@@ -281,7 +298,10 @@ fn s2_drop_snapshot_nonclone_frees_via_free_pages() {
         db.insert(0, i, v((i as u8).wrapping_add(9))).unwrap();
     }
     db.flush().unwrap();
-    let report = db.drop_snapshot(s).unwrap().expect("drop youngest snapshot");
+    let report = db
+        .drop_snapshot(s)
+        .unwrap()
+        .expect("drop youngest snapshot");
     assert!(
         report.pages_freed > 0,
         "S2 deadlist free_pages must actually free the snapshot-exclusive pages"
@@ -297,7 +317,11 @@ fn s2_drop_snapshot_nonclone_frees_via_free_pages() {
     drop(db);
     let db = crate::Db::open(dir.path()).unwrap();
     for i in 0u64..200 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v((i as u8).wrapping_add(9))), "reopen lba {i}");
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v((i as u8).wrapping_add(9))),
+            "reopen lba {i}"
+        );
     }
     drop(db);
     let report = crate::verify::verify_path(
@@ -310,7 +334,11 @@ fn s2_drop_snapshot_nonclone_frees_via_free_pages() {
         },
     )
     .unwrap();
-    assert!(report.is_clean(), "verify issues after S2 snapshot free: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "verify issues after S2 snapshot free: {:?}",
+        report.issues
+    );
 }
 
 #[test]
@@ -364,15 +392,25 @@ fn s2_drop_snapshot_crash_recovery_completeness() {
     // lost across the crash, so the inheritor's dl_next under-counted →
     // check_page_deadlist_shadow MISSING Corruption. Post-fix they are durable
     // in the HEAD chain (accumulator-seal) → the drop succeeds.
-    db.drop_snapshot(s2).unwrap().expect("drop s2 after crash + reopen (no MISSING)");
+    db.drop_snapshot(s2)
+        .unwrap()
+        .expect("drop s2 after crash + reopen (no MISSING)");
     for i in 0u64..64 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v((i as u8).wrapping_add(2))), "lba {i} live");
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v((i as u8).wrapping_add(2))),
+            "lba {i} live"
+        );
     }
     db.flush().unwrap();
     drop(db);
     let db = crate::Db::open(dir.path()).unwrap();
     for i in 0u64..64 {
-        assert_eq!(db.get(0, i).unwrap(), Some(v((i as u8).wrapping_add(2))), "lba {i} reopen");
+        assert_eq!(
+            db.get(0, i).unwrap(),
+            Some(v((i as u8).wrapping_add(2))),
+            "lba {i} reopen"
+        );
     }
     drop(db);
     let report = crate::verify::verify_path(
@@ -385,7 +423,11 @@ fn s2_drop_snapshot_crash_recovery_completeness() {
         },
     )
     .unwrap();
-    assert!(report.is_clean(), "verify after crash-recovery drop: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "verify after crash-recovery drop: {:?}",
+        report.issues
+    );
 }
 
 #[test]
@@ -429,12 +471,16 @@ fn s1_promoted_exclone_buffer_fold_capture_watermark_no_hole() {
     db.flush().unwrap();
     let base_snap = db.take_snapshot(base).unwrap();
     let clone = db.clone_volume(base_snap).unwrap();
-    assert!(db.promote_volume(clone).unwrap(), "clone should promote to independence");
+    assert!(
+        db.promote_volume(clone).unwrap(),
+        "clone should promote to independence"
+    );
 
     // Diverge the promoted clone in ONE folded batch: the root forks once;
     // leaves are born across the batch's lsn span (above the fork lsn).
     for i in 0u64..32 {
-        db.insert(clone, i * 256, v((0xC0u8).wrapping_add(i as u8))).unwrap();
+        db.insert(clone, i * 256, v((0xC0u8).wrapping_add(i as u8)))
+            .unwrap();
     }
     db.flush().unwrap();
 
@@ -444,7 +490,8 @@ fn s1_promoted_exclone_buffer_fold_capture_watermark_no_hole() {
     // Overwrite the snapshot-pinned leaves in another folded batch → their
     // deaths (birth = a post-fork batch lsn) are recorded against S.
     for i in 0u64..32 {
-        db.insert(clone, i * 256, v((0x40u8).wrapping_add(i as u8))).unwrap();
+        db.insert(clone, i * 256, v((0x40u8).wrapping_add(i as u8)))
+            .unwrap();
     }
     db.flush().unwrap();
 
@@ -554,7 +601,12 @@ fn h1_steady_flush_seals_all_folded_page_deaths() {
     // so without this the benign deferred orphans would be flagged.
     let db = crate::Db::open(dir.path()).unwrap();
     for i in 0u64..16 {
-        assert_eq!(db.get(0, i * 256).unwrap(), Some(v(0xA0 | i as u8)), "lba {} reopen", i * 256);
+        assert_eq!(
+            db.get(0, i * 256).unwrap(),
+            Some(v(0xA0 | i as u8)),
+            "lba {} reopen",
+            i * 256
+        );
     }
     drop(db);
     let report = crate::verify::verify_path(
@@ -567,7 +619,11 @@ fn h1_steady_flush_seals_all_folded_page_deaths() {
         },
     )
     .unwrap();
-    assert!(report.is_clean(), "verify after H1 crash-recovery: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "verify after H1 crash-recovery: {:?}",
+        report.issues
+    );
 }
 
 #[test]
@@ -605,7 +661,12 @@ fn h1_drop_volume_seals_other_volumes_page_deaths() {
         .unwrap()
         .expect("drop after drop_volume + crash + reopen must not fire MISSING");
     for i in 0u64..16 {
-        assert_eq!(db.get(0, i * 256).unwrap(), Some(v(0xA0 | i as u8)), "lba {} live", i * 256);
+        assert_eq!(
+            db.get(0, i * 256).unwrap(),
+            Some(v(0xA0 | i as u8)),
+            "lba {} live",
+            i * 256
+        );
     }
     db.flush().unwrap();
     drop(db);
@@ -623,7 +684,11 @@ fn h1_drop_volume_seals_other_volumes_page_deaths() {
         },
     )
     .unwrap();
-    assert!(report.is_clean(), "verify after H1 drop_volume crash-recovery: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "verify after H1 drop_volume crash-recovery: {:?}",
+        report.issues
+    );
 }
 
 #[test]
@@ -737,7 +802,10 @@ fn buffer_nonempty_triggers_flush_even_with_no_l2p_dirty() {
     let (_, tail_before) = dead_list_anchors(&db, 0);
     db.flush().unwrap();
     let (_, tail_after) = dead_list_anchors(&db, 0);
-    assert_ne!(tail_after, tail_before, "flush must advance tail when buffer has records");
+    assert_ne!(
+        tail_after, tail_before,
+        "flush must advance tail when buffer has records"
+    );
 }
 
 // WAL-free recovery: `wal_replay_re_emits_dead_records_into_buffer` tested
@@ -765,7 +833,9 @@ fn drop_volume_reclaims_dead_list_chain_pages() {
     assert_ne!(head, NULL_PAGE);
     assert_ne!(tail, NULL_PAGE);
     let head_pid_owned_before = head;
-    db.drop_volume(v_ord).unwrap().expect("drop returns DropVolumeReport");
+    db.drop_volume(v_ord)
+        .unwrap()
+        .expect("drop returns DropVolumeReport");
     // Verify no orphan rc / chain pages survive: offline verify must
     // be clean. drop_volume's manifest commit released the chain
     // anchor; the WAL apply path freed the per-segment pages via
@@ -925,7 +995,10 @@ fn s1_snapshot_overwrite_preserves_old_via_birth_no_divergence() {
     // OLD values back. A wrong recycle would have clobbered them in place.
     let clone = db.clone_volume(snap).unwrap();
     for i in 0u64..8 {
-        let val = db.get(clone, i * 256).unwrap().expect("snapshot mapping lost");
+        let val = db
+            .get(clone, i * 256)
+            .unwrap()
+            .expect("snapshot mapping lost");
         assert_eq!(
             val.head_pba(),
             (0x10 | i as u8) as u64,

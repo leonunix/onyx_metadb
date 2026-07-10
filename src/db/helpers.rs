@@ -302,7 +302,9 @@ pub(super) fn make_l2p_shard(
         active_readers: std::sync::atomic::AtomicUsize::new(0),
         apply_lane: ApplyLane::new(0, ApplyLaneKind::L2p, shard_idx, metrics),
         last_flushed_lsn: AtomicU64::new(initial_last_flushed_lsn),
-        l2p_buffer: Arc::new(crate::db::l2p_buffer::L2pBuffer::new(initial_last_flushed_lsn)),
+        l2p_buffer: Arc::new(crate::db::l2p_buffer::L2pBuffer::new(
+            initial_last_flushed_lsn,
+        )),
         use_buffer,
     }
 }
@@ -353,7 +355,8 @@ pub(super) fn open_l2p_shards(
     }
     let mut shards = Vec::with_capacity(roots.len());
     for (shard_idx, &root) in roots.iter().enumerate() {
-        let tree = PagedL2p::open_with_cache(page_store.clone(), page_cache.clone(), root, next_gen)?;
+        let tree =
+            PagedL2p::open_with_cache(page_store.clone(), page_cache.clone(), root, next_gen)?;
         shards.push(make_l2p_shard(
             tree,
             &page_cache,

@@ -61,7 +61,10 @@ fn no_hang_after_faulted_sync(threads: bool) {
     // the manifest -> fault -> Err. Must RETURN (not hang) with Err.
     faults.install(FaultPoint::ManifestFsyncBefore, 1, FaultAction::Error);
     let first = take_snapshot_no_hang(&db, vol, "first/faulted");
-    assert!(first.is_err(), "faulted-sync snapshot must return Err, got {first:?}");
+    assert!(
+        first.is_err(),
+        "faulted-sync snapshot must return Err, got {first:?}"
+    );
     assert!(
         faults.fired(FaultPoint::ManifestFsyncBefore),
         "the manifest-fsync fault must have fired on the snapshot's commit"
@@ -71,7 +74,10 @@ fn no_hang_after_faulted_sync(threads: bool) {
     // SECOND take_snapshot must FAIL FAST, not hang on the stuck Syncing slot.
     faults.clear();
     let second = take_snapshot_no_hang(&db, vol, "second/post-poison");
-    assert!(second.is_err(), "post-poison snapshot must fail fast, got {second:?}");
+    assert!(
+        second.is_err(),
+        "post-poison snapshot must fail fast, got {second:?}"
+    );
     // create_volume also drives a forced sync at entry -> fail fast (no hang).
     assert!(
         db.create_volume().is_err(),
@@ -85,12 +91,19 @@ fn no_hang_after_faulted_sync(threads: bool) {
     // the faulted snapshot is absent. Reopen, confirm data (both modes).
     let db = Db::open(dir.path()).unwrap();
     for i in 0u64..8 {
-        assert_eq!(db.get(vol, i).unwrap(), Some(v(i as u8)), "reopen lba {i} lost");
+        assert_eq!(
+            db.get(vol, i).unwrap(),
+            Some(v(i as u8)),
+            "reopen lba {i} lost"
+        );
     }
     // Subsystem usable after restart (fresh constructor reset sync_poison): a
     // snapshot now succeeds.
     let ok = db.take_snapshot(vol);
-    assert!(ok.is_ok(), "post-reopen snapshot must succeed (poison reset by restart), got {ok:?}");
+    assert!(
+        ok.is_ok(),
+        "post-reopen snapshot must succeed (poison reset by restart), got {ok:?}"
+    );
     drop(db);
 
     // Strict page-rc verify in threads-OFF only — that is the soak/production
@@ -113,7 +126,11 @@ fn no_hang_after_faulted_sync(threads: bool) {
             },
         )
         .unwrap();
-        assert!(report.is_clean(), "verify after faulted-sync recovery (threads-off): {:?}", report.issues);
+        assert!(
+            report.is_clean(),
+            "verify after faulted-sync recovery (threads-off): {:?}",
+            report.issues
+        );
     }
 }
 
@@ -182,7 +199,11 @@ fn concurrent_take_snapshots_no_hang_no_corruption_on_faulted_sync() {
         // ring-corruption the racer fix prevents) would surface here.
         let db = Db::open(dir.path()).unwrap();
         for i in 0u64..8 {
-            assert_eq!(db.get(vol, i).unwrap(), Some(v(i as u8)), "reopen lba {i} (attempt {attempt})");
+            assert_eq!(
+                db.get(vol, i).unwrap(),
+                Some(v(i as u8)),
+                "reopen lba {i} (attempt {attempt})"
+            );
         }
         drop(db);
         let report = verify_path(

@@ -28,7 +28,8 @@ fn manifest_survives_page_store_reopen() {
     {
         let ps = Arc::new(PageStore::create(&pages).unwrap());
         let faults = FaultController::new();
-        let (mut mstore, _) = ManifestStore::open_or_create(ps.clone(), cache(&ps), faults).unwrap();
+        let (mut mstore, _) =
+            ManifestStore::open_or_create(ps.clone(), cache(&ps), faults).unwrap();
         for lsn in [42u64, 77, 123] {
             let mut m = Manifest::empty();
             m.checkpoint_lsn = lsn;

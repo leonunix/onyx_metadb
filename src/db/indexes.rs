@@ -270,11 +270,7 @@ impl Db {
     /// entire index; this does not). See
     /// [`crate::dedup::cuckoo::Cuckoo::scan_from`] for the coverage / cursor
     /// stability contract (best-effort under concurrent growth/shrink).
-    pub fn scan_dedup_from(
-        &self,
-        cursor: DedupScanCursor,
-        limit: usize,
-    ) -> Result<DedupScanBatch> {
+    pub fn scan_dedup_from(&self, cursor: DedupScanCursor, limit: usize) -> Result<DedupScanBatch> {
         let (entries, page_idx, slot, wrapped) =
             self.dedup_index
                 .scan_from(cursor.page_idx as usize, cursor.slot as usize, limit)?;

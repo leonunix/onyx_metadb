@@ -352,10 +352,7 @@ fn cmd_forensic(args: &[String]) -> Result<ExitCode, String> {
         from,
         to,
         ..
-    } = parse_flags(
-        args,
-        ParseSpec::path_only().with_vol().with_from_to(),
-    )?;
+    } = parse_flags(args, ParseSpec::path_only().with_vol().with_from_to())?;
     let (Some(from), Some(to)) = (from, to) else {
         return Err("forensic requires --from and --to".into());
     };
@@ -484,7 +481,6 @@ fn cmd_dedup(args: &[String]) -> Result<ExitCode, String> {
     }
     Ok(ExitCode::SUCCESS)
 }
-
 
 // -------- snapshots -----------------------------------------------------
 

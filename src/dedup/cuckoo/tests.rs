@@ -89,8 +89,7 @@ fn saturation_drops_instead_of_erroring() {
     // Push well past a single page's capacity so saturation is certain.
     for i in 0..400u64 {
         // `put_with_metrics` NEVER errors — it reports a drop as Ok(false).
-        if c
-            .put_with_metrics(h64(i), dv64(1), (100 + i) as Lsn, &mut timings)
+        if c.put_with_metrics(h64(i), dv64(1), (100 + i) as Lsn, &mut timings)
             .unwrap()
         {
             placed += 1;
@@ -123,9 +122,10 @@ fn batch_put_reports_dropped_hashes_on_saturation() {
     let (_d, c) = make_index(1);
     let mut timings = crate::metrics::DedupPutStageTimings::default();
     // h64(0) is guaranteed placed (first insert into an empty page).
-    assert!(c
-        .put_with_metrics(h64(0), dv64(7), 100, &mut timings)
-        .unwrap());
+    assert!(
+        c.put_with_metrics(h64(0), dv64(7), 100, &mut timings)
+            .unwrap()
+    );
     // Saturate the rest of the page.
     for i in 1..400u64 {
         c.put_with_metrics(h64(i), dv64(1), (100 + i) as Lsn, &mut timings)
@@ -177,8 +177,12 @@ fn scan_from_covers_iter_in_bounded_steps() {
     for i in 0..150u8 {
         c.put(h(i), dv(i), 100).unwrap();
     }
-    let want: std::collections::HashSet<Hash8> =
-        c.iter().unwrap().into_iter().map(|(hash, _)| hash).collect();
+    let want: std::collections::HashSet<Hash8> = c
+        .iter()
+        .unwrap()
+        .into_iter()
+        .map(|(hash, _)| hash)
+        .collect();
     assert_eq!(want.len(), 150);
 
     // Walk the whole index in small bounded batches via the resume cursor.
@@ -377,7 +381,8 @@ fn concurrent_reads_during_grow_never_error() {
     // 4096 buckets / 28 buckets-per-page ≈ 147 data pages; 4000 unique
     // keys spread across them keeps growth continuous throughout the run
     // while staying under a 0.7 load factor (4096 * 4 = 16384 slots).
-    let cuckoo = Arc::new(CuckooHash::create(page_store, page_cache, 4096, 0xC0DE, 0xF00D).unwrap());
+    let cuckoo =
+        Arc::new(CuckooHash::create(page_store, page_cache, 4096, 0xC0DE, 0xF00D).unwrap());
 
     const WRITERS: u64 = 4;
     const PER_WRITER: u64 = 1000;
@@ -467,7 +472,9 @@ fn dangling_unwritten_page_without_writer_still_errors() {
     // publish it into the page table — mimicking a corrupt/torn state.
     let dangling = c.page_store.allocate().unwrap();
     c.inner.lock().page_table[0] = dangling;
-    let err = c.recount().expect_err("unwritten page must not read as empty");
+    let err = c
+        .recount()
+        .expect_err("unwritten page must not read as empty");
     assert!(
         matches!(err, MetaDbError::PageMagicMismatch { .. }),
         "expected magic mismatch on an unwritten page, got {err:?}"
@@ -512,8 +519,7 @@ fn put_if_absent_drops_when_candidate_pages_full() {
     let mut timings = crate::metrics::DedupPutStageTimings::default();
     let mut placed = Vec::new();
     for i in 0..400u64 {
-        if c
-            .put_with_metrics(h64(i), dv64(i), 100 + i, &mut timings)
+        if c.put_with_metrics(h64(i), dv64(i), 100 + i, &mut timings)
             .unwrap()
         {
             placed.push(i);
@@ -646,20 +652,43 @@ fn put_if_absent_many_grouped_skips_present_inserts_absent_no_dup() {
 
     let entries = vec![
         // present — a fresher value is offered but must be IGNORED (put-if-absent)
-        CuckooPutEntry { hash: h(1), value: dv(99) },
-        CuckooPutEntry { hash: h(2), value: dv(99) },
+        CuckooPutEntry {
+            hash: h(1),
+            value: dv(99),
+        },
+        CuckooPutEntry {
+            hash: h(2),
+            value: dv(99),
+        },
         // absent — must be inserted
-        CuckooPutEntry { hash: h(3), value: dv(3) },
-        CuckooPutEntry { hash: h(4), value: dv(4) },
-        CuckooPutEntry { hash: h(5), value: dv(5) },
+        CuckooPutEntry {
+            hash: h(3),
+            value: dv(3),
+        },
+        CuckooPutEntry {
+            hash: h(4),
+            value: dv(4),
+        },
+        CuckooPutEntry {
+            hash: h(5),
+            value: dv(5),
+        },
     ];
     let stats = c.put_if_absent_many_grouped(&entries, 200).unwrap();
     assert_eq!(stats.already_present, 2, "h1,h2 present → skipped");
     assert_eq!(stats.inserted, 3, "h3,h4,h5 inserted");
     assert_eq!(stats.dropped, 0);
 
-    assert_eq!(c.get(&h(1)).unwrap(), Some(dv(1)), "present entry NOT overwritten");
-    assert_eq!(c.get(&h(2)).unwrap(), Some(dv(2)), "present entry NOT overwritten");
+    assert_eq!(
+        c.get(&h(1)).unwrap(),
+        Some(dv(1)),
+        "present entry NOT overwritten"
+    );
+    assert_eq!(
+        c.get(&h(2)).unwrap(),
+        Some(dv(2)),
+        "present entry NOT overwritten"
+    );
     assert_eq!(c.get(&h(3)).unwrap(), Some(dv(3)));
     assert_eq!(c.get(&h(5)).unwrap(), Some(dv(5)));
     assert_eq!(c.recount().unwrap(), 5, "exactly 5 entries, no duplicates");

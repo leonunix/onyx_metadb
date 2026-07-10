@@ -87,11 +87,9 @@ impl DeferredOutcomeHandle {
         match self.rx.try_recv() {
             Ok(value) => Ok(value),
             Err(crossbeam_channel::TryRecvError::Empty) => Err(self),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                Ok(Err(MetaDbError::InvalidArgument(
-                    "deferred outcome channel disconnected".into(),
-                )))
-            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Ok(Err(
+                MetaDbError::InvalidArgument("deferred outcome channel disconnected".into()),
+            )),
         }
     }
 
@@ -144,11 +142,7 @@ impl DeferredOutcomeAggregator {
     /// promised — apply complete, last_applied_lsn bumped, L2pBuffer
     /// insert visible — has already been established by the sync-mode
     /// commit that produced these outcomes).
-    pub(crate) fn stage(
-        &self,
-        lsn: Lsn,
-        outcomes: Vec<ApplyOutcome>,
-    ) -> DeferredOutcomeHandle {
+    pub(crate) fn stage(&self, lsn: Lsn, outcomes: Vec<ApplyOutcome>) -> DeferredOutcomeHandle {
         self.metrics.record_deferred_outcomes_staged();
         // zero pending depth at all times.
         self.metrics.record_deferred_outcomes_pending(0);

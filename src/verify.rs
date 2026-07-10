@@ -10,7 +10,7 @@ use crate::manifest::{LoadedManifest, Manifest, ManifestStore, load_snapshot_roo
 use crate::page::PageType;
 use crate::page_store::PageStore;
 use crate::paged::format::{INDEX_FANOUT, index_child_at};
-use crate::types::{FIRST_DATA_PAGE, Lsn, NULL_PAGE, Pba, PageId};
+use crate::types::{FIRST_DATA_PAGE, Lsn, NULL_PAGE, PageId, Pba};
 
 #[derive(Clone, Debug, Default)]
 pub struct VerifyOptions {
@@ -309,8 +309,7 @@ fn check_clone_livelist(
                 continue;
             }
         };
-        let live_set: HashSet<(PageId, Lsn)> =
-            live.iter().map(|r| (r.pid, r.birth_lsn)).collect();
+        let live_set: HashSet<(PageId, Lsn)> = live.iter().map(|r| (r.pid, r.birth_lsn)).collect();
 
         // Ground truth: the clone's clone-private subtree — pages reachable
         // from its current roots whose immutable birth is after the branch.
@@ -324,17 +323,14 @@ fn check_clone_livelist(
                 Ok(h) => h,
                 Err(_) => continue,
             };
-            if matches!(
-                header.page_type,
-                PageType::PagedLeaf | PageType::PagedIndex
-            ) && header.birth_lsn > b
+            if matches!(header.page_type, PageType::PagedLeaf | PageType::PagedIndex)
+                && header.birth_lsn > b
             {
                 clone_private.insert((*pid, header.birth_lsn));
             }
         }
 
-        let mut extra: Vec<(PageId, Lsn)> =
-            live_set.difference(&clone_private).copied().collect();
+        let mut extra: Vec<(PageId, Lsn)> = live_set.difference(&clone_private).copied().collect();
         if !extra.is_empty() {
             extra.sort_unstable();
             report.issues.push(format!(
@@ -404,8 +400,7 @@ fn check_birth_shadow(
         let snap_set = match youngest {
             None => HashSet::new(),
             Some(snap) => {
-                let roots =
-                    snapshot_roots(page_store, snap.l2p_roots_page, &snap.l2p_shard_roots)?;
+                let roots = snapshot_roots(page_store, snap.l2p_roots_page, &snap.l2p_shard_roots)?;
                 reachable_l2p_pages(page_store, &roots)?
             }
         };
@@ -418,10 +413,7 @@ fn check_birth_shadow(
                 Ok(h) => h,
                 Err(_) => continue,
             };
-            if !matches!(
-                header.page_type,
-                PageType::PagedLeaf | PageType::PagedIndex
-            ) {
+            if !matches!(header.page_type, PageType::PagedLeaf | PageType::PagedIndex) {
                 continue;
             }
             let birth_predicts_preserved = youngest_snap > 0 && header.birth_lsn <= youngest_snap;
@@ -542,10 +534,7 @@ pub(crate) fn clone_birth_shadow_findings(
                 Ok(h) => h,
                 Err(_) => continue,
             };
-            if !matches!(
-                header.page_type,
-                PageType::PagedLeaf | PageType::PagedIndex
-            ) {
+            if !matches!(header.page_type, PageType::PagedLeaf | PageType::PagedIndex) {
                 continue;
             }
             let operand_cows = header.birth_lsn <= b_eff;
@@ -637,8 +626,7 @@ fn check_page_deadlist(
             std::collections::HashMap::new();
         let mut chain_pids: HashSet<PageId> = HashSet::new();
         for (label, tail) in &chains {
-            let records =
-                crate::deadlist::read_chain_records(*tail, |p| page_store.read_page(p))?;
+            let records = crate::deadlist::read_chain_records(*tail, |p| page_store.read_page(p))?;
             for r in records {
                 if r.birth_lsn >= r.death_lsn {
                     report.issues.push(format!(
@@ -876,10 +864,9 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         // `prev_seg_pid == NULL_PAGE`), so walk it to NULL and mark every
         // segment page live — else orphan reclaim frees it on reopen.
         if snapshot.page_dead_list_tail_pid != NULL_PAGE {
-            for pid in crate::deadlist::walk_chain_pages(
-                snapshot.page_dead_list_tail_pid,
-                |p| page_store.read_page(p),
-            )? {
+            for pid in crate::deadlist::walk_chain_pages(snapshot.page_dead_list_tail_pid, |p| {
+                page_store.read_page(p)
+            })? {
                 live.mark(pid);
             }
         }

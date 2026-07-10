@@ -61,7 +61,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::types::{Lsn, Bfg};
+use crate::types::{Bfg, Lsn};
 
 /// Ring slot count. Must be a power of two (slot index = `bfg & (BFG_SIZE - 1)`).
 pub const BFG_SIZE: usize = 4;
@@ -665,7 +665,10 @@ mod tests {
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || {
             // Shutdown is a clean teardown wake, not an abort → returns true.
-            assert!(sm2.wait_until_synced(99), "shutdown wake must return true (clean)");
+            assert!(
+                sm2.wait_until_synced(99),
+                "shutdown wake must return true (clean)"
+            );
         });
         thread::sleep(Duration::from_millis(30));
         sm.shutdown();
@@ -722,7 +725,10 @@ mod tests {
         assert!(!h.is_finished(), "should block before abort");
         sm.mark_aborted();
         let synced = h.join().unwrap();
-        assert!(!synced, "aborted wait must return false (caller surfaces poison)");
+        assert!(
+            !synced,
+            "aborted wait must return false (caller surfaces poison)"
+        );
     }
 
     #[test]
@@ -739,7 +745,10 @@ mod tests {
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || sm2.promote_to_syncing(q2));
         thread::sleep(Duration::from_millis(40));
-        assert!(!h.is_finished(), "promote should block while q1 stuck Syncing");
+        assert!(
+            !h.is_finished(),
+            "promote should block while q1 stuck Syncing"
+        );
         sm.mark_aborted();
         h.join().unwrap();
         // q2 was NOT promoted: still Quiescing, syncing_bfg still the stuck q1.
@@ -759,11 +768,18 @@ mod tests {
         let sm2 = Arc::clone(&sm);
         let h = thread::spawn(move || sm2.roll_to_quiescing());
         thread::sleep(Duration::from_millis(40));
-        assert!(!h.is_finished(), "roll should block on the inflight-drain wait");
+        assert!(
+            !h.is_finished(),
+            "roll should block on the inflight-drain wait"
+        );
         sm.mark_aborted();
         let returned = h.join().unwrap();
         assert_eq!(returned, 1, "aborted roll returns cur without advancing");
-        assert_eq!(sm.snapshot().quiescing_bfg, None, "aborted roll must not flip to Quiescing");
+        assert_eq!(
+            sm.snapshot().quiescing_bfg,
+            None,
+            "aborted roll must not flip to Quiescing"
+        );
         assert!(sm.is_aborted());
         drop(g);
     }

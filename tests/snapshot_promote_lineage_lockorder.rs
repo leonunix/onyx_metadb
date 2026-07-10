@@ -20,8 +20,8 @@
 //! a regression to enter-before-read hangs, which the watchdog converts into a
 //! loud abort rather than an infinite CI hang.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -132,11 +132,14 @@ fn snapshot_vs_promote_and_lineage_gc_no_deadlock() {
                 // Give the clone private mappings so promotion has PBAs to
                 // incref (drives commit_promotion_chunk, not just _complete).
                 for i in 0..32u64 {
-                    db.insert(c, i, v((round as u8).wrapping_add(i as u8))).unwrap();
+                    db.insert(c, i, v((round as u8).wrapping_add(i as u8)))
+                        .unwrap();
                 }
                 db.promote_volume(c).unwrap();
                 db.drop_volume(c).unwrap().expect("clone must drop");
-                db.drop_snapshot(s).unwrap().expect("linking snapshot must drop");
+                db.drop_snapshot(s)
+                    .unwrap()
+                    .expect("linking snapshot must drop");
             }
         })
     };

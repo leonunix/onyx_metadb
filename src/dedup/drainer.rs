@@ -10,8 +10,8 @@
 //!   page-generation replay-skip (dedup writes are idempotent).
 //! - park wakeups key off the staging `active` length, not a `DeltaMap`.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::metrics::MetaMetrics;

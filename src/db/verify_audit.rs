@@ -7,7 +7,10 @@ use super::*;
 /// hand `verify_path` a path to). Purely read-only: reads the current durable
 /// manifest and scans `page_store`, no page store or manifest mutation.
 impl Db {
-    pub fn verify(&self, options: crate::verify::VerifyOptions) -> Result<crate::verify::VerifyReport> {
+    pub fn verify(
+        &self,
+        options: crate::verify::VerifyOptions,
+    ) -> Result<crate::verify::VerifyReport> {
         let loaded = match crate::manifest::ManifestStore::load_latest(&self.page_store)? {
             Some(loaded) => loaded,
             None => {

@@ -313,7 +313,6 @@ fn attach_subtree_root_rejects_invalid_level() {
     ));
 }
 
-
 // -------- warmup_index_pages ---------------------------------------
 
 fn mk_tree_with_pin(pin_pages: u64) -> (TempDir, PagedL2p) {

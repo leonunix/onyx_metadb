@@ -338,7 +338,8 @@ impl MetaMetrics {
     /// dead-list segment was fully unpinned + rc==0, so it advances and
     /// surfaces `dead_pbas` FreePbas.
     pub(crate) fn record_lineage_gc_head_advanced(&self, dead_pbas: usize) {
-        self.lineage_gc_head_advanced.fetch_add(1, Ordering::Relaxed);
+        self.lineage_gc_head_advanced
+            .fetch_add(1, Ordering::Relaxed);
         self.lineage_gc_head_dead_pbas
             .fetch_add(dead_pbas as u64, Ordering::Relaxed);
     }

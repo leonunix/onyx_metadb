@@ -22,10 +22,7 @@ fn mk_cache(ps: &Arc<PageStore>) -> Arc<PageCache> {
 /// small one is fine — this wrapper keeps the call sites terse. The function
 /// is referenced as a value (not called inline) so the `open_or_create(` →
 /// `open_oc(` call-site rewrite doesn't recurse into this body.
-fn open_oc(
-    ps: Arc<PageStore>,
-    faults: Arc<FaultController>,
-) -> Result<(ManifestStore, Manifest)> {
+fn open_oc(ps: Arc<PageStore>, faults: Arc<FaultController>) -> Result<(ManifestStore, Manifest)> {
     let cache = mk_cache(&ps);
     let open = ManifestStore::open_or_create;
     open(ps, cache, faults)
@@ -221,8 +218,7 @@ fn corrupt_slot_a_falls_back_to_slot_b() {
         f.sync_all().unwrap();
     }
 
-    let (store2, loaded) =
-        open_oc(reopen(&dir), FaultController::new()).unwrap();
+    let (store2, loaded) = open_oc(reopen(&dir), FaultController::new()).unwrap();
     assert_eq!(without_catalog_heads(loaded), Manifest::empty());
     assert_eq!(store2.sequence(), 1);
     assert_eq!(store2.next_slot(), MANIFEST_PAGE_B);
@@ -245,8 +241,7 @@ fn both_slots_corrupt_rewrites_fresh_empty() {
         f.write_all_at(&[0xFFu8; 8192], 0).unwrap();
         f.sync_all().unwrap();
     }
-    let (store, manifest) =
-        open_oc(reopen(&dir), FaultController::new()).unwrap();
+    let (store, manifest) = open_oc(reopen(&dir), FaultController::new()).unwrap();
     assert_eq!(without_catalog_heads(manifest), Manifest::empty());
     assert_eq!(store.sequence(), 1);
 }
@@ -349,7 +344,8 @@ fn snapshot_table_spans_chain_pages() {
     let count = 500u64;
     m.next_snapshot_id = count + 1;
     for i in 0..count {
-        m.snapshots.push(snap(&ps, i + 1, 0, &[10, 11, 12, 13], i + 1));
+        m.snapshots
+            .push(snap(&ps, i + 1, 0, &[10, 11, 12, 13], i + 1));
     }
     let decoded = roundtrip(&dir, ps, m);
     assert_eq!(decoded.snapshots.len() as u64, count);
@@ -891,8 +887,7 @@ fn encode_v10_for_test(m: &Manifest, page: &mut Page) {
     let p = page.payload_mut();
     p.fill(0);
     p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].copy_from_slice(&10u32.to_le_bytes());
-    p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
-        .copy_from_slice(&m.checkpoint_lsn.to_le_bytes());
+    p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8].copy_from_slice(&m.checkpoint_lsn.to_le_bytes());
     p[OFF_FREE_LIST_HEAD..OFF_FREE_LIST_HEAD + 8].copy_from_slice(&m.free_list_head.to_le_bytes());
     p[OFF_SHARD_COUNT..OFF_SHARD_COUNT + 4]
         .copy_from_slice(&(m.refcount_shard_roots.len() as u32).to_le_bytes());

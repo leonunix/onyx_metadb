@@ -210,8 +210,7 @@ fn condense_one(
     } else {
         let page_count = crate::livelist::segment_pages_for(live.len());
         let start = inner.page_store.allocate_run(page_count)?;
-        let pages =
-            crate::livelist::build_segment_pages(start, &live, NULL_PAGE, checkpoint_lsn);
+        let pages = crate::livelist::build_segment_pages(start, &live, NULL_PAGE, checkpoint_lsn);
         let sealed: Vec<(PageId, Arc<Page>)> =
             pages.into_iter().map(|(p, pg)| (p, Arc::new(pg))).collect();
         inner.page_store.write_sealed_page_runs(sealed)?;
@@ -241,7 +240,12 @@ fn condense_one(
     //    the cur_tail check above passes) — a CLEAN abort, never corruption.
     let mut manifest_for_commit = {
         let mut mstate = inner.manifest_state.lock();
-        let entry = match mstate.manifest.volumes.iter_mut().find(|v| v.ord == vol_ord) {
+        let entry = match mstate
+            .manifest
+            .volumes
+            .iter_mut()
+            .find(|v| v.ord == vol_ord)
+        {
             Some(entry) => entry,
             None => {
                 drop(mstate);
@@ -273,8 +277,7 @@ fn condense_one(
         .faults
         .inject(FaultPoint::LivelistCondensePostManifestBeforeFree)?;
     let free_gen = inner.manifest_state.lock().manifest.checkpoint_lsn;
-    let old_pids =
-        crate::livelist::walk_chain_pages(tail0, |p| inner.page_store.read_page(p))?;
+    let old_pids = crate::livelist::walk_chain_pages(tail0, |p| inner.page_store.read_page(p))?;
     for pid in old_pids {
         inner.page_store.free_idempotent(pid, free_gen)?;
         inner.page_cache.invalidate(pid);

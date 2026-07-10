@@ -430,7 +430,14 @@ pub(in crate::db) fn stage_remap_rc(
     let snap_pins_new = if new_is_zero || snap_infos.is_empty() {
         false
     } else {
-        any_snap_pins(snap_infos, snap_sid, tree, lba, new_value, new_value.birth_lsn())?
+        any_snap_pins(
+            snap_infos,
+            snap_sid,
+            tree,
+            lba,
+            new_value,
+            new_value.birth_lsn(),
+        )?
     };
     stage_rc_net(
         refcount_shards,

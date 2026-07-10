@@ -201,7 +201,9 @@ impl FaultPoint {
             Self::CloneVolumeMidIncref => "clone_volume.mid_incref",
             Self::DeadListPostSegWriteBeforeManifest => "deadlist.post_seg_write.before_manifest",
             Self::DeadListPostManifestBeforeNextFlush => "deadlist.post_manifest.before_next_flush",
-            Self::LineageGcPostFreePbasBeforeManifest => "lineage_gc.post_free_pbas.before_manifest",
+            Self::LineageGcPostFreePbasBeforeManifest => {
+                "lineage_gc.post_free_pbas.before_manifest"
+            }
             Self::LineageGcPostHeadAdvanceBeforeFree => "lineage_gc.post_head_advance.before_free",
             Self::LineageGcMidSegmentRead => "lineage_gc.mid_segment_read",
             Self::LivelistCondensePostSegWriteBeforeManifest => {

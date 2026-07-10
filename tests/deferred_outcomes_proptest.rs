@@ -64,10 +64,26 @@ fn mk_l2p_value(pba: u64, seq: u64) -> L2pValue {
 
 #[derive(Clone, Debug)]
 enum Op {
-    Put { vol: VolumeOrdinal, lba: u64, pba: u64 },
-    Delete { vol: VolumeOrdinal, lba: u64 },
-    Remap { vol: VolumeOrdinal, lba: u64, pba: u64, seq: u64 },
-    RemapRange { vol: VolumeOrdinal, start_lba: u64, len: u64 },
+    Put {
+        vol: VolumeOrdinal,
+        lba: u64,
+        pba: u64,
+    },
+    Delete {
+        vol: VolumeOrdinal,
+        lba: u64,
+    },
+    Remap {
+        vol: VolumeOrdinal,
+        lba: u64,
+        pba: u64,
+        seq: u64,
+    },
+    RemapRange {
+        vol: VolumeOrdinal,
+        start_lba: u64,
+        len: u64,
+    },
 }
 
 fn arb_vol() -> impl Strategy<Value = VolumeOrdinal> {
@@ -114,7 +130,11 @@ fn op_to_walop(op: &Op, fresh_pba_seed: u64) -> WalOp {
             new_value: mk_l2p_value(pba, seq),
             guard: None,
         },
-        Op::RemapRange { vol, start_lba, len } => WalOp::L2pRemapRange {
+        Op::RemapRange {
+            vol,
+            start_lba,
+            len,
+        } => WalOp::L2pRemapRange {
             vol_ord: vol,
             start_lba,
             // Values share a synthetic base PBA so we can still
@@ -253,8 +273,7 @@ fn run_equivalence(seed_ops: Vec<Op>, batch_sizes: Vec<usize>) -> Result<(), Str
             .recv()
             .map_err(|e| format!("deferred recv batch {batch_idx}: {e:?}"))?;
 
-        outcomes_eq(&outs_sync, &outs_def)
-            .map_err(|msg| format!("batch {batch_idx}: {msg}"))?;
+        outcomes_eq(&outs_sync, &outs_def).map_err(|msg| format!("batch {batch_idx}: {msg}"))?;
 
         let sync_applied = db_sync.last_applied_lsn();
         let def_applied = db_def.last_applied_lsn();
@@ -273,8 +292,14 @@ fn run_equivalence(seed_ops: Vec<Op>, batch_sizes: Vec<usize>) -> Result<(), Str
     let sync_state = snapshot(&db_sync);
     let def_state = snapshot(&db_def);
     if sync_state != def_state {
-        let only_sync: Vec<_> = sync_state.keys().filter(|k| !def_state.contains_key(k)).collect();
-        let only_def: Vec<_> = def_state.keys().filter(|k| !sync_state.contains_key(k)).collect();
+        let only_sync: Vec<_> = sync_state
+            .keys()
+            .filter(|k| !def_state.contains_key(k))
+            .collect();
+        let only_def: Vec<_> = def_state
+            .keys()
+            .filter(|k| !sync_state.contains_key(k))
+            .collect();
         return Err(format!(
             "final state divergence: only_sync={only_sync:?} only_def={only_def:?}"
         ));
@@ -409,9 +434,7 @@ fn deep_overlap_remap_range_prevs_match_without_sync_compact() {
         let outs_def = h_def.recv().unwrap();
 
         if format!("{outs_sync:?}") != format!("{outs_def:?}") {
-            panic!(
-                "batch {batch_idx} prev divergence\nsync={outs_sync:?}\ndef ={outs_def:?}"
-            );
+            panic!("batch {batch_idx} prev divergence\nsync={outs_sync:?}\ndef ={outs_def:?}");
         }
     }
 }

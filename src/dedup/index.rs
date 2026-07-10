@@ -128,8 +128,13 @@ impl DedupIndex {
         staging_shards: usize,
         drainer_enabled: bool,
     ) -> Result<Self> {
-        let cuckoo =
-            CuckooHash::create(page_store.clone(), page_cache.clone(), bucket_count, seed1, seed2)?;
+        let cuckoo = CuckooHash::create(
+            page_store.clone(),
+            page_cache.clone(),
+            bucket_count,
+            seed1,
+            seed2,
+        )?;
         let l0_capacity = l0_capacity_for(cuckoo.bucket_count());
         Ok(Self {
             state: RwLock::new(DedupState {
@@ -161,7 +166,9 @@ impl DedupIndex {
         // current load. The cuckoo filter cannot grow once allocated;
         // sizing it at 4 × bucket_count keeps load < 0.95 even after
         // L3 fills up, avoiding the saturation fallback.
-        let sketch = Arc::new(FpSketch::with_capacity(l0_capacity_for(cuckoo.bucket_count())));
+        let sketch = Arc::new(FpSketch::with_capacity(l0_capacity_for(
+            cuckoo.bucket_count(),
+        )));
         let l1 = L1HotCache::new(l1_capacity);
         let me = Self {
             state: RwLock::new(DedupState {
@@ -1102,7 +1109,11 @@ impl DedupIndex {
                 ..MigrateStepStats::default()
             });
         }
-        let mut pi = if start_page >= page_count { 0 } else { start_page };
+        let mut pi = if start_page >= page_count {
+            0
+        } else {
+            start_page
+        };
         let mut acc = MigrateStepStats {
             growing: true,
             ..MigrateStepStats::default()
@@ -1688,7 +1699,11 @@ mod tests {
         for i in 0..200u8 {
             assert!(idx.get(&h(i)).unwrap().is_some(), "post-swap i={i}");
         }
-        assert_eq!(idx.recount().unwrap(), 200, "no duplicate / no loss after swap");
+        assert_eq!(
+            idx.recount().unwrap(),
+            200,
+            "no duplicate / no loss after swap"
+        );
     }
 
     #[test]
@@ -1702,8 +1717,8 @@ mod tests {
         {
             let page_store = Arc::new(PageStore::create(&path).unwrap());
             let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
-            let idx = DedupIndex::create(page_store, page_cache, 64, 16, 0xAA, 0xBB, 4, false)
-                .unwrap();
+            let idx =
+                DedupIndex::create(page_store, page_cache, 64, 16, 0xAA, 0xBB, 4, false).unwrap();
             for i in 0..80u8 {
                 idx.put(h(i), dv(i), 100 + i as u64).unwrap();
             }
@@ -1717,8 +1732,8 @@ mod tests {
         // Reopen mid-resize from the two persisted heads.
         let page_store = Arc::new(PageStore::open(&path).unwrap());
         let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
-        let idx =
-            DedupIndex::open_growing(page_store, page_cache, new_pid, old_pid, 16, 4, false).unwrap();
+        let idx = DedupIndex::open_growing(page_store, page_cache, new_pid, old_pid, 16, 4, false)
+            .unwrap();
         assert!(idx.is_growing(), "reopen resumes Growing");
         assert_eq!(idx.bucket_count(), 256);
         for i in 0..80u8 {
@@ -1740,7 +1755,10 @@ mod tests {
     #[test]
     fn begin_grow_rejects_smaller_or_concurrent() {
         let (_d, idx) = make_index(); // 64
-        assert!(idx.begin_grow(64, 1, 2).is_err(), "must exceed current modulus");
+        assert!(
+            idx.begin_grow(64, 1, 2).is_err(),
+            "must exceed current modulus"
+        );
         assert!(idx.begin_grow(32, 1, 2).is_err());
         idx.begin_grow(256, 1, 2).unwrap();
         assert!(

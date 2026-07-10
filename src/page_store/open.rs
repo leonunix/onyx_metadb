@@ -239,7 +239,12 @@ impl PageStore {
             elapsed_ms = open_started.elapsed().as_millis(),
             "metadb page store open scan complete"
         );
-        Ok(Self::from_parts(path, Arc::new(device), high_water, free_list))
+        Ok(Self::from_parts(
+            path,
+            Arc::new(device),
+            high_water,
+            free_list,
+        ))
     }
 }
 

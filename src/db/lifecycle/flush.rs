@@ -233,10 +233,7 @@ impl Db {
     /// Returns `Ok(false)` only on the threads-off `Steady` path when
     /// `apply_gate.try_write()` does not immediately succeed (the same
     /// best-effort behaviour `try_flush` had before threaded sync).
-    pub(in crate::db) fn flush_with_gate(
-        &self,
-        kind: crate::metrics::FlushKind,
-    ) -> Result<bool> {
+    pub(in crate::db) fn flush_with_gate(&self, kind: crate::metrics::FlushKind) -> Result<bool> {
         // A prior forced sync failed non-recoverably and poisoned the
         // subsystem. Fail fast before touching the BFG state machine: its slot
         // is stuck in Syncing forever, so rolling or promoting would block.
@@ -262,8 +259,7 @@ impl Db {
                     MetaDbError::Corruption("bfg sync aborted; restart required".into())
                 }));
             }
-            self.metrics
-                .record_flush_attempt(kind);
+            self.metrics.record_flush_attempt(kind);
             // Wall-time accounting kept consistent with the inline
             // path: every threaded `flush()` records as a completed
             // forced-flush (Steady never lands here because Steady is
@@ -287,9 +283,7 @@ impl Db {
         // roll entirely when `apply_gate.try_write()` fails. Forced
         // kind always rolls.
         let blocking_gate = matches!(kind, crate::metrics::FlushKind::Forced);
-        if !blocking_gate
-            && let None = self.apply_gate.try_write()
-        {
+        if !blocking_gate && let None = self.apply_gate.try_write() {
             self.metrics.record_flush_attempt(kind);
             self.metrics
                 .record_flush_total(kind, std::time::Duration::ZERO);
@@ -663,7 +657,10 @@ impl Db {
                         "lock_selected_l2p_shards_for must hand out one guard per selected shard",
                     );
                     if capture_roots {
-                        snapshot_roots.entry(volume.ord).or_default().push(guard.root());
+                        snapshot_roots
+                            .entry(volume.ord)
+                            .or_default()
+                            .push(guard.root());
                         // capture_watermark = the shard's true FOLD watermark =
                         // max lsn folded into this tree = `next_generation() - 1`.
                         // NOT `root_birth_lsn()`: the root is mutated IN PLACE
@@ -872,11 +869,9 @@ impl Db {
         // so the increfs fold into this cycle's page-rc checkpoint and become
         // durable atomically with the manifest entry. On error, roll
         // back the L2P + refcount checkpoints (nothing page-rc folded yet).
-        if let Err(err) = self.prepare_pending_snapshot_entries(
-            bfg,
-            &snapshot_roots,
-            &snapshot_watermarks,
-        ) {
+        if let Err(err) =
+            self.prepare_pending_snapshot_entries(bfg, &snapshot_roots, &snapshot_watermarks)
+        {
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             self.metrics
@@ -1488,10 +1483,14 @@ impl Db {
         // the durable (NULL) manifest anchors.
         for vol_ord in &page_seal_resets {
             if let Some(vol) = volumes.iter().find(|v| v.ord == *vol_ord) {
-                vol.page_dead_list_head_pid
-                    .store(crate::types::NULL_PAGE, std::sync::atomic::Ordering::Release);
-                vol.page_dead_list_tail_pid
-                    .store(crate::types::NULL_PAGE, std::sync::atomic::Ordering::Release);
+                vol.page_dead_list_head_pid.store(
+                    crate::types::NULL_PAGE,
+                    std::sync::atomic::Ordering::Release,
+                );
+                vol.page_dead_list_tail_pid.store(
+                    crate::types::NULL_PAGE,
+                    std::sync::atomic::Ordering::Release,
+                );
             }
         }
         self.faults

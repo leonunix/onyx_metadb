@@ -410,9 +410,7 @@ impl Db {
                     page_store.read_page(pid)
                 })?;
                 segs.iter()
-                    .flat_map(|s| {
-                        (0..s.seg_page_count as u64).map(move |i| s.page_id + i)
-                    })
+                    .flat_map(|s| (0..s.seg_page_count as u64).map(move |i| s.page_id + i))
                     .collect()
             }
         };
@@ -624,7 +622,8 @@ impl Db {
             // satisfying the `set ⊆ pages` apply invariant.
             let surviving_roots =
                 self.collect_surviving_roots(&l2p_guards, target_start, target_end)?;
-            let reachable_clone = crate::verify::reachable_l2p_pages(&self.page_store, &clone_roots)?;
+            let reachable_clone =
+                crate::verify::reachable_l2p_pages(&self.page_store, &clone_roots)?;
             let reachable_surv =
                 crate::verify::reachable_l2p_pages(&self.page_store, &surviving_roots)?;
             let mut exclusive: Vec<PageId> = reachable_clone
@@ -721,12 +720,7 @@ impl Db {
             .inject(FaultPoint::DropVolumePostWalBeforeApply)?;
         self.wait_for_global_apply_turn(lsn)?;
 
-        let pages_freed = apply_drop_volume(
-            &self.page_store,
-            lsn,
-            &pages,
-            free_pages.as_deref(),
-        )?;
+        let pages_freed = apply_drop_volume(&self.page_store, lsn, &pages, free_pages.as_deref())?;
         self.faults
             .inject(FaultPoint::CommitPostApplyBeforeLsnBump)?;
 
@@ -784,10 +778,12 @@ impl Db {
         if !s0_promoted.is_empty() {
             for &pba in &s0_promoted {
                 let sid = crate::db::apply::shard_for_key(&self.refcount_shards, pba);
-                let (prev, new) =
-                    self.refcount_shards[sid]
-                        .rc
-                        .stage_unskippable(_bfg_guard.bfg(), pba, -1, checkpoint_lsn)?;
+                let (prev, new) = self.refcount_shards[sid].rc.stage_unskippable(
+                    _bfg_guard.bfg(),
+                    pba,
+                    -1,
+                    checkpoint_lsn,
+                )?;
                 // Surface iff this decref reached 0 from a positive count AND no
                 // survivor maps it. `prev > 0` matches `stage`'s documented
                 // `freed_pba` contract and guards against a floored decref-past-0
@@ -954,19 +950,18 @@ impl Db {
 
         // origin vs clone-private partition of the freed set (diagnostics
         // only; does not gate the free).
-        let (origin, clone_private) = freed_with_birth
-            .iter()
-            .filter(|(_, _, rc)| *rc == 1)
-            .fold((0usize, 0usize), |(o, c), (_, birth, _)| {
+        let (origin, clone_private) = freed_with_birth.iter().filter(|(_, _, rc)| *rc == 1).fold(
+            (0usize, 0usize),
+            |(o, c), (_, birth, _)| {
                 if *birth <= branched_at_lsn {
                     (o + 1, c)
                 } else {
                     (o, c + 1)
                 }
-            });
+            },
+        );
 
-        let mut premature: Vec<PageId> =
-            structural_free.difference(&exclusive).copied().collect();
+        let mut premature: Vec<PageId> = structural_free.difference(&exclusive).copied().collect();
         if !premature.is_empty() {
             premature.sort_unstable();
             return Err(MetaDbError::Corruption(format!(
@@ -978,8 +973,7 @@ impl Db {
                 exclusive.len(),
             )));
         }
-        let mut missing: Vec<PageId> =
-            exclusive.difference(&structural_free).copied().collect();
+        let mut missing: Vec<PageId> = exclusive.difference(&structural_free).copied().collect();
         if !missing.is_empty() {
             missing.sort_unstable();
             return Err(MetaDbError::Corruption(format!(

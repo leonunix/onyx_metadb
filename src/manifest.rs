@@ -28,7 +28,7 @@ use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::testing::faults::{FaultController, FaultPoint};
 use crate::types::{
-    Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, SnapshotId, Bfg, VolumeOrdinal,
+    Bfg, Lsn, MANIFEST_PAGE_A, MANIFEST_PAGE_B, NULL_PAGE, PageId, SnapshotId, VolumeOrdinal,
 };
 
 /// Version of the current manifest body layout.

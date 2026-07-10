@@ -27,8 +27,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -530,7 +530,10 @@ impl PageDevice for MemDevice {
     }
 
     fn read_pages(&self, page_ids: &[PageId]) -> Result<Vec<Page>> {
-        page_ids.iter().map(|&pid| self.read_page_bytes(pid)).collect()
+        page_ids
+            .iter()
+            .map(|&pid| self.read_page_bytes(pid))
+            .collect()
     }
 
     fn read_page_unchecked(&self, page_id: PageId) -> Result<Page> {

@@ -153,7 +153,8 @@ fn many_snapshots_exceed_old_single_page_cap_and_verify_clean() {
     // Far beyond the old single-page cap (~30 at 60 shards).
     let target = 200usize;
     for _ in 0..target {
-        db.take_snapshot(0).expect("snapshot count is no longer capped");
+        db.take_snapshot(0)
+            .expect("snapshot count is no longer capped");
     }
     db.flush().unwrap();
     assert_eq!(db.snapshots_for(0).len(), target);

@@ -175,7 +175,8 @@ fn range_delete_concurrent_stall() {
             let mut round = 1u64;
             while !stop.load(Ordering::Relaxed) {
                 let t0 = Instant::now();
-                db.insert(vo, i, v(((i + round) % 251) as u8)).expect("insert");
+                db.insert(vo, i, v(((i + round) % 251) as u8))
+                    .expect("insert");
                 let us = t0.elapsed().as_micros() as u64;
                 fetch_max(&max_insert_us, us);
                 if us > 200_000 {

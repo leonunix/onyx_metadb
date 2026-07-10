@@ -284,7 +284,10 @@ fn drop_tied_snapshot_no_premature_no_hang() {
         .unwrap()
         .collect::<onyx_metadb::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(snap_a, snap_b, "tied snapshot must read identically to its sibling");
+    assert_eq!(
+        snap_a, snap_b,
+        "tied snapshot must read identically to its sibling"
+    );
     // Dropping the survivor frees the now-unpinned pages cleanly.
     db.drop_snapshot(b).unwrap();
 }

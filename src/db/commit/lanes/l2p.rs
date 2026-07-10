@@ -290,7 +290,14 @@ impl Db {
                 {
                     let b = &batch_lbas[batch_i];
                     if rc_authoritative {
-                        push_rc_install(&mut rc_actions, b.op_idx, new_value, prev, b.range_offset.is_some(), true);
+                        push_rc_install(
+                            &mut rc_actions,
+                            b.op_idx,
+                            new_value,
+                            prev,
+                            b.range_offset.is_some(),
+                            true,
+                        );
                     } else {
                         super::apply::record_dead(&volume, prev, lsn);
                     }

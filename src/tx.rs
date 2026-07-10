@@ -28,9 +28,9 @@ use std::collections::HashMap;
 
 use crate::dedup_types::{DedupValue, Hash8};
 use crate::error::Result;
+use crate::op::WalOp;
 use crate::paged::L2pValue;
 use crate::types::{Lba, Lsn, Pba, VolumeOrdinal};
-use crate::op::WalOp;
 
 /// Per-op outcome returned from the apply phase. Auto-commit wrappers
 /// around `Transaction` use these to surface pre-images through the
@@ -387,9 +387,7 @@ impl<'db> Transaction<'db> {
     /// when the relevant L2P buffer entries have been folded. With the flag off
     /// the handle is pre-populated and `recv()` returns immediately. See
     /// `commit/outcomes.rs` for the delivery model.
-    pub fn commit_deferred_with_outcomes(
-        mut self,
-    ) -> Result<(Lsn, crate::DeferredOutcomeHandle)> {
+    pub fn commit_deferred_with_outcomes(mut self) -> Result<(Lsn, crate::DeferredOutcomeHandle)> {
         self.resolve_dedup_old_pbas()?;
         self.db.commit_ops_deferred(&self.ops)
     }

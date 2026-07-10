@@ -38,9 +38,9 @@ use std::thread::{self, JoinHandle};
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::bfg::BfgStateMachine;
 use crate::error::Result;
 use crate::metrics::MetaMetrics;
-use crate::bfg::BfgStateMachine;
 use crate::types::Bfg;
 
 /// One leaf's worth of fold work, prepared off-lock by

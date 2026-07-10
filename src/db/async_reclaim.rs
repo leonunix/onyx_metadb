@@ -209,8 +209,7 @@ fn run_worker(inner: Arc<AsyncReclaimInner>) {
                     for pid in &outcome.reclaimed {
                         inner.page_cache.invalidate(*pid);
                     }
-                    let cycle_us =
-                        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    let cycle_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
                     inner.last_cycle_us.store(cycle_us, Ordering::Relaxed);
                     inner.metrics.record_async_reclaim_cycle(
                         outcome.selected,
@@ -379,7 +378,10 @@ pub(super) fn gc_plan_head_advance(
     // re-evaluated on the next cycle (e.g. after a drop_snapshot,
     // a PromotionComplete, or further FreePbas/DedupDelete events).
     let n_shards = ctx.refcount_shards_rc.len();
-    debug_assert!(n_shards > 0, "lineage GC: refcount_shards_rc must be non-empty");
+    debug_assert!(
+        n_shards > 0,
+        "lineage GC: refcount_shards_rc must be non-empty"
+    );
     let mut dead_pbas: Vec<Pba> = Vec::with_capacity(records.len());
     for rec in &records {
         if snap_pinned(&snap_lsns, rec.birth_lsn, rec.death_lsn) {
@@ -505,9 +507,7 @@ fn try_advance_head_one(
 }
 
 fn snap_pinned(snap_lsns: &[Lsn], birth_lsn: Lsn, death_lsn: Lsn) -> bool {
-    snap_lsns
-        .iter()
-        .any(|&s| s >= birth_lsn && s < death_lsn)
+    snap_lsns.iter().any(|&s| s >= birth_lsn && s < death_lsn)
 }
 
 fn advance_head_pid_durable(
@@ -569,9 +569,7 @@ fn advance_head_pid_durable(
             .iter_mut()
             .find(|v| v.ord == vol_ord)
             .ok_or_else(|| {
-                MetaDbError::Corruption(format!(
-                    "lineage GC: vol_ord {vol_ord} not in manifest"
-                ))
+                MetaDbError::Corruption(format!("lineage GC: vol_ord {vol_ord} not in manifest"))
             })?;
         entry.dead_list_head_pid = new_head_pid;
         if new_head_pid == NULL_PAGE {
@@ -623,9 +621,7 @@ fn advance_head_pid_durable(
     // the manifest commit makes the new head_pid durable, so no
     // subsequent reader will load this segment again.
     let generation = mstate_checkpoint_lsn(ctx);
-    let pids: Vec<PageId> = (0..head_page_count as u64)
-        .map(|i| old_head + i)
-        .collect();
+    let pids: Vec<PageId> = (0..head_page_count as u64).map(|i| old_head + i).collect();
     page_store.free_many(&pids, generation)?;
 
     Ok(())

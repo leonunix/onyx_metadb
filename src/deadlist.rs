@@ -502,7 +502,10 @@ mod tests {
     fn capacity_math() {
         let first = first_page_record_capacity();
         let cont = continuation_record_capacity();
-        assert_eq!(first, (PAGE_PAYLOAD_SIZE - SEGMENT_HEADER_BYTES) / DEAD_RECORD_BYTES);
+        assert_eq!(
+            first,
+            (PAGE_PAYLOAD_SIZE - SEGMENT_HEADER_BYTES) / DEAD_RECORD_BYTES
+        );
         assert_eq!(cont, PAGE_PAYLOAD_SIZE / DEAD_RECORD_BYTES);
         assert_eq!(segment_pages_for(0), 0);
         assert_eq!(segment_pages_for(1), 1);

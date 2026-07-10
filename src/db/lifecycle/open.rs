@@ -192,11 +192,13 @@ impl Db {
         // window; `RingJournal::open` scans from 0, finds the first block
         // never-written, and starts the tail there.
         let lifecycle_journal = Some(Mutex::new(match &backing {
-            MetaBacking::File => LifecycleWriter::File(crate::lifecycle_log::LifecycleJournal::open(
-                &lifecycle_log_dir(&cfg.path),
-                1,
-                cfg.wal_segment_bytes,
-            )?),
+            MetaBacking::File => {
+                LifecycleWriter::File(crate::lifecycle_log::LifecycleJournal::open(
+                    &lifecycle_log_dir(&cfg.path),
+                    1,
+                    cfg.wal_segment_bytes,
+                )?)
+            }
             MetaBacking::Device { journal_device, .. } => {
                 LifecycleWriter::Ring(RingJournal::open(journal_device.clone(), 0, 1)?)
             }
@@ -721,18 +723,22 @@ impl Db {
         let lifecycle_journal = {
             let next_seq = lifecycle_max_seq.saturating_add(1);
             Some(Mutex::new(match &backing {
-                MetaBacking::File => LifecycleWriter::File(
-                    crate::lifecycle_log::LifecycleJournal::open(
+                MetaBacking::File => {
+                    LifecycleWriter::File(crate::lifecycle_log::LifecycleJournal::open(
                         &lifecycle_log_dir(&cfg.path),
                         next_seq,
                         cfg.wal_segment_bytes,
-                    )?,
-                ),
+                    )?)
+                }
                 // Reopen the ring at the persisted prune boundary; the tail +
                 // live-block count are rediscovered by scanning from there.
-                MetaBacking::Device { journal_device, .. } => LifecycleWriter::Ring(
-                    RingJournal::open(journal_device.clone(), manifest.journal_ring_head, next_seq)?,
-                ),
+                MetaBacking::Device { journal_device, .. } => {
+                    LifecycleWriter::Ring(RingJournal::open(
+                        journal_device.clone(),
+                        manifest.journal_ring_head,
+                        next_seq,
+                    )?)
+                }
             }))
         };
 
@@ -821,7 +827,11 @@ impl Db {
                          volume {} shard {s} retains an unsealed page-death death_lsn<=checkpoint_lsn \
                          (recovery deadlist-seal gap): {:?}",
                         vol.ord,
-                        acc.peek().iter().map(|r| r.death_lsn).filter(|&d| d <= last_applied).collect::<Vec<_>>(),
+                        acc.peek()
+                            .iter()
+                            .map(|r| r.death_lsn)
+                            .filter(|&d| d <= last_applied)
+                            .collect::<Vec<_>>(),
                     );
                 }
             }
@@ -1322,12 +1332,7 @@ fn apply_lifecycle_record_replay(
             // is `reclaim_orphan_pages`. The free-set `free_pages` only ever drives
             // the live path; it is threaded through for completeness.
             if volumes.contains_key(ord) {
-                apply_drop_volume(
-                    page_store,
-                    lsn,
-                    pages,
-                    free_pages.as_deref(),
-                )?;
+                apply_drop_volume(page_store, lsn, pages, free_pages.as_deref())?;
                 volumes.remove(ord);
                 manifest.volumes.retain(|v| v.ord != *ord);
                 outcome.mutated_volumes = true;

@@ -110,7 +110,10 @@ fn clone_of_clone_drop_middle_after_promote_shadow_stays_green() {
     // The shadow must stay green: C's born>B1 pages are reachable from D
     // (a survivor) => not C-exclusive => page-rc keeps them => no premature.
     let report = db.drop_volume(c).unwrap();
-    assert!(report.is_some(), "drop_volume(C) should succeed, not abort premature");
+    assert!(
+        report.is_some(),
+        "drop_volume(C) should succeed, not abort premature"
+    );
 
     // D's data survived C's drop (the shared born>B1 pages were not freed).
     for i in 0u64..8 {
@@ -236,19 +239,15 @@ fn clone_drop_shadow_fires_on_premature_divergence() {
     // birth > B) cross-checked against its real live-ALLOC set must pass all
     // three detectors. `la` = reachable(C) ∩ {birth > B}; with src the only
     // survivor those are exactly the C-exclusive freed pages.
-    let la: Vec<(crate::types::PageId, crate::types::Lsn)> =
-        db.test_clone_live_allocs(clone).unwrap().into_iter().collect();
+    let la: Vec<(crate::types::PageId, crate::types::Lsn)> = db
+        .test_clone_live_allocs(clone)
+        .unwrap()
+        .into_iter()
+        .collect();
     let freed: Vec<(crate::types::PageId, crate::types::Lsn, u32)> =
         la.iter().map(|&(pid, birth)| (pid, birth, 1)).collect();
-    db.test_check_clone_livelist_shadow(
-        clone,
-        b,
-        &freed,
-        &[clone_root],
-        &[src_root],
-        &allocs(&la),
-    )
-    .unwrap();
+    db.test_check_clone_livelist_shadow(clone, b, &freed, &[clone_root], &[src_root], &allocs(&la))
+        .unwrap();
 }
 
 /// TEETH (missing → HARD): a free-set that frees NOTHING while the clone has
@@ -322,9 +321,15 @@ fn clone_drop_shadow_fires_on_livelist_disagreement() {
     let b = clone_entry.branched_at_lsn;
 
     // Real, self-consistent baseline: free-set == live-ALLOC == clone-private.
-    let la: Vec<(crate::types::PageId, crate::types::Lsn)> =
-        db.test_clone_live_allocs(clone).unwrap().into_iter().collect();
-    assert!(!la.is_empty(), "diverged clone must have clone-private pages");
+    let la: Vec<(crate::types::PageId, crate::types::Lsn)> = db
+        .test_clone_live_allocs(clone)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert!(
+        !la.is_empty(),
+        "diverged clone must have clone-private pages"
+    );
     let freed: Vec<(crate::types::PageId, crate::types::Lsn, u32)> =
         la.iter().map(|&(pid, birth)| (pid, birth, 1)).collect();
 
@@ -390,8 +395,16 @@ fn clone_drop_without_flush_unions_unsealed_livelist_buffer() {
     // Chain is empty (nothing sealed), buffer is non-empty: chain-only LA would
     // be a strict subset of the true LA → assertion #3 would false-HARD.
     let (head, tail) = db.test_page_live_list_anchors(clone).unwrap();
-    assert_eq!(head, crate::types::NULL_PAGE, "no segment sealed without flush");
-    assert_eq!(tail, crate::types::NULL_PAGE, "no segment sealed without flush");
+    assert_eq!(
+        head,
+        crate::types::NULL_PAGE,
+        "no segment sealed without flush"
+    );
+    assert_eq!(
+        tail,
+        crate::types::NULL_PAGE,
+        "no segment sealed without flush"
+    );
     assert!(
         db.test_page_live_list_len(clone).unwrap() > 0,
         "un-sealed records must be sitting in the buffer"
@@ -545,9 +558,9 @@ fn clone_churn_shadow_stress() {
                     .copied()
                     .filter(|&c| {
                         !clone_snap_src.contains(&c)
-                            && !clones.iter().any(|x| {
-                                parent.get(x).copied().flatten() == Some(c)
-                            })
+                            && !clones
+                                .iter()
+                                .any(|x| parent.get(x).copied().flatten() == Some(c))
                     })
                     .collect();
                 if !droppable.is_empty() {
@@ -821,17 +834,28 @@ fn s2_drop_clone_frees_exclusive_reachability_set() {
         // pages), then drop the clone — the flip frees C's exclusive set.
         let _ = db.drop_snapshot(snap).unwrap().unwrap();
         let report = db.drop_volume(clone).unwrap().expect("drop clone");
-        assert!(report.pages_freed > 0, "S2 reachability free_pages must free C-exclusive pages");
+        assert!(
+            report.pages_freed > 0,
+            "S2 reachability free_pages must free C-exclusive pages"
+        );
         db.flush().unwrap();
         assert!(!db.volumes().contains(&clone), "clone gone after drop");
         for i in 0u64..8 {
-            assert_eq!(db.get(src, i).unwrap(), Some(v(i as u8)), "source lba {i} kept");
+            assert_eq!(
+                db.get(src, i).unwrap(),
+                Some(v(i as u8)),
+                "source lba {i} kept"
+            );
         }
         src
     };
     let db = Db::open(dir.path()).unwrap();
     for i in 0u64..8 {
-        assert_eq!(db.get(src, i).unwrap(), Some(v(i as u8)), "source lba {i} after reopen");
+        assert_eq!(
+            db.get(src, i).unwrap(),
+            Some(v(i as u8)),
+            "source lba {i} after reopen"
+        );
     }
     drop(db);
     let report = crate::verify::verify_path(
@@ -844,7 +868,11 @@ fn s2_drop_clone_frees_exclusive_reachability_set() {
         },
     )
     .unwrap();
-    assert!(report.is_clean(), "verify issues after clone flip drop: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "verify issues after clone flip drop: {:?}",
+        report.issues
+    );
 }
 
 /// A promoted ex-clone survives close + reopen: the sticky flag is rehydrated
@@ -877,7 +905,10 @@ fn promoted_exclone_reopen_then_drop() {
         .find(|e| e.ord == clone)
         .cloned()
         .unwrap();
-    assert!(entry.parent_vol_ord.is_none(), "still a promoted ex-clone after reopen");
+    assert!(
+        entry.parent_vol_ord.is_none(),
+        "still a promoted ex-clone after reopen"
+    );
     assert!(
         entry.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0,
         "sticky flag must survive reopen so the widened gate fires"
@@ -1044,11 +1075,18 @@ fn clone_cow_kill_preserves_descendant_shared_page_after_snap_drop() {
             Some(v(0xC0 | i as u8)),
             "D's view of lba {i} was clobbered by C's in-place overwrite (clone COW-kill under-pinned)"
         );
-        assert_eq!(db.get(c, i).unwrap(), Some(v(0xE0 | i as u8)), "C's own overwrite of lba {i} lost");
+        assert_eq!(
+            db.get(c, i).unwrap(),
+            Some(v(0xE0 | i as u8)),
+            "C's own overwrite of lba {i} lost"
+        );
     }
     // The page-rc-independent operand agrees (no clobber would have been allowed).
     let findings = db.test_clone_birth_shadow_findings().unwrap();
-    assert!(findings.is_empty(), "clone-birth-shadow not clean: {findings:?}");
+    assert!(
+        findings.is_empty(),
+        "clone-birth-shadow not clean: {findings:?}"
+    );
 }
 
 /// TEETH: the `clone_birth_shadow` HARD gate must FIRE when a descendant pin is
@@ -1152,11 +1190,32 @@ fn s2c_promoted_exclone_sharer_routes_drop_to_reachability_not_deadlist() {
 
     // We are in the newly-covered category: P is a plain origin (old is_clone
     // false), D is promoted (old has_clone_child false), yet D shares s_v's pages.
-    let pentry = db.manifest().volumes.iter().find(|e| e.ord == p).cloned().unwrap();
-    assert!(pentry.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE == 0, "P must be a plain origin");
-    let dentry = db.manifest().volumes.iter().find(|e| e.ord == d).cloned().unwrap();
-    assert!(dentry.parent_vol_ord.is_none(), "D must be promoted so old has_clone_child(P)=false");
-    assert!(dentry.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0, "D keeps the sticky flag");
+    let pentry = db
+        .manifest()
+        .volumes
+        .iter()
+        .find(|e| e.ord == p)
+        .cloned()
+        .unwrap();
+    assert!(
+        pentry.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE == 0,
+        "P must be a plain origin"
+    );
+    let dentry = db
+        .manifest()
+        .volumes
+        .iter()
+        .find(|e| e.ord == d)
+        .cloned()
+        .unwrap();
+    assert!(
+        dentry.parent_vol_ord.is_none(),
+        "D must be promoted so old has_clone_child(P)=false"
+    );
+    assert!(
+        dentry.flags & crate::manifest::VOLUME_FLAG_CLONE_LINEAGE != 0,
+        "D keeps the sticky flag"
+    );
 
     // Old code: routes to the single-vol deadlist → PREMATURE (s_v's pages are
     // dead in P's chain but still reachable from promoted survivor D). New code:
@@ -1165,15 +1224,27 @@ fn s2c_promoted_exclone_sharer_routes_drop_to_reachability_not_deadlist() {
         .unwrap()
         .expect("clone-involved snapshot drop must use reachability, not false-premature");
     for i in 0u64..8 {
-        assert_eq!(db.get(d, i).unwrap(), Some(v(i as u8)), "D lost shared lba {i}");
-        assert_eq!(db.get(p, i).unwrap(), Some(v(0xD0 | i as u8)), "P head lba {i}");
+        assert_eq!(
+            db.get(d, i).unwrap(),
+            Some(v(i as u8)),
+            "D lost shared lba {i}"
+        );
+        assert_eq!(
+            db.get(p, i).unwrap(),
+            Some(v(0xD0 | i as u8)),
+            "P head lba {i}"
+        );
     }
     db.flush().unwrap();
     drop(db);
     let db = crate::Db::open(dir.path()).unwrap();
     for i in 0u64..8 {
         assert_eq!(db.get(d, i).unwrap(), Some(v(i as u8)), "reopen D lba {i}");
-        assert_eq!(db.get(p, i).unwrap(), Some(v(0xD0 | i as u8)), "reopen P lba {i}");
+        assert_eq!(
+            db.get(p, i).unwrap(),
+            Some(v(0xD0 | i as u8)),
+            "reopen P lba {i}"
+        );
     }
     drop(db);
     let report = s2c_verify_all(dir.path());
@@ -1211,7 +1282,11 @@ fn s2c_clone_involved_snapshot_drop_frees_exclusive_pages() {
         "clone-involved snapshot drop must free the snapshot-exclusive pages via reachability"
     );
     for i in 0u64..8 {
-        assert_eq!(db.get(c, i).unwrap(), Some(v(0xD0 | i as u8)), "C head lost lba {i}");
+        assert_eq!(
+            db.get(c, i).unwrap(),
+            Some(v(0xD0 | i as u8)),
+            "C head lost lba {i}"
+        );
     }
     db.flush().unwrap();
     drop(db);
@@ -1221,7 +1296,11 @@ fn s2c_clone_involved_snapshot_drop_frees_exclusive_pages() {
     // uses.
     let db = crate::Db::open(dir.path()).unwrap();
     for i in 0u64..8 {
-        assert_eq!(db.get(c, i).unwrap(), Some(v(0xD0 | i as u8)), "reopen C lba {i}");
+        assert_eq!(
+            db.get(c, i).unwrap(),
+            Some(v(0xD0 | i as u8)),
+            "reopen C lba {i}"
+        );
     }
     drop(db);
     let report = s2c_verify_all(dir.path());
@@ -1277,7 +1356,9 @@ fn s2c_merge_runs_on_clone_routed_drop_keeps_chain_consistent_after_flip() {
     let wc = db.clone_volume(sc).unwrap();
     // Drop the MIDDLE snapshot s_b clone-routed: its chain carries the value-i
     // deaths that surviving s_a still pins → the merge must forward them to s_c.
-    db.drop_snapshot(sb).unwrap().expect("clone-routed drop of middle snapshot s_b");
+    db.drop_snapshot(sb)
+        .unwrap()
+        .expect("clone-routed drop of middle snapshot s_b");
 
     // Drop the clone → no clone-lineage volume remains → routing flips back.
     db.drop_volume(wc).unwrap().expect("drop clone wc");
@@ -1289,17 +1370,29 @@ fn s2c_merge_runs_on_clone_routed_drop_keeps_chain_consistent_after_flip() {
         .unwrap()
         .expect("non-clone drop of s_a after flip must not fire a deadlist Corruption (merge kept chain consistent)");
     for i in 0u64..16 {
-        assert_eq!(db.get(vv, i).unwrap(), Some(v((i as u8).wrapping_add(3))), "V head lba {i}");
+        assert_eq!(
+            db.get(vv, i).unwrap(),
+            Some(v((i as u8).wrapping_add(3))),
+            "V head lba {i}"
+        );
     }
     db.flush().unwrap();
     drop(db);
     let db = crate::Db::open(dir.path()).unwrap();
     for i in 0u64..16 {
-        assert_eq!(db.get(vv, i).unwrap(), Some(v((i as u8).wrapping_add(3))), "reopen lba {i}");
+        assert_eq!(
+            db.get(vv, i).unwrap(),
+            Some(v((i as u8).wrapping_add(3))),
+            "reopen lba {i}"
+        );
     }
     drop(db);
     let report = s2c_verify_all(dir.path());
-    assert!(report.is_clean(), "verify after merge-across-flip: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "verify after merge-across-flip: {:?}",
+        report.issues
+    );
 }
 
 /// T7 (over-routing harmless): an UNRELATED clone (off a different volume)
@@ -1328,10 +1421,20 @@ fn s2c_unrelated_clone_over_routes_harmless() {
     let w = db.clone_volume(su).unwrap();
 
     // V's drop is over-routed to reachability (W is clone-lineage), still correct.
-    let report = db.drop_snapshot(s).unwrap().expect("over-routed drop of V's snapshot");
-    assert!(report.pages_freed > 0, "V's exclusive pages must still be freed");
+    let report = db
+        .drop_snapshot(s)
+        .unwrap()
+        .expect("over-routed drop of V's snapshot");
+    assert!(
+        report.pages_freed > 0,
+        "V's exclusive pages must still be freed"
+    );
     for i in 0u64..8 {
-        assert_eq!(db.get(vv, i).unwrap(), Some(v((i as u8).wrapping_add(1))), "V lba {i}");
+        assert_eq!(
+            db.get(vv, i).unwrap(),
+            Some(v((i as u8).wrapping_add(1))),
+            "V lba {i}"
+        );
         assert_eq!(db.get(u, i).unwrap(), Some(v(0xE0 | i as u8)), "U lba {i}");
         assert_eq!(db.get(w, i).unwrap(), Some(v(0xE0 | i as u8)), "W lba {i}");
     }
@@ -1340,11 +1443,19 @@ fn s2c_unrelated_clone_over_routes_harmless() {
     // Reopen so deferred orphan reclaim runs before the offline verify.
     let db = crate::Db::open(dir.path()).unwrap();
     for i in 0u64..8 {
-        assert_eq!(db.get(vv, i).unwrap(), Some(v((i as u8).wrapping_add(1))), "reopen V lba {i}");
+        assert_eq!(
+            db.get(vv, i).unwrap(),
+            Some(v((i as u8).wrapping_add(1))),
+            "reopen V lba {i}"
+        );
     }
     drop(db);
     let report = s2c_verify_all(dir.path());
-    assert!(report.is_clean(), "verify after unrelated-clone over-route: {:?}", report.issues);
+    assert!(
+        report.is_clean(),
+        "verify after unrelated-clone over-route: {:?}",
+        report.issues
+    );
 }
 
 /// T9 (shim teeth): the reachability shadow fires PREMATURE when the structural
@@ -1373,7 +1484,14 @@ fn s2c_reachability_shadow_fires_premature_on_crafted_survivor_reachable() {
     let other: Vec<crate::manifest::SnapshotEntry> = Vec::new();
 
     let err = db
-        .test_check_clone_drop_reachability_shadow(s, &entry, &pages, &after_refs, &all_current_roots, &other)
+        .test_check_clone_drop_reachability_shadow(
+            s,
+            &entry,
+            &pages,
+            &after_refs,
+            &all_current_roots,
+            &other,
+        )
         .expect_err("crafted survivor-reachable free must fire PREMATURE");
     assert!(
         matches!(err, MetaDbError::Corruption(ref m) if m.contains("PREMATURE FREE")),

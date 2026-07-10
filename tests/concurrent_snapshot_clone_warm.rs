@@ -36,8 +36,8 @@
 //! overlap stays sound because `take_snapshot` holds `drop_gate.write`).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use onyx_metadb::{Config, Db, L2pValue, SnapshotId, VerifyOptions, VolumeOrdinal};
@@ -169,8 +169,12 @@ fn concurrent_writer_vs_snapshot_flush_warm_stays_sound() {
             thread::yield_now();
             for i in 0..32u64 {
                 let _g = lock.read();
-                db.insert(0, (i * 7) % SEED_KEYS, v((round as u8).wrapping_add(i as u8)))
-                    .unwrap();
+                db.insert(
+                    0,
+                    (i * 7) % SEED_KEYS,
+                    v((round as u8).wrapping_add(i as u8)),
+                )
+                .unwrap();
             }
 
             if live.len() > LIVE_SNAP_CAP {
@@ -187,7 +191,11 @@ fn concurrent_writer_vs_snapshot_flush_warm_stays_sound() {
         assert!(ops > 0, "writer must have made progress");
 
         for snap in live {
-            admin(&lock, || db.drop_snapshot(snap).unwrap().expect("drain live snapshot"));
+            admin(&lock, || {
+                db.drop_snapshot(snap)
+                    .unwrap()
+                    .expect("drain live snapshot")
+            });
         }
         db.flush().unwrap();
     }
@@ -234,7 +242,9 @@ fn concurrent_clone_source_overwrite_stays_sound() {
                 // Drop the linking snapshot WHILE the clone lives — vol0 and c1
                 // now share pages with no snapshot anchor; only
                 // `clone_cow_pinners` pins them.
-                db.drop_snapshot(s1).unwrap().expect("drop linking snapshot");
+                db.drop_snapshot(s1)
+                    .unwrap()
+                    .expect("drop linking snapshot");
                 c1
             });
 

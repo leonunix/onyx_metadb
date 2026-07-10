@@ -299,8 +299,7 @@ impl Db {
             let mut tx = self.begin();
             for entry in chunk {
                 match entry {
-                    DiffEntry::Changed { key, old, .. }
-                    | DiffEntry::RemovedInB { key, old } => {
+                    DiffEntry::Changed { key, old, .. } | DiffEntry::RemovedInB { key, old } => {
                         // Strip the seq: the snapshot value carries its original
                         // (low) commit seq, and `seq_guard_rejects` would drop a
                         // remap whose seq is below the current entry's. Restore is
@@ -615,7 +614,8 @@ impl Db {
         // missing-forward direction can also surface as a COMPLETENESS HOLE).
         // Running it always keeps the chain consistent across routing flips
         // (empty carry → NULL anchor, a no-op).
-        let merge_plan = Some(self.plan_page_deadlist_merge(&entry, &inheritor_ctx, checkpoint_lsn)?);
+        let merge_plan =
+            Some(self.plan_page_deadlist_merge(&entry, &inheritor_ctx, checkpoint_lsn)?);
         let merge: Option<(crate::lifecycle_log::DropMergeTarget, PageId)> =
             merge_plan.as_ref().map(|m| {
                 let target = match m.target {
@@ -719,8 +719,7 @@ impl Db {
                             .store(merge.anchor, Ordering::Release);
                     }
                     MergeTarget::Snapshot(sid) => {
-                        if let Some(sn) =
-                            mstate.manifest.snapshots.iter_mut().find(|s| s.id == sid)
+                        if let Some(sn) = mstate.manifest.snapshots.iter_mut().find(|s| s.id == sid)
                         {
                             sn.page_dead_list_tail_pid = merge.anchor;
                         }
@@ -954,8 +953,7 @@ impl Db {
                 exclusive.len(),
             )));
         }
-        let mut missing: Vec<PageId> =
-            exclusive.difference(&structural_to_free).copied().collect();
+        let mut missing: Vec<PageId> = exclusive.difference(&structural_to_free).copied().collect();
         if !missing.is_empty() {
             missing.sort_unstable();
             return Err(MetaDbError::Corruption(format!(
@@ -1066,8 +1064,10 @@ impl Db {
         // structural graph still references. This set must be empty; a
         // non-empty premature set is a real soundness bug and becomes a hard
         // `Corruption`.
-        let mut premature: Vec<PageId> =
-            deadlist_to_free.difference(&structural_to_free).copied().collect();
+        let mut premature: Vec<PageId> = deadlist_to_free
+            .difference(&structural_to_free)
+            .copied()
+            .collect();
         if !premature.is_empty() {
             premature.sort();
             return Err(MetaDbError::Corruption(format!(
@@ -1087,8 +1087,10 @@ impl Db {
         // the deadlist now PROVABLY equals the page-rc free-set at every
         // drop, which is the invariant relies on when it deletes
         // page-rc and the deadlist becomes the sole free source.
-        let mut missing: Vec<PageId> =
-            structural_to_free.difference(&deadlist_to_free).copied().collect();
+        let mut missing: Vec<PageId> = structural_to_free
+            .difference(&deadlist_to_free)
+            .copied()
+            .collect();
         if !missing.is_empty() {
             missing.sort();
             return Err(MetaDbError::Corruption(format!(
@@ -1165,7 +1167,8 @@ impl Db {
                 } else {
                     old_head
                 };
-                vol.page_dead_list_head_pid.store(new_head, Ordering::Release);
+                vol.page_dead_list_head_pid
+                    .store(new_head, Ordering::Release);
                 vol.page_dead_list_tail_pid.store(start, Ordering::Release);
                 Ok(())
             }
@@ -1226,7 +1229,11 @@ impl Db {
                     "checkpoint_lsn={checkpoint_lsn} committed but volume {} shard {s} retains an \
                      unsealed page-death death_lsn<=checkpoint_lsn (deadlist-seal gap): {:?}",
                     vol.ord,
-                    acc.peek().iter().map(|r| r.death_lsn).filter(|&d| d <= checkpoint_lsn).collect::<Vec<_>>(),
+                    acc.peek()
+                        .iter()
+                        .map(|r| r.death_lsn)
+                        .filter(|&d| d <= checkpoint_lsn)
+                        .collect::<Vec<_>>(),
                 );
             }
         }
@@ -1263,15 +1270,13 @@ impl Db {
         // carried = DL_S ++ KEEP(DL_next). DL_S deaths all fall in
         // (S_prev, S]; KEEP deaths in (S, S_next] — disjoint ranges, so no
         // dedup is needed. Sort by death_lsn for a deterministic segment.
-        let mut carried = crate::deadlist::read_chain_records(entry.page_dead_list_tail_pid, |p| {
-            self.page_store.read_page(p)
-        })?;
-        carried.extend(
-            ctx.dl_next
-                .iter()
-                .copied()
-                .filter(|r| !Self::dl_record_freed(&ctx.other_created_sorted, r.birth_lsn, r.death_lsn)),
-        );
+        let mut carried =
+            crate::deadlist::read_chain_records(entry.page_dead_list_tail_pid, |p| {
+                self.page_store.read_page(p)
+            })?;
+        carried.extend(ctx.dl_next.iter().copied().filter(|r| {
+            !Self::dl_record_freed(&ctx.other_created_sorted, r.birth_lsn, r.death_lsn)
+        }));
         carried.sort_by_key(|r| (r.death_lsn, r.pba, r.birth_lsn));
 
         let anchor = if carried.is_empty() {
@@ -1344,8 +1349,10 @@ impl Db {
                 // `tree.write()` in `run_sync_cycle_body` and passed in here.
                 // Feeds the birth COW-kill oracle (NOT `created_lsn`). See
                 // `SnapshotEntry::capture_watermark` / `youngest_snap_lsn`.
-                let capture_watermark =
-                    snapshot_watermarks.get(&vol_ord).copied().unwrap_or(created_lsn);
+                let capture_watermark = snapshot_watermarks
+                    .get(&vol_ord)
+                    .copied()
+                    .unwrap_or(created_lsn);
                 // Assign the id + capacity-probe under `manifest_state`.
                 let id = {
                     let mut ms = self.manifest_state.lock();

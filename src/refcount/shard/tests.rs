@@ -104,7 +104,10 @@ fn get_and_stage_floor_read_underflow_instead_of_erroring() {
     // clamp absorbs the redundant decref as a benign no-op — never Err.
     let floored1 = read_floored();
     assert_eq!(s.stage(T0, p, -1, 501).unwrap(), (0, 0));
-    assert!(read_floored() > floored1, "stage merged_prev should floor too");
+    assert!(
+        read_floored() > floored1,
+        "stage merged_prev should floor too"
+    );
     assert_eq!(s.get(p).unwrap(), 0);
 }
 

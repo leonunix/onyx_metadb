@@ -42,9 +42,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-use crate::paged::L2pValue;
 use crate::bfg::BFG_SIZE;
-use crate::types::{Lba, Lsn, Bfg};
+use crate::paged::L2pValue;
+use crate::types::{Bfg, Lba, Lsn};
 
 const BFG_INDEX_MASK: u64 = (BFG_SIZE as u64) - 1;
 

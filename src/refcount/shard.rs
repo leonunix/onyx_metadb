@@ -75,7 +75,7 @@ use super::delta::{DeltaMap, Pending};
 use crate::cache::PageCache;
 use crate::error::Result;
 use crate::page_store::PageStore;
-use crate::types::{Lsn, PageId, Pba, Bfg};
+use crate::types::{Bfg, Lsn, PageId, Pba};
 
 /// Number of BFG ring slots. Matches `crate::db::l2p_buffer::BFG_SIZE`.
 const BFG_SLOTS: usize = 4;
@@ -315,7 +315,13 @@ impl RcShard {
     /// generation to `lsn` never poisons a future op (which has a strictly
     /// higher lsn) or a replayed op (which starts above the checkpoint).
     /// Returns `(prev_rc, new_rc)`.
-    pub fn stage_unskippable(&self, bfg: Bfg, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
+    pub fn stage_unskippable(
+        &self,
+        bfg: Bfg,
+        pba: Pba,
+        delta: i64,
+        lsn: Lsn,
+    ) -> Result<(u32, u32)> {
         self.stage_inner(bfg, pba, delta, lsn, false)
     }
 
@@ -456,9 +462,11 @@ impl RcShard {
         // clearing the slots yet. `force` (cold lifecycle flush) applies
         // every delta despite the per-page replay-skip generation guard;
         // `force_increfs` is the always-apply / no-gen-bump snapshot incref.
-        let staged =
-            self.array
-                .stage_deltas_in_memory_with_force_increfs(drained.clone(), force, force_increfs)?;
+        let staged = self.array.stage_deltas_in_memory_with_force_increfs(
+            drained.clone(),
+            force,
+            force_increfs,
+        )?;
 
         // Publish is visible now; clear the folded slots. They are frozen
         // (Syncing / threads-off quiesce) so a fresh `DeltaMap` discards

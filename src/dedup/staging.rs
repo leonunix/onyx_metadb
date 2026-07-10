@@ -301,7 +301,16 @@ mod tests {
         let s = DedupStaging::new(1);
         s.merge_put(h(1), dv(7), 100);
         let snap = s.swap_active_to_draining(0);
-        assert_eq!(snap, vec![(h(1), StagedMutation::Put { value: dv(7), lsn: 100 })]);
+        assert_eq!(
+            snap,
+            vec![(
+                h(1),
+                StagedMutation::Put {
+                    value: dv(7),
+                    lsn: 100
+                }
+            )]
+        );
         // Still visible via the draining slot.
         assert_eq!(s.lookup(&h(1)), StagedLookup::Present(dv(7)));
         // A newer mutation lands in the fresh active map and shadows.
@@ -322,7 +331,19 @@ mod tests {
         // h(1) gets a newer value in active after the swap.
         s.merge_put(h(1), dv(9), 200);
         let snap = s.snapshot_all();
-        assert_eq!(snap.get(&h(1)), Some(&StagedMutation::Put { value: dv(9), lsn: 200 }));
-        assert_eq!(snap.get(&h(2)), Some(&StagedMutation::Put { value: dv(2), lsn: 100 }));
+        assert_eq!(
+            snap.get(&h(1)),
+            Some(&StagedMutation::Put {
+                value: dv(9),
+                lsn: 200
+            })
+        );
+        assert_eq!(
+            snap.get(&h(2)),
+            Some(&StagedMutation::Put {
+                value: dv(2),
+                lsn: 100
+            })
+        );
     }
 }

@@ -657,5 +657,8 @@ fn drop_dedup_shared_still_bails_on_active_descendant_pin() {
         "nothing may be dropped while a descendant pins the segment"
     );
     let (head_after, _) = dead_list_anchors(&db, BOOTSTRAP_VOLUME_ORD);
-    assert_eq!(head_after, head_before, "head must not advance under the pin");
+    assert_eq!(
+        head_after, head_before,
+        "head must not advance under the pin"
+    );
 }

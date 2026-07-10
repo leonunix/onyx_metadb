@@ -205,8 +205,7 @@ fn guarded_remap_adds_only_guard_pba_rc_shard() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Db::create(dir.path()).unwrap();
     let guard_pba: Pba = 0xABCDE;
-    let expected_sid =
-        super::lanes::rc_shard_of_pba(guard_pba, db.refcount_shards.len());
+    let expected_sid = super::lanes::rc_shard_of_pba(guard_pba, db.refcount_shards.len());
 
     let ops = [WalOp::L2pRemap {
         vol_ord: BOOTSTRAP_VOLUME_ORD,
@@ -323,7 +322,9 @@ fn two_disjoint_l2p_remap_range_commits_do_not_conflict() {
 
     let make_range = |start_lba: u64| -> WalOp {
         // One 32-LBA range inside a single 128-LBA leaf → one shard.
-        let values: Box<[L2pValue]> = (0..32u64).map(|i| l2p_value_with_pba(start_lba + i)).collect();
+        let values: Box<[L2pValue]> = (0..32u64)
+            .map(|i| l2p_value_with_pba(start_lba + i))
+            .collect();
         WalOp::L2pRemapRange {
             vol_ord: BOOTSTRAP_VOLUME_ORD,
             start_lba,
@@ -513,7 +514,10 @@ fn direct_apply_equivalent_to_lane_path() {
     let (_d2, db_lane) = mk_lane_only_db();
 
     let lbas: Vec<u64> = (0..64u64).collect();
-    let values: Vec<L2pValue> = lbas.iter().map(|&i| l2p_value_with_pba(0xC0DE + i)).collect();
+    let values: Vec<L2pValue> = lbas
+        .iter()
+        .map(|&i| l2p_value_with_pba(0xC0DE + i))
+        .collect();
 
     // First commit: L2pPut burst.
     let mut tx_d = db_direct.begin();
@@ -932,9 +936,7 @@ fn stage_ops_persists_across_flush_and_reopen() {
 fn commit_ops_deferred_remap_range_round_trip() {
     let (_d, db) = mk_deferred_apply_db(true);
     let start = 0u64;
-    let values: Box<[L2pValue]> = (0..64u64)
-        .map(|i| l2p_value_with_pba(0xF000 + i))
-        .collect();
+    let values: Box<[L2pValue]> = (0..64u64).map(|i| l2p_value_with_pba(0xF000 + i)).collect();
     let (_lsn, handle) = db
         .commit_ops_deferred(&[WalOp::L2pRemapRange {
             vol_ord: BOOTSTRAP_VOLUME_ORD,

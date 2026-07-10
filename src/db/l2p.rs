@@ -614,17 +614,14 @@ impl Db {
         total_started: std::time::Instant,
     ) -> Result<Lsn> {
         let journal = self.lifecycle_journal.as_ref().ok_or_else(|| {
-            MetaDbError::Corruption(
-                "range_delete: buffer mode without lifecycle journal".into(),
-            )
+            MetaDbError::Corruption("range_delete: buffer mode without lifecycle journal".into())
         })?;
 
         // How many u32::MAX-sized LBA chunks does the range need?
         // Almost always 1; bigger values are recorded so dashboards
         // see the real shape if a caller TRIMs > 17 TiB.
         let total_range = end - start;
-        let chunk_count =
-            ((total_range + u32::MAX as u64 - 1) / u32::MAX as u64).max(1) as usize;
+        let chunk_count = ((total_range + u32::MAX as u64 - 1) / u32::MAX as u64).max(1) as usize;
         self.metrics.record_range_delete_chunks(chunk_count);
 
         let mut last_lsn = self.last_applied_lsn();
@@ -642,9 +639,7 @@ impl Db {
             // chunk's LBA range. captured is sorted by lba, so we
             // can walk forward.
             let chunk_start_idx = captured_cursor;
-            while captured_cursor < captured.len()
-                && captured[captured_cursor].0 < chunk_end
-            {
+            while captured_cursor < captured.len() && captured[captured_cursor].0 < chunk_end {
                 captured_cursor += 1;
             }
             let chunk_captured = &captured[chunk_start_idx..captured_cursor];
@@ -696,9 +691,7 @@ impl Db {
             self.metrics
                 .record_range_delete_apply_wait(wait_started.elapsed());
 
-            let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> {
-                self.snap_info_for_vol(vol)
-            };
+            let snap_lookup = |vol: VolumeOrdinal| -> Vec<SnapInfo> { self.snap_info_for_vol(vol) };
             let apply_started = std::time::Instant::now();
             let apply_result = apply_l2p_range_delete(
                 volumes_map,

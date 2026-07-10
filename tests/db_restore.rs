@@ -98,7 +98,11 @@ fn restore_survives_reopen() {
 
     let db = Db::open(dir.path()).unwrap();
     for i in 0u64..32 {
-        assert_eq!(db.get(vol, i).unwrap(), Some(v(i as u8)), "lba {i} after reopen");
+        assert_eq!(
+            db.get(vol, i).unwrap(),
+            Some(v(i as u8)),
+            "lba {i} after reopen"
+        );
     }
     // Snapshot entry survived too.
     assert!(db.snapshots().iter().any(|s| s.id == snap));
