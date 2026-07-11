@@ -152,6 +152,13 @@ impl PageStore {
         let ops = pages.len();
         let bytes = ops * PAGE_SIZE;
         let started = Instant::now();
+        // The fixed-device PageBlockIo path cannot express io_uring priority
+        // classes and used to discard `Background`. Preserve the semantic at
+        // the PageStore boundary: manifest publication can drain and exclude
+        // these writes before taking apply_gate, while ordinary foreground
+        // page IO remains fully concurrent.
+        let _background_guard = (priority == crate::io_submitter::IoPriority::Background)
+            .then(|| self.publish_io_barrier.read());
         self.device.write_sealed_page_runs(pages, class, priority)?;
         if let Some(metrics) = self.metrics() {
             metrics.record_meta_io_write_batch(ops, bytes, started.elapsed());

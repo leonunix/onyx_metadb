@@ -178,6 +178,44 @@ fn commits_alternate_slots() {
 }
 
 #[test]
+fn prepared_generation_is_not_visible_until_slot_publish() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let (mut store, _) = open_oc(ps, FaultController::new()).unwrap();
+    let start_sequence = store.sequence();
+    let start_slot = store.next_slot();
+
+    let mut next = Manifest::empty();
+    next.checkpoint_lsn = 77;
+    let _prepared = store.prepare_commit(&mut next).unwrap();
+    assert_eq!(store.sequence(), start_sequence);
+    assert_eq!(store.next_slot(), start_slot);
+    drop(store);
+
+    let (reopened, loaded) = open_oc(reopen(&dir), FaultController::new()).unwrap();
+    assert_eq!(loaded.checkpoint_lsn, 0);
+    assert_eq!(reopened.sequence(), start_sequence);
+    assert_eq!(reopened.next_slot(), start_slot);
+}
+
+#[test]
+fn prepared_generation_round_trips_after_slot_publish() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let (mut store, _) = open_oc(ps, FaultController::new()).unwrap();
+
+    let mut next = Manifest::empty();
+    next.checkpoint_lsn = 88;
+    let prepared = store.prepare_commit(&mut next).unwrap();
+    store.publish_prepared(prepared).unwrap();
+    assert_eq!(store.sequence(), 2);
+    drop(store);
+
+    let (_, loaded) = open_oc(reopen(&dir), FaultController::new()).unwrap();
+    assert_eq!(loaded, next);
+}
+
+#[test]
 fn higher_sequence_wins_on_open() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);

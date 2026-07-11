@@ -52,6 +52,52 @@ fn flush_persists_tree_state_via_manifest() {
 }
 
 #[test]
+fn buffer_applied_watermark_reports_only_committed_manifest_frontier() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = Db::create(dir.path()).unwrap();
+        db.set_buffer_applied_watermark(41);
+        assert_eq!(db.buffer_applied_watermark(), 41);
+        assert_eq!(db.durable_buffer_applied_watermark(), 0);
+
+        db.flush().unwrap();
+        assert_eq!(db.durable_buffer_applied_watermark(), 41);
+    }
+
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(db.buffer_applied_watermark(), 41);
+    assert_eq!(db.durable_buffer_applied_watermark(), 41);
+
+    // A stale caller cannot regress the replay boundary on a later manifest.
+    db.set_buffer_applied_watermark(7);
+    db.flush().unwrap();
+    assert_eq!(db.durable_buffer_applied_watermark(), 41);
+}
+
+#[test]
+fn async_page_reclaim_drains_bounded_cycles_without_checkpoint_waiting() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = Config::new(dir.path());
+    cfg.async_reclaim_enabled = true;
+    cfg.async_reclaim_max_pages_per_cycle = 2;
+    cfg.async_reclaim_idle_interval_ms = 1;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    let pages: Vec<PageId> = (0..8).map(|_| db.page_store.allocate().unwrap()).collect();
+    db.page_store.free_many(&pages, 1).unwrap();
+    db.notify_async_reclaim();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while db.page_store.deferred_free_len() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background page reclaim did not drain its bounded backlog"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
 fn take_snapshot_assigns_monotonic_ids() {
     let (_d, db) = mk_db();
     let a = db.take_snapshot(0).unwrap();

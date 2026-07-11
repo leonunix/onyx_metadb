@@ -593,162 +593,238 @@ impl Db {
         let bucket_started = std::time::Instant::now();
         let ops_started = std::time::Instant::now();
         let ops_result = (|| -> Result<()> {
+            #[derive(Clone, Copy)]
+            enum FlatKind {
+                Put,
+                Delete,
+                Remap { guard: Option<(Pba, u32)> },
+                Range { offset: u32 },
+            }
+            #[derive(Clone, Copy)]
+            struct FlatOp {
+                op_idx: usize,
+                lba: Lba,
+                value: Option<L2pValue>,
+                kind: FlatKind,
+            }
+
+            let mut flat = Vec::new();
+            let mut range_partials: std::collections::HashMap<
+                usize,
+                (Box<[bool]>, Vec<Option<L2pValue>>),
+            > = std::collections::HashMap::new();
             for entry in &indices {
-                if let L2pBucketEntry::RangeSlice {
-                    op_idx,
-                    lba_offsets,
-                } = entry
-                {
-                    let (range_start_lba, range_values) = match &ops[*op_idx] {
-                        WalOp::L2pRemapRange {
-                            start_lba, values, ..
-                        } => (*start_lba, values.as_ref()),
-                        other => {
-                            unreachable!("RangeSlice op_idx points to non-range op: {other:?}")
-                        }
-                    };
-                    let n = range_values.len();
-                    let mut applied_bits = vec![false; n].into_boxed_slice();
-                    let mut prevs_box: Vec<Option<L2pValue>> = vec![None; n];
-
-                    for &off in lba_offsets.iter() {
-                        let lba = range_start_lba + off as u64;
-                        let new_value = range_values[off as usize];
-                        let cur = match shard.l2p_buffer.lookup_for_open_bfg(bfg, lba) {
-                            BufferLookup::Present(v) => Some(v),
-                            BufferLookup::Tombstone => None,
-                            BufferLookup::Absent => load_view().get(lba)?,
+                match entry {
+                    L2pBucketEntry::Single(idx) => match &ops[*idx] {
+                        WalOp::L2pPut { lba, value, .. } => flat.push(FlatOp {
+                            op_idx: *idx,
+                            lba: *lba,
+                            value: Some(*value),
+                            kind: FlatKind::Put,
+                        }),
+                        WalOp::L2pDelete { lba, .. } => flat.push(FlatOp {
+                            op_idx: *idx,
+                            lba: *lba,
+                            value: None,
+                            kind: FlatKind::Delete,
+                        }),
+                        WalOp::L2pRemap {
+                            lba,
+                            new_value,
+                            guard,
+                            ..
+                        } => flat.push(FlatOp {
+                            op_idx: *idx,
+                            lba: *lba,
+                            value: Some(*new_value),
+                            kind: FlatKind::Remap { guard: *guard },
+                        }),
+                        other => unreachable!("L2P bucket holds only L2P ops; saw {other:?}"),
+                    },
+                    L2pBucketEntry::RangeSlice {
+                        op_idx,
+                        lba_offsets,
+                    } => {
+                        let (start_lba, values) = match &ops[*op_idx] {
+                            WalOp::L2pRemapRange {
+                                start_lba, values, ..
+                            } => (*start_lba, values.as_ref()),
+                            other => {
+                                unreachable!("RangeSlice op_idx points to non-range op: {other:?}")
+                            }
                         };
-                        if super::apply::seq_guard_rejects(new_value.seq(), cur.as_ref()) {
-                            l2p_remap_range_lba_count += 1;
-                            prevs_box[off as usize] = cur;
-                            continue;
+                        range_partials.entry(*op_idx).or_insert_with(|| {
+                            (
+                                vec![false; values.len()].into_boxed_slice(),
+                                vec![None; values.len()],
+                            )
+                        });
+                        for &offset in lba_offsets.iter() {
+                            flat.push(FlatOp {
+                                op_idx: *op_idx,
+                                lba: start_lba + u64::from(offset),
+                                value: Some(values[offset as usize]),
+                                kind: FlatKind::Range { offset },
+                            });
                         }
-                        shard.l2p_buffer.insert_at_bfg(bfg, lba, new_value, lsn);
-                        // rc-authoritative: incref(new) + decref(old), paired
-                        // (range_op so a net rc==0 surfaces into L2pRemapRange).
-                        if rc_authoritative {
-                            push_rc_install(&mut rc_actions, *op_idx, new_value, cur, true, true);
-                        } else {
-                            super::apply::record_dead(&volume, cur, lsn);
-                        }
-                        l2p_remap_range_lba_count += 1;
-                        applied_bits[off as usize] = true;
-                        prevs_box[off as usize] = cur;
                     }
+                }
+            }
 
+            // Read the three visible BFG slots once each, then load one fresh
+            // read-view for every miss. Loading the view after the buffer scan
+            // preserves publish-before-clear against the concurrent compactor.
+            let lbas: Vec<Lba> = flat.iter().map(|op| op.lba).collect();
+            let buffer_values = shard.l2p_buffer.lookup_many_for_open_bfg(bfg, &lbas);
+            let mut initial_values = vec![None; flat.len()];
+            let mut absent = Vec::new();
+            for (idx, lookup) in buffer_values.into_iter().enumerate() {
+                match lookup {
+                    BufferLookup::Present(value) => initial_values[idx] = Some(value),
+                    BufferLookup::Tombstone => {}
+                    BufferLookup::Absent => absent.push(idx),
+                }
+            }
+            if !absent.is_empty() {
+                load_view().multi_get_into(&lbas, &absent, &mut initial_values)?;
+            }
+
+            // Guard PBAs are immutable for this bucket's apply window (their
+            // RC lanes are in the dispatch footprint), so read each distinct
+            // PBA once per refcount shard.
+            let mut guard_passed = vec![true; flat.len()];
+            let mut guard_buckets: Vec<std::collections::HashMap<Pba, Vec<(usize, u32)>>> = (0
+                ..refcount_shards.len())
+                .map(|_| std::collections::HashMap::new())
+                .collect();
+            for (idx, op) in flat.iter().enumerate() {
+                if let FlatKind::Remap {
+                    guard: Some((pba, min_rc)),
+                } = op.kind
+                {
+                    let rc_sid = (xxh3_64(&pba.to_be_bytes()) as usize) % refcount_shards.len();
+                    guard_buckets[rc_sid]
+                        .entry(pba)
+                        .or_default()
+                        .push((idx, min_rc));
+                }
+            }
+            for (rc_sid, bucket) in guard_buckets.into_iter().enumerate() {
+                if bucket.is_empty() {
+                    continue;
+                }
+                let mut guards: Vec<_> = bucket.into_iter().collect();
+                guards.sort_by_key(|(pba, _)| *pba);
+                let pbas: Vec<Pba> = guards.iter().map(|(pba, _)| *pba).collect();
+                let counts = refcount_shards[rc_sid].get_many(&pbas)?;
+                for ((_, members), rc) in guards.into_iter().zip(counts) {
+                    for (flat_idx, min_rc) in members {
+                        guard_passed[flat_idx] = rc >= min_rc;
+                    }
+                }
+            }
+
+            let mut latest: std::collections::HashMap<Lba, Option<L2pValue>> =
+                std::collections::HashMap::new();
+            for (flat_idx, op) in flat.iter().copied().enumerate() {
+                if !guard_passed[flat_idx] {
+                    l2p_remap_count += 1;
                     outcomes.push((
-                        *op_idx,
-                        ApplyOutcome::L2pRemapRange {
-                            applied: applied_bits,
-                            prevs: prevs_box.into_boxed_slice(),
-                            freed_pbas: Vec::new(),
+                        op.op_idx,
+                        ApplyOutcome::L2pRemap {
+                            applied: false,
+                            prev: None,
+                            freed_pba: None,
                         },
                     ));
                     continue;
                 }
-                let idx = match entry {
-                    L2pBucketEntry::Single(i) => *i,
-                    L2pBucketEntry::RangeSlice { .. } => unreachable!("handled above"),
-                };
-                let outcome = match &ops[idx] {
-                    WalOp::L2pPut { lba, value, .. } => {
-                        let cur = match shard.l2p_buffer.lookup_for_open_bfg(bfg, *lba) {
-                            BufferLookup::Present(v) => Some(v),
-                            BufferLookup::Tombstone => None,
-                            BufferLookup::Absent => load_view().get(*lba)?,
-                        };
-                        if super::apply::seq_guard_rejects(value.seq(), cur.as_ref()) {
-                            l2p_put_count += 1;
-                            outcomes.push((idx, ApplyOutcome::L2pPrev(cur)));
-                            continue;
-                        }
-                        shard.l2p_buffer.insert_at_bfg(bfg, *lba, *value, lsn);
-                        if rc_authoritative {
-                            push_rc_install(&mut rc_actions, idx, *value, cur, false, false);
-                        } else {
-                            super::apply::record_dead(&volume, cur, lsn);
-                        }
+                let cur = latest
+                    .get(&op.lba)
+                    .copied()
+                    .unwrap_or(initial_values[flat_idx]);
+                let seq_rejected = op.value.is_some_and(|value| {
+                    !matches!(op.kind, FlatKind::Delete)
+                        && super::apply::seq_guard_rejects(value.seq(), cur.as_ref())
+                });
+
+                match op.kind {
+                    FlatKind::Put => {
                         l2p_put_count += 1;
-                        ApplyOutcome::L2pPrev(cur)
-                    }
-                    WalOp::L2pDelete { lba, .. } => {
-                        let cur = match shard.l2p_buffer.lookup_for_open_bfg(bfg, *lba) {
-                            BufferLookup::Present(v) => Some(v),
-                            BufferLookup::Tombstone => None,
-                            BufferLookup::Absent => load_view().get(*lba)?,
-                        };
-                        shard.l2p_buffer.insert_tombstone_at_bfg(bfg, *lba, lsn);
-                        // rc-authoritative: decref the deleted reference inline
-                        // (see tree path). no rc movement.
-                        if rc_authoritative {
-                            push_rc_delete(&mut rc_actions, idx, cur);
-                        }
-                        l2p_delete_count += 1;
-                        ApplyOutcome::L2pPrev(cur)
-                    }
-                    WalOp::L2pRemap {
-                        lba,
-                        new_value,
-                        guard,
-                        ..
-                    } => {
-                        // RC-guarded remap: verify target pba refcount
-                        // before mutating. Same lock-order rule as the
-                        // tree-mode bucket (rc shard lookup only — buffer
-                        // mutation needs no L2P lock).
-                        if let Some((gp, min_rc)) = guard {
-                            let gp_sid =
-                                (xxh3_64(&gp.to_be_bytes()) as usize) % refcount_shards.len();
-                            let cur_rc = refcount_shards[gp_sid].get(*gp)?;
-                            if cur_rc < *min_rc {
-                                l2p_remap_count += 1;
-                                outcomes.push((
-                                    idx,
-                                    ApplyOutcome::L2pRemap {
-                                        applied: false,
-                                        prev: None,
-                                        freed_pba: None,
-                                    },
-                                ));
-                                continue;
-                            }
-                        }
-                        let cur = match shard.l2p_buffer.lookup_for_open_bfg(bfg, *lba) {
-                            BufferLookup::Present(v) => Some(v),
-                            BufferLookup::Tombstone => None,
-                            BufferLookup::Absent => load_view().get(*lba)?,
-                        };
-                        if super::apply::seq_guard_rejects(new_value.seq(), cur.as_ref()) {
-                            l2p_remap_count += 1;
-                            outcomes.push((
-                                idx,
-                                ApplyOutcome::L2pRemap {
-                                    applied: false,
-                                    prev: cur,
-                                    freed_pba: None,
-                                },
-                            ));
+                        outcomes.push((op.op_idx, ApplyOutcome::L2pPrev(cur)));
+                        if seq_rejected {
                             continue;
                         }
-                        shard.l2p_buffer.insert_at_bfg(bfg, *lba, *new_value, lsn);
-                        // rc-authoritative: incref(new) + decref(old), paired
-                        // (guarded dedup-hit included).
+                        let value = op.value.expect("put carries a value");
+                        latest.insert(op.lba, Some(value));
                         if rc_authoritative {
-                            push_rc_install(&mut rc_actions, idx, *new_value, cur, false, true);
+                            push_rc_install(&mut rc_actions, op.op_idx, value, cur, false, false);
                         } else {
                             super::apply::record_dead(&volume, cur, lsn);
                         }
-                        l2p_remap_count += 1;
-                        ApplyOutcome::L2pRemap {
-                            applied: true,
-                            prev: cur,
-                            freed_pba: None,
+                    }
+                    FlatKind::Delete => {
+                        l2p_delete_count += 1;
+                        outcomes.push((op.op_idx, ApplyOutcome::L2pPrev(cur)));
+                        latest.insert(op.lba, None);
+                        if rc_authoritative {
+                            push_rc_delete(&mut rc_actions, op.op_idx, cur);
                         }
                     }
-                    other => unreachable!("L2P bucket holds only L2P ops; saw {other:?}"),
-                };
-                outcomes.push((idx, outcome));
+                    FlatKind::Remap { .. } => {
+                        l2p_remap_count += 1;
+                        outcomes.push((
+                            op.op_idx,
+                            ApplyOutcome::L2pRemap {
+                                applied: !seq_rejected,
+                                prev: cur,
+                                freed_pba: None,
+                            },
+                        ));
+                        if seq_rejected {
+                            continue;
+                        }
+                        let value = op.value.expect("remap carries a value");
+                        latest.insert(op.lba, Some(value));
+                        if rc_authoritative {
+                            push_rc_install(&mut rc_actions, op.op_idx, value, cur, false, true);
+                        } else {
+                            super::apply::record_dead(&volume, cur, lsn);
+                        }
+                    }
+                    FlatKind::Range { offset } => {
+                        l2p_remap_range_lba_count += 1;
+                        let (applied, prevs) = range_partials
+                            .get_mut(&op.op_idx)
+                            .expect("range partial allocated while flattening");
+                        prevs[offset as usize] = cur;
+                        if seq_rejected {
+                            continue;
+                        }
+                        let value = op.value.expect("range remap carries a value");
+                        applied[offset as usize] = true;
+                        latest.insert(op.lba, Some(value));
+                        if rc_authoritative {
+                            push_rc_install(&mut rc_actions, op.op_idx, value, cur, true, true);
+                        } else {
+                            super::apply::record_dead(&volume, cur, lsn);
+                        }
+                    }
+                }
+            }
+
+            let mut mutations: Vec<_> = latest.into_iter().collect();
+            mutations.sort_by_key(|(lba, _)| *lba);
+            shard.l2p_buffer.apply_batch_at_bfg(bfg, &mutations, lsn);
+            for (op_idx, (applied, prevs)) in range_partials {
+                outcomes.push((
+                    op_idx,
+                    ApplyOutcome::L2pRemapRange {
+                        applied,
+                        prevs: prevs.into_boxed_slice(),
+                        freed_pbas: Vec::new(),
+                    },
+                ));
             }
             Ok(())
         })();

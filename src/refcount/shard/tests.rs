@@ -30,6 +30,26 @@ fn stage_accumulates_across_ops() {
 }
 
 #[test]
+fn batch_get_and_stage_preserve_per_pba_results() {
+    let (_d, s) = make_shard();
+    s.stage(T0, 10, 2, 10).unwrap();
+    s.stage(1, 20, 3, 11).unwrap();
+
+    let staged = s.stage_batch(2, &[(10, -1), (20, 2), (30, 4)], 20).unwrap();
+    assert_eq!(staged, vec![(2, 1), (3, 5), (0, 4)]);
+    assert_eq!(s.get_many(&[30, 10, 99, 20]).unwrap(), vec![4, 1, 0, 5]);
+}
+
+#[test]
+fn stage_batch_keeps_replay_skip_semantics() {
+    let (_d, s) = make_shard();
+    s.stage(T0, 10, 1, 100).unwrap();
+    s.flush().unwrap();
+    assert_eq!(s.stage_batch(1, &[(10, 1)], 100).unwrap(), vec![(1, 1)]);
+    assert_eq!(s.get(10).unwrap(), 1);
+}
+
+#[test]
 fn flush_moves_pending_to_array() {
     let (_d, s) = make_shard();
     s.stage(T0, 10, 5, 100).unwrap();

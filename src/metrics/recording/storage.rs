@@ -29,6 +29,30 @@ impl MetaMetrics {
         );
     }
 
+    pub(crate) fn record_flush_gate_hold(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_gate_hold_us,
+            &self.flush_gate_hold_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_flush_dedup_drain(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_dedup_drain_us,
+            &self.flush_dedup_drain_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_flush_l2p_fold(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_l2p_fold_us,
+            &self.flush_l2p_fold_max_us,
+            elapsed,
+        );
+    }
+
     pub(crate) fn record_flush_sample(&self, kind: FlushKind, elapsed: Duration) {
         record_duration(&self.flush_sample_us, &self.flush_sample_max_us, elapsed);
         let (us_slot, max_slot) = match kind {
@@ -285,6 +309,38 @@ impl MetaMetrics {
         );
     }
 
+    pub(crate) fn record_flush_manifest_stage(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_manifest_stage_us,
+            &self.flush_manifest_stage_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_flush_manifest_publish(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_manifest_publish_us,
+            &self.flush_manifest_publish_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_flush_manifest_cleanup(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_manifest_cleanup_us,
+            &self.flush_manifest_cleanup_max_us,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn record_flush_publish_barrier_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.flush_publish_barrier_wait_us,
+            &self.flush_publish_barrier_wait_max_us,
+            elapsed,
+        );
+    }
+
     pub(crate) fn record_flush_install(&self, elapsed: Duration) {
         record_duration(&self.flush_install_us, &self.flush_install_max_us, elapsed);
     }
@@ -382,7 +438,19 @@ impl MetaMetrics {
     /// One L2P buffer compaction cycle completed. `entries` is the
     /// number of `(lba, value, lsn)` tuples drained from the
     /// `draining` slot into the paged radix tree on this shard cycle.
-    pub(crate) fn record_l2p_buffer_compaction(&self, entries: usize, elapsed: Duration) {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_l2p_buffer_compaction(
+        &self,
+        entries: usize,
+        leaves: usize,
+        chunks: usize,
+        elapsed: Duration,
+        plan: Duration,
+        tree_wait: Duration,
+        apply: Duration,
+        publish: Duration,
+        finish: Duration,
+    ) {
         self.l2p_buffer_compaction_cycles
             .fetch_add(1, Ordering::Relaxed);
         self.l2p_buffer_compaction_entries
@@ -390,6 +458,57 @@ impl MetaMetrics {
         record_duration(
             &self.l2p_buffer_compaction_us,
             &self.l2p_buffer_compaction_max_us,
+            elapsed,
+        );
+        self.l2p_buffer_compaction_leaves
+            .fetch_add(leaves as u64, Ordering::Relaxed);
+        self.l2p_buffer_compaction_chunks
+            .fetch_add(chunks as u64, Ordering::Relaxed);
+        record_duration(
+            &self.l2p_buffer_compaction_plan_us,
+            &self.l2p_buffer_compaction_plan_max_us,
+            plan,
+        );
+        record_duration(
+            &self.l2p_buffer_compaction_tree_wait_us,
+            &self.l2p_buffer_compaction_tree_wait_max_us,
+            tree_wait,
+        );
+        record_duration(
+            &self.l2p_buffer_compaction_apply_us,
+            &self.l2p_buffer_compaction_apply_max_us,
+            apply,
+        );
+        record_duration(
+            &self.l2p_buffer_compaction_publish_us,
+            &self.l2p_buffer_compaction_publish_max_us,
+            publish,
+        );
+        record_duration(
+            &self.l2p_buffer_compaction_finish_us,
+            &self.l2p_buffer_compaction_finish_max_us,
+            finish,
+        );
+    }
+
+    pub(crate) fn record_l2p_prefold(
+        &self,
+        result: &crate::error::Result<bool>,
+        elapsed: Duration,
+    ) {
+        self.l2p_prefold_attempts.fetch_add(1, Ordering::Relaxed);
+        match result {
+            Ok(true) => self.l2p_prefold_completed.fetch_add(1, Ordering::Relaxed),
+            Ok(false) => self.l2p_prefold_skipped.fetch_add(1, Ordering::Relaxed),
+            Err(_) => self.l2p_prefold_errors.fetch_add(1, Ordering::Relaxed),
+        };
+        record_duration(&self.l2p_prefold_us, &self.l2p_prefold_max_us, elapsed);
+    }
+
+    pub(crate) fn record_l2p_prefold_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.l2p_prefold_wait_us,
+            &self.l2p_prefold_wait_max_us,
             elapsed,
         );
     }

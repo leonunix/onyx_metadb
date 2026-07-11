@@ -12,18 +12,21 @@ impl PageStore {
         free_list: Vec<PageId>,
     ) -> Self {
         let free_list_pages = free_list.len();
+        let free_bitmap = build_free_bitmap(high_water, &free_list);
         Self {
             path,
             device,
             inner: Mutex::new(Inner {
                 high_water,
                 free_list,
+                free_bitmap,
             }),
             high_water_pages: AtomicU64::new(high_water),
             free_list_pages: AtomicUsize::new(free_list_pages),
             deferred_free_pages: AtomicUsize::new(0),
             epoch: Arc::new(EpochManager::new()),
             deferred_free: Mutex::new(BTreeMap::new()),
+            publish_io_barrier: RwLock::new(()),
             metrics: OnceLock::new(),
         }
     }
@@ -173,9 +176,11 @@ impl PageStore {
         let (high_water, free_list) =
             scan_free_list(self.device.as_ref(), FIRST_DATA_PAGE, scan_to)?;
         let free_list_len = free_list.len();
+        let free_bitmap = build_free_bitmap(high_water, &free_list);
         let mut inner = self.inner.lock();
         inner.high_water = high_water;
         inner.free_list = free_list;
+        inner.free_bitmap = free_bitmap;
         self.high_water_pages.store(high_water, Ordering::Relaxed);
         self.free_list_pages.store(free_list_len, Ordering::Relaxed);
         Ok(())

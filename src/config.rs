@@ -312,9 +312,13 @@ pub struct Config {
     /// [`crate::db::l2p_buffer`] + [`docs/DESIGN.md §B2`].
     pub l2p_buffer_enabled: bool,
 
-    /// Soft threshold (per-shard active entry count). When
-    /// `active.len()` crosses this, the compactor is woken to run a
-    /// cycle. Default `64_000` ≈ 5 MB/shard at ~80 B/entry.
+    /// Global L2P mutation budget for one Open BFG. The first commit that
+    /// crosses it wakes the quiesce worker, so checkpoint fold work is bounded
+    /// by admitted work rather than only by a wall-clock interval. Repeated
+    /// writes to one LBA count repeatedly; this is a conservative O(1) hot-path
+    /// bound that avoids scanning or locking all per-shard buffers. Work-driven
+    /// rolling is suspended while snapshots are live; snapshot take/drop own
+    /// their forced BFG boundaries and page-deadlist classification.
     pub l2p_buffer_soft_entries: usize,
 
     /// Hard threshold (per-shard active entry count). When
@@ -339,8 +343,9 @@ pub struct Config {
     /// lock + `l2p_buffer` + per-shard page alloc pool); the serial fold
     /// was the bfg-sync drain bottleneck (~74% of that thread in
     /// `compact_drain_into_tree`), capping single-volume write throughput.
-    /// Default `true`; set `false` for the legacy serial fold (A/B,
-    /// fallback). Mirrors the already-parallel refcount `begin_checkpoint`.
+    /// Default `false`: an older nvme-box run regressed, so this remains an
+    /// explicit diagnostic A/B rather than an assumed production win. The
+    /// work-driven BFG bound is independent of this setting.
     pub parallel_l2p_drain_enabled: bool,
 
     /// Bound on buffered entries folded per `tree.write()` acquisition
@@ -354,6 +359,14 @@ pub struct Config {
     /// final chunk publishes). `0` = unbounded (legacy one-shot fold,
     /// A/B fallback). Applies to both the serial and parallel drain.
     pub l2p_drain_chunk_entries: usize,
+
+    /// Pipeline the next frozen BFG's serial L2P fold with the current BFG's
+    /// checkpoint IO. The successor is folded only after the current dirty
+    /// checkpoint has been frozen, and the sync worker waits for the prefold
+    /// before allowing that successor to enter Syncing. Snapshot and clone
+    /// lifecycles conservatively disable the overlap because their page-death
+    /// accounting requires strict fold/checkpoint boundaries.
+    pub l2p_checkpoint_pipeline_enabled: bool,
 
     /// Make PBA refcount the AUTHORITATIVE count of live L2P references
     /// (every L2P remap increfs its new head_pba; a packed N-LBA unit → +N),
@@ -670,12 +683,9 @@ impl Config {
             // The L2P buffer ships default-off in the generic config; onyx can
             // opt in once its workload wants buffered writes.
             l2p_buffer_enabled: false,
-            // 64 K entries soft trigger ≈ 5 MB / shard. Compactor
-            // wakes when any shard crosses this. Same magnitude as
-            // `refcount_drainer_threshold_entries`. Smaller values
-            // (e.g. 16 K) appeared attractive ("fold often, fold
-            // small") but the more frequent cycles compete with
-            // flush's apply_gate.write hold and net regress p9999.
+            // Work-driven BFG roll. 64 K global mutations bounds a generation
+            // well below the old five-second batch while amortising one
+            // checkpoint's page IO and manifest publish.
             l2p_buffer_soft_entries: 64_000,
             // 512 K entries hard trigger ≈ 40 MB / shard. Commit
             // backpressure kicks in past this; bounds peak per-shard
@@ -696,6 +706,8 @@ impl Config {
             // (same lock, same op order, same publish point); 0 restores
             // the one-shot hold for A/B.
             l2p_drain_chunk_entries: 4096,
+            // Opt-in until the pipeline passes production crash/load A/B.
+            l2p_checkpoint_pipeline_enabled: false,
             rc_authoritative_reclaim: false,
             bfg_timeout_ms: 5_000,
             // Streaming writeback ships default-off in this generic

@@ -11,6 +11,7 @@ impl PageStore {
     pub fn allocate(&self) -> Result<PageId> {
         let mut inner = self.inner.lock();
         if let Some(page_id) = inner.free_list.pop() {
+            set_free_bitmap_bit(&mut inner, page_id, false);
             self.free_list_pages.fetch_sub(1, Ordering::Relaxed);
             return Ok(page_id);
         }
@@ -21,18 +22,18 @@ impl PageStore {
             .ok_or(MetaDbError::OutOfSpace)?;
         self.device.ensure_covers(new_high)?;
         inner.high_water = new_high;
+        resize_free_bitmap(&mut inner);
         self.high_water_pages.store(new_high, Ordering::Relaxed);
         Ok(page_id)
     }
 
     /// Allocate a contiguous run of `count` page ids.
     ///
-    /// Fast path reuses a contiguous run from the free list. Reclaim
-    /// appends sorted page ids, so checkpoint-local allocation runs can
-    /// recycle recently freed runs instead of monotonically pushing
-    /// `high_water` forward. The common case is a contiguous LIFO
-    /// suffix; if that suffix is fragmented, scan backward for an older
-    /// contiguous run before extending the file.
+    /// Fast path reuses a contiguous run from the free list. Reclaim keeps
+    /// that list as an unordered stack, so this less-common path sorts it
+    /// before searching for an extent. This lets checkpoint-local allocation
+    /// recycle freed runs without paying a whole-list sort in every reclaim
+    /// cycle or monotonically pushing `high_water` forward.
     pub fn allocate_run(&self, count: usize) -> Result<PageId> {
         if count == 0 {
             return Err(MetaDbError::InvalidArgument(
@@ -43,7 +44,14 @@ impl PageStore {
         let count = u64::try_from(count)
             .map_err(|_| MetaDbError::InvalidArgument("page run too large".into()))?;
         let mut inner = self.inner.lock();
+        // Reclaim appends to an unordered free-page stack. Contiguous-run
+        // allocation is uncommon (catalog/dead-list segment construction), so
+        // pay the sort here instead of once per 4K-page reclaim cycle.
+        inner.free_list.sort_unstable();
         if let Some(start) = take_contiguous_free_run(&mut inner.free_list, count_usize) {
+            for pid in start..start + count {
+                set_free_bitmap_bit(&mut inner, pid, false);
+            }
             self.free_list_pages
                 .fetch_sub(count_usize, Ordering::Relaxed);
             return Ok(start);
@@ -55,6 +63,7 @@ impl PageStore {
             .ok_or(MetaDbError::OutOfSpace)?;
         self.device.ensure_covers(new_high)?;
         inner.high_water = new_high;
+        resize_free_bitmap(&mut inner);
         self.high_water_pages.store(new_high, Ordering::Relaxed);
         Ok(start)
     }
@@ -79,6 +88,7 @@ impl PageStore {
             .ok_or(MetaDbError::OutOfSpace)?;
         self.device.ensure_covers(new_high)?;
         inner.high_water = new_high;
+        resize_free_bitmap(&mut inner);
         self.high_water_pages.store(new_high, Ordering::Relaxed);
         Ok((start..new_high).collect())
     }
@@ -106,6 +116,7 @@ impl PageStore {
         for _ in 0..reuse {
             // LIFO keeps the free-list's existing cache-locality behaviour.
             if let Some(page_id) = inner.free_list.pop() {
+                set_free_bitmap_bit(&mut inner, page_id, false);
                 reused.push(page_id);
             }
         }
@@ -126,6 +137,7 @@ impl PageStore {
                 .ok_or(MetaDbError::OutOfSpace)?;
             self.device.ensure_covers(new_high)?;
             inner.high_water = new_high;
+            resize_free_bitmap(&mut inner);
             self.high_water_pages.store(new_high, Ordering::Relaxed);
             // Store new tail pages in reverse so `pop()` yields ascending ids.
             pages.extend((start..new_high).rev());

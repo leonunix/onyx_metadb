@@ -86,6 +86,9 @@ struct Slot {
     state: BfgState,
     inflight: u64,
     max_lsn: Lsn,
+    /// Number of L2P mutations admitted to this BFG. This is an upper
+    /// bound on the unique entries the syncing fold must consume.
+    l2p_work: usize,
 }
 
 impl Slot {
@@ -94,6 +97,7 @@ impl Slot {
             state: BfgState::Empty,
             inflight: 0,
             max_lsn: 0,
+            l2p_work: 0,
         }
     }
 }
@@ -192,6 +196,28 @@ impl BfgStateMachine {
         }
     }
 
+    /// Account L2P work against the Open BFG and report the first crossing
+    /// of `limit`. The caller uses that edge to wake the quiesce worker.
+    ///
+    /// Counting submitted mutations rather than distinct keys deliberately
+    /// overestimates the eventual fold: it keeps the checkpoint batch bounded
+    /// without taking every shard's buffer lock on the commit hot path.
+    pub fn record_l2p_work(&self, bfg: Bfg, work: usize, limit: usize) -> bool {
+        if work == 0 || limit == 0 {
+            return false;
+        }
+        let mut g = self.inner.lock();
+        let idx = (bfg & BFG_INDEX_MASK) as usize;
+        debug_assert!(matches!(
+            g.slots[idx].state,
+            BfgState::Open | BfgState::Quiescing
+        ));
+        let previous = g.slots[idx].l2p_work;
+        let current = previous.saturating_add(work);
+        g.slots[idx].l2p_work = current;
+        previous < limit && current >= limit
+    }
+
     /// Close the currently-Open BFG, wait for its in-flight commits to
     /// drain, then advance `open_bfg` to the next slot. Returns the now-
     /// Quiescing BFG.
@@ -250,6 +276,7 @@ impl BfgStateMachine {
         // Flip states and advance open_bfg.
         g.slots[cur_idx].state = BfgState::Quiescing;
         g.slots[next_idx].state = BfgState::Open;
+        debug_assert_eq!(g.slots[next_idx].l2p_work, 0);
         g.quiescing_bfg = Some(cur);
         g.open_bfg = next;
         self.open_bfg_atomic.store(next, Ordering::Release);
@@ -302,6 +329,7 @@ impl BfgStateMachine {
         g.slots[idx].state = BfgState::Empty;
         g.slots[idx].inflight = 0;
         g.slots[idx].max_lsn = 0;
+        g.slots[idx].l2p_work = 0;
         g.syncing_bfg = None;
         if bfg > g.checkpoint_bfg {
             g.checkpoint_bfg = bfg;
@@ -316,6 +344,11 @@ impl BfgStateMachine {
         let g = self.inner.lock();
         let idx = (bfg & BFG_INDEX_MASK) as usize;
         g.slots[idx].max_lsn
+    }
+
+    pub fn slot_l2p_work(&self, bfg: Bfg) -> usize {
+        let g = self.inner.lock();
+        g.slots[(bfg & BFG_INDEX_MASK) as usize].l2p_work
     }
 
     /// Park until `checkpoint_bfg >= target`. Used by `flush_with_gate` after
@@ -404,6 +437,11 @@ impl BfgGuard<'_> {
     pub fn record_lsn(&self, lsn: Lsn) {
         self.sm.record_lsn(self.bfg, lsn);
     }
+
+    /// Returns true exactly once when this BFG reaches its L2P work budget.
+    pub fn record_l2p_work(&self, work: usize, limit: usize) -> bool {
+        self.sm.record_l2p_work(self.bfg, work, limit)
+    }
 }
 
 impl Drop for BfgGuard<'_> {
@@ -490,6 +528,35 @@ mod tests {
         g.record_lsn(5);
         g.record_lsn(20);
         assert_eq!(sm.slot_max_lsn(g.bfg()), 20);
+    }
+
+    #[test]
+    fn l2p_work_reports_one_threshold_edge_per_bfg() {
+        let sm = BfgStateMachine::new(0);
+        let g = sm.enter();
+        assert!(!g.record_l2p_work(3, 8));
+        assert!(!g.record_l2p_work(4, 8));
+        assert!(g.record_l2p_work(1, 8));
+        assert!(!g.record_l2p_work(100, 8));
+        assert_eq!(sm.slot_l2p_work(g.bfg()), 108);
+        drop(g);
+
+        let q = sm.roll_to_quiescing();
+        sm.promote_to_syncing(q);
+        sm.mark_synced(q);
+        assert_eq!(sm.slot_l2p_work(q), 0);
+
+        let next = sm.enter();
+        assert_eq!(next.bfg(), 2);
+        assert!(next.record_l2p_work(8, 8));
+    }
+
+    #[test]
+    fn zero_l2p_work_limit_disables_threshold() {
+        let sm = BfgStateMachine::new(0);
+        let g = sm.enter();
+        assert!(!g.record_l2p_work(usize::MAX, 0));
+        assert_eq!(sm.slot_l2p_work(g.bfg()), 0);
     }
 
     #[test]

@@ -77,6 +77,23 @@ fn apply_deltas_spans_multiple_pages() {
 }
 
 #[test]
+fn batch_get_returns_entries_and_page_generations_in_input_order() {
+    let (_dir, a) = make_array();
+    let p0 = 5;
+    let p1 = (ENTRIES_PER_PAGE + 7) as Pba;
+    a.apply_deltas(vec![(p0, pending(2, 100)), (p1, pending(3, 200))])
+        .unwrap();
+
+    let got = a.get_many_with_page_lsn(&[p1, 99_999, p0, p1]).unwrap();
+    assert_eq!(got[0].0.rc, 3);
+    assert_eq!(got[0].1, 200);
+    assert_eq!(got[1], (RcEntry::ZERO, 0));
+    assert_eq!(got[2].0.rc, 2);
+    assert_eq!(got[2].1, 100);
+    assert_eq!(got[3], got[0]);
+}
+
+#[test]
 fn round_trip_via_open() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("pages");
@@ -296,4 +313,29 @@ fn restage_after_eviction_uses_staged_base_not_disk() {
     // iter_live also serves from the overlay.
     let live = a.iter_live().unwrap();
     assert_eq!(live.len(), 2);
+}
+
+#[test]
+fn warmup_data_pages_makes_refcount_reads_cache_resident() {
+    let (_dir, cache, a) = make_array_with_cache();
+    let far_pba = (ENTRIES_PER_PAGE * 2) as u64;
+    a.apply_deltas(vec![(7, pending(1, 100)), (far_pba, pending(2, 101))])
+        .unwrap();
+    let page_ids: Vec<PageId> = a
+        .inner
+        .lock()
+        .page_table
+        .iter()
+        .copied()
+        .filter(|pid| *pid != 0)
+        .collect();
+    for pid in &page_ids {
+        cache.invalidate(*pid);
+    }
+
+    assert_eq!(a.warmup_data_pages().unwrap(), page_ids.len() as u64);
+    let misses_after_warm = cache.stats().misses;
+    assert_eq!(a.get(7).unwrap().rc, 1);
+    assert_eq!(a.get(far_pba).unwrap().rc, 2);
+    assert_eq!(cache.stats().misses, misses_after_warm);
 }

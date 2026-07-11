@@ -101,10 +101,6 @@ impl Slot {
             Self::Dirty(page) => page,
         }
     }
-
-    fn is_dirty(&self) -> bool {
-        matches!(self, Self::Dirty(_))
-    }
 }
 
 /// Private buffer of pages a `PagedL2p` is reading / mutating. Clean
@@ -122,6 +118,10 @@ pub struct PageBuf {
     /// `evict_clean_pages` O(number of clean pages) instead of scanning
     /// the whole dirty overlay on every tree op.
     clean_pages: PageIdSet,
+    /// Exact live set of `Slot::Dirty` entries in `pages`. Checkpoint and
+    /// streaming-writeback snapshots walk this index instead of scanning the
+    /// whole page map, so their lock hold scales with dirty work only.
+    dirty_pages: PageIdSet,
 }
 
 impl PageBuf {
@@ -146,6 +146,7 @@ impl PageBuf {
             read_overlay_updates: PageIdSet::default(),
             exclusive_read_overlay_mutation: false,
             clean_pages: PageIdSet::default(),
+            dirty_pages: PageIdSet::default(),
         }
     }
 
@@ -163,8 +164,14 @@ impl PageBuf {
         if was_clean {
             self.clean_pages.remove(&pid);
         }
+        if was_dirty {
+            self.dirty_pages.remove(&pid);
+        }
         if is_clean {
             self.clean_pages.insert(pid);
+        }
+        if is_dirty {
+            self.dirty_pages.insert(pid);
         }
         if is_dirty || was_dirty {
             self.read_overlay_updates.insert(pid);
@@ -178,6 +185,7 @@ impl PageBuf {
             self.clean_pages.remove(&pid);
         }
         if matches!(old, Some(Slot::Dirty(_))) {
+            self.dirty_pages.remove(&pid);
             self.read_overlay_updates.insert(pid);
         }
         old
@@ -403,6 +411,7 @@ impl PageBuf {
         self.read_overlay_shards = ReadOverlay::empty_shards();
         self.read_overlay_updates.clear();
         self.clean_pages.clear();
+        self.dirty_pages.clear();
     }
 
     /// Return `pid` to the page store's free list, stamping with
@@ -483,7 +492,7 @@ impl PageBuf {
 
     /// Dirty pages pending flush.
     pub fn dirty_count(&self) -> usize {
-        self.pages.values().filter(|s| s.is_dirty()).count()
+        self.dirty_pages.len()
     }
 
     /// Drop every clean page from the private buffer. The shared
@@ -523,11 +532,7 @@ impl PageBuf {
     /// Seal + write + fsync every dirty page in ascending page-id order,
     /// then reinsert them into the shared `PageCache` as clean.
     pub fn flush(&mut self) -> Result<()> {
-        let mut dirty: Vec<PageId> = self
-            .pages
-            .iter()
-            .filter_map(|(pid, slot)| if slot.is_dirty() { Some(*pid) } else { None })
-            .collect();
+        let mut dirty: Vec<PageId> = self.dirty_pages.iter().copied().collect();
         if dirty.is_empty() {
             return Ok(());
         }
@@ -573,14 +578,16 @@ impl PageBuf {
 
     pub(crate) fn dirty_snapshot(&self) -> DirtySnapshot {
         let mut pages: Vec<_> = self
-            .pages
+            .dirty_pages
             .iter()
-            .filter_map(|(pid, slot)| match slot {
-                Slot::Dirty(arc) => Some(DirtySnapshotPage {
+            .map(|pid| {
+                let Some(Slot::Dirty(arc)) = self.pages.get(pid) else {
+                    unreachable!("dirty-page index drifted from page slots");
+                };
+                DirtySnapshotPage {
                     pid: *pid,
                     original: arc.clone(),
-                }),
-                Slot::Clean(_) => None,
+                }
             })
             .collect();
         pages.sort_unstable_by_key(|page| page.pid);
@@ -598,21 +605,21 @@ impl PageBuf {
         if max == 0 {
             return DirtySnapshot { pages: Vec::new() };
         }
-        let mut pages: Vec<_> = self
-            .pages
-            .iter()
-            .filter_map(|(pid, slot)| match slot {
-                Slot::Dirty(arc) => Some(DirtySnapshotPage {
-                    pid: *pid,
+        let mut pids: Vec<_> = self.dirty_pages.iter().copied().collect();
+        pids.sort_unstable();
+        pids.truncate(max);
+        let pages = pids
+            .into_iter()
+            .map(|pid| {
+                let Some(Slot::Dirty(arc)) = self.pages.get(&pid) else {
+                    unreachable!("dirty-page index drifted from page slots");
+                };
+                DirtySnapshotPage {
+                    pid,
                     original: arc.clone(),
-                }),
-                Slot::Clean(_) => None,
+                }
             })
             .collect();
-        pages.sort_unstable_by_key(|page| page.pid);
-        if pages.len() > max {
-            pages.truncate(max);
-        }
         DirtySnapshot { pages }
     }
 
@@ -654,10 +661,14 @@ impl PageBuf {
     }
 
     pub fn iter_dirty(&self) -> impl Iterator<Item = (PageId, Arc<Page>)> + '_ {
-        self.pages.iter().filter_map(|(pid, slot)| match slot {
-            Slot::Dirty(arc) => Some((*pid, arc.clone())),
-            Slot::Clean(_) => None,
-        })
+        self.dirty_pages
+            .iter()
+            .map(|pid| match self.pages.get(pid) {
+                Some(Slot::Dirty(arc)) => (*pid, arc.clone()),
+                Some(Slot::Clean(_)) | None => {
+                    unreachable!("dirty-page index drifted from page slots")
+                }
+            })
     }
 
     /// Helper for tests / `PagedL2p::root_level`: read a page's level

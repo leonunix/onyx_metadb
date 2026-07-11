@@ -172,6 +172,18 @@ impl MetaMetrics {
         );
     }
 
+    pub(crate) fn record_apply_refcount_batch(&self, ops: u64, elapsed: Duration) {
+        if ops == 0 {
+            return;
+        }
+        self.apply_refcount_count.fetch_add(ops, Ordering::Relaxed);
+        record_duration(
+            &self.apply_refcount_us,
+            &self.apply_refcount_max_us,
+            elapsed,
+        );
+    }
+
     pub(crate) fn record_apply_dedup(&self, elapsed: Duration) {
         self.apply_dedup_count.fetch_add(1, Ordering::Relaxed);
         record_duration(&self.apply_dedup_us, &self.apply_dedup_max_us, elapsed);

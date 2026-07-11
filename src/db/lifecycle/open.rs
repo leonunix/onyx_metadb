@@ -300,6 +300,8 @@ impl Db {
             bfg_threads_enabled: cfg.bfg_threads_enabled,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
             l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
+            l2p_checkpoint_pipeline_enabled: cfg.l2p_checkpoint_pipeline_enabled,
+            bfg_l2p_work_limit: cfg.l2p_buffer_soft_entries,
             rc_authoritative_reclaim: cfg.rc_authoritative_reclaim,
             // notifiers allocated regardless; the worker
             // threads are spawned conditionally below.
@@ -307,6 +309,7 @@ impl Db {
             bfg_sync_notifier: Arc::new(crate::db::bfg_sync::SyncNotifier::new()),
             bfg_quiesce: Mutex::new(None),
             bfg_sync: Mutex::new(None),
+            l2p_prefold: Mutex::new(None),
             buffer_applied_watermark: AtomicU64::new(0),
             lifecycle_applied_watermark: AtomicU64::new(0),
             lifecycle_journal,
@@ -885,6 +888,51 @@ impl Db {
             }
         }
 
+        // A large, explicitly provisioned metadata cache should not start
+        // empty and force the first foreground overwrite burst to synchronously
+        // fault old L2P and refcount pages through the metadata RAID. Only do a
+        // full data-page warmup when the complete allocated page frontier fits
+        // in the cache; otherwise a scan would evict its own beginning and add
+        // startup IO without producing a resident working set.
+        const DATA_PREWARM_MIN_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+        let high_water_bytes = page_store
+            .high_water()
+            .saturating_mul(crate::config::PAGE_SIZE as u64);
+        if cfg.page_cache_bytes >= DATA_PREWARM_MIN_CACHE_BYTES
+            && high_water_bytes <= cfg.page_cache_bytes
+        {
+            let started = std::time::Instant::now();
+            let mut l2p_pages = 0u64;
+            for volume in volumes.values() {
+                for shard in &volume.shards {
+                    l2p_pages += shard.tree.read().warmup_all_pages()?;
+                }
+            }
+            let mut rc_pages = 0u64;
+            for shard in &refcount_shards {
+                rc_pages += shard.rc.warmup_data_pages()?;
+            }
+            let dedup_page_ids = dedup_index.data_page_ids();
+            for chunk in dedup_page_ids.chunks(4096) {
+                page_cache.get_many(chunk)?;
+            }
+            tracing::info!(
+                l2p_pages,
+                rc_pages,
+                dedup_pages = dedup_page_ids.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                cache_bytes = cfg.page_cache_bytes,
+                high_water_bytes,
+                "metadb data-page cache prewarm complete"
+            );
+        } else {
+            tracing::info!(
+                cache_bytes = cfg.page_cache_bytes,
+                high_water_bytes,
+                "metadb data-page cache prewarm skipped: allocated frontier does not fit"
+            );
+        }
+
         // Recovery LSN frontier bump. `last_applied` so far is the recovery
         // FLOOR (`checkpoint_lsn = min(durable_seq)`, then advanced by any
         // lifecycle replay). In buffer mode the floor can sit far below an
@@ -916,6 +964,7 @@ impl Db {
         // Capture before `manifest` is moved into `ManifestState` below.
         let manifest_dedup_shards = manifest.dedup_shards as usize;
         let manifest_checkpoint_bfg = manifest.checkpoint_bfg;
+        let manifest_buffer_applied_watermark = manifest.last_processed_buffer_seq;
         let drainer_cfg = cfg.clone();
         let metrics_for_drainers = metrics.clone();
         let page_store_for_writeback = page_store.clone();
@@ -1011,12 +1060,15 @@ impl Db {
             bfg_threads_enabled: cfg.bfg_threads_enabled,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
             l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
+            l2p_checkpoint_pipeline_enabled: cfg.l2p_checkpoint_pipeline_enabled,
+            bfg_l2p_work_limit: cfg.l2p_buffer_soft_entries,
             rc_authoritative_reclaim: cfg.rc_authoritative_reclaim,
             bfg_quiesce_notifier: Arc::new(crate::db::bfg_quiesce::QuiesceNotifier::new()),
             bfg_sync_notifier: Arc::new(crate::db::bfg_sync::SyncNotifier::new()),
             bfg_quiesce: Mutex::new(None),
             bfg_sync: Mutex::new(None),
-            buffer_applied_watermark: AtomicU64::new(0),
+            l2p_prefold: Mutex::new(None),
+            buffer_applied_watermark: AtomicU64::new(manifest_buffer_applied_watermark),
             // lifecycle replay: resume the lifecycle watermark from whatever
             // the post-replay manifest commit just persisted. Future
             // lifecycle ops `fetch_max` onto this value so the next

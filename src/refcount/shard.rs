@@ -210,10 +210,45 @@ impl RcShard {
         self.array.meta_page_id()
     }
 
+    pub(crate) fn warmup_data_pages(&self) -> Result<u64> {
+        self.array.warmup_data_pages()
+    }
+
     /// Logical refcount. Sums pending across all four slots, falls back
     /// to the on-disk array, floors a transient underflow to 0.
     pub fn get(&self, pba: Pba) -> Result<u32> {
         Ok(self.lookup_entry(pba)?.rc)
+    }
+
+    /// Batched hot-path lookup for PBAs routed to this shard. Each pending
+    /// BFG slot is locked once and backing refcount pages are fetched through
+    /// one cache multi-get.
+    pub(crate) fn get_many(&self, pbas: &[Pba]) -> Result<Vec<u32>> {
+        let bases = self.array.get_many_with_page_lsn(pbas)?;
+        let mut net = vec![0i64; pbas.len()];
+        let mut max_lsn = vec![0u64; pbas.len()];
+        let mut any = vec![false; pbas.len()];
+        for slot in &self.delta_slots {
+            let slot = slot.lock();
+            for (idx, &pba) in pbas.iter().enumerate() {
+                if let Some(pending) = slot.get(pba) {
+                    net[idx] += pending.delta;
+                    max_lsn[idx] = max_lsn[idx].max(pending.last_lsn);
+                    any[idx] = true;
+                }
+            }
+        }
+        bases
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (base, _))| {
+                if any[idx] {
+                    super::merge_read_or_floor(base, net[idx], max_lsn[idx]).map(|entry| entry.rc)
+                } else {
+                    Ok(base.rc)
+                }
+            })
+            .collect()
     }
 
     /// Full entry (rc + birth_lsn). Internal use only — public callers
@@ -294,6 +329,63 @@ impl RcShard {
     /// Overflow (delta >= 0) is fatal.
     pub fn stage(&self, bfg: Bfg, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
         self.stage_inner(bfg, pba, delta, lsn, true)
+    }
+
+    /// Batch [`Self::stage`] for a set of distinct PBAs routed to this shard.
+    /// All four BFG slots and the refcount page table are sampled once, then
+    /// the Open-slot deltas are merged under the same lock set. This preserves
+    /// per-PBA replay-skip and underflow semantics while eliminating the six
+    /// mutex/cache lookups previously paid for every remap action.
+    pub(crate) fn stage_batch(
+        &self,
+        bfg: Bfg,
+        actions: &[(Pba, i64)],
+        lsn: Lsn,
+    ) -> Result<Vec<(u32, u32)>> {
+        if actions.is_empty() {
+            return Ok(Vec::new());
+        }
+        debug_assert!(
+            actions
+                .iter()
+                .enumerate()
+                .all(|(idx, (pba, _))| actions[..idx].iter().all(|(prev, _)| prev != pba)),
+            "RcShard::stage_batch requires distinct PBAs"
+        );
+
+        let open_idx = slot_index(bfg);
+        let mut slots: Vec<_> = self.delta_slots.iter().map(|slot| slot.lock()).collect();
+        let pbas: Vec<Pba> = actions.iter().map(|(pba, _)| *pba).collect();
+        let bases = self.array.get_many_with_page_lsn(&pbas)?;
+        let mut out = Vec::with_capacity(actions.len());
+
+        for (action_idx, &(pba, delta)) in actions.iter().enumerate() {
+            let mut net = 0i64;
+            let mut max_lsn = 0u64;
+            let mut any = false;
+            for slot in &slots {
+                if let Some(pending) = slot.get(pba) {
+                    net += pending.delta;
+                    max_lsn = max_lsn.max(pending.last_lsn);
+                    any = true;
+                }
+            }
+            let (base, page_lsn) = bases[action_idx];
+            if !any && page_lsn >= lsn {
+                out.push((base.rc, base.rc));
+                continue;
+            }
+            let merged_prev = super::merge_read_or_floor(base, net, max_lsn)?;
+            let (post, skipped) = super::apply_delta_or_skip(merged_prev, delta, lsn)?;
+            if skipped {
+                super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, "stage_batch");
+                out.push((merged_prev.rc, merged_prev.rc));
+                continue;
+            }
+            slots[open_idx].merge(pba, delta, lsn);
+            out.push((merged_prev.rc, post.rc));
+        }
+        Ok(out)
     }
 
     /// Stage one op into `bfg`'s slot WITHOUT the per-op `page_lsn >= lsn`

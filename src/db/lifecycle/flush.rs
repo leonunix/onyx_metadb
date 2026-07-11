@@ -464,8 +464,13 @@ impl Db {
         let _dedup_drainer_resume_guard = DedupDrainerResumeGuard {
             dedup_index: &self.dedup_index,
         };
-        self.dedup_index
-            .preempt_and_drain_for_checkpoint(&self.metrics)?;
+        let dedup_drain_started = std::time::Instant::now();
+        let dedup_drain_result = self
+            .dedup_index
+            .preempt_and_drain_for_checkpoint(&self.metrics);
+        self.metrics
+            .record_flush_dedup_drain(dedup_drain_started.elapsed());
+        dedup_drain_result?;
 
         // Fold the buffered L2P updates into the tree so the sample
         // phase observes them. Two drains:
@@ -479,11 +484,15 @@ impl Db {
         //   drainer): `force_compact_l2p_buffers` folds ALL slots so a
         //   single flush persists everything. Lifecycle ops also use the
         //   drain-all path under `drop_gate.write`.
-        if self.bfg_threads_enabled {
-            self.drain_syncing_slot_into_trees(bfg)?;
+        let l2p_fold_started = std::time::Instant::now();
+        let l2p_fold_result = if self.bfg_threads_enabled {
+            self.drain_syncing_slot_into_trees(bfg)
         } else {
-            self.force_compact_l2p_buffers()?;
-        }
+            self.force_compact_l2p_buffers()
+        };
+        self.metrics
+            .record_flush_l2p_fold(l2p_fold_started.elapsed());
+        l2p_fold_result?;
 
         let sample_started = std::time::Instant::now();
         // `slot_max_lsn(bfg)` is the BFG-frozen high-water LSN of
@@ -891,6 +900,7 @@ impl Db {
         // make the IO independent of further tree mutations. The
         // manifest commit + atomics bump below acquires
         // `apply_gate.write()` for its narrow window.
+        let prefold_ticket = self.request_l2p_prefold(bfg);
 
         let io_started = std::time::Instant::now();
         let mut total_pages_written = 0usize;
@@ -1167,30 +1177,45 @@ impl Db {
         let page_seal_resets =
             self.seal_pending_snapshot_page_deadlists(bfg, &volumes, &mut page_dead_list_overrides);
 
+        // Background reclaim/writeback is explicitly quiesced before taking
+        // apply_gate. This matters on fixed PageBlockIo devices, where the
+        // io_uring priority class is unavailable and background writes share
+        // chunklet stripe locks with the final manifest page. Any wait belongs
+        // here, outside both gate wait and gate hold.
+        let publish_barrier_started = std::time::Instant::now();
+        let publish_io_guard = self.page_store.checkpoint_publish_io_guard();
+        self.metrics
+            .record_flush_publish_barrier_wait(publish_barrier_started.elapsed());
         let manifest_started = std::time::Instant::now();
-        // BFG gate-shrink: this is the only point in
-        // `run_sync_cycle_body` that acquires `apply_gate.write()`. The
-        // window covers manifest commit prep, `wal.fsync_all_lanes()`,
-        // `manifest_state.store.commit`, dead-list head/tail promotion,
-        // the per-shard `last_flushed_lsn.store(wal_checkpoint, ...)`
-        // loop, and the `unlogged_pending_lsn` clear. Rationale:
+        // BFG gate-shrink: manifest publication uses two short
+        // `apply_gate.write()` windows. This first window reconciles raced
+        // lifecycle state and freezes the manifest generation. A writer
+        // reservation then admits data-plane readers while catalog/free-list
+        // pages are encoded, written, and synced. The second window publishes
+        // one manifest slot and promotes the matching in-memory atomics.
         //
         // - Serializes the manifest commit against other
         //   `apply_gate.write()` holders (snapshot / range_delete /
         //   drop_volume / drop_snapshot / `async_reclaim` GC) so the
         //   on-disk `(manifest, atomics)` pair stays consistent and
         //   so readers never observe a transient half-bumped state.
-        // - Blocks new apply across `fsync_all_lanes` — so no commit
-        //   at LSN > `wal_checkpoint` can complete its apply between
-        //   the fsync and the manifest commit (which would violate
-        //   "manifest checkpoint_lsn reflects a strict prefix of
-        //   applied ops").
+        // - The frozen BFG roots and replay watermarks remain a strict prefix
+        //   even when newer Open-BFG commits apply during the stage. Those
+        //   commits allocate pages referenced only by a future manifest.
         // - Releases before IO-heavy post-manifest work (RC meta
         //   install, L2P checkpoint install via apply lanes, reclaim,
         //   WAL prune) — those paths take their own per-shard locks.
         let gate_started = std::time::Instant::now();
         let apply_guard = self.apply_gate.write();
         self.metrics.record_flush_gate_wait(gate_started.elapsed());
+        let gate_hold_started = std::time::Instant::now();
+        macro_rules! release_apply_guard {
+            () => {{
+                self.metrics
+                    .record_flush_gate_hold(gate_hold_started.elapsed());
+                drop(apply_guard);
+            }};
+        }
         // BFG — Bug 3 (+ lineage-GC extension): now that we hold the gate
         // (which excludes both the `LivelistCondenser` and the
         // `LineageGcWorker`), re-validate every drained chain whose committed
@@ -1263,7 +1288,7 @@ impl Db {
                 self.metrics
                     .record_flush_total(kind, flush_started.elapsed());
                 drop(manifest_state);
-                drop(apply_guard);
+                release_apply_guard!();
                 self.rollback_dead_list_drain(
                     &mut drained_deadlists,
                     &dead_list_plans,
@@ -1283,7 +1308,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            drop(apply_guard);
+            release_apply_guard!();
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
@@ -1303,7 +1328,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            drop(apply_guard);
+            release_apply_guard!();
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
@@ -1344,9 +1369,11 @@ impl Db {
         // path (onyx never publishes), so this is effectively a no-op
         // there: the manifest field stays 0 and recovery still falls
         // back to `checkpoint_lsn` semantics.
-        manifest_state.manifest.last_processed_buffer_seq = self
-            .buffer_applied_watermark
-            .load(std::sync::atomic::Ordering::Acquire);
+        manifest_state.manifest.last_processed_buffer_seq =
+            manifest_state.manifest.last_processed_buffer_seq.max(
+                self.buffer_applied_watermark
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
         let lifecycle_prune_seq = self
             .lifecycle_applied_watermark
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1410,7 +1437,7 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            drop(apply_guard);
+            release_apply_guard!();
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
@@ -1427,25 +1454,86 @@ impl Db {
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
-            drop(apply_guard);
+            release_apply_guard!();
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
         let mut manifest = manifest_state.manifest.clone();
-        if let Err(err) = manifest_state.store.commit(&mut manifest) {
-            self.metrics
-                .record_flush_manifest(manifest_started.elapsed());
-            self.metrics
-                .record_flush_total(kind, flush_started.elapsed());
-            drop(manifest_state);
-            drop(apply_guard);
-            self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
-            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
-            self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
-            return Err(err);
+
+        // Freeze complete. Keep writer ordering reserved while allowing normal
+        // data-plane readers to enter during catalog/free-bitmap IO. A lifecycle
+        // writer that arrives here queues behind the reservation and therefore
+        // cannot mutate the manifest generation we are preparing.
+        self.metrics
+            .record_flush_gate_hold(gate_hold_started.elapsed());
+        let reservation = apply_guard.suspend();
+        let manifest_stage_started = std::time::Instant::now();
+        let manifest_stage_result = manifest_state.store.prepare_commit(&mut manifest);
+        self.metrics
+            .record_flush_manifest_stage(manifest_stage_started.elapsed());
+        let prepared = match manifest_stage_result {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.metrics
+                    .record_flush_manifest(manifest_started.elapsed());
+                self.metrics
+                    .record_flush_total(kind, flush_started.elapsed());
+                drop(manifest_state);
+                drop(reservation);
+                self.rollback_dead_list_drain(
+                    &mut drained_deadlists,
+                    &dead_list_plans,
+                    wal_checkpoint,
+                );
+                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+                return Err(err);
+            }
+        };
+
+        // Stop new readers and wait only for readers that entered during the
+        // stage. The final gate window writes one 4 KiB manifest slot, syncs it,
+        // and promotes the matching in-memory atomics.
+        let publish_gate_started = std::time::Instant::now();
+        let apply_guard = reservation.resume();
+        self.metrics
+            .record_flush_gate_wait(publish_gate_started.elapsed());
+        let gate_hold_started = std::time::Instant::now();
+        macro_rules! release_apply_guard {
+            () => {{
+                self.metrics
+                    .record_flush_gate_hold(gate_hold_started.elapsed());
+                drop(apply_guard);
+            }};
         }
+        let manifest_publish_started = std::time::Instant::now();
+        let manifest_publish_result = manifest_state
+            .store
+            .publish_prepared_deferred_cleanup(prepared);
+        self.metrics
+            .record_flush_manifest_publish(manifest_publish_started.elapsed());
+        let manifest_cleanup = match manifest_publish_result {
+            Ok(cleanup) => cleanup,
+            Err(err) => {
+                self.metrics
+                    .record_flush_manifest(manifest_started.elapsed());
+                self.metrics
+                    .record_flush_total(kind, flush_started.elapsed());
+                drop(manifest_state);
+                release_apply_guard!();
+                self.rollback_dead_list_drain(
+                    &mut drained_deadlists,
+                    &dead_list_plans,
+                    wal_checkpoint,
+                );
+                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+                return Err(err);
+            }
+        };
+        drop(publish_io_guard);
         self.metrics
             .record_flush_manifest(manifest_started.elapsed());
 
@@ -1558,7 +1646,12 @@ impl Db {
         // below this point (RC meta install, L2P checkpoint install
         // via apply lanes, reclaim, WAL prune) takes its own per-shard
         // locks and does not need the global gate.
-        drop(apply_guard);
+        release_apply_guard!();
+
+        let manifest_cleanup_started = std::time::Instant::now();
+        manifest_state.store.cleanup_published(manifest_cleanup);
+        self.metrics
+            .record_flush_manifest_cleanup(manifest_cleanup_started.elapsed());
 
         // Lifecycle journal prune. The manifest carrying
         // `lifecycle_replay_seq`/`journal_ring_head` is now durable, so it is
@@ -1707,6 +1800,27 @@ impl Db {
                 .free_many(&checkpoint_frees, tree_generation)?;
             for pid in checkpoint_frees {
                 self.page_cache.invalidate(pid);
+            }
+        }
+
+        if let Some(ticket) = prefold_ticket {
+            let successor = ticket.bfg;
+            let prefold_wait_started = std::time::Instant::now();
+            let prefold_result = self.wait_l2p_prefold(ticket);
+            self.metrics
+                .record_l2p_prefold_wait(prefold_wait_started.elapsed());
+            match prefold_result {
+                Ok(true) => tracing::debug!(
+                    current_bfg = bfg,
+                    prefold_bfg = successor,
+                    "metadb: overlapped successor L2P fold with checkpoint IO"
+                ),
+                Ok(false) => {}
+                Err(err) => {
+                    self.metrics
+                        .record_flush_total(kind, flush_started.elapsed());
+                    return Err(err);
+                }
             }
         }
 

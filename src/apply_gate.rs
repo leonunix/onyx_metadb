@@ -12,10 +12,16 @@
 //!
 //! `ApplyGate` is a thin wrapper that adds writer priority: when a
 //! writer is in flight (waiting for the lock OR holding it), new
-//! readers wait on a condvar before calling the inner `read()`. Existing
+//! readers wait on a condvar before entering. Existing
 //! readers (already holding the inner lock) are unaffected — they
 //! drain naturally and the writer proceeds. Once the writer releases,
 //! the condvar wakes every parked reader.
+//!
+//! Checkpoint manifest publication has one deliberate exception: a writer may
+//! suspend into a reservation after freezing its generation. The reservation
+//! preserves writer order but admits readers while immutable catalog/bitmap
+//! pages are written; resuming the writer closes the gate for the final slot
+//! publish.
 //!
 //! Trade-off: commits' `apply_gate_wait` increases (they politely yield
 //! to flush) in exchange for flush completing in tens of milliseconds
@@ -38,6 +44,7 @@ struct GateState {
     readers: usize,
     writers_pending: usize,
     writer_active: bool,
+    writer_reserved: bool,
 }
 
 impl Default for ApplyGate {
@@ -96,12 +103,15 @@ impl ApplyGate {
     pub fn write(&self) -> WriteGuard<'_> {
         let mut state = self.state.lock();
         state.writers_pending += 1;
-        while state.writer_active || state.readers > 0 {
+        while state.writer_active || state.writer_reserved || state.readers > 0 {
             self.cv.wait(&mut state);
         }
         state.writers_pending -= 1;
         state.writer_active = true;
-        WriteGuard { gate: self }
+        WriteGuard {
+            gate: self,
+            active: true,
+        }
     }
 
     /// Acquire exclusive access only if it is immediately available.
@@ -111,11 +121,18 @@ impl ApplyGate {
     /// parking new commit readers behind a background maintenance task.
     pub fn try_write(&self) -> Option<WriteGuard<'_>> {
         let mut state = self.state.lock();
-        if state.writer_active || state.writers_pending > 0 || state.readers > 0 {
+        if state.writer_active
+            || state.writer_reserved
+            || state.writers_pending > 0
+            || state.readers > 0
+        {
             return None;
         }
         state.writer_active = true;
-        Some(WriteGuard { gate: self })
+        Some(WriteGuard {
+            gate: self,
+            active: true,
+        })
     }
 }
 
@@ -125,6 +142,52 @@ pub struct ReadGuard<'a> {
 
 pub struct WriteGuard<'a> {
     gate: &'a ApplyGate,
+    active: bool,
+}
+
+/// Exclusive-writer ordering token that temporarily lets readers through.
+///
+/// A checkpoint uses this after freezing the manifest generation: data-plane
+/// readers may continue while immutable catalog/bitmap pages are written, but
+/// another lifecycle writer cannot enter and publish a competing generation.
+pub struct WriteReservation<'a> {
+    gate: &'a ApplyGate,
+    active: bool,
+}
+
+impl<'a> WriteGuard<'a> {
+    pub fn suspend(mut self) -> WriteReservation<'a> {
+        let mut state = self.gate.state.lock();
+        debug_assert!(state.writer_active);
+        debug_assert!(!state.writer_reserved);
+        state.writer_active = false;
+        state.writer_reserved = true;
+        self.active = false;
+        self.gate.cv.notify_all();
+        WriteReservation {
+            gate: self.gate,
+            active: true,
+        }
+    }
+}
+
+impl<'a> WriteReservation<'a> {
+    pub fn resume(mut self) -> WriteGuard<'a> {
+        let mut state = self.gate.state.lock();
+        debug_assert!(state.writer_reserved);
+        state.writers_pending += 1;
+        while state.writer_active || state.readers > 0 {
+            self.gate.cv.wait(&mut state);
+        }
+        state.writers_pending -= 1;
+        state.writer_reserved = false;
+        state.writer_active = true;
+        self.active = false;
+        WriteGuard {
+            gate: self.gate,
+            active: true,
+        }
+    }
 }
 
 impl Drop for ReadGuard<'_> {
@@ -139,8 +202,22 @@ impl Drop for ReadGuard<'_> {
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         let mut state = self.gate.state.lock();
         state.writer_active = false;
+        self.gate.cv.notify_all();
+    }
+}
+
+impl Drop for WriteReservation<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.gate.state.lock();
+        state.writer_reserved = false;
         self.gate.cv.notify_all();
     }
 }
@@ -258,6 +335,50 @@ mod tests {
         drop(second_reader);
         drop(first_reader);
         assert!(gate.try_write().is_some());
+    }
+
+    #[test]
+    fn suspended_writer_allows_readers_but_blocks_other_writers() {
+        let gate = Arc::new(ApplyGate::new());
+        let reservation = gate.write().suspend();
+
+        let reader = gate.read();
+        let writer_entered = Arc::new(AtomicBool::new(false));
+        let gate_w = gate.clone();
+        let writer_entered_w = writer_entered.clone();
+        let writer = thread::spawn(move || {
+            let _guard = gate_w.write();
+            writer_entered_w.store(true, Ordering::SeqCst);
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(!writer_entered.load(Ordering::SeqCst));
+        drop(reader);
+
+        let resumed = reservation.resume();
+        assert!(!writer_entered.load(Ordering::SeqCst));
+        drop(resumed);
+        writer.join().unwrap();
+        assert!(writer_entered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropping_suspended_writer_releases_queued_writer() {
+        let gate = Arc::new(ApplyGate::new());
+        let reservation = gate.write().suspend();
+        let writer_entered = Arc::new(AtomicBool::new(false));
+        let gate_w = gate.clone();
+        let writer_entered_w = writer_entered.clone();
+        let writer = thread::spawn(move || {
+            let _guard = gate_w.write();
+            writer_entered_w.store(true, Ordering::SeqCst);
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(!writer_entered.load(Ordering::SeqCst));
+        drop(reservation);
+        writer.join().unwrap();
+        assert!(writer_entered.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -377,6 +377,64 @@ fn allocate_run_reuses_contiguous_free_list_suffix() {
 }
 
 #[test]
+fn incremental_free_bitmap_tracks_reclaim_and_run_reuse() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("pages.onyx_meta");
+    let ps = PageStore::create(&path).unwrap();
+    let start = ps.allocate_run(8).unwrap();
+    for i in 0..8 {
+        ps.write_page(start + i, &mk_page(1, i as u8)).unwrap();
+    }
+
+    ps.free_run(start + 1, 3, 99).unwrap();
+    ps.try_reclaim().unwrap();
+    let (high_water, bitmap) = ps.snapshot_free_bitmap_and_high_water();
+    assert_eq!(high_water, start + 8);
+    for pid in start..start + 8 {
+        let bit = (pid - FIRST_DATA_PAGE) as usize;
+        let is_free = bitmap[bit / 8] & (1 << (bit % 8)) != 0;
+        assert_eq!(is_free, (start + 1..start + 4).contains(&pid));
+    }
+
+    assert_eq!(ps.allocate_run(3).unwrap(), start + 1);
+    let (_, bitmap) = ps.snapshot_free_bitmap_and_high_water();
+    assert!(bitmap.iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn allocate_run_sorts_unordered_reclaim_stack_lazily() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("pages.onyx_meta");
+    let ps = PageStore::create(&path).unwrap();
+    let start = ps.allocate_run(8).unwrap();
+    let live_tail = ps.allocate().unwrap();
+    for i in 0..8 {
+        ps.write_page(start + i, &mk_page(1, i as u8)).unwrap();
+    }
+    ps.write_page(live_tail, &mk_page(1, 9)).unwrap();
+
+    // Reclaim higher ids first, then lower ids. Reclaim deliberately appends
+    // each sorted batch without sorting the accumulated stack.
+    ps.free_run(start + 4, 2, 99).unwrap();
+    ps.try_reclaim().unwrap();
+    ps.free_run(start + 1, 2, 100).unwrap();
+    ps.try_reclaim().unwrap();
+    assert_eq!(ps.free_list_len(), 4);
+
+    // The contiguous allocator sorts on demand and can still recover the
+    // higher two-page extent. The lower extent remains available and marked
+    // in the persisted bitmap.
+    assert_eq!(ps.allocate_run(2).unwrap(), start + 4);
+    assert_eq!(ps.free_list_len(), 2);
+    let (_, bitmap) = ps.snapshot_free_bitmap_and_high_water();
+    for pid in start..=live_tail {
+        let bit = (pid - FIRST_DATA_PAGE) as usize;
+        let is_free = bitmap[bit / 8] & (1 << (bit % 8)) != 0;
+        assert_eq!(is_free, (start + 1..start + 3).contains(&pid));
+    }
+}
+
+#[test]
 fn allocate_run_reuses_contiguous_run_before_fragmented_tail() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("pages.onyx_meta");
@@ -438,6 +496,16 @@ fn reclaim_truncates_contiguous_free_tail() {
         std::fs::metadata(&path).unwrap().len(),
         (start + 2) * PAGE_SIZE as u64
     );
+    let (high_water, bitmap) = ps.snapshot_free_bitmap_and_high_water();
+    assert_eq!(high_water, start + 2);
+    assert_eq!(bitmap.len(), free_bitmap_len(high_water));
+    assert!(bitmap.iter().all(|byte| *byte == 0));
+
+    // Growing back into the truncated range must not resurrect padding bits
+    // that belonged to the old free tail.
+    assert_eq!(ps.allocate_run(3).unwrap(), start + 2);
+    let (_, bitmap) = ps.snapshot_free_bitmap_and_high_water();
+    assert!(bitmap.iter().all(|byte| *byte == 0));
 }
 
 #[test]
@@ -756,4 +824,33 @@ fn mem_device_bounded_scan_ignores_garbage_above_frontier() {
     assert_eq!(ps2.high_water(), frontier);
     assert_eq!(ps2.free_list_len(), 0);
     assert_eq!(ps2.allocate().unwrap(), frontier);
+}
+
+#[test]
+fn checkpoint_publish_barrier_waits_for_background_writer() {
+    let device: Arc<dyn PageDevice> = Arc::new(MemDevice::new(8));
+    let store = Arc::new(PageStore::create_on_device(device).unwrap());
+    let background = store.publish_io_barrier.read();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+
+    let waiter = Arc::clone(&store);
+    let handle = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        let _publish = waiter.checkpoint_publish_io_guard();
+        entered_tx.send(()).unwrap();
+    });
+
+    ready_rx.recv().unwrap();
+    assert!(
+        entered_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "publish must wait while a background page writer is active"
+    );
+    drop(background);
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("publish should enter after the background writer drains");
+    handle.join().unwrap();
 }

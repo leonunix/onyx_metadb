@@ -52,6 +52,71 @@ fn rc_authoritative_packed_unit_increfs_n() {
     );
 }
 
+#[test]
+fn rc_authoritative_guarded_batch_preserves_each_outcome() {
+    let (_d, db) = mk_db_rc_auth();
+    db.incref_pba(5_000, 1).unwrap();
+    let mut tx = db.begin();
+    for lba in 1_000..1_016 {
+        tx.l2p_remap(
+            BOOTSTRAP_VOLUME_ORD,
+            lba,
+            remap_val(5_000, (lba - 1_000) as u8),
+            Some((5_000, 1)),
+        );
+    }
+    tx.l2p_remap(
+        BOOTSTRAP_VOLUME_ORD,
+        1_016,
+        remap_val(6_000, 1),
+        Some((6_000, 1)),
+    );
+    let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+    assert!(
+        outcomes[..16]
+            .iter()
+            .all(|outcome| matches!(outcome, ApplyOutcome::L2pRemap { applied: true, .. }))
+    );
+    assert!(matches!(
+        outcomes[16],
+        ApplyOutcome::L2pRemap { applied: false, .. }
+    ));
+    for lba in 1_000..1_016 {
+        assert!(db.get(BOOTSTRAP_VOLUME_ORD, lba).unwrap().is_some());
+    }
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 1_016).unwrap(), None);
+}
+
+#[test]
+fn rc_authoritative_batch_repeated_lba_observes_prior_op() {
+    let (_d, db) = mk_db_rc_auth();
+    let first = remap_val(100, 1);
+    let second = remap_val(200, 2);
+    let mut tx = db.begin();
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, first, None);
+    tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, second, None);
+    let (_, outcomes) = tx.commit_with_outcomes().unwrap();
+    assert!(matches!(
+        outcomes[0],
+        ApplyOutcome::L2pRemap {
+            applied: true,
+            prev: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        outcomes[1],
+        ApplyOutcome::L2pRemap {
+            applied: true,
+            prev: Some(value),
+            ..
+        } if value == first
+    ));
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, 10).unwrap(), Some(second));
+    assert_eq!(db.get_refcount(100).unwrap(), 0);
+    assert_eq!(db.get_refcount(200).unwrap(), 1);
+}
+
 /// Overwriting an LBA does the inline incref(new) + decref(old) pair:
 /// rc[new]==1, rc[old]==0. The decref is traditional/inline (NOT deferred to
 /// the deadlist) — that 1:1 balance is what makes reclaim's rc==0 Gate

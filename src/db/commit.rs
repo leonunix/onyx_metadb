@@ -65,6 +65,20 @@ struct RcBucketApplyResult {
     remap_freed: Vec<(usize, Pba, bool)>,
 }
 
+/// Upper bound on the number of L2P entries this batch can add to the Open
+/// BFG. Counting attempted mutations is intentionally cheaper and more
+/// conservative than locking every target buffer to count distinct keys.
+fn l2p_work_entries(ops: &[WalOp]) -> usize {
+    ops.iter().fold(0usize, |total, op| {
+        let work = match op {
+            WalOp::L2pPut { .. } | WalOp::L2pDelete { .. } | WalOp::L2pRemap { .. } => 1,
+            WalOp::L2pRemapRange { values, .. } => values.len(),
+            _ => 0,
+        };
+        total.saturating_add(work)
+    })
+}
+
 /// Land an L2P bucket's per-op outcome into the `outcomes` vec. For
 /// `L2pRemapRange` outcomes that may have been split across multiple
 /// shard lanes, merge with any partial outcome already at the slot:
@@ -273,6 +287,30 @@ fn dispatch_ready(state: &DispatchState, lsn: Lsn) -> bool {
 }
 
 impl Db {
+    fn account_bfg_l2p_work(&self, guard: &crate::bfg::BfgGuard<'_>, ops: &[WalOp]) {
+        if !self.bfg_threads_enabled || !self.l2p_buffer_enabled {
+            return;
+        }
+        // Snapshot lifecycle relies on its forced BFG boundaries to classify
+        // page deaths against a stable pinner set. Extra size-driven rolls
+        // while snapshots are live can interleave a background fold between
+        // take/drop boundaries and violate that completeness invariant. The
+        // cache is a leaf mutex and this check happens once per commit batch,
+        // not per LBA.
+        if self
+            .snap_info_cache
+            .lock()
+            .values()
+            .any(|infos| !infos.is_empty())
+        {
+            return;
+        }
+        let work = l2p_work_entries(ops);
+        if guard.record_l2p_work(work, self.bfg_l2p_work_limit) {
+            self.bfg_quiesce_notifier.signal_force(guard.bfg());
+        }
+    }
+
     // -------- transaction / commit --------------------------------------
 
     /// Start a new transaction that buffers ops until `commit()`.
@@ -464,6 +502,7 @@ impl Db {
             }
         };
         _bfg_guard.record_lsn(lsn);
+        self.account_bfg_l2p_work(&_bfg_guard, ops);
         drop(unlogged_commit_guard);
         if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
             self.metrics.record_commit_error(commit_started.elapsed());
@@ -641,6 +680,7 @@ impl Db {
             }
         };
         _bfg_guard.record_lsn(lsn);
+        self.account_bfg_l2p_work(&_bfg_guard, ops);
         if let Err(err) = self.mark_wal_durable_and_wait_for_dispatch(lsn) {
             timing.dispatch_wait = dispatch_started.elapsed();
             self.metrics.record_commit_apply_wait(timing.dispatch_wait);
@@ -767,6 +807,7 @@ impl Db {
         };
         self.metrics.record_commit_wal_submit(lsn_started.elapsed());
         _bfg_guard.record_lsn(lsn);
+        self.account_bfg_l2p_work(&_bfg_guard, ops);
 
         let apply_started = std::time::Instant::now();
         let outcomes = match self.apply_commit_batch(&volumes, lsn, _bfg_guard.bfg(), ops) {

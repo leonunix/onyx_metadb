@@ -79,6 +79,7 @@ impl PageStore {
                 DeferredFree {
                     epoch: tag,
                     generation,
+                    in_flight: false,
                     idempotent: false,
                 },
             );
@@ -127,6 +128,7 @@ impl PageStore {
             DeferredFree {
                 epoch: tag,
                 generation,
+                in_flight: false,
                 idempotent: true,
             },
         );
@@ -149,6 +151,18 @@ impl PageStore {
     /// safe entries so latency-sensitive callers can make progress
     /// without turning one checkpoint into an unbounded free storm.
     pub fn try_reclaim_limit(&self, max_pages: usize) -> Result<ReclaimOutcome> {
+        self.try_reclaim_limit_with_priority(max_pages, crate::io_submitter::IoPriority::Sync)
+    }
+
+    pub(crate) fn try_reclaim_limit_background(&self, max_pages: usize) -> Result<ReclaimOutcome> {
+        self.try_reclaim_limit_with_priority(max_pages, crate::io_submitter::IoPriority::Background)
+    }
+
+    fn try_reclaim_limit_with_priority(
+        &self,
+        max_pages: usize,
+        priority: crate::io_submitter::IoPriority,
+    ) -> Result<ReclaimOutcome> {
         if max_pages == 0 {
             return Ok(ReclaimOutcome::default());
         }
@@ -163,7 +177,7 @@ impl PageStore {
         let selected: Vec<(PageId, DeferredFree)> = deferred
             .iter()
             .filter_map(|(pid, entry)| {
-                if entry.epoch < safe_below {
+                if entry.epoch < safe_below && !entry.in_flight {
                     Some((*pid, *entry))
                 } else {
                     None
@@ -172,6 +186,26 @@ impl PageStore {
             .take(max_pages)
             .collect();
         for (pid, _) in &selected {
+            if let Some(entry) = deferred.get_mut(pid) {
+                entry.in_flight = true;
+            }
+        }
+        drop(deferred);
+
+        let reclaimed = match self.reclaim_sorted_runs(&selected, priority) {
+            Ok(reclaimed) => reclaimed,
+            Err(err) => {
+                let mut deferred = self.deferred_free.lock();
+                for (pid, _) in &selected {
+                    if let Some(entry) = deferred.get_mut(pid) {
+                        entry.in_flight = false;
+                    }
+                }
+                return Err(err);
+            }
+        };
+        let mut deferred = self.deferred_free.lock();
+        for (pid, _) in &selected {
             deferred.remove(pid);
         }
         if !selected.is_empty() {
@@ -179,8 +213,6 @@ impl PageStore {
                 .fetch_sub(selected.len(), Ordering::Relaxed);
         }
         drop(deferred);
-
-        let reclaimed = self.reclaim_sorted_runs(&selected)?;
         Ok(ReclaimOutcome {
             safe_below,
             selected: selected.len(),
@@ -188,7 +220,11 @@ impl PageStore {
         })
     }
 
-    fn reclaim_sorted_runs(&self, pages: &[(PageId, DeferredFree)]) -> Result<Vec<PageId>> {
+    fn reclaim_sorted_runs(
+        &self,
+        pages: &[(PageId, DeferredFree)],
+        priority: crate::io_submitter::IoPriority,
+    ) -> Result<Vec<PageId>> {
         if pages.is_empty() {
             return Ok(Vec::new());
         }
@@ -233,11 +269,8 @@ impl PageStore {
         // PageStore wrapper) so these background Free-stamps don't pollute the
         // foreground `meta_io_write` latency/batch gauges — matching the
         // pre-refactor io_uring reclaim path, which recorded nothing.
-        self.device.write_sealed_page_runs(
-            sealed,
-            IoLaneClass::L2p,
-            crate::io_submitter::IoPriority::Sync,
-        )?;
+        self.device
+            .write_sealed_page_runs(sealed, IoLaneClass::L2p, priority)?;
 
         // punch_hole sweep for runs large enough to reclaim physical
         // space. A fixed-capacity device treats this as a no-op (the
@@ -247,7 +280,17 @@ impl PageStore {
         }
 
         let mut inner = self.inner.lock();
+        for &pid in &reclaimed {
+            if free_bitmap_bit(&inner, pid) {
+                return Err(MetaDbError::Corruption(format!(
+                    "page_store: reclaimed page {pid} is already on the free list",
+                )));
+            }
+        }
         inner.free_list.extend(reclaimed.iter().copied());
+        for &pid in &reclaimed {
+            set_free_bitmap_bit(&mut inner, pid, true);
+        }
         self.free_list_pages
             .store(inner.free_list.len(), Ordering::Relaxed);
         self.truncate_free_tail_locked(&mut inner)?;
@@ -263,22 +306,23 @@ impl PageStore {
             return Ok(());
         }
         let tail_page = inner.high_water - 1;
-        if !inner.free_list.iter().any(|pid| *pid == tail_page) {
+        if !free_bitmap_bit(inner, tail_page) {
             return Ok(());
         }
 
-        inner.free_list.sort_unstable();
-        inner.free_list.dedup();
         let original_high_water = inner.high_water;
-        while inner.high_water > FIRST_DATA_PAGE
-            && inner
-                .free_list
-                .last()
-                .is_some_and(|pid| *pid == inner.high_water - 1)
-        {
-            inner.free_list.pop();
+        while inner.high_water > FIRST_DATA_PAGE && free_bitmap_bit(inner, inner.high_water - 1) {
+            let pid = inner.high_water - 1;
+            set_free_bitmap_bit(inner, pid, false);
             inner.high_water -= 1;
         }
+
+        // Tail truncation is rare under random COW churn. Only when it
+        // actually occurs do we scan the unordered stack to discard ids that
+        // are now outside the new logical high-water mark.
+        inner.free_list.retain(|pid| *pid < inner.high_water);
+
+        resize_free_bitmap(inner);
 
         if inner.high_water < original_high_water {
             self.device.truncate_to(inner.high_water)?;

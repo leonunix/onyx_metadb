@@ -856,6 +856,45 @@ impl PagedL2p {
         Ok(stats)
     }
 
+    /// Populate the shared cache with every page reachable from this tree's
+    /// current root. Unlike [`Self::warmup_index_pages`], leaves are included
+    /// and nothing is pinned; callers must first prove the complete metadata
+    /// working set fits in the configured cache.
+    pub(crate) fn warmup_all_pages(&self) -> Result<u64> {
+        if self.root == NULL_PAGE {
+            return Ok(0);
+        }
+
+        const READ_BATCH_PAGES: usize = 4096;
+        let cache = self.buf.page_cache().clone();
+        let mut frontier = vec![(self.root, self.root_level)];
+        let mut seen = PageIdSet::default();
+        seen.insert(self.root);
+        let mut cursor = 0usize;
+
+        while cursor < frontier.len() {
+            let end = (cursor + READ_BATCH_PAGES).min(frontier.len());
+            let batch: Vec<(PageId, u8)> = frontier[cursor..end].to_vec();
+            let ids: Vec<PageId> = batch.iter().map(|(pid, _)| *pid).collect();
+            let pages = cache.get_many(&ids)?;
+            for ((pid, level), page) in batch.into_iter().zip(pages) {
+                expect_page_level(page.as_ref(), pid, level, "paged::warmup_all_pages")?;
+                if level == 0 {
+                    continue;
+                }
+                for slot in 0..INDEX_FANOUT {
+                    let child = index_child_at(page.as_ref(), slot);
+                    if child != NULL_PAGE && seen.insert(child) {
+                        frontier.push((child, level - 1));
+                    }
+                }
+            }
+            cursor = end;
+        }
+
+        Ok(seen.len() as u64)
+    }
+
     // -------- read path --------------------------------------------------
 
     /// Point lookup. `None` if `lba` is not mapped.

@@ -32,7 +32,7 @@
 //! is atomic at the kernel level. The mutex only protects metadata (free
 //! list, high-water mark, committed file size).
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -97,6 +97,11 @@ pub struct PageStore {
     /// into large hole-punch extents instead of random single pages.
     /// idempotent / replay path cannot push the same pid twice).
     deferred_free: Mutex<BTreeMap<PageId, DeferredFree>>,
+    /// Background page writes take the read side. Checkpoint manifest
+    /// publication takes the write side before entering `apply_gate`, so a
+    /// fixed-capacity device cannot hide background reclaim behind the same
+    /// chunklet stripe locks as the final manifest page write.
+    publish_io_barrier: RwLock<()>,
     /// Set once during `Db` construction (after `MetaMetrics::new`),
     /// then read-only for the lifetime of the store. Use `Option::ok()`
     /// in IO paths so unit tests that build a bare `PageStore` still
@@ -104,10 +109,24 @@ pub struct PageStore {
     metrics: OnceLock<Arc<MetaMetrics>>,
 }
 
+impl PageStore {
+    /// Quiesce background page writes for a checkpoint manifest stage and
+    /// publish. Callers must acquire this before `apply_gate.write()` so any
+    /// outstanding background IO is waited for outside the data-plane gate.
+    pub(crate) fn checkpoint_publish_io_guard(&self) -> RwLockWriteGuard<'_, ()> {
+        self.publish_io_barrier.write()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DeferredFree {
     epoch: u64,
     generation: Lsn,
+    /// Selected by a reclaim worker but not yet physically committed to the
+    /// free list. Keeping the entry in `deferred_free` while IO is in flight
+    /// makes failures retryable and prevents a second reclaimer from selecting
+    /// the same page.
+    in_flight: bool,
     /// `true` if the entry came from [`free_idempotent`] — i.e. WAL
     /// replay path. Kept as a provenance flag; reclaim does not branch
     /// on it. Crash-replay safety is provided upstream: every caller of
@@ -143,8 +162,62 @@ struct Inner {
     /// `<= device.len_pages()`; the gap is pre-extended zero-init growth
     /// tail (file) or unused capacity (device).
     high_water: u64,
-    /// Explicitly-freed pages available for reuse. LIFO.
+    /// Explicitly-freed pages available for reuse. This is an unordered LIFO
+    /// stack: single/batch allocation needs no ordering, and `allocate_run`
+    /// sorts lazily before searching for a contiguous extent. Keeping reclaim
+    /// append-only avoids sorting the accumulated million-page list on every
+    /// small background reclaim cycle.
     free_list: Vec<PageId>,
+    /// One bit per page in `[FIRST_DATA_PAGE, high_water)`, set iff the page is
+    /// present in `free_list`. Maintained incrementally under `inner` so a
+    /// manifest checkpoint copies the compact bitmap instead of cloning and
+    /// re-encoding millions of `PageId`s.
+    free_bitmap: Vec<u8>,
+}
+
+fn free_bitmap_len(high_water: u64) -> usize {
+    (high_water.saturating_sub(FIRST_DATA_PAGE) as usize).div_ceil(8)
+}
+
+fn build_free_bitmap(high_water: u64, free_list: &[PageId]) -> Vec<u8> {
+    let mut bitmap = vec![0; free_bitmap_len(high_water)];
+    for &pid in free_list {
+        if (FIRST_DATA_PAGE..high_water).contains(&pid) {
+            let bit = (pid - FIRST_DATA_PAGE) as usize;
+            bitmap[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+    bitmap
+}
+
+fn set_free_bitmap_bit(inner: &mut Inner, pid: PageId, free: bool) {
+    debug_assert!((FIRST_DATA_PAGE..inner.high_water).contains(&pid));
+    let bit = (pid - FIRST_DATA_PAGE) as usize;
+    let byte = &mut inner.free_bitmap[bit / 8];
+    if free {
+        *byte |= 1 << (bit % 8);
+    } else {
+        *byte &= !(1 << (bit % 8));
+    }
+}
+
+fn free_bitmap_bit(inner: &Inner, pid: PageId) -> bool {
+    debug_assert!((FIRST_DATA_PAGE..inner.high_water).contains(&pid));
+    let bit = (pid - FIRST_DATA_PAGE) as usize;
+    inner.free_bitmap[bit / 8] & (1 << (bit % 8)) != 0
+}
+
+fn resize_free_bitmap(inner: &mut Inner) {
+    inner
+        .free_bitmap
+        .resize(free_bitmap_len(inner.high_water), 0);
+    let live_bits = inner.high_water.saturating_sub(FIRST_DATA_PAGE) as usize;
+    let tail_bits = live_bits % 8;
+    if tail_bits != 0 {
+        if let Some(last) = inner.free_bitmap.last_mut() {
+            *last &= (1u8 << tail_bits) - 1;
+        }
+    }
 }
 
 impl PageStore {}

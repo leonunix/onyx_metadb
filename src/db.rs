@@ -342,6 +342,14 @@ pub struct Db {
     /// entries folded per `tree.write()` hold in the syncing-slot drain
     /// (0 = one-shot fold).
     pub(crate) l2p_drain_chunk_entries: usize,
+    /// Enable one-generation look-ahead: after the current dirty checkpoint is
+    /// frozen, a dedicated worker folds the Quiescing successor while current
+    /// checkpoint IO runs.
+    pub(crate) l2p_checkpoint_pipeline_enabled: bool,
+    /// Maximum submitted L2P mutations in one Open BFG before the commit
+    /// path asks the quiesce worker to roll it. This turns checkpoint cadence
+    /// into a work bound; the timer remains the idle/low-rate fallback.
+    pub(crate) bfg_l2p_work_limit: usize,
     /// Cached copy of `Config::rc_authoritative_reclaim`. When `true`, every
     /// L2P remap increfs its new head_pba so refcount is the authoritative
     /// live-reference count (reclaim = `rc==0`, no full-volume reverify scan).
@@ -360,6 +368,10 @@ pub struct Db {
     /// the quiesce side is gone, and the sync side drains whatever it
     /// has before exiting.
     pub(crate) bfg_sync: Mutex<Option<bfg_sync::BfgSyncThread>>,
+    /// Serial successor-fold worker used by the checkpoint pipeline. It never
+    /// changes BFG durability state; the sync worker consumes its ticket before
+    /// returning and remains the sole `mark_synced` owner.
+    l2p_prefold: Mutex<Option<l2p_prefold::L2pPrefoldWorker>>,
     /// Buffer-backed journal watermark hook. The onyx engine
     /// stamps this atomic to "the highest LV2 buffer entry seq whose
     /// flusher-derived mutations are now in metadb's in-memory state".
@@ -1413,6 +1425,7 @@ mod helpers;
 mod indexes;
 mod l2p;
 mod l2p_buffer;
+mod l2p_prefold;
 mod lifecycle;
 mod lineage_gc;
 mod livelist_condense;
@@ -1438,6 +1451,9 @@ impl Drop for Db {
         // call is in flight when those fields go away.
         if let Some(mut flusher) = self.l2p_writeback.lock().take() {
             flusher.stop();
+        }
+        if let Some(mut prefold) = self.l2p_prefold.lock().take() {
+            prefold.stop();
         }
         // Stop the BFG worker pair before volume trees / page cache go away.
         // Quiesce stops first so no new group enters Syncing; sync drains any

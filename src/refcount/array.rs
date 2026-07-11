@@ -214,6 +214,24 @@ impl PagedRefcountArray {
         self.meta_page_id
     }
 
+    /// Populate the shared cache with every allocated refcount data page.
+    /// The page table itself is already resident in `inner` after open.
+    pub(crate) fn warmup_data_pages(&self) -> Result<u64> {
+        const READ_BATCH_PAGES: usize = 4096;
+        let page_ids: Vec<PageId> = self
+            .inner
+            .lock()
+            .page_table
+            .iter()
+            .copied()
+            .filter(|pid| *pid != 0)
+            .collect();
+        for chunk in page_ids.chunks(READ_BATCH_PAGES) {
+            self.page_cache.get_many(chunk)?;
+        }
+        Ok(page_ids.len() as u64)
+    }
+
     /// Resolve `page_idx` to its pid and, if the page is currently
     /// staged (dirty, not yet durable), the overlay copy — both under
     /// ONE `inner` acquisition so a reader can never observe a
@@ -245,6 +263,59 @@ impl PagedRefcountArray {
             None => self.page_cache.get(page_id)?,
         };
         Ok(read_entry(&page, slot))
+    }
+
+    /// Resolve a batch of entries and their backing-page generations with one
+    /// page-table lock and one cache multi-get. The page generation is the
+    /// replay-skip operand used by [`crate::refcount::RcShard::stage_batch`].
+    pub(crate) fn get_many_with_page_lsn(&self, pbas: &[Pba]) -> Result<Vec<(RcEntry, Lsn)>> {
+        if pbas.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let resolved: Vec<(PageId, Option<Arc<Page>>, usize)> = {
+            let inner = self.inner.lock();
+            pbas.iter()
+                .map(|&pba| {
+                    let (page_idx, slot) = page_offset(pba);
+                    let pid = inner.page_table.get(page_idx).copied().unwrap_or(0);
+                    let staged = if pid == 0 {
+                        None
+                    } else {
+                        inner.staged_overlay.get(&pid).cloned()
+                    };
+                    if staged.is_some() {
+                        super::note_staged_overlay_hit();
+                    }
+                    (pid, staged, slot)
+                })
+                .collect()
+        };
+
+        let disk_pids: Vec<PageId> = resolved
+            .iter()
+            .filter_map(|(pid, staged, _)| (*pid != 0 && staged.is_none()).then_some(*pid))
+            .collect();
+        let disk_pages = self.page_cache.get_many(&disk_pids)?;
+        let mut disk_pages = disk_pages.into_iter();
+        let mut out = Vec::with_capacity(pbas.len());
+        for (pid, staged, slot) in resolved {
+            if pid == 0 {
+                out.push((RcEntry::ZERO, 0));
+                continue;
+            }
+            let page = match staged {
+                Some(page) => page,
+                None => disk_pages.next().ok_or_else(|| {
+                    crate::error::MetaDbError::Corruption(
+                        "refcount batch page iterator underflow".into(),
+                    )
+                })?,
+            };
+            out.push((read_entry(&page, slot), page.header()?.generation));
+        }
+        debug_assert!(disk_pages.next().is_none());
+        Ok(out)
     }
 
     /// `last_applied_lsn` recorded on the data page covering `pba`.

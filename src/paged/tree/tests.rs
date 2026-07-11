@@ -359,6 +359,35 @@ fn warmup_pins_all_index_pages_in_small_tree() {
 }
 
 #[test]
+fn warmup_all_pages_populates_leaves_for_cold_reads() {
+    let dir = TempDir::new().unwrap();
+    let page_store = Arc::new(PageStore::create(dir.path().join("warm-all.pages")).unwrap());
+    let build_cache = Arc::new(PageCache::new(page_store.clone(), 64 * PAGE_SIZE as u64));
+    let mut tree = PagedL2p::create_with_cache(page_store.clone(), build_cache, 1).unwrap();
+    let lbas = [0, 1 << LEAF_SHIFT, 2 << LEAF_SHIFT, 3 << LEAF_SHIFT];
+    for (idx, lba) in lbas.into_iter().enumerate() {
+        tree.insert(lba, v(idx as u8)).unwrap();
+    }
+    tree.flush().unwrap();
+
+    let cold_cache = Arc::new(PageCache::new(page_store.clone(), 64 * PAGE_SIZE as u64));
+    let reopened = PagedL2p::open_with_cache(
+        page_store,
+        cold_cache.clone(),
+        tree.root(),
+        tree.next_generation(),
+    )
+    .unwrap();
+    let warmed = reopened.warmup_all_pages().unwrap();
+    assert!(warmed >= 5, "root plus four leaves must be resident");
+    let misses_after_warm = cold_cache.stats().misses;
+    for lba in lbas {
+        assert!(reopened.get_read_only(lba).unwrap().is_some());
+    }
+    assert_eq!(cold_cache.stats().misses, misses_after_warm);
+}
+
+#[test]
 fn warmup_respects_pin_budget() {
     let (_d, mut t) = mk_tree_with_pin(1);
     // Level-2 tree with multiple level-1 index pages under the

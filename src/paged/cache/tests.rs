@@ -98,6 +98,32 @@ fn install_flushed_snapshot_page_keeps_newer_dirty_copy() {
 }
 
 #[test]
+fn dirty_index_tracks_mutation_install_and_forget() {
+    let (_d, ps) = mk_store();
+    let mut buf = PageBuf::new(ps.clone());
+    let first = buf.alloc_leaf(1).unwrap();
+    let second = buf.alloc_leaf(1).unwrap();
+    assert_eq!(buf.dirty_count(), 2);
+
+    let snapshot = buf.dirty_snapshot_capped(1);
+    assert_eq!(snapshot.pages_count(), 1);
+    let flushed = snapshot.write().unwrap();
+    let mut sealed = Vec::new();
+    flushed.append_sealed_pages(&mut sealed);
+    ps.write_sealed_page_runs(sealed).unwrap();
+    ps.sync().unwrap();
+    assert_eq!(
+        buf.install_flushed_snapshot_page(&flushed, 0),
+        Some((first.min(second), true))
+    );
+    assert_eq!(buf.dirty_count(), 1);
+
+    buf.forget(first.max(second));
+    assert_eq!(buf.dirty_count(), 0);
+    assert!(buf.iter_dirty().next().is_none());
+}
+
+#[test]
 fn page_store_reclaim_requires_cache_invalidation_before_reuse() {
     let (_d, ps) = mk_store();
     let page_cache = Arc::new(PageCache::new(ps.clone(), DEFAULT_PAGE_CACHE_BYTES));

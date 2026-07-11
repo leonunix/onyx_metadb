@@ -46,6 +46,33 @@ pub struct LoadedManifest {
     pub manifest: Manifest,
 }
 
+/// Immutable output of the expensive half of a manifest commit.
+///
+/// Catalog and free-list pages are already durable. Publishing this generation
+/// only writes and syncs the single manifest slot page, then advances the
+/// in-memory double-buffer bookkeeping.
+pub(crate) struct PreparedManifestCommit {
+    new_sequence: u64,
+    target_slot: PageId,
+    generation: Lsn,
+    manifest_page: Page,
+    volume_chain: Vec<PageId>,
+    snapshot_chain: Vec<PageId>,
+    free_list_run: Vec<PageId>,
+    volume_free: Vec<PageId>,
+    snapshot_free: Vec<PageId>,
+    free_list_free: Vec<PageId>,
+    is_device: bool,
+}
+
+/// Post-durable garbage left by a manifest catalog/free-bitmap chain shrink.
+/// The referenced pages belong to the just-overwritten (older) slot and can be
+/// queued for epoch reclaim after the apply gate is released.
+pub(crate) struct PublishedManifestCleanup {
+    generation: Lsn,
+    pages: Vec<PageId>,
+}
+
 fn slot_index(slot: PageId) -> usize {
     if slot == MANIFEST_PAGE_A { 0 } else { 1 }
 }
@@ -283,6 +310,21 @@ impl ManifestStore {
     /// On failure before the manifest fsync, in-memory state is untouched (the
     /// retry targets the same slot).
     pub fn commit(&mut self, manifest: &mut Manifest) -> Result<()> {
+        let prepared = self.prepare_commit(manifest)?;
+        self.publish_prepared(prepared)
+    }
+
+    /// Encode and persist every page except the manifest slot itself.
+    ///
+    /// The target slot is the sacrificial (older) half of the double buffer, so
+    /// its catalog/free-list chains may be rewritten before publication while
+    /// the other slot remains the crash fallback. Callers may run this phase
+    /// outside their global apply barrier once the manifest generation is
+    /// frozen.
+    pub(crate) fn prepare_commit(
+        &mut self,
+        manifest: &mut Manifest,
+    ) -> Result<PreparedManifestCommit> {
         let new_sequence = self
             .sequence
             .checked_add(1)
@@ -354,8 +396,8 @@ impl ManifestStore {
             // (never marks a used page free) but possibly-conservative snapshot;
             // a crash in that narrow window Free-stamps those pages on disk but
             // leaves them unlisted until a future flush re-persists them.
-            let (h2, free_list) = self.page_store.snapshot_free_list_and_high_water();
-            let bitmap = catalog::encode_free_list_bitmap(h2, &free_list);
+            let (h2, bitmap) = self.page_store.snapshot_free_bitmap_and_high_water();
+            debug_assert_eq!(bitmap.len(), catalog::free_list_bitmap_len(h2));
             let fl_sealed = catalog::seal_free_list_run(&fl_run, &bitmap, generation)?;
             (fl_run, fl_sealed, fl_free, h2)
         } else {
@@ -389,7 +431,53 @@ impl ManifestStore {
         manifest.encode(&mut page, vol_chain[0], snap_chain[0])?;
         page.seal();
 
-        self.page_store.write_page(target_slot, &page)?;
+        Ok(PreparedManifestCommit {
+            new_sequence,
+            target_slot,
+            generation,
+            manifest_page: page,
+            volume_chain: vol_chain,
+            snapshot_chain: snap_chain,
+            free_list_run: fl_run,
+            volume_free: vol_free,
+            snapshot_free: snap_free,
+            free_list_free: fl_free,
+            is_device,
+        })
+    }
+
+    /// Publish a prepared generation by writing only its manifest slot page.
+    pub(crate) fn publish_prepared(&mut self, prepared: PreparedManifestCommit) -> Result<()> {
+        let cleanup = self.publish_prepared_deferred_cleanup(prepared)?;
+        self.cleanup_published(cleanup);
+        Ok(())
+    }
+
+    /// Publish without enqueueing obsolete catalog pages for reclaim. The
+    /// checkpoint path uses this form so only the 4 KiB slot write, sync, and
+    /// in-memory generation flip run under its apply gate.
+    pub(crate) fn publish_prepared_deferred_cleanup(
+        &mut self,
+        prepared: PreparedManifestCommit,
+    ) -> Result<PublishedManifestCleanup> {
+        let PreparedManifestCommit {
+            new_sequence,
+            target_slot,
+            generation,
+            manifest_page,
+            volume_chain,
+            snapshot_chain,
+            free_list_run,
+            volume_free,
+            snapshot_free,
+            free_list_free,
+            is_device,
+        } = prepared;
+        let idx = slot_index(target_slot);
+
+        debug_assert_eq!(self.next_slot, target_slot);
+        debug_assert_eq!(self.sequence.saturating_add(1), new_sequence);
+        self.page_store.write_page(target_slot, &manifest_page)?;
         self.faults.inject(FaultPoint::ManifestFsyncBefore)?;
         self.page_store.sync()?;
         self.faults.inject(FaultPoint::ManifestFsyncAfter)?;
@@ -397,27 +485,35 @@ impl ManifestStore {
         // 4. Durable — point of no return. Advance bookkeeping.
         self.sequence = new_sequence;
         self.next_slot = other_slot(target_slot);
-        self.slot_volume_chain[idx] = vol_chain;
-        self.slot_snapshot_chain[idx] = snap_chain;
+        self.slot_volume_chain[idx] = volume_chain;
+        self.slot_snapshot_chain[idx] = snapshot_chain;
         if is_device {
-            self.slot_free_list_run[idx] = fl_run;
+            self.slot_free_list_run[idx] = free_list_run;
         }
 
-        // 5. Free trailing continuation pages a shrink dropped (this slot's own
-        //    former pages, now referenced by nobody). Best-effort: a free error
-        //    only leaks pages (reclaimed at next open). Invalidate the cache
-        //    before releasing each pid so a recycled page can't be read stale.
-        for pid in vol_free.into_iter().chain(snap_free).chain(fl_free) {
+        let mut pages = volume_free;
+        pages.extend(snapshot_free);
+        pages.extend(free_list_free);
+        Ok(PublishedManifestCleanup { generation, pages })
+    }
+
+    /// Enqueue post-publish catalog garbage in one deferred-free batch. Errors
+    /// are space leaks only: the new manifest slot is already durable and open
+    /// recovery can reclaim the orphaned pages.
+    pub(crate) fn cleanup_published(&self, cleanup: PublishedManifestCleanup) {
+        for &pid in &cleanup.pages {
             self.page_cache.invalidate(pid);
-            if let Err(err) = self.page_store.free(pid, generation) {
-                tracing::warn!(
-                    page_id = pid,
-                    error = %err,
-                    "metadb: failed to free shrunken manifest catalog chain page"
-                );
-            }
         }
-        Ok(())
+        if let Err(err) = self
+            .page_store
+            .free_many(&cleanup.pages, cleanup.generation)
+        {
+            tracing::warn!(
+                pages = cleanup.pages.len(),
+                error = %err,
+                "metadb: failed to free shrunken manifest catalog chain pages"
+            );
+        }
     }
 }
 

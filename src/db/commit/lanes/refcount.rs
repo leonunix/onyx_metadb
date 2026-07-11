@@ -20,6 +20,44 @@ impl Db {
         let mut by_pba: Vec<_> = by_pba.into_iter().collect();
         by_pba.sort_by_key(|(pba, _)| *pba);
 
+        // The normal rc-authoritative remap path contains only derived
+        // (non-standalone) actions. Net-collapse those groups first, then
+        // stage every distinct PBA with one RcShard batch so the four BFG
+        // slot locks and refcount-page reads are amortized across the commit.
+        if by_pba
+            .iter()
+            .all(|(_, group)| group.iter().all(|action| !action.standalone_refcount))
+        {
+            let coalesced: Vec<(Pba, i64, Vec<RcApplyAction>)> = by_pba
+                .into_iter()
+                .filter_map(|(pba, group)| {
+                    let delta = group.iter().map(|action| action.delta).sum();
+                    (delta != 0).then_some((pba, delta, group))
+                })
+                .collect();
+            let staged_actions: Vec<(Pba, i64)> = coalesced
+                .iter()
+                .map(|(pba, delta, _)| (*pba, *delta))
+                .collect();
+            let batch_started = std::time::Instant::now();
+            let staged = rc.stage_batch(bfg, &staged_actions, lsn)?;
+            metrics.record_apply_refcount_batch(staged.len() as u64, batch_started.elapsed());
+            for ((pba, _delta, group), (pre, new)) in coalesced.into_iter().zip(staged) {
+                if new == 0
+                    && pre > 0
+                    && let Some(action) = group
+                        .iter()
+                        .rev()
+                        .find(|action| action.remap_freed_candidate)
+                {
+                    result
+                        .remap_freed
+                        .push((action.op_idx, pba, action.range_op));
+                }
+            }
+            return Ok(result);
+        }
+
         for (pba, group) in by_pba {
             // Net-collapse every non-standalone group — including MIXED-sign
             // (rc-authoritative emits both incref(+1) of a new head_pba and

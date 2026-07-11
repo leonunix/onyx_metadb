@@ -379,6 +379,16 @@ impl Db {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Buffer replay frontier committed in the currently durable manifest.
+    /// Unlike [`buffer_applied_watermark`](Self::buffer_applied_watermark),
+    /// this never reports in-memory work that a checkpoint has not published.
+    pub fn durable_buffer_applied_watermark(&self) -> u64 {
+        self.manifest_state
+            .lock()
+            .manifest
+            .last_processed_buffer_seq
+    }
+
     /// Same contract as [`set_buffer_applied_watermark`] but for the
     /// lifecycle journal. Called after a lifecycle-log apply lands in
     /// metadb's in-memory state.
@@ -410,7 +420,9 @@ impl Db {
     /// on the next open.
     pub(super) fn stamp_replay_watermarks(&self, manifest: &mut crate::manifest::Manifest) {
         use std::sync::atomic::Ordering;
-        manifest.last_processed_buffer_seq = self.buffer_applied_watermark.load(Ordering::Acquire);
+        manifest.last_processed_buffer_seq = manifest
+            .last_processed_buffer_seq
+            .max(self.buffer_applied_watermark.load(Ordering::Acquire));
         manifest.lifecycle_replay_seq = self.lifecycle_applied_watermark.load(Ordering::Acquire);
     }
 
@@ -449,26 +461,13 @@ impl Db {
     /// must run through `Db::run_lineage_gc_cycle_inner`, where a `Db`
     /// handle can commit the retire record before advancing the chain.
     fn start_async_reclaim(&self, params: super::async_reclaim::AsyncReclaimParams) {
-        let lineage_gc = super::async_reclaim::LineageGcCtx {
-            volumes: self.volumes.clone(),
-            manifest_state: self.manifest_state.clone(),
-            apply_gate: self.apply_gate.clone(),
-            refcount_shards_rc: self
-                .refcount_shards
-                .iter()
-                .map(|shard| shard.rc.clone())
-                .collect(),
-            faults: self.faults.clone(),
-            metrics: self.metrics.clone(),
-            emit_freepbas: self.lineage_gc_emit_freepbas,
-            drop_dedup_shared: self.lineage_gc_drop_dedup_shared,
-        };
-        let worker = super::async_reclaim::AsyncReclaim::start_with_lineage_gc(
+        // Page reclaim is deliberately single-purpose. Lineage GC has its own
+        // Db-aware worker and must never be coupled to checkpoint completion.
+        let worker = super::async_reclaim::AsyncReclaim::start(
             self.page_store.clone(),
             self.page_cache.clone(),
             self.metrics.clone(),
             params,
-            Some(lineage_gc),
         );
         *self.async_reclaim.lock() = Some(worker);
     }
@@ -570,6 +569,17 @@ impl Db {
             self.faults.clone(),
         );
         *self.bfg_quiesce.lock() = Some(quiesce);
+
+        if self.l2p_checkpoint_pipeline_enabled {
+            let weak_db = Arc::downgrade(self);
+            let work: super::l2p_prefold::PrefoldWorkFn = Arc::new(move |bfg| {
+                let Some(db) = weak_db.upgrade() else {
+                    return Ok(false);
+                };
+                db.run_l2p_prefold(bfg)
+            });
+            *self.l2p_prefold.lock() = Some(super::l2p_prefold::L2pPrefoldWorker::start(work));
+        }
     }
 
     /// BFG: stop the BFG worker pair, quiesce
@@ -577,12 +587,91 @@ impl Db {
     /// and the sync side drains its current cycle before exiting.
     /// Idempotent: a second call is a no-op.
     pub(super) fn stop_bfg_threads(&self) {
+        if let Some(mut p) = self.l2p_prefold.lock().take() {
+            p.stop();
+        }
         if let Some(mut q) = self.bfg_quiesce.lock().take() {
             q.stop();
         }
         if let Some(mut s) = self.bfg_sync.lock().take() {
             s.stop();
         }
+    }
+
+    fn run_l2p_prefold(&self, bfg: crate::types::Bfg) -> Result<bool> {
+        let started = std::time::Instant::now();
+        let result = self.run_l2p_prefold_inner(bfg);
+        self.metrics.record_l2p_prefold(&result, started.elapsed());
+        result
+    }
+
+    fn run_l2p_prefold_inner(&self, bfg: crate::types::Bfg) -> Result<bool> {
+        if !self.l2p_checkpoint_pipeline_enabled {
+            return Ok(false);
+        }
+
+        // Lifecycle writers need exclusive drop_gate access. Holding the read
+        // side across the speculative fold prevents a snapshot/clone boundary
+        // from appearing after the eligibility checks below.
+        let _drop_guard = self.drop_gate.read();
+        let state = self.bfg.snapshot();
+        if state.quiescing_bfg != Some(bfg)
+            || state.syncing_bfg != bfg.checked_sub(1)
+            || self.bfg.is_aborted()
+        {
+            return Ok(false);
+        }
+        if !self.pending_sync_tasks.lock().is_empty()
+            || self
+                .snap_info_cache
+                .lock()
+                .values()
+                .any(|snapshots| !snapshots.is_empty())
+        {
+            return Ok(false);
+        }
+        {
+            let volumes = self.volumes.read();
+            if volumes
+                .values()
+                .any(|volume| volume.parent_vol_ord.read().is_some())
+            {
+                return Ok(false);
+            }
+        }
+
+        // The Quiescing slot has drained all BfgGuards and accepts no new
+        // inserts, so it has the same immutable-slot contract as Syncing. This
+        // folds and publish-before-clears only L2P data; the BFG state remains
+        // Quiescing until the current checkpoint completes.
+        self.drain_syncing_slot_into_trees(bfg)?;
+        Ok(true)
+    }
+
+    pub(super) fn request_l2p_prefold(
+        &self,
+        current_bfg: crate::types::Bfg,
+    ) -> Option<super::l2p_prefold::PrefoldTicket> {
+        if !self.l2p_checkpoint_pipeline_enabled {
+            return None;
+        }
+        let successor = current_bfg.checked_add(1)?;
+        let state = self.bfg.snapshot();
+        if state.syncing_bfg != Some(current_bfg) || state.quiescing_bfg != Some(successor) {
+            return None;
+        }
+        self.l2p_prefold.lock().as_ref()?.request(successor)
+    }
+
+    pub(super) fn wait_l2p_prefold(
+        &self,
+        ticket: super::l2p_prefold::PrefoldTicket,
+    ) -> Result<bool> {
+        let worker_guard = self.l2p_prefold.lock();
+        let Some(worker) = worker_guard.as_ref() else {
+            return Ok(false);
+        };
+        worker.wait(ticket)
     }
 
     /// Force-fold every L2P shard's BFG ring buffer into its on-disk
@@ -713,8 +802,17 @@ impl Db {
                     super::apply::publish_l2p_read_view(shard, &tree);
                     drop(tree);
                     shard.l2p_buffer.note_compacted(max_lsn);
-                    self.metrics
-                        .record_l2p_buffer_compaction(count, started.elapsed());
+                    self.metrics.record_l2p_buffer_compaction(
+                        count,
+                        0,
+                        1,
+                        started.elapsed(),
+                        std::time::Duration::ZERO,
+                        std::time::Duration::ZERO,
+                        started.elapsed(),
+                        std::time::Duration::ZERO,
+                        std::time::Duration::ZERO,
+                    );
                 }
                 Err(err) => {
                     drop(tree);
@@ -738,21 +836,21 @@ impl Db {
     /// only on a miss. If we cleared the slot before folding+publishing,
     /// a concurrent lookup could miss the (now empty) slot and read the
     /// stale `read_view`, falsely reporting `prev = None` → a refcount /
-    /// space leak on the onyx side. So per shard, under `tree.write()`:
-    ///   1. snapshot the syncing slot (clone, NOT clear) — readers still
-    ///      hit the live slot entries during the fold;
-    ///   2. fold the snapshot into the tree;
+    /// space leak on the onyx side. So per shard:
+    ///   1. move-freeze the syncing slot into an immutable `Arc<HashMap>`;
+    ///      readers still hit that same generation during the fold;
+    ///   2. fold the frozen generation into the tree;
     ///   3. `publish_l2p_read_view` — the tree/read_view now carry the
     ///      entries;
-    ///   4. `take_syncing_slot` (clear). A lookup that acquires the slot
+    ///   4. `finish_syncing_slot` (clear). A lookup that acquires the slot
     ///      lock after this sees it empty, and the slot-lock release/
     ///      acquire edge guarantees it then observes the published view.
-    /// The slot being frozen (Syncing state, no concurrent inserts) is
-    /// what makes the step-1 snapshot equal the step-4 clear.
+    /// The slot being Syncing (no concurrent inserts) is what makes the
+    /// step-1 frozen generation equal the step-4 clear.
     ///
-    /// We clone in step 1 rather than hold the slot lock across the fold
-    /// so a concurrent `lookup_for_open_bfg` is never blocked for the
-    /// fold's duration (read-latency protection).
+    /// The move-freeze in step 1 is O(1): neither the slot lock nor a full-map
+    /// clone is held across fold planning or tree mutation. Failed drains keep
+    /// the same frozen generation for an idempotent retry.
     pub(super) fn drain_syncing_slot_into_trees(&self, bfg: crate::types::Bfg) -> Result<()> {
         if !self.l2p_buffer_enabled {
             return Ok(());
@@ -867,7 +965,7 @@ impl Db {
     /// same `tree.write()` per op and dedup/read multi_gets take
     /// `tree.read()`, so every commit worker and reader on the shard
     /// parked for the fold's full duration. Releasing between chunks is
-    /// safe because the slot stays populated until `take_syncing_slot`
+    /// safe because the slot stays populated until `finish_syncing_slot`
     /// below (publish-before-clear, see `drain_syncing_slot_into_trees`
     /// doc): a concurrent `lookup_for_open_bfg` hits the live slot
     /// entries and never observes the partially-folded tree, and every
@@ -887,10 +985,11 @@ impl Db {
         clone_cow_pinners: Vec<Lsn>,
     ) -> Result<()> {
         let started = std::time::Instant::now();
-        // Snapshot (clone) the frozen syncing slot WITHOUT the tree lock so the
-        // brief slot-lock is not held across the fold. Empty → nothing to do.
-        let entries = shard.l2p_buffer.snapshot_syncing_slot(bfg);
+        // O(1) move-freeze: the slot retains an Arc for concurrent lookups while
+        // fold planning and tree mutation use the same immutable generation.
+        let entries = shard.l2p_buffer.borrow_syncing_slot(bfg);
         if entries.is_empty() {
+            shard.l2p_buffer.finish_syncing_slot(bfg, &entries);
             return Ok(());
         }
         let count = entries.len();
@@ -898,8 +997,14 @@ impl Db {
         // Build the fold plan (leaf grouping + sorting) off-lock: it is
         // pure CPU over the frozen snapshot, and its transient
         // allocations live and die outside the lock hold.
+        let plan_started = std::time::Instant::now();
         let plan = super::bfg_sync::build_drain_plan(&entries);
-        drop(entries);
+        let plan_elapsed = plan_started.elapsed();
+        let leaves = plan.len();
+        let mut chunks = 0usize;
+        let mut tree_wait = std::time::Duration::ZERO;
+        let mut apply_elapsed = std::time::Duration::ZERO;
+        let mut publish_elapsed = std::time::Duration::ZERO;
         let mut start = 0;
         while start < plan.len() {
             // Chunk boundary: whole leaves only, >= chunk_entries entries.
@@ -912,7 +1017,10 @@ impl Db {
                     break;
                 }
             }
+            let tree_wait_started = std::time::Instant::now();
             let mut tree = shard.tree.write();
+            tree_wait += tree_wait_started.elapsed();
+            let apply_started = std::time::Instant::now();
             super::bfg_sync::apply_drain_ops(
                 &mut tree,
                 &plan[start..end],
@@ -928,19 +1036,34 @@ impl Db {
             // BFG: per-clone page-livelist witness (empty for
             // non-clones).
             super::apply::drain_live_events_into(page_live_list, &mut tree);
+            apply_elapsed += apply_started.elapsed();
             if end == plan.len() {
                 // Publish BEFORE clearing the slot (see method doc), under
                 // the final chunk's hold like the one-shot fold did.
+                let publish_started = std::time::Instant::now();
                 super::apply::publish_l2p_read_view(shard, &tree);
+                publish_elapsed += publish_started.elapsed();
             }
             drop(tree);
             start = end;
+            chunks += 1;
         }
-        // Clear the now-folded+published slot. Frozen, so this equals the
-        // snapshot; the return value is discarded.
-        let _ = shard.l2p_buffer.take_syncing_slot(bfg);
+        // Clear only the exact generation just folded and published.
+        let finish_started = std::time::Instant::now();
+        shard.l2p_buffer.finish_syncing_slot(bfg, &entries);
         shard.l2p_buffer.note_compacted(max_lsn);
-        metrics.record_l2p_buffer_compaction(count, started.elapsed());
+        let finish_elapsed = finish_started.elapsed();
+        metrics.record_l2p_buffer_compaction(
+            count,
+            leaves,
+            chunks,
+            started.elapsed(),
+            plan_elapsed,
+            tree_wait,
+            apply_elapsed,
+            publish_elapsed,
+            finish_elapsed,
+        );
         Ok(())
     }
 

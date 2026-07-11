@@ -15,7 +15,8 @@
 //! - **Quiescing slot** (open_bfg - 1): no new inserts; in-flight commits
 //!   on this BFG have not yet dropped their guards.
 //! - **Syncing slot** (typically open_bfg - 2): frozen; `BfgSyncThread`
-//!   owns it; [`L2pBuffer::take_syncing_slot`] moves the map out.
+//!   borrows the move-frozen immutable generation and clears it only after
+//!   the folded tree view is published.
 //! - The 4th slot is always Empty.
 //!
 //! ## Lookup ordering
@@ -38,6 +39,7 @@
 //! advanced via [`L2pBuffer::note_compacted`] (max-monotonic).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
@@ -62,8 +64,29 @@ pub enum BufferLookup {
     Absent,
 }
 
+enum SlotState {
+    Mutable(HashMap<Lba, BufferEntry>),
+    Frozen {
+        bfg: Bfg,
+        entries: Arc<HashMap<Lba, BufferEntry>>,
+    },
+}
+
+impl SlotState {
+    fn len(&self) -> usize {
+        match self {
+            Self::Mutable(entries) => entries.len(),
+            Self::Frozen { entries, .. } => entries.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 pub struct L2pBuffer {
-    slots: [Mutex<HashMap<Lba, BufferEntry>>; BFG_SIZE],
+    slots: [Mutex<SlotState>; BFG_SIZE],
     compacted_lsn: AtomicU64,
 }
 
@@ -71,10 +94,10 @@ impl L2pBuffer {
     pub fn new(initial_compacted_lsn: Lsn) -> Self {
         Self {
             slots: [
-                Mutex::new(HashMap::new()),
-                Mutex::new(HashMap::new()),
-                Mutex::new(HashMap::new()),
-                Mutex::new(HashMap::new()),
+                Mutex::new(SlotState::Mutable(HashMap::new())),
+                Mutex::new(SlotState::Mutable(HashMap::new())),
+                Mutex::new(SlotState::Mutable(HashMap::new())),
+                Mutex::new(SlotState::Mutable(HashMap::new())),
             ],
             compacted_lsn: AtomicU64::new(initial_compacted_lsn),
         }
@@ -85,7 +108,11 @@ impl L2pBuffer {
     /// slot's state stays Open / Quiescing for the duration of the
     /// insert.
     pub fn insert_at_bfg(&self, bfg: Bfg, lba: Lba, value: L2pValue, lsn: Lsn) {
-        self.slots[(bfg & BFG_INDEX_MASK) as usize].lock().insert(
+        let mut slot = self.slots[(bfg & BFG_INDEX_MASK) as usize].lock();
+        let SlotState::Mutable(entries) = &mut *slot else {
+            panic!("attempted L2P insert into frozen BFG slot {bfg}");
+        };
+        entries.insert(
             lba,
             BufferEntry {
                 value,
@@ -96,7 +123,11 @@ impl L2pBuffer {
     }
 
     pub fn insert_tombstone_at_bfg(&self, bfg: Bfg, lba: Lba, lsn: Lsn) {
-        self.slots[(bfg & BFG_INDEX_MASK) as usize].lock().insert(
+        let mut slot = self.slots[(bfg & BFG_INDEX_MASK) as usize].lock();
+        let SlotState::Mutable(entries) = &mut *slot else {
+            panic!("attempted L2P tombstone insert into frozen BFG slot {bfg}");
+        };
+        entries.insert(
             lba,
             BufferEntry {
                 value: L2pValue::ZERO,
@@ -104,6 +135,29 @@ impl L2pBuffer {
                 tombstone: true,
             },
         );
+    }
+
+    /// Apply a bucket of final LBA states while taking the Open-slot mutex
+    /// once. Callers collapse repeated writes to the same LBA before calling
+    /// this method; `None` represents a tombstone.
+    pub fn apply_batch_at_bfg(&self, bfg: Bfg, entries: &[(Lba, Option<L2pValue>)], lsn: Lsn) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut slot = self.slots[(bfg & BFG_INDEX_MASK) as usize].lock();
+        let SlotState::Mutable(open) = &mut *slot else {
+            panic!("attempted L2P batch insert into frozen BFG slot {bfg}");
+        };
+        for &(lba, value) in entries {
+            open.insert(
+                lba,
+                BufferEntry {
+                    value: value.unwrap_or(L2pValue::ZERO),
+                    lsn,
+                    tombstone: value.is_none(),
+                },
+            );
+        }
     }
 
     /// Walk slots newest-first starting at `open_bfg`: `open_bfg & 3` →
@@ -122,11 +176,49 @@ impl L2pBuffer {
                 break;
             }
             let idx = (visited & BFG_INDEX_MASK) as usize;
-            if let Some(entry) = self.slots[idx].lock().get(&lba).copied() {
+            let slot = self.slots[idx].lock();
+            let entry = match &*slot {
+                SlotState::Mutable(entries) => entries.get(&lba).copied(),
+                SlotState::Frozen { entries, .. } => entries.get(&lba).copied(),
+            };
+            if let Some(entry) = entry {
                 return entry_to_lookup(entry);
             }
         }
         BufferLookup::Absent
+    }
+
+    /// Batched form of [`Self::lookup_for_open_bfg`]. Each live BFG slot is
+    /// locked once for the whole bucket, preserving newest-first and
+    /// tombstone semantics while amortizing the mutex traffic of random
+    /// write batches.
+    pub fn lookup_many_for_open_bfg(&self, open_bfg: Bfg, lbas: &[Lba]) -> Vec<BufferLookup> {
+        let mut out = vec![BufferLookup::Absent; lbas.len()];
+        let mut unresolved: Vec<usize> = (0..lbas.len()).collect();
+        for delta in 0..(BFG_SIZE as u64 - 1) {
+            if unresolved.is_empty() {
+                break;
+            }
+            let visited = open_bfg.saturating_sub(delta);
+            if visited == 0 && delta > 0 {
+                break;
+            }
+            let idx = (visited & BFG_INDEX_MASK) as usize;
+            let slot = self.slots[idx].lock();
+            unresolved.retain(|&out_idx| {
+                let entry = match &*slot {
+                    SlotState::Mutable(entries) => entries.get(&lbas[out_idx]).copied(),
+                    SlotState::Frozen { entries, .. } => entries.get(&lbas[out_idx]).copied(),
+                };
+                if let Some(entry) = entry {
+                    out[out_idx] = entry_to_lookup(entry);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        out
     }
 
     /// Drain the slot indexed by `bfg & (BFG_SIZE - 1)`. Caller (the
@@ -134,22 +226,68 @@ impl L2pBuffer {
     /// in the state machine — that's what makes the move safe: no new
     /// commits can target the slot while it's Syncing.
     pub fn take_syncing_slot(&self, bfg: Bfg) -> HashMap<Lba, BufferEntry> {
-        std::mem::take(&mut *self.slots[(bfg & BFG_INDEX_MASK) as usize].lock())
+        let mut slot = self.slots[(bfg & BFG_INDEX_MASK) as usize].lock();
+        match std::mem::replace(&mut *slot, SlotState::Mutable(HashMap::new())) {
+            SlotState::Mutable(entries) => entries,
+            SlotState::Frozen { entries, .. } => {
+                Arc::try_unwrap(entries).unwrap_or_else(|entries| (*entries).clone())
+            }
+        }
     }
 
-    /// Clone (without removing) the entries of the slot indexed by
-    /// `bfg & (BFG_SIZE - 1)`. Used by the threads-on per-syncing-slot
-    /// drain ([`crate::db::Db::drain_syncing_slot_into_trees`]) to fold
-    /// the entries into the tree and PUBLISH the read view *before*
-    /// clearing the slot — so a concurrent `lookup_for_open_bfg` (a
-    /// commit's prev-value read or a user read, both of which lock this
-    /// slot during their walk) never observes the gap "slot already
-    /// emptied but tree/read_view not yet updated" and falsely reports
-    /// `prev = None`. Correct only when the slot is frozen (Syncing
-    /// state, no concurrent inserts) so the clone equals the subsequent
-    /// [`Self::take_syncing_slot`] clear.
-    pub fn snapshot_syncing_slot(&self, bfg: Bfg) -> HashMap<Lba, BufferEntry> {
-        self.slots[(bfg & BFG_INDEX_MASK) as usize].lock().clone()
+    /// Move a Syncing slot into an immutable generation and borrow it by Arc.
+    /// The slot retains the Arc for lookups until [`finish_syncing_slot`] runs,
+    /// preserving publish-before-clear without cloning the whole HashMap.
+    /// Repeated calls for a failed/retried BFG return the same generation.
+    pub fn borrow_syncing_slot(&self, bfg: Bfg) -> Arc<HashMap<Lba, BufferEntry>> {
+        let mut slot = self.slots[(bfg & BFG_INDEX_MASK) as usize].lock();
+        match &*slot {
+            SlotState::Frozen {
+                bfg: frozen_bfg,
+                entries,
+            } => {
+                assert_eq!(
+                    *frozen_bfg, bfg,
+                    "BFG slot reused before frozen drain completed"
+                );
+                return entries.clone();
+            }
+            SlotState::Mutable(_) => {}
+        }
+        let mutable = match std::mem::replace(&mut *slot, SlotState::Mutable(HashMap::new())) {
+            SlotState::Mutable(entries) => entries,
+            SlotState::Frozen { .. } => unreachable!(),
+        };
+        let entries = Arc::new(mutable);
+        *slot = SlotState::Frozen {
+            bfg,
+            entries: entries.clone(),
+        };
+        entries
+    }
+
+    /// Clear a successfully folded generation after its tree read-view has
+    /// been published. If a lifecycle drain already consumed the slot, this is
+    /// a no-op; pointer identity prevents clearing a different generation.
+    pub fn finish_syncing_slot(&self, bfg: Bfg, borrowed: &Arc<HashMap<Lba, BufferEntry>>) {
+        let mut slot = self.slots[(bfg & BFG_INDEX_MASK) as usize].lock();
+        match &*slot {
+            SlotState::Frozen {
+                bfg: frozen_bfg,
+                entries,
+            } => {
+                assert_eq!(*frozen_bfg, bfg, "finishing the wrong frozen BFG");
+                assert!(
+                    Arc::ptr_eq(entries, borrowed),
+                    "frozen BFG generation changed"
+                );
+                *slot = SlotState::Mutable(HashMap::new());
+            }
+            SlotState::Mutable(entries) if entries.is_empty() => {}
+            SlotState::Mutable(_) => {
+                panic!("BFG slot {bfg} was reused before frozen generation finished")
+            }
+        }
     }
 
     /// Visit every live (non-tombstone) entry across all four slots. The
@@ -161,8 +299,14 @@ impl L2pBuffer {
     /// blocked for the duration of the callback.
     pub fn for_each_live<F: FnMut(Lba, L2pValue)>(&self, mut f: F) {
         for slot in &self.slots {
-            let snap = slot.lock().clone();
-            for (lba, entry) in snap {
+            let snap = {
+                let slot = slot.lock();
+                match &*slot {
+                    SlotState::Mutable(entries) => Arc::new(entries.clone()),
+                    SlotState::Frozen { entries, .. } => entries.clone(),
+                }
+            };
+            for (&lba, &entry) in snap.iter() {
                 if !entry.tombstone {
                     f(lba, entry.value);
                 }
@@ -183,7 +327,13 @@ impl L2pBuffer {
     pub fn drain_all_slots(&self) -> HashMap<Lba, BufferEntry> {
         let mut merged: HashMap<Lba, BufferEntry> = HashMap::new();
         for slot in &self.slots {
-            let drained = std::mem::take(&mut *slot.lock());
+            let mut slot = slot.lock();
+            let drained = match std::mem::replace(&mut *slot, SlotState::Mutable(HashMap::new())) {
+                SlotState::Mutable(entries) => entries,
+                SlotState::Frozen { entries, .. } => {
+                    Arc::try_unwrap(entries).unwrap_or_else(|entries| (*entries).clone())
+                }
+            };
             for (lba, entry) in drained {
                 merged
                     .entry(lba)
@@ -290,6 +440,27 @@ mod tests {
     }
 
     #[test]
+    fn batch_lookup_and_apply_match_scalar_semantics() {
+        let b = L2pBuffer::new(0);
+        b.insert_at_bfg(1, 10, val(1), 101);
+        b.insert_at_bfg(2, 10, val(2), 102);
+        b.insert_at_bfg(2, 20, val(3), 102);
+        b.insert_tombstone_at_bfg(3, 20, 103);
+
+        let lbas = [10, 20, 30, 10];
+        let batch = b.lookup_many_for_open_bfg(3, &lbas);
+        let scalar: Vec<_> = lbas
+            .iter()
+            .map(|&lba| b.lookup_for_open_bfg(3, lba))
+            .collect();
+        assert_eq!(batch, scalar);
+
+        b.apply_batch_at_bfg(3, &[(10, Some(val(9))), (30, None)], 104);
+        assert_eq!(b.lookup_for_open_bfg(3, 10), BufferLookup::Present(val(9)));
+        assert_eq!(b.lookup_for_open_bfg(3, 30), BufferLookup::Tombstone);
+    }
+
+    #[test]
     fn lookup_for_open_bfg_skips_wraparound_stale_slot() {
         let b = L2pBuffer::new(0);
         // Plant in slot 0 with BFG=4 (stale from open=1's perspective).
@@ -311,6 +482,42 @@ mod tests {
         assert_eq!(b.slot_len(1), 0);
         assert_eq!(b.slot_len(0), 1);
         assert_eq!(b.slot_len(2), 1);
+    }
+
+    #[test]
+    fn frozen_slot_stays_visible_until_exact_generation_finishes() {
+        let b = L2pBuffer::new(0);
+        b.insert_at_bfg(2, 42, val(7), 202);
+
+        let first = b.borrow_syncing_slot(2);
+        let retry = b.borrow_syncing_slot(2);
+        assert!(Arc::ptr_eq(&first, &retry));
+        assert_eq!(first.get(&42).map(|e| e.value), Some(val(7)));
+        assert_eq!(
+            b.lookup_for_open_bfg(2, 42),
+            BufferLookup::Present(val(7)),
+            "publish-before-clear requires lookup to retain the frozen value"
+        );
+
+        b.finish_syncing_slot(2, &first);
+        assert_eq!(b.slot_len(2), 0);
+        assert_eq!(b.lookup_for_open_bfg(2, 42), BufferLookup::Absent);
+    }
+
+    #[test]
+    fn lifecycle_drain_can_consume_a_frozen_slot() {
+        let b = L2pBuffer::new(0);
+        b.insert_at_bfg(2, 42, val(7), 202);
+        let frozen = b.borrow_syncing_slot(2);
+
+        let drained = b.drain_all_slots();
+        assert_eq!(drained.get(&42).map(|e| e.value), Some(val(7)));
+        assert!(b.is_empty());
+
+        // The BFG worker may finish after a lifecycle drain consumed the same
+        // frozen generation. It must observe the empty slot and do nothing.
+        b.finish_syncing_slot(2, &frozen);
+        assert!(b.is_empty());
     }
 
     #[test]

@@ -203,7 +203,7 @@ fn run_worker(inner: Arc<AsyncReclaimInner>) {
             let started = Instant::now();
             match inner
                 .page_store
-                .try_reclaim_limit(inner.params.max_pages_per_cycle)
+                .try_reclaim_limit_background(inner.params.max_pages_per_cycle)
             {
                 Ok(outcome) => {
                     for pid in &outcome.reclaimed {
