@@ -66,6 +66,7 @@
 //! and serialise on it.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -76,6 +77,69 @@ use crate::cache::PageCache;
 use crate::error::Result;
 use crate::page_store::PageStore;
 use crate::types::{Bfg, Lsn, PageId, Pba};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RefcountApplyStageTimings {
+    pub base_page_lookup: Duration,
+    pub pending_slot_scan: Duration,
+    pub delta_merge: Duration,
+    pub sampled_pbas: u64,
+}
+
+#[inline]
+fn sample_refcount_breakdown(lsn: Lsn) -> bool {
+    // Mix the commit LSN before sampling so BFG and checkpoint periods do not
+    // alias with the sample selector. Every bucket in one commit still makes
+    // the same decision, preserving the commit's complete PBA shape.
+    let mut mixed = lsn.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (mixed ^ (mixed >> 31)) & 0x0f == 0
+}
+
+#[inline]
+fn scan_locked_pending(
+    slots: &[parking_lot::MutexGuard<'_, DeltaMap>],
+    pba: Pba,
+) -> (i64, Lsn, bool) {
+    let mut net = 0i64;
+    let mut max_lsn = 0u64;
+    let mut any = false;
+    for slot in slots {
+        if let Some(pending) = slot.get(pba) {
+            net += pending.delta;
+            max_lsn = max_lsn.max(pending.last_lsn);
+            any = true;
+        }
+    }
+    (net, max_lsn, any)
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn merge_staged_action(
+    open: &mut DeltaMap,
+    pba: Pba,
+    delta: i64,
+    lsn: Lsn,
+    base: RcEntry,
+    page_lsn: Lsn,
+    net: i64,
+    max_lsn: Lsn,
+    any: bool,
+) -> Result<(u32, u32)> {
+    if !any && page_lsn >= lsn {
+        return Ok((base.rc, base.rc));
+    }
+    let merged_prev = super::merge_read_or_floor(base, net, max_lsn)?;
+    let (post, skipped) = super::apply_delta_or_skip(merged_prev, delta, lsn)?;
+    if skipped {
+        super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, "stage_batch");
+        return Ok((merged_prev.rc, merged_prev.rc));
+    }
+    open.merge(pba, delta, lsn);
+    Ok((merged_prev.rc, post.rc))
+}
 
 /// Number of BFG ring slots. Matches `crate::db::l2p_buffer::BFG_SIZE`.
 const BFG_SLOTS: usize = 4;
@@ -341,9 +405,9 @@ impl RcShard {
         bfg: Bfg,
         actions: &[(Pba, i64)],
         lsn: Lsn,
-    ) -> Result<Vec<(u32, u32)>> {
+    ) -> Result<(Vec<(u32, u32)>, RefcountApplyStageTimings)> {
         if actions.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), RefcountApplyStageTimings::default()));
         }
         debug_assert!(
             actions
@@ -353,39 +417,74 @@ impl RcShard {
             "RcShard::stage_batch requires distinct PBAs"
         );
 
+        // Sample by commit LSN, not by PBA. A sampled commit therefore keeps
+        // its complete per-shard PBA shape while only about 1/16 commits pay
+        // the per-action timestamp cost.
+        let sample_breakdown = sample_refcount_breakdown(lsn);
         let open_idx = slot_index(bfg);
+        let slot_lock_started = sample_breakdown.then(Instant::now);
         let mut slots: Vec<_> = self.delta_slots.iter().map(|slot| slot.lock()).collect();
+        let slot_lock_elapsed = slot_lock_started.map_or(Duration::ZERO, |start| start.elapsed());
+
+        let lookup_started = sample_breakdown.then(Instant::now);
         let pbas: Vec<Pba> = actions.iter().map(|(pba, _)| *pba).collect();
         let bases = self.array.get_many_with_page_lsn(&pbas)?;
-        let mut out = Vec::with_capacity(actions.len());
+        let base_page_lookup = lookup_started.map_or(Duration::ZERO, |start| start.elapsed());
 
-        for (action_idx, &(pba, delta)) in actions.iter().enumerate() {
-            let mut net = 0i64;
-            let mut max_lsn = 0u64;
-            let mut any = false;
-            for slot in &slots {
-                if let Some(pending) = slot.get(pba) {
-                    net += pending.delta;
-                    max_lsn = max_lsn.max(pending.last_lsn);
-                    any = true;
-                }
+        let mut out = Vec::with_capacity(actions.len());
+        let mut pending_slot_scan = slot_lock_elapsed;
+        let mut delta_merge = Duration::ZERO;
+
+        if sample_breakdown {
+            for (action_idx, &(pba, delta)) in actions.iter().enumerate() {
+                let scan_started = Instant::now();
+                let (net, max_lsn, any) = scan_locked_pending(&slots, pba);
+                pending_slot_scan += scan_started.elapsed();
+
+                let (base, page_lsn) = bases[action_idx];
+                let merge_started = Instant::now();
+                let merged = merge_staged_action(
+                    &mut slots[open_idx],
+                    pba,
+                    delta,
+                    lsn,
+                    base,
+                    page_lsn,
+                    net,
+                    max_lsn,
+                    any,
+                );
+                delta_merge += merge_started.elapsed();
+                out.push(merged?);
             }
-            let (base, page_lsn) = bases[action_idx];
-            if !any && page_lsn >= lsn {
-                out.push((base.rc, base.rc));
-                continue;
+        } else {
+            for (action_idx, &(pba, delta)) in actions.iter().enumerate() {
+                let (net, max_lsn, any) = scan_locked_pending(&slots, pba);
+                let (base, page_lsn) = bases[action_idx];
+                out.push(merge_staged_action(
+                    &mut slots[open_idx],
+                    pba,
+                    delta,
+                    lsn,
+                    base,
+                    page_lsn,
+                    net,
+                    max_lsn,
+                    any,
+                )?);
             }
-            let merged_prev = super::merge_read_or_floor(base, net, max_lsn)?;
-            let (post, skipped) = super::apply_delta_or_skip(merged_prev, delta, lsn)?;
-            if skipped {
-                super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, "stage_batch");
-                out.push((merged_prev.rc, merged_prev.rc));
-                continue;
-            }
-            slots[open_idx].merge(pba, delta, lsn);
-            out.push((merged_prev.rc, post.rc));
         }
-        Ok(out)
+        Ok((
+            out,
+            RefcountApplyStageTimings {
+                base_page_lookup,
+                pending_slot_scan,
+                delta_merge,
+                sampled_pbas: sample_breakdown
+                    .then_some(actions.len() as u64)
+                    .unwrap_or(0),
+            },
+        ))
     }
 
     /// Stage one op into `bfg`'s slot WITHOUT the per-op `page_lsn >= lsn`

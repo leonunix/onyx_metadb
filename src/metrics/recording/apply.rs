@@ -184,6 +184,49 @@ impl MetaMetrics {
         );
     }
 
+    pub(crate) fn record_apply_refcount_batch_breakdown(
+        &self,
+        actions: u64,
+        pbas: u64,
+        pba_grouping: Duration,
+        base_page_lookup: Duration,
+        pending_slot_scan: Duration,
+        delta_merge: Duration,
+        sampled_pbas: u64,
+    ) {
+        self.apply_refcount_batch_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.apply_refcount_batch_actions
+            .fetch_add(actions, Ordering::Relaxed);
+        self.apply_refcount_batch_pbas
+            .fetch_add(pbas, Ordering::Relaxed);
+        record_duration(
+            &self.apply_refcount_pba_grouping_us,
+            &self.apply_refcount_pba_grouping_max_us,
+            pba_grouping,
+        );
+        if sampled_pbas == 0 {
+            return;
+        }
+        self.apply_refcount_breakdown_sampled_pbas
+            .fetch_add(sampled_pbas, Ordering::Relaxed);
+        record_duration(
+            &self.apply_refcount_base_page_lookup_us,
+            &self.apply_refcount_base_page_lookup_max_us,
+            base_page_lookup,
+        );
+        record_duration(
+            &self.apply_refcount_pending_slot_scan_us,
+            &self.apply_refcount_pending_slot_scan_max_us,
+            pending_slot_scan,
+        );
+        record_duration(
+            &self.apply_refcount_delta_merge_us,
+            &self.apply_refcount_delta_merge_max_us,
+            delta_merge,
+        );
+    }
+
     pub(crate) fn record_apply_dedup(&self, elapsed: Duration) {
         self.apply_dedup_count.fetch_add(1, Ordering::Relaxed);
         record_duration(&self.apply_dedup_us, &self.apply_dedup_max_us, elapsed);

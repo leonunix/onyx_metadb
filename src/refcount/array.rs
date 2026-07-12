@@ -272,6 +272,7 @@ impl PagedRefcountArray {
         if pbas.is_empty() {
             return Ok(Vec::new());
         }
+        let pbas_are_sorted = pbas.is_sorted();
 
         let resolved: Vec<(PageId, Option<Arc<Page>>, usize)> = {
             let inner = self.inner.lock();
@@ -296,7 +297,15 @@ impl PagedRefcountArray {
             .iter()
             .filter_map(|(pid, staged, _)| (*pid != 0 && staged.is_none()).then_some(*pid))
             .collect();
-        let disk_pages = self.page_cache.get_many(&disk_pids)?;
+        // Sorted PBAs make every logical refcount-page run contiguous. Filtering
+        // holes and staged pages preserves that property, so equal physical ids
+        // are still grouped even though allocation order does not make the ids
+        // numerically sorted. Arbitrary callers retain the generic cache path.
+        let disk_pages = if pbas_are_sorted {
+            self.page_cache.get_many_grouped(&disk_pids)?
+        } else {
+            self.page_cache.get_many(&disk_pids)?
+        };
         let mut disk_pages = disk_pages.into_iter();
         let mut out = Vec::with_capacity(pbas.len());
         for (pid, staged, slot) in resolved {

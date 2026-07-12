@@ -270,6 +270,18 @@ pub struct MetaMetrics {
     apply_refcount_count: AtomicU64,
     apply_refcount_us: AtomicU64,
     apply_refcount_max_us: AtomicU64,
+    apply_refcount_batch_count: AtomicU64,
+    apply_refcount_batch_actions: AtomicU64,
+    apply_refcount_batch_pbas: AtomicU64,
+    apply_refcount_breakdown_sampled_pbas: AtomicU64,
+    apply_refcount_pba_grouping_us: AtomicU64,
+    apply_refcount_pba_grouping_max_us: AtomicU64,
+    apply_refcount_base_page_lookup_us: AtomicU64,
+    apply_refcount_base_page_lookup_max_us: AtomicU64,
+    apply_refcount_pending_slot_scan_us: AtomicU64,
+    apply_refcount_pending_slot_scan_max_us: AtomicU64,
+    apply_refcount_delta_merge_us: AtomicU64,
+    apply_refcount_delta_merge_max_us: AtomicU64,
     apply_dedup_count: AtomicU64,
     apply_dedup_us: AtomicU64,
     apply_dedup_max_us: AtomicU64,
@@ -797,5 +809,47 @@ fn fetch_max(slot: &AtomicU64, value: u64) {
             Ok(_) => return,
             Err(next) => current = next,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refcount_batch_breakdown_reaches_snapshot_and_json() {
+        let metrics = MetaMetrics::default();
+        metrics.record_apply_refcount_batch_breakdown(
+            11,
+            7,
+            Duration::from_micros(13),
+            Duration::from_micros(17),
+            Duration::from_micros(19),
+            Duration::from_micros(23),
+            7,
+        );
+        metrics.record_apply_refcount_batch_breakdown(
+            5,
+            3,
+            Duration::from_micros(101),
+            Duration::from_micros(103),
+            Duration::from_micros(107),
+            Duration::from_micros(109),
+            0,
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.apply_refcount_batch_count, 2);
+        assert_eq!(snapshot.apply_refcount_batch_actions, 16);
+        assert_eq!(snapshot.apply_refcount_batch_pbas, 10);
+        assert_eq!(snapshot.apply_refcount_breakdown_sampled_pbas, 7);
+        assert_eq!(snapshot.apply_refcount_pba_grouping_us, 114);
+        assert_eq!(snapshot.apply_refcount_pba_grouping_max_us, 101);
+        assert_eq!(snapshot.apply_refcount_base_page_lookup_us, 17);
+        assert_eq!(snapshot.apply_refcount_pending_slot_scan_us, 19);
+        assert_eq!(snapshot.apply_refcount_delta_merge_us, 23);
+        let json = snapshot.to_json();
+        assert!(json.contains("\"apply_refcount_batch_count\":2"));
+        assert!(json.contains("\"apply_refcount_breakdown_sampled_pbas\":7"));
+        assert!(json.contains("\"apply_refcount_delta_merge_us\":23"));
     }
 }

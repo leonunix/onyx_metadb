@@ -12,36 +12,44 @@ impl Db {
         if actions.is_empty() {
             return Ok(result);
         }
-        actions.sort_by_key(|action| action.op_idx);
-        let mut by_pba: HashMap<Pba, Vec<RcApplyAction>> = HashMap::new();
-        for action in actions {
-            by_pba.entry(action.pba).or_default().push(action);
-        }
-        let mut by_pba: Vec<_> = by_pba.into_iter().collect();
-        by_pba.sort_by_key(|(pba, _)| *pba);
+        let grouping_started = std::time::Instant::now();
+        let action_count = actions.len();
+        // Random overwrite workloads normally contribute one or two actions
+        // per PBA. Grouping those through HashMap<Pba, Vec<_>> allocates a
+        // large number of tiny Vecs and then still has to sort the map output.
+        // One flat sort makes each PBA group contiguous while retaining the
+        // original op order needed when selecting a freed-PBA outcome.
+        actions.sort_unstable_by_key(|action| (action.pba, action.op_idx));
 
         // The normal rc-authoritative remap path contains only derived
         // (non-standalone) actions. Net-collapse those groups first, then
         // stage every distinct PBA with one RcShard batch so the four BFG
         // slot locks and refcount-page reads are amortized across the commit.
-        if by_pba
-            .iter()
-            .all(|(_, group)| group.iter().all(|action| !action.standalone_refcount))
-        {
-            let coalesced: Vec<(Pba, i64, Vec<RcApplyAction>)> = by_pba
-                .into_iter()
-                .filter_map(|(pba, group)| {
-                    let delta = group.iter().map(|action| action.delta).sum();
-                    (delta != 0).then_some((pba, delta, group))
-                })
-                .collect();
+        if actions.iter().all(|action| !action.standalone_refcount) {
+            let mut coalesced = Vec::new();
+            for group in actions.chunk_by(|left, right| left.pba == right.pba) {
+                let delta = group.iter().map(|action| action.delta).sum();
+                if delta != 0 {
+                    coalesced.push((group[0].pba, delta, group));
+                }
+            }
             let staged_actions: Vec<(Pba, i64)> = coalesced
                 .iter()
                 .map(|(pba, delta, _)| (*pba, *delta))
                 .collect();
+            let grouping_elapsed = grouping_started.elapsed();
             let batch_started = std::time::Instant::now();
-            let staged = rc.stage_batch(bfg, &staged_actions, lsn)?;
+            let (staged, stage_timings) = rc.stage_batch(bfg, &staged_actions, lsn)?;
             metrics.record_apply_refcount_batch(staged.len() as u64, batch_started.elapsed());
+            metrics.record_apply_refcount_batch_breakdown(
+                action_count as u64,
+                staged_actions.len() as u64,
+                grouping_elapsed,
+                stage_timings.base_page_lookup,
+                stage_timings.pending_slot_scan,
+                stage_timings.delta_merge,
+                stage_timings.sampled_pbas,
+            );
             for ((pba, _delta, group), (pre, new)) in coalesced.into_iter().zip(staged) {
                 if new == 0
                     && pre > 0
@@ -58,7 +66,8 @@ impl Db {
             return Ok(result);
         }
 
-        for (pba, group) in by_pba {
+        for group in actions.chunk_by(|left, right| left.pba == right.pba) {
+            let pba = group[0].pba;
             // Net-collapse every non-standalone group — including MIXED-sign
             // (rc-authoritative emits both incref(+1) of a new head_pba and
             // decref(-1) of an old one, and two LBAs in the same bucket can
@@ -66,7 +75,8 @@ impl Db {
             // while another overwrites away from P). Summing the net delta and
             // staging ONCE is what keeps the freed-pba surfacing honest: a
             // serial +1 then -1 (or -1 then +1) would transiently cross rc==0
-            // and wrongly surface a still-referenced pba as freed. Pre-            // `apply_l2p_remap` collapsed per-pba net delta for exactly this
+            // and wrongly surface a still-referenced pba as freed. Pre-
+            // `apply_l2p_remap` collapsed per-pba net delta for exactly this
             // reason. Standalone refcount ops (which need individual
             // `RefcountNew` outcomes) keep the per-action serial path below.
             let can_coalesce_remap = group.iter().all(|action| !action.standalone_refcount);
@@ -132,7 +142,7 @@ impl Db {
                 continue;
             }
 
-            for action in group {
+            for action in group.iter().copied() {
                 let op_started = std::time::Instant::now();
                 let (pre, new) = match rc.stage(bfg, action.pba, action.delta, lsn) {
                     Ok(r) => r,

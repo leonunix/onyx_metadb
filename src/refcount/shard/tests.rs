@@ -35,17 +35,24 @@ fn batch_get_and_stage_preserve_per_pba_results() {
     s.stage(T0, 10, 2, 10).unwrap();
     s.stage(1, 20, 3, 11).unwrap();
 
-    let staged = s.stage_batch(2, &[(10, -1), (20, 2), (30, 4)], 20).unwrap();
+    let sampled_lsn = (1..).find(|&lsn| sample_refcount_breakdown(lsn)).unwrap();
+    let (staged, timings) = s
+        .stage_batch(2, &[(10, -1), (20, 2), (30, 4)], sampled_lsn)
+        .unwrap();
     assert_eq!(staged, vec![(2, 1), (3, 5), (0, 4)]);
+    assert_eq!(timings.sampled_pbas, 3);
     assert_eq!(s.get_many(&[30, 10, 99, 20]).unwrap(), vec![4, 1, 0, 5]);
 }
 
 #[test]
 fn stage_batch_keeps_replay_skip_semantics() {
     let (_d, s) = make_shard();
-    s.stage(T0, 10, 1, 100).unwrap();
+    let unsampled_lsn = (1..).find(|&lsn| !sample_refcount_breakdown(lsn)).unwrap();
+    s.stage(T0, 10, 1, unsampled_lsn).unwrap();
     s.flush().unwrap();
-    assert_eq!(s.stage_batch(1, &[(10, 1)], 100).unwrap(), vec![(1, 1)]);
+    let (staged, timings) = s.stage_batch(1, &[(10, 1)], unsampled_lsn).unwrap();
+    assert_eq!(staged, vec![(1, 1)]);
+    assert_eq!(timings.sampled_pbas, 0);
     assert_eq!(s.get(10).unwrap(), 1);
 }
 

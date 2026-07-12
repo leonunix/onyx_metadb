@@ -94,6 +94,28 @@ fn batch_get_returns_entries_and_page_generations_in_input_order() {
 }
 
 #[test]
+fn sorted_batch_get_preserves_contiguous_slots_from_the_same_page() {
+    let (_dir, a) = make_array();
+    let p0 = 5;
+    let p0_next = 6;
+    let p1 = (ENTRIES_PER_PAGE + 7) as Pba;
+    a.apply_deltas(vec![
+        (p0, pending(2, 100)),
+        (p0_next, pending(4, 101)),
+        (p1, pending(3, 200)),
+    ])
+    .unwrap();
+
+    let got = a.get_many_with_page_lsn(&[p0, p0_next, p1]).unwrap();
+    assert_eq!(got[0].0.rc, 2);
+    assert_eq!(got[0].1, 101);
+    assert_eq!(got[1].0.rc, 4);
+    assert_eq!(got[1].1, 101);
+    assert_eq!(got[2].0.rc, 3);
+    assert_eq!(got[2].1, 200);
+}
+
+#[test]
 fn round_trip_via_open() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("pages");
