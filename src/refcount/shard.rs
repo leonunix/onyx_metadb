@@ -180,6 +180,7 @@ struct StreamingCheckpointTestHook {
     max_chunk_pages: std::sync::atomic::AtomicUsize,
     max_overlay_pages: std::sync::atomic::AtomicUsize,
     page_weaks: Mutex<Vec<std::sync::Weak<crate::page::Page>>>,
+    fail_before_write_chunk: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -193,7 +194,22 @@ impl StreamingCheckpointTestHook {
             max_chunk_pages: std::sync::atomic::AtomicUsize::new(0),
             max_overlay_pages: std::sync::atomic::AtomicUsize::new(0),
             page_weaks: Mutex::new(Vec::new()),
+            fail_before_write_chunk: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
+    }
+
+    fn fail_before_write_chunk(&self, chunk: usize) {
+        self.fail_before_write_chunk.store(chunk, Ordering::SeqCst);
+    }
+
+    fn before_write(&self) -> Result<()> {
+        let chunk = self.chunks.load(Ordering::SeqCst);
+        if self.fail_before_write_chunk.load(Ordering::SeqCst) == chunk {
+            return Err(MetaDbError::InjectedFault(
+                "refcount.streaming_chunk_write.before",
+            ));
+        }
+        Ok(())
     }
 
     fn capture_staged(&self, staged: &StagedDeltas, overlay_pages: usize) {
@@ -833,56 +849,71 @@ impl RcShard {
                 epoch: &self.fold_epoch,
             };
 
-            // The Syncing slot is frozen. Validate the exact snapshot before
-            // publishing so a violated BFG invariant cannot make us delete a
-            // newer or unrelated pending delta.
-            {
-                let slot = self.delta_slots[restore_slot].lock();
+            let staged_result = (|| {
+                // The Syncing slot is frozen. Validate the exact snapshot before
+                // publishing so a violated BFG invariant cannot make us delete a
+                // newer or unrelated pending delta.
+                {
+                    let slot = self.delta_slots[restore_slot].lock();
+                    for &(pba, pending) in &drained[cursor..end] {
+                        if slot.get(pba) != Some(pending) {
+                            return Err(MetaDbError::Corruption(format!(
+                                "streaming refcount checkpoint slot changed for pba {pba}"
+                            )));
+                        }
+                    }
+                }
+
+                // `stage_deltas_in_memory_preserving` is failure-atomic for this
+                // chunk: on error it removes every overlay/fresh reservation it
+                // published. The slot is still intact until the call succeeds.
+                let staged = self.array.stage_deltas_in_memory_preserving(
+                    &mut drained[cursor..end],
+                    false,
+                    &[],
+                )?;
+
+                let mut slot = self.delta_slots[restore_slot].lock();
+                let mut removed = Vec::with_capacity(end - cursor);
                 for &(pba, pending) in &drained[cursor..end] {
-                    if slot.get(pba) != Some(pending) {
-                        return Err(MetaDbError::Corruption(format!(
-                            "streaming refcount checkpoint slot changed for pba {pba}"
-                        )));
+                    match slot.remove(pba) {
+                        Some(actual) if actual == pending => removed.push((pba, actual)),
+                        actual => {
+                            if let Some(actual) = actual {
+                                slot.merge_pending(pba, actual);
+                            }
+                            for (removed_pba, removed_pending) in removed {
+                                slot.merge_pending(removed_pba, removed_pending);
+                            }
+                            drop(slot);
+                            self.array.abort_staged_deltas(&staged, 0);
+                            return Err(MetaDbError::Corruption(format!(
+                                "streaming refcount checkpoint failed exact removal for pba {pba}"
+                            )));
+                        }
                     }
                 }
-            }
-
-            // `stage_deltas_in_memory_preserving` is failure-atomic for this
-            // chunk: on error it removes every overlay/fresh reservation it
-            // published. The slot is still intact until the call succeeds.
-            let staged = self.array.stage_deltas_in_memory_preserving(
-                &mut drained[cursor..end],
-                false,
-                &[],
-            )?;
-
-            let mut slot = self.delta_slots[restore_slot].lock();
-            let mut removed = Vec::with_capacity(end - cursor);
-            for &(pba, pending) in &drained[cursor..end] {
-                match slot.remove(pba) {
-                    Some(actual) if actual == pending => removed.push((pba, actual)),
-                    actual => {
-                        if let Some(actual) = actual {
-                            slot.merge_pending(pba, actual);
-                        }
-                        for (removed_pba, removed_pending) in removed {
-                            slot.merge_pending(removed_pba, removed_pending);
-                        }
-                        drop(slot);
-                        self.array.abort_staged_deltas(&staged, 0);
-                        return Err(MetaDbError::Corruption(format!(
-                            "streaming refcount checkpoint failed exact removal for pba {pba}"
-                        )));
-                    }
-                }
-            }
-            drop(slot);
+                drop(slot);
+                Ok(staged)
+            })();
             drop(epoch_guard);
             drop(fold);
             fold_service_us =
                 fold_service_us.saturating_add(
                     fold_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
                 );
+
+            let staged = match staged_result {
+                Ok(staged) => staged,
+                Err(err) => {
+                    self.abort_partial_streamed_fresh_pages(
+                        restore_slot,
+                        &drained,
+                        &streamed_pages,
+                    );
+                    return Err(err);
+                }
+            };
 
             #[cfg(test)]
             if let Some(hook) = &test_hook {
@@ -899,7 +930,20 @@ impl RcShard {
             // Recovery starts from the prior manifest and replays the WAL.
             // The still-published overlay retains at most this bounded chunk.
             let write_started = Instant::now();
-            self.array.write_staged_page_runs(&staged)?;
+            #[cfg(test)]
+            let write_result = match &test_hook {
+                Some(hook) => hook
+                    .before_write()
+                    .and_then(|()| self.array.write_staged_page_runs(&staged)),
+                None => self.array.write_staged_page_runs(&staged),
+            };
+            #[cfg(not(test))]
+            let write_result = self.array.write_staged_page_runs(&staged);
+            if let Err(err) = write_result {
+                streamed_pages.extend(staged.compact_pages());
+                self.abort_partial_streamed_fresh_pages(restore_slot, &drained, &streamed_pages);
+                return Err(err);
+            }
             streaming_write_stats.record_chunk(staged.pages.len(), write_started.elapsed());
             let compact = staged.compact_pages();
             self.array.clear_staged(&staged);
@@ -928,6 +972,44 @@ impl RcShard {
             snapshot_page_table: self.array.page_table_snapshot(),
             snapshot_meta_chain: self.array.meta_chain_snapshot(),
         })
+    }
+
+    /// A streaming sample can fail after earlier chunks completed their data
+    /// writes but before any meta-chain page was submitted. Existing page ids
+    /// remain valid in place; fresh ids are unreachable from the stable chain
+    /// and must be detached, freed, and restored to the frozen slot.
+    fn abort_partial_streamed_fresh_pages(
+        &self,
+        restore_slot: usize,
+        drained: &[(Pba, Pending)],
+        pages: &[StagedPageMeta],
+    ) {
+        let mut fresh_page_idxs: Vec<usize> = pages
+            .iter()
+            .filter(|page| page.is_fresh)
+            .map(|page| page.page_idx)
+            .collect();
+        if fresh_page_idxs.is_empty() {
+            return;
+        }
+        fresh_page_idxs.sort_unstable();
+        fresh_page_idxs.dedup();
+
+        let fold = self.fold_lock.write();
+        let epoch_guard = FoldEpochGuard {
+            epoch: &self.fold_epoch,
+        };
+        self.array.abort_streamed_fresh_pages(pages, 0);
+        let mut slot = self.delta_slots[restore_slot].lock();
+        for &(pba, pending) in drained {
+            let page_idx = (pba as usize) / ENTRIES_PER_PAGE;
+            if fresh_page_idxs.binary_search(&page_idx).is_ok() && slot.get(pba).is_none() {
+                slot.merge_pending(pba, pending);
+            }
+        }
+        drop(slot);
+        drop(epoch_guard);
+        drop(fold);
     }
 
     /// Like [`Self::begin_checkpoint`] but additionally force-increfs

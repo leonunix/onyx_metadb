@@ -261,7 +261,7 @@ fn streaming_chunk_stage_error_cleans_published_pages_and_fresh_reservations() {
 }
 
 #[test]
-fn streaming_later_chunk_stage_error_keeps_first_applied_and_second_pending() {
+fn streaming_later_chunk_stage_error_reclaims_prior_fresh_page() {
     let (_d, s) = make_shard();
     let first = 7;
     let second = (ENTRIES_PER_PAGE + 7) as Pba;
@@ -273,21 +273,44 @@ fn streaming_later_chunk_stage_error_keeps_first_applied_and_second_pending() {
     let err = s.begin_checkpoint_streaming_capped(0, 1).err().unwrap();
     assert!(matches!(err, MetaDbError::InvalidArgument(_)));
 
-    // Chunk 1 completed its write and exact slot removal. Chunk 2 failed
-    // atomically while staging, so its fresh reservation/overlay was cleaned
-    // and its original pending delta remains retryable.
-    assert_eq!(s.array.get(first).unwrap().rc, 1);
+    // Chunk 1 completed its write, but no meta-chain submission started. Its
+    // fresh page is therefore unreachable and must be detached and restored
+    // alongside chunk 2's still-pending delta.
+    assert_eq!(s.array.get(first).unwrap().rc, 0);
     assert_eq!(s.get(first).unwrap(), 1);
-    assert!(s.delta_slots[0].lock().get(first).is_none());
+    assert_eq!(s.delta_slots[0].lock().get(first).unwrap().delta, 1);
     assert_eq!(
         s.delta_slots[0].lock().get(second).unwrap().delta,
         i64::from(u32::MAX) + 1
     );
     let page_table = s.array.page_table_snapshot();
-    assert_ne!(page_table[0], 0);
+    assert_eq!(page_table[0], 0);
     assert_eq!(page_table.get(1).copied().unwrap_or(0), 0);
-    assert_eq!(s.allocated_data_pages(), 1);
+    assert_eq!(s.allocated_data_pages(), 0);
     assert_eq!(s.array.staged_overlay_len(), 0);
+}
+
+#[test]
+fn streaming_later_chunk_write_error_reclaims_all_fresh_pages() {
+    let (_d, s) = make_shard();
+    let first = 7;
+    let second = (ENTRIES_PER_PAGE + 7) as Pba;
+    s.stage(T0, first, 1, 100).unwrap();
+    s.stage(T0, second, 1, 101).unwrap();
+
+    let hook = Arc::new(StreamingCheckpointTestHook::new(false));
+    hook.fail_before_write_chunk(1);
+    *s.streaming_checkpoint_test_hook.lock() = Some(hook);
+
+    let err = s.begin_checkpoint_streaming_capped(T0, 1).err().unwrap();
+    assert!(matches!(err, MetaDbError::InjectedFault(_)));
+    assert_eq!(s.array.page_table_snapshot(), vec![0, 0]);
+    assert_eq!(s.allocated_data_pages(), 0);
+    assert_eq!(s.array.staged_overlay_len(), 0);
+    assert_eq!(s.delta_slots[0].lock().get(first).unwrap().delta, 1);
+    assert_eq!(s.delta_slots[0].lock().get(second).unwrap().delta, 1);
+    assert_eq!(s.get(first).unwrap(), 1);
+    assert_eq!(s.get(second).unwrap(), 1);
 }
 
 #[test]
