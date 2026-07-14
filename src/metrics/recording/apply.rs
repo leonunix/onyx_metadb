@@ -190,8 +190,12 @@ impl MetaMetrics {
         pbas: u64,
         pba_grouping: Duration,
         base_page_lookup: Duration,
+        fold_lock_wait: Duration,
+        slot_lock_wait: Duration,
         pending_slot_scan: Duration,
         delta_merge: Duration,
+        base_lookup_attempts: u64,
+        epoch_retries: u64,
         sampled_pbas: u64,
     ) {
         self.apply_refcount_batch_count
@@ -200,6 +204,10 @@ impl MetaMetrics {
             .fetch_add(actions, Ordering::Relaxed);
         self.apply_refcount_batch_pbas
             .fetch_add(pbas, Ordering::Relaxed);
+        self.apply_refcount_base_lookup_attempts
+            .fetch_add(base_lookup_attempts, Ordering::Relaxed);
+        self.apply_refcount_epoch_retries
+            .fetch_add(epoch_retries, Ordering::Relaxed);
         record_duration(
             &self.apply_refcount_pba_grouping_us,
             &self.apply_refcount_pba_grouping_max_us,
@@ -214,6 +222,16 @@ impl MetaMetrics {
             &self.apply_refcount_base_page_lookup_us,
             &self.apply_refcount_base_page_lookup_max_us,
             base_page_lookup,
+        );
+        record_duration(
+            &self.apply_refcount_fold_lock_wait_us,
+            &self.apply_refcount_fold_lock_wait_max_us,
+            fold_lock_wait,
+        );
+        record_duration(
+            &self.apply_refcount_slot_lock_wait_us,
+            &self.apply_refcount_slot_lock_wait_max_us,
+            slot_lock_wait,
         );
         record_duration(
             &self.apply_refcount_pending_slot_scan_us,

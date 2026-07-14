@@ -278,6 +278,12 @@ pub struct MetaMetrics {
     apply_refcount_pba_grouping_max_us: AtomicU64,
     apply_refcount_base_page_lookup_us: AtomicU64,
     apply_refcount_base_page_lookup_max_us: AtomicU64,
+    apply_refcount_base_lookup_attempts: AtomicU64,
+    apply_refcount_epoch_retries: AtomicU64,
+    apply_refcount_fold_lock_wait_us: AtomicU64,
+    apply_refcount_fold_lock_wait_max_us: AtomicU64,
+    apply_refcount_slot_lock_wait_us: AtomicU64,
+    apply_refcount_slot_lock_wait_max_us: AtomicU64,
     apply_refcount_pending_slot_scan_us: AtomicU64,
     apply_refcount_pending_slot_scan_max_us: AtomicU64,
     apply_refcount_delta_merge_us: AtomicU64,
@@ -494,9 +500,15 @@ pub struct MetaMetrics {
     flush_sample_l2p_walk_max_us: AtomicU64,
     flush_sample_rc_drain_us: AtomicU64,
     flush_sample_rc_drain_max_us: AtomicU64,
-    // Sum of per-shard RC fold service, excluding streaming data-page writes.
-    // Compare with `flush_sample_rc_drain_us` (parallel checkpoint wall) and
-    // `flush_rc_stream_service_us` (write service) for stage separation.
+    // Per-checkpoint sum of each selected RC shard's `fold_lock.write()` wait.
+    // The total accumulates those per-cycle sums; max is the largest one-cycle
+    // sum. It is nested inside `flush_sample_rc_drain_us` (parallel wall).
+    flush_rc_fold_lock_wait_us: AtomicU64,
+    flush_rc_fold_lock_wait_max_us: AtomicU64,
+    // Sum of per-shard RC fold service after the fold lock is acquired,
+    // excluding streaming data-page writes. Compare with
+    // `flush_sample_rc_drain_us` (parallel checkpoint wall), the fold-lock wait
+    // sum above, and `flush_rc_stream_service_us` (write service).
     flush_rc_fold_service_us: AtomicU64,
     flush_rc_fold_service_max_us: AtomicU64,
     // Data-page IO performed inside bounded streaming RC checkpoint chunks,
@@ -843,6 +855,10 @@ mod tests {
             Duration::from_micros(17),
             Duration::from_micros(19),
             Duration::from_micros(23),
+            Duration::from_micros(29),
+            Duration::from_micros(31),
+            1,
+            0,
             7,
         );
         metrics.record_apply_refcount_batch_breakdown(
@@ -852,6 +868,10 @@ mod tests {
             Duration::from_micros(103),
             Duration::from_micros(107),
             Duration::from_micros(109),
+            Duration::from_micros(113),
+            Duration::from_micros(127),
+            3,
+            2,
             0,
         );
         let snapshot = metrics.snapshot();
@@ -862,12 +882,24 @@ mod tests {
         assert_eq!(snapshot.apply_refcount_pba_grouping_us, 114);
         assert_eq!(snapshot.apply_refcount_pba_grouping_max_us, 101);
         assert_eq!(snapshot.apply_refcount_base_page_lookup_us, 17);
-        assert_eq!(snapshot.apply_refcount_pending_slot_scan_us, 19);
-        assert_eq!(snapshot.apply_refcount_delta_merge_us, 23);
+        assert_eq!(snapshot.apply_refcount_base_page_lookup_max_us, 17);
+        assert_eq!(snapshot.apply_refcount_base_lookup_attempts, 4);
+        assert_eq!(snapshot.apply_refcount_epoch_retries, 2);
+        assert_eq!(snapshot.apply_refcount_fold_lock_wait_us, 19);
+        assert_eq!(snapshot.apply_refcount_fold_lock_wait_max_us, 19);
+        assert_eq!(snapshot.apply_refcount_slot_lock_wait_us, 23);
+        assert_eq!(snapshot.apply_refcount_slot_lock_wait_max_us, 23);
+        assert_eq!(snapshot.apply_refcount_pending_slot_scan_us, 29);
+        assert_eq!(snapshot.apply_refcount_pending_slot_scan_max_us, 29);
+        assert_eq!(snapshot.apply_refcount_delta_merge_us, 31);
         let json = snapshot.to_json();
         assert!(json.contains("\"apply_refcount_batch_count\":2"));
         assert!(json.contains("\"apply_refcount_breakdown_sampled_pbas\":7"));
-        assert!(json.contains("\"apply_refcount_delta_merge_us\":23"));
+        assert!(json.contains("\"apply_refcount_base_lookup_attempts\":4"));
+        assert!(json.contains("\"apply_refcount_epoch_retries\":2"));
+        assert!(json.contains("\"apply_refcount_fold_lock_wait_us\":19"));
+        assert!(json.contains("\"apply_refcount_slot_lock_wait_us\":23"));
+        assert!(json.contains("\"apply_refcount_delta_merge_us\":31"));
     }
 
     #[test]
@@ -876,6 +908,8 @@ mod tests {
         metrics.set_rc_checkpoint_mode(true, true);
         metrics.record_flush_rc_stream(3, 17, 41, 19, 8);
         metrics.record_flush_rc_stream(2, 9, 23, 29, 4);
+        metrics.record_flush_rc_fold_lock_wait(11);
+        metrics.record_flush_rc_fold_lock_wait(13);
         metrics.record_flush_rc_fold_service(31);
         metrics.record_flush_rc_fold_service(47);
         metrics.record_flush_io_pages(26);
@@ -888,6 +922,8 @@ mod tests {
         assert_eq!(snapshot.flush_rc_stream_service_us, 64);
         assert_eq!(snapshot.flush_rc_stream_max_chunk_us, 29);
         assert_eq!(snapshot.flush_rc_stream_max_chunk_pages, 8);
+        assert_eq!(snapshot.flush_rc_fold_lock_wait_us, 24);
+        assert_eq!(snapshot.flush_rc_fold_lock_wait_max_us, 13);
         assert_eq!(snapshot.flush_rc_fold_service_us, 78);
         assert_eq!(snapshot.flush_rc_fold_service_max_us, 47);
         assert_eq!(snapshot.flush_pages_written, 26);
@@ -905,6 +941,8 @@ mod tests {
         assert!(json.contains("\"flush_rc_stream_service_us\":64"));
         assert!(json.contains("\"flush_rc_stream_max_chunk_us\":29"));
         assert!(json.contains("\"flush_rc_stream_max_chunk_pages\":8"));
+        assert!(json.contains("\"flush_rc_fold_lock_wait_us\":24"));
+        assert!(json.contains("\"flush_rc_fold_lock_wait_max_us\":13"));
         assert!(json.contains("\"flush_rc_fold_service_us\":78"));
         assert!(json.contains("\"flush_rc_fold_service_max_us\":47"));
         assert!(json.contains("\"flush_sample_rc_staged_pages\":12"));

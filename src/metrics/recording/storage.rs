@@ -84,9 +84,11 @@ impl MetaMetrics {
     /// over all `(volume, shard)` pairs; `rc_drain` is the per-shard
     /// `RcShard::begin_checkpoint` parallel wall. In streaming mode the last
     /// value includes bounded RC data-page writes; use
-    /// `flush_rc_fold_service_us` and `flush_rc_stream_service_us` for the
-    /// pure service split. All three wall regions add up to `flush_sample_us`
-    /// modulo timer overhead.
+    /// `flush_rc_fold_lock_wait_us`, `flush_rc_fold_service_us`, and
+    /// `flush_rc_stream_service_us` for the per-shard wait/service split. Those
+    /// values are sums across parallel shards, not wall regions to add to this
+    /// duration. All three wall regions add up to `flush_sample_us` modulo timer
+    /// overhead.
     pub(crate) fn record_flush_sample_breakdown(
         &self,
         lock: Duration,
@@ -163,6 +165,13 @@ impl MetaMetrics {
         self.flush_rc_fold_service_us
             .fetch_add(service_us, Ordering::Relaxed);
         fetch_max(&self.flush_rc_fold_service_max_us, service_us);
+    }
+
+    /// Record one checkpoint's sum of per-shard `fold_lock.write()` waits.
+    pub(crate) fn record_flush_rc_fold_lock_wait(&self, wait_sum_us: u64) {
+        self.flush_rc_fold_lock_wait_us
+            .fetch_add(wait_sum_us, Ordering::Relaxed);
+        fetch_max(&self.flush_rc_fold_lock_wait_max_us, wait_sum_us);
     }
 
     /// Count page/byte work that completed outside the `flush_io_us` timer.

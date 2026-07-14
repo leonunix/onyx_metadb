@@ -46,8 +46,12 @@ impl Db {
                 staged_actions.len() as u64,
                 grouping_elapsed,
                 stage_timings.base_page_lookup,
+                stage_timings.fold_lock_wait,
+                stage_timings.slot_lock_wait,
                 stage_timings.pending_slot_scan,
                 stage_timings.delta_merge,
+                stage_timings.base_lookup_attempts,
+                stage_timings.epoch_retries,
                 stage_timings.sampled_pbas,
             );
             for ((pba, _delta, group), (pre, new)) in coalesced.into_iter().zip(staged) {

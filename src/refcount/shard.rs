@@ -84,8 +84,12 @@ use crate::types::{Bfg, Lsn, PageId, Pba};
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RefcountApplyStageTimings {
     pub base_page_lookup: Duration,
+    pub fold_lock_wait: Duration,
+    pub slot_lock_wait: Duration,
     pub pending_slot_scan: Duration,
     pub delta_merge: Duration,
+    pub base_lookup_attempts: u64,
+    pub epoch_retries: u64,
     pub sampled_pbas: u64,
 }
 
@@ -290,7 +294,11 @@ pub struct RcCheckpoint {
     /// Streaming hot-path pages after their write CQEs completed. Only compact
     /// allocation metadata remains; page payload Arcs were dropped per chunk.
     streamed_pages: Vec<StagedPageMeta>,
+    /// Time this shard checkpoint spent waiting to acquire `fold_lock.write()`.
+    /// The lifecycle sums this value across selected shards for one checkpoint.
+    fold_lock_wait_us: u64,
     /// Time spent folding array/slot state, excluding streaming page writes.
+    /// Starts only after `fold_lock.write()` has been acquired.
     fold_service_us: u64,
     streaming_write_stats: RcStreamingWriteStats,
     streaming: bool,
@@ -377,6 +385,10 @@ impl RcCheckpoint {
 
     pub(crate) fn streaming_write_stats(&self) -> RcStreamingWriteStats {
         self.streaming_write_stats
+    }
+
+    pub(crate) fn fold_lock_wait_us(&self) -> u64 {
+        self.fold_lock_wait_us
     }
 
     pub(crate) fn fold_service_us(&self) -> u64 {
@@ -596,9 +608,13 @@ impl RcShard {
         let pbas: Vec<Pba> = actions.iter().map(|(pba, _)| *pba).collect();
         let open_idx = slot_index(bfg);
         let mut base_page_lookup = Duration::ZERO;
-        let mut synchronization_wait = Duration::ZERO;
+        let mut fold_lock_wait = Duration::ZERO;
+        let mut slot_lock_wait = Duration::ZERO;
+        let mut base_lookup_attempts = 0u64;
+        let mut epoch_retries = 0u64;
         let (bases, mut slots) = loop {
             let epoch_before = self.fold_epoch.load(Ordering::Acquire);
+            base_lookup_attempts = base_lookup_attempts.saturating_add(1);
             let lookup_started = sample_breakdown.then(Instant::now);
             let bases = self.array.get_many_sorted_with_page_lsn(&pbas)?;
             base_page_lookup += lookup_started.map_or(Duration::ZERO, |start| start.elapsed());
@@ -610,11 +626,11 @@ impl RcShard {
                 hook.after_lookup();
             }
 
-            let synchronization_started = sample_breakdown.then(Instant::now);
+            let fold_lock_started = sample_breakdown.then(Instant::now);
             let fold = self.fold_lock.read();
+            fold_lock_wait += fold_lock_started.map_or(Duration::ZERO, |start| start.elapsed());
             if self.fold_epoch.load(Ordering::Acquire) != epoch_before {
-                synchronization_wait +=
-                    synchronization_started.map_or(Duration::ZERO, |start| start.elapsed());
+                epoch_retries = epoch_retries.saturating_add(1);
                 drop(fold);
                 continue;
             }
@@ -623,15 +639,16 @@ impl RcShard {
             // the validation-to-snapshot gap. Once the guards are ours, a new
             // checkpoint may publish its array page but cannot clear the
             // corresponding slot until this batch finishes its merge.
-            let slots: Vec<_> = self.delta_slots.iter().map(|slot| slot.lock()).collect();
-            synchronization_wait +=
-                synchronization_started.map_or(Duration::ZERO, |start| start.elapsed());
+            let mut slots = Vec::with_capacity(BFG_SLOTS);
+            let slot_lock_started = sample_breakdown.then(Instant::now);
+            slots.extend(self.delta_slots.iter().map(|slot| slot.lock()));
+            slot_lock_wait += slot_lock_started.map_or(Duration::ZERO, |start| start.elapsed());
             drop(fold);
             break (bases, slots);
         };
 
         let mut out = Vec::with_capacity(actions.len());
-        let mut pending_slot_scan = synchronization_wait;
+        let mut pending_slot_scan = Duration::ZERO;
         let mut delta_merge = Duration::ZERO;
 
         if sample_breakdown {
@@ -681,8 +698,12 @@ impl RcShard {
             out,
             RefcountApplyStageTimings {
                 base_page_lookup,
+                fold_lock_wait,
+                slot_lock_wait,
                 pending_slot_scan,
                 delta_merge,
+                base_lookup_attempts,
+                epoch_retries,
                 sampled_pbas: sample_breakdown
                     .then_some(actions.len() as u64)
                     .unwrap_or(0),
@@ -809,6 +830,7 @@ impl RcShard {
                     max_lsn: 0,
                 },
                 streamed_pages: Vec::new(),
+                fold_lock_wait_us: 0,
                 fold_service_us: 0,
                 streaming_write_stats: RcStreamingWriteStats::default(),
                 streaming: true,
@@ -823,6 +845,7 @@ impl RcShard {
         let max_unique_pages = max_unique_pages.max(1);
         let mut cursor = 0;
         let mut streamed_pages = Vec::new();
+        let mut fold_lock_wait_us = 0u64;
         let mut fold_service_us = 0u64;
         let mut streaming_write_stats = RcStreamingWriteStats::default();
 
@@ -843,8 +866,15 @@ impl RcShard {
                 }
             }
 
-            let fold_started = Instant::now();
+            let fold_lock_wait_started = Instant::now();
             let fold = self.fold_lock.write();
+            fold_lock_wait_us = fold_lock_wait_us.saturating_add(
+                fold_lock_wait_started
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+            let fold_started = Instant::now();
             let epoch_guard = FoldEpochGuard {
                 epoch: &self.fold_epoch,
             };
@@ -964,6 +994,7 @@ impl RcShard {
                 max_lsn: 0,
             },
             streamed_pages,
+            fold_lock_wait_us,
             fold_service_us,
             streaming_write_stats,
             streaming: true,
@@ -1077,6 +1108,7 @@ impl RcShard {
                     max_lsn: 0,
                 },
                 streamed_pages: Vec::new(),
+                fold_lock_wait_us: 0,
                 fold_service_us: 0,
                 streaming_write_stats: RcStreamingWriteStats::default(),
                 streaming: false,
@@ -1095,8 +1127,13 @@ impl RcShard {
         // later, outside this lock. Building staged pages may still need base
         // reads, which is why `stage_batch` never holds the read side across its
         // own base-page lookup.
-        let fold_started = Instant::now();
+        let fold_lock_wait_started = Instant::now();
         let fold = self.fold_lock.write();
+        let fold_lock_wait_us = fold_lock_wait_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        let fold_started = Instant::now();
         // Declared after `fold`, so `?` paths bump the epoch before releasing
         // the write guard. Readers can never validate a partially-moved view.
         let epoch_guard = FoldEpochGuard {
@@ -1127,6 +1164,7 @@ impl RcShard {
         Ok(RcCheckpoint {
             staged,
             streamed_pages: Vec::new(),
+            fold_lock_wait_us,
             fold_service_us,
             streaming_write_stats: RcStreamingWriteStats::default(),
             streaming: false,

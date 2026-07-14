@@ -1,6 +1,98 @@
 use super::manifest_refresh::{refresh_manifest_durable_seq, refresh_manifest_from_checkpoints};
 use super::*;
 
+const SLOW_SYNC_CYCLE_WARN_US: u64 = 1_000_000;
+
+#[derive(Debug, Default)]
+struct SyncCycleTrace {
+    terminal_phase: &'static str,
+    dedup_drain_us: u64,
+    l2p_fold_us: u64,
+    sample_wall_us: u64,
+    sample_lock_us: u64,
+    sample_l2p_walk_us: u64,
+    rc_drain_wall_us: u64,
+    rc_fold_wait_sum_us: u64,
+    rc_fold_service_sum_us: u64,
+    rc_stream_write_sum_us: u64,
+    io_us: u64,
+    publish_barrier_wait_us: u64,
+    manifest_us: u64,
+    install_us: u64,
+    prefold_wait_us: u64,
+    reclaim_us: u64,
+    selected_l2p_shards: u64,
+    dirty_l2p_shards: u64,
+    selected_rc_shards: u64,
+    dirty_rc_shards: u64,
+    l2p_dirty_pages: u64,
+    rc_drained_deltas: u64,
+    rc_fresh_pages: u64,
+    rc_staged_pages: u64,
+    rc_stream_pages: u64,
+    nonstream_write_pages: u64,
+}
+
+impl SyncCycleTrace {
+    fn warn_if_slow(
+        &self,
+        bfg: crate::types::Bfg,
+        kind: crate::metrics::FlushKind,
+        threaded: bool,
+        rc_streaming: bool,
+        total: std::time::Duration,
+        result: &Result<()>,
+    ) {
+        let total_us = micros(total);
+        if total_us < SLOW_SYNC_CYCLE_WARN_US {
+            return;
+        }
+
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        let error = result
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        tracing::warn!(
+            bfg,
+            kind = ?kind,
+            threaded,
+            rc_streaming,
+            outcome,
+            error = %error,
+            total_us,
+            terminal_phase = self.terminal_phase,
+            dedup_drain_us = self.dedup_drain_us,
+            l2p_fold_us = self.l2p_fold_us,
+            sample_wall_us = self.sample_wall_us,
+            sample_lock_us = self.sample_lock_us,
+            sample_l2p_walk_us = self.sample_l2p_walk_us,
+            rc_drain_wall_us = self.rc_drain_wall_us,
+            rc_fold_wait_sum_us = self.rc_fold_wait_sum_us,
+            rc_fold_service_sum_us = self.rc_fold_service_sum_us,
+            rc_stream_write_sum_us = self.rc_stream_write_sum_us,
+            io_us = self.io_us,
+            publish_barrier_wait_us = self.publish_barrier_wait_us,
+            manifest_us = self.manifest_us,
+            install_us = self.install_us,
+            prefold_wait_us = self.prefold_wait_us,
+            reclaim_us = self.reclaim_us,
+            selected_l2p_shards = self.selected_l2p_shards,
+            dirty_l2p_shards = self.dirty_l2p_shards,
+            selected_rc_shards = self.selected_rc_shards,
+            dirty_rc_shards = self.dirty_rc_shards,
+            l2p_dirty_pages = self.l2p_dirty_pages,
+            rc_drained_deltas = self.rc_drained_deltas,
+            rc_fresh_pages = self.rc_fresh_pages,
+            rc_staged_pages = self.rc_staged_pages,
+            rc_stream_pages = self.rc_stream_pages,
+            nonstream_write_pages = self.nonstream_write_pages,
+            "metadb: slow checkpoint cycle"
+        );
+    }
+}
+
 impl Db {
     /// Persist dirty shard pages and commit a fresh manifest with the
     /// current per-shard roots + checkpoint LSN.
@@ -389,14 +481,25 @@ impl Db {
         bfg: crate::types::Bfg,
         kind: crate::metrics::FlushKind,
     ) -> Result<()> {
-        self.run_sync_cycle_body(bfg, kind)?;
-        Ok(())
+        let started = std::time::Instant::now();
+        let mut trace = SyncCycleTrace::default();
+        let result = self.run_sync_cycle_body(bfg, kind, &mut trace);
+        trace.warn_if_slow(
+            bfg,
+            kind,
+            self.bfg_threads_enabled,
+            self.rc_checkpoint_streaming_enabled,
+            started.elapsed(),
+            &result,
+        );
+        result
     }
 
     fn run_sync_cycle_body(
         &self,
         bfg: crate::types::Bfg,
         kind: crate::metrics::FlushKind,
+        trace: &mut SyncCycleTrace,
     ) -> Result<()> {
         // BFG gate-shrink (final): the SAMPLE phase
         // runs gateless. The serialisation it used to get from
@@ -464,12 +567,14 @@ impl Db {
         let _dedup_drainer_resume_guard = DedupDrainerResumeGuard {
             dedup_index: &self.dedup_index,
         };
+        trace.terminal_phase = "dedup_drain";
         let dedup_drain_started = std::time::Instant::now();
         let dedup_drain_result = self
             .dedup_index
             .preempt_and_drain_for_checkpoint(&self.metrics);
-        self.metrics
-            .record_flush_dedup_drain(dedup_drain_started.elapsed());
+        let dedup_drain_elapsed = dedup_drain_started.elapsed();
+        trace.dedup_drain_us = micros(dedup_drain_elapsed);
+        self.metrics.record_flush_dedup_drain(dedup_drain_elapsed);
         dedup_drain_result?;
 
         // Fold the buffered L2P updates into the tree so the sample
@@ -484,16 +589,19 @@ impl Db {
         //   drainer): `force_compact_l2p_buffers` folds ALL slots so a
         //   single flush persists everything. Lifecycle ops also use the
         //   drain-all path under `drop_gate.write`.
+        trace.terminal_phase = "l2p_fold";
         let l2p_fold_started = std::time::Instant::now();
         let l2p_fold_result = if self.bfg_threads_enabled {
             self.drain_syncing_slot_into_trees(bfg)
         } else {
             self.force_compact_l2p_buffers()
         };
-        self.metrics
-            .record_flush_l2p_fold(l2p_fold_started.elapsed());
+        let l2p_fold_elapsed = l2p_fold_started.elapsed();
+        trace.l2p_fold_us = micros(l2p_fold_elapsed);
+        self.metrics.record_flush_l2p_fold(l2p_fold_elapsed);
         l2p_fold_result?;
 
+        trace.terminal_phase = "sample";
         let sample_started = std::time::Instant::now();
         // `slot_max_lsn(bfg)` is the BFG-frozen high-water LSN of
         // commits stamped to the Syncing slot. `promote_to_syncing`
@@ -550,6 +658,13 @@ impl Db {
             matches!(kind, crate::metrics::FlushKind::Forced),
             &snapshot_force_ords,
         );
+        trace.selected_l2p_shards = selected
+            .l2p
+            .iter()
+            .flatten()
+            .filter(|selected| **selected)
+            .count() as u64;
+        trace.selected_rc_shards = selected.rc.iter().filter(|selected| **selected).count() as u64;
         // Drain per-volume dead-list buffers. `DeadListState`'s internal
         // `Mutex<Vec<_>>` makes push/drain atomic. No sample-phase gate
         // holds new pushes back, so the `drain_up_to_lsn(wal_checkpoint)`
@@ -617,15 +732,18 @@ impl Db {
             // Nothing dirty enough to flush this round. Bail out
             // before locking any shards. `_drainer_resume_guard`
             // drops at scope end.
-            self.metrics
-                .record_flush_sample(kind, sample_started.elapsed());
+            let sample_elapsed = sample_started.elapsed();
+            trace.sample_wall_us = micros(sample_elapsed);
+            self.metrics.record_flush_sample(kind, sample_elapsed);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
+            trace.terminal_phase = "complete";
             return Ok(());
         }
         let lock_started = std::time::Instant::now();
         let mut l2p_guards = lock_selected_l2p_shards_for(&volumes, &selected.l2p);
         let lock_elapsed = lock_started.elapsed();
+        trace.sample_lock_us = micros(lock_elapsed);
         let tree_generation = max_generation_from_two_groups(&l2p_guards, &self.refcount_shards);
         let l2p_walk_started = std::time::Instant::now();
         // Sparse per-(volume, shard) checkpoint vector. `None`
@@ -746,6 +864,7 @@ impl Db {
         drop(guard_iter);
         drop(l2p_guards);
         let l2p_walk_elapsed = l2p_walk_started.elapsed();
+        trace.sample_l2p_walk_us = micros(l2p_walk_elapsed);
         // Refcount sample: threads-OFF keeps the legacy in-memory-only fold.
         // Threads-ON normally uses the bounded streaming fold: each shard
         // stages at most 4096 unique data pages under its fold lock, writes
@@ -806,9 +925,11 @@ impl Db {
                 out
             });
         let rc_drain_elapsed = rc_drain_started.elapsed();
+        trace.rc_drain_wall_us = micros(rc_drain_elapsed);
         let mut refcount_checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>> =
             (0..self.refcount_shards.len()).map(|_| None).collect();
         let mut rc_stream_stats = crate::refcount::shard::RcStreamingWriteStats::default();
+        let mut rc_fold_lock_wait_us = 0u64;
         let mut rc_fold_service_us = 0u64;
         let mut sample_err: Option<MetaDbError> = None;
         let mut tail_to_abort: Vec<(usize, crate::refcount::shard::RcCheckpoint)> = Vec::new();
@@ -817,6 +938,8 @@ impl Db {
                 None => continue,
                 Some(Ok(ckpt)) => {
                     rc_stream_stats.merge(ckpt.streaming_write_stats());
+                    rc_fold_lock_wait_us =
+                        rc_fold_lock_wait_us.saturating_add(ckpt.fold_lock_wait_us());
                     rc_fold_service_us = rc_fold_service_us.saturating_add(ckpt.fold_service_us());
                     if sample_err.is_some() {
                         tail_to_abort.push((idx, ckpt));
@@ -844,13 +967,20 @@ impl Db {
             rc_stream_stats.max_chunk_pages,
         );
         self.metrics
+            .record_flush_rc_fold_lock_wait(rc_fold_lock_wait_us);
+        self.metrics
             .record_flush_rc_fold_service(rc_fold_service_us);
+        trace.rc_fold_wait_sum_us = rc_fold_lock_wait_us;
+        trace.rc_fold_service_sum_us = rc_fold_service_us;
+        trace.rc_stream_write_sum_us = rc_stream_stats.service_us;
+        trace.rc_stream_pages = rc_stream_stats.pages;
         // Streaming RC page writes completed before `io_started`, so count
         // their physical work without adding their service time to
         // `flush_io_us`.
         self.metrics.record_flush_io_pages(rc_stream_stats.pages);
-        self.metrics
-            .record_flush_sample(kind, sample_started.elapsed());
+        let sample_elapsed = sample_started.elapsed();
+        trace.sample_wall_us = micros(sample_elapsed);
+        self.metrics.record_flush_sample(kind, sample_elapsed);
         self.metrics.record_flush_sample_breakdown(
             lock_elapsed,
             l2p_walk_elapsed,
@@ -882,6 +1012,23 @@ impl Db {
             .filter_map(|c| c.as_ref())
             .map(|c| c.data_pages_count())
             .sum();
+        trace.dirty_l2p_shards = l2p_checkpoints
+            .iter()
+            .flat_map(|checkpoints| checkpoints.iter())
+            .filter_map(|checkpoint| checkpoint.as_ref())
+            .filter(|checkpoint| checkpoint.dirty_pages_count() != 0)
+            .count() as u64;
+        trace.dirty_rc_shards = refcount_checkpoints
+            .iter()
+            .filter_map(|checkpoint| checkpoint.as_ref())
+            .filter(|checkpoint| {
+                checkpoint.drained_deltas_count() != 0 || checkpoint.data_pages_count() != 0
+            })
+            .count() as u64;
+        trace.l2p_dirty_pages = l2p_dirty_pages as u64;
+        trace.rc_drained_deltas = rc_drained_deltas as u64;
+        trace.rc_fresh_pages = rc_fresh_pages as u64;
+        trace.rc_staged_pages = rc_staged_pages as u64;
         self.metrics.record_flush_sample_workload(
             l2p_dirty_pages,
             rc_drained_deltas,
@@ -930,6 +1077,7 @@ impl Db {
         // `apply_gate.write()` for its narrow window.
         let prefold_ticket = self.request_l2p_prefold(bfg);
 
+        trace.terminal_phase = "io";
         let io_started = std::time::Instant::now();
         let mut total_pages_written = 0usize;
         let mut sealed_pages = Vec::new();
@@ -953,8 +1101,11 @@ impl Db {
                             }
                             Err(err) => {
                                 self.metrics.record_flush_io_seal(seal_started.elapsed());
+                                let io_elapsed = io_started.elapsed();
+                                trace.io_us = micros(io_elapsed);
+                                trace.nonstream_write_pages = total_pages_written as u64;
                                 self.metrics
-                                    .record_flush_io(io_started.elapsed(), total_pages_written);
+                                    .record_flush_io(io_elapsed, total_pages_written);
                                 self.metrics
                                     .record_flush_total(kind, flush_started.elapsed());
                                 self.abort_rc_checkpoints_sparse(
@@ -1026,8 +1177,11 @@ impl Db {
                 Err(err) => {
                     self.metrics
                         .record_flush_io_rc_meta(rc_meta_started.elapsed());
+                    let io_elapsed = io_started.elapsed();
+                    trace.io_us = micros(io_elapsed);
+                    trace.nonstream_write_pages = total_pages_written as u64;
                     self.metrics
-                        .record_flush_io(io_started.elapsed(), total_pages_written);
+                        .record_flush_io(io_elapsed, total_pages_written);
                     self.metrics
                         .record_flush_total(kind, flush_started.elapsed());
                     self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
@@ -1092,8 +1246,11 @@ impl Db {
         }
         if let Some(err) = dead_list_alloc_err {
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
+            let io_elapsed = io_started.elapsed();
+            trace.io_us = micros(io_elapsed);
+            trace.nonstream_write_pages = total_pages_written as u64;
             self.metrics
-                .record_flush_io(io_started.elapsed(), total_pages_written);
+                .record_flush_io(io_elapsed, total_pages_written);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
@@ -1111,8 +1268,11 @@ impl Db {
             self.metrics
                 .record_flush_io_page_write(page_write_started.elapsed());
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
+            let io_elapsed = io_started.elapsed();
+            trace.io_us = micros(io_elapsed);
+            trace.nonstream_write_pages = total_pages_written as u64;
             self.metrics
-                .record_flush_io(io_started.elapsed(), total_pages_written);
+                .record_flush_io(io_elapsed, total_pages_written);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
@@ -1125,8 +1285,11 @@ impl Db {
         if let Err(err) = self.page_store.sync() {
             self.metrics.record_flush_io_sync(sync_started.elapsed());
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
+            let io_elapsed = io_started.elapsed();
+            trace.io_us = micros(io_elapsed);
+            trace.nonstream_write_pages = total_pages_written as u64;
             self.metrics
-                .record_flush_io(io_started.elapsed(), total_pages_written);
+                .record_flush_io(io_elapsed, total_pages_written);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
@@ -1134,8 +1297,11 @@ impl Db {
             return Err(err);
         }
         self.metrics.record_flush_io_sync(sync_started.elapsed());
+        let io_elapsed = io_started.elapsed();
+        trace.io_us = micros(io_elapsed);
+        trace.nonstream_write_pages = total_pages_written as u64;
         self.metrics
-            .record_flush_io(io_started.elapsed(), total_pages_written);
+            .record_flush_io(io_elapsed, total_pages_written);
         // RC staged data pages are durable on disk now — drop the
         // dirty-staged overlay so rc reads go back to cache/disk. Until
         // this point the overlay is the ONLY eviction-proof copy of the
@@ -1218,10 +1384,14 @@ impl Db {
         // io_uring priority class is unavailable and background writes share
         // chunklet stripe locks with the final manifest page. Any wait belongs
         // here, outside both gate wait and gate hold.
+        trace.terminal_phase = "publish_barrier";
         let publish_barrier_started = std::time::Instant::now();
         let publish_io_guard = self.page_store.checkpoint_publish_io_guard();
+        let publish_barrier_elapsed = publish_barrier_started.elapsed();
+        trace.publish_barrier_wait_us = micros(publish_barrier_elapsed);
         self.metrics
-            .record_flush_publish_barrier_wait(publish_barrier_started.elapsed());
+            .record_flush_publish_barrier_wait(publish_barrier_elapsed);
+        trace.terminal_phase = "manifest";
         let manifest_started = std::time::Instant::now();
         // BFG gate-shrink: manifest publication uses two short
         // `apply_gate.write()` windows. This first window reconciles raced
@@ -1319,8 +1489,9 @@ impl Db {
         {
             Ok(update) => update,
             Err(err) => {
-                self.metrics
-                    .record_flush_manifest(manifest_started.elapsed());
+                let manifest_elapsed = manifest_started.elapsed();
+                trace.manifest_us = micros(manifest_elapsed);
+                self.metrics.record_flush_manifest(manifest_elapsed);
                 self.metrics
                     .record_flush_total(kind, flush_started.elapsed());
                 drop(manifest_state);
@@ -1339,8 +1510,9 @@ impl Db {
             .faults
             .inject(FaultPoint::FlushPostLevelRewriteBeforeManifest)
         {
-            self.metrics
-                .record_flush_manifest(manifest_started.elapsed());
+            let manifest_elapsed = manifest_started.elapsed();
+            trace.manifest_us = micros(manifest_elapsed);
+            self.metrics.record_flush_manifest(manifest_elapsed);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
@@ -1359,8 +1531,9 @@ impl Db {
             &page_dead_list_overrides,
             &page_live_list_overrides,
         ) {
-            self.metrics
-                .record_flush_manifest(manifest_started.elapsed());
+            let manifest_elapsed = manifest_started.elapsed();
+            trace.manifest_us = micros(manifest_elapsed);
+            self.metrics.record_flush_manifest(manifest_elapsed);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
@@ -1468,8 +1641,9 @@ impl Db {
             &selected,
             wal_checkpoint,
         ) {
-            self.metrics
-                .record_flush_manifest(manifest_started.elapsed());
+            let manifest_elapsed = manifest_started.elapsed();
+            trace.manifest_us = micros(manifest_elapsed);
+            self.metrics.record_flush_manifest(manifest_elapsed);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
@@ -1485,8 +1659,9 @@ impl Db {
         // data-plane durability rides on onyx's LV2 buffer (which
         // restarts replay from its own state on crash).
         if let Err(err) = self.faults.inject(FaultPoint::BfgSyncMidway) {
-            self.metrics
-                .record_flush_manifest(manifest_started.elapsed());
+            let manifest_elapsed = manifest_started.elapsed();
+            trace.manifest_us = micros(manifest_elapsed);
+            self.metrics.record_flush_manifest(manifest_elapsed);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
             drop(manifest_state);
@@ -1512,8 +1687,9 @@ impl Db {
         let prepared = match manifest_stage_result {
             Ok(prepared) => prepared,
             Err(err) => {
-                self.metrics
-                    .record_flush_manifest(manifest_started.elapsed());
+                let manifest_elapsed = manifest_started.elapsed();
+                trace.manifest_us = micros(manifest_elapsed);
+                self.metrics.record_flush_manifest(manifest_elapsed);
                 self.metrics
                     .record_flush_total(kind, flush_started.elapsed());
                 drop(manifest_state);
@@ -1553,8 +1729,9 @@ impl Db {
         let manifest_cleanup = match manifest_publish_result {
             Ok(cleanup) => cleanup,
             Err(err) => {
-                self.metrics
-                    .record_flush_manifest(manifest_started.elapsed());
+                let manifest_elapsed = manifest_started.elapsed();
+                trace.manifest_us = micros(manifest_elapsed);
+                self.metrics.record_flush_manifest(manifest_elapsed);
                 self.metrics
                     .record_flush_total(kind, flush_started.elapsed());
                 drop(manifest_state);
@@ -1574,8 +1751,9 @@ impl Db {
         // durable, make that exact generation the cached manifest too.
         manifest_state.manifest = manifest;
         drop(publish_io_guard);
-        self.metrics
-            .record_flush_manifest(manifest_started.elapsed());
+        let manifest_elapsed = manifest_started.elapsed();
+        trace.manifest_us = micros(manifest_elapsed);
+        self.metrics.record_flush_manifest(manifest_elapsed);
 
         // Manifest commit is durable. Promote per-volume dead-list
         // tail/head atomics so subsequent apply ops link new
@@ -1754,6 +1932,7 @@ impl Db {
         // is no longer reachable for these.
         drop(refcount_checkpoints);
 
+        trace.terminal_phase = "install";
         let install_started = std::time::Instant::now();
         let mut install_receivers = Vec::new();
         for (volume, (checkpoints, flushed)) in volumes
@@ -1803,14 +1982,18 @@ impl Db {
                 Ok(Ok(mut frees)) => checkpoint_frees.append(&mut frees),
                 Ok(Err(err)) => {
                     drop(manifest_state);
-                    self.metrics.record_flush_install(install_started.elapsed());
+                    let install_elapsed = install_started.elapsed();
+                    trace.install_us = micros(install_elapsed);
+                    self.metrics.record_flush_install(install_elapsed);
                     self.metrics
                         .record_flush_total(kind, flush_started.elapsed());
                     return Err(err);
                 }
                 Err(_) => {
                     drop(manifest_state);
-                    self.metrics.record_flush_install(install_started.elapsed());
+                    let install_elapsed = install_started.elapsed();
+                    trace.install_us = micros(install_elapsed);
+                    self.metrics.record_flush_install(install_elapsed);
                     self.metrics
                         .record_flush_total(kind, flush_started.elapsed());
                     return Err(MetaDbError::Corruption(
@@ -1833,7 +2016,9 @@ impl Db {
         }
         self.finish_dedup_manifest_update(dedup_update, tree_generation)?;
         drop(manifest_state);
-        self.metrics.record_flush_install(install_started.elapsed());
+        let install_elapsed = install_started.elapsed();
+        trace.install_us = micros(install_elapsed);
+        self.metrics.record_flush_install(install_elapsed);
 
         if !checkpoint_frees.is_empty() {
             self.page_store
@@ -1844,11 +2029,13 @@ impl Db {
         }
 
         if let Some(ticket) = prefold_ticket {
+            trace.terminal_phase = "prefold_wait";
             let successor = ticket.bfg;
             let prefold_wait_started = std::time::Instant::now();
             let prefold_result = self.wait_l2p_prefold(ticket);
-            self.metrics
-                .record_l2p_prefold_wait(prefold_wait_started.elapsed());
+            let prefold_wait_elapsed = prefold_wait_started.elapsed();
+            trace.prefold_wait_us = micros(prefold_wait_elapsed);
+            self.metrics.record_l2p_prefold_wait(prefold_wait_elapsed);
             match prefold_result {
                 Ok(true) => tracing::debug!(
                     current_bfg = bfg,
@@ -1864,6 +2051,7 @@ impl Db {
             }
         }
 
+        trace.terminal_phase = "reclaim";
         let reclaim_started = std::time::Instant::now();
         let deferred_before = self.page_store.deferred_free_len();
         if self.async_reclaim_active() {
@@ -1911,9 +2099,12 @@ impl Db {
                 );
             }
         }
-        self.metrics.record_flush_reclaim(reclaim_started.elapsed());
+        let reclaim_elapsed = reclaim_started.elapsed();
+        trace.reclaim_us = micros(reclaim_elapsed);
+        self.metrics.record_flush_reclaim(reclaim_elapsed);
         self.metrics
             .record_flush_total(kind, flush_started.elapsed());
+        trace.terminal_phase = "complete";
         Ok(())
     }
 

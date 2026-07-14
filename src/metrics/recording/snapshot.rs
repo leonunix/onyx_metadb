@@ -161,6 +161,12 @@ impl MetaMetrics {
             apply_refcount_base_page_lookup_max_us: load(
                 &self.apply_refcount_base_page_lookup_max_us,
             ),
+            apply_refcount_base_lookup_attempts: load(&self.apply_refcount_base_lookup_attempts),
+            apply_refcount_epoch_retries: load(&self.apply_refcount_epoch_retries),
+            apply_refcount_fold_lock_wait_us: load(&self.apply_refcount_fold_lock_wait_us),
+            apply_refcount_fold_lock_wait_max_us: load(&self.apply_refcount_fold_lock_wait_max_us),
+            apply_refcount_slot_lock_wait_us: load(&self.apply_refcount_slot_lock_wait_us),
+            apply_refcount_slot_lock_wait_max_us: load(&self.apply_refcount_slot_lock_wait_max_us),
             apply_refcount_pending_slot_scan_us: load(&self.apply_refcount_pending_slot_scan_us),
             apply_refcount_pending_slot_scan_max_us: load(
                 &self.apply_refcount_pending_slot_scan_max_us,
@@ -349,6 +355,8 @@ impl MetaMetrics {
             flush_sample_l2p_walk_max_us: load(&self.flush_sample_l2p_walk_max_us),
             flush_sample_rc_drain_us: load(&self.flush_sample_rc_drain_us),
             flush_sample_rc_drain_max_us: load(&self.flush_sample_rc_drain_max_us),
+            flush_rc_fold_lock_wait_us: load(&self.flush_rc_fold_lock_wait_us),
+            flush_rc_fold_lock_wait_max_us: load(&self.flush_rc_fold_lock_wait_max_us),
             flush_rc_fold_service_us: load(&self.flush_rc_fold_service_us),
             flush_rc_fold_service_max_us: load(&self.flush_rc_fold_service_max_us),
             flush_rc_stream_calls: load(&self.flush_rc_stream_calls),

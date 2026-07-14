@@ -45,6 +45,8 @@ fn batch_get_and_stage_preserve_per_pba_results() {
         .unwrap();
     assert_eq!(staged, vec![(2, 1), (3, 5), (0, 4)]);
     assert_eq!(timings.sampled_pbas, 3);
+    assert_eq!(timings.base_lookup_attempts, 1);
+    assert_eq!(timings.epoch_retries, 0);
     assert_eq!(s.get_many(&[30, 10, 99, 20]).unwrap(), vec![4, 1, 0, 5]);
 }
 
@@ -57,6 +59,8 @@ fn stage_batch_keeps_replay_skip_semantics() {
     let (staged, timings) = s.stage_batch(1, &[(10, 1)], unsampled_lsn).unwrap();
     assert_eq!(staged, vec![(1, 1)]);
     assert_eq!(timings.sampled_pbas, 0);
+    assert_eq!(timings.base_lookup_attempts, 1);
+    assert_eq!(timings.epoch_retries, 0);
     assert_eq!(s.get(10).unwrap(), 1);
 }
 
@@ -97,8 +101,10 @@ fn stage_batch_retries_when_checkpoint_moves_state_after_base_lookup() {
     let _checkpoint = s.begin_checkpoint(0).unwrap();
     hook.resume.wait();
 
-    let (staged, _) = stage.join().unwrap().unwrap();
+    let (staged, timings) = stage.join().unwrap().unwrap();
     assert_eq!(hook.lookup_count.load(Ordering::SeqCst), 2);
+    assert_eq!(timings.base_lookup_attempts, 2);
+    assert_eq!(timings.epoch_retries, 1);
     assert_eq!(staged, vec![(2, 0)]);
     assert_eq!(s.get(pba).unwrap(), 0);
 }
@@ -232,8 +238,10 @@ fn stage_batch_retries_when_streaming_checkpoint_moves_a_later_chunk() {
     assert_eq!(ckpt.data_pages_count(), 2);
     stage_hook.resume.wait();
 
-    let (staged, _) = stage.join().unwrap().unwrap();
+    let (staged, timings) = stage.join().unwrap().unwrap();
     assert_eq!(stage_hook.lookup_count.load(Ordering::SeqCst), 2);
+    assert_eq!(timings.base_lookup_attempts, 2);
+    assert_eq!(timings.epoch_retries, 1);
     assert_eq!(staged, vec![(2, 0), (2, 0)]);
     assert_eq!(s.get(p0).unwrap(), 0);
     assert_eq!(s.get(p1).unwrap(), 0);
