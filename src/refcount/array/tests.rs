@@ -368,6 +368,29 @@ fn page_idx_beyond_one_meta_page_chains_a_continuation() {
 }
 
 #[test]
+fn referenced_page_ids_include_meta_chain_and_non_hole_data_pages() {
+    let (_dir, a) = make_array();
+    let head_cap = paged_meta::head_capacity(0);
+    let pbas = [7, ((head_cap + 1) * ENTRIES_PER_PAGE + 3) as Pba];
+    a.apply_deltas(pbas.into_iter().map(|pba| (pba, pending(1, 1))).collect())
+        .unwrap();
+    a.flush_meta().unwrap();
+
+    let inner = a.inner.lock();
+    let mut expected: std::collections::HashSet<PageId> =
+        inner.meta_chain.iter().copied().collect();
+    expected.extend(inner.page_table.iter().copied().filter(|pid| *pid != 0));
+    drop(inner);
+
+    let actual: std::collections::HashSet<PageId> =
+        PagedRefcountArray::referenced_page_ids(&a.page_store, a.meta_page_id())
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn reapply_idempotency_via_page_lsn_skip_is_callers_job() {
     // The array itself does not skip — replay-skip is enforced
     // by the caller (RcShard::stage / commit apply path) reading

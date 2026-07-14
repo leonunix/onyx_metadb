@@ -439,8 +439,8 @@ mod volume;
 
 use catalog::CatalogKind;
 pub(crate) use snapshot_roots::{load_snapshot_roots, write_snapshot_roots_page};
-pub(crate) use store::catalog_chain_pids_all_slots;
 pub use store::{LoadedManifest, ManifestStore};
+pub(crate) use store::{catalog_chain_pids_all_slots, free_list_reserve_pids_all_slots};
 pub use volume::{
     VOLUME_ENTRY_FIXED_SIZE, VOLUME_FLAG_CLONE_LINEAGE, VOLUME_FLAG_DROP_PENDING, VolumeEntry,
     decode_volume_entry_inline, encode_volume_entry_inline, volume_entry_inline_size,

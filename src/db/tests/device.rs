@@ -626,6 +626,227 @@ fn device_persisted_free_list_preserves_dedup_frontier() {
     }
 }
 
+/// A free-list run owns its unwritten reserve in both manifest slots. An older
+/// buggy open could nevertheless install a stale bitmap bit for one reserve
+/// page and Free-stamp it. The verifier may tolerate that exact harmless form,
+/// but reopen must remove the owned pid before installing the allocator list.
+#[test]
+fn device_reconciles_and_verifies_free_list_reserve() {
+    let dir = TempDir::new().unwrap();
+    let (page_dev, journal_dev, db) = mk_db_on_device(&dir, 8192, 512);
+    db.flush().unwrap();
+
+    let loaded = crate::manifest::ManifestStore::load_latest(&db.page_store)
+        .unwrap()
+        .unwrap();
+    let run = crate::manifest::catalog::free_list_run_pids(
+        &db.page_store,
+        loaded.manifest.free_list_head,
+    )
+    .unwrap();
+    let reserve = crate::manifest::catalog::free_list_reserve_pids(
+        &db.page_store,
+        loaded.manifest.free_list_head,
+    )
+    .unwrap();
+    assert!(!reserve.is_empty(), "test needs free-list growth reserve");
+    let reserve_pid = reserve[0];
+
+    // Fabricate the stale persisted bit without changing runtime ownership.
+    let mut bitmap = crate::manifest::catalog::read_free_list_run(
+        &db.page_store,
+        loaded.manifest.free_list_head,
+    )
+    .unwrap();
+    let bit = (reserve_pid - FIRST_DATA_PAGE) as usize;
+    bitmap[bit / 8] |= 1 << (bit % 8);
+    let sealed =
+        crate::manifest::catalog::seal_free_list_run(&run, &bitmap, loaded.manifest.checkpoint_lsn)
+            .unwrap();
+    db.page_store.write_sealed_page_runs(sealed).unwrap();
+    db.page_store.sync().unwrap();
+
+    // Reproduce the on-disk legacy symptom directly. Keep the current runtime
+    // allocator untouched so only reopen observes the stale persisted bit.
+    let mut free_page = crate::page::Page::new(crate::page::PageHeader::new(
+        PageType::Free,
+        loaded.manifest.checkpoint_lsn,
+    ));
+    free_page.seal();
+    db.page_store.write_page(reserve_pid, &free_page).unwrap();
+    db.page_store.sync().unwrap();
+    assert_eq!(
+        db.page_store
+            .read_page_unchecked(reserve_pid)
+            .unwrap()
+            .header()
+            .unwrap()
+            .page_type,
+        PageType::Free
+    );
+    let report = db
+        .verify(crate::verify::VerifyOptions {
+            strict: true,
+            ..crate::verify::VerifyOptions::default()
+        })
+        .unwrap();
+    assert!(
+        report.is_clean(),
+        "free-list reserve Free page should be tolerated: {:?}",
+        report.issues
+    );
+    drop(db);
+
+    let db = Db::open_on_device_with_faults(
+        device_cfg(&dir),
+        FaultController::disabled(),
+        page_dev,
+        journal_dev,
+    )
+    .unwrap();
+    let protected: std::collections::HashSet<PageId> =
+        crate::manifest::catalog_chain_pids_all_slots(&db.page_store)
+            .into_iter()
+            .collect();
+    assert!(protected.contains(&reserve_pid));
+    for _ in 0..db.page_store.free_list_len() + 8 {
+        let pid = db.page_store.allocate().unwrap();
+        assert!(
+            !protected.contains(&pid),
+            "allocator handed out manifest-owned page {pid}"
+        );
+    }
+
+    // The exception is scoped to reserve pids: a Free-stamped RC root remains
+    // a verifier failure rather than inheriting generic zero/Free tolerance.
+    let rc_root = db.manifest().refcount_shard_roots[0];
+    db.page_store.free(rc_root, 1).unwrap();
+    db.page_store.try_reclaim().unwrap();
+    let report = db.verify(crate::verify::VerifyOptions::default()).unwrap();
+    assert!(
+        !report.is_clean(),
+        "non-reserve live Free page was incorrectly tolerated"
+    );
+}
+
+/// Refcount's meta head is generation-stable and updated in place. New RC data
+/// or continuation pages can therefore become durable before the manifest that
+/// advances `page_high_water`: reopen must protect both pages an older bitmap
+/// still marks free and pages above that manifest frontier.
+#[test]
+fn device_persisted_free_list_reconciles_refcount_stable_head() {
+    let dir = TempDir::new().unwrap();
+    let (page_dev, journal_dev, db) = mk_db_on_device(&dir, 8192, 512);
+    make_interior_free_pages(&db, 200);
+    db.refcount_shards[0]
+        .rc
+        .stage_unskippable(0, 0, 1, 1)
+        .unwrap();
+    db.flush().unwrap();
+
+    let manifest_n = crate::manifest::ManifestStore::load_latest(&db.page_store)
+        .unwrap()
+        .unwrap()
+        .manifest;
+    let high_water_n = manifest_n.page_high_water;
+    // Persist the current runtime free set as generation N. Normal flush takes
+    // its snapshot before post-publish reclaim, so construct the same older-
+    // bitmap crash window explicitly and deterministically for this test.
+    let (bitmap_high_water, bitmap) = db.page_store.snapshot_free_bitmap_and_high_water();
+    assert_eq!(bitmap_high_water, high_water_n);
+    let run =
+        crate::manifest::catalog::free_list_run_pids(&db.page_store, manifest_n.free_list_head)
+            .unwrap();
+    let sealed =
+        crate::manifest::catalog::seal_free_list_run(&run, &bitmap, manifest_n.checkpoint_lsn)
+            .unwrap();
+    db.page_store.write_sealed_page_runs(sealed).unwrap();
+    db.page_store.sync().unwrap();
+    let persisted_free: std::collections::HashSet<PageId> =
+        crate::manifest::catalog::decode_free_list_bitmap(&bitmap, high_water_n)
+            .into_iter()
+            .collect();
+    assert!(!persisted_free.is_empty());
+
+    let rc = &db.refcount_shards[0].rc;
+    let root = manifest_n.refcount_shard_roots[0];
+    let before: std::collections::HashSet<PageId> =
+        crate::refcount::PagedRefcountArray::referenced_page_ids(&db.page_store, root)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+    // First stable-head rewrite consumes an interior pid the gen-N bitmap still
+    // marks free.
+    let pba_interior = crate::refcount::ENTRIES_PER_PAGE as Pba;
+    rc.stage_unskippable(0, pba_interior, 1, 2).unwrap();
+    rc.flush().unwrap();
+    let after_interior: std::collections::HashSet<PageId> =
+        crate::refcount::PagedRefcountArray::referenced_page_ids(&db.page_store, root)
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert!(
+        after_interior
+            .difference(&before)
+            .any(|pid| persisted_free.contains(pid)),
+        "RC update did not consume an interior page from the persisted bitmap"
+    );
+
+    // Exhaust runtime reusable pages, then force a continuation + data page at
+    // the frontier without publishing a newer manifest.
+    while db.page_store.free_list_len() > 0 {
+        let _ = db.page_store.allocate().unwrap();
+    }
+    let page_idx = crate::paged_meta::head_capacity(0) + 1;
+    let pba_frontier = (page_idx * crate::refcount::ENTRIES_PER_PAGE) as Pba;
+    rc.stage_unskippable(0, pba_frontier, 1, 3).unwrap();
+    rc.flush().unwrap();
+    db.page_store.sync().unwrap();
+    let durable_refs =
+        crate::refcount::PagedRefcountArray::referenced_page_ids(&db.page_store, root).unwrap();
+    assert!(
+        durable_refs.iter().any(|pid| *pid >= high_water_n),
+        "RC update did not grow past gen-N high-water {high_water_n}"
+    );
+    assert_eq!(
+        crate::manifest::ManifestStore::load_latest(&db.page_store)
+            .unwrap()
+            .unwrap()
+            .manifest
+            .page_high_water,
+        high_water_n
+    );
+    drop(db);
+
+    let db = Db::open_on_device_with_faults(
+        device_cfg(&dir),
+        FaultController::disabled(),
+        page_dev,
+        journal_dev,
+    )
+    .unwrap();
+    assert_eq!(db.refcount_shards[0].rc.get(pba_interior).unwrap(), 1);
+    assert_eq!(db.refcount_shards[0].rc.get(pba_frontier).unwrap(), 1);
+    let reopened_refs: std::collections::HashSet<PageId> =
+        crate::refcount::PagedRefcountArray::referenced_page_ids(
+            &db.page_store,
+            db.manifest().refcount_shard_roots[0],
+        )
+        .unwrap()
+        .into_iter()
+        .collect();
+    let max_ref = reopened_refs.iter().copied().max().unwrap();
+    assert!(db.page_store.high_water() > max_ref);
+    for _ in 0..db.page_store.free_list_len() + 8 {
+        let pid = db.page_store.allocate().unwrap();
+        assert!(
+            !reopened_refs.contains(&pid),
+            "allocator handed out live refcount page {pid}"
+        );
+    }
+}
+
 /// Zero regression on the file backend: it keeps its EOF-bounded open scan and
 /// never persists a free-list bitmap, so `free_list_head` stays `NULL_PAGE`.
 #[test]

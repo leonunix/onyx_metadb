@@ -260,6 +260,12 @@ fn free_list_run_header(page_store: &PageStore, start: PageId) -> Result<(usize,
             "free-list run head {start} has implausible capacity {capacity}"
         )));
     }
+    let data_pages = free_list_run_data_pages(byte_len as usize) as u64;
+    if data_pages > capacity {
+        return Err(MetaDbError::Corruption(format!(
+            "free-list run head {start} needs {data_pages} data pages but capacity is {capacity}"
+        )));
+    }
     Ok((byte_len as usize, capacity))
 }
 
@@ -302,6 +308,18 @@ pub fn free_list_run_pids(page_store: &PageStore, start: PageId) -> Result<Vec<P
     }
     let (_byte_len, capacity) = free_list_run_header(page_store, start)?;
     Ok((start..start + capacity).collect())
+}
+
+/// Trailing, intentionally unwritten growth-reserve page ids in the free-list
+/// bitmap run at `start`. These pages are owned by the run but carry no live
+/// bytes until a later bitmap growth consumes them.
+pub(crate) fn free_list_reserve_pids(page_store: &PageStore, start: PageId) -> Result<Vec<PageId>> {
+    if start == crate::types::NULL_PAGE {
+        return Ok(Vec::new());
+    }
+    let (byte_len, capacity) = free_list_run_header(page_store, start)?;
+    let data_pages = free_list_run_data_pages(byte_len) as u64;
+    Ok((start + data_pages..start + capacity).collect())
 }
 
 /// Walk the chain rooted at `head_pid`, validating + concatenating every page's

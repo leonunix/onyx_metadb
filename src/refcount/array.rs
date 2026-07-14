@@ -899,6 +899,26 @@ impl PagedRefcountArray {
         self.inner.lock().meta_chain.clone()
     }
 
+    /// Read every page id owned by the durable array rooted at `meta_page_id`:
+    /// the stable meta head, its continuations, and all non-hole data pages.
+    /// Device open uses this to reconcile a persisted free bitmap after a crash
+    /// in which the stable head became durable before the next manifest slot.
+    pub(crate) fn referenced_page_ids(
+        page_store: &PageStore,
+        meta_page_id: PageId,
+    ) -> Result<Vec<PageId>> {
+        let read = paged_meta::read_chain(
+            page_store,
+            meta_page_id,
+            PageType::RefcountArray,
+            META_KEY_COUNT_MARKER,
+            0,
+        )?;
+        let mut pids = read.chain_pids;
+        pids.extend(read.page_table.into_iter().filter(|pid| *pid != 0));
+        Ok(pids)
+    }
+
     /// Outside-gate IO: write a fresh meta chain whose entries are
     /// `snapshot_page_table` and whose existing chain is
     /// `snapshot_meta_chain`. Returns the new chain (head first).

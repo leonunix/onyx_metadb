@@ -156,6 +156,22 @@ pub(crate) fn catalog_chain_pids_all_slots(page_store: &PageStore) -> Vec<PageId
     pids
 }
 
+/// Enumerate only the intentionally unwritten growth-reserve pages belonging
+/// to either manifest slot's persisted free-list bitmap run.
+pub(crate) fn free_list_reserve_pids_all_slots(page_store: &PageStore) -> Vec<PageId> {
+    let mut pids = Vec::new();
+    for slot in [MANIFEST_PAGE_A, MANIFEST_PAGE_B] {
+        let Some((_vol_head, _snap_head, free_list_head)) = slot_catalog_heads(page_store, slot)
+        else {
+            continue;
+        };
+        if let Ok(reserve) = catalog::free_list_reserve_pids(page_store, free_list_head) {
+            pids.extend(reserve);
+        }
+    }
+    pids
+}
+
 impl ManifestStore {
     /// Load the newest valid manifest slot from disk without mutating the
     /// page store. Returns `Ok(None)` if neither slot carries a decodable

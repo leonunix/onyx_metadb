@@ -565,8 +565,8 @@ impl Db {
         // v25: a non-NULL `dedup_migration_old_head` means the last durable
         // manifest was mid online-modulus-resize (Growing). Open BOTH tables and
         // resume; else open the single (Single-phase) table. The device-frontier
-        // computation below reads `dedup_index.max_referenced_page_id()`, which
-        // is union-aware, so BOTH tables' pages are protected from reallocation.
+        // protected set below uses union-aware `referenced_page_ids()`, so BOTH
+        // tables' pages are protected from reallocation.
         let dedup_index = if manifest.dedup_migration_old_head != crate::types::NULL_PAGE {
             Arc::new(crate::dedup::DedupIndex::open_growing(
                 page_store.clone(),
@@ -596,19 +596,34 @@ impl Db {
         // trust and no hole-punch — without this the meta region leaks until
         // full).
         //
-        // The ceiling is `max(page_high_water, dedup.max_referenced_page_id()+1)`,
-        // NOT just `page_high_water`: every per-generation root (refcount / L2P /
-        // catalog / deadlists) is COW and `< page_high_water` by construction, but
-        // the cuckoo dedup meta chain is generation-stable + mutated in place, so
-        // on a crash-to-older-generation it can still reference a page a newer
-        // flush made durable above `page_high_water`. Scanning short of that page
-        // would let the allocator re-hand-out a page the live dedup index points
-        // at (silent double-allocation). Must run BEFORE lifecycle replay, which
-        // allocates pages (`cow_for_write` during L2pPut apply). See the
-        // `rebuild_free_list_bounded` caller contract.
+        // The ceiling is the maximum of `page_high_water` and every durable page
+        // reachable through a generation-stable, in-place-mutated root. Dedup and
+        // refcount can both make fresh pages durable before the next manifest
+        // publish, so a crash-to-older-generation may leave either above the
+        // committed high-water. The protected set also includes both manifest
+        // slots' catalog/free-list runs: they remain owned across the A/B
+        // generations and must never be reissued from either slot's bitmap.
+        // Must run BEFORE lifecycle replay, which allocates pages (`cow_for_write`
+        // during L2pPut apply).
         if backing.is_device() {
-            let dedup_max = dedup_index.max_referenced_page_id();
-            let frontier = manifest.page_high_water.max(dedup_max.saturating_add(1));
+            let mut protected_pages: HashSet<PageId> =
+                crate::manifest::catalog_chain_pids_all_slots(&page_store)
+                    .into_iter()
+                    .collect();
+            for &meta_pid in manifest.refcount_shard_roots.iter() {
+                if meta_pid == crate::types::NULL_PAGE {
+                    continue;
+                }
+                protected_pages.extend(crate::refcount::PagedRefcountArray::referenced_page_ids(
+                    &page_store,
+                    meta_pid,
+                )?);
+            }
+            protected_pages.extend(dedup_index.referenced_page_ids());
+            let protected_max = protected_pages.iter().copied().max().unwrap_or(0);
+            let frontier = manifest
+                .page_high_water
+                .max(protected_max.saturating_add(1));
             if manifest.free_list_head != crate::types::NULL_PAGE {
                 // Fast path: the free list was persisted as a bitmap
                 // (`free_list_head`), so load it in O(bitmap pages) instead of a
@@ -621,13 +636,14 @@ impl Db {
                     manifest.free_list_head,
                     manifest.page_high_water,
                     frontier,
-                    &dedup_index,
+                    &protected_pages,
                 )?;
                 let free_list_len = free_list.len();
                 page_store.install_free_list(frontier, free_list);
                 tracing::info!(
                     page_high_water = manifest.page_high_water,
-                    dedup_max_ref = dedup_max,
+                    protected_max_ref = protected_max,
+                    protected_pages = protected_pages.len(),
                     frontier,
                     free_list_len,
                     elapsed_ms = started.elapsed().as_millis(),
@@ -638,7 +654,8 @@ impl Db {
                 page_store.rebuild_free_list_bounded(frontier)?;
                 tracing::info!(
                     page_high_water = manifest.page_high_water,
-                    dedup_max_ref = dedup_max,
+                    protected_max_ref = protected_max,
+                    protected_pages = protected_pages.len(),
                     frontier,
                     recovered_high_water = page_store.high_water(),
                     "metadb device open: bounded free-list rebuild complete"
@@ -1164,25 +1181,20 @@ impl Db {
 ///
 /// The bitmap covers `[FIRST_DATA_PAGE, page_high_water)`; the tiny tail
 /// `[page_high_water, frontier)` (non-empty only after a crash where an
-/// uncommitted newer generation grew the dedup index past the committed
-/// high-water) is recovered with a bounded scan. Finally every page the live
-/// dedup index references is removed from the result — this is the sole
-/// correctness reconciliation and it preserves the frontier invariant
-/// (`device_open_lifts_frontier_past_dedup_pages`): the persisted bitmap was
-/// consistent with the loaded manifest generation, but a dedup meta chain is
-/// generation-stable + mutated in place, so a durable-but-uncommitted newer
-/// generation could have popped an interior free page the bitmap still marks
-/// free. Removing the dedup-referenced set (read from memory — the meta chain +
-/// page table were loaded from the durable chain at open) drops exactly those.
+/// in-place stable root grew past the committed high-water) is recovered with a
+/// bounded scan. Finally every protected page is removed from the result.
+/// Protected pages include both manifest slots' catalog/free-list runs and the
+/// durable pages reachable through the stable dedup/refcount meta heads. Those
+/// roots can outlive the bitmap generation or be mutated in place before a
+/// newer manifest is published, so the persisted bitmap is not authoritative
+/// for their ownership.
 fn load_persisted_free_list(
     page_store: &Arc<PageStore>,
     free_list_head: PageId,
     page_high_water: u64,
     frontier: u64,
-    dedup_index: &crate::dedup::DedupIndex,
+    protected_pages: &HashSet<PageId>,
 ) -> Result<Vec<PageId>> {
-    use std::collections::HashSet;
-
     let bitmap = crate::manifest::catalog::read_free_list_run(page_store, free_list_head)?;
     let mut free: Vec<PageId> =
         crate::manifest::catalog::decode_free_list_bitmap(&bitmap, page_high_water);
@@ -1190,9 +1202,9 @@ fn load_persisted_free_list(
     if frontier > page_high_water {
         free.extend(page_store.scan_free_range(page_high_water, frontier)?);
     }
-    // Reconcile: a page the live dedup index points at must never be reusable.
-    let dedup_pages: HashSet<PageId> = dedup_index.referenced_page_ids().into_iter().collect();
-    free.retain(|pid| *pid < frontier && !dedup_pages.contains(pid));
+    // Reconcile: an owned page must never be reusable even if an older bitmap
+    // still carries its bit.
+    free.retain(|pid| *pid < frontier && !protected_pages.contains(pid));
     Ok(free)
 }
 

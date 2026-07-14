@@ -126,15 +126,14 @@ pub fn verify_page_store(
     };
 
     let mut free_pages = BTreeSet::new();
-    // Never-written pages (all-zero, no header ever stamped) — a SUBSET of
-    // `free_pages`. Distinguished from explicitly `PageType::Free`-typed
-    // pages because a live anchor's reserved-but-not-yet-grown-into headroom
-    // (e.g. the device-path free-list bitmap's growth reserve, see
-    // `manifest::catalog_chain_pids_all_slots` / `catalog::free_list_run_pids`)
-    // is legitimately both "live" (anchored, must survive orphan reclaim) and
-    // all-zero (never actually used yet) — that is not a conflict, unlike a
-    // page that WAS written+freed and is somehow still reachable.
-    let mut zero_never_written: BTreeSet<PageId> = BTreeSet::new();
+    // The only live pages allowed to look free are the intentionally unwritten
+    // growth-reserve tail of a persisted free-list bitmap run. Restrict the
+    // exception to those exact pids: a zero/Free page reachable from any other
+    // root is corruption, not generic unused headroom.
+    let free_list_reserve: HashSet<PageId> =
+        crate::manifest::free_list_reserve_pids_all_slots(page_store)
+            .into_iter()
+            .collect();
     // BFG: per-L2P-page refcounting was DELETED, so verify no longer
     // cross-checks an array rc. The scan just records which pids passed verify
     // (used below to flag a live page that didn't survive the byte scan).
@@ -151,7 +150,6 @@ pub fn verify_page_store(
         };
         if raw.bytes().iter().all(|b| *b == 0) {
             free_pages.insert(pid);
-            zero_never_written.insert(pid);
             continue;
         }
         if let Err(err) = raw.verify(pid) {
@@ -186,10 +184,11 @@ pub fn verify_page_store(
         Ok(live) => {
             report.live_pages = live.refs.len();
             for (pid, _expected) in &live.refs {
-                if zero_never_written.contains(pid) {
-                    // Reserved-but-unused growth headroom of a live anchor
-                    // (e.g. free-list bitmap reserve) — expected, not a
-                    // conflict; nothing has ever been written here.
+                if free_pages.contains(pid) && free_list_reserve.contains(pid) {
+                    // Reserved bitmap capacity carries no live bytes. It may be
+                    // all-zero, or Free-stamped by an older buggy open that
+                    // installed it from a stale bitmap; device-open ownership
+                    // reconciliation now keeps either form out of allocation.
                     continue;
                 }
                 if free_pages.contains(pid) {
