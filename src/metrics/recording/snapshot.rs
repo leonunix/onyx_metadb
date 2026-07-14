@@ -18,6 +18,8 @@ impl MetaMetrics {
             commit_wal_submit_max_us: load(&self.commit_wal_submit_max_us),
             commit_drop_gate_wait_us: load(&self.commit_drop_gate_wait_us),
             commit_drop_gate_wait_max_us: load(&self.commit_drop_gate_wait_max_us),
+            commit_bfg_admission_wait_us: load(&self.commit_bfg_admission_wait_us),
+            commit_bfg_admission_wait_max_us: load(&self.commit_bfg_admission_wait_max_us),
             commit_apply_wait_us: load(&self.commit_apply_wait_us),
             commit_apply_wait_max_us: load(&self.commit_apply_wait_max_us),
             commit_apply_gate_wait_us: load(&self.commit_apply_gate_wait_us),

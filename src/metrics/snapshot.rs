@@ -17,6 +17,8 @@ pub struct MetaMetricsSnapshot {
     pub commit_wal_submit_max_us: u64,
     pub commit_drop_gate_wait_us: u64,
     pub commit_drop_gate_wait_max_us: u64,
+    pub commit_bfg_admission_wait_us: u64,
+    pub commit_bfg_admission_wait_max_us: u64,
     pub commit_apply_wait_us: u64,
     pub commit_apply_wait_max_us: u64,
     pub commit_apply_gate_wait_us: u64,

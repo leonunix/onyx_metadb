@@ -54,6 +54,11 @@ pub struct MetaMetrics {
     commit_wal_submit_max_us: AtomicU64,
     commit_drop_gate_wait_us: AtomicU64,
     commit_drop_gate_wait_max_us: AtomicU64,
+    // Explicit backpressure at the per-BFG L2P work bound. Kept separate
+    // from WAL/apply waits so a smaller checkpoint cohort cannot hide a new
+    // foreground admission stall inside `commit_total_us`.
+    commit_bfg_admission_wait_us: AtomicU64,
+    commit_bfg_admission_wait_max_us: AtomicU64,
     commit_apply_wait_us: AtomicU64,
     commit_apply_wait_max_us: AtomicU64,
     commit_apply_gate_wait_us: AtomicU64,
@@ -844,6 +849,20 @@ fn fetch_max(slot: &AtomicU64, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bfg_admission_wait_reaches_snapshot_and_json() {
+        let metrics = MetaMetrics::default();
+        metrics.record_commit_bfg_admission_wait(Duration::from_micros(17));
+        metrics.record_commit_bfg_admission_wait(Duration::from_micros(41));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.commit_bfg_admission_wait_us, 58);
+        assert_eq!(snapshot.commit_bfg_admission_wait_max_us, 41);
+        let json = snapshot.to_json();
+        assert!(json.contains("\"commit_bfg_admission_wait_us\":58"));
+        assert!(json.contains("\"commit_bfg_admission_wait_max_us\":41"));
+    }
 
     #[test]
     fn refcount_batch_breakdown_reaches_snapshot_and_json() {

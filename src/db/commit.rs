@@ -287,28 +287,50 @@ fn dispatch_ready(state: &DispatchState, lsn: Lsn) -> bool {
 }
 
 impl Db {
-    fn account_bfg_l2p_work(&self, guard: &crate::bfg::BfgGuard<'_>, ops: &[WalOp]) {
-        if !self.bfg_threads_enabled || !self.l2p_buffer_enabled {
-            return;
-        }
+    /// Enter the current Open BFG and atomically account this batch's L2P
+    /// footprint before any LSN is reserved. Once a batch crosses the work
+    /// budget, later hot-path commits park here until the next BFG opens.
+    fn admit_bfg_commit(&self, ops: &[WalOp]) -> Result<crate::bfg::BfgGuard<'_>> {
+        let mut limit = if self.bfg_threads_enabled && self.l2p_buffer_enabled {
+            self.bfg_l2p_work_limit
+        } else {
+            0
+        };
         // Snapshot lifecycle relies on its forced BFG boundaries to classify
         // page deaths against a stable pinner set. Extra size-driven rolls
         // while snapshots are live can interleave a background fold between
         // take/drop boundaries and violate that completeness invariant. The
         // cache is a leaf mutex and this check happens once per commit batch,
         // not per LBA.
-        if self
-            .snap_info_cache
-            .lock()
-            .values()
-            .any(|infos| !infos.is_empty())
+        if limit != 0
+            && self
+                .snap_info_cache
+                .lock()
+                .values()
+                .any(|infos| !infos.is_empty())
         {
-            return;
+            limit = 0;
         }
-        let work = l2p_work_entries(ops);
-        if guard.record_l2p_work(work, self.bfg_l2p_work_limit) {
+
+        let work = if limit == 0 { 0 } else { l2p_work_entries(ops) };
+        let admission_started = std::time::Instant::now();
+        let admission = self.bfg.admit_l2p_work(work, limit);
+        self.metrics
+            .record_commit_bfg_admission_wait(admission_started.elapsed());
+        let guard = admission.map_err(|err| match err {
+            crate::bfg::AdmissionError::Aborted => self.sync_poison_error().unwrap_or_else(|| {
+                MetaDbError::Corruption(
+                    "metadb persistence subsystem aborted; restart required".into(),
+                )
+            }),
+            crate::bfg::AdmissionError::Shutdown => {
+                MetaDbError::Corruption("metadb is shutting down".into())
+            }
+        })?;
+        if guard.l2p_limit_crossed() {
             self.bfg_quiesce_notifier.signal_force(guard.bfg());
         }
+        Ok(guard)
     }
 
     // -------- transaction / commit --------------------------------------
@@ -487,7 +509,7 @@ impl Db {
         // `take_syncing_slot` cannot race with this commit's tree
         // mutations because the slot stays pinned (state == Open or
         // Quiescing — never Syncing while inflight > 0).
-        let _bfg_guard = self.bfg.enter();
+        let _bfg_guard = self.admit_bfg_commit(ops)?;
         let wal_started = std::time::Instant::now();
         let lsn = {
             let result = self.lsn_alloc.reserve(|lsn| {
@@ -505,7 +527,6 @@ impl Db {
             }
         };
         _bfg_guard.record_lsn(lsn);
-        self.account_bfg_l2p_work(&_bfg_guard, ops);
         drop(unlogged_commit_guard);
         if let Err(err) = self.faults.inject(FaultPoint::CommitPostWalBeforeApply) {
             self.metrics.record_commit_error(commit_started.elapsed());
@@ -673,7 +694,7 @@ impl Db {
         // BFG: same BfgGuard pattern as
         // commit_ops_with_options. Acquire before WAL reserve to preserve
         // the LSN-monotonicity invariant across the unlogged path.
-        let _bfg_guard = self.bfg.enter();
+        let _bfg_guard = self.admit_bfg_commit(ops)?;
         let dispatch_started = std::time::Instant::now();
         let lsn = match self.lsn_alloc.reserve(|lsn| {
             self.register_dispatch_intent(lsn, dispatch_footprint);
@@ -686,7 +707,6 @@ impl Db {
             }
         };
         _bfg_guard.record_lsn(lsn);
-        self.account_bfg_l2p_work(&_bfg_guard, ops);
         if let Err(err) = self.mark_wal_durable_and_wait_for_dispatch(lsn) {
             timing.dispatch_wait = dispatch_started.elapsed();
             self.metrics.record_commit_apply_wait(timing.dispatch_wait);
@@ -804,7 +824,7 @@ impl Db {
         // BfgGuard before LSN reserve: the `closing_open` invariant
         // (bfg/mod.rs) blocks `enter()` during a roll's drain, so any
         // LSN we allocate is bounded above by every later BFG's LSNs.
-        let _bfg_guard = self.bfg.enter();
+        let _bfg_guard = self.admit_bfg_commit(ops)?;
         let lsn_started = std::time::Instant::now();
         let lsn = match self.lsn_alloc.reserve(|_| {}) {
             Ok(lsn) => lsn,
@@ -816,7 +836,6 @@ impl Db {
         };
         self.metrics.record_commit_wal_submit(lsn_started.elapsed());
         _bfg_guard.record_lsn(lsn);
-        self.account_bfg_l2p_work(&_bfg_guard, ops);
 
         let apply_started = std::time::Instant::now();
         let outcomes = match self.apply_commit_batch(&volumes, lsn, _bfg_guard.bfg(), ops) {

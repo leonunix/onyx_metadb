@@ -312,19 +312,19 @@ pub struct Config {
     /// [`crate::db::l2p_buffer`] + [`docs/DESIGN.md §B2`].
     pub l2p_buffer_enabled: bool,
 
-    /// Global L2P mutation budget for one Open BFG. The first commit that
-    /// crosses it wakes the quiesce worker, so checkpoint fold work is bounded
-    /// by admitted work rather than only by a wall-clock interval. Repeated
-    /// writes to one LBA count repeatedly; this is a conservative O(1) hot-path
-    /// bound that avoids scanning or locking all per-shard buffers. Work-driven
-    /// rolling is suspended while snapshots are live; snapshot take/drop own
-    /// their forced BFG boundaries and page-deadlist classification.
+    /// Global L2P mutation budget for one Open BFG. The crossing batch is
+    /// admitted and closes that generation to later commits until it rolls, so
+    /// submitted work is bounded by `limit + max_single_batch - 1` rather than
+    /// growing with checkpoint service time. Repeated writes to one LBA count
+    /// repeatedly; this is a conservative O(1) hot-path bound that avoids
+    /// scanning or locking all per-shard buffers. Work-driven rolling is
+    /// suspended while snapshots are live; snapshot take/drop own their forced
+    /// BFG boundaries and page-deadlist classification.
     pub l2p_buffer_soft_entries: usize,
 
-    /// Hard threshold (per-shard active entry count). When
-    /// `active.len()` crosses this, commits to that shard block on a
-    /// Condvar until the compactor swaps the active map. Bounds
-    /// peak memory at the cost of brief commit stalls.
+    /// Reserved compatibility setting for a future per-shard hard threshold.
+    /// It is currently parsed but not enforced; the global BFG admission bound
+    /// above is the active backpressure mechanism.
     pub l2p_buffer_hard_entries: usize,
 
     /// Maximum wall time the compactor may wait between cycles even

@@ -46,6 +46,14 @@ impl MetaMetrics {
         );
     }
 
+    pub(crate) fn record_commit_bfg_admission_wait(&self, elapsed: Duration) {
+        record_duration(
+            &self.commit_bfg_admission_wait_us,
+            &self.commit_bfg_admission_wait_max_us,
+            elapsed,
+        );
+    }
+
     pub(crate) fn record_commit_apply_wait(&self, elapsed: Duration) {
         record_duration(
             &self.commit_apply_wait_us,

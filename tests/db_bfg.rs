@@ -137,6 +137,32 @@ fn l2p_work_budget_rolls_bfg_before_long_timer() {
 }
 
 #[test]
+fn l2p_work_budget_does_not_drive_roll_while_snapshot_is_live() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = cfg_threads_and_buffer(&dir, 60_000);
+    cfg.l2p_buffer_soft_entries = 4;
+    let db = Db::create_with_config(cfg).unwrap();
+    let ord = db.create_volume().unwrap();
+    let snapshot = db.take_snapshot(ord).unwrap();
+    let checkpoint = db.bfg_checkpoint_for_test();
+
+    for lba in 0..32 {
+        db.insert(ord, lba, v(lba as u8 + 1)).unwrap();
+    }
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        db.bfg_checkpoint_for_test(),
+        checkpoint,
+        "live snapshots must disable work-driven BFG rolls"
+    );
+    for lba in 0..32 {
+        assert_eq!(db.get(ord, lba).unwrap(), Some(v(lba as u8 + 1)));
+    }
+
+    db.drop_snapshot(snapshot).unwrap().unwrap();
+}
+
+#[test]
 fn threads_on_buffer_per_slot_drain_read_your_writes_and_recovery() {
     // onyx production shape: threads on + buffer mode. The background
     // BfgSyncThread drains only the frozen syncing slot per cycle

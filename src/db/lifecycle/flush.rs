@@ -6,6 +6,7 @@ const SLOW_SYNC_CYCLE_WARN_US: u64 = 1_000_000;
 #[derive(Debug, Default)]
 struct SyncCycleTrace {
     terminal_phase: &'static str,
+    bfg_l2p_work: u64,
     dedup_drain_us: u64,
     l2p_fold_us: u64,
     sample_wall_us: u64,
@@ -63,6 +64,7 @@ impl SyncCycleTrace {
             error = %error,
             total_us,
             terminal_phase = self.terminal_phase,
+            bfg_l2p_work = self.bfg_l2p_work,
             dedup_drain_us = self.dedup_drain_us,
             l2p_fold_us = self.l2p_fold_us,
             sample_wall_us = self.sample_wall_us,
@@ -483,6 +485,9 @@ impl Db {
     ) -> Result<()> {
         let started = std::time::Instant::now();
         let mut trace = SyncCycleTrace::default();
+        // Capture before the syncing-slot drain clears buffered entries. The
+        // slow-cycle trace can then prove the admission cohort bound directly.
+        trace.bfg_l2p_work = self.bfg.slot_l2p_work(bfg) as u64;
         let result = self.run_sync_cycle_body(bfg, kind, &mut trace);
         trace.warn_if_slow(
             bfg,

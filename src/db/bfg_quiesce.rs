@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -49,14 +49,17 @@ impl Default for QuiesceParams {
 /// any caller that wants to drive a roll immediately (e.g.
 /// `flush_with_gate`).
 pub struct QuiesceNotifier {
-    force: Mutex<bool>,
+    /// Highest Open-BFG generation requested by callers. A generation-tagged
+    /// request can be discarded if a timer or earlier request already rolled
+    /// it; a stale wake must never roll the next generation.
+    force_target: Mutex<Option<Bfg>>,
     cv: Condvar,
 }
 
 impl QuiesceNotifier {
     pub fn new() -> Self {
         Self {
-            force: Mutex::new(false),
+            force_target: Mutex::new(None),
             cv: Condvar::new(),
         }
     }
@@ -70,33 +73,25 @@ impl QuiesceNotifier {
     /// call time — pass `state.open_bfg()`. Returned for echo so the
     /// caller doesn't need to read it twice.
     pub fn signal_force(&self, target_open_bfg: Bfg) -> Bfg {
-        let mut force = self.force.lock();
-        *force = true;
+        let mut target = self.force_target.lock();
+        *target = Some(target.map_or(target_open_bfg, |pending| pending.max(target_open_bfg)));
         self.cv.notify_one();
         target_open_bfg
     }
 
     /// Park up to `timeout` waiting for a force-roll notification.
-    /// Returns `true` if a force notification was consumed; `false` if
-    /// the timeout elapsed.
-    fn wait_with_timeout(&self, timeout: Duration) -> bool {
-        let mut force = self.force.lock();
-        if *force {
-            *force = false;
-            return true;
+    /// Returns the requested generation, or `None` when the timeout elapsed.
+    fn wait_with_timeout(&self, timeout: Duration) -> Option<Bfg> {
+        let mut target = self.force_target.lock();
+        if target.is_some() {
+            return target.take();
         }
-        let res = self.cv.wait_for(&mut force, timeout);
-        let woken = *force;
-        *force = false;
-        // `parking_lot::Condvar::wait_for` returns `WaitTimeoutResult`;
-        // either branch (woken vs timeout) cleared the flag above.
-        let _ = res;
-        woken
+        let _ = self.cv.wait_for(&mut target, timeout);
+        target.take()
     }
 
     fn wake_all_for_shutdown(&self) {
-        let mut force = self.force.lock();
-        *force = true;
+        let _target = self.force_target.lock();
         self.cv.notify_all();
     }
 }
@@ -186,10 +181,14 @@ fn run_worker(inner: Arc<Inner>) {
     // with the commit path.
     crate::affinity::bind_current(crate::affinity::ThreadRole::BfgSync, 1);
     let timeout = Duration::from_millis(inner.params.bfg_timeout_ms.max(1));
+    let mut deadline = Instant::now() + timeout;
     while !inner.shutdown.load(Ordering::Acquire) {
         // Wait either for the bfg_timeout to elapse or a force-roll
-        // notification. Either path drops into the same roll body.
-        inner.notifier.wait_with_timeout(timeout);
+        // notification. Stale generation-tagged wakes keep the original
+        // deadline, so a stream of delayed callers cannot starve the timer.
+        let forced_target = inner
+            .notifier
+            .wait_with_timeout(deadline.saturating_duration_since(Instant::now()));
         if inner.shutdown.load(Ordering::Acquire) {
             break;
         }
@@ -198,6 +197,21 @@ fn run_worker(inner: Arc<Inner>) {
         // for a group that has already poisoned the process.
         if inner.state.is_aborted() {
             break;
+        }
+        if let Some(target) = forced_target {
+            let current = inner.state.open_bfg();
+            if current != target {
+                tracing::debug!(
+                    target,
+                    current,
+                    "metadb: discard stale BFG force-roll request"
+                );
+                continue;
+            }
+        } else if Instant::now() < deadline {
+            // Condvars may wake spuriously. A wake without a force target is a
+            // timer event only after the current deadline has elapsed.
+            continue;
         }
         // Roll → promote → notify sync. roll_to_quiescing handles its own
         // shutdown check (returns current open_bfg without advancing) so
@@ -223,6 +237,7 @@ fn run_worker(inner: Arc<Inner>) {
         }
         inner.state.promote_to_syncing(bfg);
         inner.sync_notifier.notify();
+        deadline = Instant::now() + timeout;
     }
 }
 
@@ -230,7 +245,6 @@ fn run_worker(inner: Arc<Inner>) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
 
     fn noop_metrics() -> Arc<MetaMetrics> {
         Arc::new(MetaMetrics::new())
@@ -276,6 +290,85 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(state.checkpoint_bfg(), target);
+        q.stop();
+    }
+
+    #[test]
+    fn stale_force_generation_does_not_roll_next_open_bfg() {
+        let state = Arc::new(BfgStateMachine::new(0));
+        let sync_n = Arc::new(SyncNotifier::new());
+        let _sync = spawn_ack_sync(Arc::clone(&state), Arc::clone(&sync_n));
+        let notifier = Arc::new(QuiesceNotifier::new());
+        let mut q = BfgQuiesceThread::start(
+            Arc::clone(&state),
+            Arc::clone(&notifier),
+            Arc::clone(&sync_n),
+            QuiesceParams {
+                bfg_timeout_ms: 60_000,
+            },
+            noop_metrics(),
+            disabled_faults(),
+        );
+
+        notifier.signal_force(1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && state.checkpoint_bfg() < 1 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.open_bfg(), 2);
+
+        // This models an admission crossing whose wake was delayed until a
+        // timer had already rolled its generation. It must be consumed as
+        // stale, not interpreted as a request to roll BFG 2.
+        notifier.signal_force(1);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(state.open_bfg(), 2);
+        assert_eq!(state.checkpoint_bfg(), 1);
+
+        notifier.signal_force(2);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && state.checkpoint_bfg() < 2 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.checkpoint_bfg(), 2);
+        q.stop();
+    }
+
+    #[test]
+    fn stale_force_generations_do_not_starve_timer_roll() {
+        let state = Arc::new(BfgStateMachine::new(0));
+        let sync_n = Arc::new(SyncNotifier::new());
+        let _sync = spawn_ack_sync(Arc::clone(&state), Arc::clone(&sync_n));
+        let notifier = Arc::new(QuiesceNotifier::new());
+        let mut q = BfgQuiesceThread::start(
+            Arc::clone(&state),
+            Arc::clone(&notifier),
+            sync_n,
+            QuiesceParams {
+                bfg_timeout_ms: 120,
+            },
+            noop_metrics(),
+            disabled_faults(),
+        );
+
+        // Keep waking the worker with a generation that was never Open. If
+        // each stale wake restarted the timer, BFG 1 could not sync until at
+        // least 120 ms after this 320 ms stream ends.
+        let sender = thread::spawn(move || {
+            for _ in 0..8 {
+                thread::sleep(Duration::from_millis(40));
+                notifier.signal_force(0);
+            }
+        });
+        sender.join().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(80);
+        while Instant::now() < deadline && state.checkpoint_bfg() < 1 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            state.checkpoint_bfg() >= 1,
+            "stale force wakes must preserve the original timer deadline"
+        );
         q.stop();
     }
 

@@ -17,7 +17,7 @@
 //!
 //! Commit hot path:
 //! ```ignore
-//! let guard = state.enter();          // 1 mutex acquire, ~50ns
+//! let guard = state.admit_l2p_work(work, limit)?; // enter + account atomically
 //! // ... submit WAL, apply ops, stamp L2pBuffer slot[guard.bfg & 3] ...
 //! guard.record_lsn(lsn);              // 1 mutex acquire
 //! drop(guard);                         // 1 mutex acquire
@@ -129,6 +129,20 @@ struct Inner {
     /// `checkpoint_lsn = slot[K].max_lsn` relies on for WAL prune
     /// correctness.
     closing_open: bool,
+    /// The Open BFG whose L2P work budget has been reached. New
+    /// work-admitting commits park until `roll_to_quiescing` successfully
+    /// opens the next generation. Keeping the generation in the gate (rather
+    /// than a bare bool) makes a delayed force notification harmless.
+    l2p_admission_closed_bfg: Option<Bfg>,
+}
+
+/// Terminal reason why a work-admitting commit could not enter an Open BFG.
+/// Callers map `Aborted` to the sync-poison error and `Shutdown` to a clean
+/// teardown error instead of parking forever.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AdmissionError {
+    Shutdown,
+    Aborted,
 }
 
 pub struct BfgStateMachine {
@@ -155,6 +169,7 @@ impl BfgStateMachine {
                 shutdown: false,
                 aborted: false,
                 closing_open: false,
+                l2p_admission_closed_bfg: None,
             }),
             cv: Condvar::new(),
             open_bfg_atomic: AtomicU64::new(open_bfg),
@@ -181,7 +196,64 @@ impl BfgStateMachine {
         let idx = (bfg & BFG_INDEX_MASK) as usize;
         debug_assert_eq!(g.slots[idx].state, BfgState::Open);
         g.slots[idx].inflight += 1;
-        BfgGuard { sm: self, bfg }
+        BfgGuard {
+            sm: self,
+            bfg,
+            l2p_limit_crossed: false,
+        }
+    }
+
+    /// Atomically admit one commit and account its submitted L2P work before
+    /// the caller reserves an LSN. The batch that crosses `limit` is admitted,
+    /// then the door closes for later callers until a successful BFG roll.
+    /// Therefore a BFG contains at most `limit + max_batch_work - 1` submitted
+    /// L2P mutations (with saturating arithmetic at `usize::MAX`).
+    ///
+    /// `limit == 0` disables work accounting and cannot close the admission
+    /// gate. An already-closed generation is still respected. This is used
+    /// when BFG threads/L2P buffering are disabled and while snapshots are
+    /// live; timer/lifecycle-driven rolls remain unchanged.
+    pub fn admit_l2p_work(
+        &self,
+        work: usize,
+        limit: usize,
+    ) -> std::result::Result<BfgGuard<'_>, AdmissionError> {
+        let mut g = self.inner.lock();
+        while (g.closing_open || g.l2p_admission_closed_bfg == Some(g.open_bfg))
+            && !g.shutdown
+            && !g.aborted
+        {
+            self.cv.wait(&mut g);
+        }
+        if g.aborted {
+            return Err(AdmissionError::Aborted);
+        }
+        if g.shutdown {
+            return Err(AdmissionError::Shutdown);
+        }
+
+        let bfg = g.open_bfg;
+        let idx = (bfg & BFG_INDEX_MASK) as usize;
+        debug_assert_eq!(g.slots[idx].state, BfgState::Open);
+
+        let mut crossed = false;
+        if work != 0 && limit != 0 {
+            let previous = g.slots[idx].l2p_work;
+            let current = previous.saturating_add(work);
+            g.slots[idx].l2p_work = current;
+            if previous < limit && current >= limit {
+                debug_assert!(g.l2p_admission_closed_bfg.is_none());
+                g.l2p_admission_closed_bfg = Some(bfg);
+                crossed = true;
+            }
+        }
+
+        g.slots[idx].inflight += 1;
+        Ok(BfgGuard {
+            sm: self,
+            bfg,
+            l2p_limit_crossed: crossed,
+        })
     }
 
     /// Bump the slot's `max_lsn` if the supplied LSN is larger. Called by the
@@ -194,28 +266,6 @@ impl BfgStateMachine {
         if lsn > g.slots[idx].max_lsn {
             g.slots[idx].max_lsn = lsn;
         }
-    }
-
-    /// Account L2P work against the Open BFG and report the first crossing
-    /// of `limit`. The caller uses that edge to wake the quiesce worker.
-    ///
-    /// Counting submitted mutations rather than distinct keys deliberately
-    /// overestimates the eventual fold: it keeps the checkpoint batch bounded
-    /// without taking every shard's buffer lock on the commit hot path.
-    pub fn record_l2p_work(&self, bfg: Bfg, work: usize, limit: usize) -> bool {
-        if work == 0 || limit == 0 {
-            return false;
-        }
-        let mut g = self.inner.lock();
-        let idx = (bfg & BFG_INDEX_MASK) as usize;
-        debug_assert!(matches!(
-            g.slots[idx].state,
-            BfgState::Open | BfgState::Quiescing
-        ));
-        let previous = g.slots[idx].l2p_work;
-        let current = previous.saturating_add(work);
-        g.slots[idx].l2p_work = current;
-        previous < limit && current >= limit
     }
 
     /// Close the currently-Open BFG, wait for its in-flight commits to
@@ -280,6 +330,11 @@ impl BfgStateMachine {
         g.quiescing_bfg = Some(cur);
         g.open_bfg = next;
         self.open_bfg_atomic.store(next, Ordering::Release);
+        if g.l2p_admission_closed_bfg == Some(cur) {
+            g.l2p_admission_closed_bfg = None;
+        } else {
+            debug_assert!(g.l2p_admission_closed_bfg.is_none());
+        }
         // Reopen the door — new commits now stamp to `next`.
         g.closing_open = false;
         self.cv.notify_all();
@@ -426,6 +481,7 @@ impl BfgStateMachine {
 pub struct BfgGuard<'a> {
     sm: &'a BfgStateMachine,
     pub bfg: Bfg,
+    l2p_limit_crossed: bool,
 }
 
 impl BfgGuard<'_> {
@@ -438,9 +494,11 @@ impl BfgGuard<'_> {
         self.sm.record_lsn(self.bfg, lsn);
     }
 
-    /// Returns true exactly once when this BFG reaches its L2P work budget.
-    pub fn record_l2p_work(&self, work: usize, limit: usize) -> bool {
-        self.sm.record_l2p_work(self.bfg, work, limit)
+    /// True only for the admitted batch that closed this BFG's L2P work gate.
+    /// The caller should send a generation-tagged quiesce notification before
+    /// reserving its LSN, while this guard keeps the crossing commit inflight.
+    pub fn l2p_limit_crossed(&self) -> bool {
+        self.l2p_limit_crossed
     }
 }
 
@@ -531,32 +589,57 @@ mod tests {
     }
 
     #[test]
-    fn l2p_work_reports_one_threshold_edge_per_bfg() {
-        let sm = BfgStateMachine::new(0);
-        let g = sm.enter();
-        assert!(!g.record_l2p_work(3, 8));
-        assert!(!g.record_l2p_work(4, 8));
-        assert!(g.record_l2p_work(1, 8));
-        assert!(!g.record_l2p_work(100, 8));
-        assert_eq!(sm.slot_l2p_work(g.bfg()), 108);
-        drop(g);
+    fn l2p_crossing_batch_closes_admission_until_next_bfg_opens() {
+        let sm = Arc::new(BfgStateMachine::new(0));
+        let before = sm.admit_l2p_work(7, 8).unwrap();
+        assert!(!before.l2p_limit_crossed());
+        let crossing = sm.admit_l2p_work(5, 8).unwrap();
+        assert!(crossing.l2p_limit_crossed());
+        // The crossing batch is the only allowed overshoot: 8 + 5 - 1.
+        assert_eq!(sm.slot_l2p_work(1), 12);
 
+        let waiter_sm = Arc::clone(&sm);
+        let waiter = thread::spawn(move || {
+            let guard = waiter_sm.admit_l2p_work(1, 8).unwrap();
+            let bfg = guard.bfg();
+            drop(guard);
+            bfg
+        });
+        thread::sleep(Duration::from_millis(30));
+        assert!(!waiter.is_finished(), "post-crossing admission must park");
+
+        drop(before);
+        drop(crossing);
         let q = sm.roll_to_quiescing();
-        sm.promote_to_syncing(q);
-        sm.mark_synced(q);
-        assert_eq!(sm.slot_l2p_work(q), 0);
-
-        let next = sm.enter();
-        assert_eq!(next.bfg(), 2);
-        assert!(next.record_l2p_work(8, 8));
+        assert_eq!(q, 1);
+        assert_eq!(waiter.join().unwrap(), 2);
+        assert_eq!(sm.slot_l2p_work(2), 1);
     }
 
     #[test]
     fn zero_l2p_work_limit_disables_threshold() {
         let sm = BfgStateMachine::new(0);
-        let g = sm.enter();
-        assert!(!g.record_l2p_work(usize::MAX, 0));
+        let g = sm.admit_l2p_work(usize::MAX, 0).unwrap();
+        assert!(!g.l2p_limit_crossed());
         assert_eq!(sm.slot_l2p_work(g.bfg()), 0);
+        let second = sm.admit_l2p_work(usize::MAX, 0).unwrap();
+        assert_eq!(second.bfg(), g.bfg());
+    }
+
+    #[test]
+    fn oversized_l2p_batch_is_admitted_then_closes_gate() {
+        let sm = Arc::new(BfgStateMachine::new(0));
+        let crossing = sm.admit_l2p_work(usize::MAX, 8).unwrap();
+        assert!(crossing.l2p_limit_crossed());
+        assert_eq!(sm.slot_l2p_work(1), usize::MAX);
+
+        let waiter_sm = Arc::clone(&sm);
+        let waiter = thread::spawn(move || waiter_sm.admit_l2p_work(1, 8).map(|g| g.bfg()));
+        thread::sleep(Duration::from_millis(30));
+        assert!(!waiter.is_finished());
+        drop(crossing);
+        assert_eq!(sm.roll_to_quiescing(), 1);
+        assert_eq!(waiter.join().unwrap(), Ok(2));
     }
 
     #[test]
@@ -645,6 +728,40 @@ mod tests {
         assert_eq!(s.quiescing_bfg, None);
     }
 
+    #[test]
+    fn l2p_admission_stays_closed_while_three_active_bfgs_block_promote() {
+        let sm = Arc::new(BfgStateMachine::new(0));
+        let q1 = sm.roll_to_quiescing();
+        sm.promote_to_syncing(q1);
+        let q2 = sm.roll_to_quiescing();
+        assert_eq!(sm.snapshot().open_bfg, 3);
+
+        let promote_sm = Arc::clone(&sm);
+        let promoter = thread::spawn(move || promote_sm.promote_to_syncing(q2));
+        thread::sleep(Duration::from_millis(30));
+        assert!(!promoter.is_finished());
+
+        let crossing = sm.admit_l2p_work(8, 8).unwrap();
+        assert!(crossing.l2p_limit_crossed());
+        drop(crossing);
+        let waiter_sm = Arc::clone(&sm);
+        let waiter = thread::spawn(move || waiter_sm.admit_l2p_work(1, 8).map(|g| g.bfg()));
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            !waiter.is_finished(),
+            "BFG 3 admission must remain closed while promote(2) is blocked"
+        );
+
+        sm.mark_synced(q1);
+        promoter.join().unwrap();
+        // Promotion alone does not reopen BFG 3; only its successful roll can.
+        thread::sleep(Duration::from_millis(20));
+        assert!(!waiter.is_finished());
+        sm.mark_synced(q2);
+        assert_eq!(sm.roll_to_quiescing(), 3);
+        assert_eq!(waiter.join().unwrap(), Ok(4));
+    }
+
     // Ring-full block path (slot[(open+1) & 3] not Empty) is exercised by
     // integration tests once `BfgQuiesceThread` and `BfgSyncThread` are
     // wired together — that's where the 3-active-BFG state is reachable.
@@ -727,6 +844,19 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_wakes_blocked_l2p_admission_with_status() {
+        let sm = Arc::new(BfgStateMachine::new(0));
+        let crossing = sm.admit_l2p_work(8, 8).unwrap();
+        let waiter_sm = Arc::clone(&sm);
+        let waiter = thread::spawn(move || waiter_sm.admit_l2p_work(1, 8).map(|g| g.bfg()));
+        thread::sleep(Duration::from_millis(30));
+        assert!(!waiter.is_finished());
+        sm.shutdown();
+        assert_eq!(waiter.join().unwrap(), Err(AdmissionError::Shutdown));
+        drop(crossing);
+    }
+
+    #[test]
     fn shutdown_wakes_sync_waiter() {
         let sm = Arc::new(BfgStateMachine::new(0));
         let sm2 = Arc::clone(&sm);
@@ -796,6 +926,19 @@ mod tests {
             !synced,
             "aborted wait must return false (caller surfaces poison)"
         );
+    }
+
+    #[test]
+    fn abort_wakes_blocked_l2p_admission_with_status() {
+        let sm = Arc::new(BfgStateMachine::new(0));
+        let crossing = sm.admit_l2p_work(8, 8).unwrap();
+        let waiter_sm = Arc::clone(&sm);
+        let waiter = thread::spawn(move || waiter_sm.admit_l2p_work(1, 8).map(|g| g.bfg()));
+        thread::sleep(Duration::from_millis(30));
+        assert!(!waiter.is_finished());
+        sm.mark_aborted();
+        assert_eq!(waiter.join().unwrap(), Err(AdmissionError::Aborted));
+        drop(crossing);
     }
 
     #[test]
