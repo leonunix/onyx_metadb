@@ -519,6 +519,23 @@ impl Db {
         self.async_reclaim.lock().is_some()
     }
 
+    /// Return every unused per-L2P-shard allocation batch to PageStore after a
+    /// terminal flush. Refcount array pages are allocated one-at-a-time and do
+    /// not keep a local reserve, so there is no corresponding RC drain.
+    fn release_terminal_allocation_reserves(&self, generation: Lsn) -> Result<usize> {
+        let mut volumes: Vec<Arc<Volume>> = self.volumes.read().values().cloned().collect();
+        volumes.sort_by_key(|volume| volume.ord);
+
+        let mut released = 0usize;
+        for volume in volumes {
+            for shard in &volume.shards {
+                released = released
+                    .saturating_add(shard.tree.write().release_unused_allocations(generation)?);
+            }
+        }
+        Ok(released)
+    }
+
     /// Terminally quiesce metadata background writers, drain every deferred
     /// page free, and make both the Free stamps and the device-path persisted
     /// free-list bitmap durable.
@@ -565,6 +582,14 @@ impl Db {
             // count that work and require another round as well.
             let inline_reclaimed = inline_after.saturating_sub(inline_before) as usize;
 
+            // PageBuf reserves ids in 256-page batches. The unused tail is not
+            // tree-reachable and has never entered deferred_free, so reclaim
+            // cannot discover it on its own. Release it only after this forced
+            // flush has installed every L2P checkpoint; the next loop round
+            // persists the resulting free bitmap before shutdown can go clean.
+            let released_reservations =
+                self.release_terminal_allocation_reserves(self.last_applied_lsn())?;
+
             let mut explicit_reclaimed = 0usize;
             loop {
                 let pending = self.page_store.deferred_free_len();
@@ -599,6 +624,7 @@ impl Db {
             tracing::info!(
                 round,
                 inline_reclaimed,
+                released_reservations,
                 explicit_reclaimed,
                 deferred,
                 "metadb: terminal deferred-page reclaim round"

@@ -765,6 +765,18 @@ impl PagedL2p {
         self.buf.dirty_count()
     }
 
+    /// Release the PageBuf's unused batch-allocation reserve. Shutdown owns the
+    /// required quiescence; normal checkpoint and writeback paths must retain
+    /// the reserve so subsequent COWs avoid the global allocator lock.
+    pub(crate) fn release_unused_allocations(&mut self, generation: Lsn) -> Result<usize> {
+        self.buf.release_unused_allocations(generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unused_allocation_ids(&self) -> Vec<PageId> {
+        self.buf.unused_allocation_ids()
+    }
+
     pub(crate) fn checkpoint_retired_page_committed(&mut self, pid: PageId) -> Option<PageId> {
         if self.retired_pages.remove(&pid) {
             self.buf.detach_for_free(pid);

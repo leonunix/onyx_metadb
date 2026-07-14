@@ -35,6 +35,45 @@ fn alloc_leaf_and_index_tagged_correctly() {
 }
 
 #[test]
+fn release_unused_allocations_returns_partial_batch_to_page_store() {
+    let (_d, ps) = mk_store();
+    let mut buf = PageBuf::new(ps.clone());
+    let live = buf.alloc_leaf(1).unwrap();
+    let unused = buf.unused_allocation_ids();
+
+    assert_eq!(unused.len(), LOCAL_ALLOC_RUN_PAGES - 1);
+    assert_eq!(buf.release_unused_allocations(7).unwrap(), unused.len());
+    assert!(buf.unused_allocation_ids().is_empty());
+    assert_eq!(ps.deferred_free_len(), unused.len());
+    let deferred_after_first = ps.deferred_free_len();
+    assert_eq!(buf.release_unused_allocations(8).unwrap(), 0);
+    assert_eq!(ps.deferred_free_len(), deferred_after_first);
+
+    let reclaimed = ps.try_reclaim().unwrap();
+    assert_eq!(reclaimed.reclaimed.len(), unused.len());
+    assert_eq!(ps.high_water(), live + 1);
+    assert_eq!(
+        ps.read_page_unchecked(live).unwrap().bytes(),
+        &[0; PAGE_SIZE]
+    );
+}
+
+#[test]
+fn drop_returns_unused_allocations_to_deferred_reclaim() {
+    let (_d, ps) = mk_store();
+    let unused = {
+        let mut buf = PageBuf::new(ps.clone());
+        let _live = buf.alloc_leaf(1).unwrap();
+        buf.unused_allocation_ids()
+    };
+
+    assert_eq!(unused.len(), LOCAL_ALLOC_RUN_PAGES - 1);
+    assert_eq!(ps.deferred_free_len(), unused.len());
+    let reclaimed = ps.try_reclaim().unwrap();
+    assert_eq!(reclaimed.reclaimed.len(), unused.len());
+}
+
+#[test]
 fn flush_persists_leaf_content() {
     let (_d, ps) = mk_store();
     let mut buf = PageBuf::new(ps.clone());

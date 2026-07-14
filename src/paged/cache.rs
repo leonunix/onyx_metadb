@@ -21,7 +21,7 @@ use crate::paged::leaf_compact;
 use crate::paged::read_view::{PageIdMap, PageIdSet, ReadOverlay, ReadOverlayShard};
 use crate::types::{Lsn, NULL_PAGE, PageId};
 
-const LOCAL_ALLOC_RUN_PAGES: usize = 256;
+pub(crate) const LOCAL_ALLOC_RUN_PAGES: usize = 256;
 
 /// Cache entry. Both variants carry `Arc<Page>` so dirty pages can be
 /// shared with `ReadView` overlays at apply-publish time without copying
@@ -259,6 +259,31 @@ impl PageBuf {
         self.pages_remove(pid);
         self.page_cache.invalidate(pid);
         Ok(pid)
+    }
+
+    /// Return page ids reserved by the local allocation batch but never handed
+    /// to the tree. This is a shutdown-only operation: the caller must exclude
+    /// further tree mutations until the enclosing terminal checkpoint finishes.
+    ///
+    /// `allocate_batch` removes the whole batch from the PageStore free list up
+    /// front. Dropping a PageBuf with a non-empty pool would therefore lose
+    /// those ids from both tree reachability and the persisted free bitmap.
+    pub(crate) fn release_unused_allocations(&mut self, generation: Lsn) -> Result<usize> {
+        if self.alloc_pool.is_empty() {
+            return Ok(0);
+        }
+
+        let count = self.alloc_pool.len();
+        // Clear only after PageStore accepted the whole batch. `free_many` is
+        // validation-first, so an error leaves both owners unchanged.
+        self.page_store.free_many(&self.alloc_pool, generation)?;
+        self.alloc_pool.clear();
+        Ok(count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unused_allocation_ids(&self) -> Vec<PageId> {
+        self.alloc_pool.clone()
     }
 
     /// Underlying page store handle.
@@ -685,6 +710,18 @@ impl PageBuf {
         let page = self.page_cache.get(pid)?;
         self.pages_insert(pid, Slot::Clean(page));
         Ok(())
+    }
+}
+
+impl Drop for PageBuf {
+    fn drop(&mut self) {
+        if let Err(err) = self.release_unused_allocations(0) {
+            tracing::warn!(
+                error = %err,
+                reserved_pages = self.alloc_pool.len(),
+                "paged PageBuf drop failed to release unused allocation reserve"
+            );
+        }
     }
 }
 

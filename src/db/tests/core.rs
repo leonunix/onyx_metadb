@@ -180,6 +180,91 @@ fn terminal_reclaim_persists_freed_pages_across_device_reopen() {
 }
 
 #[test]
+fn terminal_reclaim_persists_unused_l2p_allocation_batch_across_device_reopen() {
+    let dir = TempDir::new().unwrap();
+    let page_device = Arc::new(crate::page_store::MemDevice::new(16_384));
+    let journal_device = Arc::new(crate::lifecycle_log::MemJournalDevice::new(512));
+    let mut cfg = Config::new(dir.path());
+    cfg.shards_per_partition = 1;
+    cfg.dedup_cuckoo_buckets = 256;
+    cfg.async_reclaim_enabled = true;
+    cfg.async_reclaim_max_pages_per_cycle = 1;
+    cfg.async_reclaim_idle_interval_ms = 60_000;
+    cfg.bfg_threads_enabled = true;
+    cfg.bfg_timeout_ms = 60_000;
+    cfg.lineage_gc_enabled = false;
+    cfg.livelist_condense_min_segments = 0;
+    cfg.dedup_drainer_enabled = false;
+    cfg.l2p_writeback_enabled = false;
+    cfg.reclaim_orphans_on_open = false;
+
+    let db = Db::create_on_device_with_faults(
+        cfg.clone(),
+        FaultController::disabled(),
+        page_device.clone(),
+        journal_device.clone(),
+    )
+    .unwrap();
+    let unused = {
+        let volumes = db.volumes.read();
+        let volume = volumes.get(&BOOTSTRAP_VOLUME_ORD).unwrap();
+        let ids = volume.shards[0].tree.read().unused_allocation_ids();
+        assert_eq!(ids.len(), crate::paged::cache::LOCAL_ALLOC_RUN_PAGES - 1);
+        ids
+    };
+
+    db.drain_deferred_reclaim_durable().unwrap();
+    assert!(
+        db.volumes.read()[&BOOTSTRAP_VOLUME_ORD].shards[0]
+            .tree
+            .read()
+            .unused_allocation_ids()
+            .is_empty()
+    );
+    drop(db);
+
+    let reopened = Db::open_on_device_with_faults(
+        cfg,
+        FaultController::disabled(),
+        page_device,
+        journal_device,
+    )
+    .unwrap();
+    let (high_water, bitmap) = reopened.page_store.snapshot_free_bitmap_and_high_water();
+    let mut persisted_free = 0usize;
+    for pid in &unused {
+        assert!(*pid < high_water, "reserved pid {pid} must remain interior");
+        let raw = reopened.page_store.read_page_unchecked(*pid).unwrap();
+        let is_free = raw.bytes().iter().all(|byte| *byte == 0)
+            || matches!(
+                raw.header(),
+                Ok(header) if header.page_type == crate::page::PageType::Free
+            );
+        assert!(is_free, "reserved pid {pid} was not physically reclaimed");
+        persisted_free += 1;
+        let bit = (*pid - FIRST_DATA_PAGE) as usize;
+        assert_ne!(
+            bitmap[bit / 8] & (1 << (bit % 8)),
+            0,
+            "free reserved pid {pid} was lost from the persisted free-list bitmap"
+        );
+    }
+    assert_eq!(persisted_free, unused.len());
+    let report = reopened
+        .verify(crate::verify::VerifyOptions {
+            strict: true,
+            ..crate::verify::VerifyOptions::default()
+        })
+        .unwrap();
+    assert!(
+        report.is_clean(),
+        "strict verification failed: {:?}",
+        report.issues
+    );
+    assert!(report.orphan_pages.is_empty());
+}
+
+#[test]
 fn take_snapshot_assigns_monotonic_ids() {
     let (_d, db) = mk_db();
     let a = db.take_snapshot(0).unwrap();
