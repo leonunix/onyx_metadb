@@ -154,6 +154,12 @@ struct Inner {
     staged_overlay: HashMap<PageId, Arc<Page>>,
 }
 
+struct CleanPageRun {
+    page_id: PageId,
+    start: usize,
+    end: usize,
+}
+
 impl PagedRefcountArray {
     /// Create a fresh shard backing store. Allocates the meta page
     /// from `page_store`. The returned `meta_page_id()` must be
@@ -272,7 +278,9 @@ impl PagedRefcountArray {
         if pbas.is_empty() {
             return Ok(Vec::new());
         }
-        let pbas_are_sorted = pbas.is_sorted();
+        if pbas.is_sorted() {
+            return self.get_many_sorted_with_page_lsn(pbas);
+        }
 
         let resolved: Vec<(PageId, Option<Arc<Page>>, usize)> = {
             let inner = self.inner.lock();
@@ -297,15 +305,7 @@ impl PagedRefcountArray {
             .iter()
             .filter_map(|(pid, staged, _)| (*pid != 0 && staged.is_none()).then_some(*pid))
             .collect();
-        // Sorted PBAs make every logical refcount-page run contiguous. Filtering
-        // holes and staged pages preserves that property, so equal physical ids
-        // are still grouped even though allocation order does not make the ids
-        // numerically sorted. Arbitrary callers retain the generic cache path.
-        let disk_pages = if pbas_are_sorted {
-            self.page_cache.get_many_grouped(&disk_pids)?
-        } else {
-            self.page_cache.get_many(&disk_pids)?
-        };
+        let disk_pages = self.page_cache.get_many(&disk_pids)?;
         let mut disk_pages = disk_pages.into_iter();
         let mut out = Vec::with_capacity(pbas.len());
         for (pid, staged, slot) in resolved {
@@ -324,6 +324,67 @@ impl PagedRefcountArray {
             out.push((read_entry(&page, slot), page.header()?.generation));
         }
         debug_assert!(disk_pages.next().is_none());
+        Ok(out)
+    }
+
+    /// Sorted hot path used by commit-side refcount staging. Resolve each
+    /// logical refcount page once, borrow cache hits in place, and decode all
+    /// covered PBA slots without expanding one `Arc<Page>` per PBA.
+    pub(crate) fn get_many_sorted_with_page_lsn(
+        &self,
+        pbas: &[Pba],
+    ) -> Result<Vec<(RcEntry, Lsn)>> {
+        if pbas.is_empty() {
+            return Ok(Vec::new());
+        }
+        debug_assert!(
+            pbas.is_sorted(),
+            "sorted refcount lookup requires nondecreasing PBAs"
+        );
+
+        let mut out = vec![(RcEntry::ZERO, 0); pbas.len()];
+        let mut clean_runs = Vec::new();
+        {
+            let inner = self.inner.lock();
+            let overlay_empty = inner.staged_overlay.is_empty();
+            let mut start = 0;
+            while start < pbas.len() {
+                let (page_idx, _) = page_offset(pbas[start]);
+                let mut end = start + 1;
+                while end < pbas.len() && page_offset(pbas[end]).0 == page_idx {
+                    end += 1;
+                }
+
+                let page_id = inner.page_table.get(page_idx).copied().unwrap_or(0);
+                if page_id == 0 {
+                    start = end;
+                    continue;
+                }
+                if !overlay_empty && let Some(page) = inner.staged_overlay.get(&page_id) {
+                    decode_page_run(page, pbas, start, end, &mut out)?;
+                    for _ in start..end {
+                        super::note_staged_overlay_hit();
+                    }
+                } else {
+                    clean_runs.push(CleanPageRun {
+                        page_id,
+                        start,
+                        end,
+                    });
+                }
+                start = end;
+            }
+        }
+
+        let requests: Vec<(PageId, usize)> = clean_runs
+            .iter()
+            .map(|run| (run.page_id, run.end - run.start))
+            .collect();
+        self.page_cache
+            .visit_many_weighted(&requests, |request_idx, page| {
+                let run = &clean_runs[request_idx];
+                decode_page_run(page, pbas, run.start, run.end, &mut out)
+            })?;
         Ok(out)
     }
 
@@ -844,6 +905,21 @@ fn read_entry(page: &Page, slot: usize) -> RcEntry {
     let rc = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
     let birth_lsn = u64::from_le_bytes(payload[off + 4..off + 12].try_into().unwrap());
     RcEntry { rc, birth_lsn }
+}
+
+fn decode_page_run(
+    page: &Page,
+    pbas: &[Pba],
+    start: usize,
+    end: usize,
+    out: &mut [(RcEntry, Lsn)],
+) -> Result<()> {
+    let generation = page.header()?.generation;
+    for idx in start..end {
+        let (_, slot) = page_offset(pbas[idx]);
+        out[idx] = (read_entry(page, slot), generation);
+    }
+    Ok(())
 }
 
 #[inline]

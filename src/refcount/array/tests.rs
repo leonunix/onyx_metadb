@@ -116,6 +116,39 @@ fn sorted_batch_get_preserves_contiguous_slots_from_the_same_page() {
 }
 
 #[test]
+fn sorted_batch_get_handles_page_boundaries_holes_and_reverse_pid_order() {
+    let (_dir, a) = make_array();
+    let p0 = 5;
+    let p0_last = (ENTRIES_PER_PAGE - 1) as Pba;
+    let p1 = (ENTRIES_PER_PAGE + 7) as Pba;
+    let hole = (ENTRIES_PER_PAGE * 2 + 9) as Pba;
+    let p3 = (ENTRIES_PER_PAGE * 3 + 11) as Pba;
+
+    // Allocate the high logical page first so physical PageId order is the
+    // reverse of logical page order.
+    a.apply_deltas(vec![(p3, pending(5, 300))]).unwrap();
+    a.apply_deltas(vec![
+        (p0, pending(2, 100)),
+        (p0_last, pending(4, 101)),
+        (p1, pending(3, 200)),
+    ])
+    .unwrap();
+
+    let got = a
+        .get_many_with_page_lsn(&[p0, p0_last, p1, hole, p3])
+        .unwrap();
+    assert_eq!(got[0].0.rc, 2);
+    assert_eq!(got[0].1, 101);
+    assert_eq!(got[1].0.rc, 4);
+    assert_eq!(got[1].1, 101);
+    assert_eq!(got[2].0.rc, 3);
+    assert_eq!(got[2].1, 200);
+    assert_eq!(got[3], (RcEntry::ZERO, 0));
+    assert_eq!(got[4].0.rc, 5);
+    assert_eq!(got[4].1, 300);
+}
+
+#[test]
 fn round_trip_via_open() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("pages");
@@ -249,6 +282,41 @@ fn staged_fresh_page_survives_cache_eviction() {
     assert_eq!(e.rc, 1);
     assert_eq!(e.birth_lsn, 100);
     assert_eq!(a.page_lsn(7).unwrap(), 100);
+}
+
+#[test]
+fn sorted_batch_get_mixes_cache_miss_hole_and_staged_overlay() {
+    let (_dir, cache, a) = make_array_with_cache();
+    let durable_pba = 7;
+    let hole_pba = (ENTRIES_PER_PAGE + 3) as Pba;
+    let staged_pba = (ENTRIES_PER_PAGE * 2 + 5) as Pba;
+    let staged_next = staged_pba + 1;
+
+    a.apply_deltas(vec![(durable_pba, pending(2, 100))])
+        .unwrap();
+    let durable_pid = a.inner.lock().page_table[0];
+    cache.invalidate(durable_pid);
+    let staged = a
+        .stage_deltas_in_memory(
+            vec![
+                (staged_pba, pending(3, 200)),
+                (staged_next, pending(4, 201)),
+            ],
+            false,
+        )
+        .unwrap();
+    cache.invalidate(staged.pages[0].page_id);
+
+    let got = a
+        .get_many_sorted_with_page_lsn(&[durable_pba, hole_pba, staged_pba, staged_next])
+        .unwrap();
+    assert_eq!(got[0].0.rc, 2);
+    assert_eq!(got[0].1, 100);
+    assert_eq!(got[1], (RcEntry::ZERO, 0));
+    assert_eq!(got[2].0.rc, 3);
+    assert_eq!(got[2].1, 201);
+    assert_eq!(got[3].0.rc, 4);
+    assert_eq!(got[3].1, 201);
 }
 
 #[test]

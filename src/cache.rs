@@ -122,6 +122,13 @@ impl Shard {
         self.lru.as_ref()?.peek(&page_id).cloned()
     }
 
+    fn get_ref(&self, page_id: PageId) -> Option<&Page> {
+        if let Some(page) = self.pinned.get(&page_id) {
+            return Some(page.as_ref());
+        }
+        self.lru.as_ref()?.peek(&page_id).map(Arc::as_ref)
+    }
+
     /// Pinned-table peek without LRU promotion. Returns a clone of
     /// the pinned `Arc<Page>` so callers that want owned bytes can
     /// clone the page without disturbing the pin.
@@ -353,95 +360,128 @@ impl PageCache {
             .collect()
     }
 
-    /// Read pages whose duplicate ids are already grouped into contiguous
-    /// runs. Unlike [`Self::get_many`], this path needs no per-page positions
-    /// map: one cache lookup is expanded directly across each input run.
+    /// Visit distinct page runs while preserving cache statistics in logical
+    /// request units. Cached pages are borrowed under one read lock per shard,
+    /// avoiding an `Arc` clone for every covered refcount entry. Misses retain
+    /// the normal batched read, post-read cache recheck, pin, and insertion
+    /// semantics.
     ///
-    /// The caller must ensure that an id never reappears after a different id.
-    /// Physical ids do not need to be numerically sorted.
-    pub(crate) fn get_many_grouped(&self, page_ids: &[PageId]) -> Result<Vec<Arc<Page>>> {
+    /// `requests[i].1` is the number of logical entries covered by page run
+    /// `i`. `visit` may be invoked in cache-shard order, so callers must use the
+    /// supplied request index rather than relying on callback order.
+    pub(crate) fn visit_many_weighted(
+        &self,
+        requests: &[(PageId, usize)],
+        mut visit: impl FnMut(usize, &Page) -> Result<()>,
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
         #[cfg(debug_assertions)]
         {
             let mut seen = std::collections::HashSet::new();
-            let mut previous = None;
-            for &page_id in page_ids {
-                if previous != Some(page_id) {
-                    debug_assert!(
-                        seen.insert(page_id),
-                        "PageCache::get_many_grouped requires contiguous duplicate ids"
-                    );
-                    previous = Some(page_id);
+            for &(page_id, weight) in requests {
+                debug_assert!(weight > 0, "page-cache run weight must be positive");
+                debug_assert!(
+                    seen.insert(page_id),
+                    "PageCache::visit_many_weighted requires distinct page ids"
+                );
+            }
+        }
+
+        let mut shard_counts = [0usize; CACHE_SHARDS];
+        for &(page_id, _) in requests {
+            shard_counts[self.shard_idx(page_id)] += 1;
+        }
+        let mut shard_offsets = [0usize; CACHE_SHARDS + 1];
+        for shard_idx in 0..CACHE_SHARDS {
+            shard_offsets[shard_idx + 1] = shard_offsets[shard_idx] + shard_counts[shard_idx];
+        }
+        let mut shard_next = shard_offsets;
+        let mut shard_request_indices = vec![0usize; requests.len()];
+        for (request_idx, &(page_id, _)) in requests.iter().enumerate() {
+            let shard_idx = self.shard_idx(page_id);
+            shard_request_indices[shard_next[shard_idx]] = request_idx;
+            shard_next[shard_idx] += 1;
+        }
+
+        let mut hit_count = 0u64;
+        let mut miss_request_indices = Vec::new();
+        for shard_idx in 0..CACHE_SHARDS {
+            let indices =
+                &shard_request_indices[shard_offsets[shard_idx]..shard_offsets[shard_idx + 1]];
+            if indices.is_empty() {
+                continue;
+            }
+            let shard = self.shards[shard_idx].read();
+            for &request_idx in indices {
+                let (page_id, weight) = requests[request_idx];
+                if let Some(page) = shard.get_ref(page_id) {
+                    hit_count += weight as u64;
+                    if let Err(err) = visit(request_idx, page) {
+                        self.hits.fetch_add(hit_count, Ordering::Relaxed);
+                        return Err(err);
+                    }
+                } else {
+                    miss_request_indices.push(request_idx);
                 }
             }
         }
-
-        let mut runs: Vec<(PageId, usize)> = Vec::new();
-        for &page_id in page_ids {
-            if let Some((last_id, count)) = runs.last_mut()
-                && *last_id == page_id
-            {
-                *count += 1;
-                continue;
-            }
-            runs.push((page_id, 1));
+        if hit_count != 0 {
+            self.hits.fetch_add(hit_count, Ordering::Relaxed);
         }
 
-        let mut run_pages: Vec<Option<Arc<Page>>> = vec![None; runs.len()];
-        let mut miss_run_indices = Vec::new();
-        let mut unique_misses = Vec::new();
-        for (run_idx, &(page_id, count)) in runs.iter().enumerate() {
+        if miss_request_indices.is_empty() {
+            return Ok(());
+        }
+        miss_request_indices.sort_unstable();
+        self.misses
+            .fetch_add(miss_request_indices.len() as u64, Ordering::Relaxed);
+        let miss_page_ids: Vec<PageId> = miss_request_indices
+            .iter()
+            .map(|&request_idx| requests[request_idx].0)
+            .collect();
+        let loaded = self.page_store.read_pages(&miss_page_ids)?;
+        if loaded.len() != miss_page_ids.len() {
+            return Err(MetaDbError::Corruption(format!(
+                "page_cache weighted read returned {} pages for {} requests",
+                loaded.len(),
+                miss_page_ids.len()
+            )));
+        }
+        let mut loaded_pages = Vec::with_capacity(loaded.len());
+        for ((request_idx, page_id), page) in miss_request_indices
+            .into_iter()
+            .zip(miss_page_ids)
+            .zip(loaded)
+        {
             let shard_idx = self.shard_idx(page_id);
-            if let Some(page) = self.shards[shard_idx].read().get(page_id) {
-                self.hits.fetch_add(count as u64, Ordering::Relaxed);
-                run_pages[run_idx] = Some(page);
+            let arc = if let Some(existing) = self.shards[shard_idx].read().get(page_id) {
+                existing
             } else {
-                miss_run_indices.push(run_idx);
-                unique_misses.push(page_id);
-            }
-        }
-
-        if !unique_misses.is_empty() {
-            self.misses
-                .fetch_add(unique_misses.len() as u64, Ordering::Relaxed);
-            let loaded = self.page_store.read_pages(&unique_misses)?;
-            for ((run_idx, page_id), page) in
-                miss_run_indices.into_iter().zip(unique_misses).zip(loaded)
-            {
-                let shard_idx = self.shard_idx(page_id);
-                let arc = if let Some(existing) = self.shards[shard_idx].read().get(page_id) {
-                    existing
+                let page = Arc::new(page);
+                let is_index = matches!(
+                    page.header().map(|h| h.page_type),
+                    Ok(crate::page::PageType::PagedIndex)
+                );
+                if is_index && self.pin(page_id, page.clone()) {
+                    page
                 } else {
-                    let page = Arc::new(page);
-                    let is_index = matches!(
-                        page.header().map(|h| h.page_type),
-                        Ok(crate::page::PageType::PagedIndex)
-                    );
-                    if is_index && self.pin(page_id, page.clone()) {
-                        page
+                    let mut shard = self.shards[shard_idx].write();
+                    if let Some(existing) = shard.get(page_id) {
+                        existing
                     } else {
-                        let mut shard = self.shards[shard_idx].write();
-                        if let Some(existing) = shard.get(page_id) {
-                            existing
-                        } else {
-                            self.apply_insert_outcome(shard.insert(page_id, page.clone()));
-                            page
-                        }
+                        self.apply_insert_outcome(shard.insert(page_id, page.clone()));
+                        page
                     }
-                };
-                run_pages[run_idx] = Some(arc);
-            }
+                }
+            };
+            loaded_pages.push((request_idx, arc));
         }
-
-        let mut out = Vec::with_capacity(page_ids.len());
-        for ((_, count), page) in runs.into_iter().zip(run_pages) {
-            let page = page.ok_or_else(|| {
-                MetaDbError::Corruption("page_cache get_many_grouped left an empty result".into())
-            })?;
-            for _ in 0..count {
-                out.push(page.clone());
-            }
+        for (request_idx, page) in loaded_pages {
+            visit(request_idx, &page)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Load a page for mutation.
@@ -667,76 +707,43 @@ mod tests {
     }
 
     #[test]
-    fn grouped_get_preserves_hit_runs_and_counts_each_requested_hit() {
-        let (_dir, ps, cache) = mk_cache(8);
-        let p0 = ps.allocate().unwrap();
-        let p1 = ps.allocate().unwrap();
-        write_page(&ps, p0, 10);
-        write_page(&ps, p1, 20);
-        cache.get(p0).unwrap();
-        cache.get(p1).unwrap();
-        let before = cache.stats();
-
-        // Run order is deliberately not numeric PageId order.
-        let pages = cache.get_many_grouped(&[p1, p1, p0, p0, p0]).unwrap();
-        assert_eq!(
-            pages
-                .iter()
-                .map(|page| page.generation())
-                .collect::<Vec<_>>(),
-            vec![20, 20, 10, 10, 10]
-        );
-        let after = cache.stats();
-        assert_eq!(after.hits - before.hits, 5);
-        assert_eq!(after.misses, before.misses);
-    }
-
-    #[test]
-    fn grouped_get_reads_one_miss_for_a_repeated_run() {
-        let (_dir, ps, cache) = mk_cache(8);
-        let pid = ps.allocate().unwrap();
-        write_page(&ps, pid, 7);
-
-        let pages = cache.get_many_grouped(&[pid, pid, pid]).unwrap();
-        assert_eq!(cache.stats().misses, 1);
-        assert_eq!(cache.stats().current_pages, 1);
-        assert!(Arc::ptr_eq(&pages[0], &pages[1]));
-        assert!(Arc::ptr_eq(&pages[1], &pages[2]));
-    }
-
-    #[test]
-    fn grouped_get_handles_mixed_hit_and_miss_runs_in_order() {
-        let (_dir, ps, cache) = mk_cache(8);
+    fn weighted_visitor_decodes_hits_and_misses_in_request_slots() {
+        let (_dir, ps, cache) = mk_cache(16);
         let p0 = ps.allocate().unwrap();
         let p1 = ps.allocate().unwrap();
         let p2 = ps.allocate().unwrap();
         write_page(&ps, p0, 10);
         write_page(&ps, p1, 20);
         write_page(&ps, p2, 30);
+        cache.get(p0).unwrap();
         cache.get(p1).unwrap();
         let before = cache.stats();
 
-        let pages = cache.get_many_grouped(&[p2, p2, p0, p1, p1]).unwrap();
-        assert_eq!(
-            pages
-                .iter()
-                .map(|page| page.generation())
-                .collect::<Vec<_>>(),
-            vec![30, 30, 10, 20, 20]
-        );
+        let requests = [(p1, 3), (p2, 2), (p0, 4)];
+        let mut generations = vec![0; requests.len()];
+        cache
+            .visit_many_weighted(&requests, |request_idx, page| {
+                generations[request_idx] = page.header()?.generation;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(generations, vec![20, 30, 10]);
         let after = cache.stats();
-        assert_eq!(after.hits - before.hits, 2);
-        assert_eq!(after.misses - before.misses, 2);
+        assert_eq!(after.hits - before.hits, 7);
+        assert_eq!(after.misses - before.misses, 1);
+        assert_eq!(after.current_pages, 3);
     }
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "get_many_grouped requires contiguous duplicate ids")]
-    fn grouped_get_debug_contract_rejects_noncontiguous_duplicates() {
+    #[should_panic(expected = "visit_many_weighted requires distinct page ids")]
+    fn weighted_visitor_debug_contract_rejects_duplicate_ids() {
         let (_dir, ps, cache) = mk_cache(8);
-        let p0 = ps.allocate().unwrap();
-        let p1 = ps.allocate().unwrap();
-        cache.get_many_grouped(&[p0, p1, p0]).unwrap();
+        let page_id = ps.allocate().unwrap();
+        cache
+            .visit_many_weighted(&[(page_id, 1), (page_id, 2)], |_, _| Ok(()))
+            .unwrap();
     }
 
     #[test]

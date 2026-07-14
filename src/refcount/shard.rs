@@ -395,7 +395,7 @@ impl RcShard {
         self.stage_inner(bfg, pba, delta, lsn, true)
     }
 
-    /// Batch [`Self::stage`] for a set of distinct PBAs routed to this shard.
+    /// Batch [`Self::stage`] for strictly increasing PBAs routed to this shard.
     /// All four BFG slots and the refcount page table are sampled once, then
     /// the Open-slot deltas are merged under the same lock set. This preserves
     /// per-PBA replay-skip and underflow semantics while eliminating the six
@@ -410,11 +410,8 @@ impl RcShard {
             return Ok((Vec::new(), RefcountApplyStageTimings::default()));
         }
         debug_assert!(
-            actions
-                .iter()
-                .enumerate()
-                .all(|(idx, (pba, _))| actions[..idx].iter().all(|(prev, _)| prev != pba)),
-            "RcShard::stage_batch requires distinct PBAs"
+            actions.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "RcShard::stage_batch requires strictly increasing PBAs"
         );
 
         // Sample by commit LSN, not by PBA. A sampled commit therefore keeps
@@ -428,7 +425,7 @@ impl RcShard {
 
         let lookup_started = sample_breakdown.then(Instant::now);
         let pbas: Vec<Pba> = actions.iter().map(|(pba, _)| *pba).collect();
-        let bases = self.array.get_many_with_page_lsn(&pbas)?;
+        let bases = self.array.get_many_sorted_with_page_lsn(&pbas)?;
         let base_page_lookup = lookup_started.map_or(Duration::ZERO, |start| start.elapsed());
 
         let mut out = Vec::with_capacity(actions.len());
