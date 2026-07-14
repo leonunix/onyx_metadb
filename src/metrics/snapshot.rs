@@ -1,5 +1,8 @@
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MetaMetricsSnapshot {
+    /// 0 = threads-off/all-slots, 1 = threads-on legacy one-shot,
+    /// 2 = threads-on bounded streaming.
+    pub rc_checkpoint_mode: u64,
     pub commit_attempts: u64,
     pub commit_success: u64,
     pub commit_errors: u64,

@@ -3,6 +3,7 @@ use super::super::*;
 impl MetaMetrics {
     pub fn snapshot(&self) -> MetaMetricsSnapshot {
         MetaMetricsSnapshot {
+            rc_checkpoint_mode: load(&self.rc_checkpoint_mode),
             commit_attempts: load(&self.commit_attempts),
             commit_success: load(&self.commit_success),
             commit_errors: load(&self.commit_errors),

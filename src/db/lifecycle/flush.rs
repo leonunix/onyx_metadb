@@ -747,10 +747,12 @@ impl Db {
         drop(l2p_guards);
         let l2p_walk_elapsed = l2p_walk_started.elapsed();
         // Refcount sample: threads-OFF keeps the legacy in-memory-only fold.
-        // Threads-ON uses the bounded streaming fold: each shard stages at
-        // most 4096 unique data pages under its fold lock, writes that chunk
-        // after releasing the lock, then drops its payload Arcs. Meta-chain
-        // rewrite and the checkpoint-wide sync still happen below.
+        // Threads-ON normally uses the bounded streaming fold: each shard
+        // stages at most 4096 unique data pages under its fold lock, writes
+        // that chunk after releasing the lock, then drops its payload Arcs.
+        // The diagnostic A/B switch can select the legacy one-shot fold while
+        // keeping the same BFG boundary. Meta-chain rewrite and the
+        // checkpoint-wide sync still happen below.
         //
         // Per-shard `begin_checkpoint` is independent — each shard
         // touches only its own DeltaMap, page_table, and overlay. Allocation
@@ -776,6 +778,7 @@ impl Db {
         // `drain_syncing_slot_into_trees`. threads-OFF (inline flush is the
         // sole drainer) folds every slot, mirroring `force_compact_l2p_buffers`.
         let bfg_threads_enabled = self.bfg_threads_enabled;
+        let rc_checkpoint_streaming_enabled = self.rc_checkpoint_streaming_enabled;
         let rc_drain_started = std::time::Instant::now();
         let rc_results: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> =
             std::thread::scope(|scope| {
@@ -783,8 +786,10 @@ impl Db {
                 for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
                     if selected.rc[s_idx] {
                         let h = scope.spawn(move || {
-                            if bfg_threads_enabled {
+                            if bfg_threads_enabled && rc_checkpoint_streaming_enabled {
                                 shard.rc.begin_checkpoint_streaming(bfg)
+                            } else if bfg_threads_enabled {
+                                shard.rc.begin_checkpoint(bfg)
                             } else {
                                 shard.rc.begin_checkpoint_all_slots(false)
                             }

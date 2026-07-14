@@ -1193,6 +1193,7 @@ fn rc_authoritative_bfg_threads_rc_exact_across_checkpoints() {
         assert_eq!(db.get_refcount(old).unwrap(), 0, "pba {old} fully decref'd");
     }
     let metrics = db.metrics_snapshot();
+    assert_eq!(metrics.rc_checkpoint_mode, 2);
     assert!(metrics.flush_rc_stream_pages > 0);
     assert!(
         metrics.flush_pages_written >= metrics.flush_rc_stream_pages,
@@ -1207,6 +1208,41 @@ fn rc_authoritative_bfg_threads_rc_exact_across_checkpoints() {
     assert!(metrics.flush_rc_fold_service_us > 0);
 }
 
+/// The production binary keeps an exact A/B escape hatch for the old
+/// threads-on checkpoint shape. Disabling streaming must preserve refcount
+/// semantics while leaving the streaming counters at zero.
+#[test]
+fn rc_checkpoint_streaming_toggle_selects_legacy_threads_on_path() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = rc_auth_cfg(dir.path(), true);
+    cfg.rc_checkpoint_streaming_enabled = false;
+    let db = Db::create_with_config(cfg).unwrap();
+
+    for generation in 1u64..=6 {
+        let new_pba = 700 + generation;
+        let old_pba = 700 + generation - 1;
+        let mut tx = db.begin();
+        tx.l2p_remap(
+            BOOTSTRAP_VOLUME_ORD,
+            19,
+            remap_val(new_pba, generation as u8),
+            None,
+        );
+        tx.commit_with_outcomes().unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get_refcount(new_pba).unwrap(), 1);
+        if generation > 1 {
+            assert_eq!(db.get_refcount(old_pba).unwrap(), 0);
+        }
+    }
+
+    let metrics = db.metrics_snapshot();
+    assert_eq!(metrics.rc_checkpoint_mode, 1);
+    assert_eq!(metrics.flush_rc_stream_calls, 0);
+    assert_eq!(metrics.flush_rc_stream_pages, 0);
+    assert!(metrics.flush_pages_written > 0);
+}
+
 /// Checkpoint → durable → reopen preserves rc. metadb has no data-plane WAL,
 /// so after a `flush()` checkpoint the rc must be durable in the array; a
 /// reopen (which only replays the lifecycle journal, not commit_ops) must see
@@ -1214,10 +1250,12 @@ fn rc_authoritative_bfg_threads_rc_exact_across_checkpoints() {
 /// manifest commit → reopen path for both threads-on and threads-off.
 #[test]
 fn rc_authoritative_checkpoint_then_reopen_preserves_rc() {
-    for bfg_threads in [false, true] {
+    for (bfg_threads, streaming) in [(false, true), (true, false), (true, true)] {
         let dir = TempDir::new().unwrap();
         {
-            let db = Db::create_with_config(rc_auth_cfg(dir.path(), bfg_threads)).unwrap();
+            let mut cfg = rc_auth_cfg(dir.path(), bfg_threads);
+            cfg.rc_checkpoint_streaming_enabled = streaming;
+            let db = Db::create_with_config(cfg).unwrap();
             // Two distinct live references + one overwrite that frees a pba.
             let mut tx = db.begin();
             tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(500, 1), None);
@@ -1234,21 +1272,23 @@ fn rc_authoritative_checkpoint_then_reopen_preserves_rc() {
             assert_eq!(db.get_refcount(600).unwrap(), 1, "pre-reopen: 600 live");
         }
         // Reopen: rc must survive the checkpoint durably (no commit replay).
-        let db = Db::open_with_config(rc_auth_cfg(dir.path(), bfg_threads)).unwrap();
+        let mut cfg = rc_auth_cfg(dir.path(), bfg_threads);
+        cfg.rc_checkpoint_streaming_enabled = streaming;
+        let db = Db::open_with_config(cfg).unwrap();
         assert_eq!(
             db.get_refcount(500).unwrap(),
             0,
-            "bfg_threads={bfg_threads}: freed pba stays 0 across reopen"
+            "bfg_threads={bfg_threads} streaming={streaming}: freed pba stays 0 across reopen"
         );
         assert_eq!(
             db.get_refcount(501).unwrap(),
             1,
-            "bfg_threads={bfg_threads}: live pba 501 survives reopen"
+            "bfg_threads={bfg_threads} streaming={streaming}: live pba 501 survives reopen"
         );
         assert_eq!(
             db.get_refcount(600).unwrap(),
             1,
-            "bfg_threads={bfg_threads}: live pba 600 survives reopen"
+            "bfg_threads={bfg_threads} streaming={streaming}: live pba 600 survives reopen"
         );
     }
 }

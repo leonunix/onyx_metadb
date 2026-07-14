@@ -335,6 +335,10 @@ pub struct Db {
     /// and `flush_with_gate` reaches durability via `force_roll +
     /// wait_until_synced`.
     pub(crate) bfg_threads_enabled: bool,
+    /// Cached copy of `Config::rc_checkpoint_streaming_enabled`. Only affects
+    /// the threads-on RC checkpoint implementation; false selects the legacy
+    /// one-shot fold/write path for an exact A/B.
+    pub(crate) rc_checkpoint_streaming_enabled: bool,
     /// Cached copy of `Config::parallel_l2p_drain_enabled`. Fans the
     /// per-BFG L2P syncing-slot drain out across shards when `true`.
     pub(crate) parallel_l2p_drain_enabled: bool,

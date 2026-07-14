@@ -337,6 +337,13 @@ pub struct Config {
     /// callers fold and flush through the inline path.
     pub bfg_threads_enabled: bool,
 
+    /// Stream threads-on refcount checkpoint data pages in bounded chunks.
+    /// When `false`, the sync worker uses the legacy one-shot
+    /// `begin_checkpoint(bfg)` path and retains every sealed page until the
+    /// global checkpoint write. This is an exact diagnostic A/B switch; it
+    /// does not change BFG rolling, shard selection, or commit concurrency.
+    pub rc_checkpoint_streaming_enabled: bool,
+
     /// Fan the per-BFG L2P syncing-slot drain out across shards (one task
     /// per shard) instead of folding them serially on the single
     /// `metadb-bfg-sync` thread. Each shard is independent (own `tree`
@@ -697,6 +704,10 @@ impl Config {
             l2p_buffer_max_interval_ms: 30_000,
             // BFG worker threads default-off in the generic config; see field doc.
             bfg_threads_enabled: false,
+            // Preserve the production streaming checkpoint path whenever BFG
+            // workers are enabled. Tests/benchmarks can disable it explicitly
+            // to recover the legacy one-shot memory shape.
+            rc_checkpoint_streaming_enabled: true,
             // Parallel per-shard L2P drain default-OFF: disproven on nvme-box
             // (3-4× regression — spawned threads inherit the bfg-sync CPU
             // pinning + the drain wasn't the healthy-window gate). Kept behind

@@ -115,6 +115,8 @@ impl Db {
             cfg.index_pin_bytes,
         ));
         let metrics = Arc::new(MetaMetrics::new());
+        metrics
+            .set_rc_checkpoint_mode(cfg.bfg_threads_enabled, cfg.rc_checkpoint_streaming_enabled);
         page_store.attach_metrics(metrics.clone());
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_or_create(page_store.clone(), page_cache.clone(), faults.clone())?;
@@ -298,6 +300,7 @@ impl Db {
             // first Open BFG is 1.
             bfg: Arc::new(crate::bfg::BfgStateMachine::new(0)),
             bfg_threads_enabled: cfg.bfg_threads_enabled,
+            rc_checkpoint_streaming_enabled: cfg.rc_checkpoint_streaming_enabled,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
             l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
             l2p_checkpoint_pipeline_enabled: cfg.l2p_checkpoint_pipeline_enabled,
@@ -463,6 +466,8 @@ impl Db {
             cfg.index_pin_bytes,
         ));
         let metrics = Arc::new(MetaMetrics::new());
+        metrics
+            .set_rc_checkpoint_mode(cfg.bfg_threads_enabled, cfg.rc_checkpoint_streaming_enabled);
         page_store.attach_metrics(metrics.clone());
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_existing(page_store.clone(), page_cache.clone(), faults.clone())?;
@@ -1058,6 +1063,7 @@ impl Db {
             // them with a fresh checkpoint_bfg.
             bfg: Arc::new(crate::bfg::BfgStateMachine::new(manifest_checkpoint_bfg)),
             bfg_threads_enabled: cfg.bfg_threads_enabled,
+            rc_checkpoint_streaming_enabled: cfg.rc_checkpoint_streaming_enabled,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
             l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
             l2p_checkpoint_pipeline_enabled: cfg.l2p_checkpoint_pipeline_enabled,

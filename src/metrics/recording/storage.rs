@@ -4,6 +4,17 @@ use std::time::Duration;
 use super::super::*;
 
 impl MetaMetrics {
+    pub(crate) fn set_rc_checkpoint_mode(&self, bfg_threads: bool, streaming: bool) {
+        let mode = if !bfg_threads {
+            0
+        } else if streaming {
+            2
+        } else {
+            1
+        };
+        self.rc_checkpoint_mode.store(mode, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_flush_attempt(&self, kind: FlushKind) {
         self.flush_calls.fetch_add(1, Ordering::Relaxed);
         match kind {

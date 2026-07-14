@@ -459,6 +459,9 @@ pub struct MetaMetrics {
     // The `_steady` / `_forced` siblings split the same numbers by
     // [`FlushKind`] so dashboards can separate the running-period
     // checkpoint cadence from forced / shutdown-drain flushes.
+    // 0 = threads-off/all-slots, 1 = threads-on legacy one-shot,
+    // 2 = threads-on bounded streaming. Set once when Db is opened.
+    rc_checkpoint_mode: AtomicU64,
     flush_calls: AtomicU64,
     flush_calls_steady: AtomicU64,
     flush_calls_forced: AtomicU64,
@@ -870,6 +873,7 @@ mod tests {
     #[test]
     fn flush_rc_streaming_metrics_reach_snapshot_and_json() {
         let metrics = MetaMetrics::default();
+        metrics.set_rc_checkpoint_mode(true, true);
         metrics.record_flush_rc_stream(3, 17, 41, 19, 8);
         metrics.record_flush_rc_stream(2, 9, 23, 29, 4);
         metrics.record_flush_rc_fold_service(31);
@@ -878,6 +882,7 @@ mod tests {
         metrics.record_flush_sample_workload(5, 101, 0, 12);
 
         let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.rc_checkpoint_mode, 2);
         assert_eq!(snapshot.flush_rc_stream_calls, 5);
         assert_eq!(snapshot.flush_rc_stream_pages, 26);
         assert_eq!(snapshot.flush_rc_stream_service_us, 64);
@@ -894,6 +899,7 @@ mod tests {
         assert_eq!(snapshot.flush_sample_rc_staged_pages_max, 12);
 
         let json = snapshot.to_json();
+        assert!(json.contains("\"rc_checkpoint_mode\":2"));
         assert!(json.contains("\"flush_rc_stream_calls\":5"));
         assert!(json.contains("\"flush_rc_stream_pages\":26"));
         assert!(json.contains("\"flush_rc_stream_service_us\":64"));
