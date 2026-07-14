@@ -499,6 +499,7 @@ impl Db {
             self.stamp_replay_watermarks(&mut mstate.manifest);
             let mut manifest = mstate.manifest.clone();
             mstate.store.commit(&mut manifest)?;
+            mstate.manifest = manifest;
             dedup_update
         };
         commit_l2p_checkpoint(&mut l2p_guards, dedup_generation)?;

@@ -595,6 +595,7 @@ fn advance_head_pid_durable(
     {
         let mut mstate = ctx.manifest_state.lock();
         mstate.store.commit(&mut manifest_for_commit)?;
+        mstate.manifest = manifest_for_commit;
     }
 
     // Manifest commit is durable. Promote atomics so subsequent

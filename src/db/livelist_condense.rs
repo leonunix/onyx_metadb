@@ -264,6 +264,7 @@ fn condense_one(
     {
         let mut mstate = inner.manifest_state.lock();
         mstate.store.commit(&mut manifest_for_commit)?;
+        mstate.manifest = manifest_for_commit;
     }
 
     // 5. Manifest durable — promote the in-memory anchors so the next flush

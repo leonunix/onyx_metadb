@@ -161,8 +161,22 @@ fn device_open_lifts_frontier_past_dedup_pages() {
         db.put_dedup(h(n), dv(n as u8)).unwrap();
     }
     db.flush().unwrap();
+    // Persist an empty larger NEW table. Its stable meta head is now covered by
+    // gen N, while data pages populated below remain a between-manifest update.
+    db.dedup_resize_begin(1024).unwrap();
+    let durable_n = crate::manifest::ManifestStore::load_latest(&db.page_store)
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.manifest(), durable_n.manifest);
     let high_water_n = db.manifest().page_high_water;
     assert!(high_water_n > FIRST_DATA_PAGE);
+
+    // A completed flush can leave reusable interior pages below H_N. Consume
+    // them first so the between-flush cuckoo growth deterministically extends
+    // the frontier instead of merely popping old free-list entries.
+    while db.page_store.free_list_len() > 0 {
+        let _ = db.page_store.allocate().unwrap();
+    }
 
     // Between-flush cohort: allocate more cuckoo pages ABOVE H_N. Distinct
     // fingerprints force fresh bucket/data pages.
