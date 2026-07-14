@@ -450,10 +450,10 @@ impl PagedRefcountArray {
     /// [`stage_one_page`].
     pub fn stage_deltas_in_memory(
         &self,
-        deltas: Vec<(Pba, Pending)>,
+        mut deltas: Vec<(Pba, Pending)>,
         force: bool,
     ) -> Result<StagedDeltas> {
-        self.stage_deltas_in_memory_with_force_increfs(deltas, force, &[])
+        self.stage_deltas_in_memory_preserving(&mut deltas, force, &[])
     }
 
     /// Like [`Self::stage_deltas_in_memory`] but additionally applies a set
@@ -472,7 +472,19 @@ impl PagedRefcountArray {
     /// incref set from the queued snapshot task each cycle attempt).
     pub fn stage_deltas_in_memory_with_force_increfs(
         &self,
-        deltas: Vec<(Pba, Pending)>,
+        mut deltas: Vec<(Pba, Pending)>,
+        force: bool,
+        force_increfs: &[Pba],
+    ) -> Result<StagedDeltas> {
+        self.stage_deltas_in_memory_preserving(&mut deltas, force, force_increfs)
+    }
+
+    /// Stage a fold while retaining the caller's delta vector for checkpoint
+    /// rollback. Sorting the slice in place groups logical data pages without
+    /// cloning the full delta set or allocating one small `Vec` per page.
+    pub(crate) fn stage_deltas_in_memory_preserving(
+        &self,
+        deltas: &mut [(Pba, Pending)],
         force: bool,
         force_increfs: &[Pba],
     ) -> Result<StagedDeltas> {
@@ -483,11 +495,11 @@ impl PagedRefcountArray {
             });
         }
 
-        let mut by_page: HashMap<usize, Vec<(usize, Pending)>> = HashMap::new();
-        for (pba, pending) in deltas {
-            let (page_idx, slot) = page_offset(pba);
-            by_page.entry(page_idx).or_default().push((slot, pending));
-        }
+        // Stable ordering preserves the former slot-by-slot insertion order
+        // when the all-slot recovery path contributes the same PBA more than
+        // once. Production's one-slot fold has distinct PBAs.
+        deltas.sort_by_key(|(pba, _)| page_offset(*pba).0);
+
         // Force-increfs grouped by data page. A page may appear in both maps
         // (a snapshot root that also took a COW delta this cycle) or only
         // here (an unmodified shared root) — the union is walked below.
@@ -498,27 +510,46 @@ impl PagedRefcountArray {
         }
 
         let mut max_lsn: Lsn = 0;
-        let mut pages = Vec::with_capacity(by_page.len() + force_by_page.len());
-        let mut seen_pages = std::collections::HashSet::new();
-        let page_idxs: Vec<usize> = by_page
-            .keys()
-            .chain(force_by_page.keys())
-            .copied()
-            .filter(|idx| seen_pages.insert(*idx))
-            .collect();
+        let mut page_idxs = Vec::new();
+        let mut cursor = 0;
+        while cursor < deltas.len() {
+            let page_idx = page_offset(deltas[cursor].0).0;
+            page_idxs.push(page_idx);
+            cursor += 1;
+            while cursor < deltas.len() && page_offset(deltas[cursor].0).0 == page_idx {
+                cursor += 1;
+            }
+        }
+        page_idxs.extend(force_by_page.keys().copied());
+        page_idxs.sort_unstable();
+        page_idxs.dedup();
+
+        let mut pages = Vec::with_capacity(page_idxs.len());
         let page_bases = self.resolve_stage_page_bases(&page_idxs)?;
+        let mut delta_cursor = 0;
         for page_base in page_bases {
-            let slot_pendings = by_page.remove(&page_base.page_idx).unwrap_or_default();
+            let delta_start = delta_cursor;
+            while delta_cursor < deltas.len()
+                && page_offset(deltas[delta_cursor].0).0 == page_base.page_idx
+            {
+                delta_cursor += 1;
+            }
             let force_slots = force_by_page
                 .remove(&page_base.page_idx)
                 .unwrap_or_default();
-            let staged = self.stage_one_page(page_base, slot_pendings, force, &force_slots)?;
+            let staged = self.stage_one_page(
+                page_base,
+                &deltas[delta_start..delta_cursor],
+                force,
+                &force_slots,
+            )?;
             let page_gen = staged.sealed.header()?.generation;
             if page_gen > max_lsn {
                 max_lsn = page_gen;
             }
             pages.push(staged);
         }
+        debug_assert_eq!(delta_cursor, deltas.len());
         Ok(StagedDeltas { pages, max_lsn })
     }
 
@@ -588,7 +619,7 @@ impl PagedRefcountArray {
     fn stage_one_page(
         &self,
         page_base: StagePageBase,
-        slot_pendings: Vec<(usize, Pending)>,
+        pba_pendings: &[(Pba, Pending)],
         force: bool,
         force_incref_slots: &[usize],
     ) -> Result<StagedPage> {
@@ -619,7 +650,9 @@ impl PagedRefcountArray {
 
         let page_generation = page.header()?.generation;
         let mut max_lsn = page_generation;
-        for (slot, pending) in slot_pendings {
+        for &(pba, pending) in pba_pendings {
+            let (pending_page_idx, slot) = page_offset(pba);
+            debug_assert_eq!(pending_page_idx, page_idx);
             // Replay-skip: a previous checkpoint attempt may have
             // written this page's deltas to disk before failing
             // (write_meta_chain_external / manifest commit / etc.).

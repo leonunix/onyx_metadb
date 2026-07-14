@@ -650,11 +650,9 @@ impl RcShard {
         // clearing the slots yet. `force` (cold lifecycle flush) applies
         // every delta despite the per-page replay-skip generation guard;
         // `force_increfs` is the always-apply / no-gen-bump snapshot incref.
-        let staged = self.array.stage_deltas_in_memory_with_force_increfs(
-            drained.clone(),
-            force,
-            force_increfs,
-        )?;
+        let staged =
+            self.array
+                .stage_deltas_in_memory_preserving(&mut drained, force, force_increfs)?;
 
         // Publish is visible now; clear the folded slots. They are frozen
         // (Syncing / threads-off quiesce) so a fresh `DeltaMap` discards

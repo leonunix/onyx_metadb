@@ -130,6 +130,37 @@ fn checkpoint_stage_batches_existing_page_cache_misses() {
 }
 
 #[test]
+fn checkpoint_stage_preserves_rollback_deltas_while_grouping_pages() {
+    let (_dir, array) = make_array();
+    let p0 = 7;
+    let p1 = (ENTRIES_PER_PAGE + 9) as Pba;
+    array
+        .apply_deltas(vec![(p0, pending(1, 100)), (p1, pending(2, 100))])
+        .unwrap();
+
+    // Same-PBA entries model the all-slot recovery fold. Their relative order
+    // must survive page grouping, and the caller must retain every entry for a
+    // possible checkpoint abort.
+    let mut deltas = vec![
+        (p1, pending(1, 201)),
+        (p0, pending(1, 200)),
+        (p0, pending(-1, 202)),
+    ];
+    let staged = array
+        .stage_deltas_in_memory_preserving(&mut deltas, false, &[])
+        .unwrap();
+
+    assert_eq!(deltas.len(), 3);
+    assert_eq!(deltas[0].0, p0);
+    assert_eq!(deltas[1].0, p0);
+    assert_eq!(deltas[0].1.last_lsn, 200);
+    assert_eq!(deltas[1].1.last_lsn, 202);
+    array.write_staged_pages(&staged).unwrap();
+    assert_eq!(array.get(p0).unwrap().rc, 1);
+    assert_eq!(array.get(p1).unwrap().rc, 3);
+}
+
+#[test]
 fn batch_get_returns_entries_and_page_generations_in_input_order() {
     let (_dir, a) = make_array();
     let p0 = 5;
