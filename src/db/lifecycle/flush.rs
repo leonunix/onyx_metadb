@@ -19,6 +19,7 @@ struct SyncCycleTrace {
     publish_barrier_wait_us: u64,
     manifest_us: u64,
     install_us: u64,
+    checkpoint_free_us: u64,
     prefold_wait_us: u64,
     reclaim_us: u64,
     selected_l2p_shards: u64,
@@ -31,6 +32,7 @@ struct SyncCycleTrace {
     rc_staged_pages: u64,
     rc_stream_pages: u64,
     nonstream_write_pages: u64,
+    checkpoint_free_pages: u64,
 }
 
 impl SyncCycleTrace {
@@ -76,6 +78,7 @@ impl SyncCycleTrace {
             publish_barrier_wait_us = self.publish_barrier_wait_us,
             manifest_us = self.manifest_us,
             install_us = self.install_us,
+            checkpoint_free_us = self.checkpoint_free_us,
             prefold_wait_us = self.prefold_wait_us,
             reclaim_us = self.reclaim_us,
             selected_l2p_shards = self.selected_l2p_shards,
@@ -88,6 +91,7 @@ impl SyncCycleTrace {
             rc_staged_pages = self.rc_staged_pages,
             rc_stream_pages = self.rc_stream_pages,
             nonstream_write_pages = self.nonstream_write_pages,
+            checkpoint_free_pages = self.checkpoint_free_pages,
             "metadb: slow checkpoint cycle"
         );
     }
@@ -2020,12 +2024,18 @@ impl Db {
         trace.install_us = micros(install_elapsed);
         self.metrics.record_flush_install(install_elapsed);
 
+        trace.checkpoint_free_pages = checkpoint_frees.len() as u64;
         if !checkpoint_frees.is_empty() {
-            self.page_store
-                .free_many(&checkpoint_frees, tree_generation)?;
-            for pid in checkpoint_frees {
-                self.page_cache.invalidate(pid);
+            trace.terminal_phase = "checkpoint_free";
+            let checkpoint_free_started = std::time::Instant::now();
+            let checkpoint_free_result = self
+                .page_store
+                .free_many(&checkpoint_frees, tree_generation);
+            if checkpoint_free_result.is_ok() {
+                self.page_cache.invalidate_many(&checkpoint_frees);
             }
+            trace.checkpoint_free_us = micros(checkpoint_free_started.elapsed());
+            checkpoint_free_result?;
         }
 
         if let Some(ticket) = prefold_ticket {

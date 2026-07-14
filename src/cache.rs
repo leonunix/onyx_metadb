@@ -565,6 +565,38 @@ impl PageCache {
         }
     }
 
+    /// Remove several page ids from the cache, taking each affected shard's
+    /// write lock once. Counter updates are aggregated across the whole batch
+    /// so large checkpoint retire lists do not perform atomics per page.
+    pub fn invalidate_many(&self, page_ids: &[PageId]) {
+        let mut by_shard: [Vec<PageId>; CACHE_SHARDS] = std::array::from_fn(|_| Vec::new());
+        for &page_id in page_ids {
+            by_shard[self.shard_idx(page_id)].push(page_id);
+        }
+
+        let mut removed_pinned = 0u64;
+        let mut removed_lru = 0u64;
+        for (shard_idx, page_ids) in by_shard.into_iter().enumerate() {
+            if page_ids.is_empty() {
+                continue;
+            }
+            let mut shard = self.shards[shard_idx].write();
+            for page_id in page_ids {
+                let (was_pinned, was_in_lru) = shard.invalidate(page_id);
+                removed_pinned += u64::from(was_pinned);
+                removed_lru += u64::from(was_in_lru);
+            }
+        }
+
+        if removed_pinned != 0 {
+            self.pinned_pages
+                .fetch_sub(removed_pinned, Ordering::Relaxed);
+        }
+        if removed_lru != 0 {
+            self.current_pages.fetch_sub(removed_lru, Ordering::Relaxed);
+        }
+    }
+
     /// Remove a contiguous run of pages from the cache.
     pub fn invalidate_run(&self, start: PageId, count: u32) {
         for page_id in start..start + count as u64 {
@@ -917,6 +949,48 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.pinned_pages, 0);
         assert_eq!(stats.current_pages, 0);
+    }
+
+    #[test]
+    fn invalidate_many_matches_scalar_semantics_and_counters() {
+        let (_dir, ps, scalar) = mk_cache_with_pin(64, 64);
+        let batch =
+            PageCache::new_with_pin_budget(ps, 64 * PAGE_SIZE as u64, 64 * PAGE_SIZE as u64);
+        let pinned_targets = [1, 17];
+        let lru_targets = [2, 18];
+        let pinned_survivor = 3;
+        let lru_survivor = 4;
+
+        for cache in [&scalar, &batch] {
+            for &page_id in &pinned_targets {
+                assert!(cache.pin(page_id, Arc::new(Page::zeroed())));
+            }
+            for &page_id in &lru_targets {
+                cache.insert(page_id, Arc::new(Page::zeroed()));
+            }
+            assert!(cache.pin(pinned_survivor, Arc::new(Page::zeroed())));
+            cache.insert(lru_survivor, Arc::new(Page::zeroed()));
+        }
+
+        // Include a duplicate and a missing id: repeated scalar invalidation is
+        // a no-op after the first removal, and the batch API must match it.
+        let targets = [1, 2, 17, 18, 1, 999];
+        for &page_id in &targets {
+            scalar.invalidate(page_id);
+        }
+        batch.invalidate_many(&targets);
+
+        assert_eq!(batch.stats(), scalar.stats());
+        assert_eq!(batch.stats().pinned_pages, 1);
+        assert_eq!(batch.stats().current_pages, 1);
+        for page_id in pinned_targets.into_iter().chain(lru_targets) {
+            let shard_idx = batch.shard_idx(page_id);
+            assert!(batch.shards[shard_idx].read().get(page_id).is_none());
+        }
+        for page_id in [pinned_survivor, lru_survivor] {
+            let shard_idx = batch.shard_idx(page_id);
+            assert!(batch.shards[shard_idx].read().get(page_id).is_some());
+        }
     }
 
     #[test]
