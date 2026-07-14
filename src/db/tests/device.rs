@@ -565,6 +565,14 @@ fn device_persisted_free_list_preserves_dedup_frontier() {
     }
     make_interior_free_pages(&db, 200);
     db.flush().unwrap();
+    let durable = crate::manifest::ManifestStore::load_latest(&db.page_store)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.manifest(),
+        durable.manifest,
+        "cached manifest must match the exact generation published by prepare_commit"
+    );
     let high_water_n = db.manifest().page_high_water;
     assert_ne!(db.manifest().free_list_head, crate::types::NULL_PAGE);
     let free_before = db.page_store.free_list_len();

@@ -1569,6 +1569,10 @@ impl Db {
                 return Err(err);
             }
         };
+        // `prepare_commit` fills device-derived fields on the staged clone
+        // (catalog/free-list heads and page_high_water). Once publication is
+        // durable, make that exact generation the cached manifest too.
+        manifest_state.manifest = manifest;
         drop(publish_io_guard);
         self.metrics
             .record_flush_manifest(manifest_started.elapsed());
