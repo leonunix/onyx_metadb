@@ -62,6 +62,11 @@ pub(crate) const ENTRY_BYTES: usize = 12;
 const META_KEY_COUNT_MARKER: u16 = 0xFFFF;
 const DATA_KEY_COUNT_MARKER: u16 = 0;
 
+// A checkpoint can touch millions of sparse refcount pages. Keep the base-page
+// read parallelism bounded so the returned Arc<Page>s cannot pin an entire
+// checkpoint above the configured cache capacity while sealed pages accumulate.
+const STAGE_BASE_READ_BATCH_PAGES: usize = 4096;
+
 const _: () = {
     assert!(ENTRIES_PER_PAGE * ENTRY_BYTES == PAGE_PAYLOAD_SIZE);
 };
@@ -525,29 +530,34 @@ impl PagedRefcountArray {
         page_idxs.dedup();
 
         let mut pages = Vec::with_capacity(page_idxs.len());
-        let page_bases = self.resolve_stage_page_bases(&page_idxs)?;
         let mut delta_cursor = 0;
-        for page_base in page_bases {
-            let delta_start = delta_cursor;
-            while delta_cursor < deltas.len()
-                && page_offset(deltas[delta_cursor].0).0 == page_base.page_idx
-            {
-                delta_cursor += 1;
+        for page_idx_batch in page_idxs.chunks(STAGE_BASE_READ_BATCH_PAGES) {
+            // Consume each bounded base batch before fetching the next one.
+            // The staged output remains live for checkpoint writeout, but the
+            // replaced clean bases become evictable as this Vec is dropped.
+            let page_bases = self.resolve_stage_page_bases(page_idx_batch)?;
+            for page_base in page_bases {
+                let delta_start = delta_cursor;
+                while delta_cursor < deltas.len()
+                    && page_offset(deltas[delta_cursor].0).0 == page_base.page_idx
+                {
+                    delta_cursor += 1;
+                }
+                let force_slots = force_by_page
+                    .remove(&page_base.page_idx)
+                    .unwrap_or_default();
+                let staged = self.stage_one_page(
+                    page_base,
+                    &deltas[delta_start..delta_cursor],
+                    force,
+                    &force_slots,
+                )?;
+                let page_gen = staged.sealed.header()?.generation;
+                if page_gen > max_lsn {
+                    max_lsn = page_gen;
+                }
+                pages.push(staged);
             }
-            let force_slots = force_by_page
-                .remove(&page_base.page_idx)
-                .unwrap_or_default();
-            let staged = self.stage_one_page(
-                page_base,
-                &deltas[delta_start..delta_cursor],
-                force,
-                &force_slots,
-            )?;
-            let page_gen = staged.sealed.header()?.generation;
-            if page_gen > max_lsn {
-                max_lsn = page_gen;
-            }
-            pages.push(staged);
         }
         debug_assert_eq!(delta_cursor, deltas.len());
         Ok(StagedDeltas { pages, max_lsn })

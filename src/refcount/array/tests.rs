@@ -130,6 +130,55 @@ fn checkpoint_stage_batches_existing_page_cache_misses() {
 }
 
 #[test]
+fn checkpoint_stage_bounds_base_page_read_batches() {
+    const PAGE_COUNT: usize = STAGE_BASE_READ_BATCH_PAGES + 1;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("pages");
+    let page_store = Arc::new(PageStore::create(&path).unwrap());
+    let metrics = Arc::new(MetaMetrics::new());
+    page_store.attach_metrics(metrics.clone());
+    let page_cache = Arc::new(PageCache::new(page_store.clone(), 64 * 1024 * 1024));
+    let array = PagedRefcountArray::create(page_store, page_cache.clone()).unwrap();
+    let pbas: Vec<Pba> = (0..PAGE_COUNT)
+        .map(|page_idx| (page_idx * ENTRIES_PER_PAGE + 7) as Pba)
+        .collect();
+
+    array
+        .apply_deltas(
+            pbas.iter()
+                .copied()
+                .map(|pba| (pba, pending(1, 100)))
+                .collect(),
+        )
+        .unwrap();
+    for page_id in array.inner.lock().page_table.clone() {
+        page_cache.invalidate(page_id);
+    }
+
+    let before = metrics.snapshot();
+    let staged = array
+        .stage_deltas_in_memory(
+            pbas.iter()
+                .copied()
+                .map(|pba| (pba, pending(1, 200)))
+                .collect(),
+            false,
+        )
+        .unwrap();
+    let after = metrics.snapshot();
+
+    assert_eq!(after.meta_io_read_calls - before.meta_io_read_calls, 2);
+    assert_eq!(
+        after.meta_io_read_ops - before.meta_io_read_ops,
+        PAGE_COUNT as u64
+    );
+    array.write_staged_pages(&staged).unwrap();
+    assert_eq!(array.get(pbas[0]).unwrap().rc, 2);
+    assert_eq!(array.get(*pbas.last().unwrap()).unwrap().rc, 2);
+}
+
+#[test]
 fn checkpoint_stage_preserves_rollback_deltas_while_grouping_pages() {
     let (_dir, array) = make_array();
     let p0 = 7;
