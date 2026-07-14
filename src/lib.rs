@@ -39,6 +39,7 @@ pub mod refcount;
 pub mod testing;
 pub mod tx;
 pub mod types;
+pub(crate) mod u64_hash;
 pub mod verify;
 
 pub use cache::{PageCache, PageCacheStats};

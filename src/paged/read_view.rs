@@ -17,7 +17,7 @@
 //!   pids while a stale ReadView still references them.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::BuildHasherDefault;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, OnceLock};
 
@@ -31,30 +31,7 @@ use crate::paged::format::{
 };
 use crate::types::{NULL_PAGE, PageId};
 
-#[derive(Default)]
-pub struct PageIdHasher(u64);
-
-impl Hasher for PageIdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = 0xcbf29ce484222325u64;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        self.0 = hash;
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        let mut x = value.wrapping_add(0x9e3779b97f4a7c15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        self.0 = x ^ (x >> 31);
-    }
-}
+pub use crate::u64_hash::SplitMix64Hasher as PageIdHasher;
 
 pub const READ_OVERLAY_SHARDS: usize = 1024;
 const READ_OVERLAY_SHARD_MASK: u64 = READ_OVERLAY_SHARDS as u64 - 1;

@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 
 use crate::types::{Lsn, Pba};
+use crate::u64_hash::U64BuildHasher;
 
 /// One pending (signed) accumulator + the highest LSN that contributed
 /// to it. The LSN is needed to (a) stamp the array page on flush so
@@ -26,7 +27,7 @@ pub struct Pending {
 
 #[derive(Default)]
 pub struct DeltaMap {
-    inner: HashMap<Pba, Pending>,
+    inner: HashMap<Pba, Pending, U64BuildHasher>,
 }
 
 impl DeltaMap {
@@ -137,5 +138,38 @@ mod tests {
     fn get_missing_returns_none() {
         let d = DeltaMap::new();
         assert_eq!(d.get(99), None);
+    }
+
+    #[test]
+    fn aligned_pbas_preserve_merge_take_and_drain_semantics() {
+        const ENTRIES: u64 = 4096;
+        let mut deltas = DeltaMap::new();
+        for index in 0..ENTRIES {
+            let pba = index << 20;
+            deltas.merge(pba, 2, index + 1);
+            deltas.merge(pba, -1, ENTRIES + index + 1);
+        }
+
+        assert_eq!(deltas.len(), ENTRIES as usize);
+        for index in 0..ENTRIES {
+            assert_eq!(
+                deltas.get(index << 20),
+                Some(Pending {
+                    delta: 1,
+                    last_lsn: ENTRIES + index + 1,
+                })
+            );
+        }
+
+        let mut taken = deltas.take();
+        assert!(deltas.is_empty());
+        assert_eq!(taken.len(), ENTRIES as usize);
+
+        let drained: HashMap<_, _> = taken.drain().collect();
+        assert!(taken.is_empty());
+        assert_eq!(drained.len(), ENTRIES as usize);
+        for index in 0..ENTRIES {
+            assert_eq!(drained[&(index << 20)].delta, 1);
+        }
     }
 }
