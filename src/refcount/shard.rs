@@ -66,6 +66,7 @@
 //! and serialise on it.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -149,6 +150,41 @@ fn slot_index(bfg: Bfg) -> usize {
     (bfg as usize) & (BFG_SLOTS - 1)
 }
 
+struct FoldEpochGuard<'a> {
+    epoch: &'a AtomicU64,
+}
+
+impl Drop for FoldEpochGuard<'_> {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+struct StageBatchTestHook {
+    after_lookup: std::sync::Barrier,
+    resume: std::sync::Barrier,
+    lookup_count: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl StageBatchTestHook {
+    fn new() -> Self {
+        Self {
+            after_lookup: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+            lookup_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn after_lookup(&self) {
+        if self.lookup_count.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.after_lookup.wait();
+            self.resume.wait();
+        }
+    }
+}
+
 pub struct RcShard {
     /// Pending deltas keyed by BFG ring slot (`bfg & 3`). A commit
     /// stamped to BFG `t` merges into `delta_slots[t & 3]`; the sync
@@ -167,11 +203,17 @@ pub struct RcShard {
     /// but the GC reclaim Gate-1 treats rc==0 as proof to IRREVERSIBLY free
     /// the PBA (Gate-2 blockmap reverify is skipped under
     /// `rc_authoritative_reclaim`) → premature free → reuse → read CRC.
-    /// The fold takes this in write mode across the in-memory publish+clear
-    /// (microseconds — the page IO is staged and written later); the
-    /// consistent read takes it in read mode across its sample. The hot
-    /// `get`/`stage` paths never touch it.
+    /// The fold takes this in write mode across the in-memory stage + publish +
+    /// clear (durable page writes still happen later); the consistent read and
+    /// `stage_batch` validation take it in read mode. Single-item `get`/`stage`
+    /// paths never touch it.
     fold_lock: parking_lot::RwLock<()>,
+    /// Sequence for representation moves between `delta_slots` and `array`.
+    /// `stage_batch` reads base pages without slot locks, then validates this
+    /// under `fold_lock.read()` before accepting the matching slot snapshot.
+    fold_epoch: AtomicU64,
+    #[cfg(test)]
+    stage_batch_test_hook: Mutex<Option<Arc<StageBatchTestHook>>>,
 }
 
 /// Checkpoint produced by [`RcShard::begin_checkpoint`]. Carries the
@@ -267,6 +309,9 @@ impl RcShard {
             delta_slots: std::array::from_fn(|_| Mutex::new(DeltaMap::new())),
             array,
             fold_lock: parking_lot::RwLock::new(()),
+            fold_epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            stage_batch_test_hook: Mutex::new(None),
         }
     }
 
@@ -418,18 +463,45 @@ impl RcShard {
         // its complete per-shard PBA shape while only about 1/16 commits pay
         // the per-action timestamp cost.
         let sample_breakdown = sample_refcount_breakdown(lsn);
-        let open_idx = slot_index(bfg);
-        let slot_lock_started = sample_breakdown.then(Instant::now);
-        let mut slots: Vec<_> = self.delta_slots.iter().map(|slot| slot.lock()).collect();
-        let slot_lock_elapsed = slot_lock_started.map_or(Duration::ZERO, |start| start.elapsed());
-
-        let lookup_started = sample_breakdown.then(Instant::now);
         let pbas: Vec<Pba> = actions.iter().map(|(pba, _)| *pba).collect();
-        let bases = self.array.get_many_sorted_with_page_lsn(&pbas)?;
-        let base_page_lookup = lookup_started.map_or(Duration::ZERO, |start| start.elapsed());
+        let open_idx = slot_index(bfg);
+        let mut base_page_lookup = Duration::ZERO;
+        let mut synchronization_wait = Duration::ZERO;
+        let (bases, mut slots) = loop {
+            let epoch_before = self.fold_epoch.load(Ordering::Acquire);
+            let lookup_started = sample_breakdown.then(Instant::now);
+            let bases = self.array.get_many_sorted_with_page_lsn(&pbas)?;
+            base_page_lookup += lookup_started.map_or(Duration::ZERO, |start| start.elapsed());
+
+            #[cfg(test)]
+            let test_hook = self.stage_batch_test_hook.lock().clone();
+            #[cfg(test)]
+            if let Some(hook) = test_hook {
+                hook.after_lookup();
+            }
+
+            let synchronization_started = sample_breakdown.then(Instant::now);
+            let fold = self.fold_lock.read();
+            if self.fold_epoch.load(Ordering::Acquire) != epoch_before {
+                synchronization_wait +=
+                    synchronization_started.map_or(Duration::ZERO, |start| start.elapsed());
+                drop(fold);
+                continue;
+            }
+
+            // Acquiring every slot while the fold read guard is held closes
+            // the validation-to-snapshot gap. Once the guards are ours, a new
+            // checkpoint may publish its array page but cannot clear the
+            // corresponding slot until this batch finishes its merge.
+            let slots: Vec<_> = self.delta_slots.iter().map(|slot| slot.lock()).collect();
+            synchronization_wait +=
+                synchronization_started.map_or(Duration::ZERO, |start| start.elapsed());
+            drop(fold);
+            break (bases, slots);
+        };
 
         let mut out = Vec::with_capacity(actions.len());
-        let mut pending_slot_scan = slot_lock_elapsed;
+        let mut pending_slot_scan = synchronization_wait;
         let mut delta_merge = Duration::ZERO;
 
         if sample_breakdown {
@@ -641,10 +713,16 @@ impl RcShard {
         // array and the slots disagree (array folded, slot not yet cleared).
         // Hold `fold_lock` in write mode across it so a concurrent
         // `get_consistent` can never observe that torn state (the cheap `get`
-        // still can, by design — see the field doc). This guards only the
-        // in-memory publish+clear; the staged pages' IO happens later in the
-        // flush, outside this lock, so the critical section is microseconds.
-        let _fold = self.fold_lock.write();
+        // still can, by design — see the field doc). Durable page writes happen
+        // later, outside this lock. Building staged pages may still need base
+        // reads, which is why `stage_batch` never holds the read side across its
+        // own base-page lookup.
+        let fold = self.fold_lock.write();
+        // Declared after `fold`, so `?` paths bump the epoch before releasing
+        // the write guard. Readers can never validate a partially-moved view.
+        let epoch_guard = FoldEpochGuard {
+            epoch: &self.fold_epoch,
+        };
 
         // Fold + publish into the array (cache + page_table) WITHOUT
         // clearing the slots yet. `force` (cold lifecycle flush) applies
@@ -661,7 +739,8 @@ impl RcShard {
         for &i in slots {
             *self.delta_slots[i].lock() = DeltaMap::new();
         }
-        drop(_fold);
+        drop(epoch_guard);
+        drop(fold);
 
         let snapshot_page_table = self.array.page_table_snapshot();
         let snapshot_meta_chain = self.array.meta_chain_snapshot();
@@ -733,11 +812,18 @@ impl RcShard {
         if ckpt.is_empty() {
             return;
         }
+        let fold = self.fold_lock.write();
+        let epoch_guard = FoldEpochGuard {
+            epoch: &self.fold_epoch,
+        };
         self.array.abort_staged_deltas(&ckpt.staged, free_lsn);
         let mut slot = self.delta_slots[ckpt.restore_slot].lock();
         for (pba, pending) in ckpt.drained_deltas {
             slot.merge_pending(pba, pending);
         }
+        drop(slot);
+        drop(epoch_guard);
+        drop(fold);
     }
 
     /// Synchronous flush for non-checkpoint callers (cold path). Folds

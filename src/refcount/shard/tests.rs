@@ -57,6 +57,49 @@ fn stage_batch_keeps_replay_skip_semantics() {
 }
 
 #[test]
+fn stage_batch_retries_when_checkpoint_moves_state_after_base_lookup() {
+    let (_d, s) = make_shard();
+    let pba = 10;
+    s.array
+        .apply_deltas(vec![(
+            pba,
+            Pending {
+                delta: 1,
+                last_lsn: 100,
+            },
+        )])
+        .unwrap();
+    // Logical rc=2: durable base 1 plus the Syncing slot's pending +1.
+    s.delta_slots[0].lock().merge(pba, 1, 200);
+
+    let s = Arc::new(s);
+    let hook = Arc::new(StageBatchTestHook::new());
+    *s.stage_batch_test_hook.lock() = Some(hook.clone());
+    let stage = {
+        let s = s.clone();
+        std::thread::spawn(move || s.stage_batch(1, &[(pba, -2)], 300))
+    };
+
+    // The first lookup has captured base=1, but stage_batch has not acquired
+    // any slot lock. A checkpoint can therefore publish base=2 and clear slot
+    // 0 without waiting behind the page lookup.
+    hook.after_lookup.wait();
+    for slot in &s.delta_slots {
+        assert!(
+            slot.try_lock().is_some(),
+            "base lookup must not hold slot locks"
+        );
+    }
+    let _checkpoint = s.begin_checkpoint(0).unwrap();
+    hook.resume.wait();
+
+    let (staged, _) = stage.join().unwrap().unwrap();
+    assert_eq!(hook.lookup_count.load(Ordering::SeqCst), 2);
+    assert_eq!(staged, vec![(2, 0)]);
+    assert_eq!(s.get(pba).unwrap(), 0);
+}
+
+#[test]
 fn flush_moves_pending_to_array() {
     let (_d, s) = make_shard();
     s.stage(T0, 10, 5, 100).unwrap();
