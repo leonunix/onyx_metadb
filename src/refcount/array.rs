@@ -45,7 +45,7 @@ use super::RcEntry;
 use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
-use crate::page_store::PageStore;
+use crate::page_store::{IoLaneClass, PageStore};
 use crate::paged_meta;
 use crate::types::{Lsn, PageId, Pba};
 
@@ -65,7 +65,7 @@ const DATA_KEY_COUNT_MARKER: u16 = 0;
 // A checkpoint can touch millions of sparse refcount pages. Keep the base-page
 // read parallelism bounded so the returned Arc<Page>s cannot pin an entire
 // checkpoint above the configured cache capacity while sealed pages accumulate.
-const STAGE_BASE_READ_BATCH_PAGES: usize = 4096;
+pub(super) const STAGE_BASE_READ_BATCH_PAGES: usize = 4096;
 
 const _: () = {
     assert!(ENTRIES_PER_PAGE * ENTRY_BYTES == PAGE_PAYLOAD_SIZE);
@@ -86,6 +86,15 @@ pub struct StagedPage {
     pub page_id: PageId,
     pub page_idx: usize,
     pub sealed: Arc<Page>,
+    pub is_fresh: bool,
+}
+
+/// Compact checkpoint bookkeeping retained after a streaming data-page write
+/// has completed. Unlike [`StagedPage`], this carries no page payload Arc.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StagedPageMeta {
+    pub page_id: PageId,
+    pub page_idx: usize,
     pub is_fresh: bool,
 }
 
@@ -118,6 +127,17 @@ impl StagedDeltas {
                 .iter()
                 .map(|page| (page.page_id, page.sealed.clone())),
         );
+    }
+
+    pub(super) fn compact_pages(&self) -> Vec<StagedPageMeta> {
+        self.pages
+            .iter()
+            .map(|page| StagedPageMeta {
+                page_id: page.page_id,
+                page_idx: page.page_idx,
+                is_fresh: page.is_fresh,
+            })
+            .collect()
     }
 }
 
@@ -165,6 +185,7 @@ struct CleanPageRun {
     end: usize,
 }
 
+#[derive(Clone)]
 struct StagePageBase {
     page_idx: usize,
     page_id: PageId,
@@ -271,16 +292,24 @@ impl PagedRefcountArray {
     /// Look up one entry. Returns [`RcEntry::ZERO`] if no data page
     /// is allocated for the PBA's page_idx.
     pub fn get(&self, pba: Pba) -> Result<RcEntry> {
+        self.get_with_page_lsn(pba).map(|(entry, _)| entry)
+    }
+
+    /// Look up one entry and the generation of the exact backing page used
+    /// for that entry. Sampling both from one resolved page is required by
+    /// commit-side staging: a separate `get` + `page_lsn` could straddle a
+    /// checkpoint publish and make replay-skip decisions from a torn view.
+    pub(crate) fn get_with_page_lsn(&self, pba: Pba) -> Result<(RcEntry, Lsn)> {
         let (page_idx, slot) = page_offset(pba);
         let (page_id, staged) = self.resolve_data_page(page_idx);
         if page_id == 0 {
-            return Ok(RcEntry::ZERO);
+            return Ok((RcEntry::ZERO, 0));
         }
         let page = match staged {
             Some(page) => page,
             None => self.page_cache.get(page_id)?,
         };
-        Ok(read_entry(&page, slot))
+        Ok((read_entry(&page, slot), page.header()?.generation))
     }
 
     /// Resolve a batch of entries and their backing-page generations with one
@@ -535,8 +564,16 @@ impl PagedRefcountArray {
             // Consume each bounded base batch before fetching the next one.
             // The staged output remains live for checkpoint writeout, but the
             // replaced clean bases become evictable as this Vec is dropped.
-            let page_bases = self.resolve_stage_page_bases(page_idx_batch)?;
-            for page_base in page_bases {
+            let page_bases = match self.resolve_stage_page_bases(page_idx_batch) {
+                Ok(page_bases) => page_bases,
+                Err(err) => {
+                    self.abort_staged_deltas(&StagedDeltas { pages, max_lsn }, 0);
+                    return Err(err);
+                }
+            };
+            let mut page_bases = page_bases.into_iter().peekable();
+            while let Some(page_base) = page_bases.next() {
+                let failed_base = page_base.is_fresh.then(|| page_base.clone());
                 let delta_start = delta_cursor;
                 while delta_cursor < deltas.len()
                     && page_offset(deltas[delta_cursor].0).0 == page_base.page_idx
@@ -546,13 +583,29 @@ impl PagedRefcountArray {
                 let force_slots = force_by_page
                     .remove(&page_base.page_idx)
                     .unwrap_or_default();
-                let staged = self.stage_one_page(
+                let staged = match self.stage_one_page(
                     page_base,
                     &deltas[delta_start..delta_cursor],
                     force,
                     &force_slots,
-                )?;
-                let page_gen = staged.sealed.header()?.generation;
+                ) {
+                    Ok(staged) => staged,
+                    Err(err) => {
+                        self.abort_unstaged_page_bases(failed_base);
+                        self.abort_unstaged_page_bases(page_bases);
+                        self.abort_staged_deltas(&StagedDeltas { pages, max_lsn }, 0);
+                        return Err(err);
+                    }
+                };
+                let page_gen = match staged.sealed.header() {
+                    Ok(header) => header.generation,
+                    Err(err) => {
+                        pages.push(staged);
+                        self.abort_unstaged_page_bases(page_bases);
+                        self.abort_staged_deltas(&StagedDeltas { pages, max_lsn }, 0);
+                        return Err(err);
+                    }
+                };
                 if page_gen > max_lsn {
                     max_lsn = page_gen;
                 }
@@ -579,7 +632,14 @@ impl PagedRefcountArray {
                     inner.meta_dirty = true;
                 }
                 if inner.page_table[page_idx] == 0 {
-                    let page_id = self.page_store.allocate()?;
+                    let page_id = match self.page_store.allocate() {
+                        Ok(page_id) => page_id,
+                        Err(err) => {
+                            drop(inner);
+                            self.abort_unstaged_page_bases(page_bases);
+                            return Err(err);
+                        }
+                    };
                     inner.page_table[page_idx] = page_id;
                     inner.meta_dirty = true;
                     self.allocated_data_pages.fetch_add(1, Ordering::Relaxed);
@@ -618,12 +678,48 @@ impl PagedRefcountArray {
             .iter()
             .map(|&position| page_bases[position].page_id)
             .collect();
-        let clean_pages = self.page_cache.get_many(&clean_page_ids)?;
+        let clean_pages = match self.page_cache.get_many(&clean_page_ids) {
+            Ok(clean_pages) => clean_pages,
+            Err(err) => {
+                self.abort_unstaged_page_bases(page_bases);
+                return Err(err);
+            }
+        };
         debug_assert_eq!(clean_pages.len(), clean_positions.len());
         for (position, page) in clean_positions.into_iter().zip(clean_pages) {
             page_bases[position].base = Some(page);
         }
         Ok(page_bases)
+    }
+
+    /// Undo fresh page reservations that were published with zero placeholders
+    /// but never reached [`Self::stage_one_page`]. Existing-page bases have no
+    /// state to undo and are simply dropped.
+    fn abort_unstaged_page_bases(&self, page_bases: impl IntoIterator<Item = StagePageBase>) {
+        for page_base in page_bases {
+            if !page_base.is_fresh {
+                continue;
+            }
+            {
+                let mut inner = self.inner.lock();
+                if page_base.page_idx < inner.page_table.len()
+                    && inner.page_table[page_base.page_idx] == page_base.page_id
+                {
+                    inner.page_table[page_base.page_idx] = 0;
+                    inner.meta_dirty = true;
+                    self.allocated_data_pages.fetch_sub(1, Ordering::Relaxed);
+                }
+                inner.staged_overlay.remove(&page_base.page_id);
+            }
+            self.page_cache.invalidate(page_base.page_id);
+            if let Err(err) = self.page_store.free(page_base.page_id, 0) {
+                tracing::warn!(
+                    page_id = page_base.page_id,
+                    error = %err,
+                    "abort_unstaged_page_bases: failed to free fresh page id"
+                );
+            }
+        }
     }
 
     fn stage_one_page(
@@ -753,6 +849,21 @@ impl PagedRefcountArray {
         Ok(())
     }
 
+    /// Write one bounded streaming-checkpoint chunk through the refcount IO
+    /// lane. The caller clears the overlay only after this returns: an Ok means
+    /// every write CQE has completed, so cache eviction can safely fall through
+    /// to the newly-written disk bytes even though the checkpoint-wide sync is
+    /// intentionally deferred.
+    pub(super) fn write_staged_page_runs(&self, staged: &StagedDeltas) -> Result<()> {
+        let pages = staged
+            .pages
+            .iter()
+            .map(|page| (page.page_id, page.sealed.clone()))
+            .collect();
+        self.page_store
+            .write_sealed_page_runs_for_class(pages, IoLaneClass::Refcount)
+    }
+
     /// Drop the dirty-staged overlay entries for `staged` — call ONLY
     /// once the staged page bytes are durable on disk (or from the
     /// abort path, which restores disk truth first). Removal is gated
@@ -805,16 +916,10 @@ impl PagedRefcountArray {
         snapshot_meta_chain: &[PageId],
         free_lsn: Lsn,
     ) -> Result<Vec<PageId>> {
-        paged_meta::write_chain(
-            &self.page_store,
-            &self.page_cache,
-            PageType::RefcountArray,
-            META_KEY_COUNT_MARKER,
-            &[],
-            snapshot_page_table,
-            snapshot_meta_chain,
-            free_lsn,
-        )
+        let (new_chain, sealed_pages, to_free) =
+            self.build_meta_chain_external(snapshot_page_table, snapshot_meta_chain)?;
+        self.write_built_meta_chain_external(sealed_pages, to_free, free_lsn)?;
+        Ok(new_chain)
     }
 
     /// Outside-gate, **no-IO** companion of
@@ -843,6 +948,39 @@ impl PagedRefcountArray {
             snapshot_page_table,
             snapshot_meta_chain,
         )
+    }
+
+    /// Persist a meta chain that was built separately by
+    /// [`Self::build_meta_chain_external`]. Once write submission starts the
+    /// stable head may reference this chain's fresh data pages, so callers must
+    /// not roll those pages back on an error.
+    ///
+    /// Reclaim of trailing old-chain pages is best-effort after the new bytes
+    /// land. Leaking one old continuation is recoverable; returning an error
+    /// that tempts a caller to free newly reachable data pages is not.
+    pub(super) fn write_built_meta_chain_external(
+        &self,
+        sealed_pages: Vec<(PageId, Arc<Page>)>,
+        to_free: Vec<PageId>,
+        free_lsn: Lsn,
+    ) -> Result<()> {
+        self.page_store
+            .write_sealed_page_runs(sealed_pages.clone())?;
+
+        for (pid, page) in sealed_pages {
+            self.page_cache.replace_or_insert(pid, page);
+        }
+        for pid in to_free {
+            self.page_cache.invalidate(pid);
+            if let Err(err) = self.page_store.free(pid, free_lsn) {
+                tracing::warn!(
+                    page_id = pid,
+                    error = %err,
+                    "write_built_meta_chain_external: failed to free old continuation page"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Install a freshly-written meta chain. Briefly takes
@@ -906,6 +1044,40 @@ impl PagedRefcountArray {
                 self.page_cache.invalidate(staged_page.page_id);
             }
         }
+    }
+
+    /// Streaming checkpoints no longer retain page payload Arcs after their
+    /// write CQEs complete. Before the global meta-chain write starts, existing
+    /// pages stay installed (their bytes already include the folded deltas) and
+    /// unreachable fresh allocations can be rolled back from compact metadata.
+    /// Once the stable meta head may have been overwritten, this is forbidden.
+    pub(super) fn abort_streamed_fresh_pages(&self, pages: &[StagedPageMeta], free_lsn: Lsn) {
+        for page in pages.iter().filter(|page| page.is_fresh) {
+            {
+                let mut inner = self.inner.lock();
+                if page.page_idx < inner.page_table.len()
+                    && inner.page_table[page.page_idx] == page.page_id
+                {
+                    inner.page_table[page.page_idx] = 0;
+                    inner.meta_dirty = true;
+                    self.allocated_data_pages.fetch_sub(1, Ordering::Relaxed);
+                }
+                inner.staged_overlay.remove(&page.page_id);
+            }
+            self.page_cache.invalidate(page.page_id);
+            if let Err(err) = self.page_store.free(page.page_id, free_lsn) {
+                tracing::warn!(
+                    page_id = page.page_id,
+                    error = %err,
+                    "abort_streamed_fresh_pages: failed to free fresh page id"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn staged_overlay_len(&self) -> usize {
+        self.inner.lock().staged_overlay.len()
     }
 
     /// Persist the meta chain if it has been mutated since the last

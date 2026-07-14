@@ -746,18 +746,17 @@ impl Db {
         drop(guard_iter);
         drop(l2p_guards);
         let l2p_walk_elapsed = l2p_walk_started.elapsed();
-        // Refcount sample: drain delta + stage sealed pages in memory.
-        // No disk IO. Meta-chain rewrite + page writes happen in the
-        // IO phase below; install runs post-manifest.
+        // Refcount sample: threads-OFF keeps the legacy in-memory-only fold.
+        // Threads-ON uses the bounded streaming fold: each shard stages at
+        // most 4096 unique data pages under its fold lock, writes that chunk
+        // after releasing the lock, then drops its payload Arcs. Meta-chain
+        // rewrite and the checkpoint-wide sync still happen below.
         //
         // Per-shard `begin_checkpoint` is independent — each shard
-        // touches only its own DeltaMap, page_table, overlay, and
-        // page_pool. The only shared resource is `page_store.allocate`
-        // (priority-1 path) / `page_store.allocate_batch` (drainer
-        // mode), both under a short global mutex that is far from
-        // saturation at the observed ~7.5k alloc/s. Parallelizing across
-        // shards collapses the previously-serial 16× cost into one
-        // shard's worth (modulo any skew).
+        // touches only its own DeltaMap, page_table, and overlay. Allocation
+        // and bounded write submission are internally synchronized by the
+        // shared PageStore. Parallelizing across shards preserves IO depth
+        // while each shard retains at most one streaming chunk.
         //
         // Runs WITHOUT the sample-phase `apply_gate.write()`. The
         // commit-side `RcShard::stage` invariants (delta_active +
@@ -785,7 +784,7 @@ impl Db {
                     if selected.rc[s_idx] {
                         let h = scope.spawn(move || {
                             if bfg_threads_enabled {
-                                shard.rc.begin_checkpoint(bfg)
+                                shard.rc.begin_checkpoint_streaming(bfg)
                             } else {
                                 shard.rc.begin_checkpoint_all_slots(false)
                             }
@@ -804,12 +803,16 @@ impl Db {
         let rc_drain_elapsed = rc_drain_started.elapsed();
         let mut refcount_checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>> =
             (0..self.refcount_shards.len()).map(|_| None).collect();
+        let mut rc_stream_stats = crate::refcount::shard::RcStreamingWriteStats::default();
+        let mut rc_fold_service_us = 0u64;
         let mut sample_err: Option<MetaDbError> = None;
         let mut tail_to_abort: Vec<(usize, crate::refcount::shard::RcCheckpoint)> = Vec::new();
         for (idx, result) in rc_results.into_iter().enumerate() {
             match result {
                 None => continue,
                 Some(Ok(ckpt)) => {
+                    rc_stream_stats.merge(ckpt.streaming_write_stats());
+                    rc_fold_service_us = rc_fold_service_us.saturating_add(ckpt.fold_service_us());
                     if sample_err.is_some() {
                         tail_to_abort.push((idx, ckpt));
                     } else {
@@ -828,6 +831,19 @@ impl Db {
                 .rc
                 .abort_checkpoint(ckpt, wal_checkpoint);
         }
+        self.metrics.record_flush_rc_stream(
+            rc_stream_stats.calls,
+            rc_stream_stats.pages,
+            rc_stream_stats.service_us,
+            rc_stream_stats.max_chunk_us,
+            rc_stream_stats.max_chunk_pages,
+        );
+        self.metrics
+            .record_flush_rc_fold_service(rc_fold_service_us);
+        // Streaming RC page writes completed before `io_started`, so count
+        // their physical work without adding their service time to
+        // `flush_io_us`.
+        self.metrics.record_flush_io_pages(rc_stream_stats.pages);
         self.metrics
             .record_flush_sample(kind, sample_started.elapsed());
         self.metrics.record_flush_sample_breakdown(
@@ -836,7 +852,8 @@ impl Db {
             rc_drain_elapsed,
         );
         // Sample workload size: L2P dirty pages snapshotted, refcount
-        // delta entries drained, fresh refcount data pages allocated.
+        // delta entries drained, all refcount data pages staged, and the
+        // freshly allocated subset.
         // Lets dashboards correlate sample wall-time growth with
         // workload-size growth.
         let l2p_dirty_pages: usize = l2p_checkpoints
@@ -855,10 +872,16 @@ impl Db {
             .filter_map(|c| c.as_ref())
             .map(|c| c.fresh_pages_count())
             .sum();
+        let rc_staged_pages: usize = refcount_checkpoints
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .map(|c| c.data_pages_count())
+            .sum();
         self.metrics.record_flush_sample_workload(
             l2p_dirty_pages,
             rc_drained_deltas,
             rc_fresh_pages,
+            rc_staged_pages,
         );
         if let Some(err) = sample_err {
             // Roll back every L2P + RC checkpoint that this partial
@@ -894,10 +917,10 @@ impl Db {
         // preserves them on the next write); the snapshot's pages are reachable
         // from its `SnapshotEntry` roots in the manifest.
 
-        // No sample-phase gate to drop. The IO phase below proceeds
+        // No sample-phase gate to drop. The remaining IO phase proceeds
         // straight from the sample: concurrent commits never blocked
-        // on us, and the dirty page Arcs we hold in the checkpoints
-        // make the IO independent of further tree mutations. The
+        // on us, and L2P dirty page Arcs plus compact RC checkpoints make
+        // the IO independent of further tree mutations. The
         // manifest commit + atomics bump below acquires
         // `apply_gate.write()` for its narrow window.
         let prefold_ticket = self.request_l2p_prefold(bfg);
@@ -943,15 +966,18 @@ impl Db {
             }
             flushed_l2p.push(flushed);
         }
-        // Refcount sealed pages flow through the same write_sealed_page_runs
-        // batch as L2P. Refcount meta-chain pages also fold into the
-        // same batch via `build_meta_chain` (below) — one io_uring
-        // submission covers L2P + RC data + RC meta. Only selected
-        // (= `Some(...)`) RC shards contribute pages this round.
+        // Threads-OFF refcount data pages still flow through this global write
+        // batch. Threads-ON data pages were already written chunk-by-chunk and
+        // append nothing; their meta-chain pages are built below and remain in
+        // the final global batch. Only selected RC shards contribute.
         for ckpt_opt in &refcount_checkpoints {
             if let Some(ckpt) = ckpt_opt {
                 let before = sealed_pages.len();
                 ckpt.append_sealed_pages(&mut sealed_pages);
+                // Streaming checkpoints already wrote their data pages in
+                // bounded chunks and retain no payload Arcs. Cold checkpoints
+                // still append here. `flush_io` begins after streaming writes,
+                // so count only pages actually appended inside this timer.
                 total_pages_written += sealed_pages.len() - before;
             }
         }
@@ -1070,6 +1096,11 @@ impl Db {
             return Err(err);
         }
 
+        // RC rollback boundary: once this call starts, the stable refcount
+        // meta-chain head may be partially or fully overwritten with a table
+        // that references this checkpoint's fresh data pages. Every error from
+        // here through manifest publication must retain RC authority and rely
+        // on the enclosing sync-poison/restart contract.
         let page_write_started = std::time::Instant::now();
         if let Err(err) = self.page_store.write_sealed_page_runs(sealed_pages) {
             self.metrics
@@ -1079,7 +1110,7 @@ impl Db {
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
-            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1093,7 +1124,7 @@ impl Db {
                 .record_flush_io(io_started.elapsed(), total_pages_written);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
-            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1105,9 +1136,9 @@ impl Db {
         // this point the overlay is the ONLY eviction-proof copy of the
         // staged pages (the LRU insert in `stage_one_page` can be
         // evicted; a fresh page's disk backing is unwritten zeros). The
-        // abort paths below remain correct after the clear: abort
-        // restores `page_table`/deltas and the now-durable bytes on
-        // disk are simply orphaned, exactly as pre-overlay.
+        // Any error below retains RC authority: the stable meta-chain head was
+        // part of the global write and may already reference fresh data pages.
+        // Rollback is no longer legal once write submission has started.
         for (s_idx, ckpt_opt) in refcount_checkpoints.iter().enumerate() {
             if let Some(ckpt) = ckpt_opt {
                 self.refcount_shards[s_idx].rc.mark_staged_durable(ckpt);
@@ -1126,7 +1157,7 @@ impl Db {
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
-            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1294,7 +1325,7 @@ impl Db {
                     &dead_list_plans,
                     wal_checkpoint,
                 );
-                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
                 self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                 return Err(err);
             }
@@ -1310,7 +1341,7 @@ impl Db {
             drop(manifest_state);
             release_apply_guard!();
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
-            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1330,7 +1361,7 @@ impl Db {
             drop(manifest_state);
             release_apply_guard!();
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
-            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1439,7 +1470,7 @@ impl Db {
             drop(manifest_state);
             release_apply_guard!();
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
-            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1456,7 +1487,7 @@ impl Db {
             drop(manifest_state);
             release_apply_guard!();
             self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
-            self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+            self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
@@ -1487,7 +1518,7 @@ impl Db {
                     &dead_list_plans,
                     wal_checkpoint,
                 );
-                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
                 self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                 return Err(err);
             }
@@ -1528,7 +1559,7 @@ impl Db {
                     &dead_list_plans,
                     wal_checkpoint,
                 );
-                self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
                 self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                 return Err(err);
             }
@@ -1838,7 +1869,14 @@ impl Db {
             // returns.
             self.notify_async_reclaim();
         } else {
-            let reclaim_budget = flush_reclaim_budget(deferred_before, total_pages_written);
+            // `flush_io` intentionally excludes RC pages written before its
+            // timer, but reclaim scaling is based on the checkpoint's total
+            // write work and must retain the pre-streaming behavior.
+            let streamed_pages = usize::try_from(rc_stream_stats.pages).unwrap_or(usize::MAX);
+            let reclaim_budget = flush_reclaim_budget(
+                deferred_before,
+                total_pages_written.saturating_add(streamed_pages),
+            );
             let reclaim_outcome = self.reclaim_freed_pages_budget(reclaim_budget)?;
             let deferred_after = self.page_store.deferred_free_len();
             let blocked = reclaim_budget
@@ -2098,6 +2136,19 @@ impl Db {
                     .abort_checkpoint(ckpt, free_lsn);
             }
         }
+    }
+
+    /// Once the global page write has been submitted, the stable RC meta-chain
+    /// head may already contain the new page table. Rolling back fresh RC pages
+    /// after that point can turn a reachable page into `Free` (especially via
+    /// async reclaim) and make reopen follow a dangling chain. Preserve the
+    /// array/page-table authority and let the enclosing sync error poison the
+    /// process; restart reopens whichever sealed generation reached disk.
+    fn retain_rc_checkpoints_after_global_write(
+        &self,
+        checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>>,
+    ) {
+        drop(checkpoints);
     }
 
     /// Project what `compute_min_last_flushed_lsn` will return after

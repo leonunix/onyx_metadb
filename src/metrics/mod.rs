@@ -491,6 +491,18 @@ pub struct MetaMetrics {
     flush_sample_l2p_walk_max_us: AtomicU64,
     flush_sample_rc_drain_us: AtomicU64,
     flush_sample_rc_drain_max_us: AtomicU64,
+    // Sum of per-shard RC fold service, excluding streaming data-page writes.
+    // Compare with `flush_sample_rc_drain_us` (parallel checkpoint wall) and
+    // `flush_rc_stream_service_us` (write service) for stage separation.
+    flush_rc_fold_service_us: AtomicU64,
+    flush_rc_fold_service_max_us: AtomicU64,
+    // Data-page IO performed inside bounded streaming RC checkpoint chunks,
+    // before the lifecycle's global `flush_io` timer starts.
+    flush_rc_stream_calls: AtomicU64,
+    flush_rc_stream_pages: AtomicU64,
+    flush_rc_stream_service_us: AtomicU64,
+    flush_rc_stream_max_chunk_us: AtomicU64,
+    flush_rc_stream_max_chunk_pages: AtomicU64,
     flush_io_us: AtomicU64,
     flush_io_max_us: AtomicU64,
     flush_io_seal_us: AtomicU64,
@@ -596,6 +608,8 @@ pub struct MetaMetrics {
     flush_sample_rc_drained_deltas_max: AtomicU64,
     flush_sample_rc_fresh_pages: AtomicU64,
     flush_sample_rc_fresh_pages_max: AtomicU64,
+    flush_sample_rc_staged_pages: AtomicU64,
+    flush_sample_rc_staged_pages_max: AtomicU64,
     // Refcount drainer (priority 3). Background per-shard threads that
     // absorb `RcShard.delta` into a sealed-page staging overlay outside
     // `apply_gate.write()`. All zero when
@@ -851,5 +865,42 @@ mod tests {
         assert!(json.contains("\"apply_refcount_batch_count\":2"));
         assert!(json.contains("\"apply_refcount_breakdown_sampled_pbas\":7"));
         assert!(json.contains("\"apply_refcount_delta_merge_us\":23"));
+    }
+
+    #[test]
+    fn flush_rc_streaming_metrics_reach_snapshot_and_json() {
+        let metrics = MetaMetrics::default();
+        metrics.record_flush_rc_stream(3, 17, 41, 19, 8);
+        metrics.record_flush_rc_stream(2, 9, 23, 29, 4);
+        metrics.record_flush_rc_fold_service(31);
+        metrics.record_flush_rc_fold_service(47);
+        metrics.record_flush_io_pages(26);
+        metrics.record_flush_sample_workload(5, 101, 0, 12);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.flush_rc_stream_calls, 5);
+        assert_eq!(snapshot.flush_rc_stream_pages, 26);
+        assert_eq!(snapshot.flush_rc_stream_service_us, 64);
+        assert_eq!(snapshot.flush_rc_stream_max_chunk_us, 29);
+        assert_eq!(snapshot.flush_rc_stream_max_chunk_pages, 8);
+        assert_eq!(snapshot.flush_rc_fold_service_us, 78);
+        assert_eq!(snapshot.flush_rc_fold_service_max_us, 47);
+        assert_eq!(snapshot.flush_pages_written, 26);
+        assert_eq!(
+            snapshot.flush_io_bytes_total,
+            26 * crate::config::PAGE_SIZE as u64
+        );
+        assert_eq!(snapshot.flush_sample_rc_staged_pages, 12);
+        assert_eq!(snapshot.flush_sample_rc_staged_pages_max, 12);
+
+        let json = snapshot.to_json();
+        assert!(json.contains("\"flush_rc_stream_calls\":5"));
+        assert!(json.contains("\"flush_rc_stream_pages\":26"));
+        assert!(json.contains("\"flush_rc_stream_service_us\":64"));
+        assert!(json.contains("\"flush_rc_stream_max_chunk_us\":29"));
+        assert!(json.contains("\"flush_rc_stream_max_chunk_pages\":8"));
+        assert!(json.contains("\"flush_rc_fold_service_us\":78"));
+        assert!(json.contains("\"flush_rc_fold_service_max_us\":47"));
+        assert!(json.contains("\"flush_sample_rc_staged_pages\":12"));
     }
 }

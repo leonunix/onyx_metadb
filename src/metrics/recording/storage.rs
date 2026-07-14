@@ -71,10 +71,11 @@ impl MetaMetrics {
     /// Sample-phase sub-breakdown. `lock` is the time waiting for every
     /// L2P shard write lock; `l2p_walk` is the dirty-set snapshot loop
     /// over all `(volume, shard)` pairs; `rc_drain` is the per-shard
-    /// `RcShard::begin_checkpoint` loop. All three add up to
-    /// `flush_sample_us` (modulo a few ns of timer overhead); a sum that
-    /// diverges by more than that means the instrumentation is missing
-    /// a region.
+    /// `RcShard::begin_checkpoint` parallel wall. In streaming mode the last
+    /// value includes bounded RC data-page writes; use
+    /// `flush_rc_fold_service_us` and `flush_rc_stream_service_us` for the
+    /// pure service split. All three wall regions add up to `flush_sample_us`
+    /// modulo timer overhead.
     pub(crate) fn record_flush_sample_breakdown(
         &self,
         lock: Duration,
@@ -100,8 +101,8 @@ impl MetaMetrics {
 
     /// Record sample-phase workload size for one flush. Called from the
     /// in-gate sample loop with the totals of L2P dirty pages observed,
-    /// refcount delta entries drained, and freshly-allocated refcount
-    /// data pages produced. Kind-agnostic — pair with `flush_calls_*`
+    /// refcount delta entries drained, total refcount data pages staged, and
+    /// the freshly-allocated subset. Kind-agnostic — pair with `flush_calls_*`
     /// to compute per-flush averages, or watch the `_max` siblings to
     /// see whether sample-phase workload is itself growing over time.
     pub(crate) fn record_flush_sample_workload(
@@ -109,10 +110,12 @@ impl MetaMetrics {
         l2p_dirty_pages: usize,
         rc_drained_deltas: usize,
         rc_fresh_pages: usize,
+        rc_staged_pages: usize,
     ) {
         let l2p = l2p_dirty_pages as u64;
         let drained = rc_drained_deltas as u64;
         let fresh = rc_fresh_pages as u64;
+        let staged = rc_staged_pages as u64;
         self.flush_sample_l2p_dirty_pages
             .fetch_add(l2p, Ordering::Relaxed);
         fetch_max(&self.flush_sample_l2p_dirty_pages_max, l2p);
@@ -122,15 +125,48 @@ impl MetaMetrics {
         self.flush_sample_rc_fresh_pages
             .fetch_add(fresh, Ordering::Relaxed);
         fetch_max(&self.flush_sample_rc_fresh_pages_max, fresh);
+        self.flush_sample_rc_staged_pages
+            .fetch_add(staged, Ordering::Relaxed);
+        fetch_max(&self.flush_sample_rc_staged_pages_max, staged);
+    }
+
+    pub(crate) fn record_flush_rc_stream(
+        &self,
+        calls: u64,
+        pages: u64,
+        service_us: u64,
+        max_chunk_us: u64,
+        max_chunk_pages: u64,
+    ) {
+        self.flush_rc_stream_calls
+            .fetch_add(calls, Ordering::Relaxed);
+        self.flush_rc_stream_pages
+            .fetch_add(pages, Ordering::Relaxed);
+        self.flush_rc_stream_service_us
+            .fetch_add(service_us, Ordering::Relaxed);
+        fetch_max(&self.flush_rc_stream_max_chunk_us, max_chunk_us);
+        fetch_max(&self.flush_rc_stream_max_chunk_pages, max_chunk_pages);
+    }
+
+    pub(crate) fn record_flush_rc_fold_service(&self, service_us: u64) {
+        self.flush_rc_fold_service_us
+            .fetch_add(service_us, Ordering::Relaxed);
+        fetch_max(&self.flush_rc_fold_service_max_us, service_us);
+    }
+
+    /// Count page/byte work that completed outside the `flush_io_us` timer.
+    /// Streaming RC writes use this after their own service timer has already
+    /// been recorded, keeping count coverage without corrupting phase timing.
+    pub(crate) fn record_flush_io_pages(&self, pages: u64) {
+        self.flush_pages_written.fetch_add(pages, Ordering::Relaxed);
+        let bytes = pages.saturating_mul(crate::config::PAGE_SIZE as u64);
+        self.flush_io_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn record_flush_io(&self, elapsed: Duration, pages: usize) {
         record_duration(&self.flush_io_us, &self.flush_io_max_us, elapsed);
-        self.flush_pages_written
-            .fetch_add(pages as u64, Ordering::Relaxed);
-        let bytes = (pages as u64).saturating_mul(crate::config::PAGE_SIZE as u64);
-        self.flush_io_bytes_total
-            .fetch_add(bytes, Ordering::Relaxed);
+        self.record_flush_io_pages(pages as u64);
     }
 
     pub(crate) fn record_meta_io_write_batch(&self, ops: usize, bytes: usize, elapsed: Duration) {

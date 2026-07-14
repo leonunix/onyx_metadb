@@ -27,11 +27,12 @@
 //!
 //! ## Apply path (`stage`)
 //!
-//! `stage(bfg, …)` merges its delta into `delta_slots[bfg & 3]`, after
-//! reading the cumulative prev. It holds only the open slot's lock across
-//! its own read+merge; the other slots are read under brief individual
-//! locks. Concurrent commits on a shard all target the same open slot and
-//! serialise on its lock.
+//! `stage(bfg, …)` merges its delta into `delta_slots[bfg & 3]` after reading
+//! the cumulative prev. Like `stage_batch`, it samples the array before taking
+//! `fold_lock.read()`, validates `fold_epoch`, then locks all four slots in
+//! order. This makes the base + pending view atomic with respect to a
+//! checkpoint's publish-before-clear move, which is required for an exact
+//! `prev > 0 && new == 0` freed transition.
 //!
 //! ## Fold path (`begin_checkpoint`)
 //!
@@ -59,11 +60,10 @@
 //!
 //! ## Lock order
 //!
-//! Within a slot: `delta_slots[i]` → `array.inner`. Multi-slot holders
-//! (only `stage`, holding the open slot while briefly reading others)
-//! never hold two slot locks while acquiring a lower-indexed one in a way
-//! that can cycle, because all concurrent stages share the same open slot
-//! and serialise on it.
+//! Commit staging takes `fold_lock.read()` then all `delta_slots` in ascending
+//! order; after every slot guard is acquired it releases the fold guard before
+//! merging. Checkpoint publish takes `fold_lock.write()` before touching its
+//! slot. Read-only cumulative lookups take at most one slot at a time.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,10 +72,12 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use super::RcEntry;
-use super::array::{PagedRefcountArray, StagedDeltas};
+use super::array::{
+    ENTRIES_PER_PAGE, PagedRefcountArray, STAGE_BASE_READ_BATCH_PAGES, StagedDeltas, StagedPageMeta,
+};
 use super::delta::{DeltaMap, Pending};
 use crate::cache::PageCache;
-use crate::error::Result;
+use crate::error::{MetaDbError, Result};
 use crate::page_store::PageStore;
 use crate::types::{Bfg, Lsn, PageId, Pba};
 
@@ -123,19 +125,21 @@ fn merge_staged_action(
     pba: Pba,
     delta: i64,
     lsn: Lsn,
+    replay_skip: bool,
     base: RcEntry,
     page_lsn: Lsn,
     net: i64,
     max_lsn: Lsn,
     any: bool,
+    context: &'static str,
 ) -> Result<(u32, u32)> {
-    if !any && page_lsn >= lsn {
+    if replay_skip && !any && page_lsn >= lsn {
         return Ok((base.rc, base.rc));
     }
     let merged_prev = super::merge_read_or_floor(base, net, max_lsn)?;
     let (post, skipped) = super::apply_delta_or_skip(merged_prev, delta, lsn)?;
     if skipped {
-        super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, "stage_batch");
+        super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, context);
         return Ok((merged_prev.rc, merged_prev.rc));
     }
     open.merge(pba, delta, lsn);
@@ -165,6 +169,49 @@ struct StageBatchTestHook {
     after_lookup: std::sync::Barrier,
     resume: std::sync::Barrier,
     lookup_count: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+struct StreamingCheckpointTestHook {
+    pause_after_first_chunk: bool,
+    after_first_chunk: std::sync::Barrier,
+    resume: std::sync::Barrier,
+    chunks: std::sync::atomic::AtomicUsize,
+    max_chunk_pages: std::sync::atomic::AtomicUsize,
+    max_overlay_pages: std::sync::atomic::AtomicUsize,
+    page_weaks: Mutex<Vec<std::sync::Weak<crate::page::Page>>>,
+}
+
+#[cfg(test)]
+impl StreamingCheckpointTestHook {
+    fn new(pause_after_first_chunk: bool) -> Self {
+        Self {
+            pause_after_first_chunk,
+            after_first_chunk: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+            chunks: std::sync::atomic::AtomicUsize::new(0),
+            max_chunk_pages: std::sync::atomic::AtomicUsize::new(0),
+            max_overlay_pages: std::sync::atomic::AtomicUsize::new(0),
+            page_weaks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn capture_staged(&self, staged: &StagedDeltas, overlay_pages: usize) {
+        self.max_chunk_pages
+            .fetch_max(staged.pages.len(), Ordering::Relaxed);
+        self.max_overlay_pages
+            .fetch_max(overlay_pages, Ordering::Relaxed);
+        self.page_weaks
+            .lock()
+            .extend(staged.pages.iter().map(|page| Arc::downgrade(&page.sealed)));
+    }
+
+    fn after_chunk(&self) {
+        if self.chunks.fetch_add(1, Ordering::SeqCst) == 0 && self.pause_after_first_chunk {
+            self.after_first_chunk.wait();
+            self.resume.wait();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -205,8 +252,8 @@ pub struct RcShard {
     /// `rc_authoritative_reclaim`) → premature free → reuse → read CRC.
     /// The fold takes this in write mode across the in-memory stage + publish +
     /// clear (durable page writes still happen later); the consistent read and
-    /// `stage_batch` validation take it in read mode. Single-item `get`/`stage`
-    /// paths never touch it.
+    /// `stage_batch` and single-item `stage` validation take it in read mode.
+    /// The cheap single-item `get` path does not touch it.
     fold_lock: parking_lot::RwLock<()>,
     /// Sequence for representation moves between `delta_slots` and `array`.
     /// `stage_batch` reads base pages without slot locks, then validates this
@@ -214,14 +261,23 @@ pub struct RcShard {
     fold_epoch: AtomicU64,
     #[cfg(test)]
     stage_batch_test_hook: Mutex<Option<Arc<StageBatchTestHook>>>,
+    #[cfg(test)]
+    streaming_checkpoint_test_hook: Mutex<Option<Arc<StreamingCheckpointTestHook>>>,
 }
 
-/// Checkpoint produced by [`RcShard::begin_checkpoint`]. Carries the
-/// sealed pages, the snapshots needed to drive `paged_meta::write_chain`
-/// outside the apply gate, and the drained deltas for
-/// [`RcShard::abort_checkpoint`] to restore on a failed flush.
+/// Refcount checkpoint carried into the manifest phase. Cold checkpoints keep
+/// sealed pages for the global write batch; production streaming checkpoints
+/// keep only compact page metadata after writing each bounded chunk. Both carry
+/// the page-table snapshots needed by `paged_meta::write_chain`.
 pub struct RcCheckpoint {
     pub(super) staged: StagedDeltas,
+    /// Streaming hot-path pages after their write CQEs completed. Only compact
+    /// allocation metadata remains; page payload Arcs were dropped per chunk.
+    streamed_pages: Vec<StagedPageMeta>,
+    /// Time spent folding array/slot state, excluding streaming page writes.
+    fold_service_us: u64,
+    streaming_write_stats: RcStreamingWriteStats,
+    streaming: bool,
     /// The slot's drained entries + which slot they came from — restored
     /// by `abort_checkpoint` so a retry redoes the fold.
     drained_deltas: Vec<(Pba, Pending)>,
@@ -236,10 +292,41 @@ pub struct RcCheckpoint {
     snapshot_meta_chain: Vec<PageId>,
 }
 
+/// Service work completed by the bounded data-page writes of a streaming
+/// refcount checkpoint. The lifecycle aggregates these per-shard values into
+/// the public `flush_rc_stream_*` metrics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RcStreamingWriteStats {
+    pub calls: u64,
+    pub pages: u64,
+    pub service_us: u64,
+    pub max_chunk_us: u64,
+    pub max_chunk_pages: u64,
+}
+
+impl RcStreamingWriteStats {
+    fn record_chunk(&mut self, pages: usize, elapsed: Duration) {
+        let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.calls = self.calls.saturating_add(1);
+        self.pages = self.pages.saturating_add(pages as u64);
+        self.service_us = self.service_us.saturating_add(elapsed_us);
+        self.max_chunk_us = self.max_chunk_us.max(elapsed_us);
+        self.max_chunk_pages = self.max_chunk_pages.max(pages as u64);
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.calls = self.calls.saturating_add(other.calls);
+        self.pages = self.pages.saturating_add(other.pages);
+        self.service_us = self.service_us.saturating_add(other.service_us);
+        self.max_chunk_us = self.max_chunk_us.max(other.max_chunk_us);
+        self.max_chunk_pages = self.max_chunk_pages.max(other.max_chunk_pages);
+    }
+}
+
 impl RcCheckpoint {
     /// Empty checkpoint — fast path when nothing was drained / staged.
     pub fn is_empty(&self) -> bool {
-        self.staged.is_empty()
+        self.staged.is_empty() && self.streamed_pages.is_empty()
     }
 
     /// Append sealed pages to a shared write-out vec; lifecycle.rs uses
@@ -265,6 +352,19 @@ impl RcCheckpoint {
     /// Number of freshly-allocated data pages this checkpoint produced.
     pub fn fresh_pages_count(&self) -> usize {
         self.staged.pages.iter().filter(|p| p.is_fresh).count()
+            + self.streamed_pages.iter().filter(|p| p.is_fresh).count()
+    }
+
+    pub fn data_pages_count(&self) -> usize {
+        self.staged.pages.len() + self.streamed_pages.len()
+    }
+
+    pub(crate) fn streaming_write_stats(&self) -> RcStreamingWriteStats {
+        self.streaming_write_stats
+    }
+
+    pub(crate) fn fold_service_us(&self) -> u64 {
+        self.fold_service_us
     }
 
     #[cfg(test)]
@@ -274,6 +374,12 @@ impl RcCheckpoint {
             .iter()
             .filter(|p| p.is_fresh)
             .map(|p| (p.page_idx, p.page_id))
+            .chain(
+                self.streamed_pages
+                    .iter()
+                    .filter(|p| p.is_fresh)
+                    .map(|p| (p.page_idx, p.page_id)),
+            )
             .collect()
     }
 
@@ -284,6 +390,12 @@ impl RcCheckpoint {
             .iter()
             .filter(|p| !p.is_fresh)
             .map(|p| p.page_id)
+            .chain(
+                self.streamed_pages
+                    .iter()
+                    .filter(|p| !p.is_fresh)
+                    .map(|p| p.page_id),
+            )
             .collect()
     }
 }
@@ -312,6 +424,8 @@ impl RcShard {
             fold_epoch: AtomicU64::new(0),
             #[cfg(test)]
             stage_batch_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            streaming_checkpoint_test_hook: Mutex::new(None),
         }
     }
 
@@ -517,11 +631,13 @@ impl RcShard {
                     pba,
                     delta,
                     lsn,
+                    true,
                     base,
                     page_lsn,
                     net,
                     max_lsn,
                     any,
+                    "stage_batch",
                 );
                 delta_merge += merge_started.elapsed();
                 out.push(merged?);
@@ -535,11 +651,13 @@ impl RcShard {
                     pba,
                     delta,
                     lsn,
+                    true,
                     base,
                     page_lsn,
                     net,
                     max_lsn,
                     any,
+                    "stage_batch",
                 )?);
             }
         }
@@ -598,35 +716,45 @@ impl RcShard {
         lsn: Lsn,
         replay_skip: bool,
     ) -> Result<(u32, u32)> {
-        let idx = slot_index(bfg);
-        // Read the other three slots first (brief individual locks), then
-        // hold the open slot across read-own + array read + merge so a
-        // concurrent stage targeting the same open slot serialises here.
-        let (mut net, mut max_lsn, mut any) = self.sum_pending(pba, Some(idx));
-        let mut open = self.delta_slots[idx].lock();
-        if let Some(p) = open.get(pba) {
-            net += p.delta;
-            if p.last_lsn > max_lsn {
-                max_lsn = p.last_lsn;
+        let open_idx = slot_index(bfg);
+        loop {
+            let epoch_before = self.fold_epoch.load(Ordering::Acquire);
+            let (base, page_lsn) = self.array.get_with_page_lsn(pba)?;
+
+            #[cfg(test)]
+            let test_hook = self.stage_batch_test_hook.lock().clone();
+            #[cfg(test)]
+            if let Some(hook) = test_hook {
+                hook.after_lookup();
             }
-            any = true;
+
+            let fold = self.fold_lock.read();
+            if self.fold_epoch.load(Ordering::Acquire) != epoch_before {
+                drop(fold);
+                continue;
+            }
+
+            // Close the validation-to-slot-snapshot gap exactly as
+            // `stage_batch` does. A checkpoint cannot publish+clear while the
+            // read guard is held, and after all slot guards are acquired it
+            // cannot clear the matching pending delta until this merge ends.
+            let mut slots: Vec<_> = self.delta_slots.iter().map(|slot| slot.lock()).collect();
+            drop(fold);
+            let (net, max_lsn, any) = scan_locked_pending(&slots, pba);
+            return merge_staged_action(
+                &mut slots[open_idx],
+                pba,
+                delta,
+                lsn,
+                replay_skip,
+                base,
+                page_lsn,
+                net,
+                max_lsn,
+                any,
+                "stage",
+            );
         }
-        let base = self.array.get(pba)?;
-        // Replay-skip: with no pending anywhere AND the on-disk page
-        // generation already at/after this LSN, the op was already
-        // applied (recovery same-LSN re-application). `>=` is correct
-        // here — there is no drainer cycle-split hazard in the slot model.
-        if replay_skip && !any && self.array.page_lsn(pba)? >= lsn {
-            return Ok((base.rc, base.rc));
-        }
-        let merged_prev = super::merge_read_or_floor(base, net, max_lsn)?;
-        let (post, skipped) = super::apply_delta_or_skip(merged_prev, delta, lsn)?;
-        if skipped {
-            super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, "stage");
-            return Ok((merged_prev.rc, merged_prev.rc));
-        }
-        open.merge(pba, delta, lsn);
-        Ok((merged_prev.rc, post.rc))
     }
 
     /// Fold ONLY the Syncing slot (`bfg & 3`). Caller has frozen the slot
@@ -636,6 +764,170 @@ impl RcShard {
     /// durable_seq is correct — no separate watermark to record.
     pub fn begin_checkpoint(&self, bfg: Bfg) -> Result<RcCheckpoint> {
         self.checkpoint_slots(&[slot_index(bfg)], false, &[])
+    }
+
+    /// Production threads-on refcount checkpoint. The frozen Syncing slot is
+    /// folded in bounded data-page chunks. Each chunk performs the in-memory
+    /// publish + exact slot removal under `fold_lock.write()`, then writes its
+    /// sealed pages outside the lock and drops every payload Arc as soon as the
+    /// write CQEs complete. The checkpoint retained by the manifest phase is
+    /// compact metadata only.
+    pub(crate) fn begin_checkpoint_streaming(&self, bfg: Bfg) -> Result<RcCheckpoint> {
+        self.begin_checkpoint_streaming_capped(bfg, STAGE_BASE_READ_BATCH_PAGES)
+    }
+
+    fn begin_checkpoint_streaming_capped(
+        &self,
+        bfg: Bfg,
+        max_unique_pages: usize,
+    ) -> Result<RcCheckpoint> {
+        let restore_slot = slot_index(bfg);
+        let mut drained: Vec<(Pba, Pending)> = {
+            let slot = self.delta_slots[restore_slot].lock();
+            slot.iter().map(|(pba, pending)| (*pba, *pending)).collect()
+        };
+        if drained.is_empty() {
+            return Ok(RcCheckpoint {
+                staged: StagedDeltas {
+                    pages: Vec::new(),
+                    max_lsn: 0,
+                },
+                streamed_pages: Vec::new(),
+                fold_service_us: 0,
+                streaming_write_stats: RcStreamingWriteStats::default(),
+                streaming: true,
+                drained_deltas: Vec::new(),
+                restore_slot,
+                snapshot_page_table: self.array.page_table_snapshot(),
+                snapshot_meta_chain: self.array.meta_chain_snapshot(),
+            });
+        }
+
+        drained.sort_by_key(|(pba, _)| (*pba as usize) / ENTRIES_PER_PAGE);
+        let max_unique_pages = max_unique_pages.max(1);
+        let mut cursor = 0;
+        let mut streamed_pages = Vec::new();
+        let mut fold_service_us = 0u64;
+        let mut streaming_write_stats = RcStreamingWriteStats::default();
+
+        #[cfg(test)]
+        let test_hook = self.streaming_checkpoint_test_hook.lock().clone();
+
+        while cursor < drained.len() {
+            let mut end = cursor;
+            let mut page_count = 0;
+            while end < drained.len() && page_count < max_unique_pages {
+                let page_idx = (drained[end].0 as usize) / ENTRIES_PER_PAGE;
+                page_count += 1;
+                end += 1;
+                while end < drained.len()
+                    && (drained[end].0 as usize) / ENTRIES_PER_PAGE == page_idx
+                {
+                    end += 1;
+                }
+            }
+
+            let fold_started = Instant::now();
+            let fold = self.fold_lock.write();
+            let epoch_guard = FoldEpochGuard {
+                epoch: &self.fold_epoch,
+            };
+
+            // The Syncing slot is frozen. Validate the exact snapshot before
+            // publishing so a violated BFG invariant cannot make us delete a
+            // newer or unrelated pending delta.
+            {
+                let slot = self.delta_slots[restore_slot].lock();
+                for &(pba, pending) in &drained[cursor..end] {
+                    if slot.get(pba) != Some(pending) {
+                        return Err(MetaDbError::Corruption(format!(
+                            "streaming refcount checkpoint slot changed for pba {pba}"
+                        )));
+                    }
+                }
+            }
+
+            // `stage_deltas_in_memory_preserving` is failure-atomic for this
+            // chunk: on error it removes every overlay/fresh reservation it
+            // published. The slot is still intact until the call succeeds.
+            let staged = self.array.stage_deltas_in_memory_preserving(
+                &mut drained[cursor..end],
+                false,
+                &[],
+            )?;
+
+            let mut slot = self.delta_slots[restore_slot].lock();
+            let mut removed = Vec::with_capacity(end - cursor);
+            for &(pba, pending) in &drained[cursor..end] {
+                match slot.remove(pba) {
+                    Some(actual) if actual == pending => removed.push((pba, actual)),
+                    actual => {
+                        if let Some(actual) = actual {
+                            slot.merge_pending(pba, actual);
+                        }
+                        for (removed_pba, removed_pending) in removed {
+                            slot.merge_pending(removed_pba, removed_pending);
+                        }
+                        drop(slot);
+                        self.array.abort_staged_deltas(&staged, 0);
+                        return Err(MetaDbError::Corruption(format!(
+                            "streaming refcount checkpoint failed exact removal for pba {pba}"
+                        )));
+                    }
+                }
+            }
+            drop(slot);
+            drop(epoch_guard);
+            drop(fold);
+            fold_service_us =
+                fold_service_us.saturating_add(
+                    fold_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                );
+
+            #[cfg(test)]
+            if let Some(hook) = &test_hook {
+                hook.capture_staged(&staged, self.array.staged_overlay_len());
+            }
+
+            // PageStore waits for all write CQEs before returning. Keep the
+            // overlay through that wait, then remove it so this chunk's Arcs
+            // can be dropped before the next chunk is built.
+            // On write error this chunk has already been published and removed
+            // from the frozen slot. It is deliberately not reconstructed in
+            // place: the enclosing sync cycle poisons persistence, and every
+            // subsequent non-empty commit/forced sync fails until restart.
+            // Recovery starts from the prior manifest and replays the WAL.
+            // The still-published overlay retains at most this bounded chunk.
+            let write_started = Instant::now();
+            self.array.write_staged_page_runs(&staged)?;
+            streaming_write_stats.record_chunk(staged.pages.len(), write_started.elapsed());
+            let compact = staged.compact_pages();
+            self.array.clear_staged(&staged);
+            streamed_pages.extend(compact);
+            drop(staged);
+
+            #[cfg(test)]
+            if let Some(hook) = &test_hook {
+                hook.after_chunk();
+            }
+
+            cursor = end;
+        }
+
+        Ok(RcCheckpoint {
+            staged: StagedDeltas {
+                pages: Vec::new(),
+                max_lsn: 0,
+            },
+            streamed_pages,
+            fold_service_us,
+            streaming_write_stats,
+            streaming: true,
+            drained_deltas: drained,
+            restore_slot,
+            snapshot_page_table: self.array.page_table_snapshot(),
+            snapshot_meta_chain: self.array.meta_chain_snapshot(),
+        })
     }
 
     /// Like [`Self::begin_checkpoint`] but additionally force-increfs
@@ -702,6 +994,10 @@ impl RcShard {
                     pages: Vec::new(),
                     max_lsn: 0,
                 },
+                streamed_pages: Vec::new(),
+                fold_service_us: 0,
+                streaming_write_stats: RcStreamingWriteStats::default(),
+                streaming: false,
                 drained_deltas: Vec::new(),
                 restore_slot,
                 snapshot_page_table: self.array.page_table_snapshot(),
@@ -717,6 +1013,7 @@ impl RcShard {
         // later, outside this lock. Building staged pages may still need base
         // reads, which is why `stage_batch` never holds the read side across its
         // own base-page lookup.
+        let fold_started = Instant::now();
         let fold = self.fold_lock.write();
         // Declared after `fold`, so `?` paths bump the epoch before releasing
         // the write guard. Readers can never validate a partially-moved view.
@@ -741,11 +1038,16 @@ impl RcShard {
         }
         drop(epoch_guard);
         drop(fold);
+        let fold_service_us = fold_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
         let snapshot_page_table = self.array.page_table_snapshot();
         let snapshot_meta_chain = self.array.meta_chain_snapshot();
         Ok(RcCheckpoint {
             staged,
+            streamed_pages: Vec::new(),
+            fold_service_us,
+            streaming_write_stats: RcStreamingWriteStats::default(),
+            streaming: false,
             drained_deltas: drained,
             restore_slot,
             snapshot_page_table,
@@ -805,9 +1107,12 @@ impl RcShard {
         self.array.clear_staged(&ckpt.staged);
     }
 
-    /// Roll back a checkpoint that failed before install. Frees fresh
-    /// page ids + invalidates touched cache entries, then restores the
-    /// drained deltas into a live slot so a retry redoes the fold.
+    /// Roll back a checkpoint only while the global page write has not started.
+    /// Cold checkpoints retain their page Arcs and restore every delta.
+    /// Streaming checkpoints have already completed their data-page writes,
+    /// but their stable meta-chain is still old at this phase: existing pages
+    /// remain folded, while unreachable fresh pages can be freed and restored
+    /// from compact metadata. Post-write errors must retain authority instead.
     pub fn abort_checkpoint(&self, ckpt: RcCheckpoint, free_lsn: Lsn) {
         if ckpt.is_empty() {
             return;
@@ -817,9 +1122,28 @@ impl RcShard {
             epoch: &self.fold_epoch,
         };
         self.array.abort_staged_deltas(&ckpt.staged, free_lsn);
+        if ckpt.streaming {
+            self.array
+                .abort_streamed_fresh_pages(&ckpt.streamed_pages, free_lsn);
+        }
+        let fresh_page_idxs: Vec<usize> = if ckpt.streaming {
+            ckpt.streamed_pages
+                .iter()
+                .filter(|page| page.is_fresh)
+                .map(|page| page.page_idx)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut slot = self.delta_slots[ckpt.restore_slot].lock();
         for (pba, pending) in ckpt.drained_deltas {
-            slot.merge_pending(pba, pending);
+            if !ckpt.streaming
+                || fresh_page_idxs
+                    .binary_search(&((pba as usize) / ENTRIES_PER_PAGE))
+                    .is_ok()
+            {
+                slot.merge_pending(pba, pending);
+            }
         }
         drop(slot);
         drop(epoch_guard);
@@ -840,13 +1164,27 @@ impl RcShard {
             self.abort_checkpoint(ckpt, 0);
             return Err(err);
         }
-        let new_chain = match self.write_meta_chain(&ckpt, 0) {
-            Ok(c) => c,
+        // Build is still an in-memory/allocation phase: if it fails, the
+        // stable meta head was not touched and the checkpoint can be rolled
+        // back. Keep this boundary explicit instead of using `write_chain`,
+        // whose Err cannot say whether stable-head write submission started.
+        let (new_chain, chain_pages, to_free) = match self.build_meta_chain(&ckpt) {
+            Ok(built) => built,
             Err(err) => {
                 self.abort_checkpoint(ckpt, 0);
                 return Err(err);
             }
         };
+        // After this call starts, the stable head may already reference fresh
+        // data pages. Never abort/free them on error; retain the in-memory
+        // authority and let the enclosing operation fail closed.
+        if let Err(err) = self
+            .array
+            .write_built_meta_chain_external(chain_pages, to_free, 0)
+        {
+            drop(ckpt);
+            return Err(err);
+        }
         self.install_meta_chain(new_chain);
         Ok(())
     }

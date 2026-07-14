@@ -2,10 +2,14 @@ use super::*;
 use tempfile::TempDir;
 
 fn make_shard() -> (TempDir, RcShard) {
+    make_shard_with_cache_bytes(16 * 1024 * 1024)
+}
+
+fn make_shard_with_cache_bytes(cache_bytes: u64) -> (TempDir, RcShard) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("pages");
     let page_store = Arc::new(PageStore::create(&path).unwrap());
-    let page_cache = Arc::new(PageCache::new(page_store.clone(), 16 * 1024 * 1024));
+    let page_cache = Arc::new(PageCache::new(page_store.clone(), cache_bytes));
     let s = RcShard::create(page_store, page_cache).unwrap();
     (dir, s)
 }
@@ -97,6 +101,226 @@ fn stage_batch_retries_when_checkpoint_moves_state_after_base_lookup() {
     assert_eq!(hook.lookup_count.load(Ordering::SeqCst), 2);
     assert_eq!(staged, vec![(2, 0)]);
     assert_eq!(s.get(pba).unwrap(), 0);
+}
+
+#[test]
+fn stage_retries_when_checkpoint_moves_state_after_base_lookup() {
+    let (_d, s) = make_shard();
+    let pba = 10;
+    s.array
+        .apply_deltas(vec![(
+            pba,
+            Pending {
+                delta: 1,
+                last_lsn: 100,
+            },
+        )])
+        .unwrap();
+    // Logical rc=2: durable base 1 plus the Syncing slot's pending +1.
+    s.delta_slots[0].lock().merge(pba, 1, 200);
+
+    let s = Arc::new(s);
+    let hook = Arc::new(StageBatchTestHook::new());
+    *s.stage_batch_test_hook.lock() = Some(hook.clone());
+    let stage = {
+        let s = s.clone();
+        std::thread::spawn(move || s.stage(1, pba, -2, 300))
+    };
+
+    // The first lookup captured base=1. Move the pending +1 into the array
+    // before stage validates; accepting the old base with the now-empty slot
+    // would miss the real 2 -> 0 freed transition.
+    hook.after_lookup.wait();
+    let _checkpoint = s.begin_checkpoint(0).unwrap();
+    hook.resume.wait();
+
+    let transition = stage.join().unwrap().unwrap();
+    assert_eq!(hook.lookup_count.load(Ordering::SeqCst), 2);
+    assert_eq!(transition, (2, 0));
+    assert_eq!(s.get(pba).unwrap(), 0);
+}
+
+#[test]
+fn streaming_checkpoint_bounds_overlay_and_releases_chunk_page_arcs() {
+    const PAGE_COUNT: usize = 5;
+    const CHUNK_PAGES: usize = 2;
+
+    // A zero-capacity shared cache makes the payload lifetime observable: once
+    // the streaming checkpoint clears the overlay and drops its local chunk,
+    // no cache Arc can keep the page alive.
+    let (_d, s) = make_shard_with_cache_bytes(0);
+    for page_idx in 0..PAGE_COUNT {
+        let pba = (page_idx * ENTRIES_PER_PAGE + 7) as Pba;
+        s.stage(T0, pba, 1, 100 + page_idx as u64).unwrap();
+    }
+
+    let hook = Arc::new(StreamingCheckpointTestHook::new(false));
+    *s.streaming_checkpoint_test_hook.lock() = Some(hook.clone());
+    let ckpt = s
+        .begin_checkpoint_streaming_capped(T0, CHUNK_PAGES)
+        .unwrap();
+
+    assert_eq!(ckpt.data_pages_count(), PAGE_COUNT);
+    assert!(ckpt.staged.pages.is_empty());
+    let stream = ckpt.streaming_write_stats();
+    assert_eq!(stream.calls, 3);
+    assert_eq!(stream.pages, PAGE_COUNT as u64);
+    assert_eq!(stream.max_chunk_pages, CHUNK_PAGES as u64);
+    assert!(stream.max_chunk_us <= stream.service_us);
+    assert_eq!(hook.chunks.load(Ordering::SeqCst), 3);
+    assert!(hook.max_chunk_pages.load(Ordering::Relaxed) <= CHUNK_PAGES);
+    assert!(hook.max_overlay_pages.load(Ordering::Relaxed) <= CHUNK_PAGES);
+    assert_eq!(s.array.staged_overlay_len(), 0);
+    assert!(
+        hook.page_weaks
+            .lock()
+            .iter()
+            .all(|page| page.upgrade().is_none()),
+        "streaming RcCheckpoint retained a sealed page Arc"
+    );
+}
+
+#[test]
+fn stage_batch_retries_when_streaming_checkpoint_moves_a_later_chunk() {
+    let (_d, s) = make_shard();
+    let p0 = 7;
+    let p1 = (ENTRIES_PER_PAGE + 7) as Pba;
+    s.array
+        .apply_deltas(vec![
+            (
+                p0,
+                Pending {
+                    delta: 1,
+                    last_lsn: 100,
+                },
+            ),
+            (
+                p1,
+                Pending {
+                    delta: 1,
+                    last_lsn: 100,
+                },
+            ),
+        ])
+        .unwrap();
+    s.stage(0, p0, 1, 200).unwrap();
+    s.stage(0, p1, 1, 201).unwrap();
+
+    let s = Arc::new(s);
+    let checkpoint_hook = Arc::new(StreamingCheckpointTestHook::new(true));
+    *s.streaming_checkpoint_test_hook.lock() = Some(checkpoint_hook.clone());
+    let checkpoint = {
+        let s = s.clone();
+        std::thread::spawn(move || s.begin_checkpoint_streaming_capped(0, 1))
+    };
+    checkpoint_hook.after_first_chunk.wait();
+
+    let stage_hook = Arc::new(StageBatchTestHook::new());
+    *s.stage_batch_test_hook.lock() = Some(stage_hook.clone());
+    let stage = {
+        let s = s.clone();
+        std::thread::spawn(move || s.stage_batch(1, &[(p0, -2), (p1, -2)], 300))
+    };
+    // stage_batch captured the mixed physical representation (first page
+    // folded, second still pending) at one logically coherent instant.
+    stage_hook.after_lookup.wait();
+
+    // Let the checkpoint publish+clear the second chunk before stage_batch
+    // validates its epoch. The batch must discard both old bases and retry.
+    checkpoint_hook.resume.wait();
+    let ckpt = checkpoint.join().unwrap().unwrap();
+    assert_eq!(ckpt.data_pages_count(), 2);
+    stage_hook.resume.wait();
+
+    let (staged, _) = stage.join().unwrap().unwrap();
+    assert_eq!(stage_hook.lookup_count.load(Ordering::SeqCst), 2);
+    assert_eq!(staged, vec![(2, 0), (2, 0)]);
+    assert_eq!(s.get(p0).unwrap(), 0);
+    assert_eq!(s.get(p1).unwrap(), 0);
+}
+
+#[test]
+fn streaming_chunk_stage_error_cleans_published_pages_and_fresh_reservations() {
+    let (_d, s) = make_shard();
+    let p0 = 7;
+    let p1 = (ENTRIES_PER_PAGE + 7) as Pba;
+    s.delta_slots[0].lock().merge(p0, 1, 100);
+    s.delta_slots[0]
+        .lock()
+        .merge(p1, i64::from(u32::MAX) + 1, 101);
+
+    let err = s.begin_checkpoint_streaming_capped(0, 2).err().unwrap();
+    assert!(matches!(err, MetaDbError::InvalidArgument(_)));
+    assert_eq!(s.array.staged_overlay_len(), 0);
+    assert_eq!(s.allocated_data_pages(), 0);
+    assert_eq!(s.delta_slots[0].lock().get(p0).unwrap().delta, 1);
+    assert_eq!(
+        s.delta_slots[0].lock().get(p1).unwrap().delta,
+        i64::from(u32::MAX) + 1
+    );
+}
+
+#[test]
+fn streaming_later_chunk_stage_error_keeps_first_applied_and_second_pending() {
+    let (_d, s) = make_shard();
+    let first = 7;
+    let second = (ENTRIES_PER_PAGE + 7) as Pba;
+    s.delta_slots[0].lock().merge(first, 1, 100);
+    s.delta_slots[0]
+        .lock()
+        .merge(second, i64::from(u32::MAX) + 1, 101);
+
+    let err = s.begin_checkpoint_streaming_capped(0, 1).err().unwrap();
+    assert!(matches!(err, MetaDbError::InvalidArgument(_)));
+
+    // Chunk 1 completed its write and exact slot removal. Chunk 2 failed
+    // atomically while staging, so its fresh reservation/overlay was cleaned
+    // and its original pending delta remains retryable.
+    assert_eq!(s.array.get(first).unwrap().rc, 1);
+    assert_eq!(s.get(first).unwrap(), 1);
+    assert!(s.delta_slots[0].lock().get(first).is_none());
+    assert_eq!(
+        s.delta_slots[0].lock().get(second).unwrap().delta,
+        i64::from(u32::MAX) + 1
+    );
+    let page_table = s.array.page_table_snapshot();
+    assert_ne!(page_table[0], 0);
+    assert_eq!(page_table.get(1).copied().unwrap_or(0), 0);
+    assert_eq!(s.allocated_data_pages(), 1);
+    assert_eq!(s.array.staged_overlay_len(), 0);
+}
+
+#[test]
+fn streaming_abort_keeps_written_existing_pages_and_restores_only_fresh_deltas() {
+    let (_d, s) = make_shard();
+    let existing = 7;
+    let fresh = (ENTRIES_PER_PAGE + 7) as Pba;
+    s.array
+        .apply_deltas(vec![(
+            existing,
+            Pending {
+                delta: 1,
+                last_lsn: 100,
+            },
+        )])
+        .unwrap();
+    s.stage(0, existing, 1, 200).unwrap();
+    s.stage(0, fresh, 1, 201).unwrap();
+
+    let ckpt = s.begin_checkpoint_streaming_capped(0, 1).unwrap();
+    assert_eq!(s.get(existing).unwrap(), 2);
+    assert_eq!(s.get(fresh).unwrap(), 1);
+    s.abort_checkpoint(ckpt, 0);
+
+    // Existing bytes already completed their write and remain authoritative;
+    // restoring their delta would transiently double-count before restart.
+    assert!(s.delta_slots[0].lock().get(existing).is_none());
+    assert_eq!(s.get(existing).unwrap(), 2);
+    // A fresh pid can be detached and freed exactly, so its pending delta is
+    // restored for the fatal cycle's diagnostic in-memory view.
+    assert_eq!(s.delta_slots[0].lock().get(fresh).unwrap().delta, 1);
+    assert_eq!(s.get(fresh).unwrap(), 1);
+    assert_eq!(s.allocated_data_pages(), 1);
 }
 
 #[test]
@@ -284,7 +508,9 @@ fn abort_then_retry_does_not_double_apply_via_replay_skip() {
 
     let ckpt = s.begin_checkpoint_all_slots(false).unwrap();
     s.array.write_staged_pages(&ckpt.staged).unwrap();
-    let _ = s.write_meta_chain(&ckpt, 0).unwrap();
+    // Abort remains legal after data-page IO while the stable meta head still
+    // names the old page table. Once meta-chain write submission starts, fresh
+    // pages may be reachable and must be retained instead.
     s.abort_checkpoint(ckpt, 0);
     assert_eq!(s.get(10).unwrap(), 5, "value still observable post-abort");
     s.flush().unwrap();

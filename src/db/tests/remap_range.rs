@@ -1192,6 +1192,19 @@ fn rc_authoritative_bfg_threads_rc_exact_across_checkpoints() {
     for old in 100u64..=105 {
         assert_eq!(db.get_refcount(old).unwrap(), 0, "pba {old} fully decref'd");
     }
+    let metrics = db.metrics_snapshot();
+    assert!(metrics.flush_rc_stream_pages > 0);
+    assert!(
+        metrics.flush_pages_written >= metrics.flush_rc_stream_pages,
+        "streaming RC pages must remain included in total flush page work"
+    );
+    assert_eq!(
+        metrics.flush_io_bytes_total,
+        metrics
+            .flush_pages_written
+            .saturating_mul(crate::config::PAGE_SIZE as u64)
+    );
+    assert!(metrics.flush_rc_fold_service_us > 0);
 }
 
 /// Checkpoint → durable → reopen preserves rc. metadb has no data-plane WAL,

@@ -46,6 +46,15 @@ impl DeltaMap {
         self.inner.get(&pba).copied()
     }
 
+    /// Remove one exact PBA from a frozen checkpoint slot.
+    ///
+    /// Production streaming checkpoints call this only after publishing the
+    /// corresponding array page under `fold_lock.write()`. The Syncing slot is
+    /// frozen, so no concurrent insert can race the removal.
+    pub fn remove(&mut self, pba: Pba) -> Option<Pending> {
+        self.inner.remove(&pba)
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len()
     }

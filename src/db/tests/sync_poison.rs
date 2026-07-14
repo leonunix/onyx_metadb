@@ -47,6 +47,8 @@ fn no_hang_after_faulted_sync(threads: bool) {
     let mut cfg = crate::config::Config::new(dir.path());
     cfg.shards_per_partition = 1;
     cfg.bfg_threads_enabled = threads;
+    cfg.async_reclaim_enabled = true;
+    cfg.async_reclaim_idle_interval_ms = 1;
     // Long timeout so the background quiesce worker (threads-on) doesn't roll a
     // spurious BFG into the fault window.
     cfg.bfg_timeout_ms = 60_000;
@@ -56,6 +58,13 @@ fn no_hang_after_faulted_sync(threads: bool) {
         db.insert(vol, i, v(i as u8)).unwrap();
     }
     db.flush().unwrap();
+
+    // Keep one brand-new RC data page exclusively in the BFG that the faulted
+    // sync will fold. The stable RC meta head is rewritten in place before the
+    // manifest publish, so a post-write abort must not free this page or
+    // restore its delta.
+    const FAULT_RC_PBA: u64 = 42;
+    assert_eq!(db.incref_pba(FAULT_RC_PBA, 1).unwrap(), 1);
 
     // Arm a one-shot manifest-fsync fault, then snapshot: its sync cycle commits
     // the manifest -> fault -> Err. Must RETURN (not hang) with Err.
@@ -68,6 +77,10 @@ fn no_hang_after_faulted_sync(threads: bool) {
     assert!(
         faults.fired(FaultPoint::ManifestFsyncBefore),
         "the manifest-fsync fault must have fired on the snapshot's commit"
+    );
+    assert!(
+        db.metrics_snapshot().flush_sample_rc_fresh_pages_max > 0,
+        "faulted cycle must exercise a freshly allocated RC data page"
     );
 
     // The subsystem is now poisoned (restart required). Clear the fault: the
@@ -83,6 +96,23 @@ fn no_hang_after_faulted_sync(threads: bool) {
         db.create_volume().is_err(),
         "create_volume must fail fast once the sync subsystem is poisoned"
     );
+    let post_poison_lba = 99;
+    assert!(
+        db.insert(vol, post_poison_lba, v(99)).is_err(),
+        "ordinary commit must fail fast once the sync subsystem is poisoned"
+    );
+    let post_poison_staged_lba = 100;
+    let mut staged = db.begin();
+    staged.insert(vol, post_poison_staged_lba, v(100));
+    assert!(
+        staged.commit_staged_with_outcomes().is_err(),
+        "production staged commit must fail fast once the sync subsystem is poisoned"
+    );
+
+    // If the post-sync error path incorrectly queued the fresh RC page for
+    // free, the enabled reclaim worker will turn it into a `Free` page before
+    // shutdown. Reopen below must still follow the stable meta chain to rc=1.
+    thread::sleep(Duration::from_millis(50));
 
     drop(db);
 
@@ -97,12 +127,56 @@ fn no_hang_after_faulted_sync(threads: bool) {
             "reopen lba {i} lost"
         );
     }
+    assert_eq!(
+        db.get_refcount(FAULT_RC_PBA).unwrap(),
+        1,
+        "fresh RC page referenced by the stable meta chain was freed or lost"
+    );
+    assert_eq!(
+        db.get(vol, post_poison_lba).unwrap(),
+        None,
+        "the rejected post-poison commit must not survive reopen"
+    );
+    assert_eq!(
+        db.get(vol, post_poison_staged_lba).unwrap(),
+        None,
+        "the rejected post-poison staged commit must not survive reopen"
+    );
     // Subsystem usable after restart (fresh constructor reset sync_poison): a
     // snapshot now succeeds.
     let ok = db.take_snapshot(vol);
     assert!(
         ok.is_ok(),
         "post-reopen snapshot must succeed (poison reset by restart), got {ok:?}"
+    );
+
+    let report = db.verify(VerifyOptions::default()).unwrap();
+    assert!(
+        report.issues.is_empty() && report.orphan_pages.is_empty(),
+        "faulted manifest publish left reachable/free or orphan RC pages: issues={:?} orphans={:?}",
+        report.issues,
+        report.orphan_pages
+    );
+
+    // Force another fresh RC data page and a longer meta-chain after reopen.
+    // If the old manifest's free-list still considered FAULT_RC_PBA's page
+    // free, this allocation/flush could recycle and overwrite it.
+    const NEXT_RC_PBA: u64 = 1_000_000;
+    assert_eq!(db.incref_pba(NEXT_RC_PBA, 2).unwrap(), 2);
+    db.flush().unwrap();
+    assert_eq!(db.get_refcount(FAULT_RC_PBA).unwrap(), 1);
+    assert_eq!(db.get_refcount(NEXT_RC_PBA).unwrap(), 2);
+    drop(db);
+
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(db.get_refcount(FAULT_RC_PBA).unwrap(), 1);
+    assert_eq!(db.get_refcount(NEXT_RC_PBA).unwrap(), 2);
+    let report = db.verify(VerifyOptions::default()).unwrap();
+    assert!(
+        report.issues.is_empty() && report.orphan_pages.is_empty(),
+        "post-reallocation reopen is inconsistent: issues={:?} orphans={:?}",
+        report.issues,
+        report.orphan_pages
     );
     drop(db);
 

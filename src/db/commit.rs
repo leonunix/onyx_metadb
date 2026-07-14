@@ -393,6 +393,9 @@ impl Db {
             self.metrics.record_commit_empty();
             return Ok((self.last_applied_lsn(), Vec::new()));
         }
+        if let Some(err) = self.sync_poison_error() {
+            return Err(err);
+        }
         let commit_started = std::time::Instant::now();
         let cpu_started = thread_cpu_time();
         let mut timing = CommitTiming::default();
@@ -602,6 +605,9 @@ impl Db {
             self.metrics.record_commit_empty();
             return Ok((self.last_applied_lsn(), Vec::new()));
         }
+        if let Some(err) = self.sync_poison_error() {
+            return Err(err);
+        }
         if !self.unlogged_commits_enabled {
             return Err(MetaDbError::InvalidArgument(
                 "unlogged commits are disabled in this metadb config".into(),
@@ -781,6 +787,9 @@ impl Db {
         if ops.is_empty() {
             self.metrics.record_commit_empty();
             return Ok((self.last_applied_lsn(), Vec::new()));
+        }
+        if let Some(err) = self.sync_poison_error() {
+            return Err(err);
         }
         let stage_started = std::time::Instant::now();
         self.metrics.record_commit_attempt(ops.len());
