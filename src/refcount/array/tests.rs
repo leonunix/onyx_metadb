@@ -1,4 +1,5 @@
 use super::*;
+use crate::metrics::MetaMetrics;
 use tempfile::TempDir;
 
 fn make_array() -> (TempDir, PagedRefcountArray) {
@@ -74,6 +75,58 @@ fn apply_deltas_spans_multiple_pages() {
     assert_eq!(a.get(pba_p3).unwrap().rc, 1);
     // page_idx 2 is a hole; page_table grows to 4 but only 3 data pages are allocated.
     assert_eq!(a.allocated_data_pages(), 3);
+}
+
+#[test]
+fn checkpoint_stage_batches_existing_page_cache_misses() {
+    const PAGE_COUNT: usize = 8;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("pages");
+    let page_store = Arc::new(PageStore::create(&path).unwrap());
+    let metrics = Arc::new(MetaMetrics::new());
+    page_store.attach_metrics(metrics.clone());
+    let page_cache = Arc::new(PageCache::new(page_store.clone(), 64 * 1024 * 1024));
+    let array = PagedRefcountArray::create(page_store, page_cache.clone()).unwrap();
+    let pbas: Vec<Pba> = (0..PAGE_COUNT)
+        .map(|page_idx| (page_idx * ENTRIES_PER_PAGE + 7) as Pba)
+        .collect();
+
+    array
+        .apply_deltas(
+            pbas.iter()
+                .copied()
+                .map(|pba| (pba, pending(1, 100)))
+                .collect(),
+        )
+        .unwrap();
+    let page_ids = array.inner.lock().page_table.clone();
+    for page_id in page_ids {
+        page_cache.invalidate(page_id);
+    }
+
+    let before = metrics.snapshot();
+    let staged = array
+        .stage_deltas_in_memory(
+            pbas.iter()
+                .copied()
+                .map(|pba| (pba, pending(1, 200)))
+                .collect(),
+            false,
+        )
+        .unwrap();
+    let after = metrics.snapshot();
+
+    assert_eq!(after.meta_io_read_calls - before.meta_io_read_calls, 1);
+    assert_eq!(
+        after.meta_io_read_ops - before.meta_io_read_ops,
+        PAGE_COUNT as u64
+    );
+    array.write_staged_pages(&staged).unwrap();
+    for pba in pbas {
+        assert_eq!(array.get(pba).unwrap().rc, 2);
+        assert_eq!(array.page_lsn(pba).unwrap(), 200);
+    }
 }
 
 #[test]

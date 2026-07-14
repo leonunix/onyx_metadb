@@ -43,7 +43,7 @@ use parking_lot::Mutex;
 
 use super::RcEntry;
 use crate::cache::PageCache;
-use crate::error::Result;
+use crate::error::{MetaDbError, Result};
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::PageStore;
 use crate::paged_meta;
@@ -158,6 +158,13 @@ struct CleanPageRun {
     page_id: PageId,
     start: usize,
     end: usize,
+}
+
+struct StagePageBase {
+    page_idx: usize,
+    page_id: PageId,
+    is_fresh: bool,
+    base: Option<Arc<Page>>,
 }
 
 impl PagedRefcountArray {
@@ -499,10 +506,13 @@ impl PagedRefcountArray {
             .copied()
             .filter(|idx| seen_pages.insert(*idx))
             .collect();
-        for page_idx in page_idxs {
-            let slot_pendings = by_page.remove(&page_idx).unwrap_or_default();
-            let force_slots = force_by_page.remove(&page_idx).unwrap_or_default();
-            let staged = self.stage_one_page(page_idx, slot_pendings, force, &force_slots)?;
+        let page_bases = self.resolve_stage_page_bases(&page_idxs)?;
+        for page_base in page_bases {
+            let slot_pendings = by_page.remove(&page_base.page_idx).unwrap_or_default();
+            let force_slots = force_by_page
+                .remove(&page_base.page_idx)
+                .unwrap_or_default();
+            let staged = self.stage_one_page(page_base, slot_pendings, force, &force_slots)?;
             let page_gen = staged.sealed.header()?.generation;
             if page_gen > max_lsn {
                 max_lsn = page_gen;
@@ -512,49 +522,82 @@ impl PagedRefcountArray {
         Ok(StagedDeltas { pages, max_lsn })
     }
 
+    /// Resolve every page touched by one refcount fold before applying deltas.
+    /// Existing clean pages are fetched through one cache multi-get, so cold
+    /// checkpoint work reaches the page device as a queued batch instead of a
+    /// serial `read_page` loop. Fresh and staged-overlay pages retain the same
+    /// publish-before-clear visibility guarantees as the former per-page path.
+    fn resolve_stage_page_bases(&self, page_idxs: &[usize]) -> Result<Vec<StagePageBase>> {
+        let mut page_bases = Vec::with_capacity(page_idxs.len());
+        let mut clean_positions = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            for &page_idx in page_idxs {
+                if page_idx >= inner.page_table.len() {
+                    inner.page_table.resize(page_idx + 1, 0);
+                    inner.meta_dirty = true;
+                }
+                if inner.page_table[page_idx] == 0 {
+                    let page_id = self.page_store.allocate()?;
+                    inner.page_table[page_idx] = page_id;
+                    inner.meta_dirty = true;
+                    self.allocated_data_pages.fetch_add(1, Ordering::Relaxed);
+
+                    // Publish a valid zero base atomically with the new pid.
+                    // Concurrent readers must never fall through to the fresh
+                    // page's unwritten disk backing while this fold is built.
+                    let mut placeholder = new_empty_data_page();
+                    placeholder.seal();
+                    inner.staged_overlay.insert(page_id, Arc::new(placeholder));
+                    page_bases.push(StagePageBase {
+                        page_idx,
+                        page_id,
+                        is_fresh: true,
+                        base: None,
+                    });
+                    continue;
+                }
+
+                let page_id = inner.page_table[page_idx];
+                let base = inner.staged_overlay.get(&page_id).cloned();
+                let position = page_bases.len();
+                page_bases.push(StagePageBase {
+                    page_idx,
+                    page_id,
+                    is_fresh: false,
+                    base,
+                });
+                if page_bases[position].base.is_none() {
+                    clean_positions.push(position);
+                }
+            }
+        }
+
+        let clean_page_ids: Vec<PageId> = clean_positions
+            .iter()
+            .map(|&position| page_bases[position].page_id)
+            .collect();
+        let clean_pages = self.page_cache.get_many(&clean_page_ids)?;
+        debug_assert_eq!(clean_pages.len(), clean_positions.len());
+        for (position, page) in clean_positions.into_iter().zip(clean_pages) {
+            page_bases[position].base = Some(page);
+        }
+        Ok(page_bases)
+    }
+
     fn stage_one_page(
         &self,
-        page_idx: usize,
+        page_base: StagePageBase,
         slot_pendings: Vec<(usize, Pending)>,
         force: bool,
         force_incref_slots: &[usize],
     ) -> Result<StagedPage> {
-        // Resolve / allocate the page id under inner; drop inner before
-        // touching the cache so concurrent reads on other pages don't
-        // block. The fold runs in the GATELESS sample phase, so reads
-        // are concurrent with everything below.
-        let (page_id, is_fresh, staged_base) = {
-            let mut inner = self.inner.lock();
-            if page_idx >= inner.page_table.len() {
-                inner.page_table.resize(page_idx + 1, 0);
-                inner.meta_dirty = true;
-            }
-            if inner.page_table[page_idx] == 0 {
-                let pid = self.page_store.allocate()?;
-                inner.page_table[page_idx] = pid;
-                inner.meta_dirty = true;
-                self.allocated_data_pages.fetch_add(1, Ordering::Relaxed);
-                // A fresh pid's disk backing is unwritten zeros, so the
-                // pid must never be observable without overlay cover:
-                // publish an all-zero placeholder page under the SAME
-                // lock that publishes the pid. All-zero entries are
-                // exactly the correct read value mid-fold (the slot
-                // deltas are still unfolded — publish-before-clear).
-                // Deliberately NOT rolled back on a later error in this
-                // function: leaving `(pid, placeholder)` published is
-                // self-healing — the next fold of this page_idx treats
-                // the placeholder as its base — whereas the pre-overlay
-                // code left a published pid over disk zeros (every read
-                // a PageMagicMismatch until restart).
-                let mut placeholder = new_empty_data_page();
-                placeholder.seal();
-                inner.staged_overlay.insert(pid, Arc::new(placeholder));
-                (pid, true, None)
-            } else {
-                let pid = inner.page_table[page_idx];
-                (pid, false, inner.staged_overlay.get(&pid).cloned())
-            }
-        };
+        let StagePageBase {
+            page_idx,
+            page_id,
+            is_fresh,
+            base,
+        } = page_base;
 
         let mut page = if is_fresh {
             new_empty_data_page()
@@ -564,9 +607,13 @@ impl PagedRefcountArray {
             // copy can be evicted and the disk copy is pre-fold, which
             // would silently drop that fold's deltas (their slot was
             // already cleared).
-            match staged_base {
+            match base {
                 Some(staged) => (*staged).clone(),
-                None => (*self.page_cache.get(page_id)?).clone(),
+                None => {
+                    return Err(MetaDbError::Corruption(format!(
+                        "resolved refcount page {page_id} has no base"
+                    )));
+                }
             }
         };
 
