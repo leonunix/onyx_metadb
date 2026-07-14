@@ -10,6 +10,8 @@ const FLUSH_RECLAIM_BACKLOG_HARD_CAP_PAGES: usize = 16 * 1_048_576;
 const FLUSH_INSTALL_PAGE_BUDGET: usize = 64;
 const FLUSH_INSTALL_CLEANUP_BUDGET: usize = 64;
 const FLUSH_INSTALL_STEP_WARN_US: u64 = 100_000;
+const TERMINAL_RECLAIM_CHUNK_PAGES: usize = 65_536;
+const TERMINAL_RECLAIM_MAX_ROUNDS: usize = 16;
 
 fn micros(duration: std::time::Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
@@ -515,6 +517,117 @@ impl Db {
     /// reclaim paths.
     fn async_reclaim_active(&self) -> bool {
         self.async_reclaim.lock().is_some()
+    }
+
+    /// Terminally quiesce metadata background writers, drain every deferred
+    /// page free, and make both the Free stamps and the device-path persisted
+    /// free-list bitmap durable.
+    ///
+    /// This is a shutdown-only operation: callers must have stopped external
+    /// writers and must not issue more Db mutations after it returns. A single
+    /// reclaim pass is insufficient on the fixed-device path because the
+    /// manifest's free-list bitmap is sampled before post-publish checkpoint
+    /// pages are retired. Each round therefore forces a manifest checkpoint,
+    /// synchronously drains the pages that checkpoint made reclaimable, and
+    /// repeats. The first round with no reclaimed or deferred pages proves that
+    /// its just-published bitmap covers every preceding reclaim.
+    pub fn drain_deferred_reclaim_durable(&self) -> Result<usize> {
+        // Stop independent page writers/producers first. Keep the BFG quiesce +
+        // sync pair alive until the convergence loop is complete because
+        // `flush()` uses them in the production threads-on configuration.
+        if let Some(mut flusher) = self.l2p_writeback.lock().take() {
+            flusher.stop();
+        }
+        if let Some(mut worker) = self.lineage_gc_worker.lock().take() {
+            worker.stop();
+        }
+        if let Some(mut worker) = self.livelist_condense.lock().take() {
+            worker.stop();
+        }
+        self.dedup_index.detach_drainers();
+        self.wait_apply_idle();
+
+        // Stop, but retain, the worker handle in the Option. While it remains
+        // present `flush_with_gate` keeps using the async-notify branch instead
+        // of reclaiming after its bitmap snapshot behind our accounting.
+        if let Some(worker) = self.async_reclaim.lock().as_mut() {
+            worker.stop();
+        }
+
+        let mut total_reclaimed = 0usize;
+        let mut converged = false;
+        for round in 1..=TERMINAL_RECLAIM_MAX_ROUNDS {
+            let inline_before = self.metrics.snapshot().flush_reclaim_reclaimed_pages;
+            self.flush()?;
+            let inline_after = self.metrics.snapshot().flush_reclaim_reclaimed_pages;
+            // Async reclaim can be disabled in standalone metadb configs. In
+            // that mode flush reclaims inline after publishing its bitmap, so
+            // count that work and require another round as well.
+            let inline_reclaimed = inline_after.saturating_sub(inline_before) as usize;
+
+            let mut explicit_reclaimed = 0usize;
+            loop {
+                let pending = self.page_store.deferred_free_len();
+                if pending == 0 {
+                    break;
+                }
+                let started = std::time::Instant::now();
+                let outcome = self
+                    .page_store
+                    .try_reclaim_limit(TERMINAL_RECLAIM_CHUNK_PAGES)?;
+                for &pid in &outcome.reclaimed {
+                    self.page_cache.invalidate(pid);
+                }
+                self.metrics.record_async_reclaim_cycle(
+                    outcome.selected,
+                    outcome.reclaimed.len(),
+                    started.elapsed(),
+                );
+                if outcome.selected == 0 {
+                    return Err(MetaDbError::Corruption(format!(
+                        "terminal page reclaim made no progress with {pending} deferred pages (safe_below={})",
+                        outcome.safe_below
+                    )));
+                }
+                explicit_reclaimed = explicit_reclaimed.saturating_add(outcome.reclaimed.len());
+            }
+
+            total_reclaimed = total_reclaimed
+                .saturating_add(inline_reclaimed)
+                .saturating_add(explicit_reclaimed);
+            let deferred = self.page_store.deferred_free_len();
+            tracing::info!(
+                round,
+                inline_reclaimed,
+                explicit_reclaimed,
+                deferred,
+                "metadb: terminal deferred-page reclaim round"
+            );
+            if inline_reclaimed == 0 && explicit_reclaimed == 0 && deferred == 0 {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            return Err(MetaDbError::Corruption(format!(
+                "terminal page reclaim did not converge after {TERMINAL_RECLAIM_MAX_ROUNDS} rounds (deferred={})",
+                self.page_store.deferred_free_len()
+            )));
+        }
+
+        // No more flush is needed. Stop the BFG pair so a timeout-triggered
+        // checkpoint cannot retire another page after the converged bitmap.
+        self.stop_bfg_threads();
+        if self.page_store.deferred_free_len() != 0 {
+            return Err(MetaDbError::Corruption(format!(
+                "terminal page reclaim gained {} deferred pages while stopping BFG workers",
+                self.page_store.deferred_free_len()
+            )));
+        }
+        // Free-stamp writes wait for CQEs, but only sync_all makes both their
+        // content and file metadata (tail truncation / hole punching) durable.
+        self.page_store.sync_all()?;
+        Ok(total_reclaimed)
     }
 
     /// BFG: spawn the quiesce + sync workers

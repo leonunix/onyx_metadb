@@ -98,6 +98,88 @@ fn async_page_reclaim_drains_bounded_cycles_without_checkpoint_waiting() {
 }
 
 #[test]
+fn terminal_reclaim_persists_freed_pages_across_device_reopen() {
+    let dir = TempDir::new().unwrap();
+    let page_device = Arc::new(crate::page_store::MemDevice::new(16_384));
+    let journal_device = Arc::new(crate::lifecycle_log::MemJournalDevice::new(512));
+    let mut cfg = Config::new(dir.path());
+    cfg.dedup_cuckoo_buckets = 256;
+    cfg.async_reclaim_enabled = true;
+    cfg.async_reclaim_max_pages_per_cycle = 1;
+    cfg.async_reclaim_idle_interval_ms = 60_000;
+    cfg.bfg_threads_enabled = true;
+    cfg.bfg_timeout_ms = 60_000;
+    cfg.lineage_gc_enabled = false;
+    cfg.livelist_condense_min_segments = 0;
+    cfg.dedup_drainer_enabled = false;
+    cfg.l2p_writeback_enabled = false;
+    cfg.reclaim_orphans_on_open = false;
+
+    let db = Db::create_on_device_with_faults(
+        cfg.clone(),
+        FaultController::disabled(),
+        page_device.clone(),
+        journal_device.clone(),
+    )
+    .unwrap();
+    let mut retired = Vec::new();
+    for generation in 1..=32u64 {
+        let pid = db.page_store.allocate().unwrap();
+        let mut page = crate::page::Page::new(crate::page::PageHeader::new(
+            crate::page::PageType::PagedLeaf,
+            generation,
+        ));
+        page.seal();
+        db.page_store.write_page(pid, &page).unwrap();
+        retired.push(pid);
+    }
+    // Keep the reclaimed pages interior so reopen must recover them from the
+    // persisted bitmap rather than merely lowering the allocation frontier.
+    let sentinel = db.page_store.allocate().unwrap();
+    let mut sentinel_page = crate::page::Page::new(crate::page::PageHeader::new(
+        crate::page::PageType::PagedLeaf,
+        99,
+    ));
+    sentinel_page.seal();
+    db.page_store.write_page(sentinel, &sentinel_page).unwrap();
+    let pin = db.page_store.epoch().pin();
+    db.page_store.free_many(&retired, 100).unwrap();
+    drop(pin);
+
+    let sequence_before = db.manifest_state.lock().store.sequence();
+    db.drain_deferred_reclaim_durable().unwrap();
+    let sequence_after = db.manifest_state.lock().store.sequence();
+    assert_eq!(
+        sequence_after - sequence_before,
+        2,
+        "one reclaiming flush plus one zero-reclaim flush must converge"
+    );
+    assert_eq!(db.page_store.deferred_free_len(), 0);
+    drop(db);
+
+    let reopened = Db::open_on_device_with_faults(
+        cfg,
+        FaultController::disabled(),
+        page_device,
+        journal_device,
+    )
+    .unwrap();
+    let (high_water, bitmap) = reopened.page_store.snapshot_free_bitmap_and_high_water();
+    for pid in retired {
+        assert!(
+            pid < high_water,
+            "reclaimed pid must remain below the frontier"
+        );
+        let bit = (pid - FIRST_DATA_PAGE) as usize;
+        assert_ne!(
+            bitmap[bit / 8] & (1 << (bit % 8)),
+            0,
+            "reclaimed pid {pid} was lost from the persisted free-list bitmap"
+        );
+    }
+}
+
+#[test]
 fn take_snapshot_assigns_monotonic_ids() {
     let (_d, db) = mk_db();
     let a = db.take_snapshot(0).unwrap();

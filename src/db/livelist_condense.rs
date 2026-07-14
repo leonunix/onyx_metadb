@@ -113,7 +113,10 @@ impl LivelistCondenser {
 
     pub(super) fn stop(&mut self) {
         self.inner.shutdown.store(true, Ordering::Release);
+        let mut sig = self.inner.signal.lock();
+        *sig = sig.wrapping_add(1);
         self.inner.signal_cvar.notify_all();
+        drop(sig);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }

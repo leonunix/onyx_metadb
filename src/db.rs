@@ -1475,15 +1475,9 @@ impl Drop for Db {
         // a no-op kept only for API parity.
         self.deferred_outcomes
             .poison_all("metadb: db shutting down");
-        // Stop the async reclaim worker before page_store /
-        // page_cache go away. It holds `Arc<PageStore>` +
-        // `Arc<PageCache>` clones; join it here so the page-store
-        // teardown doesn't race against in-flight reclaim writes.
-        if let Some(mut worker) = self.async_reclaim.lock().take() {
-            worker.stop();
-        }
         // Stop the livelist-condense worker before page_store / page_cache go
-        // away; it holds clones of both and may be mid-rewrite.
+        // away and before async reclaim. A completed condense can enqueue old
+        // chain pages into deferred_free, so it is a reclaim producer.
         if let Some(mut worker) = self.livelist_condense.lock().take() {
             worker.stop();
         }
@@ -1493,6 +1487,13 @@ impl Drop for Db {
         // never drop and the threads would run forever — the same
         // circular-shutdown shape as the refcount drainers below.
         self.dedup_index.detach_drainers();
+        // Stop the async reclaim worker only after every independent producer
+        // above has joined. The explicit shutdown path drains durably via
+        // `drain_deferred_reclaim_durable`; Drop merely prevents IO racing field
+        // teardown when a caller omitted that terminal operation.
+        if let Some(mut worker) = self.async_reclaim.lock().take() {
+            worker.stop();
+        }
         // The refcount fold is inline + per-BFG-slot now — no background rc
         // drainer threads to detach (see `refcount::shard`).
         // ApplyLanes have their own Drop that joins their workers;

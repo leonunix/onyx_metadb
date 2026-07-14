@@ -174,9 +174,14 @@ impl AsyncReclaim {
 
     pub(super) fn stop(&mut self) {
         self.inner.shutdown.store(true, Ordering::Release);
-        // Kick the worker out of `wait_for` so it can observe shutdown
-        // promptly instead of riding the next idle tick.
+        // Take the signalling mutex before notifying.  Without this handshake,
+        // shutdown can race between the worker's signal check and `wait_for`,
+        // lose the wake-up, and make a terminal reclaim wait for the whole idle
+        // interval before it can join the worker.
+        let mut sig = self.inner.signal.lock();
+        *sig = sig.wrapping_add(1);
         self.inner.signal_cvar.notify_all();
+        drop(sig);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
