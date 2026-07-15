@@ -162,7 +162,13 @@ struct QueuedLanePlan {
     /// `apply_ops_laned` (it awaits every rc/dedup receiver), so the slot
     /// cannot roll to Syncing while these stages run.
     bfg: crate::types::Bfg,
+    /// L2P lane slots are installed before the global dispatch reservation is
+    /// retired, but their work is armed only after guarded RC dependencies
+    /// reach this LSN. This prevents a higher LSN from entering the FIFO first
+    /// without allowing a guarded L2P read to race lower RC work.
+    l2p_pending_work: Vec<(PendingApplyWork, ApplyWork)>,
     l2p_receivers: Vec<crossbeam_channel::Receiver<Result<L2pBucketApplyResult>>>,
+    l2p_guard_rc_enqueued: Vec<bool>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
     rc_reservations: Vec<Option<ReservedApplyWork>>,
     dedup_rc_enqueued: Vec<bool>,

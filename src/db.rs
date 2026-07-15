@@ -1070,11 +1070,9 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
             .map(|t| popped_at.duration_since(t))
             .unwrap_or_default();
 
-        // For RC tasks enqueued via `enqueue_pending`, `slot.take()`
-        // blocks on the slot's cvar until the commit thread calls
-        // `set()` to fill in the deferred refcount delta. Time it
-        // separately so we can tell apart "lane is starved on commit
-        // handoff" vs "lane is starved by its own backlog".
+        // For tasks enqueued via `enqueue_pending`, `slot.take()` blocks on
+        // the slot's cvar until the commit thread arms the deferred work. The
+        // separate pending-set metric is currently recorded for RC lanes.
         let take_start = Instant::now();
         task.slot.mark_started();
         let work = task.slot.take();

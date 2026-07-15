@@ -324,21 +324,11 @@ impl Db {
             }
         }
 
-        // A guarded L2P op reads RC outside the RC worker. Wait until this
-        // commit's reserved slot reaches the head of every guard shard; that
-        // proves all lower-LSN RC and dedup work on those shards has finished.
-        for (sid, guarded) in l2p_guard_rc_enqueued.iter().copied().enumerate() {
-            if guarded {
-                rc_reservations[sid]
-                    .as_ref()
-                    .expect("guarded RC shard must have a reserved lane slot")
-                    .wait_until_started();
-            }
-        }
-        if let Some(err) = self.commit_poison_error() {
-            return Err(err);
-        }
-
+        // Install pending L2P slots before waiting on guarded RC dependencies.
+        // Once L2P, RC, and dedup all contain this LSN, the caller can retire
+        // the global dispatch reservation. `apply_ops_laned` arms these slots
+        // only after every guarded RC reservation reaches the lane head.
+        let mut l2p_pending_work = Vec::with_capacity(l2p_sorted.len());
         let mut l2p_receivers = Vec::with_capacity(l2p_sorted.len());
         // Snapshot refcount shard handles once per commit so the per-lane
         // closures can do guarded-remap rc lookups (dedup hits) without
@@ -364,40 +354,39 @@ impl Db {
             let clone_cow_pinners =
                 crate::db::volume::clone_cow_pinners_from(volumes, vol_ord, snapshot_wms.clone());
             let (tx, rx) = crossbeam_channel::bounded(1);
-            volume.shards[sid].apply_lane.enqueue_ready(
-                lsn,
-                Box::new(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if commit_poisoned.load(std::sync::atomic::Ordering::Acquire) {
-                            return Err(MetaDbError::Corruption(format!(
-                                "commit pipeline poisoned before L2P lane applied LSN {lsn}"
-                            )));
-                        }
-                        Self::apply_l2p_bucket(
-                            apply_volume,
-                            sid,
-                            indices,
-                            lsn,
-                            bfg,
-                            apply_ops.as_slice(),
-                            refcount_shards_arc.as_slice(),
-                            metrics.as_ref(),
-                            rc_authoritative,
-                            snapshot_wms,
-                            clone_cow_pinners,
-                        )
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err(MetaDbError::Corruption(format!(
-                            "persistent L2P lane {sid} panicked while applying LSN {lsn}"
-                        )))
-                    });
-                    if result.is_err() {
-                        commit_poisoned.store(true, std::sync::atomic::Ordering::Release);
+            let pending = volume.shards[sid].apply_lane.enqueue_pending(lsn);
+            let work: ApplyWork = Box::new(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if commit_poisoned.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(MetaDbError::Corruption(format!(
+                            "commit pipeline poisoned before L2P lane applied LSN {lsn}"
+                        )));
                     }
-                    let _ = tx.send(result);
-                }),
-            );
+                    Self::apply_l2p_bucket(
+                        apply_volume,
+                        sid,
+                        indices,
+                        lsn,
+                        bfg,
+                        apply_ops.as_slice(),
+                        refcount_shards_arc.as_slice(),
+                        metrics.as_ref(),
+                        rc_authoritative,
+                        snapshot_wms,
+                        clone_cow_pinners,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Err(MetaDbError::Corruption(format!(
+                        "persistent L2P lane {sid} panicked while applying LSN {lsn}"
+                    )))
+                });
+                if result.is_err() {
+                    commit_poisoned.store(true, std::sync::atomic::Ordering::Release);
+                }
+                let _ = tx.send(result);
+            });
+            l2p_pending_work.push((pending, work));
             l2p_receivers.push(rx);
         }
         // One pending slot per non-empty dedup bucket. Empty buckets
@@ -412,7 +401,9 @@ impl Db {
         Ok(QueuedLanePlan {
             ops,
             bfg,
+            l2p_pending_work,
             l2p_receivers,
+            l2p_guard_rc_enqueued,
             rc_buckets,
             rc_reservations,
             dedup_rc_enqueued,
@@ -432,6 +423,24 @@ impl Db {
         let mut first_error = None;
 
         let l2p_wait_started = std::time::Instant::now();
+        // A guarded L2P op reads RC outside the RC worker. Its own reserved RC
+        // slot reaching the head proves all lower-LSN RC and dedup work on that
+        // shard has finished. The RC worker marks the slot started before it
+        // waits for L2P-derived exact work, so this dependency is acyclic.
+        for (sid, guarded) in plan.l2p_guard_rc_enqueued.iter().copied().enumerate() {
+            if guarded {
+                plan.rc_reservations[sid]
+                    .as_ref()
+                    .expect("guarded RC shard must have a reserved lane slot")
+                    .wait_until_started();
+            }
+        }
+        if let Some(err) = self.commit_poison_error() {
+            return Err(err);
+        }
+        for (pending, work) in plan.l2p_pending_work.drain(..) {
+            pending.set(work);
+        }
         for rx in plan.l2p_receivers.drain(..) {
             match rx.recv() {
                 Ok(Ok(result)) => {

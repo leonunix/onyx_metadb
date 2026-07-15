@@ -110,6 +110,28 @@ fn apply_lane_reserved_slot_waits_for_work_and_release_before_advancing() {
 }
 
 #[test]
+fn apply_lane_dropped_pending_slot_unblocks_higher_watermark() {
+    let lane = ApplyLane::new(0, ApplyLaneKind::L2p, 0, Arc::new(MetaMetrics::new()));
+    let pending = lane.enqueue_pending(1);
+    pending.wait_until_started();
+
+    let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+    lane.enqueue_ready(
+        2,
+        Box::new(move || {
+            ran_tx.send(()).unwrap();
+        }),
+    );
+    drop(pending);
+
+    ran_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("higher LSN stayed blocked after pending slot was dropped");
+    lane.wait_for_drain();
+    assert_eq!(lane.last_applied_lsn(), 2);
+}
+
+#[test]
 fn apply_lane_prioritizes_ready_wal_work_with_bounded_maintenance() {
     let lane = ApplyLane::new(0, ApplyLaneKind::L2p, 0, Arc::new(MetaMetrics::new()));
     let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

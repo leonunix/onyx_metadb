@@ -1223,6 +1223,128 @@ fn guarded_l2p_waits_for_lower_dedup_rc_slot() {
 }
 
 #[test]
+fn guarded_l2p_retires_dispatch_before_lower_rc_releases() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.dedup_shards = 2;
+    let db = Arc::new(Db::create_with_config(cfg).unwrap());
+    let hash = hash_for_dedup_lane(0, 2);
+    let dedup_lane = crate::dedup_types::shard_for_hash(&hash, 2) as usize;
+    let guard_pba = 0x93_000;
+    let guard_sid = super::lanes::rc_shard_of_pba(guard_pba, db.refcount_shards.len());
+    let guarded_lba = 51_000;
+    let guarded_value = l2p_value_with_pba(0x94_000);
+    let l2p_sid = db.l2p_shard_for(guarded_lba);
+    let mut higher_lba = guarded_lba + 1;
+    while db.l2p_shard_for(higher_lba) != l2p_sid {
+        higher_lba += 1;
+    }
+    let higher_value = l2p_value_with_pba(0x95_000);
+    let volume = db
+        .volumes
+        .read()
+        .get(&BOOTSTRAP_VOLUME_ORD)
+        .unwrap()
+        .clone();
+    let baseline_l2p_lsn = volume.shards[l2p_sid]
+        .apply_lane
+        .inner
+        .state
+        .lock()
+        .last_enqueued_lsn;
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    db.dedup_lanes[dedup_lane].enqueue_maintenance(Box::new(move || {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+    }));
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("dedup maintenance blocker did not start");
+
+    let lower_db = Arc::clone(&db);
+    let lower = std::thread::spawn(move || {
+        lower_db.stage_ops(&[WalOp::DedupPut {
+            hash,
+            value: dedup_value_with_pba(guard_pba),
+            old_pba: None,
+        }])
+    });
+    spin_until(Duration::from_secs(2), || {
+        let state = db.refcount_shards[guard_sid].apply_lane.inner.state.lock();
+        state.last_enqueued_lsn > state.last_applied_lsn
+    });
+
+    let guarded_db = Arc::clone(&db);
+    let guarded = std::thread::spawn(move || {
+        guarded_db.stage_ops(&[WalOp::L2pRemap {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: guarded_lba,
+            new_value: guarded_value,
+            guard: Some((guard_pba, 1)),
+        }])
+    });
+    spin_until(Duration::from_secs(2), || {
+        let state = volume.shards[l2p_sid].apply_lane.inner.state.lock();
+        state.last_enqueued_lsn > baseline_l2p_lsn
+    });
+    spin_until(Duration::from_secs(2), || {
+        db.dispatch_state.lock().pending.is_empty()
+    });
+    let guarded_l2p_lsn = volume.shards[l2p_sid]
+        .apply_lane
+        .inner
+        .state
+        .lock()
+        .last_enqueued_lsn;
+    assert!(!guarded.is_finished());
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, guarded_lba).unwrap(), None);
+
+    let higher_db = Arc::clone(&db);
+    let higher = std::thread::spawn(move || {
+        higher_db.stage_ops(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: higher_lba,
+            value: higher_value,
+        }])
+    });
+    spin_until(Duration::from_secs(2), || {
+        let state = volume.shards[l2p_sid].apply_lane.inner.state.lock();
+        state.last_enqueued_lsn > guarded_l2p_lsn
+    });
+    spin_until(Duration::from_secs(2), || {
+        db.dispatch_state.lock().pending.is_empty()
+    });
+    assert!(!guarded.is_finished());
+    assert!(!higher.is_finished());
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, guarded_lba).unwrap(), None);
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, higher_lba).unwrap(), None);
+
+    release_tx.send(()).unwrap();
+    let (lower_lsn, _) = lower.join().unwrap().unwrap();
+    let (guarded_lsn, guarded_outcomes) = guarded.join().unwrap().unwrap();
+    let (higher_lsn, _) = higher.join().unwrap().unwrap();
+    assert!(lower_lsn < guarded_lsn && guarded_lsn < higher_lsn);
+    assert!(matches!(
+        guarded_outcomes.as_slice(),
+        [ApplyOutcome::L2pRemap { applied: true, .. }]
+    ));
+    assert_eq!(
+        db.get(BOOTSTRAP_VOLUME_ORD, guarded_lba).unwrap(),
+        Some(guarded_value)
+    );
+    assert_eq!(
+        db.get(BOOTSTRAP_VOLUME_ORD, higher_lba).unwrap(),
+        Some(higher_value)
+    );
+}
+
+#[test]
 fn stage_ops_preserves_cross_dedup_shard_rc_order() {
     use std::sync::Arc;
     use std::time::Duration;
