@@ -708,10 +708,10 @@ impl Config {
             // workers are enabled. Tests/benchmarks can disable it explicitly
             // to recover the legacy one-shot memory shape.
             rc_checkpoint_streaming_enabled: true,
-            // Parallel per-shard L2P drain default-OFF: disproven on nvme-box
-            // (3-4× regression — spawned threads inherit the bfg-sync CPU
-            // pinning + the drain wasn't the healthy-window gate). Kept behind
-            // the flag as a documented dead-end. See memory parallel_l2p_drain_impl.
+            // Parallel per-shard L2P drain default-OFF: an earlier nvme-box
+            // run regressed 3-4x after its workers escaped the background CPU
+            // domain, and L2P was not the only healthy-window gate. Keep this
+            // as an explicit A/B until background-only placement is validated.
             parallel_l2p_drain_enabled: false,
             // Bounded fold lock-holds default-ON: semantics-preserving
             // (same lock, same op order, same publish point); 0 restores

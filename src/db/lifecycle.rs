@@ -1034,12 +1034,10 @@ impl Db {
                         let snapshot_wms = snapshot_wms.clone();
                         let clone_cow_pinners = clone_cow_pinners.clone();
                         handles.push(scope.spawn(move || {
-                            // Escape the single-CPU affinity inherited from
-                            // the pinned `metadb-bfg-sync` parent. Under NUMA
-                            // partition this binds to the shard's pod (the COW
-                            // fold touches node-local pages); otherwise it
-                            // widens to all CPUs so drain tasks do not all pile
-                            // onto one core.
+                            // Keep checkpoint work inside its background CPU
+                            // domain. Confine mode inherits the parent's full
+                            // background mask; explicit layouts bind to the BFG
+                            // home pod or compactor CPU set.
                             crate::affinity::bind_for_l2p_drain(shard_idx);
                             Self::drain_one_syncing_shard(
                                 shard,

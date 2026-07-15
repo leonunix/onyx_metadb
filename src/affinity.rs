@@ -162,21 +162,75 @@ pub(crate) fn bind_current(role: ThreadRole, ordinal: usize) {
 }
 
 /// Placement for the parallel L2P BFG-drain workers (one per shard,
-/// scope-spawned from the pinned `metadb-bfg-sync` thread). Under NUMA
-/// partition each worker binds to its shard's pod so the COW fold touches
-/// node-local pages; otherwise widen to all CPUs to escape the inherited
-/// single-CPU pin.
+/// scope-spawned from `metadb-bfg-sync`). These workers are checkpoint
+/// background work: partition mode keeps them on the BFG home pod, an explicit
+/// per-role layout uses the complete compactor CPU set, and confine/unconfigured
+/// mode preserves the exact mask inherited from the parent.
 pub(crate) fn bind_for_l2p_drain(shard_idx: usize) {
-    if let Some(nodes) = NODE_LAYOUT.get() {
-        if !nodes.pods.is_empty() {
-            let pod = nodes.pod_for(ThreadRole::L2pApply, shard_idx);
-            let _ = set_thread_preferred_node(pod.node);
-            if set_current_cpus(&pod.cpus).is_ok() {
-                return;
+    match select_l2p_drain_placement(
+        NODE_LAYOUT.get(),
+        LAYOUT.get().and_then(Option::as_ref),
+        shard_idx,
+    ) {
+        L2pDrainPlacement::CpuSet {
+            cpus,
+            preferred_node,
+        } => {
+            if let Some(node) = preferred_node {
+                if let Err(err) = set_thread_preferred_node(node) {
+                    tracing::warn!(
+                        shard_idx,
+                        node,
+                        error = %err,
+                        "failed to set L2P drain worker memory policy"
+                    );
+                }
+            }
+            if let Err(err) = set_current_cpus(cpus) {
+                tracing::warn!(
+                    shard_idx,
+                    cpus = ?cpus,
+                    error = %err,
+                    "failed to bind L2P drain worker; preserving inherited affinity"
+                );
             }
         }
+        L2pDrainPlacement::Inherit => {}
     }
-    unbind_current();
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum L2pDrainPlacement<'a> {
+    Inherit,
+    CpuSet {
+        cpus: &'a [usize],
+        preferred_node: Option<usize>,
+    },
+}
+
+fn select_l2p_drain_placement<'a>(
+    nodes: Option<&'a NodeAffinityConfig>,
+    layout: Option<&'a AffinityLayout>,
+    shard_idx: usize,
+) -> L2pDrainPlacement<'a> {
+    if let Some(nodes) = nodes {
+        if !nodes.pods.is_empty() {
+            let pod = nodes.pod_for(ThreadRole::BfgSync, shard_idx);
+            return L2pDrainPlacement::CpuSet {
+                cpus: &pod.cpus,
+                preferred_node: Some(pod.node),
+            };
+        }
+    }
+    if let Some(layout) = layout {
+        if !layout.l2p_compactor.cpus.is_empty() {
+            return L2pDrainPlacement::CpuSet {
+                cpus: &layout.l2p_compactor.cpus,
+                preferred_node: None,
+            };
+        }
+    }
+    L2pDrainPlacement::Inherit
 }
 
 impl AffinityLayout {
@@ -356,38 +410,102 @@ fn set_thread_preferred_node(_node: usize) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Widen the calling thread's CPU affinity to ALL CPUs, clearing any
-/// inherited single-CPU pin. Worker threads spawned from a `bind_current`-
-/// pinned parent (e.g. the parallel L2P drain fanned out from the pinned
-/// `metadb-bfg-sync` thread) inherit that one-CPU mask and would otherwise
-/// pile onto a single core instead of spreading.
-pub(crate) fn unbind_current() {
-    if let Err(err) = set_current_all_cpus() {
-        tracing::warn!(error = %err, "failed to widen metadb thread CPU affinity");
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(target_os = "linux")]
-fn set_current_all_cpus() -> std::io::Result<()> {
-    const CPU_SETSIZE: usize = 1024;
-    const BITS_PER_WORD: usize = 8 * std::mem::size_of::<libc::c_ulong>();
-    // All-ones mask = run on any CPU (kernel ignores bits past online CPUs).
-    let set = [!(0 as libc::c_ulong); CPU_SETSIZE / BITS_PER_WORD];
-    let rc = unsafe {
-        libc::sched_setaffinity(
-            0,
-            std::mem::size_of_val(&set),
-            set.as_ptr().cast::<libc::cpu_set_t>(),
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
+    #[test]
+    fn per_role_l2p_drain_uses_the_complete_compactor_cpu_set() {
+        let layout = AffinityLayout::from_config(AffinityConfig {
+            l2p_compactor_cpus: "3-5,9".into(),
+            ..AffinityConfig::default()
+        })
+        .unwrap();
 
-#[cfg(not(target_os = "linux"))]
-fn set_current_all_cpus() -> std::io::Result<()> {
-    Ok(())
+        assert_eq!(
+            select_l2p_drain_placement(None, Some(&layout), 7),
+            L2pDrainPlacement::CpuSet {
+                cpus: &[3, 4, 5, 9],
+                preferred_node: None,
+            }
+        );
+    }
+
+    #[test]
+    fn node_layout_routes_l2p_drain_to_the_bfg_home_pod() {
+        let layout = NodeAffinityConfig {
+            pods: vec![
+                NodePod {
+                    node: 0,
+                    cpus: vec![0, 2],
+                },
+                NodePod {
+                    node: 1,
+                    cpus: vec![4, 6],
+                },
+            ],
+            home_pod: 1,
+            shard_pods: vec![0],
+            dedup_shard_pods: vec![0],
+        };
+
+        assert_eq!(
+            select_l2p_drain_placement(Some(&layout), None, 0),
+            L2pDrainPlacement::CpuSet {
+                cpus: &[4, 6],
+                preferred_node: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn unconfigured_l2p_drain_selects_inherited_affinity() {
+        assert_eq!(
+            select_l2p_drain_placement(None, None, 0),
+            L2pDrainPlacement::Inherit
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unconfigured_l2p_drain_preserves_the_inherited_cpu_mask() {
+        assert!(NODE_LAYOUT.get().is_none());
+        assert!(LAYOUT.get().is_none());
+        let available = current_cpu_set().unwrap();
+        if available.len() < 3 {
+            return;
+        }
+        let inherited = available[..2].to_vec();
+        let expected = inherited.clone();
+
+        let observed = std::thread::spawn(move || {
+            set_current_cpus(&inherited).unwrap();
+            bind_for_l2p_drain(0);
+            current_cpu_set().unwrap()
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(observed, expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_cpu_set() -> std::io::Result<Vec<usize>> {
+        const CPU_SETSIZE: usize = 1024;
+        const BITS_PER_WORD: usize = 8 * std::mem::size_of::<libc::c_ulong>();
+        let mut set = [0 as libc::c_ulong; CPU_SETSIZE / BITS_PER_WORD];
+        let rc = unsafe {
+            libc::sched_getaffinity(
+                0,
+                std::mem::size_of_val(&set),
+                set.as_mut_ptr().cast::<libc::cpu_set_t>(),
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((0..CPU_SETSIZE)
+            .filter(|cpu| set[cpu / BITS_PER_WORD] & (1 << (cpu % BITS_PER_WORD)) != 0)
+            .collect())
+    }
 }
