@@ -105,14 +105,34 @@ fn sample_refcount_breakdown(lsn: Lsn) -> bool {
 }
 
 #[inline]
-fn scan_locked_pending(
+fn active_slot_mask(slots: &[parking_lot::MutexGuard<'_, DeltaMap>], open_idx: usize) -> u8 {
+    debug_assert_eq!(slots.len(), BFG_SLOTS);
+    debug_assert!(open_idx < slots.len());
+    slots
+        .iter()
+        .enumerate()
+        .fold(1 << open_idx, |mask, (idx, slot)| {
+            if slot.is_empty() {
+                mask
+            } else {
+                mask | (1 << idx)
+            }
+        })
+}
+
+#[inline]
+fn scan_active_locked_pending(
     slots: &[parking_lot::MutexGuard<'_, DeltaMap>],
+    mut active_slots: u8,
     pba: Pba,
 ) -> (i64, Lsn, bool) {
     let mut net = 0i64;
     let mut max_lsn = 0u64;
     let mut any = false;
-    for slot in slots {
+    while active_slots != 0 {
+        let slot_idx = active_slots.trailing_zeros() as usize;
+        active_slots &= active_slots - 1;
+        let slot = &slots[slot_idx];
         if let Some(pending) = slot.get(pba) {
             net += pending.delta;
             max_lsn = max_lsn.max(pending.last_lsn);
@@ -152,6 +172,7 @@ fn merge_staged_action(
 
 /// Number of BFG ring slots. Matches `crate::db::l2p_buffer::BFG_SIZE`.
 const BFG_SLOTS: usize = 4;
+const ALL_SLOT_MASK: u8 = (1 << BFG_SLOTS) - 1;
 
 #[inline]
 fn slot_index(bfg: Bfg) -> usize {
@@ -612,7 +633,7 @@ impl RcShard {
         let mut slot_lock_wait = Duration::ZERO;
         let mut base_lookup_attempts = 0u64;
         let mut epoch_retries = 0u64;
-        let (bases, mut slots) = loop {
+        let (bases, mut slots, active_slots) = loop {
             let epoch_before = self.fold_epoch.load(Ordering::Acquire);
             base_lookup_attempts = base_lookup_attempts.saturating_add(1);
             let lookup_started = sample_breakdown.then(Instant::now);
@@ -643,8 +664,14 @@ impl RcShard {
             let slot_lock_started = sample_breakdown.then(Instant::now);
             slots.extend(self.delta_slots.iter().map(|slot| slot.lock()));
             slot_lock_wait += slot_lock_started.map_or(Duration::ZERO, |start| start.elapsed());
+            // Every non-empty slot contributes to cumulative RC, including a
+            // zero-net entry whose last_lsn suppresses replay skipping. Empty
+            // slots are stable while their guards are held. Keep the open slot
+            // active even when initially empty because this batch mutates it;
+            // the other empty maps cannot gain entries while locked.
+            let active_slots = active_slot_mask(&slots, open_idx);
             drop(fold);
-            break (bases, slots);
+            break (bases, slots, active_slots);
         };
 
         let mut out = Vec::with_capacity(actions.len());
@@ -654,7 +681,7 @@ impl RcShard {
         if sample_breakdown {
             for (action_idx, &(pba, delta)) in actions.iter().enumerate() {
                 let scan_started = Instant::now();
-                let (net, max_lsn, any) = scan_locked_pending(&slots, pba);
+                let (net, max_lsn, any) = scan_active_locked_pending(&slots, active_slots, pba);
                 pending_slot_scan += scan_started.elapsed();
 
                 let (base, page_lsn) = bases[action_idx];
@@ -677,7 +704,7 @@ impl RcShard {
             }
         } else {
             for (action_idx, &(pba, delta)) in actions.iter().enumerate() {
-                let (net, max_lsn, any) = scan_locked_pending(&slots, pba);
+                let (net, max_lsn, any) = scan_active_locked_pending(&slots, active_slots, pba);
                 let (base, page_lsn) = bases[action_idx];
                 out.push(merge_staged_action(
                     &mut slots[open_idx],
@@ -777,7 +804,7 @@ impl RcShard {
             // cannot clear the matching pending delta until this merge ends.
             let mut slots: Vec<_> = self.delta_slots.iter().map(|slot| slot.lock()).collect();
             drop(fold);
-            let (net, max_lsn, any) = scan_locked_pending(&slots, pba);
+            let (net, max_lsn, any) = scan_active_locked_pending(&slots, ALL_SLOT_MASK, pba);
             return merge_staged_action(
                 &mut slots[open_idx],
                 pba,

@@ -34,6 +34,79 @@ fn stage_accumulates_across_ops() {
 }
 
 #[test]
+fn active_slot_mask_keeps_open_and_nonempty_maps() {
+    let (_d, s) = make_shard();
+    s.delta_slots[1].lock().merge(10, 2, 20);
+    {
+        let mut zero_net = s.delta_slots[3].lock();
+        zero_net.merge(10, -1, 25);
+        zero_net.merge(20, 1, 30);
+        zero_net.merge(20, -1, 31);
+    }
+
+    let slots: Vec<_> = s.delta_slots.iter().map(|slot| slot.lock()).collect();
+    let active = active_slot_mask(&slots, 0);
+    assert_eq!(active, 0b1011);
+    assert_eq!(
+        scan_active_locked_pending(&slots, active, 10),
+        (1, 25, true)
+    );
+    // A zero-net entry is still semantically active: its presence and LSN
+    // participate in replay-skip and merged-entry generation decisions.
+    assert_eq!(
+        scan_active_locked_pending(&slots, active, 20),
+        (0, 31, true)
+    );
+}
+
+#[test]
+fn stage_batch_probes_zero_net_pending_before_replay_skip() {
+    let (_d, s) = make_shard();
+    // Raise the shared page generation while leaving the target PBA at rc=0.
+    s.array
+        .apply_deltas(vec![(
+            11,
+            Pending {
+                delta: 1,
+                last_lsn: 100,
+            },
+        )])
+        .unwrap();
+    assert_eq!(s.array.page_lsn(10).unwrap(), 100);
+
+    // DeltaMap deliberately retains zero-net entries. Its presence means the
+    // target has pending history, so page_lsn >= replay_lsn must not trigger
+    // the !any replay-skip fast path.
+    {
+        let mut pending = s.delta_slots[0].lock();
+        pending.merge(10, 1, 40);
+        pending.merge(10, -1, 41);
+    }
+    let (staged, _) = s.stage_batch(1, &[(10, 1)], 50).unwrap();
+    assert_eq!(staged, vec![(0, 1)]);
+    assert_eq!(s.get(10).unwrap(), 1);
+}
+
+#[test]
+fn stage_batch_handles_an_initially_empty_open_slot() {
+    let (_d, s) = make_shard();
+    s.stage(T0, 10, 2, 10).unwrap();
+    assert!(s.delta_slots[1].lock().is_empty());
+
+    let lsn = (20..)
+        .find(|&candidate| !sample_refcount_breakdown(candidate))
+        .unwrap();
+    let (staged, _) = s
+        .stage_batch(1, &[(10, -1), (20, 3), (30, 4)], lsn)
+        .unwrap();
+
+    // The open slot is included even though it was initially empty, then
+    // receives all three distinct PBAs without changing the snapshot mask.
+    assert_eq!(staged, vec![(2, 1), (0, 3), (0, 4)]);
+    assert_eq!(s.get_many(&[10, 20, 30]).unwrap(), vec![1, 3, 4]);
+}
+
+#[test]
 fn batch_get_and_stage_preserve_per_pba_results() {
     let (_d, s) = make_shard();
     s.stage(T0, 10, 2, 10).unwrap();
