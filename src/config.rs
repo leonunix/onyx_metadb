@@ -694,9 +694,9 @@ impl Config {
             // well below the old five-second batch while amortising one
             // checkpoint's page IO and manifest publish.
             l2p_buffer_soft_entries: 64_000,
-            // 512 K entries hard trigger ≈ 40 MB / shard. Commit
-            // backpressure kicks in past this; bounds peak per-shard
-            // RAM at ~40 MB worst case.
+            // Reserved compatibility value for a future per-shard hard
+            // trigger. This is parsed but not enforced; the global soft
+            // budget above is the active BFG admission bound.
             l2p_buffer_hard_entries: 512_000,
             // 30 s wall-clock floor — even on an idle system the
             // compactor will fire at least this often so
