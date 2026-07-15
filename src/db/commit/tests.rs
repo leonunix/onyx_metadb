@@ -1003,6 +1003,100 @@ fn stage_ops_runs_refcount_work_on_shard_lanes() {
 }
 
 #[test]
+fn stage_ops_slow_rc_shard_does_not_pin_ready_sibling_slots() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.commit_direct_apply_enabled = false;
+    cfg.rc_authoritative_reclaim = true;
+    let db = Arc::new(Db::create_with_config(cfg).unwrap());
+    assert!(db.refcount_shards.len() >= 2);
+    let slow_sid = 0;
+    let fast_sid = 1;
+
+    let mut lower_pba = 0x41_000;
+    while super::lanes::rc_shard_of_pba(lower_pba, db.refcount_shards.len()) != fast_sid {
+        lower_pba += 1;
+    }
+    let mut higher_pba = lower_pba + 1;
+    while super::lanes::rc_shard_of_pba(higher_pba, db.refcount_shards.len()) != fast_sid {
+        higher_pba += 1;
+    }
+    let lower_lba = 21_000;
+    let mut higher_lba = lower_lba + 1;
+    while db.l2p_shard_for(higher_lba) == db.l2p_shard_for(lower_lba) {
+        higher_lba += 1;
+    }
+
+    let slow_lane = &db.refcount_shards[slow_sid].apply_lane;
+    let fast_lane = &db.refcount_shards[fast_sid].apply_lane;
+    let baseline_slow_lsn = slow_lane.inner.state.lock().last_applied_lsn;
+    let baseline_fast_lsn = fast_lane.inner.state.lock().last_applied_lsn;
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    slow_lane.enqueue_maintenance(Box::new(move || {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+    }));
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("slow RC maintenance blocker did not start");
+
+    let lower_db = Arc::clone(&db);
+    let lower = std::thread::spawn(move || {
+        lower_db.stage_ops(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: lower_lba,
+            value: l2p_value_with_pba(lower_pba),
+        }])
+    });
+    spin_until(Duration::from_secs(2), || {
+        slow_lane.inner.state.lock().last_enqueued_lsn > baseline_slow_lsn
+    });
+    let lower_lsn = slow_lane.inner.state.lock().last_enqueued_lsn;
+    spin_until(Duration::from_secs(2), || {
+        fast_lane.inner.state.lock().last_applied_lsn >= lower_lsn
+    });
+
+    let higher_db = Arc::clone(&db);
+    let higher = std::thread::spawn(move || {
+        higher_db.stage_ops(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: higher_lba,
+            value: l2p_value_with_pba(higher_pba),
+        }])
+    });
+    spin_until(Duration::from_secs(2), || {
+        fast_lane.inner.state.lock().last_enqueued_lsn > lower_lsn
+    });
+    let higher_lsn = fast_lane.inner.state.lock().last_enqueued_lsn;
+    spin_until(Duration::from_secs(2), || {
+        fast_lane.inner.state.lock().last_applied_lsn >= higher_lsn
+    });
+
+    assert_eq!(
+        slow_lane.inner.state.lock().last_applied_lsn,
+        baseline_slow_lsn,
+        "blocked shard must still be parked on maintenance"
+    );
+    assert!(!lower.is_finished());
+    assert!(!higher.is_finished());
+
+    release_tx.send(()).unwrap();
+    let (lower_result_lsn, _) = lower.join().unwrap().unwrap();
+    let (higher_result_lsn, _) = higher.join().unwrap().unwrap();
+    assert_eq!(lower_result_lsn, lower_lsn);
+    assert_eq!(higher_result_lsn, higher_lsn);
+    assert_eq!(db.get_refcount(lower_pba).unwrap(), 1);
+    assert_eq!(db.get_refcount(higher_pba).unwrap(), 1);
+    assert!(higher_result_lsn > lower_result_lsn);
+    assert!(baseline_fast_lsn < lower_result_lsn);
+}
+
+#[test]
 fn stage_ops_releases_dispatch_but_pins_rc_lane_until_dedup_finishes() {
     use std::sync::Arc;
     use std::time::Duration;

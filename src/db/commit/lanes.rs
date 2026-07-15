@@ -518,14 +518,25 @@ impl Db {
                 }
                 let _ = tx.send(result);
             }));
-            rc_receivers.push((sid, reservation, rx));
+            // The lane worker itself serializes same-shard RC work, so a
+            // non-dedup slot no longer needs the coordinator to hold its
+            // watermark while another shard's receiver is slow. Dedup still
+            // reads/stages RC outside this worker and keeps the slot pinned
+            // until its coordinator finishes below.
+            let held_reservation = if plan.dedup_rc_enqueued[sid] {
+                Some(reservation)
+            } else {
+                reservation.release();
+                None
+            };
+            rc_receivers.push((held_reservation, rx));
         }
         timing.rc_enqueue = rc_enqueue_started.elapsed();
 
         let mut first_error = None;
         let mut held_rc_reservations = Vec::new();
         let rc_wait_started = std::time::Instant::now();
-        for (sid, reservation, rx) in rc_receivers {
+        for (reservation, rx) in rc_receivers {
             match rx.recv() {
                 Ok(Ok(result)) => {
                     for (idx, new) in result.refcount_outcomes {
@@ -547,10 +558,8 @@ impl Db {
                             }
                         }
                     }
-                    if plan.dedup_rc_enqueued[sid] {
+                    if let Some(reservation) = reservation {
                         held_rc_reservations.push(reservation);
-                    } else {
-                        reservation.release();
                     }
                 }
                 Ok(Err(err)) => {
@@ -558,7 +567,6 @@ impl Db {
                         self.poison_commit_waiters(&err);
                         first_error = Some(err);
                     }
-                    drop(reservation);
                 }
                 Err(_) => {
                     if first_error.is_none() {
@@ -568,7 +576,6 @@ impl Db {
                         self.poison_commit_waiters(&err);
                         first_error = Some(err);
                     }
-                    drop(reservation);
                 }
             }
         }
