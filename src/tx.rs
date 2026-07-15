@@ -370,12 +370,12 @@ impl<'db> Transaction<'db> {
         self.db.commit_ops_unlogged(&self.ops)
     }
 
-    /// BFG onyx-side stager. Like [`commit_unlogged_with_outcomes`] but
-    /// bypasses the per-LSN dispatch wait
-    /// (`mark_wal_durable_and_wait_for_dispatch`, ~614 us/commit on nvme-box).
-    /// Apply runs synchronously on the caller thread under a `BfgGuard`;
-    /// durability is via the caller's LV2 buffer until the next metadb BFG sync
-    /// covers this LSN. See [`Db::stage_ops`] for the full invariant list.
+    /// BFG onyx-side stager. Like [`commit_unlogged_with_outcomes`], but the
+    /// caller's LV2 buffer is the durable replay source. Apply is dispatched to
+    /// the per-shard lanes under a `BfgGuard`; the call returns only after all
+    /// L2P, refcount, and dedup work has completed. The next metadb BFG sync
+    /// transfers durability from LV2 to the metadata checkpoint. See
+    /// [`Db::stage_ops`] for the full invariant list.
     pub fn commit_staged_with_outcomes(mut self) -> Result<(Lsn, Vec<ApplyOutcome>)> {
         self.resolve_dedup_old_pbas()?;
         self.db.stage_ops(&self.ops)

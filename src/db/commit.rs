@@ -157,8 +157,9 @@ struct QueuedLanePlan {
     bfg: crate::types::Bfg,
     l2p_receivers: Vec<crossbeam_channel::Receiver<Result<L2pBucketApplyResult>>>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
-    /// Per-shard dedup op indices. Drained into the per-shard apply
-    /// closures during `apply_ops_laned`.
+    /// Per-shard dedup op indices. Combined back into input order for the
+    /// coordinator closure during `apply_ops_laned`; the buckets identify all
+    /// dedup lanes whose LSN watermarks must be reserved.
     dedup_buckets: Vec<Vec<usize>>,
     /// One pending slot per non-empty bucket (entries for empty
     /// buckets are `None`).
@@ -622,6 +623,23 @@ impl Db {
     /// metadb checkpoint makes this LSN durable. Onyx uses LV2 write-buffer
     /// entries for that source.
     pub fn commit_ops_unlogged(&self, ops: &[WalOp]) -> Result<(Lsn, Vec<ApplyOutcome>)> {
+        self.commit_ops_buffered_laned(
+            ops,
+            true,
+            true,
+            "metadb: slow unlogged commit_with_outcomes (>=1s)",
+        )
+    }
+
+    /// Shared lane-driven apply for the public unlogged API and Onyx's trusted
+    /// LV2-backed staged path.
+    fn commit_ops_buffered_laned(
+        &self,
+        ops: &[WalOp],
+        require_unlogged_enabled: bool,
+        track_unlogged_pending: bool,
+        slow_message: &'static str,
+    ) -> Result<(Lsn, Vec<ApplyOutcome>)> {
         if ops.is_empty() {
             self.metrics.record_commit_empty();
             return Ok((self.last_applied_lsn(), Vec::new()));
@@ -629,7 +647,7 @@ impl Db {
         if let Some(err) = self.sync_poison_error() {
             return Err(err);
         }
-        if !self.unlogged_commits_enabled {
+        if require_unlogged_enabled && !self.unlogged_commits_enabled {
             return Err(MetaDbError::InvalidArgument(
                 "unlogged commits are disabled in this metadb config".into(),
             ));
@@ -732,61 +750,20 @@ impl Db {
                 ops,
                 bfg: _bfg_guard.bfg(),
             },
-            "metadb: slow unlogged commit_with_outcomes (>=1s)",
+            slow_message,
         );
-        if result.is_ok() {
+        if result.is_ok() && track_unlogged_pending {
             let mut pending = self.unlogged_pending_lsn.lock();
             *pending = Some(pending.map_or(lsn, |prev| prev.max(lsn)));
         }
         result
     }
 
-    /// Buffer-mode staging path. Identical apply semantics to
-    /// [`commit_ops_unlogged`] but skips:
-    ///
-    ///   * `register_dispatch_intent` — the dispatch_state per-LSN
-    ///     pending map is purely a serialisation handle for the lane
-    ///     path; stage runs apply on the caller thread, so there is no
-    ///     lane to coordinate.
-    ///   * `mark_wal_durable_and_wait_for_dispatch` — the 614 µs/commit
-    ///     wait observed on nvme-box. With no lane dispatch, there is
-    ///     nothing to wait on.
-    ///   * `acquire_commit_apply_gate` / `enter_active_apply` — the
-    ///     apply_gate read side is defence-in-depth against flush's
-    ///     manifest-commit write side; buffer-mode apply already
-    ///     serialises on each shard's `tree.write()` (via
-    ///     `force_compact_l2p_buffers` during sync) so the read gate
-    ///     is redundant for this path.
-    ///
-    /// What still happens — `finish_global_apply(lsn)` is REQUIRED:
-    /// `last_applied_lsn` is a contiguous-prefix watermark fed by
-    /// `applied_set` pops. Lifecycle ops (PromotionChunk / FreePbas /
-    /// range_delete / DropSnapshot) park on
-    /// `wait_for_global_apply_turn(lsn)` until the watermark covers
-    /// `lsn - 1`. Skipping `finish_global_apply` would leave gaps in
-    /// the prefix and any later lifecycle op would wait forever.
-    ///
-
-    /// What still happens, preserving correctness:
-    ///
-    ///   * `drop_gate.read()` — keeps lifecycle ops (drop_snapshot /
-    ///     drop_volume / clone_volume / range_delete / create_volume /
-    ///     take_snapshot) from racing with our apply. Lifecycle paths
-    ///     hold `drop_gate.write()` across their forced BFG sync and
-    ///     plan-then-apply, so they observe a quiesced state.
-    ///   * `BfgGuard` pinned **before** LSN allocation. The
-    ///     `closing_open` flag in `BfgStateMachine::roll_to_quiescing`
-    ///     blocks new `enter()` while a roll is mid-drain, preserving
-    ///     `max(LSN in BFG_n) <= min(LSN in BFG_n+1)`. This is the
-    ///     invariant `wal_checkpoint = slot_max_lsn(bfg)` relies on.
-    ///   * `lsn_alloc.reserve(|_| {})` — bumps the global LSN counter
-    ///     under a brief mutex. The callback is a no-op (no dispatch
-    ///     intent registration).
-    ///   * `apply_commit_batch` — synchronous apply, identical to
-    ///     `commit_ops`'s serial-fallback path. For batches ≥ 8 ops
-    ///     it routes through `apply_ops_grouped` (per-shard bucketing).
-    ///     For smaller batches and snapshot-bearing volumes it loops
-    ///     `apply_op_bare`.
+    /// Buffer-mode staging path. The caller's LV2 journal is the durable replay
+    /// source, so the public `unlogged_commits_enabled` gate does not apply.
+    /// Apply uses the same per-shard lane dispatch and LSN ordering as
+    /// [`commit_ops_unlogged`], allowing independent L2P/refcount shards to run
+    /// in parallel instead of walking them serially on the commit caller.
     ///
     /// Idempotency under onyx LV2 buffer replay:
     ///
@@ -798,76 +775,16 @@ impl Db {
     ///   * Dedup: `apply_dedup_*_with_rc` reads the current value
     ///     before mutating; same-LSN replays are no-ops.
     ///
-    /// This is the **hot path** for onyx writes: the writer batches
-    /// dozens to hundreds of `L2pRemap` + `DedupPut` ops per call.
-    /// The savings vs `commit_ops_unlogged` is the per-call dispatch
-    /// wait (~614 µs at j16d32 randwrite on the nvme-box baseline);
-    /// the apply work itself is unchanged.
+    /// This is the **hot path** for Onyx writes. The sub-millisecond dispatch
+    /// cost is intentionally paid to overlap the much larger cold-page and
+    /// refcount stage work across independent shards.
     pub fn stage_ops(&self, ops: &[WalOp]) -> Result<(Lsn, Vec<ApplyOutcome>)> {
-        if ops.is_empty() {
-            self.metrics.record_commit_empty();
-            return Ok((self.last_applied_lsn(), Vec::new()));
-        }
-        if let Some(err) = self.sync_poison_error() {
-            return Err(err);
-        }
-        let stage_started = std::time::Instant::now();
-        self.metrics.record_commit_attempt(ops.len());
-
-        let drop_gate_started = std::time::Instant::now();
-        let _drop_guard = self.drop_gate.read();
-        self.metrics
-            .record_commit_drop_gate_wait(drop_gate_started.elapsed());
-
-        let volumes = self.volumes.read().clone();
-
-        // BfgGuard before LSN reserve: the `closing_open` invariant
-        // (bfg/mod.rs) blocks `enter()` during a roll's drain, so any
-        // LSN we allocate is bounded above by every later BFG's LSNs.
-        let _bfg_guard = self.admit_bfg_commit(ops)?;
-        let lsn_started = std::time::Instant::now();
-        let lsn = match self.lsn_alloc.reserve(|_| {}) {
-            Ok(lsn) => lsn,
-            Err(err) => {
-                self.metrics.record_commit_error(stage_started.elapsed());
-                self.poison_commit_waiters(&err);
-                return Err(err);
-            }
-        };
-        self.metrics.record_commit_wal_submit(lsn_started.elapsed());
-        _bfg_guard.record_lsn(lsn);
-
-        let apply_started = std::time::Instant::now();
-        let outcomes = match self.apply_commit_batch(&volumes, lsn, _bfg_guard.bfg(), ops) {
-            Ok(outcomes) => outcomes,
-            Err(err) => {
-                self.metrics.record_commit_apply(apply_started.elapsed());
-                self.metrics.record_commit_error(stage_started.elapsed());
-                self.poison_commit_waiters(&err);
-                return Err(err);
-            }
-        };
-        self.metrics.record_commit_apply(apply_started.elapsed());
-
-        // Bump the contiguous-prefix watermark via applied_set. Without
-        // this, lifecycle ops parking on `wait_for_global_apply_turn`
-        // would stall forever — their LSN would always be `> applied + 1`
-        // because the staged LSNs never enter `applied_set`. The
-        // `finish_global_apply` call itself only touches in-memory
-        // counters; it does not interact with dispatch_state.
-        let finish_started = std::time::Instant::now();
-        if let Err(err) = self.finish_global_apply(lsn) {
-            self.metrics.record_commit_error(stage_started.elapsed());
-            return Err(err);
-        }
-        // stage_ops is the buffer-direct hot path; the laned path records
-        // this via `record_commit_finish_global_wait` but stage_ops did
-        // not, leaving the global watermark-bump cost (last_applied_lsn +
-        // applied_set mutexes) folded into the opaque apply bucket.
-        self.metrics
-            .record_commit_finish_global_wait(finish_started.elapsed());
-        self.metrics.record_commit_success(stage_started.elapsed());
-        Ok((lsn, outcomes))
+        self.commit_ops_buffered_laned(
+            ops,
+            false,
+            false,
+            "metadb: slow staged commit_with_outcomes (>=1s)",
+        )
     }
 
     /// BFG eligibility check.
@@ -1035,10 +952,9 @@ impl Db {
                         ctx.timing.apply = apply_started.elapsed();
                         self.metrics.record_commit_apply(ctx.timing.apply);
                         self.metrics.record_commit_direct_apply(ctx.timing.apply);
-                        // Direct-apply bypasses `enqueue_lane_plan` and
-                        // `apply_ops_laned`, where the lane path retires
-                        // its dispatch reservation
-                        // (`complete_retained_dispatch`). Skipping that
+                        // Direct-apply bypasses the lane-success branch below,
+                        // where the lane path retires its dispatch reservation.
+                        // Skipping this
                         // call would leave our LSN forever in
                         // `dispatch_state.pending`, blocking every
                         // higher-LSN commit on
@@ -1077,6 +993,10 @@ impl Db {
                             laned_timing.dedup_enqueue,
                             laned_timing.dedup_wait,
                         );
+                        // The footprint covers direct RC work plus every
+                        // dedup-derived RC guard/stage. Retire it only after all
+                        // corresponding lane receivers have completed.
+                        self.complete_retained_dispatch(lsn);
                         outcomes
                     }
                     Err(err) => {

@@ -397,7 +397,6 @@ impl Db {
             rc_receivers.push(rx);
         }
         timing.rc_enqueue = rc_enqueue_started.elapsed();
-        self.complete_retained_dispatch(lsn);
 
         let mut first_error = None;
         let rc_wait_started = std::time::Instant::now();
@@ -443,9 +442,12 @@ impl Db {
             return Err(err);
         }
 
-        // Fan dedup work out across shards. Each non-empty bucket gets
-        // its own apply closure on its shard's lane; the commit thread
-        // AWAITS every one before returning.
+        // Dedup table shards are independent, but their derived refcount
+        // mutations are not: two different hashes can read or update the same
+        // PBA. Preserve the old grouped apply's input order by running all
+        // dedup ops for this commit in one coordinator closure. Pending tasks
+        // are still installed on every touched dedup lane before dispatch, so
+        // higher conflicting LSNs cannot pass any of those lane watermarks.
         //
         // The previous async dispatch (fire the dedup closure on its lane
         // and return without awaiting) is gone under the BFG-slot refcount
@@ -462,18 +464,40 @@ impl Db {
         // drainer; awaiting here costs only the cheap `stage_put` + rc
         // stage. `DedupCompare*` ops were already on this awaited path
         // (their `applied` flag feeds the caller).
-        let mut dedup_receivers: Vec<
-            crossbeam_channel::Receiver<Result<Vec<(usize, ApplyOutcome)>>>,
-        > = Vec::new();
         let dedup_enqueue_started = std::time::Instant::now();
         let dedup_buckets = std::mem::take(&mut plan.dedup_buckets);
         let pendings = std::mem::take(&mut plan.dedup_pendings);
         let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> =
             Arc::new(self.refcount_shards.iter().map(|s| s.rc.clone()).collect());
-        for (_sid, (pending_opt, bucket)) in pendings.into_iter().zip(dedup_buckets).enumerate() {
+        let mut leader: Option<(usize, PendingApplyWork)> = None;
+        let mut followers = Vec::new();
+        let mut dedup_indices = Vec::new();
+        for (pending_opt, bucket) in pendings.into_iter().zip(dedup_buckets) {
             let Some(pending) = pending_opt else { continue };
+            let first_idx = *bucket
+                .first()
+                .expect("a pending dedup task must have a non-empty bucket");
+            dedup_indices.extend(bucket);
+            match leader.take() {
+                None => leader = Some((first_idx, pending)),
+                Some((leader_idx, leader_pending)) if first_idx < leader_idx => {
+                    followers.push(leader_pending);
+                    leader = Some((first_idx, pending));
+                }
+                Some(existing) => {
+                    followers.push(pending);
+                    leader = Some(existing);
+                }
+            }
+        }
+        for pending in followers {
+            pending.set(Box::new(|| {}));
+        }
+
+        let dedup_receiver = leader.map(|(_first_idx, pending)| {
+            dedup_indices.sort_unstable();
             let ready_at = std::time::Instant::now();
-            let bucket_ops = bucket.len() as u64;
+            let bucket_ops = dedup_indices.len() as u64;
             let ops = plan.ops.clone();
             let dedup_index = self.dedup_index.clone();
             let refcount_shards_arc = refcount_shards_arc.clone();
@@ -487,7 +511,7 @@ impl Db {
                     refcount_shards_arc.as_slice(),
                     metrics.as_ref(),
                     ops.as_slice(),
-                    bucket,
+                    dedup_indices,
                     lsn,
                     bfg,
                 );
@@ -498,11 +522,11 @@ impl Db {
                 );
                 let _ = tx.send(outcomes);
             }));
-            dedup_receivers.push(rx);
-        }
+            rx
+        });
         timing.dedup_enqueue = dedup_enqueue_started.elapsed();
         let dedup_wait_started = std::time::Instant::now();
-        for rx in dedup_receivers {
+        if let Some(rx) = dedup_receiver {
             let dedup_outcomes = rx.recv().map_err(|_| {
                 MetaDbError::Corruption(
                     "persistent dedup lane worker failed to return a result".into(),

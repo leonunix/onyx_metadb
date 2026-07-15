@@ -152,6 +152,26 @@ fn hash_for(n: u64) -> crate::dedup_types::Hash8 {
     x
 }
 
+fn hash_for_dedup_lane(lane: u32, shards: u32) -> crate::dedup_types::Hash8 {
+    assert!(lane < shards && shards.is_power_of_two());
+    let mut hash = hash_for(u64::from(lane) + 1);
+    let shift = 8 - shards.trailing_zeros();
+    hash[0] = (lane << shift) as u8;
+    assert_eq!(crate::dedup_types::shard_for_hash(&hash, shards), lane);
+    hash
+}
+
+fn spin_until(timeout: std::time::Duration, mut predicate: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !predicate() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for concurrent test state"
+        );
+        std::thread::yield_now();
+    }
+}
+
 #[test]
 fn remap_range_only_commits_have_no_rc_footprint() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -738,6 +758,157 @@ fn stage_ops_l2p_put_visible_to_reads() {
     }
 }
 
+#[test]
+fn stage_ops_runs_refcount_work_on_shard_lanes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.commit_direct_apply_enabled = true;
+    cfg.rc_authoritative_reclaim = true;
+    let db = Db::create_with_config(cfg).unwrap();
+    let before = db.metrics_snapshot();
+    let ops: Vec<WalOp> = (0..256u64)
+        .map(|i| WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 20_000 + i,
+            value: l2p_value_with_pba(0x20_000 + i),
+        })
+        .collect();
+
+    let (_, outcomes) = db.stage_ops(&ops).unwrap();
+    let after = db.metrics_snapshot();
+
+    assert_eq!(outcomes.len(), ops.len());
+    assert!(
+        after.rc_apply_lane_tasks > before.rc_apply_lane_tasks,
+        "staged refcount work must execute on the per-shard lanes"
+    );
+    assert!(
+        after.apply_refcount_count > before.apply_refcount_count,
+        "staged installs must still update refcounts"
+    );
+}
+
+#[test]
+fn stage_ops_retains_rc_dispatch_until_dedup_lane_finishes() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.dedup_shards = 2;
+    let db = Arc::new(Db::create_with_config(cfg).unwrap());
+    let hash = hash_for_dedup_lane(0, 2);
+    let lane = crate::dedup_types::shard_for_hash(&hash, 2) as usize;
+    let pba = 0x51_000;
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    db.dedup_lanes[lane].enqueue_maintenance(Box::new(move || {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+    }));
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("dedup maintenance blocker did not start");
+
+    let commit_db = Arc::clone(&db);
+    let commit = std::thread::spawn(move || {
+        commit_db.stage_ops(&[WalOp::DedupPut {
+            hash,
+            value: dedup_value_with_pba(pba),
+            old_pba: None,
+        }])
+    });
+
+    spin_until(Duration::from_secs(2), || {
+        let state = db.dedup_lanes[lane].inner.state.lock();
+        state.queue.front().is_some_and(|task| task.slot.is_ready())
+    });
+    {
+        let state = db.dispatch_state.lock();
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "derived RC work must retain its dispatch reservation"
+        );
+        assert!(
+            state.pending.values().all(|entry| entry.durable),
+            "the staged commit must be dispatch-ready before its dedup lane runs"
+        );
+    }
+
+    release_tx.send(()).unwrap();
+    let (lsn, outcomes) = commit.join().unwrap().unwrap();
+    assert!(lsn > 0);
+    assert_eq!(outcomes.len(), 1);
+    assert!(db.dispatch_state.lock().pending.is_empty());
+    assert_eq!(db.get_refcount(pba).unwrap(), 1);
+}
+
+#[test]
+fn stage_ops_preserves_cross_dedup_shard_rc_order() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.dedup_shards = 2;
+    let db = Arc::new(Db::create_with_config(cfg).unwrap());
+    let first_hash = hash_for_dedup_lane(0, 2);
+    let guarded_hash = hash_for_dedup_lane(1, 2);
+    let guard_pba = 0x61_000;
+    let guarded_pba = 0x62_000;
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    db.dedup_lanes[0].enqueue_maintenance(Box::new(move || {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+    }));
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("dedup maintenance blocker did not start");
+
+    let commit_db = Arc::clone(&db);
+    let commit = std::thread::spawn(move || {
+        commit_db.stage_ops(&[
+            WalOp::DedupPut {
+                hash: first_hash,
+                value: dedup_value_with_pba(guard_pba),
+                old_pba: None,
+            },
+            WalOp::DedupPutGuarded {
+                hash: guarded_hash,
+                value: dedup_value_with_pba(guarded_pba),
+                pba_guard: guard_pba,
+                min_rc: 1,
+                old_pba: None,
+            },
+        ])
+    });
+
+    // The second dedup lane has crossed this LSN while lane 0 is blocked. In
+    // the ordered implementation it only executes a follower no-op; the
+    // coordinator still applies both real ops in their original order.
+    spin_until(Duration::from_secs(2), || {
+        db.dedup_lanes[1].last_applied_lsn() > 0
+    });
+    release_tx.send(()).unwrap();
+    let (_, outcomes) = commit.join().unwrap().unwrap();
+
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(
+        db.get_dedup(&guarded_hash).unwrap(),
+        Some(dedup_value_with_pba(guarded_pba)),
+        "the guarded op must observe the earlier cross-shard refcount update"
+    );
+    assert_eq!(db.get_refcount(guard_pba).unwrap(), 1);
+    assert_eq!(db.get_refcount(guarded_pba).unwrap(), 1);
+}
+
 /// stage_ops + commit_ops_deferred operate on the same database
 /// state — a value written by stage is visible to a later
 /// deferred-commit batch's read, and vice-versa.
@@ -865,13 +1036,11 @@ fn stage_ops_concurrent_writers_all_visible() {
     }
 }
 
-/// stage_ops does NOT register a dispatch intent or wait on
-/// `mark_wal_durable_and_wait_for_dispatch`. After staging a batch,
-/// `dispatch_state.pending` must be empty — otherwise a later
-/// `commit_ops` would block forever on
+/// stage_ops uses lane dispatch, but every reservation must be retired before
+/// it returns. Otherwise a later commit would block forever on
 /// `mark_wal_durable_and_wait_for_dispatch`.
 #[test]
-fn stage_ops_does_not_register_dispatch_intent() {
+fn stage_ops_retires_dispatch_intent_before_return() {
     let (_d, db) = mk_deferred_apply_db(true);
     let ops: Vec<WalOp> = (0..16u64)
         .map(|i| WalOp::L2pPut {
@@ -884,7 +1053,7 @@ fn stage_ops_does_not_register_dispatch_intent() {
     let pending = db.dispatch_state.lock().pending.len();
     assert_eq!(
         pending, 0,
-        "stage_ops must not leave dispatch reservations behind"
+        "stage_ops must retire dispatch reservations before returning"
     );
 
     // Sanity: a subsequent commit_ops_deferred call completes without
