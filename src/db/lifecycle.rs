@@ -17,6 +17,74 @@ fn micros(duration: std::time::Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn l2p_drain_worker_count(job_count: usize, configured_workers: usize) -> usize {
+    if configured_workers == 0 {
+        job_count
+    } else {
+        configured_workers.min(job_count)
+    }
+}
+
+/// Run scoped jobs with a fixed number of workers while retaining input-order
+/// results. Workers keep taking jobs after an error, so callers can finish all
+/// independent shard drains before returning the first ordered error.
+fn run_scoped_jobs_bounded<T, R, F>(jobs: Vec<T>, configured_workers: usize, run: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> R + Sync,
+{
+    let job_count = jobs.len();
+    let worker_count = l2p_drain_worker_count(job_count, configured_workers);
+    if worker_count == 0 {
+        return Vec::new();
+    }
+
+    let queue = parking_lot::Mutex::new(
+        jobs.into_iter()
+            .enumerate()
+            .collect::<std::collections::VecDeque<_>>(),
+    );
+    let completed = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let queue = &queue;
+            let run = &run;
+            handles.push(scope.spawn(move || {
+                let mut local = Vec::new();
+                loop {
+                    // Drop the queue lock before executing the potentially
+                    // multi-second shard fold.
+                    let job = { queue.lock().pop_front() };
+                    let Some((order, job)) = job else {
+                        break;
+                    };
+                    local.push((order, run(job)));
+                }
+                local
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut ordered: Vec<Option<R>> = (0..job_count).map(|_| None).collect();
+    for (order, result) in completed {
+        debug_assert!(ordered[order].is_none(), "scoped job executed twice");
+        ordered[order] = Some(result);
+    }
+    ordered
+        .into_iter()
+        .map(|result| result.expect("scoped worker exited without executing its job"))
+        .collect()
+}
+
 fn flush_reclaim_budget(pending_reclaim_pages: usize, pages_written: usize) -> usize {
     let write_scaled = pages_written.saturating_mul(8);
     let backlog_scaled = pending_reclaim_pages / 2;
@@ -1015,49 +1083,43 @@ impl Db {
         let metrics = &self.metrics;
         let chunk_entries = self.l2p_drain_chunk_entries;
         if self.parallel_l2p_drain_enabled {
-            let results: Vec<Result<()>> = std::thread::scope(|scope| {
-                let mut handles = Vec::new();
-                for vol in &vols {
-                    // Youngest snapshot pinning this volume's pages; computed
-                    // once per volume and captured by per-shard fold tasks for
-                    // the page-deadlist birth gate.
-                    let snapshot_wms = self.snapshot_wms(vol.ord);
-                    // Clone COW-kill pinner set, computed once per volume
-                    // (empty for non-clones).
-                    let clone_cow_pinners = self.clone_cow_pinners(vol.ord);
-                    let page_dead_list = &vol.page_dead_list;
-                    let page_live_list = &vol.page_live_list;
-                    for (shard_idx, shard) in vol.shards.iter().enumerate() {
-                        if !shard.use_buffer {
-                            continue;
-                        }
-                        let snapshot_wms = snapshot_wms.clone();
-                        let clone_cow_pinners = clone_cow_pinners.clone();
-                        handles.push(scope.spawn(move || {
-                            // Keep checkpoint work inside its background CPU
-                            // domain. Confine mode inherits the parent's full
-                            // background mask; explicit layouts bind to the BFG
-                            // home pod or compactor CPU set.
-                            crate::affinity::bind_for_l2p_drain(shard_idx);
-                            Self::drain_one_syncing_shard(
-                                shard,
-                                bfg,
-                                metrics,
-                                chunk_entries,
-                                // H1: this shard's own page-death accumulator.
-                                &page_dead_list[shard_idx],
-                                page_live_list,
-                                snapshot_wms,
-                                clone_cow_pinners,
-                            )
-                        }));
+            type DrainJob<'a> = Box<dyn FnOnce() -> Result<()> + Send + 'a>;
+            let mut jobs: Vec<DrainJob<'_>> = Vec::new();
+            for vol in &vols {
+                // Youngest snapshot pinning this volume's pages; computed once
+                // per volume and captured by its per-shard fold jobs.
+                let snapshot_wms = self.snapshot_wms(vol.ord);
+                let clone_cow_pinners = self.clone_cow_pinners(vol.ord);
+                let page_dead_list = &vol.page_dead_list;
+                let page_live_list = &vol.page_live_list;
+                for (shard_idx, shard) in vol.shards.iter().enumerate() {
+                    if !shard.use_buffer {
+                        continue;
                     }
+                    let snapshot_wms = snapshot_wms.clone();
+                    let clone_cow_pinners = clone_cow_pinners.clone();
+                    jobs.push(Box::new(move || {
+                        // Keep checkpoint work inside its background CPU
+                        // domain. Confine mode inherits the parent's full
+                        // background mask; explicit layouts bind to the BFG
+                        // home pod or compactor CPU set.
+                        crate::affinity::bind_for_l2p_drain(shard_idx);
+                        Self::drain_one_syncing_shard(
+                            shard,
+                            bfg,
+                            metrics,
+                            chunk_entries,
+                            // H1: this shard's own page-death accumulator.
+                            &page_dead_list[shard_idx],
+                            page_live_list,
+                            snapshot_wms,
+                            clone_cow_pinners,
+                        )
+                    }));
                 }
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-                    .collect()
-            });
+            }
+            let results =
+                run_scoped_jobs_bounded(jobs, self.parallel_l2p_drain_workers, |job| job());
             // First error wins. Every shard that could drain has drained and
             // cleared its frozen slot, so a retry of this BFG only re-processes
             // the shard(s) that errored (their slots are still populated).

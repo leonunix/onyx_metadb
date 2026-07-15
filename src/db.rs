@@ -346,6 +346,9 @@ pub struct Db {
     /// Cached copy of `Config::parallel_l2p_drain_enabled`. Fans the
     /// per-BFG L2P syncing-slot drain out across shards when `true`.
     pub(crate) parallel_l2p_drain_enabled: bool,
+    /// Cached copy of `Config::parallel_l2p_drain_workers`. Zero preserves the
+    /// legacy one-worker-per-job fan-out; positive values cap active folds.
+    pub(crate) parallel_l2p_drain_workers: usize,
     /// Cached copy of `Config::l2p_drain_chunk_entries`. Bounds buffered
     /// entries folded per `tree.write()` hold in the syncing-slot drain
     /// (0 = one-shot fold).

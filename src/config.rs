@@ -355,6 +355,12 @@ pub struct Config {
     /// work-driven BFG bound is independent of this setting.
     pub parallel_l2p_drain_enabled: bool,
 
+    /// Maximum number of L2P shard folds that may execute concurrently when
+    /// [`Self::parallel_l2p_drain_enabled`] is true. `0` preserves the legacy
+    /// unbounded fan-out (one worker per pending shard job); positive values are
+    /// a hard concurrency cap. Ignored when parallel drain is disabled.
+    pub parallel_l2p_drain_workers: usize,
+
     /// Bound on buffered entries folded per `tree.write()` acquisition
     /// in the per-BFG L2P syncing-slot drain. The one-shot fold held the
     /// shard's tree write lock for the whole slot (100k+ entries under
@@ -713,6 +719,9 @@ impl Config {
             // domain, and L2P was not the only healthy-window gate. Keep this
             // as an explicit A/B until background-only placement is validated.
             parallel_l2p_drain_enabled: false,
+            // Parallel drain remains opt-in, but enabling it should be bounded
+            // by default. Zero is reserved for an explicit legacy fan-out A/B.
+            parallel_l2p_drain_workers: 4,
             // Bounded fold lock-holds default-ON: semantics-preserving
             // (same lock, same op order, same publish point); 0 restores
             // the one-shot hold for A/B.
