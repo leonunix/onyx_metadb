@@ -178,6 +178,10 @@ pub struct Db {
     /// commit fails after a higher-LSN commit has already been durably
     /// acked by another WAL lane.
     commit_poison: Mutex<Option<String>>,
+    /// Lock-free mirror for already-enqueued lane closures. A lower-LSN lane
+    /// error publishes this before releasing its reserved slot, so queued
+    /// higher-LSN work fails closed instead of mutating poisoned state.
+    commit_poisoned: Arc<AtomicBool>,
     /// Sticky failure set when a forced BFG sync fails non-recoverably, for
     /// example a faulted manifest fsync. Once set, forced-sync lifecycle ops
     /// (`take_snapshot`, `flush_with_gate`, `create_volume`, restore) fail fast
@@ -604,10 +608,27 @@ struct ApplyLaneTask {
 struct ApplyLaneTaskSlot {
     work: Mutex<Option<ApplyWork>>,
     cvar: Condvar,
+    reservation: Option<Arc<ReservedSlotState>>,
+}
+
+struct ReservedSlotState {
+    started: Mutex<bool>,
+    started_cvar: Condvar,
+    released: Mutex<bool>,
+    released_cvar: Condvar,
 }
 
 struct PendingApplyWork {
     slot: Option<Arc<ApplyLaneTaskSlot>>,
+}
+
+/// A lane slot whose LSN order is fixed before its work is known. The worker
+/// may reach the slot and wait for `set`; after executing the work it keeps the
+/// lane watermark pinned until `release`. This lets L2P discover exact RC
+/// deltas without letting a later LSN pass the corresponding RC/dedup phase.
+struct ReservedApplyWork {
+    slot: Option<Arc<ApplyLaneTaskSlot>>,
+    work_set: bool,
 }
 
 impl ApplyLane {
@@ -660,6 +681,15 @@ impl ApplyLane {
         let slot = ApplyLaneTaskSlot::pending();
         self.enqueue_task(lsn, slot.clone());
         PendingApplyWork { slot: Some(slot) }
+    }
+
+    fn enqueue_reserved(&self, lsn: Lsn) -> ReservedApplyWork {
+        let slot = ApplyLaneTaskSlot::reserved();
+        self.enqueue_task(lsn, slot.clone());
+        ReservedApplyWork {
+            slot: Some(slot),
+            work_set: false,
+        }
     }
 
     #[allow(dead_code)]
@@ -786,6 +816,7 @@ impl ApplyLaneTaskSlot {
         Arc::new(Self {
             work: Mutex::new(Some(work)),
             cvar: Condvar::new(),
+            reservation: None,
         })
     }
 
@@ -793,6 +824,25 @@ impl ApplyLaneTaskSlot {
         Arc::new(Self {
             work: Mutex::new(None),
             cvar: Condvar::new(),
+            reservation: Some(Arc::new(ReservedSlotState {
+                started: Mutex::new(false),
+                started_cvar: Condvar::new(),
+                released: Mutex::new(true),
+                released_cvar: Condvar::new(),
+            })),
+        })
+    }
+
+    fn reserved() -> Arc<Self> {
+        Arc::new(Self {
+            work: Mutex::new(None),
+            cvar: Condvar::new(),
+            reservation: Some(Arc::new(ReservedSlotState {
+                started: Mutex::new(false),
+                started_cvar: Condvar::new(),
+                released: Mutex::new(false),
+                released_cvar: Condvar::new(),
+            })),
         })
     }
 
@@ -814,9 +864,59 @@ impl ApplyLaneTaskSlot {
     fn is_ready(&self) -> bool {
         self.work.lock().is_some()
     }
+
+    fn mark_started(&self) {
+        if let Some(reservation) = &self.reservation {
+            let mut started = reservation.started.lock();
+            *started = true;
+            reservation.started_cvar.notify_all();
+        }
+    }
+
+    fn wait_until_started(&self) {
+        let reservation = self
+            .reservation
+            .as_ref()
+            .expect("only reserved lane slots expose a start barrier");
+        let mut started = reservation.started.lock();
+        while !*started {
+            reservation.started_cvar.wait(&mut started);
+        }
+    }
+
+    fn release(&self) {
+        let reservation = self
+            .reservation
+            .as_ref()
+            .expect("only reserved lane slots expose a release barrier");
+        let mut released = reservation.released.lock();
+        *released = true;
+        reservation.released_cvar.notify_all();
+    }
+
+    fn wait_until_released(&self) {
+        if let Some(reservation) = &self.reservation {
+            let mut released = reservation.released.lock();
+            while !*released {
+                reservation.released_cvar.wait(&mut released);
+            }
+        }
+    }
+
+    fn release_pending(&self) -> bool {
+        self.reservation
+            .as_ref()
+            .is_some_and(|reservation| !*reservation.released.lock())
+    }
 }
 
 impl PendingApplyWork {
+    fn wait_until_started(&self) {
+        if let Some(slot) = &self.slot {
+            slot.wait_until_started();
+        }
+    }
+
     fn set(mut self, work: ApplyWork) {
         if let Some(slot) = self.slot.take() {
             slot.set(work);
@@ -828,6 +928,44 @@ impl Drop for PendingApplyWork {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
             slot.set(Box::new(|| {}));
+        }
+    }
+}
+
+impl ReservedApplyWork {
+    fn wait_until_started(&self) {
+        if let Some(slot) = &self.slot {
+            slot.wait_until_started();
+        }
+    }
+
+    fn set(&mut self, work: ApplyWork) {
+        let slot = self
+            .slot
+            .as_ref()
+            .expect("reserved apply work already released");
+        debug_assert!(!self.work_set, "reserved apply work filled twice");
+        slot.set(work);
+        self.work_set = true;
+    }
+
+    fn release(mut self) {
+        if let Some(slot) = self.slot.take() {
+            if !self.work_set {
+                slot.set(Box::new(|| {}));
+            }
+            slot.release();
+        }
+    }
+}
+
+impl Drop for ReservedApplyWork {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            if !self.work_set {
+                slot.set(Box::new(|| {}));
+            }
+            slot.release();
         }
     }
 }
@@ -938,12 +1076,25 @@ fn apply_lane_worker(inner: Arc<ApplyLaneInner>) {
         // separately so we can tell apart "lane is starved on commit
         // handoff" vs "lane is starved by its own backlog".
         let take_start = Instant::now();
+        task.slot.mark_started();
         let work = task.slot.take();
         let pending_set_wait = take_start.elapsed();
 
         let exec_start = Instant::now();
         let _ = catch_unwind(AssertUnwindSafe(work));
         let exec = exec_start.elapsed();
+        let reservation_held = task.slot.release_pending();
+        if reservation_held && matches!(inner.kind, ApplyLaneKind::Refcount) {
+            inner.metrics.record_rc_apply_lane_reserved_hold_start();
+        }
+        let reserved_hold_started = Instant::now();
+        task.slot.wait_until_released();
+        let reserved_hold = reserved_hold_started.elapsed();
+        if reservation_held && matches!(inner.kind, ApplyLaneKind::Refcount) {
+            inner
+                .metrics
+                .record_rc_apply_lane_reserved_hold_end(reserved_hold);
+        }
         tasks_since_wait = tasks_since_wait.saturating_add(1);
 
         let is_wal_task = task.lsn.is_some();

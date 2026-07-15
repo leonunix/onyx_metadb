@@ -215,6 +215,12 @@ impl MetaMetrics {
             rc_apply_lane_pending_set_wait_max_us: load(
                 &self.rc_apply_lane_pending_set_wait_max_us,
             ),
+            rc_apply_lane_reserved_hold_us: load(&self.rc_apply_lane_reserved_hold_us),
+            rc_apply_lane_reserved_hold_max_us: load(&self.rc_apply_lane_reserved_hold_max_us),
+            rc_apply_lane_reserved_hold_active: load(&self.rc_apply_lane_reserved_hold_active),
+            rc_apply_lane_reserved_hold_active_max: load(
+                &self.rc_apply_lane_reserved_hold_active_max,
+            ),
             rc_apply_lane_wakeups: load(&self.rc_apply_lane_wakeups),
             rc_apply_lane_empty_wakeups: load(&self.rc_apply_lane_empty_wakeups),
             rc_apply_lane_burst_total: load(&self.rc_apply_lane_burst_total),

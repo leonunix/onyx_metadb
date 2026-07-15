@@ -53,8 +53,14 @@ impl Db {
         // non-atomic read-then-stage in `stage_rc_decref_if_live`.
         let num_rc_shards = self.refcount_shards.len();
         let mut rc_shards_touched: Vec<bool> = vec![false; num_rc_shards];
-        let mut mark_rc = |pba: Pba, rc_shards_touched: &mut Vec<bool>| {
-            rc_shards_touched[rc_shard_of_pba(pba, num_rc_shards)] = true;
+        let mut l2p_guard_rc_shards_touched: Vec<bool> = vec![false; num_rc_shards];
+        let mut dedup_rc_shards_touched: Vec<bool> = vec![false; num_rc_shards];
+        let mark_dedup_rc = |pba: Pba,
+                             rc_shards_touched: &mut Vec<bool>,
+                             dedup_rc_shards_touched: &mut Vec<bool>| {
+            let sid = rc_shard_of_pba(pba, num_rc_shards);
+            rc_shards_touched[sid] = true;
+            dedup_rc_shards_touched[sid] = true;
         };
         // rc-authoritative: every applied L2P install increfs its new
         // head_pba AND decrefs the OLD head_pba it replaced (traditional,
@@ -115,7 +121,9 @@ impl Db {
                     // Guarded L2pRemap reads rc[guard.0] inline in
                     // `apply_l2p_bucket` (lanes/l2p.rs:~280, ~540).
                     if let Some((gp, _)) = guard {
-                        mark_rc(*gp, &mut rc_shards_touched);
+                        let guard_sid = rc_shard_of_pba(*gp, num_rc_shards);
+                        rc_shards_touched[guard_sid] = true;
+                        l2p_guard_rc_shards_touched[guard_sid] = true;
                     }
                     // rc-authoritative incref(new)+decref(old) rc shards are
                     // blanket-claimed after this loop (decref pba unknown here).
@@ -171,9 +179,13 @@ impl Db {
                     // even though the apply skips the decref/incref pair
                     // when old_pba == new_pba — that runtime decision
                     // must not change the dispatch footprint.
-                    mark_rc(value.head_pba(), &mut rc_shards_touched);
+                    mark_dedup_rc(
+                        value.head_pba(),
+                        &mut rc_shards_touched,
+                        &mut dedup_rc_shards_touched,
+                    );
                     if let Some(op) = old_pba {
-                        mark_rc(*op, &mut rc_shards_touched);
+                        mark_dedup_rc(*op, &mut rc_shards_touched, &mut dedup_rc_shards_touched);
                     }
                 }
                 WalOp::DedupPutGuarded {
@@ -188,10 +200,18 @@ impl Db {
                     dedup_buckets[sid].push(idx);
                     // Apply reads rc[pba_guard] then conditionally stages
                     // decref(old_pba) + incref(new_pba) (lanes/dedup.rs:97-123).
-                    mark_rc(*pba_guard, &mut rc_shards_touched);
-                    mark_rc(value.head_pba(), &mut rc_shards_touched);
+                    mark_dedup_rc(
+                        *pba_guard,
+                        &mut rc_shards_touched,
+                        &mut dedup_rc_shards_touched,
+                    );
+                    mark_dedup_rc(
+                        value.head_pba(),
+                        &mut rc_shards_touched,
+                        &mut dedup_rc_shards_touched,
+                    );
                     if let Some(op) = old_pba {
-                        mark_rc(*op, &mut rc_shards_touched);
+                        mark_dedup_rc(*op, &mut rc_shards_touched, &mut dedup_rc_shards_touched);
                     }
                 }
                 WalOp::DedupDelete { hash, old_pba } => {
@@ -200,7 +220,7 @@ impl Db {
                     dedup_buckets[sid].push(idx);
                     // Apply stages decref(old_pba) if Some (lanes/dedup.rs:127-135).
                     if let Some(op) = old_pba {
-                        mark_rc(*op, &mut rc_shards_touched);
+                        mark_dedup_rc(*op, &mut rc_shards_touched, &mut dedup_rc_shards_touched);
                     }
                 }
                 WalOp::DedupCompareDelete { hash, old_value } => {
@@ -211,7 +231,11 @@ impl Db {
                     // CAS observes old_value matches current
                     // (lanes/dedup.rs:137-148). Pessimistic claim — the
                     // CAS decision can't change the dispatch footprint.
-                    mark_rc(old_value.head_pba(), &mut rc_shards_touched);
+                    mark_dedup_rc(
+                        old_value.head_pba(),
+                        &mut rc_shards_touched,
+                        &mut dedup_rc_shards_touched,
+                    );
                 }
                 WalOp::DedupComparePut {
                     hash,
@@ -223,8 +247,16 @@ impl Db {
                     dedup_buckets[sid].push(idx);
                     // Apply stages decref(old)+incref(new) iff CAS hits
                     // (lanes/dedup.rs:149-171). Pessimistic claim.
-                    mark_rc(old_value.head_pba(), &mut rc_shards_touched);
-                    mark_rc(new_value.head_pba(), &mut rc_shards_touched);
+                    mark_dedup_rc(
+                        old_value.head_pba(),
+                        &mut rc_shards_touched,
+                        &mut dedup_rc_shards_touched,
+                    );
+                    mark_dedup_rc(
+                        new_value.head_pba(),
+                        &mut rc_shards_touched,
+                        &mut dedup_rc_shards_touched,
+                    );
                 }
             }
         }
@@ -255,6 +287,8 @@ impl Db {
             l2p_sorted,
             rc_buckets,
             rc_enqueued,
+            l2p_guard_rc_enqueued: l2p_guard_rc_shards_touched,
+            dedup_rc_enqueued: dedup_rc_shards_touched,
             dedup_buckets,
         })
     }
@@ -266,15 +300,53 @@ impl Db {
         bfg: crate::types::Bfg,
         plan: LaneDispatchPlan,
         ops: Arc<Vec<WalOp>>,
-    ) -> QueuedLanePlan {
-        let mut l2p_receivers = Vec::with_capacity(plan.l2p_sorted.len());
+    ) -> Result<QueuedLanePlan> {
+        let LaneDispatchPlan {
+            l2p_sorted,
+            rc_buckets,
+            rc_enqueued,
+            l2p_guard_rc_enqueued,
+            dedup_rc_enqueued,
+            dedup_buckets,
+        } = plan;
+
+        // Install an LSN slot on every possible RC shard before any L2P work
+        // runs. Under rc-authoritative mode the old PBA is unknown until L2P
+        // apply, so this is deliberately all shards. The slot is filled with
+        // exact actions later, but its FIFO position already prevents a higher
+        // LSN from passing this commit on that RC shard.
+        let mut rc_reservations: Vec<Option<ReservedApplyWork>> =
+            (0..rc_enqueued.len()).map(|_| None).collect();
+        for (sid, touched) in rc_enqueued.iter().copied().enumerate() {
+            if touched {
+                rc_reservations[sid] =
+                    Some(self.refcount_shards[sid].apply_lane.enqueue_reserved(lsn));
+            }
+        }
+
+        // A guarded L2P op reads RC outside the RC worker. Wait until this
+        // commit's reserved slot reaches the head of every guard shard; that
+        // proves all lower-LSN RC and dedup work on those shards has finished.
+        for (sid, guarded) in l2p_guard_rc_enqueued.iter().copied().enumerate() {
+            if guarded {
+                rc_reservations[sid]
+                    .as_ref()
+                    .expect("guarded RC shard must have a reserved lane slot")
+                    .wait_until_started();
+            }
+        }
+        if let Some(err) = self.commit_poison_error() {
+            return Err(err);
+        }
+
+        let mut l2p_receivers = Vec::with_capacity(l2p_sorted.len());
         // Snapshot refcount shard handles once per commit so the per-lane
         // closures can do guarded-remap rc lookups (dedup hits) without
         // touching the Db struct from the worker thread.
         let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> =
             Arc::new(self.refcount_shards.iter().map(|s| s.rc.clone()).collect());
         let rc_authoritative = self.rc_authoritative_reclaim;
-        for ((vol_ord, sid), indices) in plan.l2p_sorted {
+        for ((vol_ord, sid), indices) in l2p_sorted {
             let volume = volumes
                 .get(&vol_ord)
                 .expect("volume presence checked during lane planning");
@@ -282,6 +354,7 @@ impl Db {
             let apply_ops = ops.clone();
             let metrics = self.metrics.clone();
             let refcount_shards_arc = refcount_shards_arc.clone();
+            let commit_poisoned = self.commit_poisoned.clone();
             // BFG: capture this volume's live snapshot
             // capture-watermarks for the birth COW-kill + page-deadlist gate
             // before the lane runs.
@@ -294,19 +367,34 @@ impl Db {
             volume.shards[sid].apply_lane.enqueue_ready(
                 lsn,
                 Box::new(move || {
-                    let result = Self::apply_l2p_bucket(
-                        apply_volume,
-                        sid,
-                        indices,
-                        lsn,
-                        bfg,
-                        apply_ops.as_slice(),
-                        refcount_shards_arc.as_slice(),
-                        metrics.as_ref(),
-                        rc_authoritative,
-                        snapshot_wms,
-                        clone_cow_pinners,
-                    );
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if commit_poisoned.load(std::sync::atomic::Ordering::Acquire) {
+                            return Err(MetaDbError::Corruption(format!(
+                                "commit pipeline poisoned before L2P lane applied LSN {lsn}"
+                            )));
+                        }
+                        Self::apply_l2p_bucket(
+                            apply_volume,
+                            sid,
+                            indices,
+                            lsn,
+                            bfg,
+                            apply_ops.as_slice(),
+                            refcount_shards_arc.as_slice(),
+                            metrics.as_ref(),
+                            rc_authoritative,
+                            snapshot_wms,
+                            clone_cow_pinners,
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(MetaDbError::Corruption(format!(
+                            "persistent L2P lane {sid} panicked while applying LSN {lsn}"
+                        )))
+                    });
+                    if result.is_err() {
+                        commit_poisoned.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     let _ = tx.send(result);
                 }),
             );
@@ -315,20 +403,22 @@ impl Db {
         // One pending slot per non-empty dedup bucket. Empty buckets
         // get `None`, matching the per-shard layout of `dedup_buckets`.
         let mut dedup_pendings: Vec<Option<PendingApplyWork>> =
-            (0..plan.dedup_buckets.len()).map(|_| None).collect();
-        for (sid, bucket) in plan.dedup_buckets.iter().enumerate() {
+            (0..dedup_buckets.len()).map(|_| None).collect();
+        for (sid, bucket) in dedup_buckets.iter().enumerate() {
             if !bucket.is_empty() {
                 dedup_pendings[sid] = Some(self.dedup_lanes[sid].enqueue_pending(lsn));
             }
         }
-        QueuedLanePlan {
+        Ok(QueuedLanePlan {
             ops,
             bfg,
             l2p_receivers,
-            rc_buckets: plan.rc_buckets,
-            dedup_buckets: plan.dedup_buckets,
+            rc_buckets,
+            rc_reservations,
+            dedup_rc_enqueued,
+            dedup_buckets,
             dedup_pendings,
-        }
+        })
     }
 
     pub(super) fn apply_ops_laned(
@@ -355,20 +445,24 @@ impl Db {
                 }
                 Ok(Err(err)) => {
                     if first_error.is_none() {
+                        self.poison_commit_waiters(&err);
                         first_error = Some(err);
                     }
                 }
                 Err(_) => {
                     if first_error.is_none() {
-                        first_error = Some(MetaDbError::Corruption(
+                        let err = MetaDbError::Corruption(
                             "persistent L2P lane worker failed to return a result".into(),
-                        ));
+                        );
+                        self.poison_commit_waiters(&err);
+                        first_error = Some(err);
                     }
                 }
             }
         }
         timing.l2p_wait = l2p_wait_started.elapsed();
         if let Some(err) = first_error {
+            self.poison_commit_waiters(&err);
             return Err(err);
         }
 
@@ -380,27 +474,49 @@ impl Db {
         let rc_enqueue_started = std::time::Instant::now();
         for sid in 0..plan.rc_buckets.len() {
             let actions = std::mem::take(&mut plan.rc_buckets[sid]);
-            if actions.is_empty() {
-                continue;
-            }
+            let Some(mut reservation) = plan.rc_reservations[sid].take() else {
+                if actions.is_empty() {
+                    continue;
+                }
+                let err = MetaDbError::Corruption(format!(
+                    "RC shard {sid} produced actions without an LSN reservation"
+                ));
+                self.poison_commit_waiters(&err);
+                return Err(err);
+            };
             let rc = self.refcount_shards[sid].rc.clone();
             let metrics = self.metrics.clone();
+            let commit_poisoned = self.commit_poisoned.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
-            self.refcount_shards[sid].apply_lane.enqueue_ready(
-                lsn,
-                Box::new(move || {
+            reservation.set(Box::new(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if commit_poisoned.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(MetaDbError::Corruption(format!(
+                            "commit pipeline poisoned before RC lane {sid} applied LSN {lsn}"
+                        )));
+                    }
                     let result =
                         Self::apply_refcount_bucket_to_tree(rc, metrics, actions, lsn, bfg);
-                    let _ = tx.send(result);
-                }),
-            );
-            rc_receivers.push(rx);
+                    result
+                }))
+                .unwrap_or_else(|_| {
+                    Err(MetaDbError::Corruption(format!(
+                        "persistent refcount lane {sid} panicked while applying LSN {lsn}"
+                    )))
+                });
+                if result.is_err() {
+                    commit_poisoned.store(true, std::sync::atomic::Ordering::Release);
+                }
+                let _ = tx.send(result);
+            }));
+            rc_receivers.push((sid, reservation, rx));
         }
         timing.rc_enqueue = rc_enqueue_started.elapsed();
 
         let mut first_error = None;
+        let mut held_rc_reservations = Vec::new();
         let rc_wait_started = std::time::Instant::now();
-        for rx in rc_receivers {
+        for (sid, reservation, rx) in rc_receivers {
             match rx.recv() {
                 Ok(Ok(result)) => {
                     for (idx, new) in result.refcount_outcomes {
@@ -422,23 +538,34 @@ impl Db {
                             }
                         }
                     }
+                    if plan.dedup_rc_enqueued[sid] {
+                        held_rc_reservations.push(reservation);
+                    } else {
+                        reservation.release();
+                    }
                 }
                 Ok(Err(err)) => {
                     if first_error.is_none() {
+                        self.poison_commit_waiters(&err);
                         first_error = Some(err);
                     }
+                    drop(reservation);
                 }
                 Err(_) => {
                     if first_error.is_none() {
-                        first_error = Some(MetaDbError::Corruption(
+                        let err = MetaDbError::Corruption(
                             "persistent refcount lane worker failed to return a result".into(),
-                        ));
+                        );
+                        self.poison_commit_waiters(&err);
+                        first_error = Some(err);
                     }
+                    drop(reservation);
                 }
             }
         }
         timing.rc_wait = rc_wait_started.elapsed();
         if let Some(err) = first_error {
+            self.poison_commit_waiters(&err);
             return Err(err);
         }
 
@@ -467,6 +594,17 @@ impl Db {
         let dedup_enqueue_started = std::time::Instant::now();
         let dedup_buckets = std::mem::take(&mut plan.dedup_buckets);
         let pendings = std::mem::take(&mut plan.dedup_pendings);
+        // A coordinator may run on any one of this commit's dedup shards. Do
+        // not start it until this LSN is at the head of every touched shard;
+        // otherwise a high-LSN leader on shard C could bypass a low-LSN
+        // coordinator whose shared shard A is only represented by a pending
+        // follower slot.
+        for pending in pendings.iter().flatten() {
+            pending.wait_until_started();
+        }
+        if let Some(err) = self.commit_poison_error() {
+            return Err(err);
+        }
         let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> =
             Arc::new(self.refcount_shards.iter().map(|s| s.rc.clone()).collect());
         let mut leader: Option<(usize, PendingApplyWork)> = None;
@@ -490,10 +628,6 @@ impl Db {
                 }
             }
         }
-        for pending in followers {
-            pending.set(Box::new(|| {}));
-        }
-
         let dedup_receiver = leader.map(|(_first_idx, pending)| {
             dedup_indices.sort_unstable();
             let ready_at = std::time::Instant::now();
@@ -502,19 +636,35 @@ impl Db {
             let dedup_index = self.dedup_index.clone();
             let refcount_shards_arc = refcount_shards_arc.clone();
             let metrics = self.metrics.clone();
+            let commit_poisoned = self.commit_poisoned.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
             pending.set(Box::new(move || {
                 let ready_queue_wait = ready_at.elapsed();
                 let exec_started = std::time::Instant::now();
-                let outcomes = Self::apply_dedup_indices_to(
-                    dedup_index.as_ref(),
-                    refcount_shards_arc.as_slice(),
-                    metrics.as_ref(),
-                    ops.as_slice(),
-                    dedup_indices,
-                    lsn,
-                    bfg,
-                );
+                let outcomes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if commit_poisoned.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(MetaDbError::Corruption(format!(
+                            "commit pipeline poisoned before dedup lane applied LSN {lsn}"
+                        )));
+                    }
+                    Self::apply_dedup_indices_to(
+                        dedup_index.as_ref(),
+                        refcount_shards_arc.as_slice(),
+                        metrics.as_ref(),
+                        ops.as_slice(),
+                        dedup_indices,
+                        lsn,
+                        bfg,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Err(MetaDbError::Corruption(format!(
+                        "persistent dedup lane panicked while applying LSN {lsn}"
+                    )))
+                });
+                if outcomes.is_err() {
+                    commit_poisoned.store(true, std::sync::atomic::Ordering::Release);
+                }
                 metrics.record_dedup_lane_task(
                     bucket_ops,
                     ready_queue_wait,
@@ -527,14 +677,40 @@ impl Db {
         timing.dedup_enqueue = dedup_enqueue_started.elapsed();
         let dedup_wait_started = std::time::Instant::now();
         if let Some(rx) = dedup_receiver {
-            let dedup_outcomes = rx.recv().map_err(|_| {
-                MetaDbError::Corruption(
-                    "persistent dedup lane worker failed to return a result".into(),
-                )
-            })??;
-            for (idx, outcome) in dedup_outcomes {
-                outcomes[idx] = Some(outcome);
+            let dedup_result = match rx.recv() {
+                Ok(result) => result,
+                Err(_) => {
+                    let err = MetaDbError::Corruption(
+                        "persistent dedup lane worker failed to return a result".into(),
+                    );
+                    self.poison_commit_waiters(&err);
+                    return Err(err);
+                }
+            };
+            match dedup_result {
+                Ok(dedup_outcomes) => {
+                    for (idx, outcome) in dedup_outcomes {
+                        outcomes[idx] = Some(outcome);
+                    }
+                }
+                Err(err) => {
+                    self.poison_commit_waiters(&err);
+                    return Err(err);
+                }
             }
+        }
+        // Followers intentionally remain pending until the real coordinator
+        // has finished. Only then may their lane watermark advance past this
+        // LSN; otherwise a higher commit whose coordinator lands on a follower
+        // shard could overtake the lower-LSN cross-shard operation.
+        for pending in followers {
+            pending.set(Box::new(|| {}));
+        }
+        // Dedup reads/stages RC outside the RC workers. Keep every touched RC
+        // lane pinned at this LSN until those mutations are complete, then let
+        // higher-LSN RC slots proceed.
+        for reservation in held_rc_reservations {
+            reservation.release();
         }
         timing.dedup_wait = dedup_wait_started.elapsed();
 

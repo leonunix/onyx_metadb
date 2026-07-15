@@ -396,6 +396,24 @@ impl MetaMetrics {
         }
     }
 
+    pub(crate) fn record_rc_apply_lane_reserved_hold_start(&self) {
+        let active = self
+            .rc_apply_lane_reserved_hold_active
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        fetch_max(&self.rc_apply_lane_reserved_hold_active_max, active);
+    }
+
+    pub(crate) fn record_rc_apply_lane_reserved_hold_end(&self, elapsed: Duration) {
+        record_duration(
+            &self.rc_apply_lane_reserved_hold_us,
+            &self.rc_apply_lane_reserved_hold_max_us,
+            elapsed,
+        );
+        self.rc_apply_lane_reserved_hold_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
     /// Record one batch of cvar wakeups observed while the L2P apply lane
     /// was hunting for its next task. `wakeups` counts every `cvar.wait()`
     /// return (productive or spurious); `empty_wakeups` is the subset that

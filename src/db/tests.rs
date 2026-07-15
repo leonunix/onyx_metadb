@@ -81,6 +81,35 @@ fn apply_lane_maintenance_bypasses_queued_wal_work() {
 }
 
 #[test]
+fn apply_lane_reserved_slot_waits_for_work_and_release_before_advancing() {
+    let metrics = Arc::new(MetaMetrics::new());
+    let lane = ApplyLane::new(0, ApplyLaneKind::Refcount, 0, metrics.clone());
+    let mut reserved = lane.enqueue_reserved(1);
+    lane.enqueue_ready(2, Box::new(|| {}));
+
+    reserved.wait_until_started();
+    let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+    reserved.set(Box::new(move || ran_tx.send(()).unwrap()));
+    ran_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        lane.last_applied_lsn(),
+        0,
+        "reserved slot must pin its LSN after work execution"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2));
+
+    reserved.release();
+    lane.wait_for_drain();
+    assert_eq!(lane.last_applied_lsn(), 2);
+    let snapshot = metrics.snapshot();
+    assert!(snapshot.rc_apply_lane_reserved_hold_us >= 1_000);
+    assert_eq!(snapshot.rc_apply_lane_reserved_hold_active, 0);
+    assert_eq!(snapshot.rc_apply_lane_reserved_hold_active_max, 1);
+}
+
+#[test]
 fn apply_lane_prioritizes_ready_wal_work_with_bounded_maintenance() {
     let lane = ApplyLane::new(0, ApplyLaneKind::L2p, 0, Arc::new(MetaMetrics::new()));
     let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

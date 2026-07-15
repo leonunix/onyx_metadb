@@ -243,6 +243,15 @@ fn guarded_remap_adds_only_guard_pba_rc_shard() {
         vec![expected_sid],
         "Guarded L2pRemap reads rc[guard.0] in apply_l2p_bucket; only that one rc shard must appear"
     );
+    assert!(plan.l2p_guard_rc_enqueued[expected_sid]);
+    assert_eq!(
+        plan.l2p_guard_rc_enqueued
+            .iter()
+            .filter(|touched| **touched)
+            .count(),
+        1,
+        "guard wait bitmap must contain exactly the guard PBA shard"
+    );
 }
 
 #[test]
@@ -276,6 +285,130 @@ fn dedup_put_commit_has_precise_rc_footprint() {
         got, expected,
         "DedupPut must claim rc shards for both old_pba and new_pba (lanes/dedup.rs::stage_rc paths)"
     );
+    let held: Vec<_> = plan
+        .dedup_rc_enqueued
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(sid, touched)| touched.then_some(sid))
+        .collect();
+    assert_eq!(
+        held, expected,
+        "dedup-derived RC shards must retain their reserved lane slots"
+    );
+}
+
+#[test]
+fn every_dedup_op_marks_all_rc_shards_it_can_read_or_stage() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Db::create(dir.path()).unwrap();
+    let num_rc = db.refcount_shards.len();
+    let old = 0x81_000;
+    let new = 0x82_000;
+    let guard = 0x83_000;
+    let cases = vec![
+        (
+            "put",
+            WalOp::DedupPut {
+                hash: hash_for(1),
+                value: dedup_value_with_pba(new),
+                old_pba: Some(old),
+            },
+            vec![old, new],
+        ),
+        (
+            "put_guarded",
+            WalOp::DedupPutGuarded {
+                hash: hash_for(2),
+                value: dedup_value_with_pba(new),
+                pba_guard: guard,
+                min_rc: 1,
+                old_pba: Some(old),
+            },
+            vec![guard, old, new],
+        ),
+        (
+            "delete",
+            WalOp::DedupDelete {
+                hash: hash_for(3),
+                old_pba: Some(old),
+            },
+            vec![old],
+        ),
+        (
+            "compare_delete",
+            WalOp::DedupCompareDelete {
+                hash: hash_for(4),
+                old_value: dedup_value_with_pba(old),
+            },
+            vec![old],
+        ),
+        (
+            "compare_put",
+            WalOp::DedupComparePut {
+                hash: hash_for(5),
+                old_value: dedup_value_with_pba(old),
+                new_value: dedup_value_with_pba(new),
+            },
+            vec![old, new],
+        ),
+    ];
+
+    for (name, op, pbas) in cases {
+        let plan = db
+            .build_lane_dispatch_plan(&db.volumes.read().clone(), &[op])
+            .unwrap();
+        let got: std::collections::BTreeSet<_> = plan
+            .dedup_rc_enqueued
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(sid, touched)| touched.then_some(sid))
+            .collect();
+        let expected: std::collections::BTreeSet<_> = pbas
+            .into_iter()
+            .map(|pba| super::lanes::rc_shard_of_pba(pba, num_rc))
+            .collect();
+        assert_eq!(got, expected, "dedup RC hold mismatch for {name}");
+    }
+}
+
+#[test]
+fn rc_authoritative_reserves_all_rc_slots_and_marks_precise_dedup_holds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.rc_authoritative_reclaim = true;
+    let db = Db::create_with_config(cfg).unwrap();
+    let dedup_pba = 0x31_000;
+    let dedup_sid = super::lanes::rc_shard_of_pba(dedup_pba, db.refcount_shards.len());
+    let ops = [
+        WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: 123,
+            value: l2p_value_with_pba(0x32_000),
+        },
+        WalOp::DedupPut {
+            hash: hash_for(99),
+            value: dedup_value_with_pba(dedup_pba),
+            old_pba: None,
+        },
+    ];
+
+    let plan = db
+        .build_lane_dispatch_plan(&db.volumes.read().clone(), &ops)
+        .unwrap();
+    assert!(
+        plan.rc_enqueued.iter().all(|touched| *touched),
+        "rc-authoritative L2P apply must initially reserve every dynamic RC lane"
+    );
+    let held: Vec<_> = plan
+        .dedup_rc_enqueued
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(sid, touched)| touched.then_some(sid))
+        .collect();
+    assert_eq!(held, vec![dedup_sid]);
 }
 
 #[test]
@@ -522,6 +655,86 @@ fn direct_apply_path_increments_counter_and_serves_reads() {
             "direct-applied LBA {i} must be readable"
         );
     }
+}
+
+#[test]
+fn direct_apply_waits_for_lower_lsn_on_same_l2p_lane() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let (_dir, db) = mk_direct_apply_db();
+    let low_lba = 60_000;
+    let target_sid = db.l2p_shard_for(low_lba);
+    let mut high_lba = low_lba + 1;
+    while db.l2p_shard_for(high_lba) != target_sid {
+        high_lba += 1;
+    }
+    let low_value = l2p_value_with_pba(0xc1_000);
+    let high_value = l2p_value_with_pba(0xc2_000);
+    let dedup_hash = hash_for(0xc3_000);
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let volume = db
+        .volumes
+        .read()
+        .get(&BOOTSTRAP_VOLUME_ORD)
+        .unwrap()
+        .clone();
+    volume.shards[target_sid]
+        .apply_lane
+        .enqueue_maintenance(Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        }));
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("L2P maintenance blocker did not start");
+
+    let low_db = Arc::clone(&db);
+    let low = std::thread::spawn(move || {
+        low_db.stage_ops(&[
+            WalOp::L2pPut {
+                vol_ord: BOOTSTRAP_VOLUME_ORD,
+                lba: low_lba,
+                value: low_value,
+            },
+            WalOp::DedupPut {
+                hash: dedup_hash,
+                value: dedup_value_with_pba(0xc3_000),
+                old_pba: None,
+            },
+        ])
+    });
+    spin_until(Duration::from_secs(2), || {
+        let state = volume.shards[target_sid].apply_lane.inner.state.lock();
+        !state.queue.is_empty()
+    });
+
+    let high_db = Arc::clone(&db);
+    let high = std::thread::spawn(move || {
+        high_db.stage_ops(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: high_lba,
+            value: high_value,
+        }])
+    });
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(!high.is_finished());
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, high_lba).unwrap(), None);
+
+    release_tx.send(()).unwrap();
+    let (low_lsn, _) = low.join().unwrap().unwrap();
+    let (high_lsn, _) = high.join().unwrap().unwrap();
+    assert!(high_lsn > low_lsn);
+    assert_eq!(
+        db.get(BOOTSTRAP_VOLUME_ORD, low_lba).unwrap(),
+        Some(low_value)
+    );
+    assert_eq!(
+        db.get(BOOTSTRAP_VOLUME_ORD, high_lba).unwrap(),
+        Some(high_value)
+    );
 }
 
 #[test]
@@ -790,7 +1003,7 @@ fn stage_ops_runs_refcount_work_on_shard_lanes() {
 }
 
 #[test]
-fn stage_ops_retains_rc_dispatch_until_dedup_lane_finishes() {
+fn stage_ops_releases_dispatch_but_pins_rc_lane_until_dedup_finishes() {
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -802,6 +1015,7 @@ fn stage_ops_retains_rc_dispatch_until_dedup_lane_finishes() {
     let hash = hash_for_dedup_lane(0, 2);
     let lane = crate::dedup_types::shard_for_hash(&hash, 2) as usize;
     let pba = 0x51_000;
+    let rc_sid = super::lanes::rc_shard_of_pba(pba, db.refcount_shards.len());
 
     let (started_tx, started_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
@@ -824,18 +1038,20 @@ fn stage_ops_retains_rc_dispatch_until_dedup_lane_finishes() {
 
     spin_until(Duration::from_secs(2), || {
         let state = db.dedup_lanes[lane].inner.state.lock();
-        state.queue.front().is_some_and(|task| task.slot.is_ready())
+        !state.queue.is_empty()
+    });
+    spin_until(Duration::from_secs(2), || {
+        let state = db.refcount_shards[rc_sid].apply_lane.inner.state.lock();
+        state.last_enqueued_lsn > state.last_applied_lsn
+    });
+    spin_until(Duration::from_secs(2), || {
+        db.dispatch_state.lock().pending.is_empty()
     });
     {
         let state = db.dispatch_state.lock();
-        assert_eq!(
-            state.pending.len(),
-            1,
-            "derived RC work must retain its dispatch reservation"
-        );
         assert!(
-            state.pending.values().all(|entry| entry.durable),
-            "the staged commit must be dispatch-ready before its dedup lane runs"
+            state.pending.is_empty(),
+            "global dispatch reservation must retire once per-lane LSN slots are installed"
         );
     }
 
@@ -845,6 +1061,165 @@ fn stage_ops_retains_rc_dispatch_until_dedup_lane_finishes() {
     assert_eq!(outcomes.len(), 1);
     assert!(db.dispatch_state.lock().pending.is_empty());
     assert_eq!(db.get_refcount(pba).unwrap(), 1);
+    spin_until(Duration::from_secs(2), || {
+        let state = db.refcount_shards[rc_sid].apply_lane.inner.state.lock();
+        state.last_enqueued_lsn == state.last_applied_lsn
+    });
+}
+
+#[test]
+fn stage_ops_pipelines_higher_l2p_behind_lower_dedup_rc_hold() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.rc_authoritative_reclaim = true;
+    cfg.dedup_shards = 2;
+    let db = Arc::new(Db::create_with_config(cfg).unwrap());
+
+    let dedup_hash = hash_for_dedup_lane(0, 2);
+    let dedup_lane = crate::dedup_types::shard_for_hash(&dedup_hash, 2) as usize;
+    let dedup_pba = 0x71_000;
+    let held_rc_sid = super::lanes::rc_shard_of_pba(dedup_pba, db.refcount_shards.len());
+    let mut higher_pba = dedup_pba + 1;
+    while super::lanes::rc_shard_of_pba(higher_pba, db.refcount_shards.len()) != held_rc_sid {
+        higher_pba += 1;
+    }
+    let lower_lba = 30_000;
+    let higher_lba = 40_000;
+    let lower_pba = 0x72_000;
+    let higher_value = l2p_value_with_pba(higher_pba);
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    db.dedup_lanes[dedup_lane].enqueue_maintenance(Box::new(move || {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+    }));
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("dedup maintenance blocker did not start");
+
+    let lower_db = Arc::clone(&db);
+    let lower = std::thread::spawn(move || {
+        lower_db.stage_ops(&[
+            WalOp::L2pPut {
+                vol_ord: BOOTSTRAP_VOLUME_ORD,
+                lba: lower_lba,
+                value: l2p_value_with_pba(lower_pba),
+            },
+            WalOp::DedupPut {
+                hash: dedup_hash,
+                value: dedup_value_with_pba(dedup_pba),
+                old_pba: None,
+            },
+        ])
+    });
+    spin_until(Duration::from_secs(2), || {
+        let state = db.refcount_shards[held_rc_sid]
+            .apply_lane
+            .inner
+            .state
+            .lock();
+        state.last_enqueued_lsn > state.last_applied_lsn
+    });
+
+    let higher_db = Arc::clone(&db);
+    let higher = std::thread::spawn(move || {
+        higher_db.stage_ops(&[WalOp::L2pPut {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: higher_lba,
+            value: higher_value,
+        }])
+    });
+
+    spin_until(Duration::from_secs(2), || {
+        db.get(BOOTSTRAP_VOLUME_ORD, higher_lba).unwrap() == Some(higher_value)
+    });
+    assert!(
+        !higher.is_finished(),
+        "higher LSN must not finish while its RC slot is behind the lower dedup hold"
+    );
+    assert!(
+        db.dispatch_state.lock().pending.is_empty(),
+        "both commits should have handed ordering to their per-shard slots"
+    );
+
+    release_tx.send(()).unwrap();
+    let (lower_lsn, _) = lower.join().unwrap().unwrap();
+    let (higher_lsn, _) = higher.join().unwrap().unwrap();
+    assert!(higher_lsn > lower_lsn);
+    assert_eq!(db.get_refcount(lower_pba).unwrap(), 1);
+    assert_eq!(db.get_refcount(dedup_pba).unwrap(), 1);
+    assert_eq!(db.get_refcount(higher_pba).unwrap(), 1);
+}
+
+#[test]
+fn guarded_l2p_waits_for_lower_dedup_rc_slot() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.dedup_shards = 2;
+    let db = Arc::new(Db::create_with_config(cfg).unwrap());
+    let hash = hash_for_dedup_lane(0, 2);
+    let dedup_lane = crate::dedup_types::shard_for_hash(&hash, 2) as usize;
+    let guard_pba = 0x91_000;
+    let guard_sid = super::lanes::rc_shard_of_pba(guard_pba, db.refcount_shards.len());
+    let guarded_lba = 50_000;
+    let guarded_value = l2p_value_with_pba(0x92_000);
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    db.dedup_lanes[dedup_lane].enqueue_maintenance(Box::new(move || {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+    }));
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("dedup maintenance blocker did not start");
+
+    let lower_db = Arc::clone(&db);
+    let lower = std::thread::spawn(move || {
+        lower_db.stage_ops(&[WalOp::DedupPut {
+            hash,
+            value: dedup_value_with_pba(guard_pba),
+            old_pba: None,
+        }])
+    });
+    spin_until(Duration::from_secs(2), || {
+        let state = db.refcount_shards[guard_sid].apply_lane.inner.state.lock();
+        state.last_enqueued_lsn > state.last_applied_lsn
+    });
+
+    let higher_db = Arc::clone(&db);
+    let higher = std::thread::spawn(move || {
+        higher_db.stage_ops(&[WalOp::L2pRemap {
+            vol_ord: BOOTSTRAP_VOLUME_ORD,
+            lba: guarded_lba,
+            new_value: guarded_value,
+            guard: Some((guard_pba, 1)),
+        }])
+    });
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(!higher.is_finished());
+    assert_eq!(db.get(BOOTSTRAP_VOLUME_ORD, guarded_lba).unwrap(), None);
+
+    release_tx.send(()).unwrap();
+    lower.join().unwrap().unwrap();
+    let (_, outcomes) = higher.join().unwrap().unwrap();
+    assert!(matches!(
+        outcomes.as_slice(),
+        [ApplyOutcome::L2pRemap { applied: true, .. }]
+    ));
+    assert_eq!(
+        db.get(BOOTSTRAP_VOLUME_ORD, guarded_lba).unwrap(),
+        Some(guarded_value)
+    );
 }
 
 #[test]
@@ -890,14 +1265,25 @@ fn stage_ops_preserves_cross_dedup_shard_rc_order() {
         ])
     });
 
-    // The second dedup lane has crossed this LSN while lane 0 is blocked. In
-    // the ordered implementation it only executes a follower no-op; the
-    // coordinator still applies both real ops in their original order.
+    // The follower lane must reserve this LSN but must not cross it while the
+    // real coordinator is blocked on lane 0.
     spin_until(Duration::from_secs(2), || {
-        db.dedup_lanes[1].last_applied_lsn() > 0
+        let state = db.dedup_lanes[1].inner.state.lock();
+        state.last_enqueued_lsn > state.last_applied_lsn
     });
+    {
+        let state = db.dedup_lanes[1].inner.state.lock();
+        assert!(
+            state.last_applied_lsn < state.last_enqueued_lsn,
+            "dedup follower watermark advanced before the coordinator completed"
+        );
+    }
     release_tx.send(()).unwrap();
     let (_, outcomes) = commit.join().unwrap().unwrap();
+    spin_until(Duration::from_secs(2), || {
+        let state = db.dedup_lanes[1].inner.state.lock();
+        state.last_enqueued_lsn == state.last_applied_lsn
+    });
 
     assert_eq!(outcomes.len(), 2);
     assert_eq!(
@@ -907,6 +1293,101 @@ fn stage_ops_preserves_cross_dedup_shard_rc_order() {
     );
     assert_eq!(db.get_refcount(guard_pba).unwrap(), 1);
     assert_eq!(db.get_refcount(guarded_pba).unwrap(), 1);
+}
+
+#[test]
+fn higher_dedup_leader_waits_for_every_shared_follower_lane() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.dedup_shards = 4;
+    let db = Arc::new(Db::create_with_config(cfg).unwrap());
+    let low_leader_hash = hash_for_dedup_lane(1, 4);
+    let shared_follower_low_hash = hash_for_dedup_lane(0, 4);
+    let high_leader_hash = hash_for_dedup_lane(2, 4);
+    let mut shared_follower_high_hash = hash_for_dedup_lane(0, 4);
+    shared_follower_high_hash[7] ^= 0x5a;
+    assert_eq!(
+        crate::dedup_types::shard_for_hash(&shared_follower_high_hash, 4),
+        0
+    );
+
+    let mut pbas = Vec::new();
+    let mut used_sids = std::collections::BTreeSet::new();
+    let mut candidate = 0xa1_000;
+    while pbas.len() < 4 {
+        let sid = super::lanes::rc_shard_of_pba(candidate, db.refcount_shards.len());
+        if used_sids.insert(sid) {
+            pbas.push(candidate);
+        }
+        candidate += 1;
+    }
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    db.dedup_lanes[1].enqueue_maintenance(Box::new(move || {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+    }));
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("low dedup leader blocker did not start");
+
+    let low_db = Arc::clone(&db);
+    let low_pbas = [pbas[0], pbas[1]];
+    let low = std::thread::spawn(move || {
+        low_db.stage_ops(&[
+            WalOp::DedupPut {
+                hash: low_leader_hash,
+                value: dedup_value_with_pba(low_pbas[0]),
+                old_pba: None,
+            },
+            WalOp::DedupPut {
+                hash: shared_follower_low_hash,
+                value: dedup_value_with_pba(low_pbas[1]),
+                old_pba: None,
+            },
+        ])
+    });
+    spin_until(Duration::from_secs(2), || {
+        let state = db.dedup_lanes[0].inner.state.lock();
+        state.last_enqueued_lsn > state.last_applied_lsn
+    });
+
+    let high_db = Arc::clone(&db);
+    let high_pbas = [pbas[2], pbas[3]];
+    let high = std::thread::spawn(move || {
+        high_db.stage_ops(&[
+            WalOp::DedupPut {
+                hash: high_leader_hash,
+                value: dedup_value_with_pba(high_pbas[0]),
+                old_pba: None,
+            },
+            WalOp::DedupPut {
+                hash: shared_follower_high_hash,
+                value: dedup_value_with_pba(high_pbas[1]),
+                old_pba: None,
+            },
+        ])
+    });
+    spin_until(Duration::from_secs(2), || {
+        let state = db.dedup_lanes[2].inner.state.lock();
+        state.last_enqueued_lsn > state.last_applied_lsn
+    });
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(!high.is_finished());
+    assert_eq!(db.get_dedup(&high_leader_hash).unwrap(), None);
+    assert_eq!(db.get_dedup(&shared_follower_high_hash).unwrap(), None);
+
+    release_tx.send(()).unwrap();
+    low.join().unwrap().unwrap();
+    high.join().unwrap().unwrap();
+    for pba in pbas {
+        assert_eq!(db.get_refcount(pba).unwrap(), 1);
+    }
 }
 
 /// stage_ops + commit_ops_deferred operate on the same database
@@ -1033,6 +1514,76 @@ fn stage_ops_concurrent_writers_all_visible() {
                 "lost stage for (t={t}, i={i}, lba={lba})"
             );
         }
+    }
+}
+
+#[test]
+fn stage_ops_rc_authoritative_mixed_concurrent_writers_all_visible() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.rc_authoritative_reclaim = true;
+    cfg.dedup_shards = 4;
+    let db = Arc::new(Db::create_with_config(cfg).unwrap());
+    let n_threads = 8;
+    let per_thread = 24;
+    let handles: Vec<_> = (0..n_threads)
+        .map(|t| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                let mut lsns = Vec::with_capacity(per_thread);
+                for i in 0..per_thread {
+                    let ordinal = (t * per_thread + i) as u64;
+                    let lba = 100_000 + ordinal;
+                    let pba = 0xb0_000 + ordinal;
+                    let lane = (ordinal % 4) as u32;
+                    let mut hash = hash_for_dedup_lane(lane, 4);
+                    hash[1..].copy_from_slice(&ordinal.to_be_bytes()[1..]);
+                    let (lsn, _) = db
+                        .stage_ops(&[
+                            WalOp::L2pPut {
+                                vol_ord: BOOTSTRAP_VOLUME_ORD,
+                                lba,
+                                value: l2p_value_with_pba(pba),
+                            },
+                            WalOp::DedupPut {
+                                hash,
+                                value: dedup_value_with_pba(pba),
+                                old_pba: None,
+                            },
+                        ])
+                        .unwrap();
+                    lsns.push(lsn);
+                }
+                lsns
+            })
+        })
+        .collect();
+    let mut all_lsns = Vec::new();
+    for handle in handles {
+        all_lsns.extend(handle.join().unwrap());
+    }
+    let unique: std::collections::HashSet<_> = all_lsns.iter().copied().collect();
+    assert_eq!(unique.len(), all_lsns.len());
+
+    for ordinal in 0..(n_threads * per_thread) as u64 {
+        let lba = 100_000 + ordinal;
+        let pba = 0xb0_000 + ordinal;
+        let lane = (ordinal % 4) as u32;
+        let mut hash = hash_for_dedup_lane(lane, 4);
+        hash[1..].copy_from_slice(&ordinal.to_be_bytes()[1..]);
+        assert_eq!(
+            db.get(BOOTSTRAP_VOLUME_ORD, lba).unwrap(),
+            Some(l2p_value_with_pba(pba))
+        );
+        assert_eq!(
+            db.get_dedup(&hash).unwrap(),
+            Some(dedup_value_with_pba(pba))
+        );
+        assert_eq!(db.get_refcount(pba).unwrap(), 2);
     }
 }
 

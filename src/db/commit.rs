@@ -137,6 +137,13 @@ struct LaneDispatchPlan {
     l2p_sorted: Vec<((VolumeOrdinal, usize), Vec<L2pBucketEntry>)>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
     rc_enqueued: Vec<bool>,
+    /// Precise RC shards read by guarded L2P work. The corresponding reserved
+    /// RC slots must reach the head of their lane before L2P can evaluate the
+    /// guard.
+    l2p_guard_rc_enqueued: Vec<bool>,
+    /// Precise RC shards reached by dedup-derived guards/deltas. Their reserved
+    /// RC slots remain held until the dedup coordinator completes.
+    dedup_rc_enqueued: Vec<bool>,
     /// Dedup op indices grouped by shard. Outer length always equals
     /// `Db::dedup_lanes.len()`; an empty inner vec means that shard
     /// has no work in this commit and gets no `DispatchLaneKey::Dedup`
@@ -157,6 +164,8 @@ struct QueuedLanePlan {
     bfg: crate::types::Bfg,
     l2p_receivers: Vec<crossbeam_channel::Receiver<Result<L2pBucketApplyResult>>>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
+    rc_reservations: Vec<Option<ReservedApplyWork>>,
+    dedup_rc_enqueued: Vec<bool>,
     /// Per-shard dedup op indices. Combined back into input order for the
     /// coordinator closure during `apply_ops_laned`; the buckets identify all
     /// dedup lanes whose LSN watermarks must be reserved.
@@ -947,19 +956,40 @@ impl Db {
             if self.commit_direct_apply_enabled
                 && Self::plan_is_l2p_direct_eligible(&plan, &ctx.volumes)
             {
+                // The caller-thread fast path must still participate in each
+                // target L2P lane's LSN order. Install held no-op slots first,
+                // hand off the global dispatch reservation, then wait until
+                // all lower-LSN lane work has completed before touching the
+                // buffered shards directly.
+                let direct_reserve_started = std::time::Instant::now();
+                let mut direct_reservations = Vec::with_capacity(plan.l2p_sorted.len());
+                for ((vol_ord, sid), _) in &plan.l2p_sorted {
+                    let volume = ctx
+                        .volumes
+                        .get(vol_ord)
+                        .expect("volume presence checked during lane planning");
+                    let mut reservation = volume.shards[*sid].apply_lane.enqueue_reserved(lsn);
+                    reservation.set(Box::new(|| {}));
+                    direct_reservations.push(reservation);
+                }
+                self.complete_retained_dispatch(lsn);
+                for reservation in &direct_reservations {
+                    reservation.wait_until_started();
+                }
+                ctx.timing.lane_enqueue = direct_reserve_started.elapsed();
+                if let Some(err) = self.commit_poison_error() {
+                    self.metrics
+                        .record_commit_error(ctx.commit_started.elapsed());
+                    return Err(err);
+                }
                 match self.apply_l2p_direct(&ctx.volumes, lsn, ctx.bfg, plan, ctx.ops) {
                     Ok(outcomes) => {
+                        for reservation in direct_reservations {
+                            reservation.release();
+                        }
                         ctx.timing.apply = apply_started.elapsed();
                         self.metrics.record_commit_apply(ctx.timing.apply);
                         self.metrics.record_commit_direct_apply(ctx.timing.apply);
-                        // Direct-apply bypasses the lane-success branch below,
-                        // where the lane path retires its dispatch reservation.
-                        // Skipping this
-                        // call would leave our LSN forever in
-                        // `dispatch_state.pending`, blocking every
-                        // higher-LSN commit on
-                        // `mark_wal_durable_and_wait_for_dispatch`.
-                        self.complete_retained_dispatch(lsn);
                         outcomes
                     }
                     Err(err) => {
@@ -973,14 +1003,29 @@ impl Db {
                 }
             } else {
                 let enqueue_started = std::time::Instant::now();
-                let queued_plan = self.enqueue_lane_plan(
+                let queued_plan = match self.enqueue_lane_plan(
                     &ctx.volumes,
                     lsn,
                     ctx.bfg,
                     plan,
                     Arc::new(ctx.ops.to_vec()),
-                );
+                ) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        ctx.timing.apply = apply_started.elapsed();
+                        self.metrics.record_commit_apply(ctx.timing.apply);
+                        self.metrics
+                            .record_commit_error(ctx.commit_started.elapsed());
+                        self.poison_commit_waiters(&err);
+                        return Err(err);
+                    }
+                };
                 ctx.timing.lane_enqueue = enqueue_started.elapsed();
+                // Every touched L2P, RC, and dedup lane now contains this LSN.
+                // Their persistent FIFO slots carry ordering from here, so the
+                // short global dispatch reservation can be retired before the
+                // expensive apply work runs.
+                self.complete_retained_dispatch(lsn);
                 match self.apply_ops_laned(lsn, ctx.ops.len(), queued_plan) {
                     Ok((outcomes, laned_timing)) => {
                         ctx.timing.apply = apply_started.elapsed();
@@ -993,10 +1038,6 @@ impl Db {
                             laned_timing.dedup_enqueue,
                             laned_timing.dedup_wait,
                         );
-                        // The footprint covers direct RC work plus every
-                        // dedup-derived RC guard/stage. Retire it only after all
-                        // corresponding lane receivers have completed.
-                        self.complete_retained_dispatch(lsn);
                         outcomes
                     }
                     Err(err) => {
@@ -1336,6 +1377,8 @@ impl Db {
     }
 
     pub(super) fn poison_commit_waiters(&self, err: &MetaDbError) {
+        self.commit_poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
         let mut poison = self.commit_poison.lock();
         if poison.is_none() {
             *poison = Some(err.to_string());
@@ -1345,10 +1388,23 @@ impl Db {
     }
 
     fn commit_poison_error(&self) -> Option<MetaDbError> {
-        self.commit_poison
-            .lock()
-            .as_ref()
-            .map(|msg| MetaDbError::Corruption(format!("commit pipeline failed: {msg}")))
+        if !self
+            .commit_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        Some(
+            self.commit_poison
+                .lock()
+                .as_ref()
+                .map(|msg| MetaDbError::Corruption(format!("commit pipeline failed: {msg}")))
+                .unwrap_or_else(|| {
+                    MetaDbError::Corruption(
+                        "commit pipeline failed in an apply lane; detail pending".into(),
+                    )
+                }),
+        )
     }
 
     /// Poison the forced-sync subsystem after a non-recoverable sync-cycle
