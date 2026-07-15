@@ -107,7 +107,13 @@ impl L2pPrefoldWorker {
         if self.inner.shutdown.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.inner.cv.notify_all();
+        // Pair the predicate change with the condvar mutex. Otherwise the
+        // worker can observe `shutdown == false`, lose this notification, and
+        // park after it, leaving the join below blocked forever.
+        {
+            let _state = self.inner.state.lock();
+            self.inner.cv.notify_all();
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -161,6 +167,14 @@ mod tests {
         assert_eq!(ticket.bfg, 9);
         assert!(worker.wait(ticket).unwrap());
         assert_eq!(seen.load(Ordering::Acquire), 9);
-        worker.stop();
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let stop_thread = std::thread::spawn(move || {
+            worker.stop();
+            let _ = stopped_tx.send(());
+        });
+        stopped_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("prefold worker stop missed its wakeup");
+        stop_thread.join().unwrap();
     }
 }
