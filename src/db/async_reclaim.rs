@@ -399,7 +399,7 @@ pub(super) fn gc_plan_head_advance(
             return Ok(None);
         }
         let sid = ctx.refcount_routing.shard_for_pba(rec.pba, n_shards);
-        let rc = ctx.refcount_shards_rc[sid].get(rec.pba)?;
+        let rc = ctx.refcount_shards_rc[sid].get_consistent(rec.pba)?;
         if rc > 0 {
             if ctx.drop_dedup_shared {
                 // Guarded Option 3 (`Config::lineage_gc_drop_dedup_shared`):
@@ -427,7 +427,10 @@ pub(super) fn gc_plan_head_advance(
             let mut blocked_rc0 = dead_pbas.len();
             for later in &records[dead_pbas.len() + 1..] {
                 let lsid = ctx.refcount_routing.shard_for_pba(later.pba, n_shards);
-                if matches!(ctx.refcount_shards_rc[lsid].get(later.pba), Ok(0)) {
+                if matches!(
+                    ctx.refcount_shards_rc[lsid].get_consistent(later.pba),
+                    Ok(0)
+                ) {
                     blocked_rc0 += 1;
                 }
             }

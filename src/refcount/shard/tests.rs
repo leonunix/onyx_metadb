@@ -477,12 +477,26 @@ fn stage_double_decref_of_freed_pba_is_benign() {
     assert_eq!(clamped() - c0, 1);
 }
 
+#[test]
+fn stage_decref_if_positive_is_coherent_and_zero_is_not_an_underflow() {
+    let (_d, s) = make_shard();
+    let c0 = clamped();
+
+    assert_eq!(s.stage_decref_if_positive(T0, 21, 1).unwrap(), (0, 0));
+    assert_eq!(clamped(), c0, "expected zero must be a quiet no-op");
+
+    s.stage(T0, 21, 1, 2).unwrap();
+    assert_eq!(s.stage_decref_if_positive(T0, 21, 3).unwrap(), (1, 0));
+    assert_eq!(s.get(21).unwrap(), 0);
+    assert_eq!(clamped(), c0);
+}
+
 fn read_floored() -> u64 {
     crate::refcount::read_underflow_floored_total()
 }
 
 #[test]
-fn get_and_stage_floor_read_underflow_instead_of_erroring() {
+fn get_floors_torn_read_but_stage_rejects_incoherent_state() {
     // Reproduce the torn `(pending, array)` state a concurrent rc fold
     // can leave: the array base for P has already folded a pending decref
     // (rc=0), but a stale `-1` pending still sits in a slot. The logical
@@ -497,15 +511,11 @@ fn get_and_stage_floor_read_underflow_instead_of_erroring() {
     assert_eq!(s.get(p).unwrap(), 0);
     assert!(read_floored() > floored0, "get should record a read floor");
 
-    // `stage`'s merged_prev computation must also floor on the same torn
-    // state: a further decref floors the read to 0, then the final-apply
-    // clamp absorbs the redundant decref as a benign no-op — never Err.
+    // `stage` takes a fold-coherent base+slots sample. Seeing this impossible
+    // negative state there is a model error, not a read tear to hide.
     let floored1 = read_floored();
-    assert_eq!(s.stage(T0, p, -1, 501).unwrap(), (0, 0));
-    assert!(
-        read_floored() > floored1,
-        "stage merged_prev should floor too"
-    );
+    assert!(s.stage(T0, p, -1, 501).is_err());
+    assert_eq!(read_floored(), floored1, "stage must not use read floor");
     assert_eq!(s.get(p).unwrap(), 0);
 }
 

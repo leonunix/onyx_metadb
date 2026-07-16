@@ -156,11 +156,18 @@ fn merge_staged_action(
     max_lsn: Lsn,
     any: bool,
     context: &'static str,
+    zero_decref_is_noop: bool,
 ) -> Result<(u32, u32)> {
     if replay_skip && !any && page_lsn >= lsn {
         return Ok((base.rc, base.rc));
     }
-    let merged_prev = super::merge_read_or_floor(base, net, max_lsn)?;
+    // The caller holds a fold-epoch-validated base plus every slot guard, so
+    // this is a coherent mutation sample. Unlike a plain get, an underflow here
+    // is not a publish-before-clear tear and must not be hidden by a read floor.
+    let merged_prev = super::apply_delta_pure(base, net, max_lsn)?;
+    if zero_decref_is_noop && delta < 0 && merged_prev.rc == 0 {
+        return Ok((0, 0));
+    }
     let (post, skipped) = super::apply_delta_or_skip(merged_prev, delta, lsn)?;
     if skipped {
         super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, context);
@@ -600,7 +607,23 @@ impl RcShard {
     /// left at its floor) rather than poisoning the commit pipeline.
     /// Overflow (delta >= 0) is fatal.
     pub fn stage(&self, bfg: Bfg, pba: Pba, delta: i64, lsn: Lsn) -> Result<(u32, u32)> {
-        self.stage_inner(bfg, pba, delta, lsn, true)
+        self.stage_inner(bfg, pba, delta, lsn, true, false)
+    }
+
+    /// Coherently decrement one live reference, or return `(0, 0)` without
+    /// recording an underflow when the PBA is already at zero.
+    ///
+    /// This is the mutation-safe replacement for `get(pba) > 0` followed by
+    /// `stage(-1)`: a plain get can tear across checkpoint publish-before-clear
+    /// and spuriously return zero, while this decision is made from the same
+    /// fold-epoch-validated base+slots snapshot used for the mutation.
+    pub(crate) fn stage_decref_if_positive(
+        &self,
+        bfg: Bfg,
+        pba: Pba,
+        lsn: Lsn,
+    ) -> Result<(u32, u32)> {
+        self.stage_inner(bfg, pba, -1, lsn, true, true)
     }
 
     /// Batch [`Self::stage`] for strictly increasing PBAs routed to this shard.
@@ -698,6 +721,7 @@ impl RcShard {
                     max_lsn,
                     any,
                     "stage_batch",
+                    false,
                 );
                 delta_merge += merge_started.elapsed();
                 out.push(merged?);
@@ -718,6 +742,7 @@ impl RcShard {
                     max_lsn,
                     any,
                     "stage_batch",
+                    false,
                 )?);
             }
         }
@@ -764,7 +789,7 @@ impl RcShard {
         delta: i64,
         lsn: Lsn,
     ) -> Result<(u32, u32)> {
-        self.stage_inner(bfg, pba, delta, lsn, false)
+        self.stage_inner(bfg, pba, delta, lsn, false, false)
     }
 
     /// Shared body for [`stage`] / [`stage_unskippable`]. `replay_skip`
@@ -779,6 +804,7 @@ impl RcShard {
         delta: i64,
         lsn: Lsn,
         replay_skip: bool,
+        zero_decref_is_noop: bool,
     ) -> Result<(u32, u32)> {
         let open_idx = slot_index(bfg);
         loop {
@@ -817,6 +843,7 @@ impl RcShard {
                 max_lsn,
                 any,
                 "stage",
+                zero_decref_is_noop,
             );
         }
     }

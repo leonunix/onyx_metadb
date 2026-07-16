@@ -32,19 +32,15 @@ impl Db {
             refcount_shards[sid].stage(bfg, pba, delta, lsn)?;
             Ok(())
         };
-        // stale-entry tolerance: a dedup_index row can point to
-        // a PBA whose rc has been driven to 0 by lineage GC without
-        // cleanup removing the row. The matching put/delete must then
-        // skip the decref instead of underflowing the rc table — see
-        // `apply_dedup_put_with_rc` for the full rationale. We pre-read
-        // the current rc once per stale candidate; within this lane the
-        // LSN-ordered apply gate prevents concurrent rc mutation on the
-        // same pba, so the floor check is sound.
+        // Stale-entry tolerance: a dedup_index row can point to a PBA whose rc
+        // is already 0. `stage_decref_if_positive` takes one fold-coherent
+        // base+slots snapshot and makes a genuine zero a no-op. A preceding
+        // plain get is not a safe guard because it can tear across
+        // publish-before-clear and return a spurious zero, permanently dropping
+        // a required decref.
         let stage_rc_decref_if_live = |pba: Pba| -> Result<()> {
             let sid = rc_shard_for(pba);
-            if refcount_shards[sid].get(pba)? > 0 {
-                refcount_shards[sid].stage(bfg, pba, -1, lsn)?;
-            }
+            refcount_shards[sid].stage_decref_if_positive(bfg, pba, lsn)?;
             Ok(())
         };
         //         // every dedup put / delete carries an embedded `old_pba`

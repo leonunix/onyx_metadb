@@ -145,9 +145,8 @@ pub fn underflow_clamped_total() -> u64 {
     UNDERFLOW_CLAMPED.load(Ordering::Relaxed)
 }
 
-/// Count of read-side merge underflows floored to rc=0 (vs propagated as
-/// an Err), across `RcShard::lookup_entry` (`get`) and `stage`'s
-/// "current value" computation, all shards.
+/// Count of plain read-side merge underflows floored to rc=0 (vs propagated as
+/// an Err), across `RcShard::lookup_entry` (`get` / `get_many`), all shards.
 static READ_UNDERFLOW_FLOORED: AtomicU64 = AtomicU64::new(0);
 
 /// Count of data-page reads served from the dirty-staged overlay
@@ -194,21 +193,13 @@ pub fn read_underflow_floored_total() -> u64 {
 /// to rc=0 instead of erroring. Overflow (delta >= 0) still errors —
 /// that is never benign.
 ///
-/// Why this exists: `RcShard::lookup_entry` / `stage` sample the pending
-/// delta (`delta_active` / `delta_draining`) and the base
-/// (overlay / on-disk array) without a lock that also excludes the flush
-/// checkpoint. `begin_checkpoint` drains the pending under
-/// `delta_active.lock` but installs the folded result into the array /
-/// overlay **without** that lock, and the onyx hot path (`stage_ops`)
-/// applies its rc ops without holding `apply_gate.read()` — so a reader
-/// can observe a base that already folded a pending decref while it still
-/// holds the pre-drain pending, double-counting the decref and computing
-/// a negative rc. The logical refcount floor is 0, so flooring is
-/// correct; propagating the Err instead fails the dedup-hit / promote tx,
-/// which onyx demotes to a fresh miss — a self-amplifying `commit_errors`
-/// burst on hot re-overwritten PBAs. The actual decref still flows
-/// through [`apply_delta_or_skip`] at stage time, so a genuine
-/// over-decref is still counted, never silently lost.
+/// Why this exists: plain `RcShard::get` / `get_many` sample pending slots and
+/// the array without holding `fold_lock`. During publish-before-clear they can
+/// observe a base that already folded a pending decref while still seeing that
+/// same pending delta, double-counting it and computing a negative rc. The
+/// logical read floor is 0. Mutation paths do not use this helper: `stage` and
+/// `stage_batch` validate `fold_epoch` under `fold_lock` and all slot guards, so
+/// an underflow in their coherent sample is a real model error.
 #[inline]
 pub(crate) fn merge_read_or_floor(prev: RcEntry, delta: i64, lsn: Lsn) -> Result<RcEntry> {
     match apply_delta_pure(prev, delta, lsn) {
@@ -234,9 +225,8 @@ pub(crate) fn merge_read_or_floor(prev: RcEntry, delta: i64, lsn: Lsn) -> Result
 }
 
 /// Read-side convenience over [`merge_read_or_floor`]: fold an optional
-/// pending delta onto `base` (`None` leaves `base` unchanged). The shape
-/// `RcShard::lookup_entry` / `stage` use to merge each of `delta_active`
-/// / `delta_draining` onto the on-disk-or-overlay base.
+/// pending delta onto `base` (`None` leaves `base` unchanged). This mirrors the
+/// read-only lookup shape; mutation staging uses a fold-coherent snapshot.
 #[inline]
 pub(crate) fn merge_pending_read(
     base: RcEntry,

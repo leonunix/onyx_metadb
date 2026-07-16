@@ -68,9 +68,9 @@ pub(in crate::db) fn apply_dedup_put_with_rc(
             // `DedupPut` on the stale hash should not double-decref
             // — the entry never represented a live shared reference
             // by the time we got here.
-            if refcount_shards[sid].rc.get(op)? > 0 {
-                refcount_shards[sid].rc.stage(bfg, op, -1, lsn)?;
-            }
+            refcount_shards[sid]
+                .rc
+                .stage_decref_if_positive(bfg, op, lsn)?;
         }
         let sid = shard_for_key(refcount_shards, new_pba);
         refcount_shards[sid].rc.stage(bfg, new_pba, 1, lsn)?;
@@ -97,9 +97,9 @@ pub(in crate::db) fn apply_dedup_delete_with_rc(
         // a dedup_index row pointing to a PBA whose rc has been driven
         // to 0 by lineage GC is stale, and removing it must not
         // underflow the rc table.
-        if refcount_shards[sid].rc.get(pba)? > 0 {
-            refcount_shards[sid].rc.stage(bfg, pba, -1, lsn)?;
-        }
+        refcount_shards[sid]
+            .rc
+            .stage_decref_if_positive(bfg, pba, lsn)?;
     }
     dedup_index.stage_delete(hash, lsn)?;
     Ok(())
@@ -147,16 +147,12 @@ pub(in crate::db) fn apply_free_pbas(
     let mut freed: Vec<Pba> = Vec::new();
     for &pba in pbas {
         let sid = shard_for_key(refcount_shards, pba);
-        // Peek current rc (pending merged with base). `rc.get` does
-        // not mutate state and never underflows.
-        let cur = refcount_shards[sid].rc.get(pba)?;
-        if cur == 0 {
-            // Exclusive — never refcounted (no dedup entry, no hot-
-            // path bump still pending). Surface without touching rc.
-            freed.push(pba);
-            continue;
-        }
-        let (_, new) = refcount_shards[sid].rc.stage(bfg, pba, -1, lsn)?;
+        // One fold-coherent stage both classifies and applies the decref. At
+        // rc=0 it clamps to `(0, 0)`, preserving the exclusive/duplicate
+        // surface semantics without a racy read-then-stage gap.
+        let (_, new) = refcount_shards[sid]
+            .rc
+            .stage_decref_if_positive(bfg, pba, lsn)?;
         if new == 0 {
             freed.push(pba);
         }
