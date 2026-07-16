@@ -110,6 +110,36 @@ fn apply_lane_reserved_slot_waits_for_work_and_release_before_advancing() {
 }
 
 #[test]
+fn apply_lane_dropped_reserved_slot_before_start_unblocks_higher_watermark() {
+    let lane = ApplyLane::new(0, ApplyLaneKind::Refcount, 0, Arc::new(MetaMetrics::new()));
+    let (lower_started_tx, lower_started_rx) = std::sync::mpsc::channel();
+    let (lower_release_tx, lower_release_rx) = std::sync::mpsc::channel();
+    lane.enqueue_ready(
+        1,
+        Box::new(move || {
+            lower_started_tx.send(()).unwrap();
+            lower_release_rx.recv().unwrap();
+        }),
+    );
+    lower_started_rx.recv().unwrap();
+
+    let reserved = lane.enqueue_reserved(2);
+    let (higher_ran_tx, higher_ran_rx) = std::sync::mpsc::channel();
+    lane.enqueue_ready(3, Box::new(move || higher_ran_tx.send(()).unwrap()));
+
+    // Error returns drop an unarmed reservation. That path must publish both
+    // the no-op work and the release signal even if the worker has not arrived.
+    drop(reserved);
+    lower_release_tx.send(()).unwrap();
+
+    higher_ran_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("higher LSN stayed blocked after an early reserved-slot drop");
+    lane.wait_for_drain();
+    assert_eq!(lane.last_applied_lsn(), 3);
+}
+
+#[test]
 fn apply_lane_dropped_pending_slot_unblocks_higher_watermark() {
     let lane = ApplyLane::new(0, ApplyLaneKind::L2p, 0, Arc::new(MetaMetrics::new()));
     let pending = lane.enqueue_pending(1);
