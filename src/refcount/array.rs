@@ -417,15 +417,17 @@ impl PagedRefcountArray {
             }
         }
 
-        let requests: Vec<(PageId, usize)> = clean_runs
-            .iter()
-            .map(|run| (run.page_id, run.end - run.start))
-            .collect();
-        self.page_cache
-            .visit_many_weighted(&requests, |request_idx, page| {
+        self.page_cache.visit_many_weighted_by(
+            clean_runs.len(),
+            |request_idx| {
+                let run = &clean_runs[request_idx];
+                (run.page_id, run.end - run.start)
+            },
+            |request_idx, page| {
                 let run = &clean_runs[request_idx];
                 decode_page_run(page, pbas, run.start, run.end, &mut out)
-            })?;
+            },
+        )?;
         Ok(out)
     }
 
