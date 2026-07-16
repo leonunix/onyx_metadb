@@ -58,6 +58,9 @@ fn run_arm(chunk_entries: usize, secs: u64, writers: usize) -> String {
     let mut cfg = Config::new(dir.path());
     cfg.bfg_threads_enabled = true;
     cfg.l2p_buffer_enabled = true;
+    // Keep this benchmark timer-driven; the production admission default must
+    // not change how much work each measured fold accumulates.
+    cfg.l2p_buffer_soft_entries = 0;
     // Long BFG + few shards → each syncing slot carries a large
     // per-shard backlog, so the fold's lock hold is big enough to
     // measure (mirrors the sustained-load shape on hardware).

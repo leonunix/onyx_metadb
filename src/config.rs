@@ -696,10 +696,11 @@ impl Config {
             // The L2P buffer ships default-off in the generic config; onyx can
             // opt in once its workload wants buffered writes.
             l2p_buffer_enabled: false,
-            // Work-driven BFG roll. 64 K global mutations bounds a generation
-            // well below the old five-second batch while amortising one
-            // checkpoint's page IO and manifest publish.
-            l2p_buffer_soft_entries: 64_000,
+            // Work-driven BFG roll. This is a global per-generation admission
+            // budget, not the old per-shard compactor wake threshold. The
+            // nvme-box A/B validated 4 M mutations; 64 K rolls checkpoints too
+            // aggressively for production profiles that enable buffered L2P.
+            l2p_buffer_soft_entries: 4_000_000,
             // Reserved compatibility value for a future per-shard hard
             // trigger. This is parsed but not enforced; the global soft
             // budget above is the active BFG admission bound.
@@ -758,5 +759,15 @@ impl Config {
             // `Config::io_submitter_bg_inflight_cap`; 0 disables.
             io_submitter_bg_inflight_cap: 1024,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn default_l2p_buffer_budget_matches_production_admission_semantics() {
+        assert_eq!(Config::new("unused").l2p_buffer_soft_entries, 4_000_000);
     }
 }
