@@ -170,6 +170,10 @@ fn page_affine_v26_reopens_refcount_birth_and_free_outcome() {
         reopened.manifest_state.lock().manifest.body_version,
         MANIFEST_BODY_VERSION
     );
+    let report = reopened
+        .verify(crate::verify::VerifyOptions::default())
+        .unwrap();
+    assert_eq!(report.manifest_body_version, Some(MANIFEST_BODY_VERSION));
 }
 
 #[test]
@@ -245,5 +249,12 @@ fn legacy_v25_reopens_without_changing_routing_or_manifest_version() {
     assert_eq!(
         reopened.manifest_state.lock().manifest.body_version,
         LEGACY_MANIFEST_BODY_VERSION
+    );
+    let report = reopened
+        .verify(crate::verify::VerifyOptions::default())
+        .unwrap();
+    assert_eq!(
+        report.manifest_body_version,
+        Some(LEGACY_MANIFEST_BODY_VERSION)
     );
 }

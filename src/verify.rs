@@ -47,6 +47,9 @@ pub struct VerifyReport {
     pub path: PathBuf,
     pub manifest_slot: Option<PageId>,
     pub manifest_sequence: Option<u64>,
+    /// Durable manifest semantic version. In particular, v25 uses legacy
+    /// refcount-shard routing while v26 uses page-affine routing.
+    pub manifest_body_version: Option<u32>,
     pub checkpoint_lsn: Option<Lsn>,
     pub high_water: u64,
     pub scanned_pages: u64,
@@ -121,6 +124,7 @@ pub fn verify_page_store(
         high_water: page_store.high_water(),
         manifest_slot: Some(manifest.slot),
         manifest_sequence: Some(manifest.sequence),
+        manifest_body_version: Some(manifest.manifest.body_version),
         checkpoint_lsn: Some(manifest.manifest.checkpoint_lsn),
         ..VerifyReport::default()
     };

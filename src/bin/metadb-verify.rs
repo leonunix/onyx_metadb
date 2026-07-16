@@ -85,6 +85,9 @@ fn print_human(report: &VerifyReport) {
     if let Some(sequence) = report.manifest_sequence {
         println!("manifest_sequence: {sequence}");
     }
+    if let Some(line) = format_manifest_body_version_human(report) {
+        println!("{line}");
+    }
     if let Some(lsn) = report.checkpoint_lsn {
         println!("checkpoint_lsn: {lsn}");
     }
@@ -126,6 +129,10 @@ fn print_json(report: &VerifyReport) {
     );
     print_opt_num("manifest_slot", report.manifest_slot);
     print_opt_num("manifest_sequence", report.manifest_sequence);
+    println!(
+        "  \"manifest_body_version\": {},",
+        format_manifest_body_version_json(report)
+    );
     print_opt_num("checkpoint_lsn", report.checkpoint_lsn);
     println!("  \"high_water\": {},", report.high_water);
     println!("  \"scanned_pages\": {},", report.scanned_pages);
@@ -147,6 +154,19 @@ fn print_json(report: &VerifyReport) {
     println!("  \"warnings\": {},", json_string_array(&report.warnings));
     println!("  \"issues\": {}", json_string_array(&report.issues));
     println!("}}");
+}
+
+fn format_manifest_body_version_human(report: &VerifyReport) -> Option<String> {
+    report
+        .manifest_body_version
+        .map(|version| format!("manifest_body_version: {version}"))
+}
+
+fn format_manifest_body_version_json(report: &VerifyReport) -> String {
+    report
+        .manifest_body_version
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "null".into())
 }
 
 fn print_opt_num<T: std::fmt::Display>(name: &str, value: Option<T>) {
@@ -196,4 +216,34 @@ fn escape_json(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn formatters_expose_manifest_body_version() {
+        let report = VerifyReport {
+            path: PathBuf::from("/meta"),
+            manifest_body_version: Some(26),
+            ..VerifyReport::default()
+        };
+
+        assert_eq!(
+            format_manifest_body_version_human(&report).as_deref(),
+            Some("manifest_body_version: 26")
+        );
+        assert_eq!(format_manifest_body_version_json(&report), "26");
+    }
+
+    #[test]
+    fn json_uses_null_when_no_manifest_was_decoded() {
+        assert_eq!(
+            format_manifest_body_version_json(&VerifyReport::default()),
+            "null"
+        );
+    }
 }
