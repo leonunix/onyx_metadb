@@ -5,6 +5,7 @@ impl Db {
     pub(in crate::db::commit) fn apply_dedup_indices_to(
         dedup_index: &crate::dedup::DedupIndex,
         refcount_shards: &[Arc<crate::refcount::RcShard>],
+        refcount_routing: crate::refcount::RefcountRouting,
         metrics: &MetaMetrics,
         ops: &[WalOp],
         indices: Vec<usize>,
@@ -23,8 +24,9 @@ impl Db {
         // (`build_lane_dispatch_plan`) and this apply lane agree on
         // which rc shard a PBA lives in — divergence is a deadlock /
         // underflow hazard.
-        let rc_shard_for =
-            |pba: Pba| -> usize { super::rc_shard_of_pba(pba, refcount_shards.len()) };
+        let rc_shard_for = |pba: Pba| -> usize {
+            super::rc_shard_for_routing(refcount_routing, pba, refcount_shards.len())
+        };
         let stage_rc = |pba: Pba, delta: i64| -> Result<()> {
             let sid = rc_shard_for(pba);
             refcount_shards[sid].stage(bfg, pba, delta, lsn)?;

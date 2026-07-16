@@ -8,7 +8,6 @@ pub(in crate::db::lifecycle) fn refresh_manifest_from_checkpoints(
     page_dead_list_overrides: &HashMap<VolumeOrdinal, (PageId, PageId)>,
     page_live_list_overrides: &HashMap<VolumeOrdinal, (PageId, PageId)>,
 ) -> Result<()> {
-    manifest.body_version = MANIFEST_BODY_VERSION;
     if volumes.len() != l2p_checkpoints.len() {
         return Err(MetaDbError::Corruption(format!(
             "checkpoint volume count {} does not match checkpoint groups {}",

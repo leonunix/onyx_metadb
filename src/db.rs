@@ -1192,6 +1192,7 @@ fn record_lane_burst(inner: &ApplyLaneInner, burst: u64) {
 
 struct Shard {
     rc: Arc<crate::refcount::RcShard>,
+    routing: crate::refcount::RefcountRouting,
     apply_lane: ApplyLane,
     /// Highest LSN whose effects on this shard are durable on disk.
     /// Initialized at open from `manifest.checkpoint_lsn`. Bumped
@@ -1961,6 +1962,7 @@ impl Db {
                 .iter()
                 .map(|shard| shard.rc.clone())
                 .collect(),
+            refcount_routing: self.refcount_routing(),
             faults: self.faults.clone(),
             metrics: self.metrics.clone(),
             emit_freepbas: self.lineage_gc_emit_freepbas,

@@ -12,12 +12,25 @@ mod replay;
 /// hazard (planner says shard X is in the footprint, apply touches
 /// shard Y → concurrent commit on Y races).
 #[inline]
+pub(super) fn rc_shard_for_routing(
+    routing: crate::refcount::RefcountRouting,
+    pba: Pba,
+    num_shards: usize,
+) -> usize {
+    routing.shard_for_pba(pba, num_shards)
+}
+
+#[cfg(test)]
 pub(super) fn rc_shard_of_pba(pba: Pba, num_shards: usize) -> usize {
-    (xxh3_64(&pba.to_be_bytes()) as usize) % num_shards
+    rc_shard_for_routing(
+        crate::refcount::RefcountRouting::PageAffine,
+        pba,
+        num_shards,
+    )
 }
 
 impl Db {
-    pub(super) fn build_lane_dispatch_plan(
+    pub(in crate::db) fn build_lane_dispatch_plan(
         &self,
         volumes: &HashMap<VolumeOrdinal, Arc<Volume>>,
         ops: &[WalOp],
@@ -52,13 +65,14 @@ impl Db {
         // commit also touching rc[Y] races → underflow on the
         // non-atomic read-then-stage in `stage_rc_decref_if_live`.
         let num_rc_shards = self.refcount_shards.len();
+        let refcount_routing = self.refcount_routing();
         let mut rc_shards_touched: Vec<bool> = vec![false; num_rc_shards];
         let mut l2p_guard_rc_shards_touched: Vec<bool> = vec![false; num_rc_shards];
         let mut dedup_rc_shards_touched: Vec<bool> = vec![false; num_rc_shards];
         let mark_dedup_rc = |pba: Pba,
                              rc_shards_touched: &mut Vec<bool>,
                              dedup_rc_shards_touched: &mut Vec<bool>| {
-            let sid = rc_shard_of_pba(pba, num_rc_shards);
+            let sid = rc_shard_for_routing(refcount_routing, pba, num_rc_shards);
             rc_shards_touched[sid] = true;
             dedup_rc_shards_touched[sid] = true;
         };
@@ -121,7 +135,7 @@ impl Db {
                     // Guarded L2pRemap reads rc[guard.0] inline in
                     // `apply_l2p_bucket` (lanes/l2p.rs:~280, ~540).
                     if let Some((gp, _)) = guard {
-                        let guard_sid = rc_shard_of_pba(*gp, num_rc_shards);
+                        let guard_sid = rc_shard_for_routing(refcount_routing, *gp, num_rc_shards);
                         rc_shards_touched[guard_sid] = true;
                         l2p_guard_rc_shards_touched[guard_sid] = true;
                     }
@@ -336,6 +350,7 @@ impl Db {
         let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> =
             Arc::new(self.refcount_shards.iter().map(|s| s.rc.clone()).collect());
         let rc_authoritative = self.rc_authoritative_reclaim;
+        let refcount_routing = self.refcount_routing();
         for ((vol_ord, sid), indices) in l2p_sorted {
             let volume = volumes
                 .get(&vol_ord)
@@ -370,6 +385,7 @@ impl Db {
                         bfg,
                         apply_ops.as_slice(),
                         refcount_shards_arc.as_slice(),
+                        refcount_routing,
                         metrics.as_ref(),
                         rc_authoritative,
                         snapshot_wms,
@@ -623,6 +639,7 @@ impl Db {
         }
         let refcount_shards_arc: Arc<Vec<Arc<crate::refcount::RcShard>>> =
             Arc::new(self.refcount_shards.iter().map(|s| s.rc.clone()).collect());
+        let refcount_routing = self.refcount_routing();
         let mut leader: Option<(usize, PendingApplyWork)> = None;
         let mut followers = Vec::new();
         let mut dedup_indices = Vec::new();
@@ -666,6 +683,7 @@ impl Db {
                     Self::apply_dedup_indices_to(
                         dedup_index.as_ref(),
                         refcount_shards_arc.as_slice(),
+                        refcount_routing,
                         metrics.as_ref(),
                         ops.as_slice(),
                         dedup_indices,

@@ -67,6 +67,7 @@ pub(super) struct LineageGcCtx {
     /// dedup hit or clone-promotion edge. Once the count reaches 0, lineage GC
     /// can emit `FreePbas` for the retired PBA.
     pub refcount_shards_rc: Vec<Arc<RcShard>>,
+    pub refcount_routing: crate::refcount::RefcountRouting,
     pub faults: Arc<FaultController>,
     /// Metrics sink so `gc_plan_head_advance` can attribute every
     /// head-advance decision (advanced / snap-pinned / descendant-pinned
@@ -397,7 +398,7 @@ pub(super) fn gc_plan_head_advance(
             ctx.metrics.record_lineage_gc_head_skipped_descendant();
             return Ok(None);
         }
-        let sid = (xxhash_rust::xxh3::xxh3_64(&rec.pba.to_be_bytes()) as usize) % n_shards;
+        let sid = ctx.refcount_routing.shard_for_pba(rec.pba, n_shards);
         let rc = ctx.refcount_shards_rc[sid].get(rec.pba)?;
         if rc > 0 {
             if ctx.drop_dedup_shared {
@@ -425,8 +426,7 @@ pub(super) fn gc_plan_head_advance(
             // is swallowed (the plan decision is already "bail").
             let mut blocked_rc0 = dead_pbas.len();
             for later in &records[dead_pbas.len() + 1..] {
-                let lsid =
-                    (xxhash_rust::xxh3::xxh3_64(&later.pba.to_be_bytes()) as usize) % n_shards;
+                let lsid = ctx.refcount_routing.shard_for_pba(later.pba, n_shards);
                 if matches!(ctx.refcount_shards_rc[lsid].get(later.pba), Ok(0)) {
                     blocked_rc0 += 1;
                 }

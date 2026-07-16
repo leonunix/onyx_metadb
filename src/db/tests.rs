@@ -233,6 +233,7 @@ mod indexes;
 mod lineage_gc;
 mod promotion;
 mod range_delete_stress;
+mod refcount_routing;
 mod remap_range;
 mod sync_poison;
 mod volume;

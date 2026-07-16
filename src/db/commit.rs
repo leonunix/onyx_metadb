@@ -133,10 +133,10 @@ fn merge_l2p_outcome(outcomes: &mut [Option<ApplyOutcome>], idx: usize, incoming
     }
 }
 
-struct LaneDispatchPlan {
+pub(in crate::db) struct LaneDispatchPlan {
     l2p_sorted: Vec<((VolumeOrdinal, usize), Vec<L2pBucketEntry>)>,
     rc_buckets: Vec<Vec<RcApplyAction>>,
-    rc_enqueued: Vec<bool>,
+    pub(in crate::db) rc_enqueued: Vec<bool>,
     /// Precise RC shards read by guarded L2P work. The corresponding reserved
     /// RC slots must reach the head of their lane before L2P can evaluate the
     /// guard.
@@ -893,6 +893,7 @@ impl Db {
                 bfg,
                 ops,
                 &refcount_shards_snapshot,
+                self.refcount_routing(),
                 &self.metrics,
                 self.rc_authoritative_reclaim,
             )?;

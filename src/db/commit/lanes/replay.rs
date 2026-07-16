@@ -61,6 +61,7 @@ impl Db {
         ops: &[WalOp],
         rc_authoritative: bool,
     ) -> Result<Vec<ApplyOutcome>> {
+        let refcount_routing = crate::db::apply::refcount_routing(refcount_shards);
         let ops = Arc::new(ops.to_vec());
         let mut outcomes: Vec<Option<ApplyOutcome>> = (0..ops.len()).map(|_| None).collect();
         let mut l2p_buckets: HashMap<(VolumeOrdinal, usize), Vec<L2pBucketEntry>> = HashMap::new();
@@ -148,6 +149,7 @@ impl Db {
                         bfg,
                         apply_ops.as_slice(),
                         refcount_shards_arc.as_slice(),
+                        refcount_routing,
                         metrics.as_ref(),
                         rc_authoritative,
                         // BFG: WAL replay does not re-record page
@@ -260,6 +262,7 @@ impl Db {
         for (idx, outcome) in Self::apply_dedup_indices_to(
             dedup_index.as_ref(),
             refcount_shards_arc.as_slice(),
+            refcount_routing,
             metrics.as_ref(),
             ops.as_slice(),
             dedup_idxs,
@@ -286,6 +289,7 @@ impl Db {
         ops: &[WalOp],
         rc_authoritative: bool,
     ) -> Result<Vec<ApplyOutcome>> {
+        let refcount_routing = crate::db::apply::refcount_routing(refcount_shards);
         let mut outcomes: Vec<Option<ApplyOutcome>> = (0..ops.len()).map(|_| None).collect();
         let mut l2p_buckets: HashMap<(VolumeOrdinal, usize), Vec<L2pBucketEntry>> = HashMap::new();
         let mut rc_buckets: Vec<Vec<RcApplyAction>> = vec![Vec::new(); refcount_shards.len()];
@@ -360,6 +364,7 @@ impl Db {
                 bfg,
                 ops,
                 &refcount_shards_vec,
+                refcount_routing,
                 metrics.as_ref(),
                 rc_authoritative,
                 // BFG: replay does not re-record page deaths.
@@ -411,6 +416,7 @@ impl Db {
         for (idx, outcome) in Self::apply_dedup_indices_to(
             dedup_index.as_ref(),
             refcount_shards_vec.as_slice(),
+            refcount_routing,
             metrics.as_ref(),
             ops,
             dedup_idxs,

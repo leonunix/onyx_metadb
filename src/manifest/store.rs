@@ -104,7 +104,10 @@ fn slot_catalog_heads(page_store: &PageStore, slot: PageId) -> Option<(PageId, P
     let p = page.payload();
     let body_version =
         u32::from_le_bytes(p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].try_into().ok()?);
-    if body_version != MANIFEST_BODY_VERSION {
+    if !matches!(
+        body_version,
+        LEGACY_MANIFEST_BODY_VERSION | MANIFEST_BODY_VERSION
+    ) {
         return None;
     }
     let vol = u64::from_le_bytes(

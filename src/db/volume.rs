@@ -1459,8 +1459,11 @@ impl Db {
     }
 
     pub(super) fn refcount_shard_for(&self, pba: Pba) -> usize {
-        debug_assert!(!self.refcount_shards.is_empty());
-        (xxh3_64(&pba.to_be_bytes()) as usize) % self.refcount_shards.len()
+        crate::db::apply::shard_for_key(&self.refcount_shards, pba)
+    }
+
+    pub(super) fn refcount_routing(&self) -> crate::refcount::RefcountRouting {
+        crate::db::apply::refcount_routing(&self.refcount_shards)
     }
 
     /// Public L2P-shard routing for clients (onyx) that want to

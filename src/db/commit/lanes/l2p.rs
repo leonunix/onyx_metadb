@@ -77,6 +77,7 @@ impl Db {
         bfg: crate::types::Bfg,
         ops: &[WalOp],
         refcount_shards: &[Arc<crate::refcount::RcShard>],
+        refcount_routing: crate::refcount::RefcountRouting,
         metrics: &MetaMetrics,
         // rc-authoritative: when true, every applied L2P-value install
         // (Put/Remap/RemapRange) pushes a +1 `RcApplyAction` for its new
@@ -108,6 +109,7 @@ impl Db {
                 bfg,
                 ops,
                 refcount_shards,
+                refcount_routing,
                 metrics,
                 rc_authoritative,
             );
@@ -392,8 +394,7 @@ impl Db {
                         // their own shard's lock and never touch L2P, so
                         // there is no L2P↔RC cycle.
                         if let Some((gp, min_rc)) = guard {
-                            let gp_sid =
-                                (xxh3_64(&gp.to_be_bytes()) as usize) % refcount_shards.len();
+                            let gp_sid = refcount_routing.shard_for_pba(*gp, refcount_shards.len());
                             let cur = refcount_shards[gp_sid].get(*gp)?;
                             if cur < *min_rc {
                                 l2p_remap_count += 1;
@@ -564,6 +565,7 @@ impl Db {
         bfg: crate::types::Bfg,
         ops: &[WalOp],
         refcount_shards: &[Arc<crate::refcount::RcShard>],
+        refcount_routing: crate::refcount::RefcountRouting,
         metrics: &MetaMetrics,
         // See `apply_l2p_bucket`: rc-authoritative emits +1 per applied install.
         rc_authoritative: bool,
@@ -702,7 +704,7 @@ impl Db {
                     guard: Some((pba, min_rc)),
                 } = op.kind
                 {
-                    let rc_sid = (xxh3_64(&pba.to_be_bytes()) as usize) % refcount_shards.len();
+                    let rc_sid = refcount_routing.shard_for_pba(pba, refcount_shards.len());
                     guard_buckets[rc_sid]
                         .entry(pba)
                         .or_default()

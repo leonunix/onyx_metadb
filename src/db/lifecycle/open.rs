@@ -50,6 +50,16 @@ impl Db {
         Self::create_core(cfg, faults, MetaBacking::File)
     }
 
+    #[cfg(test)]
+    pub(crate) fn create_legacy_v25_with_config(cfg: Config) -> Result<Arc<Self>> {
+        Self::create_core_with_manifest_version(
+            cfg,
+            FaultController::disabled(),
+            MetaBacking::File,
+            crate::manifest::LEGACY_MANIFEST_BODY_VERSION,
+        )
+    }
+
     /// Create a fresh database over caller-supplied devices (the fixed-capacity
     /// device path — onyx over a chunklet meta LogicalDisk). `page_device`
     /// backs the page store; `journal_device` backs the lifecycle-journal ring.
@@ -92,9 +102,26 @@ impl Db {
         faults: Arc<FaultController>,
         backing: MetaBacking,
     ) -> Result<Arc<Self>> {
+        Self::create_core_with_manifest_version(cfg, faults, backing, MANIFEST_BODY_VERSION)
+    }
+
+    fn create_core_with_manifest_version(
+        cfg: Config,
+        faults: Arc<FaultController>,
+        backing: MetaBacking,
+        manifest_body_version: u32,
+    ) -> Result<Arc<Self>> {
         validate_rc_neutral_refcount_mode(&cfg)?;
         let shard_count = validate_shard_count(cfg.shards_per_partition)?;
         let dedup_shards = validate_dedup_shards(cfg.dedup_shards)?;
+        let refcount_routing = crate::refcount::RefcountRouting::from_manifest_version(
+            manifest_body_version,
+        )
+        .ok_or_else(|| {
+            MetaDbError::InvalidArgument(format!(
+                "unsupported manifest body version {manifest_body_version} for database create"
+            ))
+        })?;
         let page_store = Arc::new(match &backing {
             MetaBacking::File => {
                 std::fs::create_dir_all(&cfg.path)?;
@@ -133,6 +160,7 @@ impl Db {
             page_store.clone(),
             page_cache.clone(),
             shard_count,
+            refcount_routing,
             metrics.clone(),
         )?;
         let dedup_index = Arc::new(crate::dedup::DedupIndex::create(
@@ -148,7 +176,7 @@ impl Db {
             dedup_shards as usize,
             cfg.dedup_drainer_enabled,
         )?);
-        manifest.body_version = MANIFEST_BODY_VERSION;
+        manifest.body_version = manifest_body_version;
         let refcount_count = refcount_roots.len();
         manifest.refcount_shard_roots = refcount_roots;
         // Fresh database: no flush has happened yet, every shard's
@@ -473,6 +501,14 @@ impl Db {
         page_store.attach_metrics(metrics.clone());
         let (mut manifest_store, mut manifest) =
             ManifestStore::open_existing(page_store.clone(), page_cache.clone(), faults.clone())?;
+        let refcount_routing =
+            crate::refcount::RefcountRouting::from_manifest_version(manifest.body_version)
+                .ok_or_else(|| {
+                    MetaDbError::Corruption(format!(
+                        "manifest body version {} has no refcount routing semantic",
+                        manifest.body_version
+                    ))
+                })?;
         if manifest.volumes.is_empty() {
             return Err(MetaDbError::Corruption(
                 "manifest has no volume entries; database was not initialized".into(),
@@ -557,6 +593,7 @@ impl Db {
             page_cache.clone(),
             &manifest.refcount_shard_roots,
             &manifest.refcount_durable_seq,
+            refcount_routing,
             metrics.clone(),
         )?;
         let dedup_index_meta_pid: PageId = manifest

@@ -159,6 +159,21 @@ fn commit_then_reopen_recovers_manifest() {
 }
 
 #[test]
+fn legacy_v25_manifest_round_trip_preserves_body_version() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let (mut store, _) = open_oc(ps, FaultController::new()).unwrap();
+    let mut manifest = Manifest::empty();
+    manifest.body_version = LEGACY_MANIFEST_BODY_VERSION;
+
+    store.commit(&mut manifest).unwrap();
+    drop(store);
+
+    let (_, loaded) = open_oc(reopen(&dir), FaultController::new()).unwrap();
+    assert_eq!(loaded.body_version, LEGACY_MANIFEST_BODY_VERSION);
+}
+
+#[test]
 fn commits_alternate_slots() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
@@ -408,12 +423,10 @@ fn find_snapshot_locates_by_id() {
 }
 
 #[test]
-fn decode_rejects_pre_v6_body_versions() {
-    // v5 and v4 are no longer supported — is fresh-install
-    // only. Any body_version other than v6 reports `Corruption`.
+fn decode_rejects_unsupported_body_versions() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
-    for bad_version in [3u32, 4, 5] {
+    for bad_version in [3u32, 24, 27] {
         let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
         {
             let p = page.payload_mut();
@@ -1126,8 +1139,8 @@ fn v13_manifest_is_rejected_after_flag_day_to_v14() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v23"),
-                "expected v13-rejection message mentioning v23, got: {msg}"
+                msg.contains("unsupported manifest body version") && msg.contains("v25 and v26"),
+                "expected v13-rejection message mentioning v25/v26, got: {msg}"
             );
         }
         e => panic!("expected Corruption from v13 manifest, got {e}"),
@@ -1150,8 +1163,8 @@ fn v14_manifest_is_rejected_after_flag_day_to_v15() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v23"),
-                "expected v14-rejection message mentioning v23, got: {msg}"
+                msg.contains("unsupported manifest body version") && msg.contains("v25 and v26"),
+                "expected v14-rejection message mentioning v25/v26, got: {msg}"
             );
         }
         e => panic!("expected Corruption from v14 manifest, got {e}"),
@@ -1239,8 +1252,8 @@ fn v21_manifest_is_rejected_after_flag_day_to_v22() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v23"),
-                "expected v21-rejection message mentioning v23, got: {msg}"
+                msg.contains("unsupported manifest body version") && msg.contains("v25 and v26"),
+                "expected v21-rejection message mentioning v25/v26, got: {msg}"
             );
         }
         e => panic!("expected Corruption from v21 manifest, got {e}"),
@@ -1264,8 +1277,8 @@ fn v22_manifest_is_rejected_after_flag_day_to_v23() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v23"),
-                "expected v22-rejection message mentioning v23, got: {msg}"
+                msg.contains("unsupported manifest body version") && msg.contains("v25 and v26"),
+                "expected v22-rejection message mentioning v25/v26, got: {msg}"
             );
         }
         e => panic!("expected Corruption from v22 manifest, got {e}"),

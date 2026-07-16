@@ -347,8 +347,16 @@ pub(super) fn apply_op_bare(
     }
 }
 
+pub(super) fn refcount_routing(shards: &[Shard]) -> crate::refcount::RefcountRouting {
+    let first = shards
+        .first()
+        .expect("refcount shard routing requires at least one shard");
+    debug_assert!(shards.iter().all(|shard| shard.routing == first.routing));
+    first.routing
+}
+
 pub(super) fn shard_for_key(shards: &[Shard], key: u64) -> usize {
-    (xxh3_64(&key.to_be_bytes()) as usize) % shards.len()
+    refcount_routing(shards).shard_for_pba(key, shards.len())
 }
 
 /// Read `pba`'s `birth_lsn` from the refcount shard. Returns `Some` if

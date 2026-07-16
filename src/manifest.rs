@@ -213,11 +213,16 @@ use crate::types::{
 ///   own cuckoo meta `head_extra`, and the migration cursor is not persisted
 ///   (idempotent put-if-absent re-walks from 0 on reopen).
 ///
-/// Old v24-and-earlier manifests are hard-rejected on open — no on-disk
-/// migration (fresh rebuild; onyx rebuilds metadb on schema change). This is the
-/// last "rebuild to change the dedup modulus": once on v25 the modulus grows
-/// online.
-pub const MANIFEST_BODY_VERSION: u32 = 25;
+/// v26 keeps the v25 byte layout but changes the semantic routing of PBA
+/// refcounts from `hash(pba)` to `hash(pba / 336)`. v25 remains readable and
+/// writable with its legacy routing; rewriting a v25 manifest must retain v25.
+/// The version is therefore a durable semantic gate even though no offsets move.
+/// The divisor 336 is fixed by v26, not derived from the current array layout;
+/// changing the physical entries-per-page requires a new manifest version and
+/// an explicit routing/migration decision.
+/// Old v24-and-earlier manifests remain hard-rejected on open.
+pub const MANIFEST_BODY_VERSION: u32 = 26;
+pub const LEGACY_MANIFEST_BODY_VERSION: u32 = 25;
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -446,7 +451,7 @@ pub use volume::{
     decode_volume_entry_inline, encode_volume_entry_inline, volume_entry_inline_size,
 };
 
-/// Decoded manifest body (v25).
+/// Decoded manifest body (v25 or v26).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub body_version: u32,
@@ -685,6 +690,15 @@ impl Manifest {
     /// for a dry-run fit probe.
     fn encode(&self, page: &mut Page, vol_head: PageId, snap_head: PageId) -> Result<()> {
         self.assert_durable_seq_invariant()?;
+        if !matches!(
+            self.body_version,
+            LEGACY_MANIFEST_BODY_VERSION | MANIFEST_BODY_VERSION
+        ) {
+            return Err(MetaDbError::InvalidArgument(format!(
+                "unsupported manifest body version {} for encode; expected v{} or v{}",
+                self.body_version, LEGACY_MANIFEST_BODY_VERSION, MANIFEST_BODY_VERSION
+            )));
+        }
         let refcount_shard_count = self.refcount_shard_roots.len();
         if refcount_shard_count > MAX_SHARD_ROOTS_PER_PAGE {
             return Err(MetaDbError::InvalidArgument(format!(
@@ -724,8 +738,7 @@ impl Manifest {
 
         let p = page.payload_mut();
         p.fill(0);
-        p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4]
-            .copy_from_slice(&MANIFEST_BODY_VERSION.to_le_bytes());
+        p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].copy_from_slice(&self.body_version.to_le_bytes());
         p[OFF_CHECKPOINT_LSN..OFF_CHECKPOINT_LSN + 8]
             .copy_from_slice(&self.checkpoint_lsn.to_le_bytes());
         p[OFF_FREE_LIST_HEAD..OFF_FREE_LIST_HEAD + 8]
@@ -851,17 +864,19 @@ impl Manifest {
         );
         match body_version {
             25 => Self::decode_v25(page, page_store),
+            26 => Self::decode_v26(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v25 (v23 \
-                 out-of-line catalog + v24 page_high_water / journal_ring_head + \
-                 v25 dedup_migration_old_head) is readable — older databases \
-                 must be rebuilt"
+                "unsupported manifest body version {other}; only v25 and v26 are readable"
             ))),
         }
     }
 
     fn decode_v25(page: &Page, page_store: &PageStore) -> Result<Self> {
         Self::decode_body(page, page_store, 25)
+    }
+
+    fn decode_v26(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 26)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {
@@ -986,7 +1001,7 @@ impl Manifest {
         let snapshots = decode_snapshot_catalog_bytes(&snapshot_bytes, snapshot_count, page_store)?;
 
         Ok(Self {
-            body_version: MANIFEST_BODY_VERSION,
+            body_version: version,
             checkpoint_lsn,
             checkpoint_bfg,
             last_processed_buffer_seq,

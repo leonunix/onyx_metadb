@@ -76,8 +76,11 @@ cargo test -- --ignored  # 长跑 proptest + 故障注入，发布前必跑 ，�
 
 ### 分片
 
-- L2P / refcount: `shard_for(key) = xxh3_64(key.to_be_bytes()) as usize % shard_count`。
-  分片数写死在 `Config::shards_per_partition`（默认 16），落在 manifest 里。
+- L2P 按 compact leaf 路由；refcount 路由由 manifest 版本持久化：v25 使用 legacy
+  `hash(PBA)`，v26 使用 `hash(PBA / 336)`，让一个 refcount array page 只归一个 shard。
+  分片数写死在 `Config::shards_per_partition`（默认 16），落在 manifest 里。打开 v25
+  后必须继续按 v25 路由并写回 v25，禁止无迁移静默升级。v26 的除数 336 是持久化
+  语义常量；未来改变 array page 格式必须升 manifest 路由版本并明确迁移策略。
 - dedup: `Config::dedup_shards`（默认 8）。**当前最优值**——见
   [memory: phase4_dedup_shards_results](dev:phase4)。`MAX_DEDUP_SHARDS = 64`。N=4
   是不稳定平衡点，不要默认。manifest v8 持久化 `dedup_shards` + per-shard heads。

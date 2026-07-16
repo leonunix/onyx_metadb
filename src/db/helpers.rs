@@ -53,7 +53,6 @@ pub(super) fn refresh_manifest_entries(
     refcount_shards: &[Shard],
     durable_override: Option<Lsn>,
 ) -> Result<()> {
-    manifest.body_version = MANIFEST_BODY_VERSION;
     let expected_total: usize = volumes.iter().map(|v| v.shards.len()).sum();
     if expected_total != l2p_guards.len() {
         return Err(MetaDbError::Corruption(format!(
@@ -234,6 +233,7 @@ pub(super) fn create_shards(
     page_store: Arc<PageStore>,
     page_cache: Arc<PageCache>,
     shard_count: usize,
+    routing: crate::refcount::RefcountRouting,
     metrics: Arc<MetaMetrics>,
 ) -> Result<(Vec<Shard>, Box<[PageId]>)> {
     let mut shards = Vec::with_capacity(shard_count);
@@ -243,6 +243,7 @@ pub(super) fn create_shards(
         roots.push(rc.meta_page_id());
         shards.push(Shard {
             rc: Arc::new(rc),
+            routing,
             apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx, metrics.clone()),
             last_flushed_lsn: AtomicU64::new(0),
         });
@@ -255,6 +256,7 @@ pub(super) fn open_shards(
     page_cache: Arc<PageCache>,
     roots: &[PageId],
     initial_last_flushed_lsn: &[Lsn],
+    routing: crate::refcount::RefcountRouting,
     metrics: Arc<MetaMetrics>,
 ) -> Result<Vec<Shard>> {
     if initial_last_flushed_lsn.len() != roots.len() {
@@ -271,6 +273,7 @@ pub(super) fn open_shards(
             crate::refcount::RcShard::open(page_store.clone(), page_cache.clone(), meta_page_id)?;
         shards.push(Shard {
             rc: Arc::new(rc),
+            routing,
             apply_lane: ApplyLane::new(0, ApplyLaneKind::Refcount, shard_idx, metrics.clone()),
             last_flushed_lsn: AtomicU64::new(initial_last_flushed_lsn[shard_idx]),
         });

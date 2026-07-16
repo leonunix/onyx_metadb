@@ -27,6 +27,50 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{MetaDbError, Result};
 use crate::types::Lsn;
+use xxhash_rust::xxh3::xxh3_64;
+
+/// Durable refcount-shard routing semantic selected by the manifest version.
+///
+/// The paged-array bytes are identical in both modes. What changes is which
+/// shard owns a PBA, so this must never change while an existing manifest is
+/// being rewritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefcountRouting {
+    /// Manifest v25: hash every PBA independently.
+    LegacyPbaHash,
+    /// Manifest v26: hash the 336-entry refcount page index. All entries that
+    /// share one logical refcount page therefore share one shard.
+    PageAffine,
+}
+
+/// The divisor is part of manifest-v26's durable routing contract. Do not
+/// derive it from the current array layout: changing this value requires a new
+/// manifest routing version and an explicit migration policy.
+pub(crate) const REFCOUNT_V26_ROUTING_ENTRIES_PER_PAGE: usize = 336;
+
+const _: () = {
+    assert!(array::ENTRIES_PER_PAGE == REFCOUNT_V26_ROUTING_ENTRIES_PER_PAGE);
+};
+
+impl RefcountRouting {
+    pub(crate) fn from_manifest_version(version: u32) -> Option<Self> {
+        match version {
+            25 => Some(Self::LegacyPbaHash),
+            26 => Some(Self::PageAffine),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn shard_for_pba(self, pba: crate::types::Pba, shard_count: usize) -> usize {
+        debug_assert!(shard_count > 0);
+        let routing_key = match self {
+            Self::LegacyPbaHash => pba,
+            Self::PageAffine => pba / REFCOUNT_V26_ROUTING_ENTRIES_PER_PAGE as u64,
+        };
+        (xxh3_64(&routing_key.to_be_bytes()) as usize) % shard_count
+    }
+}
 
 /// Per-PBA refcount entry. `rc` is the live reference count;
 /// `birth_lsn` records the LSN at which the entry transitioned from
