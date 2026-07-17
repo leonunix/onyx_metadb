@@ -463,9 +463,11 @@ fn sorted_batch_get_mixes_cache_miss_hole_and_staged_overlay() {
         .unwrap();
     cache.invalidate(staged.pages[0].page_id);
 
-    let got = a
-        .get_many_sorted_with_page_lsn(&[durable_pba, hole_pba, staged_pba, staged_next])
-        .unwrap();
+    let pbas = [durable_pba, hole_pba, staged_pba, staged_next];
+    let unprofiled = a.get_many_sorted_with_page_lsn(&pbas).unwrap();
+    cache.invalidate(durable_pid);
+    let (got, profile) = a.get_many_sorted_with_page_lsn_profiled(&pbas).unwrap();
+    assert_eq!(got, unprofiled);
     assert_eq!(got[0].0.rc, 2);
     assert_eq!(got[0].1, 100);
     assert_eq!(got[1], (RcEntry::ZERO, 0));
@@ -473,6 +475,43 @@ fn sorted_batch_get_mixes_cache_miss_hole_and_staged_overlay() {
     assert_eq!(got[2].1, 201);
     assert_eq!(got[3].0.rc, 4);
     assert_eq!(got[3].1, 201);
+    assert_eq!(profile.pbas, 4);
+    assert_eq!(profile.page_runs, 3);
+    assert_eq!(profile.clean_runs, 1);
+    assert_eq!(profile.hole_runs, 1);
+    assert_eq!(profile.overlay_runs, 1);
+}
+
+#[test]
+fn profiled_sorted_batch_empty_input_has_zero_profile() {
+    let (_dir, a) = make_array();
+    let (got, profile) = a.get_many_sorted_with_page_lsn_profiled(&[]).unwrap();
+    assert!(got.is_empty());
+    assert_eq!(profile.pbas, 0);
+    assert_eq!(profile.page_runs, 0);
+    assert_eq!(profile.output_init, std::time::Duration::ZERO);
+    assert_eq!(profile.inner_lock_wait, std::time::Duration::ZERO);
+    assert_eq!(profile.page_resolve, std::time::Duration::ZERO);
+    assert_eq!(profile.request_materialize, std::time::Duration::ZERO);
+    assert_eq!(profile.cache_probe, std::time::Duration::ZERO);
+    assert_eq!(profile.decode, std::time::Duration::ZERO);
+}
+
+#[test]
+fn profiled_sorted_batch_preserves_duplicate_input_slots() {
+    let (_dir, a) = make_array();
+    let pba = 7;
+    a.apply_deltas(vec![(pba, pending(3, 100))]).unwrap();
+
+    let (got, profile) = a
+        .get_many_sorted_with_page_lsn_profiled(&[pba, pba])
+        .unwrap();
+    assert_eq!(got, vec![got[0], got[0]]);
+    assert_eq!(got[0].0.rc, 3);
+    assert_eq!(got[0].1, 100);
+    assert_eq!(profile.pbas, 2);
+    assert_eq!(profile.page_runs, 1);
+    assert_eq!(profile.clean_runs, 1);
 }
 
 #[test]

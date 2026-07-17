@@ -38,12 +38,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
 use super::RcEntry;
 use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
+use crate::metrics::RefcountBaseLookupProfile;
 use crate::page::{PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
 use crate::page_store::{IoLaneClass, PageStore};
 use crate::paged_meta;
@@ -375,6 +377,24 @@ impl PagedRefcountArray {
         &self,
         pbas: &[Pba],
     ) -> Result<Vec<(RcEntry, Lsn)>> {
+        self.get_many_sorted_with_page_lsn_inner::<false>(pbas, None)
+    }
+
+    pub(crate) fn get_many_sorted_with_page_lsn_profiled(
+        &self,
+        pbas: &[Pba],
+    ) -> Result<(Vec<(RcEntry, Lsn)>, RefcountBaseLookupProfile)> {
+        let mut profile = RefcountBaseLookupProfile::default();
+        let values = self.get_many_sorted_with_page_lsn_inner::<true>(pbas, Some(&mut profile))?;
+        Ok((values, profile))
+    }
+
+    fn get_many_sorted_with_page_lsn_inner<const PROFILE: bool>(
+        &self,
+        pbas: &[Pba],
+        profile_out: Option<&mut RefcountBaseLookupProfile>,
+    ) -> Result<Vec<(RcEntry, Lsn)>> {
+        let mut profile = RefcountBaseLookupProfile::default();
         if pbas.is_empty() {
             return Ok(Vec::new());
         }
@@ -382,50 +402,91 @@ impl PagedRefcountArray {
             pbas.is_sorted(),
             "sorted refcount lookup requires nondecreasing PBAs"
         );
-
-        let mut out = vec![(RcEntry::ZERO, 0); pbas.len()];
-        let mut clean_runs = Vec::new();
-        {
-            let inner = self.inner.lock();
-            let overlay_empty = inner.staged_overlay.is_empty();
-            let mut start = 0;
-            while start < pbas.len() {
-                let (page_idx, _) = page_offset(pbas[start]);
-                let mut end = start + 1;
-                while end < pbas.len() && page_offset(pbas[end]).0 == page_idx {
-                    end += 1;
-                }
-
-                let page_id = inner.page_table.get(page_idx).copied().unwrap_or(0);
-                if page_id == 0 {
-                    start = end;
-                    continue;
-                }
-                if !overlay_empty && let Some(page) = inner.staged_overlay.get(&page_id) {
-                    decode_page_run(page, pbas, start, end, &mut out)?;
-                    for _ in start..end {
-                        super::note_staged_overlay_hit();
-                    }
-                } else {
-                    clean_runs.push(CleanPageRun {
-                        page_id,
-                        start,
-                        end,
-                    });
-                }
-                start = end;
-            }
+        if PROFILE {
+            profile.pbas = pbas.len() as u64;
         }
 
+        let output_started = PROFILE.then(Instant::now);
+        let mut out = vec![(RcEntry::ZERO, 0); pbas.len()];
+        profile.output_init = output_started.map_or(Duration::ZERO, |start| start.elapsed());
+        let mut clean_runs = Vec::new();
+        let inner_wait_started = PROFILE.then(Instant::now);
+        let inner = self.inner.lock();
+        profile.inner_lock_wait =
+            inner_wait_started.map_or(Duration::ZERO, |start| start.elapsed());
+        let resolve_started = PROFILE.then(Instant::now);
+        let overlay_empty = inner.staged_overlay.is_empty();
+        let mut overlay_decode = Duration::ZERO;
+        let mut start = 0;
+        while start < pbas.len() {
+            let (page_idx, _) = page_offset(pbas[start]);
+            let mut end = start + 1;
+            while end < pbas.len() && page_offset(pbas[end]).0 == page_idx {
+                end += 1;
+            }
+
+            if PROFILE {
+                profile.page_runs = profile.page_runs.saturating_add(1);
+            }
+            let page_id = inner.page_table.get(page_idx).copied().unwrap_or(0);
+            if page_id == 0 {
+                if PROFILE {
+                    profile.hole_runs = profile.hole_runs.saturating_add(1);
+                }
+                start = end;
+                continue;
+            }
+            if !overlay_empty && let Some(page) = inner.staged_overlay.get(&page_id) {
+                let decode_started = PROFILE.then(Instant::now);
+                decode_page_run(page, pbas, start, end, &mut out)?;
+                overlay_decode +=
+                    decode_started.map_or(Duration::ZERO, |started| started.elapsed());
+                if PROFILE {
+                    profile.overlay_runs = profile.overlay_runs.saturating_add(1);
+                }
+                for _ in start..end {
+                    super::note_staged_overlay_hit();
+                }
+            } else {
+                if PROFILE {
+                    profile.clean_runs = profile.clean_runs.saturating_add(1);
+                }
+                clean_runs.push(CleanPageRun {
+                    page_id,
+                    start,
+                    end,
+                });
+            }
+            start = end;
+        }
+        drop(inner);
+        let resolve_elapsed = resolve_started.map_or(Duration::ZERO, |started| started.elapsed());
+        profile.page_resolve = resolve_elapsed.saturating_sub(overlay_decode);
+        profile.decode = overlay_decode;
+
+        let request_started = PROFILE.then(Instant::now);
         let requests: Vec<(PageId, usize)> = clean_runs
             .iter()
             .map(|run| (run.page_id, run.end - run.start))
             .collect();
+        profile.request_materialize =
+            request_started.map_or(Duration::ZERO, |started| started.elapsed());
+        let cache_started = PROFILE.then(Instant::now);
+        let mut clean_decode = Duration::ZERO;
         self.page_cache
             .visit_many_weighted(&requests, |request_idx, page| {
                 let run = &clean_runs[request_idx];
-                decode_page_run(page, pbas, run.start, run.end, &mut out)
+                let decode_started = PROFILE.then(Instant::now);
+                let result = decode_page_run(page, pbas, run.start, run.end, &mut out);
+                clean_decode += decode_started.map_or(Duration::ZERO, |started| started.elapsed());
+                result
             })?;
+        let cache_elapsed = cache_started.map_or(Duration::ZERO, |started| started.elapsed());
+        profile.cache_probe = cache_elapsed.saturating_sub(clean_decode);
+        profile.decode += clean_decode;
+        if PROFILE {
+            *profile_out.expect("profile output is required when PROFILE is enabled") = profile;
+        }
         Ok(out)
     }
 

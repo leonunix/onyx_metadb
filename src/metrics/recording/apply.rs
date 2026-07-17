@@ -189,7 +189,12 @@ impl MetaMetrics {
         actions: u64,
         pbas: u64,
         pba_grouping: Duration,
+        actions_sort: Duration,
+        actions_sort_sampled_actions: u64,
+        stage_sampled: Duration,
+        pbas_materialize: Duration,
         base_page_lookup: Duration,
+        base_profile: RefcountBaseLookupProfile,
         fold_lock_wait: Duration,
         slot_lock_wait: Duration,
         pending_slot_scan: Duration,
@@ -213,16 +218,54 @@ impl MetaMetrics {
             &self.apply_refcount_pba_grouping_max_us,
             pba_grouping,
         );
+        if actions_sort_sampled_actions > 0 {
+            add_duration(&self.apply_refcount_actions_sort_us, actions_sort);
+            self.apply_refcount_actions_sort_sampled_actions
+                .fetch_add(actions_sort_sampled_actions, Ordering::Relaxed);
+        }
         if sampled_pbas == 0 {
             return;
         }
         self.apply_refcount_breakdown_sampled_pbas
             .fetch_add(sampled_pbas, Ordering::Relaxed);
+        add_duration(&self.apply_refcount_stage_sampled_us, stage_sampled);
+        add_duration(&self.apply_refcount_pbas_materialize_us, pbas_materialize);
         record_duration(
             &self.apply_refcount_base_page_lookup_us,
             &self.apply_refcount_base_page_lookup_max_us,
             base_page_lookup,
         );
+        self.apply_refcount_base_profiled_pbas
+            .fetch_add(base_profile.pbas, Ordering::Relaxed);
+        self.apply_refcount_base_page_runs
+            .fetch_add(base_profile.page_runs, Ordering::Relaxed);
+        self.apply_refcount_base_hole_runs
+            .fetch_add(base_profile.hole_runs, Ordering::Relaxed);
+        self.apply_refcount_base_overlay_runs
+            .fetch_add(base_profile.overlay_runs, Ordering::Relaxed);
+        self.apply_refcount_base_clean_runs
+            .fetch_add(base_profile.clean_runs, Ordering::Relaxed);
+        add_duration(
+            &self.apply_refcount_base_output_init_us,
+            base_profile.output_init,
+        );
+        add_duration(
+            &self.apply_refcount_base_inner_lock_wait_us,
+            base_profile.inner_lock_wait,
+        );
+        add_duration(
+            &self.apply_refcount_base_page_resolve_us,
+            base_profile.page_resolve,
+        );
+        add_duration(
+            &self.apply_refcount_base_request_materialize_us,
+            base_profile.request_materialize,
+        );
+        add_duration(
+            &self.apply_refcount_base_cache_probe_us,
+            base_profile.cache_probe,
+        );
+        add_duration(&self.apply_refcount_base_decode_us, base_profile.decode);
         record_duration(
             &self.apply_refcount_fold_lock_wait_us,
             &self.apply_refcount_fold_lock_wait_max_us,

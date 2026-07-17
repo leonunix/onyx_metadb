@@ -167,6 +167,20 @@ impl MetaMetrics {
         fetch_max(&self.flush_rc_fold_service_max_us, service_us);
     }
 
+    pub(crate) fn record_flush_rc_fold_breakdown(
+        &self,
+        validate_us: u64,
+        stage_us: u64,
+        remove_us: u64,
+    ) {
+        self.flush_rc_fold_validate_us
+            .fetch_add(validate_us, Ordering::Relaxed);
+        self.flush_rc_fold_stage_us
+            .fetch_add(stage_us, Ordering::Relaxed);
+        self.flush_rc_fold_remove_us
+            .fetch_add(remove_us, Ordering::Relaxed);
+    }
+
     /// Record one checkpoint's sum of per-shard `fold_lock.write()` waits.
     pub(crate) fn record_flush_rc_fold_lock_wait(&self, wait_sum_us: u64) {
         self.flush_rc_fold_lock_wait_us

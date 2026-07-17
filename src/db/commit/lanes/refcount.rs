@@ -19,7 +19,11 @@ impl Db {
         // large number of tiny Vecs and then still has to sort the map output.
         // One flat sort makes each PBA group contiguous while retaining the
         // original op order needed when selecting a freed-PBA outcome.
+        let sample_breakdown = crate::refcount::shard::sample_refcount_breakdown(lsn);
+        let sort_started = sample_breakdown.then(std::time::Instant::now);
         actions.sort_unstable_by_key(|action| (action.pba, action.op_idx));
+        let actions_sort_elapsed =
+            sort_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
 
         // The normal rc-authoritative remap path contains only derived
         // (non-standalone) actions. Net-collapse those groups first, then
@@ -45,7 +49,12 @@ impl Db {
                 action_count as u64,
                 staged_actions.len() as u64,
                 grouping_elapsed,
+                actions_sort_elapsed,
+                sample_breakdown.then_some(action_count as u64).unwrap_or(0),
+                stage_timings.stage_sampled,
+                stage_timings.pbas_materialize,
                 stage_timings.base_page_lookup,
+                stage_timings.base_profile,
                 stage_timings.fold_lock_wait,
                 stage_timings.slot_lock_wait,
                 stage_timings.pending_slot_scan,

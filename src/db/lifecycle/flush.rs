@@ -936,6 +936,9 @@ impl Db {
         let mut rc_stream_stats = crate::refcount::shard::RcStreamingWriteStats::default();
         let mut rc_fold_lock_wait_us = 0u64;
         let mut rc_fold_service_us = 0u64;
+        let mut rc_fold_validate_us = 0u64;
+        let mut rc_fold_stage_us = 0u64;
+        let mut rc_fold_remove_us = 0u64;
         let mut sample_err: Option<MetaDbError> = None;
         let mut tail_to_abort: Vec<(usize, crate::refcount::shard::RcCheckpoint)> = Vec::new();
         for (idx, result) in rc_results.into_iter().enumerate() {
@@ -946,6 +949,10 @@ impl Db {
                     rc_fold_lock_wait_us =
                         rc_fold_lock_wait_us.saturating_add(ckpt.fold_lock_wait_us());
                     rc_fold_service_us = rc_fold_service_us.saturating_add(ckpt.fold_service_us());
+                    let (validate_us, stage_us, remove_us) = ckpt.fold_breakdown_us();
+                    rc_fold_validate_us = rc_fold_validate_us.saturating_add(validate_us);
+                    rc_fold_stage_us = rc_fold_stage_us.saturating_add(stage_us);
+                    rc_fold_remove_us = rc_fold_remove_us.saturating_add(remove_us);
                     if sample_err.is_some() {
                         tail_to_abort.push((idx, ckpt));
                     } else {
@@ -975,6 +982,11 @@ impl Db {
             .record_flush_rc_fold_lock_wait(rc_fold_lock_wait_us);
         self.metrics
             .record_flush_rc_fold_service(rc_fold_service_us);
+        self.metrics.record_flush_rc_fold_breakdown(
+            rc_fold_validate_us,
+            rc_fold_stage_us,
+            rc_fold_remove_us,
+        );
         trace.rc_fold_wait_sum_us = rc_fold_lock_wait_us;
         trace.rc_fold_service_sum_us = rc_fold_service_us;
         trace.rc_stream_write_sum_us = rc_stream_stats.service_us;
