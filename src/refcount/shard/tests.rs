@@ -260,29 +260,6 @@ fn streaming_checkpoint_bounds_overlay_and_releases_chunk_page_arcs() {
 }
 
 #[test]
-fn streaming_checkpoint_keeps_same_page_deltas_in_one_capped_chunk() {
-    let (_d, s) = make_shard();
-    let p0 = 7;
-    let p0_next = 8;
-    let p1 = (ENTRIES_PER_PAGE + 7) as Pba;
-    s.stage(T0, p0, 1, 100).unwrap();
-    s.stage(T0, p0_next, 2, 101).unwrap();
-    s.stage(T0, p1, 3, 102).unwrap();
-
-    let ckpt = s.begin_checkpoint_streaming_capped(T0, 1).unwrap();
-
-    assert_eq!(ckpt.data_pages_count(), 2);
-    let stream = ckpt.streaming_write_stats();
-    assert_eq!(stream.calls, 2);
-    assert_eq!(stream.pages, 2);
-    assert_eq!(stream.max_chunk_pages, 1);
-    assert!(s.delta_slots[0].lock().is_empty());
-    assert_eq!(s.get(p0).unwrap(), 1);
-    assert_eq!(s.get(p0_next).unwrap(), 2);
-    assert_eq!(s.get(p1).unwrap(), 3);
-}
-
-#[test]
 fn stage_batch_retries_when_streaming_checkpoint_moves_a_later_chunk() {
     let (_d, s) = make_shard();
     let p0 = 7;

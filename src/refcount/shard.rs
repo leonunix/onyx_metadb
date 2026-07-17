@@ -948,11 +948,11 @@ impl RcShard {
                     }
                 }
 
-                // Presorted staging is failure-atomic for this chunk: on error
-                // it removes every overlay/fresh reservation it published. The
-                // slot is still intact until the call succeeds.
-                let staged = self.array.stage_sorted_deltas_in_memory_preserving(
-                    &drained[cursor..end],
+                // `stage_deltas_in_memory_preserving` is failure-atomic for this
+                // chunk: on error it removes every overlay/fresh reservation it
+                // published. The slot is still intact until the call succeeds.
+                let staged = self.array.stage_deltas_in_memory_preserving(
+                    &mut drained[cursor..end],
                     false,
                     &[],
                 )?;
