@@ -88,6 +88,36 @@ fn stage_batch_probes_zero_net_pending_before_replay_skip() {
 }
 
 #[test]
+fn stage_batch_probes_and_updates_zero_net_open_pending() {
+    let (_d, s) = make_shard();
+    s.array
+        .apply_deltas(vec![(
+            11,
+            Pending {
+                delta: 1,
+                last_lsn: 100,
+            },
+        )])
+        .unwrap();
+
+    {
+        let mut open = s.delta_slots[1].lock();
+        open.merge(10, 1, 40);
+        open.merge(10, -1, 41);
+    }
+    let (staged, _) = s.stage_batch(1, &[(10, 1)], 50).unwrap();
+
+    assert_eq!(staged, vec![(0, 1)]);
+    assert_eq!(
+        s.delta_slots[1].lock().get(10),
+        Some(Pending {
+            delta: 1,
+            last_lsn: 50,
+        })
+    );
+}
+
+#[test]
 fn stage_batch_handles_an_initially_empty_open_slot() {
     let (_d, s) = make_shard();
     s.stage(T0, 10, 2, 10).unwrap();
@@ -135,6 +165,40 @@ fn stage_batch_keeps_replay_skip_semantics() {
     assert_eq!(timings.base_lookup_attempts, 1);
     assert_eq!(timings.epoch_retries, 0);
     assert_eq!(s.get(10).unwrap(), 1);
+    assert!(s.delta_slots[1].lock().get(10).is_none());
+}
+
+#[test]
+fn stage_batch_skip_does_not_mutate_or_insert_open_entries() {
+    let (_d, s) = make_shard();
+    s.delta_slots[1].lock().merge(10, 1, 10);
+
+    let (staged, _) = s.stage_batch(1, &[(10, -2), (20, -1)], 20).unwrap();
+
+    assert_eq!(staged, vec![(1, 1), (0, 0)]);
+    assert_eq!(
+        s.delta_slots[1].lock().get(10),
+        Some(Pending {
+            delta: 1,
+            last_lsn: 10,
+        })
+    );
+    assert!(s.delta_slots[1].lock().get(20).is_none());
+}
+
+#[test]
+fn stage_batch_error_leaves_open_entry_unchanged() {
+    let (_d, s) = make_shard();
+    let pending = Pending {
+        delta: i64::from(u32::MAX) + 1,
+        last_lsn: 10,
+    };
+    s.delta_slots[1].lock().merge_pending(10, pending);
+
+    let err = s.stage_batch(1, &[(10, 1)], 20).err().unwrap();
+
+    assert!(matches!(err, MetaDbError::InvalidArgument(_)));
+    assert_eq!(s.delta_slots[1].lock().get(10), Some(pending));
 }
 
 #[test]
