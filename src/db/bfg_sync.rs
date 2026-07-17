@@ -46,7 +46,8 @@ use crate::types::Bfg;
 /// One leaf's worth of fold work, prepared off-lock by
 /// [`build_drain_plan`]. Inserts are pre-sorted by lba and all share
 /// the same leaf, so [`apply_drain_ops`] can hand them straight to
-/// `insert_leaf_run_at_lsn_deferred_finish` (one CoW per leaf).
+/// `insert_leaf_run_at_lsn_deferred_finish_discard_prev` (one CoW per leaf,
+/// without collecting previous mappings that the fold has already consumed).
 pub(crate) struct LeafDrainOp {
     inserts: Vec<(u64, crate::paged::L2pValue)>,
     inserts_max_lsn: crate::types::Lsn,
@@ -134,7 +135,10 @@ pub(crate) fn apply_drain_ops(
     tree.set_clone_cow_pinners(clone_cow_pinners);
     for op in ops {
         if !op.inserts.is_empty() {
-            tree.insert_leaf_run_at_lsn_deferred_finish(&op.inserts, op.inserts_max_lsn)?;
+            tree.insert_leaf_run_at_lsn_deferred_finish_discard_prev(
+                &op.inserts,
+                op.inserts_max_lsn,
+            )?;
         }
         for &(lba, lsn) in &op.tombstones {
             tree.delete_at_lsn_deferred_finish(lba, lsn)?;
@@ -146,8 +150,7 @@ pub(crate) fn apply_drain_ops(
 
 /// Apply every `draining` entry into `tree` in one shot. Groups by
 /// leaf so that inserts touching the same leaf share one CoW (matches
-/// the laned bucket's `insert_leaf_run_at_lsn_deferred_finish`
-/// optimisation).
+/// the laned bucket's leaf-run optimisation).
 ///
 /// Used by the "merge every slot" inline drain
 /// (`force_compact_l2p_buffers`), whose callers run quiesced (no
