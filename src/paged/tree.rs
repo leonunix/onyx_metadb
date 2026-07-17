@@ -1057,35 +1057,11 @@ impl PagedL2p {
         entries: &[(u64, L2pValue)],
         lsn: Lsn,
     ) -> Result<Vec<Option<L2pValue>>> {
-        let mut old_values = Vec::with_capacity(entries.len());
-        self.insert_leaf_run_at_lsn_deferred_finish_for_each_prev(entries, lsn, |old| {
-            old_values.push(old);
-        })?;
-        Ok(old_values)
-    }
-
-    /// Apply a same-leaf run when the caller has already consumed the previous
-    /// mappings. Buffer folds use this path to avoid allocating and filling a
-    /// `Vec<Option<L2pValue>>` that they would immediately discard.
-    pub(crate) fn insert_leaf_run_at_lsn_deferred_finish_discard_prev(
-        &mut self,
-        entries: &[(u64, L2pValue)],
-        lsn: Lsn,
-    ) -> Result<()> {
-        self.insert_leaf_run_at_lsn_deferred_finish_for_each_prev(entries, lsn, drop)
-    }
-
-    fn insert_leaf_run_at_lsn_deferred_finish_for_each_prev(
-        &mut self,
-        entries: &[(u64, L2pValue)],
-        lsn: Lsn,
-        mut visit_prev: impl FnMut(Option<L2pValue>),
-    ) -> Result<()> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         self.advance_next_gen(lsn);
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<Vec<Option<L2pValue>>> {
             let leaf_idx = entries[0].0 >> LEAF_SHIFT;
             for (lba, _) in entries.iter().skip(1) {
                 let next_leaf_idx = *lba >> LEAF_SHIFT;
@@ -1121,6 +1097,7 @@ impl PagedL2p {
             }
 
             let leaf = self.buf.modify(current, lsn)?;
+            let mut old_values = Vec::with_capacity(entries.len());
             for (lba, value) in entries {
                 let bit = (*lba & LEAF_MASK) as usize;
                 let old = leaf_set(leaf, bit, value).map_err(|err| {
@@ -1128,10 +1105,10 @@ impl PagedL2p {
                         "paged::insert leaf run leaf {current} slot {bit} lba {lba} lsn {lsn}: {err}"
                     ))
                 })?;
-                visit_prev(old);
+                old_values.push(old);
             }
             self.root = new_root;
-            Ok(())
+            Ok(old_values)
         })();
         self.finalize_rc_deltas_deferred_finish(lsn, result)
     }

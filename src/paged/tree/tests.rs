@@ -74,55 +74,6 @@ fn overwrite_returns_previous_value() {
 }
 
 #[test]
-fn leaf_run_discard_prev_preserves_updates_and_previous_value_api() {
-    let (_d, ps) = mk_store();
-    let mut t = PagedL2p::create(ps).unwrap();
-    t.insert(3, v(1)).unwrap();
-    t.insert(4, v(2)).unwrap();
-
-    t.insert_leaf_run_at_lsn_deferred_finish_discard_prev(&[(3, v(3)), (5, v(5))], 10)
-        .unwrap();
-    t.finish_batch_apply().unwrap();
-    assert_eq!(t.get(3).unwrap(), Some(v(3)));
-    assert_eq!(t.get(4).unwrap(), Some(v(2)));
-    assert_eq!(t.get(5).unwrap(), Some(v(5)));
-
-    let previous = t
-        .insert_leaf_run_at_lsn_deferred_finish(&[(3, v(6)), (6, v(7))], 11)
-        .unwrap();
-    t.finish_batch_apply().unwrap();
-    assert_eq!(previous, vec![Some(v(3)), None]);
-    assert_eq!(t.get(3).unwrap(), Some(v(6)));
-    assert_eq!(t.get(6).unwrap(), Some(v(7)));
-}
-
-#[test]
-fn leaf_run_apis_keep_empty_and_same_leaf_contracts() {
-    let (_d, ps) = mk_store();
-    let mut t = PagedL2p::create(ps).unwrap();
-    let generation = t.next_generation();
-
-    t.insert_leaf_run_at_lsn_deferred_finish_discard_prev(&[], 100)
-        .unwrap();
-    assert!(
-        t.insert_leaf_run_at_lsn_deferred_finish(&[], 100)
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(t.next_generation(), generation);
-
-    let cross_leaf = [(LEAF_MASK, v(1)), (LEAF_MASK + 1, v(2))];
-    assert!(
-        t.insert_leaf_run_at_lsn_deferred_finish_discard_prev(&cross_leaf, 101)
-            .is_err()
-    );
-    assert!(
-        t.insert_leaf_run_at_lsn_deferred_finish(&cross_leaf, 101)
-            .is_err()
-    );
-}
-
-#[test]
 fn delete_missing_key_is_noop() {
     let (_d, ps) = mk_store();
     let mut t = PagedL2p::create(ps).unwrap();
