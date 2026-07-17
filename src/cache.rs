@@ -372,28 +372,15 @@ impl PageCache {
     pub(crate) fn visit_many_weighted(
         &self,
         requests: &[(PageId, usize)],
-        visit: impl FnMut(usize, &Page) -> Result<()>,
-    ) -> Result<()> {
-        self.visit_many_weighted_by(requests.len(), |idx| requests[idx], visit)
-    }
-
-    /// Variant of [`Self::visit_many_weighted`] that reads request metadata
-    /// from an existing caller-owned representation. Hot paths that already
-    /// retain per-page run state can avoid building a duplicate request vec.
-    pub(crate) fn visit_many_weighted_by(
-        &self,
-        request_count: usize,
-        request_at: impl Fn(usize) -> (PageId, usize),
         mut visit: impl FnMut(usize, &Page) -> Result<()>,
     ) -> Result<()> {
-        if request_count == 0 {
+        if requests.is_empty() {
             return Ok(());
         }
         #[cfg(debug_assertions)]
         {
             let mut seen = std::collections::HashSet::new();
-            for request_idx in 0..request_count {
-                let (page_id, weight) = request_at(request_idx);
+            for &(page_id, weight) in requests {
                 debug_assert!(weight > 0, "page-cache run weight must be positive");
                 debug_assert!(
                     seen.insert(page_id),
@@ -403,8 +390,7 @@ impl PageCache {
         }
 
         let mut shard_counts = [0usize; CACHE_SHARDS];
-        for request_idx in 0..request_count {
-            let (page_id, _) = request_at(request_idx);
+        for &(page_id, _) in requests {
             shard_counts[self.shard_idx(page_id)] += 1;
         }
         let mut shard_offsets = [0usize; CACHE_SHARDS + 1];
@@ -412,9 +398,8 @@ impl PageCache {
             shard_offsets[shard_idx + 1] = shard_offsets[shard_idx] + shard_counts[shard_idx];
         }
         let mut shard_next = shard_offsets;
-        let mut shard_request_indices = vec![0usize; request_count];
-        for request_idx in 0..request_count {
-            let (page_id, _) = request_at(request_idx);
+        let mut shard_request_indices = vec![0usize; requests.len()];
+        for (request_idx, &(page_id, _)) in requests.iter().enumerate() {
             let shard_idx = self.shard_idx(page_id);
             shard_request_indices[shard_next[shard_idx]] = request_idx;
             shard_next[shard_idx] += 1;
@@ -430,7 +415,7 @@ impl PageCache {
             }
             let shard = self.shards[shard_idx].read();
             for &request_idx in indices {
-                let (page_id, weight) = request_at(request_idx);
+                let (page_id, weight) = requests[request_idx];
                 if let Some(page) = shard.get_ref(page_id) {
                     hit_count += weight as u64;
                     if let Err(err) = visit(request_idx, page) {
@@ -454,7 +439,7 @@ impl PageCache {
             .fetch_add(miss_request_indices.len() as u64, Ordering::Relaxed);
         let miss_page_ids: Vec<PageId> = miss_request_indices
             .iter()
-            .map(|&request_idx| request_at(request_idx).0)
+            .map(|&request_idx| requests[request_idx].0)
             .collect();
         let loaded = self.page_store.read_pages(&miss_page_ids)?;
         if loaded.len() != miss_page_ids.len() {
