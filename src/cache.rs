@@ -360,6 +360,124 @@ impl PageCache {
             .collect()
     }
 
+    /// Read distinct pages while preserving input order. Unlike [`Self::get_many`],
+    /// this path does not build duplicate-position vectors and probes all hits
+    /// for one cache shard under a single read lock. Refcount checkpoint staging
+    /// already supplies one page id per logical refcount page, so paying the
+    /// generic duplicate-expansion cost there only adds allocator and lock
+    /// traffic inside the fold critical section.
+    pub(crate) fn get_many_unique(&self, page_ids: &[PageId]) -> Result<Vec<Arc<Page>>> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(debug_assertions)]
+        {
+            let mut seen = std::collections::HashSet::with_capacity(page_ids.len());
+            for &page_id in page_ids {
+                debug_assert!(
+                    seen.insert(page_id),
+                    "PageCache::get_many_unique requires distinct page ids"
+                );
+            }
+        }
+
+        let mut shard_counts = [0usize; CACHE_SHARDS];
+        for &page_id in page_ids {
+            shard_counts[self.shard_idx(page_id)] += 1;
+        }
+        let mut shard_offsets = [0usize; CACHE_SHARDS + 1];
+        for shard_idx in 0..CACHE_SHARDS {
+            shard_offsets[shard_idx + 1] = shard_offsets[shard_idx] + shard_counts[shard_idx];
+        }
+        let mut shard_next = shard_offsets;
+        let mut shard_request_indices = vec![0usize; page_ids.len()];
+        for (request_idx, &page_id) in page_ids.iter().enumerate() {
+            let shard_idx = self.shard_idx(page_id);
+            shard_request_indices[shard_next[shard_idx]] = request_idx;
+            shard_next[shard_idx] += 1;
+        }
+
+        let mut out: Vec<Option<Arc<Page>>> = vec![None; page_ids.len()];
+        let mut hit_count = 0u64;
+        for shard_idx in 0..CACHE_SHARDS {
+            let indices =
+                &shard_request_indices[shard_offsets[shard_idx]..shard_offsets[shard_idx + 1]];
+            if indices.is_empty() {
+                continue;
+            }
+            let shard = self.shards[shard_idx].read();
+            for &request_idx in indices {
+                if let Some(page) = shard.get(page_ids[request_idx]) {
+                    out[request_idx] = Some(page);
+                    hit_count += 1;
+                }
+            }
+        }
+        if hit_count != 0 {
+            self.hits.fetch_add(hit_count, Ordering::Relaxed);
+        }
+
+        if hit_count != page_ids.len() as u64 {
+            // Shard-grouped probes write hits back to their original slots, so
+            // a linear scan recovers misses in deterministic input order.
+            let miss_request_indices: Vec<usize> = out
+                .iter()
+                .enumerate()
+                .filter_map(|(request_idx, page)| page.is_none().then_some(request_idx))
+                .collect();
+            self.misses
+                .fetch_add(miss_request_indices.len() as u64, Ordering::Relaxed);
+            let miss_page_ids: Vec<PageId> = miss_request_indices
+                .iter()
+                .map(|&request_idx| page_ids[request_idx])
+                .collect();
+            let loaded = self.page_store.read_pages(&miss_page_ids)?;
+            if loaded.len() != miss_page_ids.len() {
+                return Err(MetaDbError::Corruption(format!(
+                    "page_cache unique read returned {} pages for {} requests",
+                    loaded.len(),
+                    miss_page_ids.len()
+                )));
+            }
+            for ((request_idx, page_id), page) in miss_request_indices
+                .into_iter()
+                .zip(miss_page_ids)
+                .zip(loaded)
+            {
+                let shard_idx = self.shard_idx(page_id);
+                let arc = if let Some(existing) = self.shards[shard_idx].read().get(page_id) {
+                    existing
+                } else {
+                    let page = Arc::new(page);
+                    let is_index = matches!(
+                        page.header().map(|h| h.page_type),
+                        Ok(crate::page::PageType::PagedIndex)
+                    );
+                    if is_index && self.pin(page_id, page.clone()) {
+                        page
+                    } else {
+                        let mut shard = self.shards[shard_idx].write();
+                        if let Some(existing) = shard.get(page_id) {
+                            existing
+                        } else {
+                            self.apply_insert_outcome(shard.insert(page_id, page.clone()));
+                            page
+                        }
+                    }
+                };
+                out[request_idx] = Some(arc);
+            }
+        }
+
+        out.into_iter()
+            .map(|page| {
+                page.ok_or_else(|| {
+                    MetaDbError::Corruption("page_cache unique read left an empty result".into())
+                })
+            })
+            .collect()
+    }
+
     /// Visit distinct page runs while preserving cache statistics in logical
     /// request units. Cached pages are borrowed under one read lock per shard,
     /// avoiding an `Arc` clone for every covered refcount entry. Misses retain
@@ -733,6 +851,64 @@ mod tests {
         assert_eq!(after.hits - before.hits, 7);
         assert_eq!(after.misses - before.misses, 1);
         assert_eq!(after.current_pages, 3);
+    }
+
+    #[test]
+    fn unique_batch_preserves_order_and_counts_hits_and_misses() {
+        let (_dir, ps, cache) = mk_cache(64);
+        let allocated: Vec<PageId> = (0..33).map(|_| ps.allocate().unwrap()).collect();
+        let p0 = allocated[0];
+        let p1 = allocated[16];
+        let p2 = allocated[32];
+        write_page(&ps, p0, 10);
+        write_page(&ps, p1, 20);
+        write_page(&ps, p2, 30);
+        cache.get(p0).unwrap();
+        cache.get(p2).unwrap();
+        let before = cache.stats();
+
+        let pages = cache.get_many_unique(&[p2, p1, p0]).unwrap();
+        let generations: Vec<u64> = pages
+            .iter()
+            .map(|page| page.header().unwrap().generation)
+            .collect();
+        assert_eq!(generations, vec![30, 20, 10]);
+
+        let after = cache.stats();
+        assert_eq!(after.hits - before.hits, 2);
+        assert_eq!(after.misses - before.misses, 1);
+        assert_eq!(after.current_pages, 3);
+    }
+
+    #[test]
+    fn unique_batch_reads_existing_pages_with_zero_cache_capacity() {
+        let (_dir, ps, cache) = mk_cache(0);
+        let p0 = ps.allocate().unwrap();
+        let p1 = ps.allocate().unwrap();
+        write_page(&ps, p0, 10);
+        write_page(&ps, p1, 20);
+        let before = cache.stats();
+
+        let pages = cache.get_many_unique(&[p1, p0]).unwrap();
+        let generations: Vec<u64> = pages
+            .iter()
+            .map(|page| page.header().unwrap().generation)
+            .collect();
+        assert_eq!(generations, vec![20, 10]);
+
+        let after = cache.stats();
+        assert_eq!(after.hits - before.hits, 0);
+        assert_eq!(after.misses - before.misses, 2);
+        assert_eq!(after.current_pages, 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "get_many_unique requires distinct page ids")]
+    fn unique_batch_debug_contract_rejects_duplicate_ids() {
+        let (_dir, ps, cache) = mk_cache(8);
+        let page_id = ps.allocate().unwrap();
+        cache.get_many_unique(&[page_id, page_id]).unwrap();
     }
 
     #[test]

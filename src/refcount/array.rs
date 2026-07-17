@@ -678,7 +678,7 @@ impl PagedRefcountArray {
             .iter()
             .map(|&position| page_bases[position].page_id)
             .collect();
-        let clean_pages = match self.page_cache.get_many(&clean_page_ids) {
+        let clean_pages = match self.page_cache.get_many_unique(&clean_page_ids) {
             Ok(clean_pages) => clean_pages,
             Err(err) => {
                 self.abort_unstaged_page_bases(page_bases);
