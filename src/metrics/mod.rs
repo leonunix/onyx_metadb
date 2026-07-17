@@ -38,37 +38,6 @@ pub(crate) struct DedupPutStageTimings {
     pub cuckoo_bucket_lock_wait: Duration,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct RefcountBaseLookupProfile {
-    pub output_init: Duration,
-    pub inner_lock_wait: Duration,
-    pub page_resolve: Duration,
-    pub request_materialize: Duration,
-    pub cache_probe: Duration,
-    pub decode: Duration,
-    pub pbas: u64,
-    pub page_runs: u64,
-    pub hole_runs: u64,
-    pub overlay_runs: u64,
-    pub clean_runs: u64,
-}
-
-impl RefcountBaseLookupProfile {
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.output_init += other.output_init;
-        self.inner_lock_wait += other.inner_lock_wait;
-        self.page_resolve += other.page_resolve;
-        self.request_materialize += other.request_materialize;
-        self.cache_probe += other.cache_probe;
-        self.decode += other.decode;
-        self.pbas = self.pbas.saturating_add(other.pbas);
-        self.page_runs = self.page_runs.saturating_add(other.page_runs);
-        self.hole_runs = self.hole_runs.saturating_add(other.hole_runs);
-        self.overlay_runs = self.overlay_runs.saturating_add(other.overlay_runs);
-        self.clean_runs = self.clean_runs.saturating_add(other.clean_runs);
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct MetaMetrics {
     commit_attempts: AtomicU64,
@@ -312,23 +281,8 @@ pub struct MetaMetrics {
     apply_refcount_breakdown_sampled_pbas: AtomicU64,
     apply_refcount_pba_grouping_us: AtomicU64,
     apply_refcount_pba_grouping_max_us: AtomicU64,
-    apply_refcount_actions_sort_us: AtomicU64,
-    apply_refcount_actions_sort_sampled_actions: AtomicU64,
-    apply_refcount_stage_sampled_us: AtomicU64,
-    apply_refcount_pbas_materialize_us: AtomicU64,
     apply_refcount_base_page_lookup_us: AtomicU64,
     apply_refcount_base_page_lookup_max_us: AtomicU64,
-    apply_refcount_base_profiled_pbas: AtomicU64,
-    apply_refcount_base_page_runs: AtomicU64,
-    apply_refcount_base_hole_runs: AtomicU64,
-    apply_refcount_base_overlay_runs: AtomicU64,
-    apply_refcount_base_clean_runs: AtomicU64,
-    apply_refcount_base_output_init_us: AtomicU64,
-    apply_refcount_base_inner_lock_wait_us: AtomicU64,
-    apply_refcount_base_page_resolve_us: AtomicU64,
-    apply_refcount_base_request_materialize_us: AtomicU64,
-    apply_refcount_base_cache_probe_us: AtomicU64,
-    apply_refcount_base_decode_us: AtomicU64,
     apply_refcount_base_lookup_attempts: AtomicU64,
     apply_refcount_epoch_retries: AtomicU64,
     apply_refcount_fold_lock_wait_us: AtomicU64,
@@ -566,9 +520,6 @@ pub struct MetaMetrics {
     // sum above, and `flush_rc_stream_service_us` (write service).
     flush_rc_fold_service_us: AtomicU64,
     flush_rc_fold_service_max_us: AtomicU64,
-    flush_rc_fold_validate_us: AtomicU64,
-    flush_rc_fold_stage_us: AtomicU64,
-    flush_rc_fold_remove_us: AtomicU64,
     // Data-page IO performed inside bounded streaming RC checkpoint chunks,
     // before the lifecycle's global `flush_io` timer starts.
     flush_rc_stream_calls: AtomicU64,
@@ -883,11 +834,6 @@ fn record_duration(total: &AtomicU64, max: &AtomicU64, elapsed: Duration) {
     fetch_max(max, us);
 }
 
-fn add_duration(total: &AtomicU64, elapsed: Duration) {
-    let us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
-    total.fetch_add(us, Ordering::Relaxed);
-}
-
 fn record_batch_duration(total: &AtomicU64, max: &AtomicU64, count: u64, elapsed: Duration) {
     let us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
     total.fetch_add(us, Ordering::Relaxed);
@@ -928,25 +874,8 @@ mod tests {
         metrics.record_apply_refcount_batch_breakdown(
             11,
             7,
-            Duration::from_micros(130),
-            Duration::from_micros(14),
-            11,
-            Duration::from_micros(150),
-            Duration::from_micros(16),
-            Duration::from_micros(30),
-            RefcountBaseLookupProfile {
-                output_init: Duration::from_micros(1),
-                inner_lock_wait: Duration::from_micros(2),
-                page_resolve: Duration::from_micros(3),
-                request_materialize: Duration::from_micros(4),
-                cache_probe: Duration::from_micros(5),
-                decode: Duration::from_micros(6),
-                pbas: 8,
-                page_runs: 4,
-                hole_runs: 1,
-                overlay_runs: 1,
-                clean_runs: 2,
-            },
+            Duration::from_micros(13),
+            Duration::from_micros(17),
             Duration::from_micros(19),
             Duration::from_micros(23),
             Duration::from_micros(29),
@@ -959,16 +888,11 @@ mod tests {
             5,
             3,
             Duration::from_micros(101),
-            Duration::from_micros(20),
-            0,
             Duration::from_micros(103),
-            Duration::from_micros(105),
             Duration::from_micros(107),
-            RefcountBaseLookupProfile::default(),
             Duration::from_micros(109),
             Duration::from_micros(113),
             Duration::from_micros(127),
-            Duration::from_micros(129),
             3,
             2,
             0,
@@ -978,25 +902,10 @@ mod tests {
         assert_eq!(snapshot.apply_refcount_batch_actions, 16);
         assert_eq!(snapshot.apply_refcount_batch_pbas, 10);
         assert_eq!(snapshot.apply_refcount_breakdown_sampled_pbas, 7);
-        assert_eq!(snapshot.apply_refcount_pba_grouping_us, 231);
-        assert_eq!(snapshot.apply_refcount_pba_grouping_max_us, 130);
-        assert_eq!(snapshot.apply_refcount_actions_sort_us, 14);
-        assert_eq!(snapshot.apply_refcount_actions_sort_sampled_actions, 11);
-        assert_eq!(snapshot.apply_refcount_stage_sampled_us, 150);
-        assert_eq!(snapshot.apply_refcount_pbas_materialize_us, 16);
-        assert_eq!(snapshot.apply_refcount_base_page_lookup_us, 30);
-        assert_eq!(snapshot.apply_refcount_base_page_lookup_max_us, 30);
-        assert_eq!(snapshot.apply_refcount_base_profiled_pbas, 8);
-        assert_eq!(snapshot.apply_refcount_base_page_runs, 4);
-        assert_eq!(snapshot.apply_refcount_base_hole_runs, 1);
-        assert_eq!(snapshot.apply_refcount_base_overlay_runs, 1);
-        assert_eq!(snapshot.apply_refcount_base_clean_runs, 2);
-        assert_eq!(snapshot.apply_refcount_base_output_init_us, 1);
-        assert_eq!(snapshot.apply_refcount_base_inner_lock_wait_us, 2);
-        assert_eq!(snapshot.apply_refcount_base_page_resolve_us, 3);
-        assert_eq!(snapshot.apply_refcount_base_request_materialize_us, 4);
-        assert_eq!(snapshot.apply_refcount_base_cache_probe_us, 5);
-        assert_eq!(snapshot.apply_refcount_base_decode_us, 6);
+        assert_eq!(snapshot.apply_refcount_pba_grouping_us, 114);
+        assert_eq!(snapshot.apply_refcount_pba_grouping_max_us, 101);
+        assert_eq!(snapshot.apply_refcount_base_page_lookup_us, 17);
+        assert_eq!(snapshot.apply_refcount_base_page_lookup_max_us, 17);
         assert_eq!(snapshot.apply_refcount_base_lookup_attempts, 4);
         assert_eq!(snapshot.apply_refcount_epoch_retries, 2);
         assert_eq!(snapshot.apply_refcount_fold_lock_wait_us, 19);
@@ -1009,9 +918,6 @@ mod tests {
         let json = snapshot.to_json();
         assert!(json.contains("\"apply_refcount_batch_count\":2"));
         assert!(json.contains("\"apply_refcount_breakdown_sampled_pbas\":7"));
-        assert!(json.contains("\"apply_refcount_stage_sampled_us\":150"));
-        assert!(json.contains("\"apply_refcount_base_page_runs\":4"));
-        assert!(json.contains("\"apply_refcount_base_cache_probe_us\":5"));
         assert!(json.contains("\"apply_refcount_base_lookup_attempts\":4"));
         assert!(json.contains("\"apply_refcount_epoch_retries\":2"));
         assert!(json.contains("\"apply_refcount_fold_lock_wait_us\":19"));
@@ -1029,8 +935,6 @@ mod tests {
         metrics.record_flush_rc_fold_lock_wait(13);
         metrics.record_flush_rc_fold_service(31);
         metrics.record_flush_rc_fold_service(47);
-        metrics.record_flush_rc_fold_breakdown(2, 3, 5);
-        metrics.record_flush_rc_fold_breakdown(7, 11, 13);
         metrics.record_flush_io_pages(26);
         metrics.record_flush_sample_workload(5, 101, 0, 12);
 
@@ -1045,9 +949,6 @@ mod tests {
         assert_eq!(snapshot.flush_rc_fold_lock_wait_max_us, 13);
         assert_eq!(snapshot.flush_rc_fold_service_us, 78);
         assert_eq!(snapshot.flush_rc_fold_service_max_us, 47);
-        assert_eq!(snapshot.flush_rc_fold_validate_us, 9);
-        assert_eq!(snapshot.flush_rc_fold_stage_us, 14);
-        assert_eq!(snapshot.flush_rc_fold_remove_us, 18);
         assert_eq!(snapshot.flush_pages_written, 26);
         assert_eq!(
             snapshot.flush_io_bytes_total,
@@ -1067,9 +968,6 @@ mod tests {
         assert!(json.contains("\"flush_rc_fold_lock_wait_max_us\":13"));
         assert!(json.contains("\"flush_rc_fold_service_us\":78"));
         assert!(json.contains("\"flush_rc_fold_service_max_us\":47"));
-        assert!(json.contains("\"flush_rc_fold_validate_us\":9"));
-        assert!(json.contains("\"flush_rc_fold_stage_us\":14"));
-        assert!(json.contains("\"flush_rc_fold_remove_us\":18"));
         assert!(json.contains("\"flush_sample_rc_staged_pages\":12"));
     }
 }

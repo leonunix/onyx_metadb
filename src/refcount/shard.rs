@@ -78,16 +78,12 @@ use super::array::{
 use super::delta::{DeltaMap, Pending};
 use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
-use crate::metrics::RefcountBaseLookupProfile;
 use crate::page_store::PageStore;
 use crate::types::{Bfg, Lsn, PageId, Pba};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RefcountApplyStageTimings {
-    pub stage_sampled: Duration,
-    pub pbas_materialize: Duration,
     pub base_page_lookup: Duration,
-    pub base_profile: RefcountBaseLookupProfile,
     pub fold_lock_wait: Duration,
     pub slot_lock_wait: Duration,
     pub pending_slot_scan: Duration,
@@ -98,7 +94,7 @@ pub(crate) struct RefcountApplyStageTimings {
 }
 
 #[inline]
-pub(crate) fn sample_refcount_breakdown(lsn: Lsn) -> bool {
+fn sample_refcount_breakdown(lsn: Lsn) -> bool {
     // Mix the commit LSN before sampling so BFG and checkpoint periods do not
     // alias with the sample selector. Every bucket in one commit still makes
     // the same decision, preserving the commit's complete PBA shape.
@@ -332,11 +328,6 @@ pub struct RcCheckpoint {
     /// Time spent folding array/slot state, excluding streaming page writes.
     /// Starts only after `fold_lock.write()` has been acquired.
     fold_service_us: u64,
-    /// Streaming fold service split. These three regions are disjoint subsets
-    /// of `fold_service_us` modulo timer overhead.
-    fold_validate_us: u64,
-    fold_stage_us: u64,
-    fold_remove_us: u64,
     streaming_write_stats: RcStreamingWriteStats,
     streaming: bool,
     /// The slot's drained entries + which slot they came from — restored
@@ -430,14 +421,6 @@ impl RcCheckpoint {
 
     pub(crate) fn fold_service_us(&self) -> u64 {
         self.fold_service_us
-    }
-
-    pub(crate) fn fold_breakdown_us(&self) -> (u64, u64, u64) {
-        (
-            self.fold_validate_us,
-            self.fold_stage_us,
-            self.fold_remove_us,
-        )
     }
 
     #[cfg(test)]
@@ -666,13 +649,9 @@ impl RcShard {
         // its complete per-shard PBA shape while only about 1/16 commits pay
         // the per-action timestamp cost.
         let sample_breakdown = sample_refcount_breakdown(lsn);
-        let stage_started = sample_breakdown.then(Instant::now);
-        let pbas_started = sample_breakdown.then(Instant::now);
         let pbas: Vec<Pba> = actions.iter().map(|(pba, _)| *pba).collect();
-        let pbas_materialize = pbas_started.map_or(Duration::ZERO, |started| started.elapsed());
         let open_idx = slot_index(bfg);
         let mut base_page_lookup = Duration::ZERO;
-        let mut base_profile = RefcountBaseLookupProfile::default();
         let mut fold_lock_wait = Duration::ZERO;
         let mut slot_lock_wait = Duration::ZERO;
         let mut base_lookup_attempts = 0u64;
@@ -681,14 +660,7 @@ impl RcShard {
             let epoch_before = self.fold_epoch.load(Ordering::Acquire);
             base_lookup_attempts = base_lookup_attempts.saturating_add(1);
             let lookup_started = sample_breakdown.then(Instant::now);
-            let bases = if sample_breakdown {
-                let (bases, lookup_profile) =
-                    self.array.get_many_sorted_with_page_lsn_profiled(&pbas)?;
-                base_profile.merge(lookup_profile);
-                bases
-            } else {
-                self.array.get_many_sorted_with_page_lsn(&pbas)?
-            };
+            let bases = self.array.get_many_sorted_with_page_lsn(&pbas)?;
             base_page_lookup += lookup_started.map_or(Duration::ZERO, |start| start.elapsed());
 
             #[cfg(test)]
@@ -774,14 +746,10 @@ impl RcShard {
                 )?);
             }
         }
-        let stage_sampled = stage_started.map_or(Duration::ZERO, |started| started.elapsed());
         Ok((
             out,
             RefcountApplyStageTimings {
-                stage_sampled,
-                pbas_materialize,
                 base_page_lookup,
-                base_profile,
                 fold_lock_wait,
                 slot_lock_wait,
                 pending_slot_scan,
@@ -918,9 +886,6 @@ impl RcShard {
                 streamed_pages: Vec::new(),
                 fold_lock_wait_us: 0,
                 fold_service_us: 0,
-                fold_validate_us: 0,
-                fold_stage_us: 0,
-                fold_remove_us: 0,
                 streaming_write_stats: RcStreamingWriteStats::default(),
                 streaming: true,
                 drained_deltas: Vec::new(),
@@ -936,9 +901,6 @@ impl RcShard {
         let mut streamed_pages = Vec::new();
         let mut fold_lock_wait_us = 0u64;
         let mut fold_service_us = 0u64;
-        let mut fold_validate_us = 0u64;
-        let mut fold_stage_us = 0u64;
-        let mut fold_remove_us = 0u64;
         let mut streaming_write_stats = RcStreamingWriteStats::default();
 
         #[cfg(test)]
@@ -975,7 +937,6 @@ impl RcShard {
                 // The Syncing slot is frozen. Validate the exact snapshot before
                 // publishing so a violated BFG invariant cannot make us delete a
                 // newer or unrelated pending delta.
-                let validate_started = Instant::now();
                 {
                     let slot = self.delta_slots[restore_slot].lock();
                     for &(pba, pending) in &drained[cursor..end] {
@@ -986,30 +947,16 @@ impl RcShard {
                         }
                     }
                 }
-                fold_validate_us = fold_validate_us.saturating_add(
-                    validate_started
-                        .elapsed()
-                        .as_micros()
-                        .min(u128::from(u64::MAX)) as u64,
-                );
 
                 // `stage_deltas_in_memory_preserving` is failure-atomic for this
                 // chunk: on error it removes every overlay/fresh reservation it
                 // published. The slot is still intact until the call succeeds.
-                let stage_started = Instant::now();
                 let staged = self.array.stage_deltas_in_memory_preserving(
                     &mut drained[cursor..end],
                     false,
                     &[],
                 )?;
-                fold_stage_us = fold_stage_us.saturating_add(
-                    stage_started
-                        .elapsed()
-                        .as_micros()
-                        .min(u128::from(u64::MAX)) as u64,
-                );
 
-                let remove_started = Instant::now();
                 let mut slot = self.delta_slots[restore_slot].lock();
                 let mut removed = Vec::with_capacity(end - cursor);
                 for &(pba, pending) in &drained[cursor..end] {
@@ -1031,12 +978,6 @@ impl RcShard {
                     }
                 }
                 drop(slot);
-                fold_remove_us = fold_remove_us.saturating_add(
-                    remove_started
-                        .elapsed()
-                        .as_micros()
-                        .min(u128::from(u64::MAX)) as u64,
-                );
                 Ok(staged)
             })();
             drop(epoch_guard);
@@ -1109,9 +1050,6 @@ impl RcShard {
             streamed_pages,
             fold_lock_wait_us,
             fold_service_us,
-            fold_validate_us,
-            fold_stage_us,
-            fold_remove_us,
             streaming_write_stats,
             streaming: true,
             drained_deltas: drained,
@@ -1226,9 +1164,6 @@ impl RcShard {
                 streamed_pages: Vec::new(),
                 fold_lock_wait_us: 0,
                 fold_service_us: 0,
-                fold_validate_us: 0,
-                fold_stage_us: 0,
-                fold_remove_us: 0,
                 streaming_write_stats: RcStreamingWriteStats::default(),
                 streaming: false,
                 drained_deltas: Vec::new(),
@@ -1263,27 +1198,17 @@ impl RcShard {
         // clearing the slots yet. `force` (cold lifecycle flush) applies
         // every delta despite the per-page replay-skip generation guard;
         // `force_increfs` is the always-apply / no-gen-bump snapshot incref.
-        let stage_started = Instant::now();
         let staged =
             self.array
                 .stage_deltas_in_memory_preserving(&mut drained, force, force_increfs)?;
-        let fold_stage_us = stage_started
-            .elapsed()
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64;
 
         // Publish is visible now; clear the folded slots. They are frozen
         // (Syncing / threads-off quiesce) so a fresh `DeltaMap` discards
         // exactly what we folded with no risk of dropping a concurrent
         // insert.
-        let remove_started = Instant::now();
         for &i in slots {
             *self.delta_slots[i].lock() = DeltaMap::new();
         }
-        let fold_remove_us = remove_started
-            .elapsed()
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64;
         drop(epoch_guard);
         drop(fold);
         let fold_service_us = fold_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -1295,9 +1220,6 @@ impl RcShard {
             streamed_pages: Vec::new(),
             fold_lock_wait_us,
             fold_service_us,
-            fold_validate_us: 0,
-            fold_stage_us,
-            fold_remove_us,
             streaming_write_stats: RcStreamingWriteStats::default(),
             streaming: false,
             drained_deltas: drained,

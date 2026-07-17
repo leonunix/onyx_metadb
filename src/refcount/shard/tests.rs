@@ -120,19 +120,6 @@ fn batch_get_and_stage_preserve_per_pba_results() {
     assert_eq!(timings.sampled_pbas, 3);
     assert_eq!(timings.base_lookup_attempts, 1);
     assert_eq!(timings.epoch_retries, 0);
-    assert_eq!(timings.base_profile.pbas, 3);
-    assert_eq!(timings.base_profile.page_runs, 1);
-    assert_eq!(timings.base_profile.hole_runs, 1);
-    assert_eq!(timings.base_profile.overlay_runs, 0);
-    assert_eq!(timings.base_profile.clean_runs, 0);
-    let profiled_lookup_sum = timings.base_profile.output_init
-        + timings.base_profile.inner_lock_wait
-        + timings.base_profile.page_resolve
-        + timings.base_profile.request_materialize
-        + timings.base_profile.cache_probe
-        + timings.base_profile.decode;
-    assert!(profiled_lookup_sum <= timings.base_page_lookup);
-    assert!(timings.base_page_lookup <= timings.stage_sampled);
     assert_eq!(s.get_many(&[30, 10, 99, 20]).unwrap(), vec![4, 1, 0, 5]);
 }
 
@@ -147,7 +134,6 @@ fn stage_batch_keeps_replay_skip_semantics() {
     assert_eq!(timings.sampled_pbas, 0);
     assert_eq!(timings.base_lookup_attempts, 1);
     assert_eq!(timings.epoch_retries, 0);
-    assert_eq!(timings.base_profile.pbas, 0);
     assert_eq!(s.get(10).unwrap(), 1);
 }
 
@@ -260,13 +246,6 @@ fn streaming_checkpoint_bounds_overlay_and_releases_chunk_page_arcs() {
     assert_eq!(stream.pages, PAGE_COUNT as u64);
     assert_eq!(stream.max_chunk_pages, CHUNK_PAGES as u64);
     assert!(stream.max_chunk_us <= stream.service_us);
-    let (validate_us, stage_us, remove_us) = ckpt.fold_breakdown_us();
-    assert!(
-        validate_us
-            .saturating_add(stage_us)
-            .saturating_add(remove_us)
-            <= ckpt.fold_service_us()
-    );
     assert_eq!(hook.chunks.load(Ordering::SeqCst), 3);
     assert!(hook.max_chunk_pages.load(Ordering::Relaxed) <= CHUNK_PAGES);
     assert!(hook.max_overlay_pages.load(Ordering::Relaxed) <= CHUNK_PAGES);
