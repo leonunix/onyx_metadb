@@ -65,7 +65,6 @@
 //! merging. Checkpoint publish takes `fold_lock.write()` before touching its
 //! slot. Read-only cumulative lookups take at most one slot at a time.
 
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -153,22 +152,12 @@ fn merge_staged_action(
     replay_skip: bool,
     base: RcEntry,
     page_lsn: Lsn,
-    mut net: i64,
-    mut max_lsn: Lsn,
-    mut any: bool,
+    net: i64,
+    max_lsn: Lsn,
+    any: bool,
     context: &'static str,
     zero_decref_is_noop: bool,
 ) -> Result<(u32, u32)> {
-    // Probe the open slot once: its existing Pending participates in the
-    // cumulative pre-state, and the same Entry is updated only after every
-    // replay/underflow check succeeds.
-    let entry = open.entry(pba);
-    if let Entry::Occupied(occupied) = &entry {
-        let pending = occupied.get();
-        net += pending.delta;
-        max_lsn = max_lsn.max(pending.last_lsn);
-        any = true;
-    }
     if replay_skip && !any && page_lsn >= lsn {
         return Ok((base.rc, base.rc));
     }
@@ -184,17 +173,7 @@ fn merge_staged_action(
         super::note_decref_underflow_skip(delta, lsn, merged_prev.rc, context);
         return Ok((merged_prev.rc, merged_prev.rc));
     }
-    match entry {
-        Entry::Occupied(mut occupied) => {
-            occupied.get_mut().merge(delta, lsn);
-        }
-        Entry::Vacant(vacant) => {
-            vacant.insert(Pending {
-                delta,
-                last_lsn: lsn,
-            });
-        }
-    }
+    open.merge(pba, delta, lsn);
     Ok((merged_prev.rc, post.rc))
 }
 
@@ -725,8 +704,7 @@ impl RcShard {
         if sample_breakdown {
             for (action_idx, &(pba, delta)) in actions.iter().enumerate() {
                 let scan_started = Instant::now();
-                let (net, max_lsn, any) =
-                    scan_active_locked_pending(&slots, active_slots & !(1 << open_idx), pba);
+                let (net, max_lsn, any) = scan_active_locked_pending(&slots, active_slots, pba);
                 pending_slot_scan += scan_started.elapsed();
 
                 let (base, page_lsn) = bases[action_idx];
@@ -750,8 +728,7 @@ impl RcShard {
             }
         } else {
             for (action_idx, &(pba, delta)) in actions.iter().enumerate() {
-                let (net, max_lsn, any) =
-                    scan_active_locked_pending(&slots, active_slots & !(1 << open_idx), pba);
+                let (net, max_lsn, any) = scan_active_locked_pending(&slots, active_slots, pba);
                 let (base, page_lsn) = bases[action_idx];
                 out.push(merge_staged_action(
                     &mut slots[open_idx],
@@ -853,8 +830,7 @@ impl RcShard {
             // cannot clear the matching pending delta until this merge ends.
             let mut slots: Vec<_> = self.delta_slots.iter().map(|slot| slot.lock()).collect();
             drop(fold);
-            let (net, max_lsn, any) =
-                scan_active_locked_pending(&slots, ALL_SLOT_MASK & !(1 << open_idx), pba);
+            let (net, max_lsn, any) = scan_active_locked_pending(&slots, ALL_SLOT_MASK, pba);
             return merge_staged_action(
                 &mut slots[open_idx],
                 pba,

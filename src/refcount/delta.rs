@@ -10,7 +10,7 @@
 //! in-memory accumulator that lets us amortise per-op cost (replacing
 //! the O(log N) B+tree write per op with O(1) HashMap merge).
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
 
 use crate::types::{Lsn, Pba};
 use crate::u64_hash::U64BuildHasher;
@@ -25,13 +25,6 @@ pub struct Pending {
     pub last_lsn: Lsn,
 }
 
-impl Pending {
-    pub(crate) fn merge(&mut self, delta: i64, lsn: Lsn) {
-        self.delta = self.delta.saturating_add(delta);
-        self.last_lsn = self.last_lsn.max(lsn);
-    }
-}
-
 #[derive(Default)]
 pub struct DeltaMap {
     inner: HashMap<Pba, Pending, U64BuildHasher>,
@@ -43,15 +36,15 @@ impl DeltaMap {
     }
 
     pub fn merge(&mut self, pba: Pba, delta: i64, lsn: Lsn) {
-        self.inner.entry(pba).or_default().merge(delta, lsn);
+        let slot = self.inner.entry(pba).or_default();
+        slot.delta = slot.delta.saturating_add(delta);
+        if lsn > slot.last_lsn {
+            slot.last_lsn = lsn;
+        }
     }
 
     pub fn get(&self, pba: Pba) -> Option<Pending> {
         self.inner.get(&pba).copied()
-    }
-
-    pub(crate) fn entry(&mut self, pba: Pba) -> Entry<'_, Pba, Pending> {
-        self.inner.entry(pba)
     }
 
     /// Remove one exact PBA from a frozen checkpoint slot.
@@ -91,10 +84,11 @@ impl DeltaMap {
     /// unflushed deltas, and by the backpressure fallback path that
     /// rolls a draining batch back into `delta_active`.
     pub fn merge_pending(&mut self, pba: Pba, pending: Pending) {
-        self.inner
-            .entry(pba)
-            .or_default()
-            .merge(pending.delta, pending.last_lsn);
+        let slot = self.inner.entry(pba).or_default();
+        slot.delta = slot.delta.saturating_add(pending.delta);
+        if pending.last_lsn > slot.last_lsn {
+            slot.last_lsn = pending.last_lsn;
+        }
     }
 
     /// Iterate without consuming. Used by the drainer to clone the
