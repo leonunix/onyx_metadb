@@ -522,17 +522,37 @@ impl PagedRefcountArray {
         force: bool,
         force_increfs: &[Pba],
     ) -> Result<StagedDeltas> {
+        // Stable ordering preserves the former slot-by-slot insertion order
+        // when the all-slot recovery path contributes the same PBA more than
+        // once. Production's one-slot fold has distinct PBAs.
+        deltas.sort_by_key(|(pba, _)| page_offset(*pba).0);
+        self.stage_sorted_deltas_in_memory_preserving(deltas, force, force_increfs)
+    }
+
+    /// Stage deltas already grouped in nondecreasing refcount-page order.
+    /// Streaming checkpoints establish this order before taking the fold write
+    /// lock, so repeating the stable sort in the lock only extends foreground
+    /// apply stalls. Generic all-slot/recovery callers use the sorting wrapper
+    /// above to preserve duplicate-PBA relative order. Callers of this core
+    /// retain responsibility for the order of duplicates within one page.
+    pub(crate) fn stage_sorted_deltas_in_memory_preserving(
+        &self,
+        deltas: &[(Pba, Pending)],
+        force: bool,
+        force_increfs: &[Pba],
+    ) -> Result<StagedDeltas> {
         if deltas.is_empty() && force_increfs.is_empty() {
             return Ok(StagedDeltas {
                 pages: Vec::new(),
                 max_lsn: 0,
             });
         }
-
-        // Stable ordering preserves the former slot-by-slot insertion order
-        // when the all-slot recovery path contributes the same PBA more than
-        // once. Production's one-slot fold has distinct PBAs.
-        deltas.sort_by_key(|(pba, _)| page_offset(*pba).0);
+        debug_assert!(
+            deltas
+                .windows(2)
+                .all(|pair| { page_offset(pair[0].0).0 <= page_offset(pair[1].0).0 }),
+            "presorted refcount staging requires nondecreasing page indexes"
+        );
 
         // Force-increfs grouped by data page. A page may appear in both maps
         // (a snapshot root that also took a COW delta this cycle) or only
@@ -555,8 +575,10 @@ impl PagedRefcountArray {
             }
         }
         page_idxs.extend(force_by_page.keys().copied());
-        page_idxs.sort_unstable();
-        page_idxs.dedup();
+        if !force_by_page.is_empty() {
+            page_idxs.sort_unstable();
+            page_idxs.dedup();
+        }
 
         let mut pages = Vec::with_capacity(page_idxs.len());
         let mut delta_cursor = 0;

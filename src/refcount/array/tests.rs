@@ -210,6 +210,70 @@ fn checkpoint_stage_preserves_rollback_deltas_while_grouping_pages() {
 }
 
 #[test]
+fn presorted_checkpoint_stage_matches_generic_grouping() {
+    let (_generic_dir, generic) = make_array();
+    let (_sorted_dir, sorted) = make_array();
+    let p0 = 7;
+    let p0_next = 8;
+    let p1 = (ENTRIES_PER_PAGE + 9) as Pba;
+    let seed = vec![(p0, pending(1, 100))];
+    generic.apply_deltas(seed.clone()).unwrap();
+    sorted.apply_deltas(seed).unwrap();
+
+    let mut generic_deltas = vec![
+        (p1, pending(3, 202)),
+        (p0_next, pending(2, 201)),
+        (p0, pending(5, 90)),
+    ];
+    let sorted_deltas = vec![
+        (p0_next, pending(2, 201)),
+        (p0, pending(5, 90)),
+        (p1, pending(3, 202)),
+    ];
+    let generic_staged = generic
+        .stage_deltas_in_memory_preserving(&mut generic_deltas, false, &[])
+        .unwrap();
+    let sorted_staged = sorted
+        .stage_sorted_deltas_in_memory_preserving(&sorted_deltas, false, &[])
+        .unwrap();
+
+    assert_eq!(generic_staged.pages.len(), 2);
+    assert_eq!(sorted_staged.pages.len(), 2);
+    for pba in [p0, p0_next, p1] {
+        assert_eq!(generic.get(pba).unwrap(), sorted.get(pba).unwrap());
+        assert_eq!(
+            generic.page_lsn(pba).unwrap(),
+            sorted.page_lsn(pba).unwrap()
+        );
+    }
+    // The older p0 delta is replay-skipped by both paths.
+    assert_eq!(sorted.get(p0).unwrap().rc, 1);
+    assert_eq!(sorted.get(p0_next).unwrap().rc, 2);
+    assert_eq!(sorted.get(p1).unwrap().rc, 3);
+}
+
+#[test]
+fn presorted_checkpoint_stage_preserves_force_incref_semantics() {
+    let (_dir, array) = make_array();
+    let p0 = 7;
+    let p0_next = 8;
+    let p1 = (ENTRIES_PER_PAGE + 9) as Pba;
+    array.apply_deltas(vec![(p0, pending(1, 100))]).unwrap();
+
+    let deltas = vec![(p0_next, pending(2, 200))];
+    let staged = array
+        .stage_sorted_deltas_in_memory_preserving(&deltas, false, &[p0_next, p1, p1])
+        .unwrap();
+
+    assert_eq!(staged.pages.len(), 2);
+    assert_eq!(array.get(p0).unwrap().rc, 1);
+    assert_eq!(array.get(p0_next).unwrap().rc, 3);
+    assert_eq!(array.get(p1).unwrap().rc, 2);
+    assert_eq!(array.page_lsn(p0).unwrap(), 200);
+    assert_eq!(array.page_lsn(p1).unwrap(), 0);
+}
+
+#[test]
 fn batch_get_returns_entries_and_page_generations_in_input_order() {
     let (_dir, a) = make_array();
     let p0 = 5;
