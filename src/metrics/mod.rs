@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use parking_lot::RwLock;
+
 use crate::config::MAX_APPLY_LANE_SHARDS;
 
 /// Newtype around `[AtomicU64; MAX_APPLY_LANE_SHARDS]` so the H2
@@ -477,6 +479,11 @@ pub struct MetaMetrics {
     // 0 = threads-off/all-slots, 1 = threads-on legacy one-shot,
     // 2 = threads-on bounded streaming. Set once when Db is opened.
     rc_checkpoint_mode: AtomicU64,
+    /// The BFG state machine permits Syncing N and Quiescing N+1 at the same
+    /// time. Keep those two timelines independent so a status snapshot cannot
+    /// combine one generation's phase with the other's start timestamp.
+    checkpoint_sync_state: RwLock<CheckpointSyncState>,
+    checkpoint_quiesce_state: RwLock<CheckpointQuiesceState>,
     flush_calls: AtomicU64,
     flush_calls_steady: AtomicU64,
     flush_calls_forced: AtomicU64,
@@ -814,6 +821,88 @@ pub enum FlushKind {
     Forced,
 }
 
+/// Low-frequency checkpoint phase exposed for live correlation with commit
+/// completions. Values are stable because external probes persist the numeric
+/// code alongside structured phase-transition events.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum CheckpointSyncPhase {
+    Idle = 0,
+    CycleStart = 1,
+    DedupDrain = 2,
+    L2pFold = 3,
+    Sample = 4,
+    SampleWaitRefcount = 5,
+    Io = 6,
+    PublishBarrier = 7,
+    Manifest = 8,
+    Install = 9,
+    PrefoldWait = 10,
+    Reclaim = 11,
+    Complete = 12,
+    Error = 13,
+}
+
+impl CheckpointSyncPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::CycleStart => "cycle_start",
+            Self::DedupDrain => "dedup_drain",
+            Self::L2pFold => "l2p_fold",
+            Self::Sample => "sample",
+            Self::SampleWaitRefcount => "sample_wait_refcount",
+            Self::Io => "io",
+            Self::PublishBarrier => "publish_barrier",
+            Self::Manifest => "manifest",
+            Self::Install => "install",
+            Self::PrefoldWait => "prefold_wait",
+            Self::Reclaim => "reclaim",
+            Self::Complete => "complete",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct CheckpointSyncState {
+    bfg: u64,
+    kind: u64,
+    phase: u64,
+    transition_seq: u64,
+    sync_started_unix_us: u64,
+    phase_started_unix_us: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum CheckpointQuiescePhase {
+    Idle = 0,
+    Quiesce = 1,
+    AwaitSync = 2,
+    Error = 3,
+}
+
+impl CheckpointQuiescePhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Quiesce => "quiesce",
+            Self::AwaitSync => "await_sync",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct CheckpointQuiesceState {
+    bfg: u64,
+    phase: u64,
+    transition_seq: u64,
+    quiesce_started_unix_us: u64,
+    phase_started_unix_us: u64,
+}
+
 mod json;
 mod recording;
 mod snapshot;
@@ -853,6 +942,92 @@ fn fetch_max(slot: &AtomicU64, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_phase_lanes_stay_consistent_when_generations_overlap() {
+        let metrics = MetaMetrics::default();
+        let initial = metrics.snapshot();
+        assert_eq!(initial.checkpoint_sync_transition_seq, 0);
+        assert_eq!(initial.checkpoint_quiesce_transition_seq, 0);
+
+        metrics.record_checkpoint_sync_phase(
+            41,
+            FlushKind::Forced,
+            CheckpointSyncPhase::CycleStart,
+            Some(900),
+        );
+        let sync_start = metrics.snapshot();
+        assert_eq!(sync_start.checkpoint_sync_bfg, 41);
+        assert_eq!(sync_start.checkpoint_sync_kind, 1);
+        assert_eq!(
+            sync_start.checkpoint_sync_phase,
+            CheckpointSyncPhase::CycleStart as u64
+        );
+        assert_eq!(sync_start.checkpoint_sync_transition_seq, 1);
+        assert!(sync_start.checkpoint_sync_started_unix_us > 0);
+
+        // Quiescing N+1 is legal while N is still syncing. Updating that lane
+        // must not rewrite N's identity or start timestamp.
+        metrics.record_checkpoint_quiesce_phase(42, CheckpointQuiescePhase::Quiesce);
+        metrics.record_checkpoint_sync_phase(
+            41,
+            FlushKind::Forced,
+            CheckpointSyncPhase::Io,
+            Some(901),
+        );
+        let overlapping = metrics.snapshot();
+        assert_eq!(overlapping.checkpoint_sync_bfg, 41);
+        assert_eq!(
+            overlapping.checkpoint_sync_started_unix_us,
+            sync_start.checkpoint_sync_started_unix_us
+        );
+        assert_eq!(overlapping.checkpoint_quiesce_bfg, 42);
+        assert_eq!(
+            overlapping.checkpoint_quiesce_phase,
+            CheckpointQuiescePhase::Quiesce as u64
+        );
+        assert_eq!(overlapping.checkpoint_quiesce_transition_seq, 1);
+        assert!(overlapping.checkpoint_quiesce_started_unix_us > 0);
+
+        metrics.record_checkpoint_quiesce_phase(42, CheckpointQuiescePhase::AwaitSync);
+        let awaiting = metrics.snapshot();
+        assert_eq!(awaiting.checkpoint_quiesce_transition_seq, 2);
+        assert_eq!(
+            awaiting.checkpoint_quiesce_started_unix_us,
+            overlapping.checkpoint_quiesce_started_unix_us
+        );
+
+        metrics.record_checkpoint_sync_phase(
+            41,
+            FlushKind::Forced,
+            CheckpointSyncPhase::Complete,
+            Some(902),
+        );
+        metrics.record_checkpoint_sync_phase(
+            41,
+            FlushKind::Forced,
+            CheckpointSyncPhase::Idle,
+            Some(902),
+        );
+        metrics.record_checkpoint_quiesce_phase(42, CheckpointQuiescePhase::Idle);
+        let idle = metrics.snapshot();
+        assert_eq!(idle.checkpoint_sync_phase, CheckpointSyncPhase::Idle as u64);
+        assert_eq!(idle.checkpoint_sync_transition_seq, 4);
+        assert_eq!(
+            idle.checkpoint_quiesce_phase,
+            CheckpointQuiescePhase::Idle as u64
+        );
+        assert_eq!(idle.checkpoint_quiesce_transition_seq, 3);
+
+        let json = idle.to_json();
+        assert!(json.contains("\"checkpoint_sync_bfg\":41"));
+        assert!(json.contains("\"checkpoint_sync_kind\":1"));
+        assert!(json.contains("\"checkpoint_sync_phase\":0"));
+        assert!(json.contains("\"checkpoint_sync_transition_seq\":4"));
+        assert!(json.contains("\"checkpoint_quiesce_bfg\":42"));
+        assert!(json.contains("\"checkpoint_quiesce_phase\":0"));
+        assert!(json.contains("\"checkpoint_quiesce_transition_seq\":3"));
+    }
 
     #[test]
     fn bfg_admission_wait_reaches_snapshot_and_json() {

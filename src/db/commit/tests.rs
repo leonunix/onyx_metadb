@@ -955,6 +955,7 @@ fn stage_ops_empty_batch_is_noop() {
 #[test]
 fn stage_ops_l2p_put_visible_to_reads() {
     let (_d, db) = mk_deferred_apply_db(true);
+    let before = db.metrics_snapshot();
     let ops: Vec<WalOp> = (0..32u64)
         .map(|i| WalOp::L2pPut {
             vol_ord: BOOTSTRAP_VOLUME_ORD,
@@ -963,12 +964,46 @@ fn stage_ops_l2p_put_visible_to_reads() {
         })
         .collect();
     let (lsn, outs) = db.stage_ops(&ops).unwrap();
+    let after = db.metrics_snapshot();
     assert!(lsn > 0);
     assert_eq!(outs.len(), 32);
+    assert_eq!(after.commit_attempts, before.commit_attempts + 1);
+    assert_eq!(after.commit_success, before.commit_success + 1);
+    assert_eq!(after.commit_errors, before.commit_errors);
+    assert_eq!(after.commit_ops, before.commit_ops + ops.len() as u64);
+    assert_eq!(db.last_applied_lsn(), lsn);
     for i in 0..32 {
         let got = db.get(BOOTSTRAP_VOLUME_ORD, 1_000 + i).unwrap();
         assert_eq!(got, Some(l2p_value_with_pba(0xCAFE + i)));
     }
+}
+
+#[test]
+fn stage_ops_error_does_not_increment_commit_success() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let faults = crate::testing::faults::FaultController::new();
+    let mut cfg = crate::config::Config::new(dir.path());
+    cfg.l2p_buffer_enabled = true;
+    cfg.commit_direct_apply_enabled = true;
+    let db = Db::create_with_config_and_faults(cfg, faults.clone()).unwrap();
+    let before = db.metrics_snapshot();
+    faults.install(
+        crate::testing::faults::FaultPoint::CommitPostApplyBeforeLsnBump,
+        1,
+        crate::testing::faults::FaultAction::Error,
+    );
+
+    let result = db.stage_ops(&[WalOp::L2pPut {
+        vol_ord: BOOTSTRAP_VOLUME_ORD,
+        lba: 77,
+        value: l2p_value_with_pba(0xCAFE),
+    }]);
+    assert!(result.is_err());
+    let after = db.metrics_snapshot();
+    assert_eq!(after.commit_attempts, before.commit_attempts + 1);
+    assert_eq!(after.commit_success, before.commit_success);
+    assert_eq!(after.commit_errors, before.commit_errors + 1);
+    assert_eq!(after.commit_ops, before.commit_ops + 1);
 }
 
 #[test]

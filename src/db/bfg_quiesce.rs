@@ -216,27 +216,85 @@ fn run_worker(inner: Arc<Inner>) {
         // Roll → promote → notify sync. roll_to_quiescing handles its own
         // shutdown check (returns current open_bfg without advancing) so
         // we re-check shutdown afterwards before promoting.
+        let target_bfg = inner.state.open_bfg();
+        inner.metrics.record_checkpoint_quiesce_phase(
+            target_bfg,
+            crate::metrics::CheckpointQuiescePhase::Quiesce,
+        );
         let bfg = inner.state.roll_to_quiescing();
-        if inner.shutdown.load(Ordering::Acquire) {
+        if inner.state.is_aborted() {
+            inner.metrics.record_checkpoint_quiesce_phase(
+                bfg,
+                crate::metrics::CheckpointQuiescePhase::Error,
+            );
             break;
         }
-        // If roll observed shutdown it returns `open_bfg` without flipping
-        // states — promote would panic in that case. Re-fetch snapshot to
-        // be safe; if quiescing_bfg isn't set, skip.
+        if inner.shutdown.load(Ordering::Acquire) {
+            inner
+                .metrics
+                .record_checkpoint_quiesce_phase(bfg, crate::metrics::CheckpointQuiescePhase::Idle);
+            break;
+        }
+        // Shutdown and abort were handled above. Any remaining mismatch is an
+        // invariant violation; stop this producer rather than notifying sync
+        // for a generation that was never promoted.
         let snapshot = inner.state.snapshot();
         if snapshot.quiescing_bfg != Some(bfg) {
-            // Roll did not advance (shutdown raced).
-            continue;
+            tracing::error!(
+                bfg,
+                quiescing_bfg = ?snapshot.quiescing_bfg,
+                "metadb: BfgQuiesceThread roll returned without a Quiescing BFG"
+            );
+            inner.metrics.record_checkpoint_quiesce_phase(
+                bfg,
+                crate::metrics::CheckpointQuiescePhase::Error,
+            );
+            break;
         }
         // Fault window between the Open -> Quiescing flip and
         // `promote_to_syncing`. Soak runs can crash here; recovery must rebuild
         // from the durable manifest and ignore this in-memory half-roll.
         if let Err(err) = inner.faults.inject(FaultPoint::BfgQuiesceMidway) {
             tracing::error!(error = %err, bfg, "metadb: BfgQuiesceThread fault-injected midway; skipping promote");
+            inner.metrics.record_checkpoint_quiesce_phase(
+                bfg,
+                crate::metrics::CheckpointQuiescePhase::Error,
+            );
             continue;
         }
+        inner.metrics.record_checkpoint_quiesce_phase(
+            bfg,
+            crate::metrics::CheckpointQuiescePhase::AwaitSync,
+        );
         inner.state.promote_to_syncing(bfg);
+        let promoted = inner.state.snapshot().syncing_bfg == Some(bfg);
+        if !promoted {
+            if inner.state.is_aborted() {
+                inner.metrics.record_checkpoint_quiesce_phase(
+                    bfg,
+                    crate::metrics::CheckpointQuiescePhase::Error,
+                );
+            } else if inner.shutdown.load(Ordering::Acquire) {
+                inner.metrics.record_checkpoint_quiesce_phase(
+                    bfg,
+                    crate::metrics::CheckpointQuiescePhase::Idle,
+                );
+            } else {
+                tracing::error!(
+                    bfg,
+                    "metadb: BFG promotion returned without installing Syncing"
+                );
+                inner.metrics.record_checkpoint_quiesce_phase(
+                    bfg,
+                    crate::metrics::CheckpointQuiescePhase::Error,
+                );
+            }
+            break;
+        }
         inner.sync_notifier.notify();
+        inner
+            .metrics
+            .record_checkpoint_quiesce_phase(bfg, crate::metrics::CheckpointQuiescePhase::Idle);
         deadline = Instant::now() + timeout;
     }
 }
@@ -456,11 +514,12 @@ mod tests {
         // and promote_to_syncing. With FaultAction::Error the worker
         // logs and continues to the next iteration without notifying
         // the sync thread — the open_bfg has advanced but the now-
-        // Quiescing BFG stays Quiescing (it'll be promoted on a
-        // subsequent successful cycle).
+        // Quiescing BFG stays Quiescing; production fault runs terminate or
+        // restart before this half-roll can be reused.
         use crate::testing::faults::FaultAction;
         let state = Arc::new(BfgStateMachine::new(0));
         let sync_n = Arc::new(SyncNotifier::new());
+        let metrics = noop_metrics();
         let sync_calls = Arc::new(AtomicU64::new(0));
         let calls = Arc::clone(&sync_calls);
         let work: super::super::bfg_sync::SyncWorkFn = Arc::new(move |_| {
@@ -483,7 +542,7 @@ mod tests {
             QuiesceParams {
                 bfg_timeout_ms: 60_000,
             },
-            noop_metrics(),
+            Arc::clone(&metrics),
             Arc::clone(&faults),
         );
         notifier.signal_force(state.open_bfg());
@@ -501,8 +560,78 @@ mod tests {
         assert!(s.syncing_bfg.is_none());
         assert_eq!(state.checkpoint_bfg(), 0);
         assert_eq!(sync_calls.load(Ordering::Acquire), 0);
+        let phase = metrics.snapshot();
+        assert_eq!(phase.checkpoint_quiesce_bfg, 1);
+        assert_eq!(
+            phase.checkpoint_quiesce_phase,
+            crate::metrics::CheckpointQuiescePhase::Error as u64
+        );
         // Clean shutdown still works.
         q.stop();
+    }
+
+    #[test]
+    fn abort_while_waiting_for_sync_slot_keeps_error_and_does_not_notify() {
+        let state = Arc::new(BfgStateMachine::new(0));
+        let first = state.roll_to_quiescing();
+        state.promote_to_syncing(first);
+        assert_eq!(state.snapshot().syncing_bfg, Some(1));
+
+        let sync_n = Arc::new(SyncNotifier::new());
+        let metrics = noop_metrics();
+        let notifier = Arc::new(QuiesceNotifier::new());
+        let mut q = BfgQuiesceThread::start(
+            Arc::clone(&state),
+            Arc::clone(&notifier),
+            Arc::clone(&sync_n),
+            QuiesceParams {
+                bfg_timeout_ms: 60_000,
+            },
+            Arc::clone(&metrics),
+            disabled_faults(),
+        );
+
+        notifier.signal_force(state.open_bfg());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && metrics.snapshot().checkpoint_quiesce_phase
+                != crate::metrics::CheckpointQuiescePhase::AwaitSync as u64
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let awaiting = metrics.snapshot();
+        assert_eq!(awaiting.checkpoint_quiesce_bfg, 2);
+        assert_eq!(
+            awaiting.checkpoint_quiesce_phase,
+            crate::metrics::CheckpointQuiescePhase::AwaitSync as u64
+        );
+        assert_eq!(state.snapshot().quiescing_bfg, Some(2));
+        assert!(!sync_n.has_pending_wake());
+
+        state.mark_aborted();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && metrics.snapshot().checkpoint_quiesce_phase
+                != crate::metrics::CheckpointQuiescePhase::Error as u64
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let failed = metrics.snapshot();
+        assert_eq!(failed.checkpoint_quiesce_bfg, 2);
+        assert_eq!(
+            failed.checkpoint_quiesce_phase,
+            crate::metrics::CheckpointQuiescePhase::Error as u64
+        );
+        assert_eq!(state.snapshot().syncing_bfg, Some(1));
+        assert_eq!(state.snapshot().quiescing_bfg, Some(2));
+        assert!(!sync_n.has_pending_wake());
+
+        q.stop();
+        assert_eq!(
+            metrics.snapshot().checkpoint_quiesce_phase,
+            crate::metrics::CheckpointQuiescePhase::Error as u64,
+            "shutdown must not erase the abort terminal state"
+        );
     }
 
     #[test]

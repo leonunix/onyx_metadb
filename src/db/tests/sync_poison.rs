@@ -58,6 +58,11 @@ fn no_hang_after_faulted_sync(threads: bool) {
         db.insert(vol, i, v(i as u8)).unwrap();
     }
     db.flush().unwrap();
+    assert_eq!(
+        db.metrics_snapshot().checkpoint_sync_phase,
+        crate::metrics::CheckpointSyncPhase::Idle as u64,
+        "successful forced cycle must publish an idle terminal phase"
+    );
 
     // Keep one brand-new RC data page exclusively in the BFG that the faulted
     // sync will fold. The stable RC meta head is rewritten in place before the
@@ -73,6 +78,11 @@ fn no_hang_after_faulted_sync(threads: bool) {
     assert!(
         first.is_err(),
         "faulted-sync snapshot must return Err, got {first:?}"
+    );
+    assert_eq!(
+        db.metrics_snapshot().checkpoint_sync_phase,
+        crate::metrics::CheckpointSyncPhase::Error as u64,
+        "faulted forced cycle must publish an error terminal phase"
     );
     assert!(
         faults.fired(FaultPoint::ManifestFsyncBefore),

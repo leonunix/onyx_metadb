@@ -2,8 +2,21 @@ use super::super::*;
 
 impl MetaMetrics {
     pub fn snapshot(&self) -> MetaMetricsSnapshot {
+        let checkpoint_sync = *self.checkpoint_sync_state.read();
+        let checkpoint_quiesce = *self.checkpoint_quiesce_state.read();
         MetaMetricsSnapshot {
             rc_checkpoint_mode: load(&self.rc_checkpoint_mode),
+            checkpoint_sync_bfg: checkpoint_sync.bfg,
+            checkpoint_sync_kind: checkpoint_sync.kind,
+            checkpoint_sync_phase: checkpoint_sync.phase,
+            checkpoint_sync_transition_seq: checkpoint_sync.transition_seq,
+            checkpoint_sync_started_unix_us: checkpoint_sync.sync_started_unix_us,
+            checkpoint_sync_phase_started_unix_us: checkpoint_sync.phase_started_unix_us,
+            checkpoint_quiesce_bfg: checkpoint_quiesce.bfg,
+            checkpoint_quiesce_phase: checkpoint_quiesce.phase,
+            checkpoint_quiesce_transition_seq: checkpoint_quiesce.transition_seq,
+            checkpoint_quiesce_started_unix_us: checkpoint_quiesce.quiesce_started_unix_us,
+            checkpoint_quiesce_phase_started_unix_us: checkpoint_quiesce.phase_started_unix_us,
             commit_attempts: load(&self.commit_attempts),
             commit_success: load(&self.commit_success),
             commit_errors: load(&self.commit_errors),

@@ -3,6 +3,20 @@ pub struct MetaMetricsSnapshot {
     /// 0 = threads-off/all-slots, 1 = threads-on legacy one-shot,
     /// 2 = threads-on bounded streaming.
     pub rc_checkpoint_mode: u64,
+    /// The sync worker and the next generation's quiesce worker may overlap;
+    /// each lane is therefore published as its own consistent snapshot.
+    /// Sync kind is 0 for steady and 1 for forced.
+    pub checkpoint_sync_bfg: u64,
+    pub checkpoint_sync_kind: u64,
+    pub checkpoint_sync_phase: u64,
+    pub checkpoint_sync_transition_seq: u64,
+    pub checkpoint_sync_started_unix_us: u64,
+    pub checkpoint_sync_phase_started_unix_us: u64,
+    pub checkpoint_quiesce_bfg: u64,
+    pub checkpoint_quiesce_phase: u64,
+    pub checkpoint_quiesce_transition_seq: u64,
+    pub checkpoint_quiesce_started_unix_us: u64,
+    pub checkpoint_quiesce_phase_started_unix_us: u64,
     pub commit_attempts: u64,
     pub commit_success: u64,
     pub commit_errors: u64,

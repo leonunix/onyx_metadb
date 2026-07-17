@@ -4,6 +4,84 @@ use std::time::Duration;
 use super::super::*;
 
 impl MetaMetrics {
+    pub(crate) fn record_checkpoint_sync_phase(
+        &self,
+        bfg: crate::types::Bfg,
+        kind: FlushKind,
+        phase: CheckpointSyncPhase,
+        last_applied_lsn: Option<u64>,
+    ) {
+        let transition_unix_us = unix_micros();
+        let kind_code = match kind {
+            FlushKind::Steady => 0,
+            FlushKind::Forced => 1,
+        };
+        let mut state = self.checkpoint_sync_state.write();
+        if phase == CheckpointSyncPhase::CycleStart
+            || state.bfg != bfg
+            || state.sync_started_unix_us == 0
+        {
+            state.sync_started_unix_us = transition_unix_us;
+        }
+        state.bfg = bfg;
+        state.kind = kind_code;
+        state.phase = phase as u64;
+        state.transition_seq = state.transition_seq.saturating_add(1);
+        state.phase_started_unix_us = transition_unix_us;
+        let published = *state;
+        drop(state);
+        let commit_success = self.commit_success.load(Ordering::Relaxed);
+        tracing::info!(
+            target: "metadb_checkpoint_phase",
+            lane = "sync_cycle",
+            bfg,
+            kind = ?kind,
+            phase = phase.as_str(),
+            phase_code = phase as u8,
+            phase_seq = published.transition_seq,
+            cycle_started_unix_us = published.sync_started_unix_us,
+            transition_unix_us,
+            commit_success,
+            last_applied_lsn = last_applied_lsn.unwrap_or_default(),
+            last_applied_valid = last_applied_lsn.is_some(),
+            "metadb: checkpoint phase transition"
+        );
+    }
+
+    pub(crate) fn record_checkpoint_quiesce_phase(
+        &self,
+        bfg: crate::types::Bfg,
+        phase: CheckpointQuiescePhase,
+    ) {
+        let transition_unix_us = unix_micros();
+        let mut state = self.checkpoint_quiesce_state.write();
+        if phase == CheckpointQuiescePhase::Quiesce
+            || state.bfg != bfg
+            || state.quiesce_started_unix_us == 0
+        {
+            state.quiesce_started_unix_us = transition_unix_us;
+        }
+        state.bfg = bfg;
+        state.phase = phase as u64;
+        state.transition_seq = state.transition_seq.saturating_add(1);
+        state.phase_started_unix_us = transition_unix_us;
+        let published = *state;
+        drop(state);
+        let commit_success = self.commit_success.load(Ordering::Relaxed);
+        tracing::info!(
+            target: "metadb_checkpoint_phase",
+            lane = "quiesce",
+            bfg,
+            phase = phase.as_str(),
+            phase_code = phase as u8,
+            phase_seq = published.transition_seq,
+            cycle_started_unix_us = published.quiesce_started_unix_us,
+            transition_unix_us,
+            commit_success,
+            "metadb: checkpoint phase transition"
+        );
+    }
+
     pub(crate) fn set_rc_checkpoint_mode(&self, bfg_threads: bool, streaming: bool) {
         let mode = if !bfg_threads {
             0
@@ -659,4 +737,12 @@ impl MetaMetrics {
         self.dedup_drainer_backpressure_drains
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn unix_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
 }

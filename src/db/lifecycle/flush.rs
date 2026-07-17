@@ -35,6 +35,22 @@ struct SyncCycleTrace {
 }
 
 impl SyncCycleTrace {
+    fn enter_phase(
+        &mut self,
+        db: &Db,
+        bfg: crate::types::Bfg,
+        kind: crate::metrics::FlushKind,
+        phase: crate::metrics::CheckpointSyncPhase,
+    ) {
+        self.terminal_phase = phase.as_str();
+        db.metrics.record_checkpoint_sync_phase(
+            bfg,
+            kind,
+            phase,
+            Some(db.last_applied_lsn_best_effort()),
+        );
+    }
+
     fn warn_if_slow(
         &self,
         bfg: crate::types::Bfg,
@@ -410,6 +426,12 @@ impl Db {
         match result {
             Ok(()) => {
                 self.bfg.mark_synced(target);
+                self.metrics.record_checkpoint_sync_phase(
+                    target,
+                    kind,
+                    crate::metrics::CheckpointSyncPhase::Idle,
+                    Some(self.last_applied_lsn_best_effort()),
+                );
                 Ok(true)
             }
             Err(err) => {
@@ -485,6 +507,12 @@ impl Db {
     ) -> Result<()> {
         let started = std::time::Instant::now();
         let mut trace = SyncCycleTrace::default();
+        trace.enter_phase(
+            self,
+            bfg,
+            kind,
+            crate::metrics::CheckpointSyncPhase::CycleStart,
+        );
         // Capture before the syncing-slot drain clears buffered entries. The
         // slow-cycle trace can then prove the admission cohort bound directly.
         trace.bfg_l2p_work = self.bfg.slot_l2p_work(bfg) as u64;
@@ -497,6 +525,9 @@ impl Db {
             started.elapsed(),
             &result,
         );
+        if result.is_err() {
+            trace.enter_phase(self, bfg, kind, crate::metrics::CheckpointSyncPhase::Error);
+        }
         result
     }
 
@@ -572,7 +603,12 @@ impl Db {
         let _dedup_drainer_resume_guard = DedupDrainerResumeGuard {
             dedup_index: &self.dedup_index,
         };
-        trace.terminal_phase = "dedup_drain";
+        trace.enter_phase(
+            self,
+            bfg,
+            kind,
+            crate::metrics::CheckpointSyncPhase::DedupDrain,
+        );
         let dedup_drain_started = std::time::Instant::now();
         let dedup_drain_result = self
             .dedup_index
@@ -594,7 +630,12 @@ impl Db {
         //   drainer): `force_compact_l2p_buffers` folds ALL slots so a
         //   single flush persists everything. Lifecycle ops also use the
         //   drain-all path under `drop_gate.write`.
-        trace.terminal_phase = "l2p_fold";
+        trace.enter_phase(
+            self,
+            bfg,
+            kind,
+            crate::metrics::CheckpointSyncPhase::L2pFold,
+        );
         let l2p_fold_started = std::time::Instant::now();
         let l2p_fold_result = if self.bfg_threads_enabled {
             self.drain_syncing_slot_into_trees(bfg)
@@ -606,7 +647,7 @@ impl Db {
         self.metrics.record_flush_l2p_fold(l2p_fold_elapsed);
         l2p_fold_result?;
 
-        trace.terminal_phase = "sample";
+        trace.enter_phase(self, bfg, kind, crate::metrics::CheckpointSyncPhase::Sample);
         let sample_started = std::time::Instant::now();
         // `slot_max_lsn(bfg)` is the BFG-frozen high-water LSN of
         // commits stamped to the Syncing slot. `promote_to_syncing`
@@ -742,7 +783,12 @@ impl Db {
             self.metrics.record_flush_sample(kind, sample_elapsed);
             self.metrics
                 .record_flush_total(kind, flush_started.elapsed());
-            trace.terminal_phase = "complete";
+            trace.enter_phase(
+                self,
+                bfg,
+                kind,
+                crate::metrics::CheckpointSyncPhase::Complete,
+            );
             return Ok(());
         }
         let lock_started = std::time::Instant::now();
@@ -903,6 +949,12 @@ impl Db {
         // sole drainer) folds every slot, mirroring `force_compact_l2p_buffers`.
         let bfg_threads_enabled = self.bfg_threads_enabled;
         let rc_checkpoint_streaming_enabled = self.rc_checkpoint_streaming_enabled;
+        trace.enter_phase(
+            self,
+            bfg,
+            kind,
+            crate::metrics::CheckpointSyncPhase::SampleWaitRefcount,
+        );
         let rc_drain_started = std::time::Instant::now();
         let rc_results: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> =
             std::thread::scope(|scope| {
@@ -1082,7 +1134,7 @@ impl Db {
         // `apply_gate.write()` for its narrow window.
         let prefold_ticket = self.request_l2p_prefold(bfg);
 
-        trace.terminal_phase = "io";
+        trace.enter_phase(self, bfg, kind, crate::metrics::CheckpointSyncPhase::Io);
         let io_started = std::time::Instant::now();
         let mut total_pages_written = 0usize;
         let mut sealed_pages = Vec::new();
@@ -1389,14 +1441,24 @@ impl Db {
         // io_uring priority class is unavailable and background writes share
         // chunklet stripe locks with the final manifest page. Any wait belongs
         // here, outside both gate wait and gate hold.
-        trace.terminal_phase = "publish_barrier";
+        trace.enter_phase(
+            self,
+            bfg,
+            kind,
+            crate::metrics::CheckpointSyncPhase::PublishBarrier,
+        );
         let publish_barrier_started = std::time::Instant::now();
         let publish_io_guard = self.page_store.checkpoint_publish_io_guard();
         let publish_barrier_elapsed = publish_barrier_started.elapsed();
         trace.publish_barrier_wait_us = micros(publish_barrier_elapsed);
         self.metrics
             .record_flush_publish_barrier_wait(publish_barrier_elapsed);
-        trace.terminal_phase = "manifest";
+        trace.enter_phase(
+            self,
+            bfg,
+            kind,
+            crate::metrics::CheckpointSyncPhase::Manifest,
+        );
         let manifest_started = std::time::Instant::now();
         // BFG gate-shrink: manifest publication uses two short
         // `apply_gate.write()` windows. This first window reconciles raced
@@ -1937,7 +1999,12 @@ impl Db {
         // is no longer reachable for these.
         drop(refcount_checkpoints);
 
-        trace.terminal_phase = "install";
+        trace.enter_phase(
+            self,
+            bfg,
+            kind,
+            crate::metrics::CheckpointSyncPhase::Install,
+        );
         let install_started = std::time::Instant::now();
         let mut install_receivers = Vec::new();
         for (volume, (checkpoints, flushed)) in volumes
@@ -2034,7 +2101,12 @@ impl Db {
         }
 
         if let Some(ticket) = prefold_ticket {
-            trace.terminal_phase = "prefold_wait";
+            trace.enter_phase(
+                self,
+                bfg,
+                kind,
+                crate::metrics::CheckpointSyncPhase::PrefoldWait,
+            );
             let successor = ticket.bfg;
             let prefold_wait_started = std::time::Instant::now();
             let prefold_result = self.wait_l2p_prefold(ticket);
@@ -2056,7 +2128,12 @@ impl Db {
             }
         }
 
-        trace.terminal_phase = "reclaim";
+        trace.enter_phase(
+            self,
+            bfg,
+            kind,
+            crate::metrics::CheckpointSyncPhase::Reclaim,
+        );
         let reclaim_started = std::time::Instant::now();
         let deferred_before = self.page_store.deferred_free_len();
         if self.async_reclaim_active() {
@@ -2109,7 +2186,12 @@ impl Db {
         self.metrics.record_flush_reclaim(reclaim_elapsed);
         self.metrics
             .record_flush_total(kind, flush_started.elapsed());
-        trace.terminal_phase = "complete";
+        trace.enter_phase(
+            self,
+            bfg,
+            kind,
+            crate::metrics::CheckpointSyncPhase::Complete,
+        );
         Ok(())
     }
 

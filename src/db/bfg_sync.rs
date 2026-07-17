@@ -218,6 +218,11 @@ impl SyncNotifier {
         *wake = true;
         self.cv.notify_all();
     }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_wake(&self) -> bool {
+        *self.wake.lock()
+    }
 }
 
 impl Default for SyncNotifier {
@@ -327,6 +332,12 @@ fn run_worker(inner: Arc<Inner>) {
         match (inner.sync_work)(bfg) {
             Ok(()) => {
                 inner.state.mark_synced(bfg);
+                inner.metrics.record_checkpoint_sync_phase(
+                    bfg,
+                    crate::metrics::FlushKind::Forced,
+                    crate::metrics::CheckpointSyncPhase::Idle,
+                    None,
+                );
             }
             Err(err) => {
                 tracing::error!(error = %err, bfg, "metadb: BfgSyncThread cycle failed; BFG stays Syncing (sync subsystem poisoned; restart required)");
