@@ -146,6 +146,10 @@ pub enum PageType {
     /// catalog bytes) owned by [`crate::manifest::catalog`]; the chain kind
     /// (volumes vs snapshots) is recorded in `key_count`.
     ManifestCatalog = 15,
+    /// Immutable page in a bounded refcount delta run. Records are sorted by
+    /// PBA and carry a signed delta plus the last LSN contributing to that
+    /// delta. Layout is owned by [`crate::refcount::delta_run`].
+    RefcountDeltaRun = 16,
 }
 
 impl PageType {
@@ -167,6 +171,7 @@ impl PageType {
             13 => Self::DeadListSegment,
             14 => Self::LiveListSegment,
             15 => Self::ManifestCatalog,
+            16 => Self::RefcountDeltaRun,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }

@@ -344,6 +344,12 @@ pub struct Config {
     /// does not change BFG rolling, shard selection, or commit concurrency.
     pub rc_checkpoint_streaming_enabled: bool,
 
+    /// Build the proposed immutable refcount delta-run encoding from each
+    /// frozen BFG slot and discard it after recording size/CPU metrics. This is
+    /// a shadow-only experiment: it does not allocate page ids, write pages,
+    /// change manifest state, or alter the authoritative paged-array fold.
+    pub rc_delta_run_shadow_enabled: bool,
+
     /// Fan the per-BFG L2P syncing-slot drain out across shards (one task
     /// per shard) instead of folding them serially on the single
     /// `metadb-bfg-sync` thread. Each shard is independent (own `tree`
@@ -715,6 +721,9 @@ impl Config {
             // workers are enabled. Tests/benchmarks can disable it explicitly
             // to recover the legacy one-shot memory shape.
             rc_checkpoint_streaming_enabled: true,
+            // L3 format experiment only. Keep disabled unless a controlled
+            // aged run is measuring the exact frozen-slot record stream.
+            rc_delta_run_shadow_enabled: false,
             // Parallel per-shard L2P drain default-OFF: an earlier nvme-box
             // run regressed 3-4x after its workers escaped the background CPU
             // domain, and L2P was not the only healthy-window gate. Keep this
@@ -769,5 +778,10 @@ mod tests {
     #[test]
     fn default_l2p_buffer_budget_matches_production_admission_semantics() {
         assert_eq!(Config::new("unused").l2p_buffer_soft_entries, 4_000_000);
+    }
+
+    #[test]
+    fn rc_delta_run_shadow_defaults_off() {
+        assert!(!Config::new("unused").rc_delta_run_shadow_enabled);
     }
 }

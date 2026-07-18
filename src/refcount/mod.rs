@@ -16,6 +16,7 @@
 
 pub mod array;
 pub mod delta;
+pub(crate) mod delta_run;
 pub mod overlay;
 pub mod shard;
 
@@ -58,6 +59,13 @@ impl RefcountRouting {
             25 => Some(Self::LegacyPbaHash),
             26 => Some(Self::PageAffine),
             _ => None,
+        }
+    }
+
+    pub(crate) const fn manifest_version(self) -> u32 {
+        match self {
+            Self::LegacyPbaHash => 25,
+            Self::PageAffine => 26,
         }
     }
 

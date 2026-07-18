@@ -1206,6 +1206,8 @@ fn rc_authoritative_bfg_threads_rc_exact_across_checkpoints() {
             .saturating_mul(crate::config::PAGE_SIZE as u64)
     );
     assert!(metrics.flush_rc_fold_service_us > 0);
+    assert_eq!(metrics.flush_rc_delta_shadow_runs, 0);
+    assert_eq!(metrics.flush_rc_delta_shadow_errors, 0);
 }
 
 /// The production binary keeps an exact A/B escape hatch for the old
@@ -1240,7 +1242,50 @@ fn rc_checkpoint_streaming_toggle_selects_legacy_threads_on_path() {
     assert_eq!(metrics.rc_checkpoint_mode, 1);
     assert_eq!(metrics.flush_rc_stream_calls, 0);
     assert_eq!(metrics.flush_rc_stream_pages, 0);
+    assert_eq!(metrics.flush_rc_delta_shadow_runs, 0);
     assert!(metrics.flush_pages_written > 0);
+}
+
+/// L3 shadow mode must observe the exact frozen-slot stream without becoming
+/// part of durability. The authoritative array remains the only persisted RC
+/// state, and reopen works with the shadow switch disabled.
+#[test]
+fn rc_delta_run_shadow_measures_without_changing_recovery() {
+    let dir = TempDir::new().unwrap();
+    {
+        let mut cfg = rc_auth_cfg(dir.path(), true);
+        cfg.rc_delta_run_shadow_enabled = true;
+        let db = Db::create_with_config(cfg).unwrap();
+
+        for generation in 1u64..=8 {
+            let mut tx = db.begin();
+            tx.l2p_remap(
+                BOOTSTRAP_VOLUME_ORD,
+                generation,
+                remap_val(8_000 + generation, generation as u8),
+                None,
+            );
+            tx.commit_with_outcomes().unwrap();
+            db.flush().unwrap();
+        }
+
+        for generation in 1u64..=8 {
+            assert_eq!(db.get_refcount(8_000 + generation).unwrap(), 1);
+        }
+        let metrics = db.metrics_snapshot();
+        assert!(metrics.flush_rc_delta_shadow_runs > 0);
+        assert!(metrics.flush_rc_delta_shadow_records >= 8);
+        assert!(metrics.flush_rc_delta_shadow_pages > 0);
+        assert!(metrics.flush_rc_delta_shadow_payload_bytes > 0);
+        assert_eq!(metrics.flush_rc_delta_shadow_errors, 0);
+    }
+
+    let db = Db::open_with_config(rc_auth_cfg(dir.path(), true)).unwrap();
+    for generation in 1u64..=8 {
+        assert_eq!(db.get_refcount(8_000 + generation).unwrap(), 1);
+    }
+    let metrics = db.metrics_snapshot();
+    assert_eq!(metrics.flush_rc_delta_shadow_runs, 0);
 }
 
 /// Checkpoint → durable → reopen preserves rc. metadb has no data-plane WAL,

@@ -949,6 +949,7 @@ impl Db {
         // sole drainer) folds every slot, mirroring `force_compact_l2p_buffers`.
         let bfg_threads_enabled = self.bfg_threads_enabled;
         let rc_checkpoint_streaming_enabled = self.rc_checkpoint_streaming_enabled;
+        let rc_delta_run_shadow_enabled = self.rc_delta_run_shadow_enabled;
         trace.enter_phase(
             self,
             bfg,
@@ -963,7 +964,13 @@ impl Db {
                     if selected.rc[s_idx] {
                         let h = scope.spawn(move || {
                             if bfg_threads_enabled && rc_checkpoint_streaming_enabled {
-                                shard.rc.begin_checkpoint_streaming(bfg)
+                                shard.rc.begin_checkpoint_streaming_shadow(
+                                    bfg,
+                                    shard.routing.manifest_version(),
+                                    s_idx as u32,
+                                    wal_checkpoint,
+                                    rc_delta_run_shadow_enabled,
+                                )
                             } else if bfg_threads_enabled {
                                 shard.rc.begin_checkpoint(bfg)
                             } else {
@@ -986,6 +993,7 @@ impl Db {
         let mut refcount_checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>> =
             (0..self.refcount_shards.len()).map(|_| None).collect();
         let mut rc_stream_stats = crate::refcount::shard::RcStreamingWriteStats::default();
+        let mut rc_delta_shadow_stats = crate::refcount::shard::RcDeltaShadowStats::default();
         let mut rc_fold_lock_wait_us = 0u64;
         let mut rc_fold_service_us = 0u64;
         let mut sample_err: Option<MetaDbError> = None;
@@ -995,6 +1003,7 @@ impl Db {
                 None => continue,
                 Some(Ok(ckpt)) => {
                     rc_stream_stats.merge(ckpt.streaming_write_stats());
+                    rc_delta_shadow_stats.merge(ckpt.delta_shadow_stats());
                     rc_fold_lock_wait_us =
                         rc_fold_lock_wait_us.saturating_add(ckpt.fold_lock_wait_us());
                     rc_fold_service_us = rc_fold_service_us.saturating_add(ckpt.fold_service_us());
@@ -1022,6 +1031,17 @@ impl Db {
             rc_stream_stats.service_us,
             rc_stream_stats.max_chunk_us,
             rc_stream_stats.max_chunk_pages,
+        );
+        self.metrics.record_flush_rc_delta_shadow(
+            rc_delta_shadow_stats.runs,
+            rc_delta_shadow_stats.records,
+            rc_delta_shadow_stats.pages,
+            rc_delta_shadow_stats.payload_bytes,
+            rc_delta_shadow_stats.encode_us,
+            rc_delta_shadow_stats.max_encode_us,
+            rc_delta_shadow_stats.verify_us,
+            rc_delta_shadow_stats.max_verify_us,
+            rc_delta_shadow_stats.errors,
         );
         self.metrics
             .record_flush_rc_fold_lock_wait(rc_fold_lock_wait_us);

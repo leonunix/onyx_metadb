@@ -343,6 +343,10 @@ pub struct Db {
     /// the threads-on RC checkpoint implementation; false selects the legacy
     /// one-shot fold/write path for an exact A/B.
     pub(crate) rc_checkpoint_streaming_enabled: bool,
+    /// Cached copy of `Config::rc_delta_run_shadow_enabled`. When enabled the
+    /// checkpoint measures a candidate immutable delta-run codec but still
+    /// persists the existing refcount array pages as the sole authority.
+    pub(crate) rc_delta_run_shadow_enabled: bool,
     /// Cached copy of `Config::parallel_l2p_drain_enabled`. Fans the
     /// per-BFG L2P syncing-slot drain out across shards when `true`.
     pub(crate) parallel_l2p_drain_enabled: bool,

@@ -239,6 +239,36 @@ impl MetaMetrics {
         fetch_max(&self.flush_rc_stream_max_chunk_pages, max_chunk_pages);
     }
 
+    pub(crate) fn record_flush_rc_delta_shadow(
+        &self,
+        runs: u64,
+        records: u64,
+        pages: u64,
+        payload_bytes: u64,
+        encode_us: u64,
+        encode_max_us: u64,
+        verify_us: u64,
+        verify_max_us: u64,
+        errors: u64,
+    ) {
+        self.flush_rc_delta_shadow_runs
+            .fetch_add(runs, Ordering::Relaxed);
+        self.flush_rc_delta_shadow_records
+            .fetch_add(records, Ordering::Relaxed);
+        self.flush_rc_delta_shadow_pages
+            .fetch_add(pages, Ordering::Relaxed);
+        self.flush_rc_delta_shadow_payload_bytes
+            .fetch_add(payload_bytes, Ordering::Relaxed);
+        self.flush_rc_delta_shadow_encode_us
+            .fetch_add(encode_us, Ordering::Relaxed);
+        fetch_max(&self.flush_rc_delta_shadow_encode_max_us, encode_max_us);
+        self.flush_rc_delta_shadow_verify_us
+            .fetch_add(verify_us, Ordering::Relaxed);
+        fetch_max(&self.flush_rc_delta_shadow_verify_max_us, verify_max_us);
+        self.flush_rc_delta_shadow_errors
+            .fetch_add(errors, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_flush_rc_fold_service(&self, service_us: u64) {
         self.flush_rc_fold_service_us
             .fetch_add(service_us, Ordering::Relaxed);

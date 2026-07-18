@@ -329,6 +329,7 @@ pub struct RcCheckpoint {
     /// Starts only after `fold_lock.write()` has been acquired.
     fold_service_us: u64,
     streaming_write_stats: RcStreamingWriteStats,
+    delta_shadow_stats: RcDeltaShadowStats,
     streaming: bool,
     /// The slot's drained entries + which slot they came from — restored
     /// by `abort_checkpoint` so a retry redoes the fold.
@@ -354,6 +355,36 @@ pub(crate) struct RcStreamingWriteStats {
     pub service_us: u64,
     pub max_chunk_us: u64,
     pub max_chunk_pages: u64,
+}
+
+/// Candidate delta-run encoding work completed in shadow mode. These values
+/// never describe durable pages; the authoritative paged-array checkpoint runs
+/// unchanged in the same cycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RcDeltaShadowStats {
+    pub runs: u64,
+    pub records: u64,
+    pub pages: u64,
+    pub payload_bytes: u64,
+    pub encode_us: u64,
+    pub max_encode_us: u64,
+    pub verify_us: u64,
+    pub max_verify_us: u64,
+    pub errors: u64,
+}
+
+impl RcDeltaShadowStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.runs = self.runs.saturating_add(other.runs);
+        self.records = self.records.saturating_add(other.records);
+        self.pages = self.pages.saturating_add(other.pages);
+        self.payload_bytes = self.payload_bytes.saturating_add(other.payload_bytes);
+        self.encode_us = self.encode_us.saturating_add(other.encode_us);
+        self.max_encode_us = self.max_encode_us.max(other.max_encode_us);
+        self.verify_us = self.verify_us.saturating_add(other.verify_us);
+        self.max_verify_us = self.max_verify_us.max(other.max_verify_us);
+        self.errors = self.errors.saturating_add(other.errors);
+    }
 }
 
 impl RcStreamingWriteStats {
@@ -413,6 +444,10 @@ impl RcCheckpoint {
 
     pub(crate) fn streaming_write_stats(&self) -> RcStreamingWriteStats {
         self.streaming_write_stats
+    }
+
+    pub(crate) fn delta_shadow_stats(&self) -> RcDeltaShadowStats {
+        self.delta_shadow_stats
     }
 
     pub(crate) fn fold_lock_wait_us(&self) -> u64 {
@@ -864,13 +899,43 @@ impl RcShard {
     /// write CQEs complete. The checkpoint retained by the manifest phase is
     /// compact metadata only.
     pub(crate) fn begin_checkpoint_streaming(&self, bfg: Bfg) -> Result<RcCheckpoint> {
-        self.begin_checkpoint_streaming_capped(bfg, STAGE_BASE_READ_BATCH_PAGES)
+        self.begin_checkpoint_streaming_shadow(bfg, 26, u32::MAX, 0, false)
+    }
+
+    pub(crate) fn begin_checkpoint_streaming_shadow(
+        &self,
+        bfg: Bfg,
+        routing_version: u32,
+        shard_id: u32,
+        covered_lsn_max: Lsn,
+        delta_shadow_enabled: bool,
+    ) -> Result<RcCheckpoint> {
+        self.begin_checkpoint_streaming_capped_shadow(
+            bfg,
+            STAGE_BASE_READ_BATCH_PAGES,
+            routing_version,
+            shard_id,
+            covered_lsn_max,
+            delta_shadow_enabled,
+        )
     }
 
     fn begin_checkpoint_streaming_capped(
         &self,
         bfg: Bfg,
         max_unique_pages: usize,
+    ) -> Result<RcCheckpoint> {
+        self.begin_checkpoint_streaming_capped_shadow(bfg, max_unique_pages, 26, u32::MAX, 0, false)
+    }
+
+    fn begin_checkpoint_streaming_capped_shadow(
+        &self,
+        bfg: Bfg,
+        max_unique_pages: usize,
+        routing_version: u32,
+        shard_id: u32,
+        covered_lsn_max: Lsn,
+        delta_shadow_enabled: bool,
     ) -> Result<RcCheckpoint> {
         let restore_slot = slot_index(bfg);
         let mut drained: Vec<(Pba, Pending)> = {
@@ -887,6 +952,7 @@ impl RcShard {
                 fold_lock_wait_us: 0,
                 fold_service_us: 0,
                 streaming_write_stats: RcStreamingWriteStats::default(),
+                delta_shadow_stats: RcDeltaShadowStats::default(),
                 streaming: true,
                 drained_deltas: Vec::new(),
                 restore_slot,
@@ -895,7 +961,61 @@ impl RcShard {
             });
         }
 
-        drained.sort_by_key(|(pba, _)| (*pba as usize) / ENTRIES_PER_PAGE);
+        let delta_shadow_stats = if delta_shadow_enabled {
+            let started = Instant::now();
+            // Exact key ordering is part of the candidate format. Its cost is
+            // deliberately included in encode_us. The disabled path below
+            // retains the legacy page-index-only sort verbatim.
+            drained.sort_by_key(|(pba, _)| *pba);
+            let covered_lsn_min = drained
+                .iter()
+                .map(|(_, pending)| pending.last_lsn)
+                .min()
+                .unwrap_or(0);
+            let context = super::delta_run::DeltaRunContext::for_manifest_routing(
+                routing_version,
+                shard_id,
+                bfg,
+                covered_lsn_min,
+                covered_lsn_max,
+            );
+            match super::delta_run::measure_shadow_run_with_context(context, &drained) {
+                Ok(measured) => {
+                    let total_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                    let encode_us = total_us.saturating_sub(measured.verify_us);
+                    RcDeltaShadowStats {
+                        runs: 1,
+                        records: measured.records,
+                        pages: measured.pages,
+                        payload_bytes: measured.payload_bytes,
+                        encode_us,
+                        max_encode_us: encode_us,
+                        verify_us: measured.verify_us,
+                        max_verify_us: measured.verify_us,
+                        errors: 0,
+                    }
+                }
+                Err(err) => {
+                    let encode_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                    tracing::warn!(
+                        shard_id,
+                        bfg,
+                        covered_lsn_max,
+                        error = %err,
+                        "refcount delta-run shadow encoding failed; continuing authoritative checkpoint"
+                    );
+                    RcDeltaShadowStats {
+                        encode_us,
+                        max_encode_us: encode_us,
+                        errors: 1,
+                        ..RcDeltaShadowStats::default()
+                    }
+                }
+            }
+        } else {
+            drained.sort_by_key(|(pba, _)| (*pba as usize) / ENTRIES_PER_PAGE);
+            RcDeltaShadowStats::default()
+        };
         let max_unique_pages = max_unique_pages.max(1);
         let mut cursor = 0;
         let mut streamed_pages = Vec::new();
@@ -1051,6 +1171,7 @@ impl RcShard {
             fold_lock_wait_us,
             fold_service_us,
             streaming_write_stats,
+            delta_shadow_stats,
             streaming: true,
             drained_deltas: drained,
             restore_slot,
@@ -1165,6 +1286,7 @@ impl RcShard {
                 fold_lock_wait_us: 0,
                 fold_service_us: 0,
                 streaming_write_stats: RcStreamingWriteStats::default(),
+                delta_shadow_stats: RcDeltaShadowStats::default(),
                 streaming: false,
                 drained_deltas: Vec::new(),
                 restore_slot,
@@ -1221,6 +1343,7 @@ impl RcShard {
             fold_lock_wait_us,
             fold_service_us,
             streaming_write_stats: RcStreamingWriteStats::default(),
+            delta_shadow_stats: RcDeltaShadowStats::default(),
             streaming: false,
             drained_deltas: drained,
             restore_slot,

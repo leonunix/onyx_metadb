@@ -534,6 +534,18 @@ pub struct MetaMetrics {
     flush_rc_stream_service_us: AtomicU64,
     flush_rc_stream_max_chunk_us: AtomicU64,
     flush_rc_stream_max_chunk_pages: AtomicU64,
+    // Default-off L3 shadow codec. The authoritative RC paged-array path still
+    // runs unchanged; page/byte counts are a data-page lower bound and exclude
+    // a future manifest locator, run catalog, and sparse index.
+    flush_rc_delta_shadow_runs: AtomicU64,
+    flush_rc_delta_shadow_records: AtomicU64,
+    flush_rc_delta_shadow_pages: AtomicU64,
+    flush_rc_delta_shadow_payload_bytes: AtomicU64,
+    flush_rc_delta_shadow_encode_us: AtomicU64,
+    flush_rc_delta_shadow_encode_max_us: AtomicU64,
+    flush_rc_delta_shadow_verify_us: AtomicU64,
+    flush_rc_delta_shadow_verify_max_us: AtomicU64,
+    flush_rc_delta_shadow_errors: AtomicU64,
     flush_io_us: AtomicU64,
     flush_io_max_us: AtomicU64,
     flush_io_seal_us: AtomicU64,
@@ -1106,6 +1118,8 @@ mod tests {
         metrics.set_rc_checkpoint_mode(true, true);
         metrics.record_flush_rc_stream(3, 17, 41, 19, 8);
         metrics.record_flush_rc_stream(2, 9, 23, 29, 4);
+        metrics.record_flush_rc_delta_shadow(2, 1_000, 7, 12_345, 31, 19, 13, 11, 0);
+        metrics.record_flush_rc_delta_shadow(1, 500, 4, 6_789, 23, 23, 17, 17, 1);
         metrics.record_flush_rc_fold_lock_wait(11);
         metrics.record_flush_rc_fold_lock_wait(13);
         metrics.record_flush_rc_fold_service(31);
@@ -1120,6 +1134,15 @@ mod tests {
         assert_eq!(snapshot.flush_rc_stream_service_us, 64);
         assert_eq!(snapshot.flush_rc_stream_max_chunk_us, 29);
         assert_eq!(snapshot.flush_rc_stream_max_chunk_pages, 8);
+        assert_eq!(snapshot.flush_rc_delta_shadow_runs, 3);
+        assert_eq!(snapshot.flush_rc_delta_shadow_records, 1_500);
+        assert_eq!(snapshot.flush_rc_delta_shadow_pages, 11);
+        assert_eq!(snapshot.flush_rc_delta_shadow_payload_bytes, 19_134);
+        assert_eq!(snapshot.flush_rc_delta_shadow_encode_us, 54);
+        assert_eq!(snapshot.flush_rc_delta_shadow_encode_max_us, 23);
+        assert_eq!(snapshot.flush_rc_delta_shadow_verify_us, 30);
+        assert_eq!(snapshot.flush_rc_delta_shadow_verify_max_us, 17);
+        assert_eq!(snapshot.flush_rc_delta_shadow_errors, 1);
         assert_eq!(snapshot.flush_rc_fold_lock_wait_us, 24);
         assert_eq!(snapshot.flush_rc_fold_lock_wait_max_us, 13);
         assert_eq!(snapshot.flush_rc_fold_service_us, 78);
@@ -1139,6 +1162,15 @@ mod tests {
         assert!(json.contains("\"flush_rc_stream_service_us\":64"));
         assert!(json.contains("\"flush_rc_stream_max_chunk_us\":29"));
         assert!(json.contains("\"flush_rc_stream_max_chunk_pages\":8"));
+        assert!(json.contains("\"flush_rc_delta_shadow_runs\":3"));
+        assert!(json.contains("\"flush_rc_delta_shadow_records\":1500"));
+        assert!(json.contains("\"flush_rc_delta_shadow_pages\":11"));
+        assert!(json.contains("\"flush_rc_delta_shadow_payload_bytes\":19134"));
+        assert!(json.contains("\"flush_rc_delta_shadow_encode_us\":54"));
+        assert!(json.contains("\"flush_rc_delta_shadow_encode_max_us\":23"));
+        assert!(json.contains("\"flush_rc_delta_shadow_verify_us\":30"));
+        assert!(json.contains("\"flush_rc_delta_shadow_verify_max_us\":17"));
+        assert!(json.contains("\"flush_rc_delta_shadow_errors\":1"));
         assert!(json.contains("\"flush_rc_fold_lock_wait_us\":24"));
         assert!(json.contains("\"flush_rc_fold_lock_wait_max_us\":13"));
         assert!(json.contains("\"flush_rc_fold_service_us\":78"));
