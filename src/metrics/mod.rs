@@ -1171,6 +1171,9 @@ mod tests {
         assert!(json.contains("\"flush_rc_delta_shadow_verify_us\":30"));
         assert!(json.contains("\"flush_rc_delta_shadow_verify_max_us\":17"));
         assert!(json.contains("\"flush_rc_delta_shadow_errors\":1"));
+        assert!(json.contains("\"rc_read_underflow_floored_total\":"));
+        assert!(json.contains("\"rc_mutation_underflow_clamped_total\":"));
+        assert!(json.contains("\"rc_staged_overlay_hits_total\":"));
         assert!(json.contains("\"flush_rc_fold_lock_wait_us\":24"));
         assert!(json.contains("\"flush_rc_fold_lock_wait_max_us\":13"));
         assert!(json.contains("\"flush_rc_fold_service_us\":78"));
