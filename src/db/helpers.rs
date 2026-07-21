@@ -144,6 +144,16 @@ pub(super) fn refresh_manifest_entries(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    // v27: keep the delta-run heads array parallel to the refreshed roots. This
+    // cold path (snapshot / drop / open post-replay) carries each shard's
+    // current durable segment-directory head; a shard with no un-condensed
+    // segments reports `NULL_PAGE`. The streaming persist checkpoint stages its
+    // own heads directly on the manifest inside the flush gate window.
+    manifest.refcount_delta_run_heads = refcount_shards
+        .iter()
+        .map(|shard| shard.rc.durable_segment_dir_head())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     Ok(())
 }
 

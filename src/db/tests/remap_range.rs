@@ -1154,6 +1154,107 @@ fn rc_auth_cfg(dir: &std::path::Path, bfg_threads: bool) -> Config {
     cfg
 }
 
+/// rc-authoritative + threads-on + delta-run persist (v27). A large K so no
+/// condense fires (S3 not landed) — segments simply accumulate.
+fn rc_persist_cfg(dir: &std::path::Path) -> Config {
+    let mut cfg = rc_auth_cfg(dir, true);
+    cfg.rc_checkpoint_streaming_enabled = true;
+    cfg.rc_delta_run_persist_enabled = true;
+    cfg.rc_condense_interval_cycles = 1_000_000;
+    cfg
+}
+
+/// End-to-end delta-run persist (S1+S2): overwrite commits append durable
+/// segments instead of folding the base array; rc stays EXACT (served from the
+/// overlay, including the cross-BFG decref that sees the overlay-parked incref);
+/// the manifest upgrades to v27 with a non-empty segment-directory head; and a
+/// reopen with un-condensed segments refuses loudly (S3 adds replay).
+#[test]
+fn rc_delta_run_persist_appends_segments_rc_exact_and_reopen_refuses() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::create_with_config(rc_persist_cfg(dir.path())).unwrap();
+
+    for g in 1u64..=6 {
+        let new_pba = 100 + g;
+        let mut tx = db.begin();
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 10, remap_val(new_pba, g as u8), None);
+        tx.commit_with_outcomes().unwrap();
+        db.flush().unwrap();
+        // rc served from the segment overlay — the base array was NOT folded.
+        assert_eq!(db.get_refcount(new_pba).unwrap(), 1, "gen {g}: new rc==1");
+        if g > 1 {
+            assert_eq!(
+                db.get_refcount(100 + g - 1).unwrap(),
+                0,
+                "gen {g}: old rc==0 (decref saw the overlay-parked incref)"
+            );
+        }
+    }
+    assert_eq!(db.get_refcount(106).unwrap(), 1);
+    for old in 100u64..=105 {
+        assert_eq!(db.get_refcount(old).unwrap(), 0, "pba {old} fully decref'd");
+    }
+
+    // The base array carries NO fold for these PBAs (they live only in segments).
+    // The manifest upgraded to v27 and records at least one segment-dir head.
+    let m = db.manifest();
+    assert_eq!(
+        m.body_version,
+        crate::manifest::DELTA_RUN_MANIFEST_BODY_VERSION,
+        "persist commit must upgrade the manifest to v27"
+    );
+    assert!(
+        m.refcount_delta_run_heads
+            .iter()
+            .any(|&h| h != crate::types::NULL_PAGE),
+        "at least one shard must anchor a segment directory"
+    );
+
+    // Authoritative segment metrics recorded (one append per flush that drained).
+    let metrics = db.metrics_snapshot();
+    assert!(
+        metrics.flush_rc_segment_appends >= 6,
+        "expected >=6 segment appends, got {}",
+        metrics.flush_rc_segment_appends
+    );
+    assert!(metrics.flush_rc_segment_pages > 0);
+    assert!(metrics.flush_rc_segment_dir_pages > 0);
+    // The shadow codec path is NOT exercised (persist is authoritative).
+    assert_eq!(metrics.flush_rc_delta_shadow_pages, 0);
+
+    drop(db);
+
+    // Reopen with persist ON but un-condensed segments present → refused (S1).
+    let err = Db::open_with_config(rc_persist_cfg(dir.path())).map(|_| ()).unwrap_err();
+    assert!(
+        format!("{err}").contains("un-condensed refcount delta-run segments"),
+        "expected persist-on reopen refusal, got: {err}"
+    );
+
+    // Reopen with persist OFF → also refused (cannot serve the segments).
+    let mut off = rc_auth_cfg(dir.path(), true);
+    off.rc_delta_run_persist_enabled = false;
+    let err2 = Db::open_with_config(off).map(|_| ()).unwrap_err();
+    assert!(
+        format!("{err2}").contains("un-condensed refcount delta-run segments"),
+        "expected persist-off reopen refusal, got: {err2}"
+    );
+}
+
+/// persist requires the streaming BFG checkpoint; the config cross-check refuses
+/// persist without bfg threads at create time.
+#[test]
+fn rc_delta_run_persist_requires_bfg_streaming() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = rc_auth_cfg(dir.path(), false); // bfg threads OFF
+    cfg.rc_delta_run_persist_enabled = true;
+    let err = Db::create_with_config(cfg).map(|_| ()).unwrap_err();
+    assert!(
+        format!("{err}").contains("rc_delta_run_persist_enabled requires"),
+        "expected config cross-check error, got: {err}"
+    );
+}
+
 /// With the threads-ON per-BFG sync driving the fold, the rc fold folds only
 /// the frozen Syncing slot per cycle. A sequence of overwrite commits, each
 /// flushed (rolling/syncing BFGs), must keep rc EXACT — the cross-BFG

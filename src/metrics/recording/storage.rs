@@ -269,6 +269,29 @@ impl MetaMetrics {
             .fetch_add(errors, Ordering::Relaxed);
     }
 
+    /// v27: one flush's authoritative delta-run segment work — `appends`
+    /// segments totalling `pages` data pages / `bytes` payload, plus `dir_pages`
+    /// segment-directory chain pages, with `overlay_entries` the largest per-shard
+    /// overlay size observed this flush (a gauge).
+    pub(crate) fn record_flush_rc_segment(
+        &self,
+        appends: u64,
+        pages: u64,
+        bytes: u64,
+        dir_pages: u64,
+        overlay_entries: u64,
+    ) {
+        self.flush_rc_segment_appends
+            .fetch_add(appends, Ordering::Relaxed);
+        self.flush_rc_segment_pages
+            .fetch_add(pages, Ordering::Relaxed);
+        self.flush_rc_segment_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.flush_rc_segment_dir_pages
+            .fetch_add(dir_pages, Ordering::Relaxed);
+        fetch_max(&self.flush_rc_segment_overlay_entries_max, overlay_entries);
+    }
+
     pub(crate) fn record_flush_rc_fold_service(&self, service_us: u64) {
         self.flush_rc_fold_service_us
             .fetch_add(service_us, Ordering::Relaxed);

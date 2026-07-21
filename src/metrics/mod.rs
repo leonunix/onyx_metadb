@@ -546,6 +546,12 @@ pub struct MetaMetrics {
     flush_rc_delta_shadow_verify_us: AtomicU64,
     flush_rc_delta_shadow_verify_max_us: AtomicU64,
     flush_rc_delta_shadow_errors: AtomicU64,
+    // v27 durable delta-run persist (authoritative, unlike the shadow above).
+    flush_rc_segment_appends: AtomicU64,
+    flush_rc_segment_pages: AtomicU64,
+    flush_rc_segment_bytes: AtomicU64,
+    flush_rc_segment_dir_pages: AtomicU64,
+    flush_rc_segment_overlay_entries_max: AtomicU64,
     flush_io_us: AtomicU64,
     flush_io_max_us: AtomicU64,
     flush_io_seal_us: AtomicU64,

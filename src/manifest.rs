@@ -221,8 +221,41 @@ use crate::types::{
 /// changing the physical entries-per-page requires a new manifest version and
 /// an explicit routing/migration decision.
 /// Old v24-and-earlier manifests remain hard-rejected on open.
+///
+/// v27 (L3 durable refcount delta-run segments): appends a third refcount-shard
+/// array to the VARIABLE region, right after `refcount_durable_seq` — the
+/// per-shard `refcount_delta_run_heads: PageId[refcount_shard_count]`, each the
+/// mutable head of a COW segment-directory chain ([`NULL_PAGE`] when the shard
+/// has no un-condensed segments). `Manifest::decode` does NOT walk these chains
+/// (the heads are raw pids read later in the open path); v25/v26 decode
+/// synthesizes an all-[`NULL_PAGE`] array so the field is always parallel to
+/// `refcount_shard_roots`. `OFF_VARIABLE_START` is unchanged (the new array is
+/// in the variable region, not the fixed header).
+///
+/// Version policy is **persist-gated, not binary-gated**. v27 is written ONLY
+/// when `rc_delta_run_persist_enabled` is on: a v26 database upgrades to v27
+/// lazily on its first persist commit (the v10→v11 precedent), a fresh database
+/// is still created at v26, and a persist-off run keeps re-committing the
+/// database's existing version verbatim (v25/v26/v27) — the off-arm never emits
+/// the new array, so it stays byte-identical to the pre-feature binary. v25 +
+/// persist is a refused config (the v27 upgrade would lose the legacy-routing
+/// marker). v27 hard-rejects on ≤v26 binaries (they never learn version 27) and
+/// this binary keeps hard-rejecting ≤v24.
 pub const MANIFEST_BODY_VERSION: u32 = 26;
 pub const LEGACY_MANIFEST_BODY_VERSION: u32 = 25;
+/// Manifest version written once `rc_delta_run_persist_enabled` is on (see the
+/// [`MANIFEST_BODY_VERSION`] doc). Adds the `refcount_delta_run_heads` array.
+pub const DELTA_RUN_MANIFEST_BODY_VERSION: u32 = 27;
+
+/// Every manifest body version this binary can decode + re-encode. v25 (legacy
+/// refcount routing), v26 (current default), v27 (delta-run persist).
+#[inline]
+pub(crate) fn is_supported_body_version(version: u32) -> bool {
+    matches!(
+        version,
+        LEGACY_MANIFEST_BODY_VERSION | MANIFEST_BODY_VERSION | DELTA_RUN_MANIFEST_BODY_VERSION
+    )
+}
 
 // v8 body layout. Fixed header is the same shape as v7 except:
 //   - OFF_DEDUP_LEVEL_COUNT is reinterpreted as OFF_DEDUP_SHARDS
@@ -347,8 +380,13 @@ pub fn max_snapshots_for_layout(
     };
     // v11: per-refcount-shard `durable_seq[i]: Lsn` array mirrors
     // `refcount_shard_roots`, written immediately after the roots. Same
-    // length (refcount_shard_count), same element size (8 B).
-    let refcount_durable_seq_bytes = refcount_bytes;
+    // length (refcount_shard_count), same element size (8 B). v27 adds a
+    // third parallel array (delta-run heads); this upper-bound helper counts
+    // it unconditionally so the estimate is safe for a v27 layout too.
+    let refcount_durable_seq_bytes = match refcount_bytes.checked_mul(2) {
+        Some(v) => v,
+        None => return 0,
+    };
     // One index (dedup_index) carries one u32 level-count header per
     // manifest head group.
     let dedup_header_bytes = match dedup_head_group_count.checked_mul(size_of::<u32>()) {
@@ -384,10 +422,18 @@ fn variable_region_bytes(
     refcount_shard_count: usize,
     dedup_head_group_count: usize,
     total_dedup_level_count: usize,
+    body_version: u32,
 ) -> usize {
+    // v27 adds a third parallel refcount-shard array (delta-run heads) after
+    // roots + durable_seq; v25/v26 carry only the first two.
+    let refcount_arrays = if body_version >= DELTA_RUN_MANIFEST_BODY_VERSION {
+        3
+    } else {
+        2
+    };
     let refcount = refcount_shard_count
         .saturating_mul(size_of::<PageId>())
-        .saturating_mul(2); // roots + durable_seq
+        .saturating_mul(refcount_arrays);
     let dedup_headers = dedup_head_group_count.saturating_mul(size_of::<u32>());
     let dedup_levels = total_dedup_level_count.saturating_mul(size_of::<PageId>());
     OFF_VARIABLE_START
@@ -521,6 +567,15 @@ pub struct Manifest {
     /// consumers to per-shard reads so partial sample can re-enable
     /// without pinning the global floor on cold shards.
     pub refcount_durable_seq: Box<[Lsn]>,
+    /// v27: per-refcount-shard head of the durable delta-run segment directory
+    /// (a COW page chain listing un-condensed segment descriptors). Same length
+    /// as [`refcount_shard_roots`](Self::refcount_shard_roots); [`NULL_PAGE`]
+    /// when a shard has no un-condensed segments. Written only at
+    /// v27+ (`rc_delta_run_persist_enabled`); synthesized all-[`NULL_PAGE`] when
+    /// decoding a v25/v26 body so the array is always parallel to the roots.
+    /// `Manifest::decode` does NOT walk these chains — the heads are raw pids
+    /// consumed by the open path's condense-on-open replay.
+    pub refcount_delta_run_heads: Box<[PageId]>,
     /// Number of dedup apply lanes. Power of two, recorded at create time;
     /// changing it requires recreating the database.
     pub dedup_shards: u32,
@@ -560,6 +615,7 @@ impl Manifest {
             free_list_head: NULL_PAGE,
             refcount_shard_roots: Vec::new().into_boxed_slice(),
             refcount_durable_seq: Vec::new().into_boxed_slice(),
+            refcount_delta_run_heads: Vec::new().into_boxed_slice(),
             dedup_shards: 1,
             dedup_index_shard_heads: vec![Vec::new().into_boxed_slice()].into_boxed_slice(),
             next_snapshot_id: 1,
@@ -637,6 +693,20 @@ impl Manifest {
                 self.refcount_shard_roots.len(),
             )));
         }
+        // v27's delta-run heads array is kept parallel to the roots (all-NULL
+        // when decoded from a v25/v26 body). An EMPTY array is also accepted as
+        // "not yet materialized" — a manifest built by mutating roots directly
+        // (create / test) leaves it empty and `encode` synthesizes all-NULL;
+        // `prepare_commit` normalizes it so the committed copy matches decode.
+        if !self.refcount_delta_run_heads.is_empty()
+            && self.refcount_delta_run_heads.len() != self.refcount_shard_roots.len()
+        {
+            return Err(MetaDbError::Corruption(format!(
+                "manifest refcount_delta_run_heads length {} != refcount_shard_roots length {}",
+                self.refcount_delta_run_heads.len(),
+                self.refcount_shard_roots.len(),
+            )));
+        }
         for vol in &self.volumes {
             if vol.l2p_shard_durable_seq.len() != vol.l2p_shard_roots.len() {
                 return Err(MetaDbError::Corruption(format!(
@@ -690,13 +760,13 @@ impl Manifest {
     /// for a dry-run fit probe.
     fn encode(&self, page: &mut Page, vol_head: PageId, snap_head: PageId) -> Result<()> {
         self.assert_durable_seq_invariant()?;
-        if !matches!(
-            self.body_version,
-            LEGACY_MANIFEST_BODY_VERSION | MANIFEST_BODY_VERSION
-        ) {
+        if !is_supported_body_version(self.body_version) {
             return Err(MetaDbError::InvalidArgument(format!(
-                "unsupported manifest body version {} for encode; expected v{} or v{}",
-                self.body_version, LEGACY_MANIFEST_BODY_VERSION, MANIFEST_BODY_VERSION
+                "unsupported manifest body version {} for encode; expected v{}, v{}, or v{}",
+                self.body_version,
+                LEGACY_MANIFEST_BODY_VERSION,
+                MANIFEST_BODY_VERSION,
+                DELTA_RUN_MANIFEST_BODY_VERSION
             )));
         }
         let refcount_shard_count = self.refcount_shard_roots.len();
@@ -729,6 +799,7 @@ impl Manifest {
             refcount_shard_count,
             DEDUP_META_HEAD_GROUPS,
             self.total_dedup_index_levels(),
+            self.body_version,
         );
         if region_used > PAGE_PAYLOAD_SIZE {
             return Err(MetaDbError::InvalidArgument(format!(
@@ -790,6 +861,22 @@ impl Manifest {
         for seq in self.refcount_durable_seq.iter().copied() {
             p[off..off + 8].copy_from_slice(&seq.to_le_bytes());
             off += 8;
+        }
+        // v27: per-refcount-shard delta-run segment-directory head follows
+        // durable_seq. Only written at v27+; v25/v26 stop after durable_seq so
+        // an older binary's decode never sees these bytes. Exactly
+        // `refcount_shard_count` entries are written — an empty in-memory array
+        // (not yet materialized) synthesizes all-[`NULL_PAGE`], matching decode.
+        if self.body_version >= DELTA_RUN_MANIFEST_BODY_VERSION {
+            for i in 0..refcount_shard_count {
+                let head = self
+                    .refcount_delta_run_heads
+                    .get(i)
+                    .copied()
+                    .unwrap_or(NULL_PAGE);
+                p[off..off + 8].copy_from_slice(&head.to_le_bytes());
+                off += 8;
+            }
         }
         // v22: the v17 L2P-page-rc roots/durable_seq arrays are deleted; the
         // dedup head groups follow the refcount arrays directly now.
@@ -865,8 +952,9 @@ impl Manifest {
         match body_version {
             25 => Self::decode_v25(page, page_store),
             26 => Self::decode_v26(page, page_store),
+            27 => Self::decode_v27(page, page_store),
             other => Err(MetaDbError::Corruption(format!(
-                "unsupported manifest body version {other}; only v25 and v26 are readable"
+                "unsupported manifest body version {other}; only v25, v26 and v27 are readable"
             ))),
         }
     }
@@ -877,6 +965,10 @@ impl Manifest {
 
     fn decode_v26(page: &Page, page_store: &PageStore) -> Result<Self> {
         Self::decode_body(page, page_store, 26)
+    }
+
+    fn decode_v27(page: &Page, page_store: &PageStore) -> Result<Self> {
+        Self::decode_body(page, page_store, 27)
     }
 
     fn decode_body(page: &Page, page_store: &PageStore, version: u32) -> Result<Self> {
@@ -942,6 +1034,15 @@ impl Manifest {
         } else {
             vec![checkpoint_lsn; refcount_shard_count].into_boxed_slice()
         };
+        // v27: per-shard delta-run segment-directory heads follow durable_seq.
+        // v25/v26 bodies never wrote them, so synthesize an all-NULL array kept
+        // parallel to the roots (the field is version-independent in memory).
+        let refcount_delta_run_heads: Box<[PageId]> =
+            if version >= DELTA_RUN_MANIFEST_BODY_VERSION {
+                read_u64_vec(p, &mut off, refcount_shard_count)
+            } else {
+                vec![NULL_PAGE; refcount_shard_count].into_boxed_slice()
+            };
         // v22: the v17 L2P-page-rc roots/durable_seq arrays are deleted; the
         // dedup head groups follow the refcount arrays directly.
 
@@ -1014,6 +1115,7 @@ impl Manifest {
             free_list_head,
             refcount_shard_roots,
             refcount_durable_seq,
+            refcount_delta_run_heads,
             dedup_shards,
             dedup_index_shard_heads: dedup_index_shard_heads.into_boxed_slice(),
             next_snapshot_id,

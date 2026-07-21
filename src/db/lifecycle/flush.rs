@@ -950,6 +950,7 @@ impl Db {
         let bfg_threads_enabled = self.bfg_threads_enabled;
         let rc_checkpoint_streaming_enabled = self.rc_checkpoint_streaming_enabled;
         let rc_delta_run_shadow_enabled = self.rc_delta_run_shadow_enabled;
+        let rc_delta_run_persist_enabled = self.rc_delta_run_persist_enabled;
         trace.enter_phase(
             self,
             bfg,
@@ -963,7 +964,20 @@ impl Db {
                 for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
                     if selected.rc[s_idx] {
                         let h = scope.spawn(move || {
-                            if bfg_threads_enabled && rc_checkpoint_streaming_enabled {
+                            if bfg_threads_enabled
+                                && rc_checkpoint_streaming_enabled
+                                && rc_delta_run_persist_enabled
+                            {
+                                // v27: append a durable delta-run segment instead
+                                // of folding the base array. The base array is
+                                // condensed only every K cycles (S3).
+                                shard.rc.begin_checkpoint_streaming_persist(
+                                    bfg,
+                                    shard.routing.manifest_version(),
+                                    s_idx as u32,
+                                    wal_checkpoint,
+                                )
+                            } else if bfg_threads_enabled && rc_checkpoint_streaming_enabled {
                                 shard.rc.begin_checkpoint_streaming_shadow(
                                     bfg,
                                     shard.routing.manifest_version(),
@@ -1236,6 +1250,22 @@ impl Db {
         // succeeds so subsequent reads don't need to hit disk for the
         // new chain head/continuation pages.
         let mut rc_chain_cache_inserts: Vec<(PageId, Arc<crate::page::Page>)> = Vec::new();
+        // v27: per-shard NEW segment-directory head — `Some` for shards that
+        // appended a delta-run segment this cycle. Staged in the manifest below;
+        // made durable on the shard after the commit lands.
+        let mut rc_segment_dir_new_heads: Vec<Option<PageId>> =
+            (0..self.refcount_shards.len()).map(|_| None).collect();
+        // v27: per-shard OLD directory head whose framing pages are freed after
+        // the commit (fresh-pid COW). The segment DATA pages stay live — they are
+        // re-listed in the new directory.
+        let mut rc_segment_dir_old_heads: Vec<Option<PageId>> =
+            (0..self.refcount_shards.len()).map(|_| None).collect();
+        // v27 authoritative segment metrics accumulated across shards this flush.
+        let mut rc_seg_appends = 0u64;
+        let mut rc_seg_pages = 0u64;
+        let mut rc_seg_bytes = 0u64;
+        let mut rc_seg_dir_pages = 0u64;
+        let mut rc_seg_overlay_max = 0u64;
         for (s_idx, ckpt_opt) in refcount_checkpoints.iter().enumerate() {
             let Some(ckpt) = ckpt_opt else { continue };
             let shard = &self.refcount_shards[s_idx];
@@ -1266,7 +1296,58 @@ impl Db {
                     return Err(err);
                 }
             }
+            // v27: for a persist checkpoint, build the shard's segment-directory
+            // chain (fresh-pid COW) from its descriptors and fold the sealed
+            // pages into the global batch. This runs only on the Ok path (the
+            // base meta-chain Err arm above already returned).
+            if let Some(segment) = ckpt.segment() {
+                rc_seg_appends += 1;
+                rc_seg_pages += segment.data_pids.len() as u64;
+                rc_seg_bytes += (segment.data_pids.len() as u64)
+                    .saturating_mul(crate::page::PAGE_PAYLOAD_SIZE as u64);
+                rc_seg_overlay_max = rc_seg_overlay_max.max(shard.rc.segment_overlay_entries() as u64);
+                let descriptors = shard.rc.segment_descriptors_snapshot();
+                match crate::refcount::segment_dir::build_directory_chain(
+                    &self.page_store,
+                    &descriptors,
+                    wal_checkpoint,
+                ) {
+                    Ok((dir_chain, dir_sealed)) => {
+                        rc_seg_dir_pages += dir_sealed.len() as u64;
+                        total_pages_written += dir_sealed.len();
+                        sealed_pages.extend(dir_sealed);
+                        rc_segment_dir_new_heads[s_idx] = Some(dir_chain[0]);
+                        let old = shard.rc.durable_segment_dir_head();
+                        if old != crate::types::NULL_PAGE {
+                            rc_segment_dir_old_heads[s_idx] = Some(old);
+                        }
+                    }
+                    Err(err) => {
+                        // Pre-global-write: abort every RC checkpoint (frees this
+                        // shard's segment data pages + un-publishes its overlay)
+                        // and the L2P checkpoints. The already-built directory
+                        // sealed pages are dropped unwritten (reclaimed by verify).
+                        let io_elapsed = io_started.elapsed();
+                        trace.io_us = micros(io_elapsed);
+                        trace.nonstream_write_pages = total_pages_written as u64;
+                        self.metrics
+                            .record_flush_io(io_elapsed, total_pages_written);
+                        self.metrics
+                            .record_flush_total(kind, flush_started.elapsed());
+                        self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                        self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+                        return Err(err);
+                    }
+                }
+            }
         }
+        self.metrics.record_flush_rc_segment(
+            rc_seg_appends,
+            rc_seg_pages,
+            rc_seg_bytes,
+            rc_seg_dir_pages,
+            rc_seg_overlay_max,
+        );
         // Build per-volume dead-list segments and fold them into the
         // same `sealed_pages` batch as L2P + RC. Allocate contiguous
         // runs per volume .
@@ -1740,6 +1821,31 @@ impl Db {
             self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
             return Err(err);
         }
+        // v27: stage the delta-run segment-directory heads for shards that
+        // appended a segment this cycle (others keep their prior committed head)
+        // and lazily upgrade the manifest to v27 on the first persist commit
+        // (byte-identical to v26 when persist is off). Done AFTER
+        // `refresh_manifest_durable_seq` so the manifest is otherwise fully shaped
+        // and BEFORE the store commit so the heads + version land on disk.
+        if rc_delta_run_persist_enabled {
+            if manifest_state.manifest.body_version
+                < crate::manifest::DELTA_RUN_MANIFEST_BODY_VERSION
+            {
+                manifest_state.manifest.body_version =
+                    crate::manifest::DELTA_RUN_MANIFEST_BODY_VERSION;
+            }
+            if manifest_state.manifest.refcount_delta_run_heads.len()
+                != self.refcount_shards.len()
+            {
+                manifest_state.manifest.refcount_delta_run_heads =
+                    vec![crate::types::NULL_PAGE; self.refcount_shards.len()].into_boxed_slice();
+            }
+            for (s_idx, new_head) in rc_segment_dir_new_heads.iter().enumerate() {
+                if let Some(head) = new_head {
+                    manifest_state.manifest.refcount_delta_run_heads[s_idx] = *head;
+                }
+            }
+        }
         // Buffer-as-sole-journal lifecycle journal cutover retired the WAL BFG-sync
         // barrier: there is no WAL page cache to flush. The lifecycle
         // journal already fsyncs each record at append time, and
@@ -1994,6 +2100,38 @@ impl Db {
         for (s_idx, chain_opt) in rc_new_chains.into_iter().enumerate() {
             if let Some(new_chain) = chain_opt {
                 self.refcount_shards[s_idx].rc.install_meta_chain(new_chain);
+            }
+        }
+        // v27: the manifest recording the new segment-directory heads is durable.
+        // Advance each persist shard's durable head, then free the OLD directory's
+        // framing pages (fresh-pid COW) — the segment DATA pages stay live because
+        // the new directory re-lists them.
+        for (s_idx, new_head) in rc_segment_dir_new_heads.into_iter().enumerate() {
+            if let Some(head) = new_head {
+                self.refcount_shards[s_idx]
+                    .rc
+                    .set_durable_segment_dir_head(head);
+            }
+        }
+        for old_head in rc_segment_dir_old_heads.into_iter().flatten() {
+            match crate::refcount::segment_dir::directory_chain_pids(&self.page_store, old_head) {
+                Ok(pids) => {
+                    for pid in pids {
+                        self.page_cache.invalidate(pid);
+                        if let Err(err) = self.page_store.free(pid, wal_checkpoint) {
+                            tracing::warn!(
+                                page_id = pid,
+                                error = %err,
+                                "flush_with_gate: failed to free retired rc segment-dir chain page"
+                            );
+                        }
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    old_head,
+                    error = %err,
+                    "flush_with_gate: failed to enumerate old rc segment-dir chain (leak; verify reclaims)"
+                ),
             }
         }
         // Trailing continuation pages from the old chains can be

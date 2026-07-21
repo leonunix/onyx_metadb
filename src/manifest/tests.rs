@@ -141,6 +141,7 @@ fn commit_then_reopen_recovers_manifest() {
         dedup_migration_old_head: NULL_PAGE,
         free_list_head: 99,
         refcount_shard_roots: bx(&[17, 18, 19, 20]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 4]),
         refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE, NULL_PAGE]),
@@ -364,6 +365,7 @@ fn encode_decode_round_trip_with_refcount_and_dedup() {
         dedup_migration_old_head: NULL_PAGE,
         free_list_head: 1234,
         refcount_shard_roots: bx(&[142, 143, 144, 145]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 4]),
         refcount_durable_seq: bx(&[
             0xDEAD_BEEF_CAFE,
             0xDEAD_BEEF_CAFE,
@@ -426,7 +428,7 @@ fn find_snapshot_locates_by_id() {
 fn decode_rejects_unsupported_body_versions() {
     let dir = TempDir::new().unwrap();
     let ps = mk_store(&dir);
-    for bad_version in [3u32, 24, 27] {
+    for bad_version in [3u32, 24, 28] {
         let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
         {
             let p = page.payload_mut();
@@ -461,6 +463,7 @@ fn v6_volumes_table_round_trip() {
         dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[50, 51]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 2]),
         refcount_durable_seq: bx(&[10, 10]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[]),
@@ -535,6 +538,7 @@ fn dedup_n4_encode_decode_round_trip() {
         dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 2]),
         refcount_durable_seq: bx(&[100, 100]),
         dedup_shards: 4,
         dedup_index_shard_heads: one_shard(&[10]),
@@ -816,6 +820,7 @@ fn v11_per_shard_durable_seq_round_trip() {
         dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 11, 12, 13]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 4]),
         refcount_durable_seq: bx(&[5, 7, 6, 9]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[]),
@@ -871,6 +876,7 @@ fn encode_rejects_durable_seq_drift_from_checkpoint_lsn() {
         dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 2]),
         // Intentionally lower than checkpoint_lsn — drift the
         // invariant should catch.
         refcount_durable_seq: bx(&[42, 7]),
@@ -912,6 +918,7 @@ fn encode_rejects_refcount_durable_seq_length_mismatch() {
         dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2, 3]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 3]),
         refcount_durable_seq: bx(&[0, 0]), // wrong length
         // Consistent so the refcount length check is the one that fires.
         dedup_shards: 1,
@@ -1009,6 +1016,7 @@ fn v10_manifest_is_rejected_after_flag_day_to_v12() {
         dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[1, 2, 3]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 3]),
         refcount_durable_seq: bx(&[]),
         // v10 hand-encoder ignores these; present only to satisfy the
         // struct literal (this manifest is never validated by encode()).
@@ -1139,7 +1147,7 @@ fn v13_manifest_is_rejected_after_flag_day_to_v14() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v25 and v26"),
+                msg.contains("unsupported manifest body version") && msg.contains("v25, v26 and v27"),
                 "expected v13-rejection message mentioning v25/v26, got: {msg}"
             );
         }
@@ -1163,7 +1171,7 @@ fn v14_manifest_is_rejected_after_flag_day_to_v15() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v25 and v26"),
+                msg.contains("unsupported manifest body version") && msg.contains("v25, v26 and v27"),
                 "expected v14-rejection message mentioning v25/v26, got: {msg}"
             );
         }
@@ -1190,6 +1198,7 @@ fn v15_round_trip_carries_checkpoint_bfg() {
         dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 20, 30, 40]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 4]),
         refcount_durable_seq: bx(&[1234, 1234, 1234, 1234]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE]),
@@ -1222,6 +1231,7 @@ fn v15_checkpoint_bfg_zero_round_trips() {
         dedup_migration_old_head: NULL_PAGE,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[NULL_PAGE; 4]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 4]),
         refcount_durable_seq: bx(&[0; 4]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[NULL_PAGE]),
@@ -1252,7 +1262,7 @@ fn v21_manifest_is_rejected_after_flag_day_to_v22() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v25 and v26"),
+                msg.contains("unsupported manifest body version") && msg.contains("v25, v26 and v27"),
                 "expected v21-rejection message mentioning v25/v26, got: {msg}"
             );
         }
@@ -1277,7 +1287,7 @@ fn v22_manifest_is_rejected_after_flag_day_to_v23() {
     match Manifest::decode(&page, &ps).unwrap_err() {
         MetaDbError::Corruption(msg) => {
             assert!(
-                msg.contains("unsupported manifest body version") && msg.contains("v25 and v26"),
+                msg.contains("unsupported manifest body version") && msg.contains("v25, v26 and v27"),
                 "expected v22-rejection message mentioning v25/v26, got: {msg}"
             );
         }
@@ -1334,6 +1344,7 @@ fn v25_round_trip_carries_dedup_migration_old_head() {
         dedup_migration_old_head: 55,
         free_list_head: NULL_PAGE,
         refcount_shard_roots: bx(&[10, 20, 30, 40]),
+        refcount_delta_run_heads: bx(&[NULL_PAGE; 4]),
         refcount_durable_seq: bx(&[4242, 4242, 4242, 4242]),
         dedup_shards: 1,
         dedup_index_shard_heads: one_shard(&[77]),
@@ -1345,6 +1356,89 @@ fn v25_round_trip_carries_dedup_migration_old_head() {
     let decoded = roundtrip(&dir, ps, m);
     assert_eq!(decoded.dedup_migration_old_head, 55);
     assert_eq!(decoded.dedup_index_shard_heads[0].as_ref(), &[77]);
+}
+
+// ── v27: durable refcount delta-run segment directories ─────
+
+/// A v27 manifest with non-NULL `refcount_delta_run_heads` (some shards carry a
+/// segment-directory chain head, others are empty) must round-trip byte-
+/// equivalent through encode + decode. This is the only new durable state v27
+/// adds; every other round-trip covers the all-NULL (Single) case.
+#[test]
+fn v27_round_trip_carries_refcount_delta_run_heads() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let m = Manifest {
+        body_version: DELTA_RUN_MANIFEST_BODY_VERSION,
+        checkpoint_lsn: 4242,
+        checkpoint_bfg: 0,
+        last_processed_buffer_seq: 0,
+        lifecycle_replay_seq: 0,
+        volume_catalog_head_pid: NULL_PAGE,
+        snapshot_catalog_head_pid: NULL_PAGE,
+        page_high_water: 0,
+        journal_ring_head: 0,
+        dedup_migration_old_head: NULL_PAGE,
+        free_list_head: NULL_PAGE,
+        refcount_shard_roots: bx(&[10, 20, 30, 40]),
+        // Shards 0 and 2 anchor un-condensed segment directories; 1 and 3 empty.
+        refcount_delta_run_heads: bx(&[111, NULL_PAGE, 222, NULL_PAGE]),
+        refcount_durable_seq: bx(&[4242, 4242, 4242, 4242]),
+        dedup_shards: 1,
+        dedup_index_shard_heads: one_shard(&[77]),
+        next_snapshot_id: 1,
+        next_volume_ord: 1,
+        snapshots: Vec::new(),
+        volumes: vec![boot_vol_at(4, &[1, 2, 3, 4], 4242)],
+    };
+    let decoded = roundtrip(&dir, ps, m);
+    assert_eq!(decoded.body_version, DELTA_RUN_MANIFEST_BODY_VERSION);
+    assert_eq!(
+        decoded.refcount_delta_run_heads.as_ref(),
+        &[111, NULL_PAGE, 222, NULL_PAGE]
+    );
+}
+
+/// A v26 body carries no delta-run heads on disk; decode synthesizes an
+/// all-[`NULL_PAGE`] array parallel to the roots so the in-memory field is
+/// version-independent (and a persist-off run keeps re-committing v26 verbatim).
+#[test]
+fn v26_decode_synthesizes_null_delta_run_heads() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let mut m = Manifest::empty();
+    assert_eq!(m.body_version, MANIFEST_BODY_VERSION); // v26 fresh default
+    m.refcount_shard_roots = bx(&[1, 2, 3, 4]);
+    m.refcount_delta_run_heads = bx(&[NULL_PAGE; 4]);
+    m.refcount_durable_seq = bx(&[0, 0, 0, 0]);
+    m.volumes = vec![boot_vol(4, &[10, 11, 12, 13])];
+    let decoded = roundtrip(&dir, ps, m);
+    assert_eq!(decoded.body_version, MANIFEST_BODY_VERSION);
+    assert_eq!(decoded.refcount_delta_run_heads.as_ref(), &[NULL_PAGE; 4]);
+}
+
+/// v27 is the newest version this binary writes; the next unknown version (v28)
+/// is hard-rejected, mirroring every prior flag-day. (An OLD binary rejecting a
+/// v27 body is the symmetric half, unobservable from inside this binary.)
+#[test]
+fn v28_manifest_is_rejected_after_flag_day_to_v27() {
+    let dir = TempDir::new().unwrap();
+    let ps = mk_store(&dir);
+    let mut page = Page::new(PageHeader::new(PageType::Manifest, 1));
+    {
+        let p = page.payload_mut();
+        p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].copy_from_slice(&28u32.to_le_bytes());
+    }
+    page.seal();
+    match Manifest::decode(&page, &ps).unwrap_err() {
+        MetaDbError::Corruption(msg) => {
+            assert!(
+                msg.contains("unsupported manifest body version") && msg.contains("v27"),
+                "expected v28-rejection message mentioning v27, got: {msg}"
+            );
+        }
+        e => panic!("expected Corruption from v28 manifest, got {e}"),
+    }
 }
 
 /// The load-bearing crash-safety invariant: every commit COWs both chains to

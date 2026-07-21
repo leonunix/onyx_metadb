@@ -910,3 +910,138 @@ fn get_consistent_never_reads_spurious_zero_under_concurrent_fold() {
         plain_torn.load(Ordering::Relaxed)
     );
 }
+
+// ── v27 durable delta-run persist checkpoint (S1/S2) ────────────────────────
+
+use crate::types::NULL_PAGE;
+
+/// Read the shard's on-disk segment page(s) back and confirm they decode to the
+/// exact drained records. Uses the array's page store via a segment descriptor.
+fn decode_segment(s: &RcShard, seg: &SegmentDescriptor) -> Vec<(Pba, Pending)> {
+    let mut out = Vec::new();
+    for &pid in &seg.data_pids {
+        let page = s.array.page_store_for_test().read_page(pid).unwrap();
+        out.extend(crate::refcount::delta_run::decode_run_page(&page, pid).unwrap().records);
+    }
+    out
+}
+
+#[test]
+fn persist_checkpoint_overlay_serves_reads_leaves_base_untouched() {
+    let (_d, s) = make_shard();
+    s.stage(0, 10, 3, 100).unwrap();
+    s.stage(0, 20, 1, 101).unwrap();
+    s.stage(0, 10, -1, 102).unwrap(); // pba 10 net = +2
+
+    let ckpt = s.begin_checkpoint_streaming_persist(0, 26, 0, 200).unwrap();
+    assert!(ckpt.has_segment());
+    let seg = ckpt.segment().unwrap().clone();
+    assert_eq!(seg.records, 2); // pba 10 and 20 (10 merged to one record)
+
+    // Slot 0 is cleared; the deltas now live in the overlay and serve reads.
+    assert_eq!(s.get(10).unwrap(), 2);
+    assert_eq!(s.get(20).unwrap(), 1);
+    assert_eq!(s.get_consistent(10).unwrap(), 2);
+    assert_eq!(s.get_many(&[10, 20]).unwrap(), vec![2, 1]);
+    // The base array was NOT folded.
+    assert_eq!(s.array.get(10).unwrap().rc, 0);
+    assert_eq!(s.array.get(20).unwrap().rc, 0);
+    // Directory mirror has one descriptor; durable head not set until the flush
+    // commits it.
+    assert_eq!(s.segment_count(), 1);
+    assert_eq!(s.durable_segment_dir_head(), NULL_PAGE);
+    // The segment pages decode to the (merged, sorted) drained records.
+    let decoded = decode_segment(&s, &seg);
+    assert_eq!(decoded.len(), 2);
+    let m: std::collections::HashMap<Pba, i64> =
+        decoded.iter().map(|(p, pend)| (*p, pend.delta)).collect();
+    assert_eq!(m[&10], 2);
+    assert_eq!(m[&20], 1);
+}
+
+#[test]
+fn persist_empty_slot_is_noop() {
+    let (_d, s) = make_shard();
+    let ckpt = s.begin_checkpoint_streaming_persist(0, 26, 0, 0).unwrap();
+    assert!(!ckpt.has_segment());
+    assert!(ckpt.is_empty());
+    assert_eq!(s.segment_count(), 0);
+    assert!(s.overlay_is_empty());
+}
+
+#[test]
+fn persist_multiple_bfg_cycles_rc_matches_model() {
+    let (_d, s) = make_shard();
+    let mut model: std::collections::HashMap<Pba, i64> = std::collections::HashMap::new();
+    let mut lsn = 1u64;
+    for cycle in 0..6u64 {
+        let bfg = cycle; // rotates across the four slots
+        for pba in 0..24u64 {
+            // Only increfs and non-underflowing decrefs so rc == model exactly.
+            let cur = *model.get(&pba).unwrap_or(&0);
+            let delta: i64 = match (pba + cycle) % 4 {
+                0 => 2,
+                1 => 1,
+                2 if cur > 0 => -1,
+                _ => 1,
+            };
+            s.stage(bfg, pba, delta, lsn).unwrap();
+            *model.entry(pba).or_default() += delta;
+            lsn += 1;
+        }
+        // Append a durable segment; keep it un-committed (overlay stays live).
+        let ckpt = s.begin_checkpoint_streaming_persist(bfg, 26, 0, lsn).unwrap();
+        assert!(ckpt.has_segment());
+        // rc read must equal the eager model at every step.
+        for pba in 0..24u64 {
+            assert_eq!(
+                s.get(pba).unwrap() as i64,
+                *model.get(&pba).unwrap_or(&0),
+                "pba {pba} after cycle {cycle}"
+            );
+        }
+        assert_eq!(s.segment_count() as u64, cycle + 1);
+    }
+}
+
+#[test]
+fn stage_after_persist_sees_overlay_in_merged_prev() {
+    let (_d, s) = make_shard();
+    // Build overlay: pba 42 rc = 5.
+    s.stage(0, 42, 5, 100).unwrap();
+    s.begin_checkpoint_streaming_persist(0, 26, 0, 200).unwrap();
+    assert_eq!(s.get(42).unwrap(), 5);
+    assert!(!s.overlay_is_empty());
+
+    // A subsequent decref on a DIFFERENT bfg slot must see the overlay term in
+    // its merged prev (prev=5 → new=3), not treat pba 42 as rc=0.
+    assert_eq!(s.stage(1, 42, -2, 300).unwrap(), (5, 3));
+    assert_eq!(s.get(42).unwrap(), 3);
+
+    // A decref that would underflow the true (overlay-aware) rc is a benign
+    // no-op, not a spurious free of the overlay-backed PBA.
+    assert_eq!(s.stage_decref_if_positive(1, 42, 301).unwrap(), (3, 2));
+}
+
+#[test]
+fn persist_abort_restores_slot_and_clears_overlay() {
+    let (_d, s) = make_shard();
+    s.stage(0, 10, 4, 100).unwrap();
+    s.stage(0, 11, 2, 101).unwrap();
+    let ckpt = s.begin_checkpoint_streaming_persist(0, 26, 0, 200).unwrap();
+    let seg = ckpt.segment().unwrap().clone();
+    assert!(!s.overlay_is_empty());
+    assert_eq!(s.segment_count(), 1);
+
+    // Abort (pre-manifest): overlay un-published, descriptor popped, slot
+    // restored, segment pages freed.
+    s.abort_checkpoint(ckpt, 0);
+    assert!(s.overlay_is_empty());
+    assert_eq!(s.segment_count(), 0);
+    // Reads see the deltas again via the restored slot.
+    assert_eq!(s.get(10).unwrap(), 4);
+    assert_eq!(s.get(11).unwrap(), 2);
+    // The segment's data pages were queued for reclaim (epoch-deferred free).
+    assert!(!seg.data_pids.is_empty());
+    assert!(s.array.page_store_for_test().deferred_free_len() >= seg.data_pids.len());
+}

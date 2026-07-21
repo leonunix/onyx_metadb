@@ -112,6 +112,7 @@ impl Db {
         manifest_body_version: u32,
     ) -> Result<Arc<Self>> {
         validate_rc_neutral_refcount_mode(&cfg)?;
+        validate_rc_delta_run_persist_config(&cfg)?;
         let shard_count = validate_shard_count(cfg.shards_per_partition)?;
         let dedup_shards = validate_dedup_shards(cfg.dedup_shards)?;
         let refcount_routing = crate::refcount::RefcountRouting::from_manifest_version(
@@ -182,6 +183,12 @@ impl Db {
         // Fresh database: no flush has happened yet, every shard's
         // durable_seq is 0 (matches the empty `checkpoint_lsn`).
         manifest.refcount_durable_seq = vec![0; refcount_count].into_boxed_slice();
+        // v27: a fresh database has no un-condensed delta-run segments; keep the
+        // heads array parallel to the roots and all-`NULL_PAGE`. The version
+        // upgrade to v27 (if `rc_delta_run_persist_enabled`) happens lazily on
+        // the first persist checkpoint, not at create.
+        manifest.refcount_delta_run_heads =
+            vec![crate::types::NULL_PAGE; refcount_count].into_boxed_slice();
         manifest.dedup_shards = dedup_shards;
         // dedup_index: cuckoo meta page id stored under the legacy
         // `dedup_index_shard_heads` slot, single-element box for
@@ -331,6 +338,9 @@ impl Db {
             bfg_threads_enabled: cfg.bfg_threads_enabled,
             rc_checkpoint_streaming_enabled: cfg.rc_checkpoint_streaming_enabled,
             rc_delta_run_shadow_enabled: cfg.rc_delta_run_shadow_enabled,
+            rc_delta_run_persist_enabled: cfg.rc_delta_run_persist_enabled,
+            rc_condense_interval_cycles: cfg.rc_condense_interval_cycles,
+            rc_segment_overlay_max_entries: cfg.rc_segment_overlay_max_entries,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
             parallel_l2p_drain_workers: cfg.parallel_l2p_drain_workers,
             l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
@@ -466,6 +476,7 @@ impl Db {
         backing: MetaBacking,
     ) -> Result<Arc<Self>> {
         validate_rc_neutral_refcount_mode(&cfg)?;
+        validate_rc_delta_run_persist_config(&cfg)?;
         let page_store = Arc::new(match &backing {
             MetaBacking::File => {
                 let pages_path = page_file(&cfg.path);
@@ -510,6 +521,43 @@ impl Db {
                         manifest.body_version
                     ))
                 })?;
+        // v27 (delta-run persist) open guards. These refuse configurations that
+        // would otherwise silently mis-serve refcount rather than degrade loudly.
+        if cfg.rc_delta_run_persist_enabled
+            && manifest.body_version == crate::manifest::LEGACY_MANIFEST_BODY_VERSION
+        {
+            return Err(MetaDbError::InvalidArgument(
+                "rc_delta_run_persist_enabled cannot be set on a v25 (legacy-routing) \
+                 database: the v27 upgrade would lose the legacy refcount-routing marker; \
+                 recreate the database to enable delta-run persist"
+                    .into(),
+            ));
+        }
+        let has_uncondensed_segments = manifest
+            .refcount_delta_run_heads
+            .iter()
+            .any(|&h| h != crate::types::NULL_PAGE);
+        if has_uncondensed_segments {
+            if !cfg.rc_delta_run_persist_enabled {
+                // Persist-off starts with an empty overlay and replays nothing, so
+                // it cannot serve reads for un-condensed segments. Refuse rather
+                // than silently returning rc missing every un-condensed delta.
+                return Err(MetaDbError::InvalidArgument(
+                    "manifest carries un-condensed refcount delta-run segments but \
+                     rc_delta_run_persist_enabled is off; enable it to drain them"
+                        .into(),
+                ));
+            }
+            // S1: condense-on-open replay lands in S3. Until then a reopen with
+            // un-condensed segments refuses rather than opening with a base array
+            // that is missing every un-condensed delta.
+            return Err(MetaDbError::InvalidArgument(
+                "reopening a database with un-condensed refcount delta-run segments \
+                 is not yet supported (S3 condense-on-open replay); do not enable \
+                 rc_delta_run_persist_enabled across restarts until S3 lands"
+                    .into(),
+            ));
+        }
         if manifest.volumes.is_empty() {
             return Err(MetaDbError::Corruption(
                 "manifest has no volume entries; database was not initialized".into(),
@@ -657,6 +705,18 @@ impl Db {
                 protected_pages.extend(crate::refcount::PagedRefcountArray::referenced_page_ids(
                     &page_store,
                     meta_pid,
+                )?);
+            }
+            // v27: protect every page each shard's un-condensed delta-run segment
+            // directory occupies + references (framing + segment data pages) so
+            // the device free-list rebuild never reissues a live segment page.
+            for &head in manifest.refcount_delta_run_heads.iter() {
+                if head == crate::types::NULL_PAGE {
+                    continue;
+                }
+                protected_pages.extend(crate::refcount::segment_dir::collect_live_pages(
+                    &page_store,
+                    head,
                 )?);
             }
             protected_pages.extend(dedup_index.referenced_page_ids());
@@ -1123,6 +1183,9 @@ impl Db {
             bfg_threads_enabled: cfg.bfg_threads_enabled,
             rc_checkpoint_streaming_enabled: cfg.rc_checkpoint_streaming_enabled,
             rc_delta_run_shadow_enabled: cfg.rc_delta_run_shadow_enabled,
+            rc_delta_run_persist_enabled: cfg.rc_delta_run_persist_enabled,
+            rc_condense_interval_cycles: cfg.rc_condense_interval_cycles,
+            rc_segment_overlay_max_entries: cfg.rc_segment_overlay_max_entries,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
             parallel_l2p_drain_workers: cfg.parallel_l2p_drain_workers,
             l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
@@ -1256,6 +1319,26 @@ fn validate_rc_neutral_refcount_mode(cfg: &Config) -> Result<()> {
         return Err(MetaDbError::InvalidArgument(
             "lineage_gc_emit_freepbas=false is no longer supported: rc-neutral \
              L2P remaps require Lineage GC to emit FreePbas retire events"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// v27 (L3 delta-run persist) config cross-check, run at both create and open.
+/// Durable segments are ONLY produced by the streaming BFG checkpoint, so
+/// persist requires both `bfg_threads_enabled` and
+/// `rc_checkpoint_streaming_enabled`. The version-dependent refusals (persist on
+/// a v25 manifest; persist-off on a v27 manifest with non-empty segment chains)
+/// live in `open_core`, where the decoded manifest is available.
+fn validate_rc_delta_run_persist_config(cfg: &Config) -> Result<()> {
+    if cfg.rc_delta_run_persist_enabled
+        && !(cfg.bfg_threads_enabled && cfg.rc_checkpoint_streaming_enabled)
+    {
+        return Err(MetaDbError::InvalidArgument(
+            "rc_delta_run_persist_enabled requires bfg_threads_enabled + \
+             rc_checkpoint_streaming_enabled: durable delta-run segments are \
+             emitted only by the streaming BFG checkpoint"
                 .into(),
         ));
     }

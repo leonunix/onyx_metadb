@@ -150,6 +150,11 @@ pub enum PageType {
     /// PBA and carry a signed delta plus the last LSN contributing to that
     /// delta. Layout is owned by [`crate::refcount::delta_run`].
     RefcountDeltaRun = 16,
+    /// COW page in a refcount shard's durable delta-run segment DIRECTORY (v27).
+    /// Lists one descriptor per un-condensed segment (bfg, covered LSN range,
+    /// record count, data-page ids). Layout is owned by
+    /// [`crate::refcount::segment_dir`].
+    RefcountSegmentDir = 17,
 }
 
 impl PageType {
@@ -172,6 +177,7 @@ impl PageType {
             14 => Self::LiveListSegment,
             15 => Self::ManifestCatalog,
             16 => Self::RefcountDeltaRun,
+            17 => Self::RefcountSegmentDir,
             _ => return Err(MetaDbError::UnknownPageType(v)),
         })
     }

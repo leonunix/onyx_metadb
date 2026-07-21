@@ -146,6 +146,41 @@ pub(crate) fn measure_shadow_run_with_context(
     Ok(stats)
 }
 
+/// Encode a sorted frozen slot into sealed [`PageType::RefcountDeltaRun`] pages
+/// for the DURABLE persist path (v27). The caller assigns a [`PageId`] to each
+/// returned page and writes them via `write_sealed_page_runs_for_class`; the
+/// page CRC is pid-independent (`Page::verify(pid)` uses the pid only for error
+/// reporting), so sealing before allocation is sound. Returns the run stats
+/// (records / pages / payload_bytes; timing fields stay zero) beside the pages.
+pub(crate) fn encode_run_pages(
+    context: DeltaRunContext,
+    records: &[(Pba, Pending)],
+) -> Result<(DeltaRunStats, Vec<Page>)> {
+    let mut pages = Vec::new();
+    let stats = encode_pages(context, records, |page, _expected| {
+        pages.push(page);
+        Ok(())
+    })?;
+    Ok((stats, pages))
+}
+
+/// Decode one sealed segment page back into its records + descriptor context.
+/// Used by condense / open-replay to reconstruct the delta stream oldest→newest.
+pub(crate) fn decode_run_page(page: &Page, page_id: PageId) -> Result<DecodedRun> {
+    let decoded = decode_page(page, page_id)?;
+    Ok(DecodedRun {
+        context: decoded.context,
+        records: decoded.records,
+    })
+}
+
+/// Public shape returned by [`decode_run_page`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DecodedRun {
+    pub context: DeltaRunContext,
+    pub records: Vec<(Pba, Pending)>,
+}
+
 #[cfg(test)]
 fn lsn_bounds(records: &[(Pba, Pending)]) -> (Lsn, Lsn) {
     let mut min = Lsn::MAX;

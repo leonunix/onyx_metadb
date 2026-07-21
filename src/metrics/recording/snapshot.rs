@@ -394,6 +394,13 @@ impl MetaMetrics {
             flush_rc_delta_shadow_verify_us: load(&self.flush_rc_delta_shadow_verify_us),
             flush_rc_delta_shadow_verify_max_us: load(&self.flush_rc_delta_shadow_verify_max_us),
             flush_rc_delta_shadow_errors: load(&self.flush_rc_delta_shadow_errors),
+            flush_rc_segment_appends: load(&self.flush_rc_segment_appends),
+            flush_rc_segment_pages: load(&self.flush_rc_segment_pages),
+            flush_rc_segment_bytes: load(&self.flush_rc_segment_bytes),
+            flush_rc_segment_dir_pages: load(&self.flush_rc_segment_dir_pages),
+            flush_rc_segment_overlay_entries_max: load(
+                &self.flush_rc_segment_overlay_entries_max,
+            ),
             rc_read_underflow_floored_total: crate::refcount::read_underflow_floored_total(),
             rc_mutation_underflow_clamped_total: crate::refcount::underflow_clamped_total(),
             rc_staged_overlay_hits_total: crate::refcount::staged_overlay_hits_total(),

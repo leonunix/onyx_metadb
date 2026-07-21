@@ -350,6 +350,38 @@ pub struct Config {
     /// change manifest state, or alter the authoritative paged-array fold.
     pub rc_delta_run_shadow_enabled: bool,
 
+    /// Make delta-run segments the DURABLE refcount representation between
+    /// condenses (L3). When enabled, the streaming BFG checkpoint appends a
+    /// compact delta-run segment (encoded by `refcount::delta_run`) to a
+    /// per-shard segment chain instead of rewriting scattered base pages; the
+    /// paged base array is rewritten only every
+    /// [`Self::rc_condense_interval_cycles`] cycles ("condense"). Reads stay
+    /// cheap via an in-memory merged overlay; open replays un-condensed
+    /// segments oldest→newest. Default **false** (byte/behaviour-identical to
+    /// the eager base-page fold — the manifest keeps its current version, the
+    /// overlay stays behind an emptiness fast-path, and every persist arm is
+    /// keyed on this flag).
+    ///
+    /// Requires `bfg_threads_enabled` + `rc_checkpoint_streaming_enabled` (the
+    /// only path that emits segments) and a manifest at or above v26 (v25's
+    /// legacy refcount routing would be lost by the v27 upgrade). `Db::open`
+    /// refuses those mismatches loudly rather than silently degrading.
+    pub rc_delta_run_persist_enabled: bool,
+
+    /// Condense interval K: a shard folds its accumulated segments back into
+    /// the paged base array (and empties its segment chain) once it has
+    /// appended this many segments since the last condense. Only consulted when
+    /// [`Self::rc_delta_run_persist_enabled`] is on. Default 8.
+    pub rc_condense_interval_cycles: u64,
+
+    /// Global cap on unique PBAs held across every shard's in-memory segment
+    /// overlay. When a shard's slice of this budget is exceeded it force-
+    /// condenses on the current cycle, bounding overlay RAM independently of the
+    /// K-cycle timer. Only consulted when
+    /// [`Self::rc_delta_run_persist_enabled`] is on. Default 4_000_000 (÷ shard
+    /// count per shard).
+    pub rc_segment_overlay_max_entries: usize,
+
     /// Fan the per-BFG L2P syncing-slot drain out across shards (one task
     /// per shard) instead of folding them serially on the single
     /// `metadb-bfg-sync` thread. Each shard is independent (own `tree`
@@ -724,6 +756,13 @@ impl Config {
             // L3 format experiment only. Keep disabled unless a controlled
             // aged run is measuring the exact frozen-slot record stream.
             rc_delta_run_shadow_enabled: false,
+            // L3 durable delta-run segments ship **default-off**: the persist
+            // arm is a strict A/B against the eager base-page fold and must be
+            // byte/behaviour-identical when off (manifest version unchanged,
+            // overlay behind an emptiness fast-path). Onyx opts in per-run.
+            rc_delta_run_persist_enabled: false,
+            rc_condense_interval_cycles: 8,
+            rc_segment_overlay_max_entries: 4_000_000,
             // Parallel per-shard L2P drain default-OFF: an earlier nvme-box
             // run regressed 3-4x after its workers escaped the background CPU
             // domain, and L2P was not the only healthy-window gate. Keep this
@@ -783,5 +822,13 @@ mod tests {
     #[test]
     fn rc_delta_run_shadow_defaults_off() {
         assert!(!Config::new("unused").rc_delta_run_shadow_enabled);
+    }
+
+    #[test]
+    fn rc_delta_run_persist_defaults_off_with_documented_knobs() {
+        let cfg = Config::new("unused");
+        assert!(!cfg.rc_delta_run_persist_enabled);
+        assert_eq!(cfg.rc_condense_interval_cycles, 8);
+        assert_eq!(cfg.rc_segment_overlay_max_entries, 4_000_000);
     }
 }

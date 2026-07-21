@@ -104,10 +104,7 @@ fn slot_catalog_heads(page_store: &PageStore, slot: PageId) -> Option<(PageId, P
     let p = page.payload();
     let body_version =
         u32::from_le_bytes(p[OFF_BODY_VERSION..OFF_BODY_VERSION + 4].try_into().ok()?);
-    if !matches!(
-        body_version,
-        LEGACY_MANIFEST_BODY_VERSION | MANIFEST_BODY_VERSION
-    ) {
+    if !is_supported_body_version(body_version) {
         return None;
     }
     let vol = u64::from_le_bytes(
@@ -351,6 +348,22 @@ impl ManifestStore {
         let target_slot = self.next_slot;
         let idx = slot_index(target_slot);
         let generation = manifest.checkpoint_lsn;
+
+        // v27: materialize the parallel all-NULL delta-run heads array for a
+        // manifest built by mutating `refcount_shard_roots` directly (create /
+        // persist-off / tests). A persist commit assigns real heads with the
+        // matching length before commit, so this only fills the "not yet
+        // touched" case; a wrong non-NULL length still surfaces via
+        // `assert_durable_seq_invariant` inside `check_encodable` below.
+        if manifest.refcount_delta_run_heads.len() != manifest.refcount_shard_roots.len()
+            && manifest
+                .refcount_delta_run_heads
+                .iter()
+                .all(|&h| h == NULL_PAGE)
+        {
+            manifest.refcount_delta_run_heads =
+                vec![NULL_PAGE; manifest.refcount_shard_roots.len()].into_boxed_slice();
+        }
 
         // Fail fast (region fit + durable_seq invariant) before any allocation.
         manifest.check_encodable()?;

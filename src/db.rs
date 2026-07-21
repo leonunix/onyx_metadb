@@ -347,6 +347,20 @@ pub struct Db {
     /// checkpoint measures a candidate immutable delta-run codec but still
     /// persists the existing refcount array pages as the sole authority.
     pub(crate) rc_delta_run_shadow_enabled: bool,
+    /// Cached copy of `Config::rc_delta_run_persist_enabled` (L3). When enabled
+    /// the streaming BFG checkpoint appends durable delta-run segments instead
+    /// of rewriting scattered base pages; the base array is condensed only every
+    /// [`Self::rc_condense_interval_cycles`] cycles. Off ⇒ byte/behaviour-
+    /// identical to the eager base-page fold (manifest version unchanged, no
+    /// segments, empty overlay).
+    pub(crate) rc_delta_run_persist_enabled: bool,
+    /// Cached copy of `Config::rc_condense_interval_cycles` (K). Segments per
+    /// shard before a forced condense. Only consulted when persist is on.
+    pub(crate) rc_condense_interval_cycles: u64,
+    /// Cached copy of `Config::rc_segment_overlay_max_entries`. Global cap on
+    /// unique PBAs across every shard's segment overlay; a shard force-condenses
+    /// when its slice is exceeded. Only consulted when persist is on.
+    pub(crate) rc_segment_overlay_max_entries: usize,
     /// Cached copy of `Config::parallel_l2p_drain_enabled`. Fans the
     /// per-BFG L2P syncing-slot drain out across shards when `true`.
     pub(crate) parallel_l2p_drain_enabled: bool,

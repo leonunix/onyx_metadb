@@ -18,6 +18,7 @@ pub mod array;
 pub mod delta;
 pub(crate) mod delta_run;
 pub mod overlay;
+pub(crate) mod segment_dir;
 pub mod shard;
 
 pub use array::{ENTRIES_PER_PAGE, PagedRefcountArray};
@@ -57,7 +58,11 @@ impl RefcountRouting {
     pub(crate) fn from_manifest_version(version: u32) -> Option<Self> {
         match version {
             25 => Some(Self::LegacyPbaHash),
-            26 => Some(Self::PageAffine),
+            // v26 and v27 (delta-run persist) share the page-affine routing —
+            // v27 only ADDS the segment-directory heads array, it does not change
+            // which shard owns a PBA. The delta-run codec's `routing_version`
+            // byte therefore stays 26 (see `manifest_version`).
+            26 | 27 => Some(Self::PageAffine),
             _ => None,
         }
     }

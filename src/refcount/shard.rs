@@ -64,9 +64,24 @@
 //! order; after every slot guard is acquired it releases the fold guard before
 //! merging. Checkpoint publish takes `fold_lock.write()` before touching its
 //! slot. Read-only cumulative lookups take at most one slot at a time.
+//!
+//! ## v27 segment overlay
+//!
+//! The durable delta-run persist path (`begin_checkpoint_streaming_persist`)
+//! appends a compact segment to disk INSTEAD of folding the base array, then
+//! publishes the drained deltas into `segment_overlay` (a merged `DeltaMap` of
+//! every un-condensed segment) under `fold_lock.write()` before clearing the
+//! slot. Reads add the overlay term between the pending slots and the base
+//! (probe order slots → overlay → base, so a publish-before-clear tear
+//! over-counts, never under-counts). Mutations sample the overlay INSIDE their
+//! fold-read window so a concurrent append cannot double-count it against the
+//! held slots. The overlay is mutated ONLY under `fold_lock.write()` (append
+//! merges, condense clears) and is guarded on the hot path by the lock-free
+//! `segment_overlay_len` atomic — zero when persist is off, so an off run takes
+//! no new locks and is byte/behaviour-identical to the eager base-page fold.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -76,10 +91,11 @@ use super::array::{
     ENTRIES_PER_PAGE, PagedRefcountArray, STAGE_BASE_READ_BATCH_PAGES, StagedDeltas, StagedPageMeta,
 };
 use super::delta::{DeltaMap, Pending};
+use super::segment_dir::SegmentDescriptor;
 use crate::cache::PageCache;
 use crate::error::{MetaDbError, Result};
 use crate::page_store::PageStore;
-use crate::types::{Bfg, Lsn, PageId, Pba};
+use crate::types::{Bfg, Lsn, NULL_PAGE, PageId, Pba};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RefcountApplyStageTimings {
@@ -155,9 +171,18 @@ fn merge_staged_action(
     net: i64,
     max_lsn: Lsn,
     any: bool,
+    overlay: (i64, Lsn, bool),
     context: &'static str,
     zero_decref_is_noop: bool,
 ) -> Result<(u32, u32)> {
+    // v27: fold the un-condensed-segment overlay term into the pending sample.
+    // The caller sampled `overlay` INSIDE its fold-read window (verdict b), so a
+    // concurrent persist checkpoint's publish-before-clear cannot double-count
+    // it against the still-held slot deltas.
+    let (overlay_net, overlay_lsn, overlay_any) = overlay;
+    let net = net + overlay_net;
+    let max_lsn = max_lsn.max(overlay_lsn);
+    let any = any || overlay_any;
     if replay_skip && !any && page_lsn >= lsn {
         return Ok((base.rc, base.rc));
     }
@@ -307,6 +332,32 @@ pub struct RcShard {
     /// `stage_batch` reads base pages without slot locks, then validates this
     /// under `fold_lock.read()` before accepting the matching slot snapshot.
     fold_epoch: AtomicU64,
+    /// v27 (delta-run persist): the mutable head pid of this shard's DURABLE
+    /// segment-directory chain, or [`NULL_PAGE`] when the shard has no
+    /// un-condensed segments. Read into the manifest by the cold-path
+    /// `refresh_manifest_entries`; the streaming persist checkpoint advances it
+    /// after its own manifest commit lands. `NULL_PAGE` whenever
+    /// `rc_delta_run_persist_enabled` is off.
+    durable_segment_dir_head: AtomicU64,
+    /// v27: merged net + max-lsn of EVERY un-condensed delta-run segment (the
+    /// deltas that were appended to disk instead of folded into the base array).
+    /// Reads add this term between the pending slots and the base so rc stays
+    /// exact; condense clears it. Mutated ONLY under `fold_lock.write()` +
+    /// `FoldEpochGuard` (append merges, condense clears) — the same discipline as
+    /// slot publish/clear. Empty (and never locked on the hot read path — see
+    /// [`Self::segment_overlay_len`]) whenever persist is off.
+    segment_overlay: Mutex<DeltaMap>,
+    /// Lock-free mirror of `segment_overlay.len()` (unique PBAs). The hot read /
+    /// mutation paths check this atomic FIRST and skip the overlay lock entirely
+    /// when it is zero, so a persist-off run takes ZERO new locks (A/B perf-
+    /// identity). Updated under the same `fold_lock.write()` as the overlay.
+    segment_overlay_len: AtomicUsize,
+    /// v27: in-memory mirror of the durable segment directory — one descriptor
+    /// per un-condensed segment, in append order (oldest first). The streaming
+    /// persist checkpoint pushes; the flush builds the directory chain from it;
+    /// condense clears it. Guarded by `fold_lock.write()` on mutation (append /
+    /// clear) so it stays consistent with the overlay and slots.
+    segment_descriptors: Mutex<Vec<SegmentDescriptor>>,
     #[cfg(test)]
     stage_batch_test_hook: Mutex<Option<Arc<StageBatchTestHook>>>,
     #[cfg(test)]
@@ -341,6 +392,14 @@ pub struct RcCheckpoint {
     /// next fold re-spreads them is unnecessary because abort only needs
     /// the deltas back in *some* live slot to be re-folded).
     restore_slot: usize,
+    /// v27 (persist): the delta-run segment this checkpoint appended, or `None`
+    /// for a base-array (shadow / cold) checkpoint. When `Some`, the checkpoint
+    /// wrote the segment's data pages durably and published its deltas into the
+    /// overlay + descriptor list; the flush builds the directory chain from the
+    /// shard's descriptors and stages the head. `abort_checkpoint` un-publishes
+    /// the overlay, pops the descriptor, restores the slot, and frees the data
+    /// pages (pre-manifest abort only).
+    segment: Option<SegmentDescriptor>,
     snapshot_page_table: Vec<PageId>,
     snapshot_meta_chain: Vec<PageId>,
 }
@@ -432,6 +491,20 @@ impl RcCheckpoint {
         self.drained_deltas.len()
     }
 
+    /// v27: the delta-run segment this persist checkpoint appended (`None` for a
+    /// base-array checkpoint).
+    pub(crate) fn segment(&self) -> Option<&SegmentDescriptor> {
+        self.segment.as_ref()
+    }
+
+    /// v27: true iff this checkpoint appended a durable delta-run segment (so the
+    /// flush must rebuild the shard's directory chain + stage its head), even
+    /// when [`Self::is_empty`] holds (the base array is untouched by a persist
+    /// checkpoint).
+    pub(crate) fn has_segment(&self) -> bool {
+        self.segment.is_some()
+    }
+
     /// Number of freshly-allocated data pages this checkpoint produced.
     pub fn fresh_pages_count(&self) -> usize {
         self.staged.pages.iter().filter(|p| p.is_fresh).count()
@@ -513,6 +586,10 @@ impl RcShard {
             array,
             fold_lock: parking_lot::RwLock::new(()),
             fold_epoch: AtomicU64::new(0),
+            durable_segment_dir_head: AtomicU64::new(NULL_PAGE),
+            segment_overlay: Mutex::new(DeltaMap::new()),
+            segment_overlay_len: AtomicUsize::new(0),
+            segment_descriptors: Mutex::new(Vec::new()),
             #[cfg(test)]
             stage_batch_test_hook: Mutex::new(None),
             #[cfg(test)]
@@ -522,6 +599,45 @@ impl RcShard {
 
     pub fn meta_page_id(&self) -> PageId {
         self.array.meta_page_id()
+    }
+
+    /// v27: the head pid of this shard's durable delta-run segment-directory
+    /// chain ([`NULL_PAGE`] when it has no un-condensed segments). Read into the
+    /// manifest by `refresh_manifest_entries` so a cold-path commit carries the
+    /// current heads.
+    pub fn durable_segment_dir_head(&self) -> PageId {
+        self.durable_segment_dir_head.load(Ordering::Acquire)
+    }
+
+    /// v27: record the segment-directory chain head that a manifest commit made
+    /// durable. Called at open (from the decoded manifest) and after each
+    /// streaming persist checkpoint / condense commit lands.
+    pub fn set_durable_segment_dir_head(&self, head: PageId) {
+        self.durable_segment_dir_head.store(head, Ordering::Release);
+    }
+
+    /// v27: snapshot of the un-condensed segment descriptors (append order,
+    /// oldest first). The flush rebuilds the durable directory chain from this
+    /// after a persist checkpoint appends its segment.
+    pub(crate) fn segment_descriptors_snapshot(&self) -> Vec<SegmentDescriptor> {
+        self.segment_descriptors.lock().clone()
+    }
+
+    /// v27: number of un-condensed segments (== directory length).
+    pub(crate) fn segment_count(&self) -> usize {
+        self.segment_descriptors.lock().len()
+    }
+
+    /// v27: unique PBAs currently in the segment overlay (observability gauge).
+    pub(crate) fn segment_overlay_entries(&self) -> usize {
+        self.segment_overlay_len.load(Ordering::Relaxed)
+    }
+
+    /// v27: true when the shard has un-condensed segments in memory (overlay
+    /// non-empty OR descriptors present). Used by the verdict-e guard and the
+    /// flush's condense-due gate.
+    pub(crate) fn has_uncondensed_segments(&self) -> bool {
+        !self.overlay_is_empty() || !self.segment_descriptors.lock().is_empty()
     }
 
     pub(crate) fn warmup_data_pages(&self) -> Result<u64> {
@@ -546,6 +662,22 @@ impl RcShard {
             let slot = slot.lock();
             for (idx, &pba) in pbas.iter().enumerate() {
                 if let Some(pending) = slot.get(pba) {
+                    net[idx] += pending.delta;
+                    max_lsn[idx] = max_lsn[idx].max(pending.last_lsn);
+                    any[idx] = true;
+                }
+            }
+        }
+        // v27: add the un-condensed-segment overlay term. Unlike `lookup_entry`,
+        // `get_many` samples bases FIRST (up top), so a concurrent condense's
+        // publish-before-clear can transiently tear here — that is TOLERATED
+        // because `get_many` serves the reversible dedup path (a spurious rc tear
+        // just demotes a dedup hit to a fresh miss). Behind the emptiness
+        // fast-path so a persist-off run takes no new lock.
+        if !self.overlay_is_empty() {
+            let overlay = self.segment_overlay.lock();
+            for (idx, &pba) in pbas.iter().enumerate() {
+                if let Some(pending) = overlay.get(pba) {
                     net[idx] += pending.delta;
                     max_lsn[idx] = max_lsn[idx].max(pending.last_lsn);
                     any[idx] = true;
@@ -625,13 +757,75 @@ impl RcShard {
         (net, max_lsn, any)
     }
 
+    /// True when no un-condensed delta-run segments are in the overlay. A
+    /// lock-free atomic read: the hot path skips the overlay mutex entirely when
+    /// this holds, so a persist-off run takes ZERO new locks (A/B perf-identity).
+    #[inline]
+    fn overlay_is_empty(&self) -> bool {
+        self.segment_overlay_len.load(Ordering::Relaxed) == 0
+    }
+
+    /// Fold this PBA's un-condensed-segment overlay term onto an already-sampled
+    /// `(net, max_lsn, any)` pair from the pending slots. VALIDATED ORDERING RULE
+    /// (verdict a): an unlocked read must probe slots → overlay → base. A
+    /// concurrent persist checkpoint publishes into the overlay BEFORE clearing
+    /// the slot, so sampling slots first then overlay yields at-worst an
+    /// over-count (the safe direction, floored by `merge_read_or_floor`);
+    /// overlay-before-slots could DROP a delta.
+    #[inline]
+    fn add_overlay_read(&self, pba: Pba, net: i64, max_lsn: Lsn, any: bool) -> (i64, Lsn, bool) {
+        if self.overlay_is_empty() {
+            return (net, max_lsn, any);
+        }
+        match self.segment_overlay.lock().get(pba) {
+            Some(p) => (net + p.delta, max_lsn.max(p.last_lsn), true),
+            None => (net, max_lsn, any),
+        }
+    }
+
     fn lookup_entry(&self, pba: Pba) -> Result<RcEntry> {
+        // Probe order slots → overlay → base (verdict a). refcount is cumulative,
+        // so the effective rc = base ⊕ (Σ slot deltas + overlay net).
         let (net, max_lsn, any) = self.sum_pending(pba, None);
+        let (net, max_lsn, any) = self.add_overlay_read(pba, net, max_lsn, any);
         let base = self.array.get(pba)?;
         if !any {
             return Ok(base);
         }
         super::merge_read_or_floor(base, net, max_lsn)
+    }
+
+    /// Sample the overlay term `(net, lsn, any)` for each PBA. MUST be called by
+    /// a mutation INSIDE its fold-read window (between `fold_epoch` validation
+    /// and `drop(fold)`) so a concurrent persist checkpoint — which publishes
+    /// into the overlay and clears the slot under `fold_lock.write()` — is atomic
+    /// with respect to this sample (verdict b: sampling at merge time, after the
+    /// fold guard drops, would see the publish while the slot clear is still
+    /// blocked on the held slot guards → double count → spurious underflow →
+    /// poison commit). Behind the emptiness fast-path: persist-off ⇒ no lock.
+    fn sample_overlay_batch(&self, pbas: &[Pba]) -> Vec<(i64, Lsn, bool)> {
+        if self.overlay_is_empty() {
+            return vec![(0, 0, false); pbas.len()];
+        }
+        let overlay = self.segment_overlay.lock();
+        pbas.iter()
+            .map(|&pba| match overlay.get(pba) {
+                Some(p) => (p.delta, p.last_lsn, true),
+                None => (0, 0, false),
+            })
+            .collect()
+    }
+
+    /// Single-PBA companion of [`Self::sample_overlay_batch`]; same fold-window
+    /// requirement.
+    fn sample_overlay_one(&self, pba: Pba) -> (i64, Lsn, bool) {
+        if self.overlay_is_empty() {
+            return (0, 0, false);
+        }
+        match self.segment_overlay.lock().get(pba) {
+            Some(p) => (p.delta, p.last_lsn, true),
+            None => (0, 0, false),
+        }
     }
 
     /// Stage one op into the pending delta for `bfg`'s slot. Returns the
@@ -691,7 +885,7 @@ impl RcShard {
         let mut slot_lock_wait = Duration::ZERO;
         let mut base_lookup_attempts = 0u64;
         let mut epoch_retries = 0u64;
-        let (bases, mut slots, active_slots) = loop {
+        let (bases, mut slots, active_slots, overlay_samples) = loop {
             let epoch_before = self.fold_epoch.load(Ordering::Acquire);
             base_lookup_attempts = base_lookup_attempts.saturating_add(1);
             let lookup_started = sample_breakdown.then(Instant::now);
@@ -728,8 +922,11 @@ impl RcShard {
             // active even when initially empty because this batch mutates it;
             // the other empty maps cannot gain entries while locked.
             let active_slots = active_slot_mask(&slots, open_idx);
+            // v27: sample the overlay INSIDE the fold-read window (verdict b),
+            // coherent with the slot snapshot just taken.
+            let overlay_samples = self.sample_overlay_batch(&pbas);
             drop(fold);
-            break (bases, slots, active_slots);
+            break (bases, slots, active_slots, overlay_samples);
         };
 
         let mut out = Vec::with_capacity(actions.len());
@@ -755,6 +952,7 @@ impl RcShard {
                     net,
                     max_lsn,
                     any,
+                    overlay_samples[action_idx],
                     "stage_batch",
                     false,
                 );
@@ -776,6 +974,7 @@ impl RcShard {
                     net,
                     max_lsn,
                     any,
+                    overlay_samples[action_idx],
                     "stage_batch",
                     false,
                 )?);
@@ -864,6 +1063,8 @@ impl RcShard {
             // read guard is held, and after all slot guards are acquired it
             // cannot clear the matching pending delta until this merge ends.
             let mut slots: Vec<_> = self.delta_slots.iter().map(|slot| slot.lock()).collect();
+            // v27: sample the overlay INSIDE the fold-read window (verdict b).
+            let overlay_sample = self.sample_overlay_one(pba);
             drop(fold);
             let (net, max_lsn, any) = scan_active_locked_pending(&slots, ALL_SLOT_MASK, pba);
             return merge_staged_action(
@@ -877,6 +1078,7 @@ impl RcShard {
                 net,
                 max_lsn,
                 any,
+                overlay_sample,
                 "stage",
                 zero_decref_is_noop,
             );
@@ -890,6 +1092,184 @@ impl RcShard {
     /// durable_seq is correct — no separate watermark to record.
     pub fn begin_checkpoint(&self, bfg: Bfg) -> Result<RcCheckpoint> {
         self.checkpoint_slots(&[slot_index(bfg)], false, &[])
+    }
+
+    /// v27 DURABLE persist checkpoint. Instead of folding the frozen Syncing
+    /// slot into the base array (the amplification we are removing), it appends
+    /// a compact delta-run SEGMENT: the drained deltas are sorted by PBA,
+    /// encoded to [`PageType::RefcountDeltaRun`] pages, written durably OUTSIDE
+    /// `fold_lock` (the hot checkpoint reads/writes NO base page), then — under
+    /// one `fold_lock.write()` + epoch window — published into `segment_overlay`
+    /// (reads add it), appended to `segment_descriptors` (the directory mirror),
+    /// and exact-removed from the slot. Publish-before-clear ⇒ a concurrent read
+    /// transiently over-counts (floored), never under-counts. The base array is
+    /// folded only at condense (S3).
+    ///
+    /// Failure is clean: an encode / write error frees any allocated segment
+    /// pids and mutates nothing; the (defensive) under-fold validation error
+    /// frees the just-written segment pages before returning. The returned
+    /// `RcCheckpoint` carries the segment descriptor for the flush to fold into
+    /// the shard's directory chain + manifest head; `abort_checkpoint` reverses
+    /// the overlay publish / descriptor append / slot clear and frees the pages
+    /// if the flush's manifest commit never lands.
+    pub(crate) fn begin_checkpoint_streaming_persist(
+        &self,
+        bfg: Bfg,
+        routing_version: u32,
+        shard_id: u32,
+        covered_lsn_max: Lsn,
+    ) -> Result<RcCheckpoint> {
+        let restore_slot = slot_index(bfg);
+        // 1. Clone the frozen Syncing slot; sort by PBA (codec requirement).
+        let mut drained: Vec<(Pba, Pending)> = {
+            let slot = self.delta_slots[restore_slot].lock();
+            slot.iter().map(|(pba, pending)| (*pba, *pending)).collect()
+        };
+        if drained.is_empty() {
+            return Ok(self.empty_persist_checkpoint(restore_slot));
+        }
+        drained.sort_by_key(|(pba, _)| *pba);
+        let covered_lsn_min = drained
+            .iter()
+            .map(|(_, pending)| pending.last_lsn)
+            .min()
+            .unwrap_or(0);
+        // The codec requires every record's `last_lsn <= covered_lsn_max`. The
+        // BFG boundary passed in is normally >= every drained last_lsn, but take
+        // the max with the actual record maximum so a non-WAL delta (e.g. a
+        // structural incref stamped above the boundary) can never fail encode.
+        let covered_lsn_max = covered_lsn_max.max(
+            drained
+                .iter()
+                .map(|(_, pending)| pending.last_lsn)
+                .max()
+                .unwrap_or(0),
+        );
+
+        // 2. Encode + allocate pids + write segment pages OUTSIDE fold_lock.
+        let context = super::delta_run::DeltaRunContext::for_manifest_routing(
+            routing_version,
+            shard_id,
+            bfg,
+            covered_lsn_min,
+            covered_lsn_max,
+        );
+        let (stats, pages) = super::delta_run::encode_run_pages(context, &drained)?;
+        let sealed: Vec<Arc<crate::page::Page>> = pages.into_iter().map(Arc::new).collect();
+        // `write_segment_pages` frees every pid it allocated on any failure, so a
+        // failed append leaks nothing and mutates no in-memory state.
+        let data_pids = self.array.write_segment_pages(sealed)?;
+        let descriptor = SegmentDescriptor {
+            bfg,
+            covered_lsn_min,
+            covered_lsn_max,
+            records: stats.records,
+            data_pids,
+        };
+
+        // 3. Under fold_lock.write() + epoch: validate → publish overlay →
+        //    append descriptor → clear slot (publish-before-clear).
+        let fold_lock_wait_started = Instant::now();
+        let fold = self.fold_lock.write();
+        let fold_lock_wait_us = fold_lock_wait_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        let fold_started = Instant::now();
+        let epoch_guard = FoldEpochGuard {
+            epoch: &self.fold_epoch,
+        };
+        let publish_result: Result<()> = (|| {
+            // The Syncing slot is frozen (no concurrent inserts). Validate the
+            // exact snapshot before mutating anything so a violated BFG
+            // invariant frees the segment pages instead of corrupting state.
+            {
+                let slot = self.delta_slots[restore_slot].lock();
+                for &(pba, pending) in &drained {
+                    if slot.get(pba) != Some(pending) {
+                        return Err(MetaDbError::Corruption(format!(
+                            "persist refcount checkpoint slot changed for pba {pba}"
+                        )));
+                    }
+                }
+            }
+            // Publish: merge drained into the overlay (reads see it now).
+            {
+                let mut overlay = self.segment_overlay.lock();
+                for &(pba, pending) in &drained {
+                    overlay.merge_pending(pba, pending);
+                }
+                self.segment_overlay_len
+                    .store(overlay.len(), Ordering::Release);
+            }
+            // Append the descriptor to the in-memory directory mirror.
+            self.segment_descriptors.lock().push(descriptor.clone());
+            // Clear: exact-remove from the (validated, frozen) slot.
+            {
+                let mut slot = self.delta_slots[restore_slot].lock();
+                for &(pba, pending) in &drained {
+                    if slot.remove(pba) != Some(pending) {
+                        // Cannot happen after a passing validation on a frozen
+                        // slot; treat as corruption.
+                        return Err(MetaDbError::Corruption(format!(
+                            "persist refcount checkpoint failed exact removal for pba {pba}"
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        drop(epoch_guard);
+        drop(fold);
+        let fold_service_us = fold_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+
+        if let Err(err) = publish_result {
+            // Validation happens before the overlay/descriptor/slot mutations, so
+            // on this (defensive) error nothing in-memory changed — just free the
+            // durable segment pages we wrote in step 2.
+            self.array.free_segment_pages(&descriptor.data_pids);
+            return Err(err);
+        }
+
+        Ok(RcCheckpoint {
+            staged: StagedDeltas {
+                pages: Vec::new(),
+                max_lsn: 0,
+            },
+            streamed_pages: Vec::new(),
+            fold_lock_wait_us,
+            fold_service_us,
+            streaming_write_stats: RcStreamingWriteStats::default(),
+            delta_shadow_stats: RcDeltaShadowStats::default(),
+            streaming: true,
+            drained_deltas: drained,
+            restore_slot,
+            segment: Some(descriptor),
+            snapshot_page_table: self.array.page_table_snapshot(),
+            snapshot_meta_chain: self.array.meta_chain_snapshot(),
+        })
+    }
+
+    /// Empty persist checkpoint — nothing drained this cycle. The base array +
+    /// segment directory are untouched.
+    fn empty_persist_checkpoint(&self, restore_slot: usize) -> RcCheckpoint {
+        RcCheckpoint {
+            staged: StagedDeltas {
+                pages: Vec::new(),
+                max_lsn: 0,
+            },
+            streamed_pages: Vec::new(),
+            fold_lock_wait_us: 0,
+            fold_service_us: 0,
+            streaming_write_stats: RcStreamingWriteStats::default(),
+            delta_shadow_stats: RcDeltaShadowStats::default(),
+            streaming: true,
+            drained_deltas: Vec::new(),
+            restore_slot,
+            segment: None,
+            snapshot_page_table: self.array.page_table_snapshot(),
+            snapshot_meta_chain: self.array.meta_chain_snapshot(),
+        }
     }
 
     /// Production threads-on refcount checkpoint. The frozen Syncing slot is
@@ -956,6 +1336,7 @@ impl RcShard {
                 streaming: true,
                 drained_deltas: Vec::new(),
                 restore_slot,
+                segment: None,
                 snapshot_page_table: self.array.page_table_snapshot(),
                 snapshot_meta_chain: self.array.meta_chain_snapshot(),
             });
@@ -1175,6 +1556,7 @@ impl RcShard {
             streaming: true,
             drained_deltas: drained,
             restore_slot,
+            segment: None,
             snapshot_page_table: self.array.page_table_snapshot(),
             snapshot_meta_chain: self.array.meta_chain_snapshot(),
         })
@@ -1290,6 +1672,7 @@ impl RcShard {
                 streaming: false,
                 drained_deltas: Vec::new(),
                 restore_slot,
+                segment: None,
                 snapshot_page_table: self.array.page_table_snapshot(),
                 snapshot_meta_chain: self.array.meta_chain_snapshot(),
             });
@@ -1347,6 +1730,7 @@ impl RcShard {
             streaming: false,
             drained_deltas: drained,
             restore_slot,
+            segment: None,
             snapshot_page_table,
             snapshot_meta_chain,
         })
@@ -1411,6 +1795,62 @@ impl RcShard {
     /// remain folded, while unreachable fresh pages can be freed and restored
     /// from compact metadata. Post-write errors must retain authority instead.
     pub fn abort_checkpoint(&self, ckpt: RcCheckpoint, free_lsn: Lsn) {
+        // v27 persist checkpoint abort (pre-manifest only — a post-manifest
+        // failure retains authority under the sync-poison contract, exactly like
+        // the base streaming path). Reverse the overlay publish, pop the
+        // descriptor, restore the slot, and free the durable segment data pages.
+        if let Some(segment) = ckpt.segment.as_ref() {
+            let fold = self.fold_lock.write();
+            let epoch_guard = FoldEpochGuard {
+                epoch: &self.fold_epoch,
+            };
+            // Un-publish: subtract the drained deltas (exact net reversal; a
+            // stale-high overlay last_lsn is benign — birth_lsn has no live
+            // production reader). Prune a PBA this abort drove back to net 0 so
+            // the overlay stays clean.
+            {
+                let mut overlay = self.segment_overlay.lock();
+                for &(pba, pending) in &ckpt.drained_deltas {
+                    overlay.merge_pending(
+                        pba,
+                        Pending {
+                            delta: -pending.delta,
+                            last_lsn: 0,
+                        },
+                    );
+                    if overlay.get(pba).map(|p| p.delta) == Some(0) {
+                        overlay.remove(pba);
+                    }
+                }
+                self.segment_overlay_len
+                    .store(overlay.len(), Ordering::Release);
+            }
+            // Pop the descriptor this checkpoint appended (the last one — one
+            // checkpoint per flush per shard, aborted before any successor).
+            {
+                let mut descriptors = self.segment_descriptors.lock();
+                if descriptors
+                    .last()
+                    .is_some_and(|d| d.data_pids == segment.data_pids)
+                {
+                    descriptors.pop();
+                } else {
+                    descriptors.retain(|d| d.data_pids != segment.data_pids);
+                }
+            }
+            // Restore the slot so a retry re-appends the segment.
+            {
+                let mut slot = self.delta_slots[ckpt.restore_slot].lock();
+                for &(pba, pending) in &ckpt.drained_deltas {
+                    slot.merge_pending(pba, pending);
+                }
+            }
+            drop(epoch_guard);
+            drop(fold);
+            // Free the durable segment data pages (written pre-fold in step 2).
+            self.array.free_segment_pages(&segment.data_pids);
+            return;
+        }
         if ckpt.is_empty() {
             return;
         }
@@ -1450,6 +1890,27 @@ impl RcShard {
     /// Synchronous flush for non-checkpoint callers (cold path). Folds
     /// every slot to disk and rotates the meta chain.
     pub fn flush(&self) -> Result<()> {
+        // Verdict-e stopgap (S1): a full cold fold (`force=true` all-slot) while
+        // un-condensed delta-run segments are anchored would raise base-page
+        // generations above the segments' record last_lsns, so the later
+        // condense would generation-skip live increfs → rc under-count →
+        // premature free. Until S3 makes this path condense-first, refuse it
+        // loudly. The segment chain is only ever non-empty under
+        // `rc_delta_run_persist_enabled`, so this guard is inert when persist is
+        // off — no behaviour change for the eager base-page fold. Callers:
+        // `drop_snapshot` (snapshot.rs), `drop_volume` / clone (volume.rs),
+        // `iter_live_flushed`.
+        if self.durable_segment_dir_head.load(Ordering::Acquire) != NULL_PAGE
+            || self.has_uncondensed_segments()
+        {
+            return Err(MetaDbError::InvalidArgument(
+                "RcShard::flush: cold full fold forbidden while un-condensed \
+                 delta-run segments are anchored (S1 stopgap — S3 makes this \
+                 condense-first); a drop_snapshot/drop_volume/clone ran with \
+                 rc_delta_run_persist_enabled before condense support"
+                    .into(),
+            ));
+        }
         // Cold path: force-apply (lifecycle-serialized, no in-place retry;
         // folds the snapshot incref whose `last_lsn == created_lsn` equals
         // the array page generation).

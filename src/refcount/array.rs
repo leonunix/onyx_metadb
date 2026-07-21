@@ -864,6 +864,55 @@ impl PagedRefcountArray {
             .write_sealed_page_runs_for_class(pages, IoLaneClass::Refcount)
     }
 
+    /// Allocate a fresh pid per sealed delta-run segment page and write them
+    /// through the refcount IO lane (durable persist path, v27). On any
+    /// allocation or write failure every pid allocated by THIS call is freed, so
+    /// a failed append leaks nothing. Returns the assigned pids in page order.
+    /// Segment pages are immutable and read only at condense/open-replay, so
+    /// they are NOT inserted into the page cache here.
+    pub(super) fn write_segment_pages(&self, pages: Vec<Arc<Page>>) -> Result<Vec<PageId>> {
+        let mut pids = Vec::with_capacity(pages.len());
+        let mut sealed: Vec<(PageId, Arc<Page>)> = Vec::with_capacity(pages.len());
+        for page in pages {
+            match self.page_store.allocate() {
+                Ok(pid) => {
+                    pids.push(pid);
+                    sealed.push((pid, page));
+                }
+                Err(err) => {
+                    self.free_segment_pages(&pids);
+                    return Err(err);
+                }
+            }
+        }
+        if let Err(err) = self
+            .page_store
+            .write_sealed_page_runs_for_class(sealed, IoLaneClass::Refcount)
+        {
+            self.free_segment_pages(&pids);
+            return Err(err);
+        }
+        Ok(pids)
+    }
+
+    /// Free delta-run segment (or directory) pages — the abort path (pre-manifest
+    /// failure) and post-condense reclaim both use this. Best-effort: a free
+    /// error is logged and otherwise ignored (a leaked page is recoverable by
+    /// offline verify; a spurious double-free is not). `free_lsn` stamps the
+    /// deferred-free entry.
+    pub(super) fn free_segment_pages(&self, pids: &[PageId]) {
+        for &pid in pids {
+            self.page_cache.invalidate(pid);
+            if let Err(err) = self.page_store.free(pid, 0) {
+                tracing::warn!(
+                    page_id = pid,
+                    error = %err,
+                    "free_segment_pages: failed to free delta-run segment/directory page"
+                );
+            }
+        }
+    }
+
     /// Drop the dirty-staged overlay entries for `staged` — call ONLY
     /// once the staged page bytes are durable on disk (or from the
     /// abort path, which restores disk truth first). Removal is gated
@@ -1098,6 +1147,13 @@ impl PagedRefcountArray {
     #[cfg(test)]
     pub(super) fn staged_overlay_len(&self) -> usize {
         self.inner.lock().staged_overlay.len()
+    }
+
+    /// Test-only handle to the backing page store (segment page decode / free
+    /// assertions in the shard's persist-checkpoint tests).
+    #[cfg(test)]
+    pub(super) fn page_store_for_test(&self) -> &Arc<PageStore> {
+        &self.page_store
     }
 
     /// Persist the meta chain if it has been mutated since the last

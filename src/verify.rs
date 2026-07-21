@@ -838,6 +838,18 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         // via its on_meta callback, matching walk_cuckoo / walk_dedup_reverse.
         walk_refcount_paged_array(page_store, meta_pid, &mut live, &mut seen_btree)?;
     }
+    // v27: mark every page each shard's un-condensed delta-run segment DIRECTORY
+    // occupies + references — the COW chain framing pages AND the segment data
+    // pages — so orphan reclaim / the device free-list rebuild never frees a live
+    // segment. `NULL_PAGE` head ⇒ the shard has no un-condensed segments.
+    for &head in manifest.refcount_delta_run_heads.iter() {
+        if head == NULL_PAGE {
+            continue;
+        }
+        for pid in crate::refcount::segment_dir::collect_live_pages(page_store, head)? {
+            live.mark(pid);
+        }
+    }
     // BFG: the v17 L2P-page-rc shard group is deleted, so there are no
     // page-rc meta chains to mark live here.
 
