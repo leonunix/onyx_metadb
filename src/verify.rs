@@ -846,6 +846,8 @@ fn collect_live_pages(page_store: &Arc<PageStore>, loaded: &LoadedManifest) -> R
         if head == NULL_PAGE {
             continue;
         }
+        // Assert the covered LSN ranges are well-formed + monotone oldest→newest.
+        crate::refcount::segment_dir::verify_directory(page_store, head)?;
         for pid in crate::refcount::segment_dir::collect_live_pages(page_store, head)? {
             live.mark(pid);
         }

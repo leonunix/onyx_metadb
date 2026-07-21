@@ -80,6 +80,25 @@ fn open_or_create_with_faults(
             .and_then(|raw| raw.parse::<u64>().ok())
             .unwrap_or(5);
     }
+    // v27 L3: METADB_SOAK_RC_DELTA_PERSIST=1 makes delta-run segments the durable
+    // refcount representation (append + condense + condense-on-open). Requires
+    // the streaming BFG checkpoint, so it force-enables bfg threads + streaming.
+    // A small METADB_SOAK_RC_CONDENSE_INTERVAL (default 4) exercises frequent
+    // condense + directory drain across the restart/fault matrix — the gate for
+    // this feature (`audit_pba_refcounts` under-count is FATAL = premature free).
+    if matches!(
+        std::env::var("METADB_SOAK_RC_DELTA_PERSIST").as_deref(),
+        Ok("1") | Ok("true")
+    ) {
+        cfg.bfg_threads_enabled = true;
+        cfg.rc_checkpoint_streaming_enabled = true;
+        cfg.rc_delta_run_persist_enabled = true;
+        cfg.rc_condense_interval_cycles = std::env::var("METADB_SOAK_RC_CONDENSE_INTERVAL")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|&k| k >= 1)
+            .unwrap_or(4);
+    }
     match Db::open_with_config_and_faults(cfg.clone(), faults.clone()) {
         Ok(db) => Ok(db),
         Err(_) => Db::create_with_config_and_faults(cfg, faults),

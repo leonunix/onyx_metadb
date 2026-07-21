@@ -329,6 +329,35 @@ pub(crate) fn directory_chain_pids(
     Ok(pids)
 }
 
+/// Offline-verify check: decode the directory at `head_pid` and assert every
+/// segment's covered LSN range is well-formed and the sequence of
+/// `covered_lsn_max` is non-decreasing oldest→newest (segments are appended in
+/// increasing BFG/checkpoint order). A [`NULL_PAGE`] head passes trivially.
+pub(crate) fn verify_directory(page_store: &PageStore, head_pid: PageId) -> Result<()> {
+    let segments = read_directory_chain(page_store, head_pid)?;
+    let mut prev_max: Option<Lsn> = None;
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.covered_lsn_min > seg.covered_lsn_max {
+            return Err(MetaDbError::Corruption(format!(
+                "refcount segment directory {head_pid} segment {i} covered range \
+                 {}..={} inverted",
+                seg.covered_lsn_min, seg.covered_lsn_max
+            )));
+        }
+        if let Some(prev) = prev_max
+            && seg.covered_lsn_max < prev
+        {
+            return Err(MetaDbError::Corruption(format!(
+                "refcount segment directory {head_pid} segment {i} covered_lsn_max {} \
+                 regresses below the previous segment's {prev}",
+                seg.covered_lsn_max
+            )));
+        }
+        prev_max = Some(seg.covered_lsn_max);
+    }
+    Ok(())
+}
+
 /// Every page id the directory at `head_pid` occupies AND references: the chain
 /// framing pages plus every segment's data pages. Used by the verifier /
 /// orphan-reclaim / device-open protected set so live segment pages are never
@@ -447,6 +476,28 @@ mod tests {
         let (_d, store) = store();
         assert!(read_directory_chain(&store, NULL_PAGE).unwrap().is_empty());
         assert!(collect_live_pages(&store, NULL_PAGE).unwrap().is_empty());
+        verify_directory(&store, NULL_PAGE).unwrap();
+    }
+
+    #[test]
+    fn verify_directory_accepts_monotone_rejects_regression() {
+        let (_d, store) = store();
+        // Monotone covered_lsn_max: accepted.
+        let ok = vec![seg(0, 1, 10, 2, &[7]), seg(1, 11, 20, 2, &[8])];
+        let (chain, sealed) = build_directory_chain(&store, &ok, 1).unwrap();
+        store.write_sealed_page_runs(sealed).unwrap();
+        store.sync().unwrap();
+        verify_directory(&store, chain[0]).unwrap();
+
+        // Regressing covered_lsn_max (segment 1's max < segment 0's): rejected.
+        let bad = vec![seg(0, 1, 30, 2, &[7]), seg(1, 5, 20, 2, &[8])];
+        let (chain2, sealed2) = build_directory_chain(&store, &bad, 2).unwrap();
+        store.write_sealed_page_runs(sealed2).unwrap();
+        store.sync().unwrap();
+        assert!(matches!(
+            verify_directory(&store, chain2[0]),
+            Err(MetaDbError::Corruption(_))
+        ));
     }
 
     #[test]

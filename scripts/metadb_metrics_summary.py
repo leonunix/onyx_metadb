@@ -163,6 +163,22 @@ def print_window(name: str, rows: list[dict]) -> None:
                 f"  l2p_walk {int(lm.get('flush_sample_l2p_walk_us', 0)) / flush_calls:,.1f} us"
                 f"  rc_drain {int(lm.get('flush_sample_rc_drain_us', 0)) / flush_calls:,.1f} us"
             )
+    # v27 L3 durable delta-run segments (rc_delta_run_persist_enabled).
+    seg_appends = delta("meta.flush_rc_segment_appends")
+    seg_condenses = delta("meta.flush_rc_segment_condenses")
+    if seg_appends or seg_condenses:
+        seg_pages = delta("meta.flush_rc_segment_pages")
+        print(f"  rc delta-run segments (L3)")
+        print(
+            f"    appends {seg_appends:,}  condenses {seg_condenses:,}"
+            f"  seg_pages {seg_pages:,}  dir_pages {delta('meta.flush_rc_segment_dir_pages'):,}"
+        )
+        print(
+            f"    seg_bytes {delta('meta.flush_rc_segment_bytes'):,}"
+            f"  overlay_entries_max {int(lm.get('flush_rc_segment_overlay_entries_max', 0)):,}"
+        )
+        if seg_appends:
+            print(f"    pages/append avg:    {seg_pages / seg_appends:,.1f}")
     if range_delete_calls or cleanup_calls:
         print(f"  op-kind hotspots")
         if range_delete_calls:
