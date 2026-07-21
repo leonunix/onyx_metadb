@@ -1288,16 +1288,19 @@ impl Db {
         // succeeds so subsequent reads don't need to hit disk for the
         // new chain head/continuation pages.
         let mut rc_chain_cache_inserts: Vec<(PageId, Arc<crate::page::Page>)> = Vec::new();
-        // v27: per-shard NEW segment-directory head — `Some` for shards that
-        // appended a delta-run segment this cycle. Staged in the manifest below;
-        // made durable on the shard after the commit lands.
+        // v27: per-shard NEW segment-directory head staged in the manifest —
+        // `Some` for shards whose directory was rewritten in place this cycle
+        // (append or condense). It equals the shard's STABLE reserved head, so
+        // staging it is an idempotent re-stamp (mirrors `refcount_shard_roots`).
         let mut rc_segment_dir_new_heads: Vec<Option<PageId>> =
             (0..self.refcount_shards.len()).map(|_| None).collect();
-        // v27: per-shard OLD directory head whose framing pages are freed after
-        // the commit (fresh-pid COW). The segment DATA pages stay live — they are
-        // re-listed in the new directory.
-        let mut rc_segment_dir_old_heads: Vec<Option<PageId>> =
+        // v27: per-shard NEW framing chain, cached on the shard after the commit
+        // lands so the next in-place rewrite reuses the head + continuation pids.
+        let mut rc_segment_dir_new_chains: Vec<Option<Vec<PageId>>> =
             (0..self.refcount_shards.len()).map(|_| None).collect();
+        // v27: trailing directory-continuation framing pids freed after the commit
+        // (the directory shrank). The STABLE head + re-listed data pages stay live.
+        let mut rc_segment_dir_framing_free: Vec<PageId> = Vec::new();
         // v27 authoritative segment metrics accumulated across shards this flush.
         let mut rc_seg_appends = 0u64;
         let mut rc_seg_pages = 0u64;
@@ -1338,31 +1341,56 @@ impl Db {
                     return Err(err);
                 }
             }
-            // v27: for a persist checkpoint, build the shard's segment-directory
-            // chain (fresh-pid COW) from its descriptors and fold the sealed
-            // pages into the global batch. This runs only on the Ok path (the
-            // base meta-chain Err arm above already returned).
-            if let Some(segment) = ckpt.segment() {
-                rc_seg_appends += 1;
-                rc_seg_pages += segment.data_pids.len() as u64;
-                rc_seg_bytes += (segment.data_pids.len() as u64)
-                    .saturating_mul(crate::page::PAGE_PAYLOAD_SIZE as u64);
-                rc_seg_overlay_max = rc_seg_overlay_max.max(shard.rc.segment_overlay_entries() as u64);
+            // v27: rewrite the shard's segment directory IN PLACE at its STABLE
+            // reserved head for any persist checkpoint that changed it — an APPEND
+            // (descriptors now include the new segment) or a CONDENSE that folded
+            // segments (descriptors now empty, so the rewrite empties the directory
+            // in place while keeping the head). The head + segment DATA pages are
+            // already durable at the global `sync()` below, so a crash before the
+            // manifest commit leaves them reachable from the manifest-recorded head.
+            // Runs only on the Ok path (the base meta-chain Err arm already returned).
+            let is_append = ckpt.segment().is_some();
+            let is_condense_with_segments =
+                ckpt.is_condense() && !ckpt.condense_segment_pages().is_empty();
+            if is_append || is_condense_with_segments {
+                if let Some(segment) = ckpt.segment() {
+                    rc_seg_appends += 1;
+                    rc_seg_pages += segment.data_pids.len() as u64;
+                    rc_seg_bytes += (segment.data_pids.len() as u64)
+                        .saturating_mul(crate::page::PAGE_PAYLOAD_SIZE as u64);
+                    rc_seg_overlay_max =
+                        rc_seg_overlay_max.max(shard.rc.segment_overlay_entries() as u64);
+                } else {
+                    rc_seg_condenses += 1;
+                    rc_condense_segment_free.extend(ckpt.condense_segment_pages());
+                }
+                let existing = shard.rc.segment_dir_chain_snapshot();
+                if existing.is_empty() {
+                    // Reservation at open guarantees a stable head before any
+                    // persist checkpoint. A missing head is an invariant violation
+                    // (persist cannot be enabled mid-run); fail cleanly rather than
+                    // allocate a fresh head that a crash would orphan.
+                    self.metrics.record_flush_total(kind, flush_started.elapsed());
+                    self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
+                    self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+                    return Err(MetaDbError::Corruption(format!(
+                        "rc shard {s_idx} persist checkpoint with no reserved segment-directory head"
+                    )));
+                }
                 let descriptors = shard.rc.segment_descriptors_snapshot();
                 match crate::refcount::segment_dir::build_directory_chain(
                     &self.page_store,
+                    &existing,
                     &descriptors,
                     wal_checkpoint,
                 ) {
-                    Ok((dir_chain, dir_sealed)) => {
+                    Ok((dir_chain, dir_sealed, dir_to_free)) => {
                         rc_seg_dir_pages += dir_sealed.len() as u64;
                         total_pages_written += dir_sealed.len();
                         sealed_pages.extend(dir_sealed);
                         rc_segment_dir_new_heads[s_idx] = Some(dir_chain[0]);
-                        let old = shard.rc.durable_segment_dir_head();
-                        if old != crate::types::NULL_PAGE {
-                            rc_segment_dir_old_heads[s_idx] = Some(old);
-                        }
+                        rc_segment_dir_new_chains[s_idx] = Some(dir_chain);
+                        rc_segment_dir_framing_free.extend(dir_to_free);
                     }
                     Err(err) => {
                         // Pre-global-write: abort every RC checkpoint (frees this
@@ -1381,17 +1409,6 @@ impl Db {
                         return Err(err);
                     }
                 }
-            } else if ckpt.is_condense() {
-                // v27 condense: the base fold rode the normal meta-chain build +
-                // sealed_pages above. Empty the directory head and free the old
-                // directory framing + every folded segment data page post-commit.
-                rc_seg_condenses += 1;
-                rc_segment_dir_new_heads[s_idx] = Some(crate::types::NULL_PAGE);
-                let old = ckpt.condense_dir_head();
-                if old != crate::types::NULL_PAGE {
-                    rc_segment_dir_old_heads[s_idx] = Some(old);
-                }
-                rc_condense_segment_free.extend(ckpt.condense_segment_pages());
             }
         }
         self.metrics.record_flush_rc_segment(
@@ -1900,12 +1917,16 @@ impl Db {
                 }
             }
         }
-        // v27 crash window: the segment/base pages are durable (the global batch
-        // synced above) but the manifest commit hasn't captured the new heads.
-        // This is POST-global-write, so it RETAINS (sync-poison contract) exactly
-        // like the durable_seq / BfgSync faults below — a crash here leaves the
-        // pages as orphans the next open reclaims; the OLD manifest never
-        // referenced them, so rc is unchanged (onyx LV2 replay re-drives).
+        // v27 crash window: the segment DATA pages + the in-place directory rewrite
+        // are durable (the global batch synced above) but the manifest commit
+        // hasn't advanced `checkpoint_lsn`/`durable_seq`. This is POST-global-write,
+        // so it RETAINS (sync-poison contract) exactly like the durable_seq /
+        // BfgSync faults below. Because the directory head is STABLE (reserved in
+        // the manifest before any append), a crash here leaves the just-written
+        // segment REACHABLE from the still-durable head — `Db::open` re-reads it and
+        // `condense_on_open` folds it into the base (restoring rc for standalone
+        // metadb, and stamping `generation` so an onyx LV2 re-drive of the same
+        // commits is dropped by the `page_lsn >= lsn` replay-skip: no double count).
         if rc_seg_appends > 0 || rc_seg_condenses > 0 {
             let point = if rc_seg_condenses > 0 {
                 FaultPoint::RcCondensePostWriteBeforeManifest
@@ -2182,21 +2203,19 @@ impl Db {
                 self.refcount_shards[s_idx].rc.install_meta_chain(new_chain);
             }
         }
-        // v27: the manifest recording the new segment-directory heads is durable.
-        // Advance each persist shard's durable head, then free the OLD directory's
-        // framing pages (fresh-pid COW) — the segment DATA pages stay live because
-        // the new directory re-lists them.
-        for (s_idx, new_head) in rc_segment_dir_new_heads.into_iter().enumerate() {
-            if let Some(head) = new_head {
-                self.refcount_shards[s_idx]
-                    .rc
-                    .set_durable_segment_dir_head(head);
+        // v27: the manifest recording the (stable) segment-directory heads is
+        // durable. Cache each rewritten shard's new framing chain (keeps the
+        // shard's `durable_segment_dir_head == chain[0]`) so the next in-place
+        // rewrite reuses the head + continuation pids.
+        for (s_idx, chain_opt) in rc_segment_dir_new_chains.into_iter().enumerate() {
+            if let Some(chain) = chain_opt {
+                self.refcount_shards[s_idx].rc.set_segment_dir_chain(chain);
             }
         }
-        // v27 crash window: the manifest is durable with the new/empty heads, but
-        // the old directory framing + folded segment pages haven't been freed. A
-        // fired fault here skips the frees (they orphan, reclaimed on the next
-        // open); the durable state is correct.
+        // v27 crash window: the manifest is durable with the stable heads, but the
+        // trailing directory-continuation framing + folded segment DATA pages
+        // haven't been freed. A fired fault here skips the frees (they orphan,
+        // reclaimed on the next open); the durable state is correct.
         if rc_seg_appends > 0 || rc_seg_condenses > 0 {
             let point = if rc_seg_condenses > 0 {
                 FaultPoint::RcCondensePostManifestBeforeFree
@@ -2205,29 +2224,21 @@ impl Db {
             };
             self.faults.inject(point)?;
         }
-        for old_head in rc_segment_dir_old_heads.into_iter().flatten() {
-            match crate::refcount::segment_dir::directory_chain_pids(&self.page_store, old_head) {
-                Ok(pids) => {
-                    for pid in pids {
-                        self.page_cache.invalidate(pid);
-                        if let Err(err) = self.page_store.free(pid, wal_checkpoint) {
-                            tracing::warn!(
-                                page_id = pid,
-                                error = %err,
-                                "flush_with_gate: failed to free retired rc segment-dir chain page"
-                            );
-                        }
-                    }
-                }
-                Err(err) => tracing::warn!(
-                    old_head,
+        // v27: trailing continuation framing pids the in-place directory rewrite
+        // shed (the directory shrank). The stable head + re-listed data pages stay
+        // live, so only these trailing pids are freed.
+        for pid in rc_segment_dir_framing_free {
+            self.page_cache.invalidate(pid);
+            if let Err(err) = self.page_store.free(pid, wal_checkpoint) {
+                tracing::warn!(
+                    page_id = pid,
                     error = %err,
-                    "flush_with_gate: failed to enumerate old rc segment-dir chain (leak; verify reclaims)"
-                ),
+                    "flush_with_gate: failed to free retired rc segment-dir continuation page"
+                );
             }
         }
-        // v27: a condense folded every segment into the base and committed a NULL
-        // directory head, so the segment DATA pages are unreferenced — free them.
+        // v27: a condense folded every segment into the base + emptied the
+        // directory in place, so the segment DATA pages are unreferenced — free them.
         for pid in rc_condense_segment_free {
             self.page_cache.invalidate(pid);
             if let Err(err) = self.page_store.free(pid, wal_checkpoint) {

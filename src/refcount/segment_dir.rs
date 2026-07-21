@@ -11,18 +11,25 @@
 //! these segments oldest→newest; condense folds them into the base array and
 //! empties the chain.
 //!
-//! # Crash model — COW fresh-pid, NOT stable-head
+//! # Crash model — stable-head, in-place, recover-ahead (like the array/cuckoo)
 //!
-//! Unlike the refcount ARRAY meta chain ([`crate::paged_meta`], whose head pid is
-//! stable and rewritten in place), the directory is **COW fresh-pid**: every
-//! commit allocates a brand-new head (+ continuations) and frees the previous
-//! chain only after the manifest slot is durable. A stable head rewritten in
-//! place before the manifest commit would expose the new segments to the OLD
-//! manifest after a crash while onyx's LV2 replay also re-issues those commits —
-//! a double count, since segments carry no per-record generation guard against
-//! LV2 re-issue. Fresh-pid COW puts the directory in the same crash class as L2P
-//! roots: a torn commit lands on either the old head (old segments) or the new
-//! head (new segments), never a spliced mix.
+//! The directory head pid is **stable**: it is allocated once (reserved empty in
+//! the manifest before any segment is appended — see `Db::open`) and rewritten
+//! **in place** on every append/condense, exactly like the refcount ARRAY meta
+//! chain and the dedup cuckoo meta chain ([`crate::paged_meta`]). A stable head
+//! recorded in the manifest ONCE means the segment data pages + directory content
+//! — both made durable at the flush's `page_store.sync()` BEFORE the manifest
+//! commit — are reachable on reopen even if that commit is lost. `Db::open` then
+//! folds any recovered segments into the base array (`condense_on_open`), which
+//! restores rc for standalone metadb AND stamps the base pages' `generation` so
+//! the existing `page_lsn >= lsn` replay-skip drops any onyx LV2 re-drive of the
+//! same commits (no double count). This is why an earlier fresh-pid-COW design
+//! was WRONG for the WAL-free model: a COW head recorded only in the not-yet-
+//! committed manifest orphans the just-written segment on crash → the rc delta is
+//! lost while its dedup entry survives (a premature-free). Segment DATA pages are
+//! write-once and carry `generation = covered_lsn_max`; only the directory chain
+//! framing is rewritten in place, reusing the head + continuation pids and
+//! freeing trailing pids after the new content is durable.
 //!
 //! # Concurrency
 //!
@@ -206,36 +213,55 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
 
 // ────────────────────────────── COW chain IO ───────────────────────────────
 
-/// Build a **fresh-pid COW** directory chain for `segments`: allocate a brand-
-/// new head (+ continuations), seal every page, and return
-/// `(new_chain, sealed_pages)` (chain head first). The caller writes
-/// `sealed_pages` (folded into the flush's global batch) and — after the
-/// manifest slot recording `new_chain[0]` is durable — frees the PREVIOUS
-/// chain. An empty `segments` still writes one head page, so the head pid is
-/// never the `0`/`NULL_PAGE` sentinel; a shard with no segments records
-/// [`NULL_PAGE`] in the manifest instead of calling this.
+/// Rewrite the **stable-head, in-place** directory chain for `segments`, reusing
+/// `existing_chain[0]` as the head + as many continuation pids as needed,
+/// allocating fresh pids only when the directory grew, and returning trailing
+/// pids `to_free` when it shrank. Returns `(new_chain, sealed_pages, to_free)`
+/// (chain head first). The caller writes `sealed_pages` (folded into the flush's
+/// global batch, durable at the flush `sync()` BEFORE the manifest commit) and —
+/// after the manifest commit lands — frees `to_free`.
+///
+/// `existing_chain` must be non-empty: the head is reserved once (empty) in the
+/// manifest before any append (see `Db::open`), so every append/condense rewrites
+/// an already-durable head in place. An empty `segments` still writes one head
+/// page (the reserved/emptied directory), mirroring `paged_meta::build_chain_pages`.
 pub(crate) fn build_directory_chain(
     page_store: &PageStore,
+    existing_chain: &[PageId],
     segments: &[SegmentDescriptor],
     generation: Lsn,
-) -> Result<(Vec<PageId>, Vec<(PageId, Arc<Page>)>)> {
+) -> Result<(Vec<PageId>, Vec<(PageId, Arc<Page>)>, Vec<PageId>)> {
+    assert!(
+        !existing_chain.is_empty(),
+        "build_directory_chain requires the reserved head pid to already exist",
+    );
     let bytes = encode_directory(segments);
     let chunk_count = bytes.len().div_ceil(DIR_PAGE_CAPACITY).max(1);
 
+    // Reuse the stable head + existing continuations; allocate fresh only for
+    // net-new chunks (mirrors `paged_meta::build_chain_pages`). On an alloc
+    // failure free ONLY the freshly-grabbed pids (indices >= existing_chain.len()).
     let mut new_chain = Vec::with_capacity(chunk_count);
-    for _ in 0..chunk_count {
-        match page_store.allocate() {
-            Ok(pid) => new_chain.push(pid),
-            Err(err) => {
-                // Free the pids we already grabbed so an alloc failure mid-build
-                // leaks nothing.
-                for &pid in &new_chain {
-                    let _ = page_store.free(pid, generation);
+    new_chain.push(existing_chain[0]);
+    for idx in 1..chunk_count {
+        let pid = if idx < existing_chain.len() {
+            existing_chain[idx]
+        } else {
+            match page_store.allocate() {
+                Ok(pid) => pid,
+                Err(err) => {
+                    for &fresh in new_chain.iter().skip(existing_chain.len()) {
+                        let _ = page_store.free(fresh, generation);
+                    }
+                    return Err(err);
                 }
-                return Err(err);
             }
-        }
+        };
+        new_chain.push(pid);
     }
+    // Trailing pages from the previous chain go on the free list once the new
+    // chain is durable + the manifest committed.
+    let to_free: Vec<PageId> = existing_chain.iter().skip(new_chain.len()).copied().collect();
 
     let mut sealed = Vec::with_capacity(chunk_count);
     for (i, &pid) in new_chain.iter().enumerate() {
@@ -256,7 +282,21 @@ pub(crate) fn build_directory_chain(
         page.seal();
         sealed.push((pid, Arc::new(page)));
     }
-    Ok((new_chain, sealed))
+    Ok((new_chain, sealed, to_free))
+}
+
+/// Reserve a fresh, empty directory head: allocate one page id and seal it as an
+/// empty directory. Used once per shard (at `Db::open` when persist is enabled and
+/// the shard has no durable head yet) so every later append rewrites this
+/// already-durable head in place. Returns `(head_pid, sealed_head_page)`.
+pub(crate) fn reserve_empty_directory(
+    page_store: &PageStore,
+    generation: Lsn,
+) -> Result<(PageId, (PageId, Arc<Page>))> {
+    let head = page_store.allocate()?;
+    let (chain, mut sealed, _to_free) = build_directory_chain(page_store, &[head], &[], generation)?;
+    debug_assert_eq!(chain.as_slice(), &[head]);
+    Ok((head, sealed.pop().expect("reserve writes exactly one head page")))
 }
 
 /// Walk the chain rooted at `head_pid`, validating + concatenating every page's
@@ -317,9 +357,9 @@ pub(crate) fn read_directory_chain(
 }
 
 /// Only the chain FRAMING pages of the directory at `head_pid` (head first),
-/// NOT the segment data pages. Used to free the previous (fresh-pid COW)
-/// directory after a new one commits — the data pages it listed stay live
-/// because the new directory re-lists them. Empty for a [`NULL_PAGE`] head.
+/// NOT the segment data pages. Used to seed the shard's cached chain at open (so
+/// later in-place rewrites reuse the continuation pids) — the data pages it lists
+/// stay live because the directory re-lists them. Empty for a [`NULL_PAGE`] head.
 pub(crate) fn directory_chain_pids(
     page_store: &PageStore,
     head_pid: PageId,
@@ -455,7 +495,9 @@ mod tests {
             let pids: Vec<PageId> = (0..8).map(|k| 1_000 + i * 100 + k * 2).collect();
             segments.push(seg(i % 4, i, i + 3, 8, &pids));
         }
-        let (chain, sealed) = build_directory_chain(&store, &segments, 42).unwrap();
+        let head = store.allocate().unwrap();
+        let (chain, sealed, _free) = build_directory_chain(&store, &[head], &segments, 42).unwrap();
+        assert_eq!(chain[0], head, "head pid is stable/reused");
         assert!(chain.len() > 1, "should span multiple chain pages");
         store.write_sealed_page_runs(sealed).unwrap();
         store.sync().unwrap();
@@ -472,6 +514,53 @@ mod tests {
     }
 
     #[test]
+    fn stable_head_reused_across_rewrites_with_grow_and_shrink() {
+        let (_d, store) = store();
+        // Reserve an empty directory head.
+        let (head, sealed) = reserve_empty_directory(&store, 1).unwrap();
+        store.write_sealed_page_runs(vec![sealed]).unwrap();
+        store.sync().unwrap();
+        assert!(read_directory_chain(&store, head).unwrap().is_empty());
+        let mut chain = vec![head];
+
+        // Append one small segment: head is REUSED, single page, nothing freed.
+        let small = vec![seg(0, 1, 10, 2, &[7])];
+        let (c1, s1, free1) = build_directory_chain(&store, &chain, &small, 2).unwrap();
+        assert_eq!(c1[0], head, "head pid stable");
+        assert_eq!(c1.len(), 1);
+        assert!(free1.is_empty());
+        store.write_sealed_page_runs(s1).unwrap();
+        store.sync().unwrap();
+        chain = c1;
+
+        // Grow to a multi-page directory: head reused, a fresh continuation
+        // allocated, nothing freed yet.
+        let mut big = Vec::new();
+        for i in 0..400u64 {
+            let pids: Vec<PageId> = (0..8).map(|k| 1_000 + i * 100 + k * 2).collect();
+            big.push(seg(i % 4, i, i + 3, 8, &pids));
+        }
+        let (c2, s2, free2) = build_directory_chain(&store, &chain, &big, 3).unwrap();
+        assert_eq!(c2[0], head, "head pid still stable across grow");
+        assert!(c2.len() > 1, "grew to multiple pages");
+        assert!(free2.is_empty(), "growth frees nothing");
+        store.write_sealed_page_runs(s2).unwrap();
+        store.sync().unwrap();
+        assert_eq!(read_directory_chain(&store, head).unwrap(), big);
+        let grown = c2;
+
+        // Shrink back to one segment: head reused, the continuation pids are
+        // returned as `to_free`.
+        let (c3, s3, free3) = build_directory_chain(&store, &grown, &small, 4).unwrap();
+        assert_eq!(c3[0], head);
+        assert_eq!(c3.len(), 1);
+        assert_eq!(free3, grown[1..].to_vec(), "trailing continuations freed");
+        store.write_sealed_page_runs(s3).unwrap();
+        store.sync().unwrap();
+        assert_eq!(read_directory_chain(&store, head).unwrap(), small);
+    }
+
+    #[test]
     fn null_head_is_empty() {
         let (_d, store) = store();
         assert!(read_directory_chain(&store, NULL_PAGE).unwrap().is_empty());
@@ -484,14 +573,16 @@ mod tests {
         let (_d, store) = store();
         // Monotone covered_lsn_max: accepted.
         let ok = vec![seg(0, 1, 10, 2, &[7]), seg(1, 11, 20, 2, &[8])];
-        let (chain, sealed) = build_directory_chain(&store, &ok, 1).unwrap();
+        let head1 = store.allocate().unwrap();
+        let (chain, sealed, _f) = build_directory_chain(&store, &[head1], &ok, 1).unwrap();
         store.write_sealed_page_runs(sealed).unwrap();
         store.sync().unwrap();
         verify_directory(&store, chain[0]).unwrap();
 
         // Regressing covered_lsn_max (segment 1's max < segment 0's): rejected.
         let bad = vec![seg(0, 1, 30, 2, &[7]), seg(1, 5, 20, 2, &[8])];
-        let (chain2, sealed2) = build_directory_chain(&store, &bad, 2).unwrap();
+        let head2 = store.allocate().unwrap();
+        let (chain2, sealed2, _f2) = build_directory_chain(&store, &[head2], &bad, 2).unwrap();
         store.write_sealed_page_runs(sealed2).unwrap();
         store.sync().unwrap();
         assert!(matches!(
@@ -503,7 +594,9 @@ mod tests {
     #[test]
     fn wrong_page_type_is_rejected() {
         let (_d, store) = store();
-        let (chain, sealed) = build_directory_chain(&store, &[seg(1, 1, 1, 1, &[7])], 1).unwrap();
+        let head = store.allocate().unwrap();
+        let (chain, sealed, _f) =
+            build_directory_chain(&store, &[head], &[seg(1, 1, 1, 1, &[7])], 1).unwrap();
         store.write_sealed_page_runs(sealed).unwrap();
         store.sync().unwrap();
         // Overwrite the head with a plain Free page — read must reject it.

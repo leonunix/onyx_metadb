@@ -332,13 +332,21 @@ pub struct RcShard {
     /// `stage_batch` reads base pages without slot locks, then validates this
     /// under `fold_lock.read()` before accepting the matching slot snapshot.
     fold_epoch: AtomicU64,
-    /// v27 (delta-run persist): the mutable head pid of this shard's DURABLE
-    /// segment-directory chain, or [`NULL_PAGE`] when the shard has no
-    /// un-condensed segments. Read into the manifest by the cold-path
-    /// `refresh_manifest_entries`; the streaming persist checkpoint advances it
-    /// after its own manifest commit lands. `NULL_PAGE` whenever
-    /// `rc_delta_run_persist_enabled` is off.
+    /// v27 (delta-run persist): the **STABLE** head pid of this shard's DURABLE
+    /// segment-directory chain, or [`NULL_PAGE`] when persist is off / the head is
+    /// not yet reserved. Once reserved (at `Db::open`, an empty directory committed
+    /// before any append) it is rewritten IN PLACE on every append/condense and
+    /// NEVER NULLed — condense empties the directory content but keeps the head, so
+    /// a crash-visible append is always reachable from the manifest-recorded head.
+    /// Read into the manifest by `refresh_manifest_entries`; kept in sync with
+    /// [`Self::segment_dir_chain`] (`== chain[0]`).
     durable_segment_dir_head: AtomicU64,
+    /// v27: cached FRAMING pids of the durable segment-directory chain (head
+    /// first), so an in-place rewrite reuses the head + continuation pids and frees
+    /// only trailing pids (mirrors `paged_meta::build_chain_pages`). Empty when no
+    /// head is reserved. Seeded at open (`directory_chain_pids`), updated after each
+    /// commit. Guarded by its own mutex (touched only on the flush / open path).
+    segment_dir_chain: Mutex<Vec<PageId>>,
     /// v27: merged net + max-lsn of EVERY un-condensed delta-run segment (the
     /// deltas that were appended to disk instead of folded into the base array).
     /// Reads add this term between the pending slots and the base so rc stays
@@ -415,10 +423,9 @@ pub struct RcCheckpoint {
 struct CondenseState {
     /// The segments this condense folded — used to rebuild the overlay on abort
     /// (re-read from the still-durable pages), restore `segment_descriptors`, and
-    /// free every segment data page after the commit lands.
+    /// free every segment data page after the commit lands. The directory head is
+    /// STABLE (kept, emptied in place), so it is not tracked here for freeing.
     descriptors: Vec<SegmentDescriptor>,
-    /// The old durable directory head whose framing pages are freed post-commit.
-    dir_head: PageId,
 }
 
 impl CondenseState {
@@ -524,24 +531,19 @@ impl RcCheckpoint {
     }
 
     /// v27: true iff this checkpoint appended a durable delta-run segment (so the
-    /// flush must rebuild the shard's directory chain + stage its head), even
-    /// when [`Self::is_empty`] holds (the base array is untouched by a persist
-    /// checkpoint).
+    /// flush must rewrite the shard's directory in place), even when
+    /// [`Self::is_empty`] holds (a persist checkpoint leaves the base untouched).
+    #[cfg(test)]
     pub(crate) fn has_segment(&self) -> bool {
         self.segment.is_some()
     }
 
     /// v27 (S3): true iff this checkpoint CONDENSED — folded every segment into
-    /// the base array and emptied the directory. The flush stages a NULL head and
-    /// frees the old directory + segment data pages after commit.
+    /// the base array and emptied the directory in place. The flush rewrites the
+    /// (stable) head to an empty directory and frees the folded segment data pages
+    /// + any trailing continuation framing after commit.
     pub(crate) fn is_condense(&self) -> bool {
         self.condensed.is_some()
-    }
-
-    /// v27 (S3): the old directory head whose framing pages the flush frees after
-    /// a condense commit ([`NULL_PAGE`] if the shard had no prior directory).
-    pub(crate) fn condense_dir_head(&self) -> PageId {
-        self.condensed.as_ref().map_or(NULL_PAGE, |c| c.dir_head)
     }
 
     /// v27 (S3): every segment data page a condense folded — freed by the flush
@@ -634,6 +636,7 @@ impl RcShard {
             fold_lock: parking_lot::RwLock::new(()),
             fold_epoch: AtomicU64::new(0),
             durable_segment_dir_head: AtomicU64::new(NULL_PAGE),
+            segment_dir_chain: Mutex::new(Vec::new()),
             segment_overlay: Mutex::new(DeltaMap::new()),
             segment_overlay_len: AtomicUsize::new(0),
             segment_descriptors: Mutex::new(Vec::new()),
@@ -648,19 +651,48 @@ impl RcShard {
         self.array.meta_page_id()
     }
 
-    /// v27: the head pid of this shard's durable delta-run segment-directory
-    /// chain ([`NULL_PAGE`] when it has no un-condensed segments). Read into the
-    /// manifest by `refresh_manifest_entries` so a cold-path commit carries the
-    /// current heads.
+    /// v27: the STABLE head pid of this shard's durable delta-run segment-directory
+    /// chain ([`NULL_PAGE`] when persist is off / the head is not yet reserved).
+    /// Read into the manifest by `refresh_manifest_entries` so a cold-path commit
+    /// carries the current head. Advanced only via [`Self::set_segment_dir_chain`]
+    /// (which keeps it `== chain[0]`).
     pub fn durable_segment_dir_head(&self) -> PageId {
         self.durable_segment_dir_head.load(Ordering::Acquire)
     }
 
-    /// v27: record the segment-directory chain head that a manifest commit made
-    /// durable. Called at open (from the decoded manifest) and after each
-    /// streaming persist checkpoint / condense commit lands.
-    pub fn set_durable_segment_dir_head(&self, head: PageId) {
+    /// v27: snapshot of the cached directory-chain FRAMING pids (head first), for
+    /// an in-place rewrite that reuses the head + continuation pids. Empty when no
+    /// head is reserved.
+    pub(crate) fn segment_dir_chain_snapshot(&self) -> Vec<PageId> {
+        self.segment_dir_chain.lock().clone()
+    }
+
+    /// v27: record the directory-chain framing pids a commit made durable, and
+    /// keep [`Self::durable_segment_dir_head`] (`== chain[0]`) in sync. A crash
+    /// before the commit simply leaves the previous cache; the disk head is the
+    /// authority on reopen.
+    pub(crate) fn set_segment_dir_chain(&self, chain: Vec<PageId>) {
+        let head = chain.first().copied().unwrap_or(NULL_PAGE);
+        *self.segment_dir_chain.lock() = chain;
         self.durable_segment_dir_head.store(head, Ordering::Release);
+    }
+
+    /// v27: reserve this shard's stable directory head if it has none yet. Allocates
+    /// one page, writes it as an EMPTY directory (unsynced — the manifest commit
+    /// that records the head syncs it), and caches the head. Returns the reserved
+    /// head pid, or `None` if a head is already reserved. Called at `Db::open` when
+    /// persist is enabled so every later append rewrites an already-durable head in
+    /// place (closing the first-append orphan window).
+    pub(crate) fn reserve_segment_directory(&self) -> Result<Option<PageId>> {
+        if self.durable_segment_dir_head.load(Ordering::Acquire) != NULL_PAGE {
+            return Ok(None);
+        }
+        let (head, sealed) = super::segment_dir::reserve_empty_directory(self.array.page_store(), 0)?;
+        self.array
+            .page_store()
+            .write_sealed_page_runs(vec![sealed])?;
+        self.set_segment_dir_chain(vec![head]);
+        Ok(Some(head))
     }
 
     /// v27: snapshot of the un-condensed segment descriptors (append order,
@@ -1352,7 +1384,6 @@ impl RcShard {
         // Read every segment page oldest→newest OUTSIDE fold_lock; decode + concat
         // in run order. The segments are immutable + durable, so no lock needed.
         let descriptors = self.segment_descriptors.lock().clone();
-        let dir_head = self.durable_segment_dir_head.load(Ordering::Acquire);
         let mut records: Vec<(Pba, Pending)> = Vec::new();
         for seg in &descriptors {
             let pages = self.array.read_segment_pages(&seg.data_pids)?;
@@ -1378,8 +1409,9 @@ impl RcShard {
         records.extend(drained_slots.iter().copied());
 
         if records.is_empty() {
-            // No segments and empty slots — the directory head is already NULL.
-            return Ok(self.empty_condense_checkpoint(restore_slot, dir_head));
+            // No segments and empty slots — nothing to fold; the stable directory
+            // head is already empty (the flush skips a rewrite for this cycle).
+            return Ok(self.empty_condense_checkpoint(restore_slot));
         }
 
         // Fold under one fold_lock.write()+epoch: base publish → overlay clear →
@@ -1433,10 +1465,7 @@ impl RcShard {
             drained_deltas: drained_slots,
             restore_slot,
             segment: None,
-            condensed: Some(CondenseState {
-                descriptors,
-                dir_head,
-            }),
+            condensed: Some(CondenseState { descriptors }),
             snapshot_page_table: self.array.page_table_snapshot(),
             snapshot_meta_chain: self.array.meta_chain_snapshot(),
         })
@@ -1447,13 +1476,16 @@ impl RcShard {
     /// before [`Self::condense_for_open`], which folds them into the base.
     pub fn load_segments_from_directory(&self, head: PageId) -> Result<usize> {
         if head == NULL_PAGE {
-            self.durable_segment_dir_head.store(NULL_PAGE, Ordering::Release);
+            self.set_segment_dir_chain(Vec::new());
             return Ok(0);
         }
-        let descriptors =
-            super::segment_dir::read_directory_chain(self.array.page_store(), head)?;
+        let page_store = self.array.page_store();
+        let descriptors = super::segment_dir::read_directory_chain(page_store, head)?;
         let count = descriptors.len();
-        self.durable_segment_dir_head.store(head, Ordering::Release);
+        // Cache the framing pids so a later in-place rewrite reuses the head +
+        // continuations (sets `durable_segment_dir_head == chain[0] == head`).
+        let chain = super::segment_dir::directory_chain_pids(page_store, head)?;
+        self.set_segment_dir_chain(chain);
         *self.segment_descriptors.lock() = descriptors;
         // The overlay stays empty: `condense_for_open` folds into the base
         // immediately, before any reader exists (open is single-threaded here).
@@ -1462,17 +1494,18 @@ impl RcShard {
 
     /// v27 (S3) condense-on-open: fold this shard's loaded segments into the base
     /// array, write the base pages + meta chain durably (stable head, in place),
-    /// and set the durable directory head NULL so the post-replay manifest commit
-    /// stages an empty head. Returns `(segment_data_pages, old_dir_head)` for the
-    /// caller to free ONLY AFTER that commit lands — a crash before it re-reads
-    /// the still-anchored segments and re-condenses idempotently (the folded base
-    /// pages already carry `generation >= record.last_lsn`, so `force=false`
-    /// replay-skip drops them). Runs before the post-replay force-fold, so the
-    /// slots are empty and only the segments fold.
-    pub fn condense_for_open(&self) -> Result<(Vec<PageId>, PageId)> {
+    /// and rewrite the segment directory to EMPTY in place — keeping the STABLE
+    /// head (never NULL), so the post-replay manifest commit stages the same head
+    /// with an empty directory. Returns the pages the caller must free ONLY AFTER
+    /// that commit lands: the folded segments' data pages plus any trailing
+    /// directory-continuation framing pages (the head survives). A crash before the
+    /// commit re-reads the still-anchored segments and re-condenses idempotently
+    /// (folded base pages already carry `generation >= record.last_lsn`, so the
+    /// `force=false` replay-skip drops them). Runs before the post-replay
+    /// force-fold, so the slots are empty and only the segments fold.
+    pub fn condense_for_open(&self) -> Result<Vec<PageId>> {
         let ckpt = self.condense(&[0, 1, 2, 3])?;
-        let segment_pages = ckpt.condense_segment_pages();
-        let dir_head = ckpt.condense_dir_head();
+        let mut free_pages = ckpt.condense_segment_pages();
         if !ckpt.staged.is_empty() {
             self.array.write_staged_pages(&ckpt.staged)?;
             let (new_chain, chain_pages, to_free) = self.build_meta_chain(&ckpt)?;
@@ -1480,12 +1513,21 @@ impl RcShard {
                 .write_built_meta_chain_external(chain_pages, to_free, 0)?;
             self.install_meta_chain(new_chain);
         }
-        self.set_durable_segment_dir_head(NULL_PAGE);
-        Ok((segment_pages, dir_head))
+        // Empty the directory IN PLACE at the stable head (descriptors were cleared
+        // by `condense`). Reuses the head, frees only trailing continuation pids.
+        let existing = self.segment_dir_chain_snapshot();
+        if !existing.is_empty() {
+            let (new_chain, sealed, to_free) =
+                super::segment_dir::build_directory_chain(self.array.page_store(), &existing, &[], 0)?;
+            self.array.page_store().write_sealed_page_runs(sealed)?;
+            self.set_segment_dir_chain(new_chain);
+            free_pages.extend(to_free);
+        }
+        Ok(free_pages)
     }
 
     /// Condense with nothing to fold — still empties any stale directory head.
-    fn empty_condense_checkpoint(&self, restore_slot: usize, dir_head: PageId) -> RcCheckpoint {
+    fn empty_condense_checkpoint(&self, restore_slot: usize) -> RcCheckpoint {
         RcCheckpoint {
             staged: StagedDeltas {
                 pages: Vec::new(),
@@ -1502,7 +1544,6 @@ impl RcShard {
             segment: None,
             condensed: Some(CondenseState {
                 descriptors: Vec::new(),
-                dir_head,
             }),
             snapshot_page_table: self.array.page_table_snapshot(),
             snapshot_meta_chain: self.array.meta_chain_snapshot(),
@@ -2201,19 +2242,19 @@ impl RcShard {
         // would generation-skip live increfs → rc under-count → premature free
         // (verdict e). So fold every segment into the base FIRST via condense
         // (which drains all slots too), THEN fall through to the all-slot
-        // force-fold — which now finds the slots empty and no-ops. The segment
-        // chain is only ever non-empty under `rc_delta_run_persist_enabled`, so
-        // this is inert when persist is off. `condense_for_open` empties the
-        // in-memory directory head; the caller's manifest commit records the NULL
-        // head (`refresh_manifest_entries` reads `durable_segment_dir_head()`).
-        // The now-unreferenced segment pages are deliberately NOT freed here:
-        // freeing before the caller's head-NULL commit is durable would let a
-        // crash point the old manifest at freed pages. They orphan and are
-        // reclaimed by offline verify. Callers: `drop_snapshot`, `drop_volume` /
-        // clone, `iter_live_flushed`, open post-replay.
-        if self.durable_segment_dir_head.load(Ordering::Acquire) != NULL_PAGE
-            || self.has_uncondensed_segments()
-        {
+        // force-fold — which now finds the slots empty and no-ops. Only fire when
+        // there are ACTUAL un-condensed segments (descriptors/overlay non-empty) —
+        // a reserved-but-empty stable head is non-NULL yet has nothing to fold, so
+        // keying on the head pid would spin a directory rewrite every cold flush.
+        // Inert when persist is off (no segments). `condense_for_open` KEEPS the
+        // STABLE head and empties the directory in place; the caller's manifest
+        // commit records that same head (`refresh_manifest_entries` reads
+        // `durable_segment_dir_head()`). The now-unreferenced segment pages are
+        // deliberately NOT freed here: freeing before the caller's commit is
+        // durable would let a crash point the manifest at freed pages. They orphan
+        // and are reclaimed by offline verify. Callers: `drop_snapshot`,
+        // `drop_volume` / clone, `iter_live_flushed`, open post-replay.
+        if self.has_uncondensed_segments() {
             let _orphaned_segment_pages = self.condense_for_open()?;
         }
         // Cold path: force-apply (lifecycle-serialized, no in-place retry;

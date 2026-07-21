@@ -183,12 +183,28 @@ impl Db {
         // Fresh database: no flush has happened yet, every shard's
         // durable_seq is 0 (matches the empty `checkpoint_lsn`).
         manifest.refcount_durable_seq = vec![0; refcount_count].into_boxed_slice();
-        // v27: a fresh database has no un-condensed delta-run segments; keep the
-        // heads array parallel to the roots and all-`NULL_PAGE`. The version
-        // upgrade to v27 (if `rc_delta_run_persist_enabled`) happens lazily on
-        // the first persist checkpoint, not at create.
-        manifest.refcount_delta_run_heads =
-            vec![crate::types::NULL_PAGE; refcount_count].into_boxed_slice();
+        // v27: a fresh database has no un-condensed delta-run segments. When
+        // persist is enabled, RESERVE each shard's STABLE directory head now
+        // (empty directory) and upgrade to v27, so every later append rewrites an
+        // already-durable head in place (closing the first-append orphan window).
+        // Persist-off keeps all-`NULL_PAGE` heads at v26 (byte-identical).
+        if cfg.rc_delta_run_persist_enabled {
+            manifest.body_version = manifest
+                .body_version
+                .max(crate::manifest::DELTA_RUN_MANIFEST_BODY_VERSION);
+            let mut heads = Vec::with_capacity(refcount_count);
+            for shard in &refcount_shards {
+                let head = shard
+                    .rc
+                    .reserve_segment_directory()?
+                    .expect("a fresh rc shard has no reserved directory head");
+                heads.push(head);
+            }
+            manifest.refcount_delta_run_heads = heads.into_boxed_slice();
+        } else {
+            manifest.refcount_delta_run_heads =
+                vec![crate::types::NULL_PAGE; refcount_count].into_boxed_slice();
+        }
         manifest.dedup_shards = dedup_shards;
         // dedup_index: cuckoo meta page id stored under the legacy
         // `dedup_index_shard_heads` slot, single-element box for
@@ -533,26 +549,11 @@ impl Db {
                     .into(),
             ));
         }
-        let has_uncondensed_segments = manifest
-            .refcount_delta_run_heads
-            .iter()
-            .any(|&h| h != crate::types::NULL_PAGE);
-        if has_uncondensed_segments && !cfg.rc_delta_run_persist_enabled {
-            // Persist-off starts with an empty overlay and replays nothing, so it
-            // cannot serve reads for un-condensed segments. Refuse rather than
-            // silently returning rc missing every un-condensed delta.
-            return Err(MetaDbError::InvalidArgument(
-                "manifest carries un-condensed refcount delta-run segments but \
-                 rc_delta_run_persist_enabled is off; enable it to drain them"
-                    .into(),
-            ));
-        }
-        // v27 (S3): persist-on with un-condensed segments replays them at open —
-        // fold each shard's directory into the base before the post-replay
-        // force-fold, then commit the emptied heads in the post-replay manifest
-        // commit (which we force entry into below).
-        let condense_on_open_needed =
-            has_uncondensed_segments && cfg.rc_delta_run_persist_enabled;
+        // v27 (delta-run persist): `has_uncondensed_segments` / `condense_on_open_needed`
+        // are computed AFTER `open_shards` below (they need the actual per-shard
+        // segment count read from the directory chains — a stable reserved head is
+        // non-NULL even when its directory is empty, so a bare `head != NULL` test
+        // would over-report).
         if manifest.volumes.is_empty() {
             return Err(MetaDbError::Corruption(
                 "manifest has no volume entries; database was not initialized".into(),
@@ -640,17 +641,65 @@ impl Db {
             refcount_routing,
             metrics.clone(),
         )?;
-        // v27 (S3): seed each shard's un-condensed segment directory from the
-        // manifest so the post-replay block can condense them into the base.
-        if condense_on_open_needed {
+        // v27 (delta-run persist): reconcile each shard's segment directory.
+        // Persist-on: LOAD shards that already have a directory (populating their
+        // descriptors + framing cache and returning the real segment count) and
+        // RESERVE a stable empty head for shards that have none yet (fresh DB, or
+        // persist just enabled on a v26 DB). Persist-off: only read the counts to
+        // decide whether to refuse. A stable reserved head is non-NULL even when
+        // its directory is empty, so guard/condense decisions key on the count.
+        let mut uncondensed_segment_count = 0usize;
+        let mut reserved_any = false;
+        if cfg.rc_delta_run_persist_enabled {
             for (s_idx, shard) in refcount_shards.iter().enumerate() {
                 let head = manifest
                     .refcount_delta_run_heads
                     .get(s_idx)
                     .copied()
                     .unwrap_or(crate::types::NULL_PAGE);
-                shard.rc.load_segments_from_directory(head)?;
+                if head != crate::types::NULL_PAGE {
+                    uncondensed_segment_count += shard.rc.load_segments_from_directory(head)?;
+                } else if shard.rc.reserve_segment_directory()?.is_some() {
+                    reserved_any = true;
+                }
             }
+        } else {
+            for &head in manifest.refcount_delta_run_heads.iter() {
+                if head != crate::types::NULL_PAGE {
+                    uncondensed_segment_count +=
+                        crate::refcount::segment_dir::read_directory_chain(&page_store, head)?.len();
+                }
+            }
+        }
+        let has_uncondensed_segments = uncondensed_segment_count > 0;
+        if has_uncondensed_segments && !cfg.rc_delta_run_persist_enabled {
+            // Persist-off starts with an empty overlay and replays nothing, so it
+            // cannot serve reads for un-condensed segments. Refuse rather than
+            // silently returning rc missing every un-condensed delta.
+            return Err(MetaDbError::InvalidArgument(
+                "manifest carries un-condensed refcount delta-run segments but \
+                 rc_delta_run_persist_enabled is off; enable it to drain them"
+                    .into(),
+            ));
+        }
+        // Persist-on with un-condensed segments: fold them into the base at open
+        // (before the post-replay force-fold), then commit the emptied directories.
+        let condense_on_open_needed = has_uncondensed_segments;
+        // If we reserved any stable head this open (fresh persist-on DB, or persist
+        // just enabled on a v26 DB), commit the reserved heads NOW — before any
+        // checkpoint can append — so every later append rewrites an already-durable
+        // head in place. Self-contained + idempotent (a crash before it re-reserves
+        // on the next open).
+        if reserved_any {
+            manifest.body_version = manifest
+                .body_version
+                .max(crate::manifest::DELTA_RUN_MANIFEST_BODY_VERSION);
+            manifest.refcount_delta_run_heads = refcount_shards
+                .iter()
+                .map(|shard| shard.rc.durable_segment_dir_head())
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            manifest_store.commit(&mut manifest)?;
         }
         let dedup_index_meta_pid: PageId = manifest
             .dedup_index_shard_heads
@@ -911,16 +960,10 @@ impl Db {
             let mut condense_free_pages: Vec<PageId> = Vec::new();
             if condense_on_open_needed {
                 for shard in refcount_shards.iter() {
-                    let (segment_pages, dir_head) = shard.rc.condense_for_open()?;
-                    condense_free_pages.extend(segment_pages);
-                    if dir_head != crate::types::NULL_PAGE {
-                        condense_free_pages.extend(
-                            crate::refcount::segment_dir::directory_chain_pids(
-                                &page_store,
-                                dir_head,
-                            )?,
-                        );
-                    }
+                    // condense_for_open keeps the STABLE head (empties the directory
+                    // in place); it returns the folded segments' data pages + any
+                    // trailing directory-continuation framing to free after commit.
+                    condense_free_pages.extend(shard.rc.condense_for_open()?);
                 }
             }
             for shard in refcount_shards.iter() {

@@ -1165,6 +1165,34 @@ fn rc_persist_cfg(dir: &std::path::Path) -> Config {
     cfg
 }
 
+/// persist with rc-authoritative **OFF** — the PRODUCTION path where rc is driven
+/// by dedup membership (`DedupPut`), not by L2P installs. The crash regression
+/// below uses this: a deduped block's rc lives ONLY in the delta-run segment, and
+/// its partner (the dedup cuckoo) is in-place recover-ahead, so the recovered
+/// segment must match it (no premature-free).
+fn rc_persist_dedup_cfg(dir: &std::path::Path) -> Config {
+    let mut cfg = Config::new(dir);
+    cfg.l2p_buffer_enabled = true;
+    cfg.rc_authoritative_reclaim = false;
+    cfg.bfg_threads_enabled = true;
+    cfg.rc_checkpoint_streaming_enabled = true;
+    cfg.rc_delta_run_persist_enabled = true;
+    cfg.rc_condense_interval_cycles = 1_000_000;
+    cfg
+}
+
+fn dhash(n: u64) -> crate::dedup_types::Hash8 {
+    n.to_le_bytes()
+}
+
+/// A `DedupValue` whose head-8B PBA is `pba`; a fresh `put_dedup` of it increfs
+/// `pba` (rc-from-dedup-membership).
+fn dedup_val_for_pba(pba: crate::types::Pba) -> crate::dedup_types::DedupValue {
+    let mut b = [0u8; crate::dedup_types::DEDUP_VALUE_SIZE];
+    b[..8].copy_from_slice(&pba.to_be_bytes());
+    crate::dedup_types::DedupValue::new(b)
+}
+
 /// End-to-end delta-run persist (S1+S2+S3): overwrite commits append durable
 /// segments instead of folding the base array; rc stays EXACT (served from the
 /// overlay, including the cross-BFG decref that sees the overlay-parked incref);
@@ -1234,11 +1262,14 @@ fn rc_delta_run_persist_appends_segments_then_condense_on_open_replays() {
         assert_eq!(db2.get_refcount(old).unwrap(), 0, "reopen: pba {old} rc==0");
     }
     let m2 = db2.manifest();
+    // Stable-head model: condense-on-open EMPTIES each directory in place but
+    // KEEPS its reserved head (non-NULL). Directory emptiness is proven by the
+    // persist-OFF reopen below, which refuses if any un-condensed segment remained.
     assert!(
         m2.refcount_delta_run_heads
             .iter()
-            .all(|&h| h == crate::types::NULL_PAGE),
-        "condense-on-open must empty every directory head"
+            .all(|&h| h != crate::types::NULL_PAGE),
+        "reserved directory heads stay allocated across condense"
     );
     drop(db2);
 
@@ -1284,64 +1315,75 @@ fn rc_delta_run_persist_condenses_at_k_interval() {
     assert_eq!(db.get_refcount(208).unwrap(), 1);
 }
 
-/// Crash between the append checkpoint's segment write and the manifest commit:
-/// the segment pages are durable but the OLD manifest never referenced them, so
-/// they orphan (reclaimed on the next open). The append does NOT overwrite any
-/// base page, so recovery is clean — reopen replays only the committed segment.
+/// P0 REGRESSION (the box-caught premature-free): crash between an append
+/// checkpoint's segment write and the manifest commit, on the PRODUCTION path
+/// (rc-authoritative OFF → rc is driven by dedup membership). The deduped block's
+/// rc lives ONLY in the just-written segment; its dedup-index entry is in-place
+/// (recover-ahead). With the STABLE directory head, the segment is reachable from
+/// the manifest-recorded head after the crash, so condense-on-open folds it and
+/// the rc is RECOVERED — the dedup entry keeps its rc (no premature free). Before
+/// the fix (fresh-pid COW), the segment orphaned → dedup entry with rc==0.
 #[test]
 fn rc_delta_run_persist_crash_post_seg_write_before_manifest_recovers() {
     use crate::testing::faults::{FaultAction, FaultController, FaultPoint};
     let dir = TempDir::new().unwrap();
     let faults = FaultController::new();
     let db =
-        Db::create_with_config_and_faults(rc_persist_cfg(dir.path()), faults.clone()).unwrap();
+        Db::create_with_config_and_faults(rc_persist_dedup_cfg(dir.path()), faults.clone()).unwrap();
 
-    // Clean commit + flush: lba 30 -> pba 301, one committed segment.
-    {
-        let mut tx = db.begin();
-        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 30, remap_val(301, 1), None);
-        tx.commit_with_outcomes().unwrap();
-    }
+    // Clean: register a dedup entry (hash 1 -> pba 10001). rc-from-membership
+    // increfs 10001; the flush appends one committed segment carrying that delta.
+    db.put_dedup(dhash(1), dedup_val_for_pba(10001)).unwrap();
     db.flush().unwrap();
-    assert_eq!(db.get_refcount(301).unwrap(), 1);
+    assert_eq!(db.get_refcount(10001).unwrap(), 1);
 
-    // Arm the append post-seg-write fault; the 2nd flush writes the segment
-    // durably, then crashes before the manifest captures its directory head.
+    // Arm the append post-seg-write fault; the 2nd flush writes the segment +
+    // in-place directory durably, then crashes before the manifest commit.
     faults.install(
         FaultPoint::RcDeltaRunPostSegWriteBeforeManifest,
         1,
         FaultAction::Error,
     );
-    {
-        let mut tx = db.begin();
-        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 30, remap_val(302, 2), None);
-        tx.commit_with_outcomes().unwrap();
-    }
+    db.put_dedup(dhash(2), dedup_val_for_pba(10002)).unwrap();
     assert!(db.flush().is_err(), "flush must surface the injected fault");
     assert!(faults.fired(FaultPoint::RcDeltaRunPostSegWriteBeforeManifest));
     faults.clear();
     drop(db);
 
-    // Reopen: the manifest still anchors only the 1st segment → condense-on-open
-    // replays it; the 2nd (crashed pre-manifest) segment is an orphan and its
-    // commit is lost (metadb-standalone has no LV2 re-drive). Both rc and L2P
-    // reflect the 1st commit — no premature free, no double count.
-    let db2 = Db::open_with_config(rc_persist_cfg(dir.path())).unwrap();
-    assert_eq!(db2.get_refcount(301).unwrap(), 1, "1st commit preserved");
-    assert_eq!(db2.get_refcount(302).unwrap(), 0, "crashed 2nd commit lost");
+    // Reopen: the STABLE head resolves to the durable in-place directory listing
+    // BOTH segments → condense-on-open folds them. rc for the crashed dedup put is
+    // RECOVERED, so every live dedup entry keeps rc >= 1 (the audit invariant).
+    let db2 = Db::open_with_config(rc_persist_dedup_cfg(dir.path())).unwrap();
+    assert_eq!(db2.get_refcount(10001).unwrap(), 1, "1st dedup rc preserved");
     assert_eq!(
-        db2.get(BOOTSTRAP_VOLUME_ORD, 30).unwrap(),
-        Some(remap_val(301, 1)),
-        "L2P reflects the 1st commit"
+        db2.get_refcount(10002).unwrap(),
+        1,
+        "2nd dedup rc RECOVERED — no premature-free of the deduped block (the P0)"
     );
-    // Directory heads emptied by condense-on-open; a clean flush now works.
-    db2.flush().unwrap();
-    assert!(
-        db2.manifest()
-            .refcount_delta_run_heads
-            .iter()
-            .all(|&h| h == crate::types::NULL_PAGE)
+    assert_eq!(
+        db2.get_dedup(&dhash(2)).unwrap(),
+        Some(dedup_val_for_pba(10002)),
+        "2nd dedup entry is durable (in-place cuckoo)"
     );
+    // Every live dedup member has rc >= 1 (the standalone audit invariant the box
+    // soak enforces): no entry left with rc==0.
+    for entry in db2.iter_dedup().unwrap() {
+        let (_hash, value) = entry.unwrap();
+        assert!(
+            db2.get_refcount(value.head_pba()).unwrap() >= 1,
+            "dedup member pba={} must not be premature-freed",
+            value.head_pba()
+        );
+    }
+    // Directories emptied by condense-on-open: a persist-OFF reopen (which refuses
+    // if any un-condensed segment remained) now succeeds with rc intact.
+    drop(db2);
+    let mut off = Config::new(dir.path());
+    off.l2p_buffer_enabled = true;
+    off.rc_delta_run_persist_enabled = false;
+    let db3 = Db::open_with_config(off).unwrap();
+    assert_eq!(db3.get_refcount(10001).unwrap(), 1);
+    assert_eq!(db3.get_refcount(10002).unwrap(), 1);
 }
 
 /// persist requires the streaming BFG checkpoint; the config cross-check refuses
