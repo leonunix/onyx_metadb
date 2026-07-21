@@ -1155,7 +1155,8 @@ fn rc_auth_cfg(dir: &std::path::Path, bfg_threads: bool) -> Config {
 }
 
 /// rc-authoritative + threads-on + delta-run persist (v27). A large K so no
-/// condense fires (S3 not landed) — segments simply accumulate.
+/// condense fires during the appends — segments accumulate, then condense-on-
+/// open drains them at reopen.
 fn rc_persist_cfg(dir: &std::path::Path) -> Config {
     let mut cfg = rc_auth_cfg(dir, true);
     cfg.rc_checkpoint_streaming_enabled = true;
@@ -1164,13 +1165,14 @@ fn rc_persist_cfg(dir: &std::path::Path) -> Config {
     cfg
 }
 
-/// End-to-end delta-run persist (S1+S2): overwrite commits append durable
+/// End-to-end delta-run persist (S1+S2+S3): overwrite commits append durable
 /// segments instead of folding the base array; rc stays EXACT (served from the
 /// overlay, including the cross-BFG decref that sees the overlay-parked incref);
 /// the manifest upgrades to v27 with a non-empty segment-directory head; and a
-/// reopen with un-condensed segments refuses loudly (S3 adds replay).
+/// reopen condense-on-open replays the segments into the base (rc preserved,
+/// heads emptied).
 #[test]
-fn rc_delta_run_persist_appends_segments_rc_exact_and_reopen_refuses() {
+fn rc_delta_run_persist_appends_segments_then_condense_on_open_replays() {
     let dir = TempDir::new().unwrap();
     let db = Db::create_with_config(rc_persist_cfg(dir.path())).unwrap();
 
@@ -1224,20 +1226,121 @@ fn rc_delta_run_persist_appends_segments_rc_exact_and_reopen_refuses() {
 
     drop(db);
 
-    // Reopen with persist ON but un-condensed segments present → refused (S1).
-    let err = Db::open_with_config(rc_persist_cfg(dir.path())).map(|_| ()).unwrap_err();
+    // Reopen with persist ON: condense-on-open replays the segments into the
+    // base array. rc is preserved and the directory heads are emptied.
+    let db2 = Db::open_with_config(rc_persist_cfg(dir.path())).unwrap();
+    assert_eq!(db2.get_refcount(106).unwrap(), 1, "reopen: rc preserved");
+    for old in 100u64..=105 {
+        assert_eq!(db2.get_refcount(old).unwrap(), 0, "reopen: pba {old} rc==0");
+    }
+    let m2 = db2.manifest();
     assert!(
-        format!("{err}").contains("un-condensed refcount delta-run segments"),
-        "expected persist-on reopen refusal, got: {err}"
+        m2.refcount_delta_run_heads
+            .iter()
+            .all(|&h| h == crate::types::NULL_PAGE),
+        "condense-on-open must empty every directory head"
     );
+    drop(db2);
 
-    // Reopen with persist OFF → also refused (cannot serve the segments).
+    // Reopen with persist OFF now succeeds — the segments were already condensed
+    // into the base (all-NULL heads), so there is nothing to replay.
     let mut off = rc_auth_cfg(dir.path(), true);
     off.rc_delta_run_persist_enabled = false;
-    let err2 = Db::open_with_config(off).map(|_| ()).unwrap_err();
+    let db3 = Db::open_with_config(off).unwrap();
+    assert_eq!(db3.get_refcount(106).unwrap(), 1, "persist-off reopen: rc preserved");
+    for old in 100u64..=105 {
+        assert_eq!(db3.get_refcount(old).unwrap(), 0);
+    }
+}
+
+/// A condense triggered by the K interval during runtime folds the accumulated
+/// segments into the base mid-flight (not just at open), keeping rc exact and
+/// eventually emptying the directory.
+#[test]
+fn rc_delta_run_persist_condenses_at_k_interval() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = rc_persist_cfg(dir.path());
+    cfg.rc_condense_interval_cycles = 3; // condense after 3 segments
+    let db = Db::create_with_config(cfg).unwrap();
+
+    for g in 1u64..=8 {
+        let new_pba = 200 + g;
+        let mut tx = db.begin();
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 20, remap_val(new_pba, g as u8), None);
+        tx.commit_with_outcomes().unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get_refcount(new_pba).unwrap(), 1, "gen {g}");
+        if g > 1 {
+            assert_eq!(db.get_refcount(200 + g - 1).unwrap(), 0, "gen {g} old");
+        }
+    }
+    // At least one condense fired (K=3 over 8 cycles).
+    let metrics = db.metrics_snapshot();
     assert!(
-        format!("{err2}").contains("un-condensed refcount delta-run segments"),
-        "expected persist-off reopen refusal, got: {err2}"
+        metrics.flush_rc_segment_condenses >= 1,
+        "expected a K-interval condense, got {}",
+        metrics.flush_rc_segment_condenses
+    );
+    assert_eq!(db.get_refcount(208).unwrap(), 1);
+}
+
+/// Crash between the append checkpoint's segment write and the manifest commit:
+/// the segment pages are durable but the OLD manifest never referenced them, so
+/// they orphan (reclaimed on the next open). The append does NOT overwrite any
+/// base page, so recovery is clean — reopen replays only the committed segment.
+#[test]
+fn rc_delta_run_persist_crash_post_seg_write_before_manifest_recovers() {
+    use crate::testing::faults::{FaultAction, FaultController, FaultPoint};
+    let dir = TempDir::new().unwrap();
+    let faults = FaultController::new();
+    let db =
+        Db::create_with_config_and_faults(rc_persist_cfg(dir.path()), faults.clone()).unwrap();
+
+    // Clean commit + flush: lba 30 -> pba 301, one committed segment.
+    {
+        let mut tx = db.begin();
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 30, remap_val(301, 1), None);
+        tx.commit_with_outcomes().unwrap();
+    }
+    db.flush().unwrap();
+    assert_eq!(db.get_refcount(301).unwrap(), 1);
+
+    // Arm the append post-seg-write fault; the 2nd flush writes the segment
+    // durably, then crashes before the manifest captures its directory head.
+    faults.install(
+        FaultPoint::RcDeltaRunPostSegWriteBeforeManifest,
+        1,
+        FaultAction::Error,
+    );
+    {
+        let mut tx = db.begin();
+        tx.l2p_remap(BOOTSTRAP_VOLUME_ORD, 30, remap_val(302, 2), None);
+        tx.commit_with_outcomes().unwrap();
+    }
+    assert!(db.flush().is_err(), "flush must surface the injected fault");
+    assert!(faults.fired(FaultPoint::RcDeltaRunPostSegWriteBeforeManifest));
+    faults.clear();
+    drop(db);
+
+    // Reopen: the manifest still anchors only the 1st segment → condense-on-open
+    // replays it; the 2nd (crashed pre-manifest) segment is an orphan and its
+    // commit is lost (metadb-standalone has no LV2 re-drive). Both rc and L2P
+    // reflect the 1st commit — no premature free, no double count.
+    let db2 = Db::open_with_config(rc_persist_cfg(dir.path())).unwrap();
+    assert_eq!(db2.get_refcount(301).unwrap(), 1, "1st commit preserved");
+    assert_eq!(db2.get_refcount(302).unwrap(), 0, "crashed 2nd commit lost");
+    assert_eq!(
+        db2.get(BOOTSTRAP_VOLUME_ORD, 30).unwrap(),
+        Some(remap_val(301, 1)),
+        "L2P reflects the 1st commit"
+    );
+    // Directory heads emptied by condense-on-open; a clean flush now works.
+    db2.flush().unwrap();
+    assert!(
+        db2.manifest()
+            .refcount_delta_run_heads
+            .iter()
+            .all(|&h| h == crate::types::NULL_PAGE)
     );
 }
 

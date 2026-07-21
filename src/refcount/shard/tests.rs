@@ -920,7 +920,7 @@ use crate::types::NULL_PAGE;
 fn decode_segment(s: &RcShard, seg: &SegmentDescriptor) -> Vec<(Pba, Pending)> {
     let mut out = Vec::new();
     for &pid in &seg.data_pids {
-        let page = s.array.page_store_for_test().read_page(pid).unwrap();
+        let page = s.array.page_store().read_page(pid).unwrap();
         out.extend(crate::refcount::delta_run::decode_run_page(&page, pid).unwrap().records);
     }
     out
@@ -1043,5 +1043,91 @@ fn persist_abort_restores_slot_and_clears_overlay() {
     assert_eq!(s.get(11).unwrap(), 2);
     // The segment's data pages were queued for reclaim (epoch-deferred free).
     assert!(!seg.data_pids.is_empty());
-    assert!(s.array.page_store_for_test().deferred_free_len() >= seg.data_pids.len());
+    assert!(s.array.page_store().deferred_free_len() >= seg.data_pids.len());
+}
+
+#[test]
+fn persist_then_condense_folds_base_and_clears_overlay() {
+    let (_d, s) = make_shard();
+    let mut model: std::collections::HashMap<Pba, i64> = std::collections::HashMap::new();
+    let mut lsn = 1u64;
+    // Append 3 segments across BFG slots (each append clears its own slot).
+    for cycle in 0..3u64 {
+        let bfg = cycle;
+        for pba in 0..12u64 {
+            let cur = *model.get(&pba).unwrap_or(&0);
+            let delta: i64 = match (pba + cycle) % 4 {
+                0 => 2,
+                1 => 1,
+                2 if cur > 0 => -1,
+                _ => 3,
+            };
+            s.stage(bfg, pba, delta, lsn).unwrap();
+            *model.entry(pba).or_default() += delta;
+            lsn += 1;
+        }
+        s.begin_checkpoint_streaming_persist(bfg, 26, 0, lsn).unwrap();
+    }
+    assert!(!s.overlay_is_empty());
+    assert_eq!(s.segment_count(), 3);
+    // The base array carries nothing yet (everything lives in segments/overlay).
+    for pba in 0..12u64 {
+        assert_eq!(s.array.get(pba).unwrap().rc, 0);
+    }
+
+    // Condense (cold all-slot). Folds the 3 segments into the base array and
+    // empties the directory.
+    let ckpt = s.condense(&[0, 1, 2, 3]).unwrap();
+    assert!(ckpt.is_condense());
+    assert!(s.overlay_is_empty());
+    assert_eq!(s.segment_count(), 0);
+    // Reads (served from the staged base overlay) match the model.
+    for pba in 0..12u64 {
+        assert_eq!(
+            s.get(pba).unwrap() as i64,
+            *model.get(&pba).unwrap_or(&0),
+            "post-condense staged pba {pba}"
+        );
+    }
+    // Make the fold durable and re-check reads from the on-disk base array.
+    s.array.write_staged_pages(&ckpt.staged).unwrap();
+    for pba in 0..12u64 {
+        let base = s.array.get(pba).unwrap().rc as i64;
+        assert_eq!(base, *model.get(&pba).unwrap_or(&0), "durable base pba {pba}");
+    }
+
+    // A fresh append after condense starts a new directory generation.
+    s.stage(1, 100, 7, lsn + 1).unwrap();
+    let ck2 = s.begin_checkpoint_streaming_persist(1, 26, 0, lsn + 2).unwrap();
+    assert!(ck2.has_segment());
+    assert_eq!(s.segment_count(), 1);
+    assert_eq!(s.get(100).unwrap(), 7);
+    // Prior condensed PBAs still read from the base.
+    assert_eq!(s.get(0).unwrap() as i64, *model.get(&0).unwrap_or(&0));
+}
+
+#[test]
+fn condense_abort_restores_overlay_descriptors_and_slot() {
+    let (_d, s) = make_shard();
+    s.stage(0, 10, 4, 100).unwrap();
+    s.stage(0, 11, 2, 101).unwrap();
+    s.begin_checkpoint_streaming_persist(0, 26, 0, 200).unwrap();
+    // Stage more into a different slot (present at condense as drained slot).
+    s.stage(1, 12, 5, 300).unwrap();
+    assert_eq!(s.segment_count(), 1);
+
+    let ckpt = s.condense(&[0, 1, 2, 3]).unwrap();
+    assert!(ckpt.is_condense());
+    assert!(s.overlay_is_empty());
+    assert_eq!(s.segment_count(), 0);
+
+    // Abort (pre-manifest): overlay rebuilt from the still-durable segment,
+    // descriptors + slot restored.
+    s.abort_checkpoint(ckpt, 0);
+    assert!(!s.overlay_is_empty());
+    assert_eq!(s.segment_count(), 1);
+    // Reads recover: 10/11 via the rebuilt overlay, 12 via the restored slot.
+    assert_eq!(s.get(10).unwrap(), 4);
+    assert_eq!(s.get(11).unwrap(), 2);
+    assert_eq!(s.get(12).unwrap(), 5);
 }

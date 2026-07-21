@@ -552,6 +552,7 @@ pub struct MetaMetrics {
     flush_rc_segment_bytes: AtomicU64,
     flush_rc_segment_dir_pages: AtomicU64,
     flush_rc_segment_overlay_entries_max: AtomicU64,
+    flush_rc_segment_condenses: AtomicU64,
     flush_io_us: AtomicU64,
     flush_io_max_us: AtomicU64,
     flush_io_seal_us: AtomicU64,

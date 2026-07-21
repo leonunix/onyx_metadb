@@ -93,6 +93,18 @@ fn parse_fault_point(raw: &str) -> Result<FaultPoint, String> {
         "flush.level_rewrite.before_manifest" => {
             Ok(FaultPoint::FlushPostLevelRewriteBeforeManifest)
         }
+        "rc_delta_run.post_seg_write.before_manifest" => {
+            Ok(FaultPoint::RcDeltaRunPostSegWriteBeforeManifest)
+        }
+        "rc_delta_run.post_manifest.before_free" => {
+            Ok(FaultPoint::RcDeltaRunPostManifestBeforeFree)
+        }
+        "rc_condense.post_write.before_manifest" => {
+            Ok(FaultPoint::RcCondensePostWriteBeforeManifest)
+        }
+        "rc_condense.post_manifest.before_free" => {
+            Ok(FaultPoint::RcCondensePostManifestBeforeFree)
+        }
         other => Err(format!("unsupported fault point `{other}`")),
     }
 }

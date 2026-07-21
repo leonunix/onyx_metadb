@@ -266,8 +266,23 @@ impl Db {
                 order.push((Kind::L2p(v_idx, s_idx), dirty));
             }
         }
+        // v27: a shard with un-condensed segments but an empty slot has zero
+        // pending yet still needs selecting so its condense (K segments / overlay
+        // cap) can fire — otherwise the directory never drains (verdict g).
+        let rc_condense_k = self.rc_condense_interval_cycles;
+        let rc_overlay_per_shard_cap =
+            (self.rc_segment_overlay_max_entries / self.refcount_shards.len().max(1)).max(1);
+        let persist = self.rc_delta_run_persist_enabled;
         for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
-            let dirty = shard.rc.pending_delta_count();
+            let mut dirty = shard.rc.pending_delta_count();
+            if persist {
+                let segments = shard.rc.segment_count() as u64;
+                if (rc_condense_k > 0 && segments >= rc_condense_k)
+                    || shard.rc.segment_overlay_entries() as u64 > rc_overlay_per_shard_cap as u64
+                {
+                    dirty += 1;
+                }
+            }
             order.push((Kind::Rc(s_idx), dirty));
         }
 
@@ -958,6 +973,11 @@ impl Db {
             crate::metrics::CheckpointSyncPhase::SampleWaitRefcount,
         );
         let rc_drain_started = std::time::Instant::now();
+        // v27 condense triggers, captured for the per-shard dispatch closure.
+        let rc_condense_k = self.rc_condense_interval_cycles;
+        let rc_overlay_per_shard_cap =
+            (self.rc_segment_overlay_max_entries / self.refcount_shards.len().max(1)).max(1);
+        let forced_flush = matches!(kind, crate::metrics::FlushKind::Forced);
         let rc_results: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> =
             std::thread::scope(|scope| {
                 let mut handles: Vec<(usize, std::thread::ScopedJoinHandle<_>)> = Vec::new();
@@ -969,14 +989,32 @@ impl Db {
                                 && rc_delta_run_persist_enabled
                             {
                                 // v27: append a durable delta-run segment instead
-                                // of folding the base array. The base array is
-                                // condensed only every K cycles (S3).
-                                shard.rc.begin_checkpoint_streaming_persist(
-                                    bfg,
-                                    shard.routing.manifest_version(),
-                                    s_idx as u32,
-                                    wal_checkpoint,
-                                )
+                                // of folding the base array — UNLESS condense is
+                                // due (K segments, overlay cap, or a Forced sweep
+                                // with any un-condensed segment), in which case
+                                // fold every segment + the frozen slot back into
+                                // the base and empty the directory.
+                                let segments = shard.rc.segment_count() as u64;
+                                let condense_due = (rc_condense_k > 0
+                                    && segments >= rc_condense_k)
+                                    || shard.rc.segment_overlay_entries() as u64
+                                        > rc_overlay_per_shard_cap as u64
+                                    // Forced sweep drains a shard that has
+                                    // segments but nothing new to append (an
+                                    // append would no-op, leaving them un-drained).
+                                    || (forced_flush
+                                        && segments > 0
+                                        && shard.rc.frozen_slot_is_empty(bfg));
+                                if condense_due {
+                                    shard.rc.condense(&[(bfg & 3) as usize])
+                                } else {
+                                    shard.rc.begin_checkpoint_streaming_persist(
+                                        bfg,
+                                        shard.routing.manifest_version(),
+                                        s_idx as u32,
+                                        wal_checkpoint,
+                                    )
+                                }
                             } else if bfg_threads_enabled && rc_checkpoint_streaming_enabled {
                                 shard.rc.begin_checkpoint_streaming_shadow(
                                     bfg,
@@ -1266,6 +1304,10 @@ impl Db {
         let mut rc_seg_bytes = 0u64;
         let mut rc_seg_dir_pages = 0u64;
         let mut rc_seg_overlay_max = 0u64;
+        let mut rc_seg_condenses = 0u64;
+        // v27: segment DATA pages a condense folded — freed after the commit
+        // (the segments are no longer referenced by any manifest).
+        let mut rc_condense_segment_free: Vec<PageId> = Vec::new();
         for (s_idx, ckpt_opt) in refcount_checkpoints.iter().enumerate() {
             let Some(ckpt) = ckpt_opt else { continue };
             let shard = &self.refcount_shards[s_idx];
@@ -1339,6 +1381,17 @@ impl Db {
                         return Err(err);
                     }
                 }
+            } else if ckpt.is_condense() {
+                // v27 condense: the base fold rode the normal meta-chain build +
+                // sealed_pages above. Empty the directory head and free the old
+                // directory framing + every folded segment data page post-commit.
+                rc_seg_condenses += 1;
+                rc_segment_dir_new_heads[s_idx] = Some(crate::types::NULL_PAGE);
+                let old = ckpt.condense_dir_head();
+                if old != crate::types::NULL_PAGE {
+                    rc_segment_dir_old_heads[s_idx] = Some(old);
+                }
+                rc_condense_segment_free.extend(ckpt.condense_segment_pages());
             }
         }
         self.metrics.record_flush_rc_segment(
@@ -1347,6 +1400,7 @@ impl Db {
             rc_seg_bytes,
             rc_seg_dir_pages,
             rc_seg_overlay_max,
+            rc_seg_condenses,
         );
         // Build per-volume dead-list segments and fold them into the
         // same `sealed_pages` batch as L2P + RC. Allocate contiguous
@@ -1846,6 +1900,32 @@ impl Db {
                 }
             }
         }
+        // v27 crash window: the segment/base pages are durable (the global batch
+        // synced above) but the manifest commit hasn't captured the new heads.
+        // This is POST-global-write, so it RETAINS (sync-poison contract) exactly
+        // like the durable_seq / BfgSync faults below — a crash here leaves the
+        // pages as orphans the next open reclaims; the OLD manifest never
+        // referenced them, so rc is unchanged (onyx LV2 replay re-drives).
+        if rc_seg_appends > 0 || rc_seg_condenses > 0 {
+            let point = if rc_seg_condenses > 0 {
+                FaultPoint::RcCondensePostWriteBeforeManifest
+            } else {
+                FaultPoint::RcDeltaRunPostSegWriteBeforeManifest
+            };
+            if let Err(err) = self.faults.inject(point) {
+                let manifest_elapsed = manifest_started.elapsed();
+                trace.manifest_us = micros(manifest_elapsed);
+                self.metrics.record_flush_manifest(manifest_elapsed);
+                self.metrics
+                    .record_flush_total(kind, flush_started.elapsed());
+                drop(manifest_state);
+                release_apply_guard!();
+                self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
+                self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
+                self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
+                return Err(err);
+            }
+        }
         // Buffer-as-sole-journal lifecycle journal cutover retired the WAL BFG-sync
         // barrier: there is no WAL page cache to flush. The lifecycle
         // journal already fsyncs each record at append time, and
@@ -2113,6 +2193,18 @@ impl Db {
                     .set_durable_segment_dir_head(head);
             }
         }
+        // v27 crash window: the manifest is durable with the new/empty heads, but
+        // the old directory framing + folded segment pages haven't been freed. A
+        // fired fault here skips the frees (they orphan, reclaimed on the next
+        // open); the durable state is correct.
+        if rc_seg_appends > 0 || rc_seg_condenses > 0 {
+            let point = if rc_seg_condenses > 0 {
+                FaultPoint::RcCondensePostManifestBeforeFree
+            } else {
+                FaultPoint::RcDeltaRunPostManifestBeforeFree
+            };
+            self.faults.inject(point)?;
+        }
         for old_head in rc_segment_dir_old_heads.into_iter().flatten() {
             match crate::refcount::segment_dir::directory_chain_pids(&self.page_store, old_head) {
                 Ok(pids) => {
@@ -2132,6 +2224,18 @@ impl Db {
                     error = %err,
                     "flush_with_gate: failed to enumerate old rc segment-dir chain (leak; verify reclaims)"
                 ),
+            }
+        }
+        // v27: a condense folded every segment into the base and committed a NULL
+        // directory head, so the segment DATA pages are unreferenced — free them.
+        for pid in rc_condense_segment_free {
+            self.page_cache.invalidate(pid);
+            if let Err(err) = self.page_store.free(pid, wal_checkpoint) {
+                tracing::warn!(
+                    page_id = pid,
+                    error = %err,
+                    "flush_with_gate: failed to free condensed rc segment data page"
+                );
             }
         }
         // Trailing continuation pages from the old chains can be

@@ -400,8 +400,34 @@ pub struct RcCheckpoint {
     /// the overlay, pops the descriptor, restores the slot, and frees the data
     /// pages (pre-manifest abort only).
     segment: Option<SegmentDescriptor>,
+    /// v27 (condense, S3): `Some` when this checkpoint FOLDED every un-condensed
+    /// segment + the drained slot(s) into the base array and emptied the segment
+    /// directory. The flush commits the new base chain with a NULL directory head
+    /// and, after commit, frees the old directory framing + segment data pages.
+    /// `abort_checkpoint` un-stages the base, rebuilds the overlay from the still-
+    /// durable segments, restores the descriptors + slot (pre-manifest only).
+    condensed: Option<CondenseState>,
     snapshot_page_table: Vec<PageId>,
     snapshot_meta_chain: Vec<PageId>,
+}
+
+/// Rollback + post-commit bookkeeping for a condense checkpoint.
+struct CondenseState {
+    /// The segments this condense folded — used to rebuild the overlay on abort
+    /// (re-read from the still-durable pages), restore `segment_descriptors`, and
+    /// free every segment data page after the commit lands.
+    descriptors: Vec<SegmentDescriptor>,
+    /// The old durable directory head whose framing pages are freed post-commit.
+    dir_head: PageId,
+}
+
+impl CondenseState {
+    fn segment_pages(&self) -> Vec<PageId> {
+        self.descriptors
+            .iter()
+            .flat_map(|d| d.data_pids.iter().copied())
+            .collect()
+    }
 }
 
 /// Service work completed by the bounded data-page writes of a streaming
@@ -503,6 +529,27 @@ impl RcCheckpoint {
     /// checkpoint).
     pub(crate) fn has_segment(&self) -> bool {
         self.segment.is_some()
+    }
+
+    /// v27 (S3): true iff this checkpoint CONDENSED — folded every segment into
+    /// the base array and emptied the directory. The flush stages a NULL head and
+    /// frees the old directory + segment data pages after commit.
+    pub(crate) fn is_condense(&self) -> bool {
+        self.condensed.is_some()
+    }
+
+    /// v27 (S3): the old directory head whose framing pages the flush frees after
+    /// a condense commit ([`NULL_PAGE`] if the shard had no prior directory).
+    pub(crate) fn condense_dir_head(&self) -> PageId {
+        self.condensed.as_ref().map_or(NULL_PAGE, |c| c.dir_head)
+    }
+
+    /// v27 (S3): every segment data page a condense folded — freed by the flush
+    /// after the commit lands (the segments are no longer referenced).
+    pub(crate) fn condense_segment_pages(&self) -> Vec<PageId> {
+        self.condensed
+            .as_ref()
+            .map_or_else(Vec::new, |c| c.segment_pages())
     }
 
     /// Number of freshly-allocated data pages this checkpoint produced.
@@ -626,6 +673,13 @@ impl RcShard {
     /// v27: number of un-condensed segments (== directory length).
     pub(crate) fn segment_count(&self) -> usize {
         self.segment_descriptors.lock().len()
+    }
+
+    /// v27: true when BFG `bfg`'s frozen slot has no pending deltas — an append
+    /// would produce an empty segment (no-op), so a Forced sweep condenses the
+    /// shard instead of appending.
+    pub(crate) fn frozen_slot_is_empty(&self, bfg: Bfg) -> bool {
+        self.delta_slots[slot_index(bfg)].lock().is_empty()
     }
 
     /// v27: unique PBAs currently in the segment overlay (observability gauge).
@@ -1245,6 +1299,7 @@ impl RcShard {
             drained_deltas: drained,
             restore_slot,
             segment: Some(descriptor),
+            condensed: None,
             snapshot_page_table: self.array.page_table_snapshot(),
             snapshot_meta_chain: self.array.meta_chain_snapshot(),
         })
@@ -1267,6 +1322,188 @@ impl RcShard {
             drained_deltas: Vec::new(),
             restore_slot,
             segment: None,
+            condensed: None,
+            snapshot_page_table: self.array.page_table_snapshot(),
+            snapshot_meta_chain: self.array.meta_chain_snapshot(),
+        }
+    }
+
+    /// v27 (S3) DURABLE condense: fold every un-condensed segment + the drained
+    /// target slot(s) back into the base array and empty the segment directory.
+    /// The segments are re-read from disk oldest→newest (their run order is
+    /// authoritative — the merged overlay is LOSSY across zero-crossings) and
+    /// concatenated ahead of the drained slot deltas into ONE
+    /// `stage_deltas_in_memory_preserving`. Base publish → overlay clear → slot
+    /// clear → descriptor clear happen atomically under one `fold_lock.write()` +
+    /// epoch so `get_consistent` never straddles. `slots` is the frozen Syncing
+    /// slot (hot) or all four (cold / open-replay).
+    ///
+    /// The stage is ALWAYS `force=false` (replay-skip on): a crash between the
+    /// base fold and the manifest commit leaves the segments still anchored by
+    /// the OLD manifest, so open re-condenses — but the folded base pages now
+    /// carry `generation >= record.last_lsn`, so the replay-skip drops the
+    /// already-applied records (idempotent). A `force=true` fold would re-apply
+    /// them → double count. There are no force-increfs in persist mode (snapshot
+    /// roots flow through the BFG slot into segments), so `force=false` loses
+    /// nothing.
+    pub(crate) fn condense(&self, slots: &[usize]) -> Result<RcCheckpoint> {
+        const FORCE: bool = false;
+        let restore_slot = slots[0];
+        // Read every segment page oldest→newest OUTSIDE fold_lock; decode + concat
+        // in run order. The segments are immutable + durable, so no lock needed.
+        let descriptors = self.segment_descriptors.lock().clone();
+        let dir_head = self.durable_segment_dir_head.load(Ordering::Acquire);
+        let mut records: Vec<(Pba, Pending)> = Vec::new();
+        for seg in &descriptors {
+            let pages = self.array.read_segment_pages(&seg.data_pids)?;
+            if pages.len() != seg.data_pids.len() {
+                return Err(MetaDbError::Corruption(format!(
+                    "condense: segment page read count {} != {} pids",
+                    pages.len(),
+                    seg.data_pids.len()
+                )));
+            }
+            for (pid, page) in seg.data_pids.iter().zip(pages.iter()) {
+                records.extend(super::delta_run::decode_run_page(page, *pid)?.records);
+            }
+        }
+        // Snapshot the drained slot(s) — appended AFTER the segments (newest).
+        let mut drained_slots: Vec<(Pba, Pending)> = Vec::new();
+        for &i in slots {
+            let slot = self.delta_slots[i].lock();
+            for (pba, pending) in slot.iter() {
+                drained_slots.push((*pba, *pending));
+            }
+        }
+        records.extend(drained_slots.iter().copied());
+
+        if records.is_empty() {
+            // No segments and empty slots — the directory head is already NULL.
+            return Ok(self.empty_condense_checkpoint(restore_slot, dir_head));
+        }
+
+        // Fold under one fold_lock.write()+epoch: base publish → overlay clear →
+        // slot clear → descriptor clear (atomic vs `get_consistent`).
+        let fold_lock_wait_started = Instant::now();
+        let fold = self.fold_lock.write();
+        let fold_lock_wait_us = fold_lock_wait_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        let fold_started = Instant::now();
+        let epoch_guard = FoldEpochGuard {
+            epoch: &self.fold_epoch,
+        };
+        let staged = match self
+            .array
+            .stage_deltas_in_memory_preserving(&mut records, FORCE, &[])
+        {
+            Ok(staged) => staged,
+            Err(err) => {
+                // No in-memory move happened yet (overlay / slots / descriptors
+                // untouched); release the fold and propagate.
+                drop(epoch_guard);
+                drop(fold);
+                return Err(err);
+            }
+        };
+        // Base is published into the array's staged_overlay. Now drop the segment
+        // overlay + descriptors + slots — every segment delta is folded into base.
+        {
+            let mut overlay = self.segment_overlay.lock();
+            *overlay = DeltaMap::new();
+            self.segment_overlay_len.store(0, Ordering::Release);
+        }
+        self.segment_descriptors.lock().clear();
+        for &i in slots {
+            *self.delta_slots[i].lock() = DeltaMap::new();
+        }
+        drop(epoch_guard);
+        drop(fold);
+        let fold_service_us = fold_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+
+        Ok(RcCheckpoint {
+            staged,
+            streamed_pages: Vec::new(),
+            fold_lock_wait_us,
+            fold_service_us,
+            streaming_write_stats: RcStreamingWriteStats::default(),
+            delta_shadow_stats: RcDeltaShadowStats::default(),
+            streaming: false,
+            drained_deltas: drained_slots,
+            restore_slot,
+            segment: None,
+            condensed: Some(CondenseState {
+                descriptors,
+                dir_head,
+            }),
+            snapshot_page_table: self.array.page_table_snapshot(),
+            snapshot_meta_chain: self.array.meta_chain_snapshot(),
+        })
+    }
+
+    /// v27 (S3): seed the shard's un-condensed segment state from the manifest
+    /// at open by reading its directory chain. Returns the segment count. Called
+    /// before [`Self::condense_for_open`], which folds them into the base.
+    pub fn load_segments_from_directory(&self, head: PageId) -> Result<usize> {
+        if head == NULL_PAGE {
+            self.durable_segment_dir_head.store(NULL_PAGE, Ordering::Release);
+            return Ok(0);
+        }
+        let descriptors =
+            super::segment_dir::read_directory_chain(self.array.page_store(), head)?;
+        let count = descriptors.len();
+        self.durable_segment_dir_head.store(head, Ordering::Release);
+        *self.segment_descriptors.lock() = descriptors;
+        // The overlay stays empty: `condense_for_open` folds into the base
+        // immediately, before any reader exists (open is single-threaded here).
+        Ok(count)
+    }
+
+    /// v27 (S3) condense-on-open: fold this shard's loaded segments into the base
+    /// array, write the base pages + meta chain durably (stable head, in place),
+    /// and set the durable directory head NULL so the post-replay manifest commit
+    /// stages an empty head. Returns `(segment_data_pages, old_dir_head)` for the
+    /// caller to free ONLY AFTER that commit lands — a crash before it re-reads
+    /// the still-anchored segments and re-condenses idempotently (the folded base
+    /// pages already carry `generation >= record.last_lsn`, so `force=false`
+    /// replay-skip drops them). Runs before the post-replay force-fold, so the
+    /// slots are empty and only the segments fold.
+    pub fn condense_for_open(&self) -> Result<(Vec<PageId>, PageId)> {
+        let ckpt = self.condense(&[0, 1, 2, 3])?;
+        let segment_pages = ckpt.condense_segment_pages();
+        let dir_head = ckpt.condense_dir_head();
+        if !ckpt.staged.is_empty() {
+            self.array.write_staged_pages(&ckpt.staged)?;
+            let (new_chain, chain_pages, to_free) = self.build_meta_chain(&ckpt)?;
+            self.array
+                .write_built_meta_chain_external(chain_pages, to_free, 0)?;
+            self.install_meta_chain(new_chain);
+        }
+        self.set_durable_segment_dir_head(NULL_PAGE);
+        Ok((segment_pages, dir_head))
+    }
+
+    /// Condense with nothing to fold — still empties any stale directory head.
+    fn empty_condense_checkpoint(&self, restore_slot: usize, dir_head: PageId) -> RcCheckpoint {
+        RcCheckpoint {
+            staged: StagedDeltas {
+                pages: Vec::new(),
+                max_lsn: 0,
+            },
+            streamed_pages: Vec::new(),
+            fold_lock_wait_us: 0,
+            fold_service_us: 0,
+            streaming_write_stats: RcStreamingWriteStats::default(),
+            delta_shadow_stats: RcDeltaShadowStats::default(),
+            streaming: false,
+            drained_deltas: Vec::new(),
+            restore_slot,
+            segment: None,
+            condensed: Some(CondenseState {
+                descriptors: Vec::new(),
+                dir_head,
+            }),
             snapshot_page_table: self.array.page_table_snapshot(),
             snapshot_meta_chain: self.array.meta_chain_snapshot(),
         }
@@ -1337,6 +1574,7 @@ impl RcShard {
                 drained_deltas: Vec::new(),
                 restore_slot,
                 segment: None,
+                condensed: None,
                 snapshot_page_table: self.array.page_table_snapshot(),
                 snapshot_meta_chain: self.array.meta_chain_snapshot(),
             });
@@ -1557,6 +1795,7 @@ impl RcShard {
             drained_deltas: drained,
             restore_slot,
             segment: None,
+            condensed: None,
             snapshot_page_table: self.array.page_table_snapshot(),
             snapshot_meta_chain: self.array.meta_chain_snapshot(),
         })
@@ -1645,6 +1884,17 @@ impl RcShard {
         force: bool,
         force_increfs: &[Pba],
     ) -> Result<RcCheckpoint> {
+        // v27 (verdict e pt 1): force-increfs (the snapshot-root incref) must
+        // never ride a persist-mode fold — in persist mode snapshot roots flow
+        // through `stage_unskippable` into the BFG slot and then into segments,
+        // so a non-empty `force_increfs` here means a caller mixed the two paths.
+        // Guard on segment presence (only non-empty under persist).
+        debug_assert!(
+            force_increfs.is_empty()
+                || (self.segment_overlay_len.load(Ordering::Relaxed) == 0
+                    && self.durable_segment_dir_head.load(Ordering::Relaxed) == NULL_PAGE),
+            "force-increfs are unsupported in persist mode (snapshot roots ride the BFG slot)"
+        );
         // Snapshot (clone) the slot contents — publish-before-clear: we
         // fold into the array first and clear the slot only after, so a
         // concurrent cumulative read can transiently over-count but never
@@ -1673,6 +1923,7 @@ impl RcShard {
                 drained_deltas: Vec::new(),
                 restore_slot,
                 segment: None,
+                condensed: None,
                 snapshot_page_table: self.array.page_table_snapshot(),
                 snapshot_meta_chain: self.array.meta_chain_snapshot(),
             });
@@ -1731,6 +1982,7 @@ impl RcShard {
             drained_deltas: drained,
             restore_slot,
             segment: None,
+            condensed: None,
             snapshot_page_table,
             snapshot_meta_chain,
         })
@@ -1795,6 +2047,59 @@ impl RcShard {
     /// remain folded, while unreachable fresh pages can be freed and restored
     /// from compact metadata. Post-write errors must retain authority instead.
     pub fn abort_checkpoint(&self, ckpt: RcCheckpoint, free_lsn: Lsn) {
+        // v27 condense abort (pre-manifest only). Un-stage the base fold, rebuild
+        // the segment overlay from the still-durable segments (they were never
+        // freed — the old directory head is still the committed one), restore the
+        // descriptor mirror + slot. Best-effort re-read: a read failure here is
+        // recovered by the crash/restart replay (old manifest still anchors the
+        // segments), so it degrades rather than corrupts.
+        if let Some(condense) = ckpt.condensed.as_ref() {
+            let fold = self.fold_lock.write();
+            let epoch_guard = FoldEpochGuard {
+                epoch: &self.fold_epoch,
+            };
+            self.array.abort_staged_deltas(&ckpt.staged, free_lsn);
+            {
+                let mut overlay = self.segment_overlay.lock();
+                *overlay = DeltaMap::new();
+                for seg in &condense.descriptors {
+                    match self.array.read_segment_pages(&seg.data_pids) {
+                        Ok(pages) => {
+                            for (pid, page) in seg.data_pids.iter().zip(pages.iter()) {
+                                match super::delta_run::decode_run_page(page, *pid) {
+                                    Ok(decoded) => {
+                                        for (pba, pending) in decoded.records {
+                                            overlay.merge_pending(pba, pending);
+                                        }
+                                    }
+                                    Err(err) => tracing::warn!(
+                                        page_id = *pid,
+                                        error = %err,
+                                        "condense abort: segment decode failed; overlay rebuild degraded (crash replay recovers)"
+                                    ),
+                                }
+                            }
+                        }
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "condense abort: segment read failed; overlay rebuild degraded (crash replay recovers)"
+                        ),
+                    }
+                }
+                self.segment_overlay_len
+                    .store(overlay.len(), Ordering::Release);
+            }
+            *self.segment_descriptors.lock() = condense.descriptors.clone();
+            {
+                let mut slot = self.delta_slots[ckpt.restore_slot].lock();
+                for &(pba, pending) in &ckpt.drained_deltas {
+                    slot.merge_pending(pba, pending);
+                }
+            }
+            drop(epoch_guard);
+            drop(fold);
+            return;
+        }
         // v27 persist checkpoint abort (pre-manifest only — a post-manifest
         // failure retains authority under the sync-poison contract, exactly like
         // the base streaming path). Reverse the overlay publish, pop the
@@ -1890,26 +2195,26 @@ impl RcShard {
     /// Synchronous flush for non-checkpoint callers (cold path). Folds
     /// every slot to disk and rotates the meta chain.
     pub fn flush(&self) -> Result<()> {
-        // Verdict-e stopgap (S1): a full cold fold (`force=true` all-slot) while
+        // v27 (S3) condense-first. A full cold fold (`force=true` all-slot) while
         // un-condensed delta-run segments are anchored would raise base-page
-        // generations above the segments' record last_lsns, so the later
-        // condense would generation-skip live increfs → rc under-count →
-        // premature free. Until S3 makes this path condense-first, refuse it
-        // loudly. The segment chain is only ever non-empty under
-        // `rc_delta_run_persist_enabled`, so this guard is inert when persist is
-        // off — no behaviour change for the eager base-page fold. Callers:
-        // `drop_snapshot` (snapshot.rs), `drop_volume` / clone (volume.rs),
-        // `iter_live_flushed`.
+        // generations above the segments' record last_lsns, so a later condense
+        // would generation-skip live increfs → rc under-count → premature free
+        // (verdict e). So fold every segment into the base FIRST via condense
+        // (which drains all slots too), THEN fall through to the all-slot
+        // force-fold — which now finds the slots empty and no-ops. The segment
+        // chain is only ever non-empty under `rc_delta_run_persist_enabled`, so
+        // this is inert when persist is off. `condense_for_open` empties the
+        // in-memory directory head; the caller's manifest commit records the NULL
+        // head (`refresh_manifest_entries` reads `durable_segment_dir_head()`).
+        // The now-unreferenced segment pages are deliberately NOT freed here:
+        // freeing before the caller's head-NULL commit is durable would let a
+        // crash point the old manifest at freed pages. They orphan and are
+        // reclaimed by offline verify. Callers: `drop_snapshot`, `drop_volume` /
+        // clone, `iter_live_flushed`, open post-replay.
         if self.durable_segment_dir_head.load(Ordering::Acquire) != NULL_PAGE
             || self.has_uncondensed_segments()
         {
-            return Err(MetaDbError::InvalidArgument(
-                "RcShard::flush: cold full fold forbidden while un-condensed \
-                 delta-run segments are anchored (S1 stopgap — S3 makes this \
-                 condense-first); a drop_snapshot/drop_volume/clone ran with \
-                 rc_delta_run_persist_enabled before condense support"
-                    .into(),
-            ));
+            let _orphaned_segment_pages = self.condense_for_open()?;
         }
         // Cold path: force-apply (lifecycle-serialized, no in-place retry;
         // folds the snapshot incref whose `last_lsn == created_lsn` equals

@@ -179,6 +179,29 @@ pub enum FaultPoint {
     /// `seg.append`, propagating through `commit_batch` to every
     /// in-batch ack.
     WalSubmitAsyncDropped,
+    /// v27 delta-run persist: the append checkpoint wrote its segment data pages
+    /// durably, but the manifest commit hasn't captured the new directory head.
+    /// A crash here leaves the segment + freshly-built directory pages as durable
+    /// orphans — the old manifest never referenced them; the next open's
+    /// free-list rebuild / offline verify reclaims them. rc is unchanged (onyx
+    /// LV2 replay re-drives the deltas).
+    RcDeltaRunPostSegWriteBeforeManifest,
+    /// v27 delta-run persist: the manifest commit landed with the new directory
+    /// head, but the OLD directory framing pages haven't been freed yet. A crash
+    /// here orphans those old framing pages (reclaimed lazily); the new
+    /// directory + segments are durable and correct.
+    RcDeltaRunPostManifestBeforeFree,
+    /// v27 condense: the base fold was written durably, but the manifest commit
+    /// (recording the folded base + emptied directory head) hasn't fired. A crash
+    /// here re-condenses on open — the segments are still anchored by the OLD
+    /// manifest, and the folded base pages carry `generation >= record.last_lsn`
+    /// so the `force=false` replay-skip drops them (idempotent).
+    RcCondensePostWriteBeforeManifest,
+    /// v27 condense: the manifest commit landed with the emptied directory head,
+    /// but the folded segment data pages + old directory framing haven't been
+    /// freed. A crash here orphans them (reclaimed lazily); rc is correct (the
+    /// base carries the fold, the manifest anchors no directory).
+    RcCondensePostManifestBeforeFree,
 }
 
 impl FaultPoint {
@@ -216,6 +239,12 @@ impl FaultPoint {
             Self::BfgSyncMidway => "flush.bfg_sync.midway",
             Self::BfgQuiesceMidway => "bfg.quiesce.midway",
             Self::WalSubmitAsyncDropped => "wal.submit_async.dropped",
+            Self::RcDeltaRunPostSegWriteBeforeManifest => {
+                "rc_delta_run.post_seg_write.before_manifest"
+            }
+            Self::RcDeltaRunPostManifestBeforeFree => "rc_delta_run.post_manifest.before_free",
+            Self::RcCondensePostWriteBeforeManifest => "rc_condense.post_write.before_manifest",
+            Self::RcCondensePostManifestBeforeFree => "rc_condense.post_manifest.before_free",
         }
     }
 }

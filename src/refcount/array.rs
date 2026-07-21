@@ -895,6 +895,13 @@ impl PagedRefcountArray {
         Ok(pids)
     }
 
+    /// Batch-read + verify delta-run segment data pages (condense / open-replay).
+    /// One `read_pages` submit per chunk so the decode reaches the page device as
+    /// a queued high-QD batch instead of a serial `read_page` loop.
+    pub(super) fn read_segment_pages(&self, pids: &[PageId]) -> Result<Vec<Page>> {
+        self.page_store.read_pages(pids)
+    }
+
     /// Free delta-run segment (or directory) pages — the abort path (pre-manifest
     /// failure) and post-condense reclaim both use this. Best-effort: a free
     /// error is logged and otherwise ignored (a leaked page is recoverable by
@@ -1149,10 +1156,9 @@ impl PagedRefcountArray {
         self.inner.lock().staged_overlay.len()
     }
 
-    /// Test-only handle to the backing page store (segment page decode / free
-    /// assertions in the shard's persist-checkpoint tests).
-    #[cfg(test)]
-    pub(super) fn page_store_for_test(&self) -> &Arc<PageStore> {
+    /// Backing page store — used by the shard's condense / open-replay to read
+    /// the segment directory chain, and by the persist-checkpoint tests.
+    pub(super) fn page_store(&self) -> &Arc<PageStore> {
         &self.page_store
     }
 

@@ -280,6 +280,7 @@ impl MetaMetrics {
         bytes: u64,
         dir_pages: u64,
         overlay_entries: u64,
+        condenses: u64,
     ) {
         self.flush_rc_segment_appends
             .fetch_add(appends, Ordering::Relaxed);
@@ -290,6 +291,8 @@ impl MetaMetrics {
         self.flush_rc_segment_dir_pages
             .fetch_add(dir_pages, Ordering::Relaxed);
         fetch_max(&self.flush_rc_segment_overlay_entries_max, overlay_entries);
+        self.flush_rc_segment_condenses
+            .fetch_add(condenses, Ordering::Relaxed);
     }
 
     pub(crate) fn record_flush_rc_fold_service(&self, service_us: u64) {

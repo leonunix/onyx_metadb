@@ -537,27 +537,22 @@ impl Db {
             .refcount_delta_run_heads
             .iter()
             .any(|&h| h != crate::types::NULL_PAGE);
-        if has_uncondensed_segments {
-            if !cfg.rc_delta_run_persist_enabled {
-                // Persist-off starts with an empty overlay and replays nothing, so
-                // it cannot serve reads for un-condensed segments. Refuse rather
-                // than silently returning rc missing every un-condensed delta.
-                return Err(MetaDbError::InvalidArgument(
-                    "manifest carries un-condensed refcount delta-run segments but \
-                     rc_delta_run_persist_enabled is off; enable it to drain them"
-                        .into(),
-                ));
-            }
-            // S1: condense-on-open replay lands in S3. Until then a reopen with
-            // un-condensed segments refuses rather than opening with a base array
-            // that is missing every un-condensed delta.
+        if has_uncondensed_segments && !cfg.rc_delta_run_persist_enabled {
+            // Persist-off starts with an empty overlay and replays nothing, so it
+            // cannot serve reads for un-condensed segments. Refuse rather than
+            // silently returning rc missing every un-condensed delta.
             return Err(MetaDbError::InvalidArgument(
-                "reopening a database with un-condensed refcount delta-run segments \
-                 is not yet supported (S3 condense-on-open replay); do not enable \
-                 rc_delta_run_persist_enabled across restarts until S3 lands"
+                "manifest carries un-condensed refcount delta-run segments but \
+                 rc_delta_run_persist_enabled is off; enable it to drain them"
                     .into(),
             ));
         }
+        // v27 (S3): persist-on with un-condensed segments replays them at open —
+        // fold each shard's directory into the base before the post-replay
+        // force-fold, then commit the emptied heads in the post-replay manifest
+        // commit (which we force entry into below).
+        let condense_on_open_needed =
+            has_uncondensed_segments && cfg.rc_delta_run_persist_enabled;
         if manifest.volumes.is_empty() {
             return Err(MetaDbError::Corruption(
                 "manifest has no volume entries; database was not initialized".into(),
@@ -645,6 +640,18 @@ impl Db {
             refcount_routing,
             metrics.clone(),
         )?;
+        // v27 (S3): seed each shard's un-condensed segment directory from the
+        // manifest so the post-replay block can condense them into the base.
+        if condense_on_open_needed {
+            for (s_idx, shard) in refcount_shards.iter().enumerate() {
+                let head = manifest
+                    .refcount_delta_run_heads
+                    .get(s_idx)
+                    .copied()
+                    .unwrap_or(crate::types::NULL_PAGE);
+                shard.rc.load_segments_from_directory(head)?;
+            }
+        }
         let dedup_index_meta_pid: PageId = manifest
             .dedup_index_shard_heads
             .first()
@@ -886,7 +893,11 @@ impl Db {
         //
         // Skipping this block when nothing was replayed keeps the
         // common "close + reopen with no WAL tail" path zero-cost.
-        if replayed_drop || mutated_volumes || lifecycle_replayed_anything {
+        // v27 (S3): a persist reopen with un-condensed segments MUST force entry
+        // into this block even if nothing else replayed, else the emptied
+        // directory heads never commit.
+        if replayed_drop || mutated_volumes || lifecycle_replayed_anything || condense_on_open_needed
+        {
             let sorted: Vec<Arc<Volume>> = {
                 let mut v: Vec<Arc<Volume>> = volumes.values().cloned().collect();
                 v.sort_by_key(|vol| vol.ord);
@@ -894,6 +905,24 @@ impl Db {
             };
             let mut l2p_guards = lock_all_l2p_shards_for(&sorted);
             flush_locked_l2p_shards(&mut l2p_guards)?;
+            // v27 (S3) condense-on-open: fold each shard's loaded segments into
+            // the base BEFORE the force-fold below (which bypasses replay-skip),
+            // then free the folded segment pages + old directory AFTER the commit.
+            let mut condense_free_pages: Vec<PageId> = Vec::new();
+            if condense_on_open_needed {
+                for shard in refcount_shards.iter() {
+                    let (segment_pages, dir_head) = shard.rc.condense_for_open()?;
+                    condense_free_pages.extend(segment_pages);
+                    if dir_head != crate::types::NULL_PAGE {
+                        condense_free_pages.extend(
+                            crate::refcount::segment_dir::directory_chain_pids(
+                                &page_store,
+                                dir_head,
+                            )?,
+                        );
+                    }
+                }
+            }
             for shard in refcount_shards.iter() {
                 shard.rc.flush()?;
             }
@@ -933,6 +962,21 @@ impl Db {
             manifest_store.commit(&mut manifest)?;
             commit_l2p_checkpoint(&mut l2p_guards, last_applied.max(1) + 1)?;
             commit_refcount_checkpoint(&refcount_shards, last_applied.max(1) + 1)?;
+            // v27 (S3): the manifest recording the emptied directory heads +
+            // folded base is durable — free the condensed segment data pages + old
+            // directory framing. A crash before this point re-condenses (segments
+            // still anchored by the old manifest; the folded base is replay-skip
+            // idempotent). Best-effort: a leak is reclaimed by offline verify.
+            for pid in condense_free_pages {
+                page_cache.invalidate(pid);
+                if let Err(err) = page_store.free(pid, last_applied) {
+                    tracing::warn!(
+                        page_id = pid,
+                        error = %err,
+                        "condense-on-open: failed to free condensed segment/dir page"
+                    );
+                }
+            }
 
             // This commit advanced `checkpoint_lsn` to `last_applied` and made
             // every L2P root durable. Every page-death those durable roots

@@ -401,6 +401,7 @@ impl MetaMetrics {
             flush_rc_segment_overlay_entries_max: load(
                 &self.flush_rc_segment_overlay_entries_max,
             ),
+            flush_rc_segment_condenses: load(&self.flush_rc_segment_condenses),
             rc_read_underflow_floored_total: crate::refcount::read_underflow_floored_total(),
             rc_mutation_underflow_clamped_total: crate::refcount::underflow_clamped_total(),
             rc_staged_overlay_hits_total: crate::refcount::staged_overlay_hits_total(),
