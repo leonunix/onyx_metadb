@@ -337,6 +337,24 @@ pub struct Config {
     /// callers fold and flush through the inline path.
     pub bfg_threads_enabled: bool,
 
+    /// When `true`, the BFG quiesce/sync workers use the non-blocking pipelined
+    /// promotion path: the quiesce worker rolls the next generation without
+    /// blocking on the prior fold, several frozen generations queue in the ring,
+    /// and admission stays open across a fold (bounded only by
+    /// `l2p_buffer_total_hard_entries`). Targets the checkpoint-blackout commit
+    /// stall where a soft-limit crossing during a fold parks all commits for the
+    /// fold's duration. Default-`false`: the legacy at-most-one-Quiescing blocking
+    /// promote is unchanged. Requires `bfg_threads_enabled` + `l2p_buffer_enabled`;
+    /// inert otherwise.
+    pub bfg_admission_pipeline_enabled: bool,
+
+    /// Pipeline-mode hard ceiling on admitted-but-not-yet-folded L2P entries
+    /// across all active generations. Bounds RAM/WAL now that the soft limit no
+    /// longer serializes commits on the fold; `admit_l2p_work` parks once the
+    /// outstanding total reaches this. Ignored unless
+    /// `bfg_admission_pipeline_enabled`. `usize::MAX` = unbounded (explicit A/B).
+    pub l2p_buffer_total_hard_entries: usize,
+
     /// Stream threads-on refcount checkpoint data pages in bounded chunks.
     /// When `false`, the sync worker uses the legacy one-shot
     /// `begin_checkpoint(bfg)` path and retains every sealed page until the
@@ -388,9 +406,11 @@ pub struct Config {
     /// lock + `l2p_buffer` + per-shard page alloc pool); the serial fold
     /// was the bfg-sync drain bottleneck (~74% of that thread in
     /// `compact_drain_into_tree`), capping single-volume write throughput.
-    /// Default `false`: an older nvme-box run regressed, so this remains an
-    /// explicit diagnostic A/B rather than an assumed production win. The
-    /// work-driven BFG bound is independent of this setting.
+    /// Default `true`: the bounded worker pool + per-shard background CPU
+    /// placement removed the old spawn-per-cycle affinity regression, and a
+    /// current-code aged nvme-box A/B roughly halved L2P fold time (max
+    /// 1.55->0.91s) and cut WRITE p999 4731->65ms with no foreground loss.
+    /// The work-driven BFG bound is independent of this setting.
     pub parallel_l2p_drain_enabled: bool,
 
     /// Maximum number of L2P shard folds that may execute concurrently when
@@ -749,6 +769,13 @@ impl Config {
             l2p_buffer_max_interval_ms: 30_000,
             // BFG worker threads default-off in the generic config; see field doc.
             bfg_threads_enabled: false,
+            // Pipelined BFG admission default-off: the legacy blocking promote is
+            // the validated path. Flip on (with bfg_threads + l2p_buffer) to
+            // decouple commit admission from fold completion.
+            bfg_admission_pipeline_enabled: false,
+            // 12 M entries ~= +0.9 GB worst-case RAM over the 4 M soft budget;
+            // caps pipeline-mode outstanding work when the fold falls behind.
+            l2p_buffer_total_hard_entries: 12_000_000,
             // Preserve the production streaming checkpoint path whenever BFG
             // workers are enabled. Tests/benchmarks can disable it explicitly
             // to recover the legacy one-shot memory shape.
@@ -763,11 +790,13 @@ impl Config {
             rc_delta_run_persist_enabled: false,
             rc_condense_interval_cycles: 8,
             rc_segment_overlay_max_entries: 4_000_000,
-            // Parallel per-shard L2P drain default-OFF: an earlier nvme-box
-            // run regressed 3-4x after its workers escaped the background CPU
-            // domain, and L2P was not the only healthy-window gate. Keep this
-            // as an explicit A/B until background-only placement is validated.
-            parallel_l2p_drain_enabled: false,
+            // Parallel per-shard L2P drain default-ON: the bounded worker pool
+            // + per-shard background CPU placement fixed the earlier affinity
+            // regression, and a current-code aged nvme-box A/B halved L2P fold
+            // time (WRITE p999 4731->65ms) with no foreground loss. A `0`
+            // worker count still selects the legacy unbounded fan-out for an
+            // explicit A/B.
+            parallel_l2p_drain_enabled: true,
             // Parallel drain remains opt-in, but enabling it should be bounded
             // by default. Zero is reserved for an explicit legacy fan-out A/B.
             parallel_l2p_drain_workers: 4,

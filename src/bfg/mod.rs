@@ -6,19 +6,21 @@
 //! Replaces the single-`compacted_lsn` / `checkpoint_lsn` progress point with
 //! BFG accounting. The code still uses `Bfg` for the epoch type because that
 //! name is wired through configs, metrics, tests, and on-disk fields. At any
-//! moment up to three groups are active in a ring of `BFG_SIZE = 4` slots
-//! (index = `bfg & 3`):
+//! moment several groups are active in a ring of `BFG_SIZE = 8` slots
+//! (index = `bfg & (BFG_SIZE - 1)`):
 //!
 //! - **Open**: accepting new commits. Exactly one slot.
-//! - **Quiescing**: closed to new commits, waiting for in-flight `BfgGuard`s
-//!   to drop. At most one slot.
+//! - **Quiescing**: closed to new commits, frozen, awaiting promotion into
+//!   Syncing. Legacy mode has at most one; pipeline mode
+//!   (`bfg_admission_pipeline_enabled`) queues several in a FIFO behind the
+//!   single Syncing generation so the quiesce worker never blocks on the fold.
 //! - **Syncing**: drained; `BfgSyncThread` is persisting it. At most one slot.
 //! - **Empty**: ring slot available for the next roll.
 //!
 //! Commit hot path:
 //! ```ignore
 //! let guard = state.admit_l2p_work(work, limit)?; // enter + account atomically
-//! // ... submit WAL, apply ops, stamp L2pBuffer slot[guard.bfg & 3] ...
+//! // ... submit WAL, apply ops, stamp L2pBuffer slot[guard.bfg & (BFG_SIZE - 1)] ...
 //! guard.record_lsn(lsn);              // 1 mutex acquire
 //! drop(guard);                         // 1 mutex acquire
 //! ```
@@ -51,12 +53,14 @@
 //!
 //! ## Ring invariants (debug_asserted)
 //!
-//! - Exactly one slot in Open, at `open_bfg & 3`.
-//! - At most one slot in Quiescing, at `(open_bfg - 1) & 3`.
-//! - At most one slot in Syncing.
+//! - Exactly one slot in Open, at `open_bfg & (BFG_SIZE - 1)`.
+//! - Legacy: at most one Quiescing, at `(open_bfg - 1) & (BFG_SIZE - 1)`.
+//!   Pipeline: a FIFO of frozen Quiescing generations below `open_bfg`.
+//! - At most one slot in Syncing (both modes).
 //! - `checkpoint_bfg + 1 <= open_bfg`
 //! - `open_bfg - checkpoint_bfg <= BFG_SIZE - 1` (at most `BFG_CONCURRENT_STATES` active)
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Condvar, Mutex};
@@ -64,12 +68,19 @@ use parking_lot::{Condvar, Mutex};
 use crate::types::{Bfg, Lsn};
 
 /// Ring slot count. Must be a power of two (slot index = `bfg & (BFG_SIZE - 1)`).
-pub const BFG_SIZE: usize = 4;
+///
+/// Deepened 4 -> 8 for pipeline mode: the quiesce worker may roll ahead of the
+/// fold, so several frozen (Quiescing) generations queue behind the single
+/// Syncing one. Worst case sized from a 1.5 s fold at a ~6.3 M/s burst fill over
+/// the 4 M soft limit ≈ 3 extra Open generations → 1 Syncing + 3 frozen + 1 Open
+/// + 1 Empty = 6, rounded up to the next power of two. Legacy mode still uses at
+/// most 3 active slots; the extra slots stay Empty.
+pub const BFG_SIZE: usize = 8;
 
 /// Maximum number of concurrently-active BFGs (Open + Quiescing + Syncing).
 /// One slot in the ring is always Empty, acting as the next-slot reservation
-/// for the upcoming roll.
-pub const BFG_CONCURRENT_STATES: usize = 3;
+/// for the upcoming roll, so this is `BFG_SIZE - 1`.
+pub const BFG_CONCURRENT_STATES: usize = BFG_SIZE - 1;
 
 const BFG_INDEX_MASK: u64 = (BFG_SIZE as u64) - 1;
 
@@ -105,7 +116,14 @@ impl Slot {
 struct Inner {
     slots: [Slot; BFG_SIZE],
     open_bfg: Bfg,
-    quiescing_bfg: Option<Bfg>,
+    /// FIFO of frozen (Quiescing) generations awaiting promotion into Syncing,
+    /// oldest at the front. Legacy (pipeline-off) mode keeps this at length
+    /// `<= 1`: the quiesce worker blocks in `promote_to_syncing` before rolling
+    /// the next generation, so at most one BFG is ever Quiescing. Pipeline mode
+    /// lets the quiesce worker roll ahead without blocking on the prior fold, so
+    /// several frozen generations queue here while one is Syncing;
+    /// `try_promote_next` drains the front after each `mark_synced`.
+    quiescing: VecDeque<Bfg>,
     syncing_bfg: Option<Bfg>,
     checkpoint_bfg: Bfg,
     shutdown: bool,
@@ -134,6 +152,20 @@ struct Inner {
     /// opens the next generation. Keeping the generation in the gate (rather
     /// than a bare bool) makes a delayed force notification harmless.
     l2p_admission_closed_bfg: Option<Bfg>,
+    /// When set, the quiesce/sync workers use the non-blocking pipelined
+    /// promotion path (`try_promote_next`) and the ring may hold several
+    /// Quiescing generations. When clear, the legacy at-most-one-Quiescing +
+    /// blocking `promote_to_syncing` semantics hold unchanged.
+    pipeline_enabled: bool,
+    /// Sum of admitted-but-not-yet-synced L2P work across every active slot
+    /// (incremented by `admit_l2p_work`, decremented by `mark_synced`). In
+    /// pipeline mode `admit_l2p_work` parks once this reaches `l2p_hard_limit`,
+    /// bounding RAM/WAL even though the soft limit no longer serializes commits
+    /// on the fold. Tracked in both modes; only enforced when pipelined.
+    outstanding_l2p_work: usize,
+    /// Hard ceiling on `outstanding_l2p_work` (pipeline mode only). `usize::MAX`
+    /// disables the ceiling (legacy mode, or an explicit unbounded A/B).
+    l2p_hard_limit: usize,
 }
 
 /// Terminal reason why a work-admitting commit could not enter an Open BFG.
@@ -154,8 +186,21 @@ pub struct BfgStateMachine {
 
 impl BfgStateMachine {
     /// Fresh state machine with all slots empty except the Open slot at
-    /// `(initial_checkpoint_bfg + 1) & 3`.
+    /// `(initial_checkpoint_bfg + 1) & (BFG_SIZE - 1)`. Legacy (pipeline-off)
+    /// semantics: at most one Quiescing, blocking `promote_to_syncing`, no
+    /// outstanding-work ceiling. Used by unit tests and pre-pipeline callers.
     pub fn new(initial_checkpoint_bfg: Bfg) -> Self {
+        Self::new_with_pipeline(initial_checkpoint_bfg, false, usize::MAX)
+    }
+
+    /// Fresh state machine with the pipelined-admission mode and outstanding
+    /// L2P-work ceiling configured explicitly. `pipeline_enabled == false` +
+    /// `l2p_hard_limit == usize::MAX` is exactly [`Self::new`].
+    pub fn new_with_pipeline(
+        initial_checkpoint_bfg: Bfg,
+        pipeline_enabled: bool,
+        l2p_hard_limit: usize,
+    ) -> Self {
         let mut slots = [Slot::empty(); BFG_SIZE];
         let open_bfg = initial_checkpoint_bfg + 1;
         slots[(open_bfg & BFG_INDEX_MASK) as usize].state = BfgState::Open;
@@ -163,13 +208,16 @@ impl BfgStateMachine {
             inner: Mutex::new(Inner {
                 slots,
                 open_bfg,
-                quiescing_bfg: None,
+                quiescing: VecDeque::new(),
                 syncing_bfg: None,
                 checkpoint_bfg: initial_checkpoint_bfg,
                 shutdown: false,
                 aborted: false,
                 closing_open: false,
                 l2p_admission_closed_bfg: None,
+                pipeline_enabled,
+                outstanding_l2p_work: 0,
+                l2p_hard_limit,
             }),
             cv: Condvar::new(),
             open_bfg_atomic: AtomicU64::new(open_bfg),
@@ -219,7 +267,14 @@ impl BfgStateMachine {
         limit: usize,
     ) -> std::result::Result<BfgGuard<'_>, AdmissionError> {
         let mut g = self.inner.lock();
-        while (g.closing_open || g.l2p_admission_closed_bfg == Some(g.open_bfg))
+        // Park on: (a) a roll's close window, (b) this generation's soft-limit
+        // gate, or (c) pipeline mode's outstanding-work hard ceiling. (c) bounds
+        // RAM/WAL now that the soft limit no longer serializes commits on the
+        // fold; a completed fold (`mark_synced`) lowers `outstanding_l2p_work`
+        // and `notify_all`s these waiters.
+        while (g.closing_open
+            || g.l2p_admission_closed_bfg == Some(g.open_bfg)
+            || (g.pipeline_enabled && g.outstanding_l2p_work >= g.l2p_hard_limit))
             && !g.shutdown
             && !g.aborted
         {
@@ -241,6 +296,9 @@ impl BfgStateMachine {
             let previous = g.slots[idx].l2p_work;
             let current = previous.saturating_add(work);
             g.slots[idx].l2p_work = current;
+            // Keep the outstanding total in step with per-slot work so
+            // `mark_synced` can subtract this generation's contribution exactly.
+            g.outstanding_l2p_work = g.outstanding_l2p_work.saturating_add(work);
             if previous < limit && current >= limit {
                 debug_assert!(g.l2p_admission_closed_bfg.is_none());
                 g.l2p_admission_closed_bfg = Some(bfg);
@@ -273,9 +331,9 @@ impl BfgStateMachine {
     /// Quiescing BFG.
     ///
     /// Three-phase wait under the inner mutex:
-    ///   1. Ring-full wait — `slots[(cur+1) & 3]` must be Empty.
+    ///   1. Ring-full wait — `slots[(cur+1) & (BFG_SIZE - 1)]` must be Empty.
     ///   2. Close `enter()` to new commits via `closing_open = true`.
-    ///   3. Drain wait — `slots[cur & 3].inflight` must hit 0.
+    ///   3. Drain wait — `slots[cur & (BFG_SIZE - 1)].inflight` must hit 0.
     /// Only then flip states and advance `open_bfg`. The drain wait
     /// happens BEFORE the advance (not after) so the WAL allocator
     /// cannot interleave a BFG_(N+1) commit's LSN below a BFG_N
@@ -291,8 +349,22 @@ impl BfgStateMachine {
         let next = cur + 1;
         let next_idx = (next & BFG_INDEX_MASK) as usize;
 
-        // (1) Ring-full wait.
-        while g.slots[next_idx].state != BfgState::Empty && !g.shutdown && !g.aborted {
+        // (1) Ring-full wait. The next slot must be Empty AND the roll must not
+        // push the active-generation count past `BFG_SIZE - 1`. The second
+        // bound is load-bearing for read correctness: `L2pBuffer::lookup_*`
+        // walks `BFG_SIZE - 1` slots back from `open_bfg`, so it only covers
+        // every active generation (Open + all Quiescing + the one Syncing) if
+        // at most `BFG_SIZE - 1` are active. Without it, pipeline mode could
+        // reach `BFG_SIZE` active generations with zero Empty slots and a read
+        // would miss the Syncing generation's still-unpublished slot → stale /
+        // torn read. `checkpoint_bfg` advances via `mark_synced` (which
+        // `notify_all`s), so this wait releases as the fold drains. Legacy mode
+        // keeps at most 3 active, so this bound never waits there.
+        while (g.slots[next_idx].state != BfgState::Empty
+            || next.saturating_sub(g.checkpoint_bfg) > (BFG_SIZE as u64 - 1))
+            && !g.shutdown
+            && !g.aborted
+        {
             self.cv.wait(&mut g);
         }
         if g.shutdown || g.aborted {
@@ -302,7 +374,13 @@ impl BfgStateMachine {
             // `quiescing_bfg != Some(cur)` and skips promote/notify.
             return cur;
         }
-        debug_assert!(g.quiescing_bfg.is_none(), "two BFGs in Quiescing");
+        // Legacy mode keeps at most one Quiescing (the worker blocks in
+        // `promote_to_syncing` before the next roll); pipeline mode intentionally
+        // queues several frozen generations behind a single Syncing.
+        debug_assert!(
+            g.pipeline_enabled || g.quiescing.is_empty(),
+            "two BFGs in Quiescing (legacy mode)"
+        );
         debug_assert_eq!(g.slots[cur_idx].state, BfgState::Open);
 
         // (2) Close enter() to new commits. Without this the drain wait
@@ -327,7 +405,7 @@ impl BfgStateMachine {
         g.slots[cur_idx].state = BfgState::Quiescing;
         g.slots[next_idx].state = BfgState::Open;
         debug_assert_eq!(g.slots[next_idx].l2p_work, 0);
-        g.quiescing_bfg = Some(cur);
+        g.quiescing.push_back(cur);
         g.open_bfg = next;
         self.open_bfg_atomic.store(next, Ordering::Release);
         if g.l2p_admission_closed_bfg == Some(cur) {
@@ -368,10 +446,37 @@ impl BfgStateMachine {
         }
         debug_assert_eq!(g.slots[idx].state, BfgState::Quiescing);
         debug_assert_eq!(g.slots[idx].inflight, 0);
-        debug_assert_eq!(g.quiescing_bfg, Some(bfg));
+        // Legacy mode promotes the sole Quiescing generation, which is the FIFO
+        // front. (Pipeline mode uses `try_promote_next` instead of this path.)
+        debug_assert_eq!(g.quiescing.front().copied(), Some(bfg));
         g.slots[idx].state = BfgState::Syncing;
-        g.quiescing_bfg = None;
+        g.quiescing.pop_front();
         g.syncing_bfg = Some(bfg);
+    }
+
+    /// Non-blocking promotion for pipeline mode: if no BFG is currently Syncing,
+    /// promote the oldest Quiescing generation (FIFO front) into Syncing and
+    /// return `Some(bfg)`; otherwise return `None` without blocking. The caller
+    /// (quiesce worker after a roll, or sync worker after `mark_synced`) notifies
+    /// the sync worker when this returns `Some`.
+    ///
+    /// Preserves at-most-one-Syncing (gates on `syncing_bfg.is_none()`) and
+    /// in-order folds (FIFO front is the lowest-numbered frozen generation).
+    /// Returns `None` under shutdown/abort so the worker stops driving syncs.
+    #[must_use]
+    pub fn try_promote_next(&self) -> Option<Bfg> {
+        let mut g = self.inner.lock();
+        if g.syncing_bfg.is_some() || g.shutdown || g.aborted {
+            return None;
+        }
+        let bfg = *g.quiescing.front()?;
+        let idx = (bfg & BFG_INDEX_MASK) as usize;
+        debug_assert_eq!(g.slots[idx].state, BfgState::Quiescing);
+        debug_assert_eq!(g.slots[idx].inflight, 0);
+        g.quiescing.pop_front();
+        g.slots[idx].state = BfgState::Syncing;
+        g.syncing_bfg = Some(bfg);
+        Some(bfg)
     }
 
     /// Mark a Syncing BFG complete; advance `checkpoint_bfg`. Wakes ring-full
@@ -381,6 +486,14 @@ impl BfgStateMachine {
         let idx = (bfg & BFG_INDEX_MASK) as usize;
         debug_assert_eq!(g.slots[idx].state, BfgState::Syncing);
         debug_assert_eq!(g.syncing_bfg, Some(bfg));
+        // Folds complete strictly in order (at-most-one-Syncing + FIFO promote),
+        // so a completed sync advances the checkpoint by exactly one.
+        debug_assert_eq!(bfg, g.checkpoint_bfg + 1);
+        // This generation's admitted L2P work is now folded into the tree; drop
+        // it from the outstanding total that bounds pipeline-mode admission.
+        g.outstanding_l2p_work = g
+            .outstanding_l2p_work
+            .saturating_sub(g.slots[idx].l2p_work);
         g.slots[idx].state = BfgState::Empty;
         g.slots[idx].inflight = 0;
         g.slots[idx].max_lsn = 0;
@@ -440,20 +553,31 @@ impl BfgStateMachine {
         self.checkpoint_bfg_atomic.load(Ordering::Acquire)
     }
 
+    /// True when this state machine runs the pipelined-admission mode
+    /// (`try_promote_next` promotion, multi-Quiescing ring). Read by the
+    /// quiesce/sync workers to choose the promotion path.
+    pub fn pipeline_enabled(&self) -> bool {
+        self.inner.lock().pipeline_enabled
+    }
+
     /// Observability / test snapshot of every slot's state.
     pub fn snapshot(&self) -> StateSnapshot {
         let g = self.inner.lock();
+        let slots =
+            std::array::from_fn(|i| (g.slots[i].state, g.slots[i].inflight, g.slots[i].max_lsn));
+        let active_generations = g
+            .slots
+            .iter()
+            .filter(|s| s.state != BfgState::Empty)
+            .count();
         StateSnapshot {
-            slots: [
-                (g.slots[0].state, g.slots[0].inflight, g.slots[0].max_lsn),
-                (g.slots[1].state, g.slots[1].inflight, g.slots[1].max_lsn),
-                (g.slots[2].state, g.slots[2].inflight, g.slots[2].max_lsn),
-                (g.slots[3].state, g.slots[3].inflight, g.slots[3].max_lsn),
-            ],
+            slots,
             open_bfg: g.open_bfg,
-            quiescing_bfg: g.quiescing_bfg,
+            quiescing_bfg: g.quiescing.front().copied(),
+            quiescing_bfgs: g.quiescing.iter().copied().collect(),
             syncing_bfg: g.syncing_bfg,
             checkpoint_bfg: g.checkpoint_bfg,
+            active_generations,
         }
     }
 
@@ -522,9 +646,18 @@ impl Drop for BfgGuard<'_> {
 pub struct StateSnapshot {
     pub slots: [(BfgState, u64, Lsn); BFG_SIZE],
     pub open_bfg: Bfg,
+    /// Oldest Quiescing generation (FIFO front), or `None`. Legacy consumers
+    /// that expect at most one Quiescing read this; pipeline-aware callers use
+    /// `quiescing_bfgs` for the full queue.
     pub quiescing_bfg: Option<Bfg>,
+    /// All frozen (Quiescing) generations, oldest first. Length `<= 1` in
+    /// legacy mode; may be deeper in pipeline mode.
+    pub quiescing_bfgs: Vec<Bfg>,
     pub syncing_bfg: Option<Bfg>,
     pub checkpoint_bfg: Bfg,
+    /// Number of active (non-Empty) generations: Open + Quiescing + Syncing.
+    /// Surfaced to onyx metrics as `bfg_active_generations`.
+    pub active_generations: usize,
 }
 
 #[cfg(test)]
@@ -557,7 +690,7 @@ mod tests {
         let s = sm.snapshot();
         assert_eq!(s.checkpoint_bfg, 7);
         assert_eq!(s.open_bfg, 8);
-        // 8 & 3 == 0 → slot 0 is Open.
+        // 8 & (BFG_SIZE - 1) == 0 → slot 0 is Open.
         assert_eq!(s.slots[0].0, BfgState::Open);
     }
 
@@ -762,7 +895,7 @@ mod tests {
         assert_eq!(waiter.join().unwrap(), Ok(4));
     }
 
-    // Ring-full block path (slot[(open+1) & 3] not Empty) is exercised by
+    // Ring-full block path (slot[(open+1) & (BFG_SIZE - 1)] not Empty) is exercised by
     // integration tests once `BfgQuiesceThread` and `BfgSyncThread` are
     // wired together — that's where the 3-active-BFG state is reachable.
     // Single-threaded unit tests can't construct it without violating the
@@ -813,17 +946,18 @@ mod tests {
 
     #[test]
     fn slot_indexing_wraps_correctly() {
-        // checkpoint_bfg starts at 100; open_bfg = 101, index = 101 & 3 = 1.
+        // checkpoint_bfg starts at 100; open_bfg = 101, index = 101 & (BFG_SIZE-1).
+        let mask = (BFG_SIZE - 1) as u64;
         let sm = BfgStateMachine::new(100);
         assert_eq!(sm.open_bfg(), 101);
-        assert_eq!(sm.snapshot().slots[1].0, BfgState::Open);
+        assert_eq!(sm.snapshot().slots[(101 & mask) as usize].0, BfgState::Open);
         for expected_open in 102..=110u64 {
             let q = sm.roll_to_quiescing();
             sm.promote_to_syncing(q);
             sm.mark_synced(q);
             assert_eq!(sm.open_bfg(), expected_open);
             let s = sm.snapshot();
-            assert_eq!(s.slots[(expected_open & 3) as usize].0, BfgState::Open);
+            assert_eq!(s.slots[(expected_open & mask) as usize].0, BfgState::Open);
         }
     }
 

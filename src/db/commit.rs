@@ -327,6 +327,24 @@ impl Db {
         {
             limit = 0;
         }
+        // Clones rely on the same forced-boundary page-death classification as
+        // snapshots: the syncing fold samples `clone_cow_pinners` at checkpoint
+        // time, and a size-driven roll — especially pipeline mode's deep FIFO,
+        // whose generations are folded several rolls late — can interleave a
+        // fold between a clone's lifecycle boundaries and mis-classify page
+        // deaths. Match the prefold clone bail-out (`lifecycle.rs`): force the
+        // forced-checkpoint path while any clone is live. Once-per-batch
+        // `volumes.read()` walk (not per-LBA), same cost class as the snapshot
+        // check above.
+        if limit != 0
+            && self
+                .volumes
+                .read()
+                .values()
+                .any(|volume| volume.parent_vol_ord.read().is_some())
+        {
+            limit = 0;
+        }
 
         let work = if limit == 0 { 0 } else { l2p_work_entries(ops) };
         let admission_started = std::time::Instant::now();

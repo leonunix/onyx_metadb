@@ -350,7 +350,18 @@ impl Db {
             wal_async_commits_enabled: cfg.wal_async_commits_enabled,
             // fresh DB starts with checkpoint_bfg = 0 so the
             // first Open BFG is 1.
-            bfg: Arc::new(crate::bfg::BfgStateMachine::new(0)),
+            bfg: Arc::new(crate::bfg::BfgStateMachine::new_with_pipeline(
+                0,
+                // Pipeline mode is inert (and, on the threads-off forced-flush
+                // path, unsafe) unless the BFG workers and L2P buffer are both
+                // on. Gate it here so a stray `bfg_admission_pipeline_enabled`
+                // without its prerequisites can never arm the multi-Quiescing
+                // FIFO / relaxed single-Quiescing assert.
+                cfg.bfg_admission_pipeline_enabled
+                    && cfg.bfg_threads_enabled
+                    && cfg.l2p_buffer_enabled,
+                cfg.l2p_buffer_total_hard_entries,
+            )),
             bfg_threads_enabled: cfg.bfg_threads_enabled,
             rc_checkpoint_streaming_enabled: cfg.rc_checkpoint_streaming_enabled,
             rc_delta_run_shadow_enabled: cfg.rc_delta_run_shadow_enabled,
@@ -1266,7 +1277,15 @@ impl Db {
             // synced BFG. open_bfg will be checkpoint_bfg + 1 — replayed
             // ops fold into that BFG so the next quiesce/sync persists
             // them with a fresh checkpoint_bfg.
-            bfg: Arc::new(crate::bfg::BfgStateMachine::new(manifest_checkpoint_bfg)),
+            bfg: Arc::new(crate::bfg::BfgStateMachine::new_with_pipeline(
+                manifest_checkpoint_bfg,
+                // See the fresh-open path: pipeline mode requires bfg_threads +
+                // l2p_buffer, else it is inert-or-unsafe.
+                cfg.bfg_admission_pipeline_enabled
+                    && cfg.bfg_threads_enabled
+                    && cfg.l2p_buffer_enabled,
+                cfg.l2p_buffer_total_hard_entries,
+            )),
             bfg_threads_enabled: cfg.bfg_threads_enabled,
             rc_checkpoint_streaming_enabled: cfg.rc_checkpoint_streaming_enabled,
             rc_delta_run_shadow_enabled: cfg.rc_delta_run_shadow_enabled,

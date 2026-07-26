@@ -11,8 +11,11 @@
 //! 3. `state.promote_to_syncing(bfg)` — flip Quiescing → Syncing.
 //! 4. `sync_notifier.notify()` — wake the [`super::bfg_sync::BfgSyncThread`].
 //!
-//! Only one quiesce in flight at a time (single thread), so the
-//! "at most one BFG in Quiescing" invariant is enforced by construction.
+//! Only one quiesce in flight at a time (single thread). Legacy mode: this
+//! enforces "at most one BFG in Quiescing" by construction. Pipeline mode
+//! (`bfg_admission_pipeline_enabled`): each roll still runs one at a time,
+//! but rolls no longer block on the fold, so several frozen Quiescing
+//! generations can queue in a FIFO behind the single Syncing one.
 //!
 //! Idempotent shutdown via `Drop` → `stop` → `join`.
 
@@ -235,6 +238,45 @@ fn run_worker(inner: Arc<Inner>) {
                 .record_checkpoint_quiesce_phase(bfg, crate::metrics::CheckpointQuiescePhase::Idle);
             break;
         }
+        // Pipeline mode: promote without blocking on the prior fold. The rolled
+        // generation is frozen in the ring FIFO; `try_promote_next` promotes the
+        // oldest one only if nothing is Syncing, then the worker immediately
+        // loops to roll the next generation instead of parking in
+        // `promote_to_syncing`. The sync worker pulls further frozen generations
+        // after each `mark_synced`. This is the whole point of the pipeline: a
+        // soft-limit crossing during a fold no longer parks commits for the
+        // fold's duration.
+        if inner.state.pipeline_enabled() {
+            // NO post-roll "is `bfg` still Quiescing?" check here. `bfg` may
+            // ALREADY have been promoted (or even synced) by the sync worker's
+            // own post-`mark_synced` `try_promote_next` in the window between
+            // this roll returning and here — that is normal pipeline progress,
+            // NOT an invariant violation. A `break` on that (as an earlier
+            // revision did) kills the sole roller and wedges admission forever.
+            // Shutdown/abort were already handled above, so the roll succeeded
+            // and pushed `bfg` onto the FIFO; promotion is the sync path's job.
+            //
+            // Fault window between the Open -> Quiescing flip and promotion.
+            // Recovery rebuilds from the durable manifest and ignores this
+            // in-memory half-roll.
+            if let Err(err) = inner.faults.inject(FaultPoint::BfgQuiesceMidway) {
+                tracing::error!(error = %err, bfg, "metadb: BfgQuiesceThread fault-injected midway; skipping promote");
+                inner.metrics.record_checkpoint_quiesce_phase(
+                    bfg,
+                    crate::metrics::CheckpointQuiescePhase::Error,
+                );
+                continue;
+            }
+            if inner.state.try_promote_next().is_some() {
+                inner.sync_notifier.notify();
+            }
+            inner
+                .metrics
+                .record_checkpoint_quiesce_phase(bfg, crate::metrics::CheckpointQuiescePhase::Idle);
+            deadline = Instant::now() + timeout;
+            continue;
+        }
+
         // Shutdown and abort were handled above. Any remaining mismatch is an
         // invariant violation; stop this producer rather than notifying sync
         // for a generation that was never promoted.

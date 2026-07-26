@@ -1006,7 +1006,7 @@ impl Db {
                                         && segments > 0
                                         && shard.rc.frozen_slot_is_empty(bfg));
                                 if condense_due {
-                                    shard.rc.condense(&[(bfg & 3) as usize])
+                                    shard.rc.condense(&[(bfg & (crate::bfg::BFG_SIZE as u64 - 1)) as usize])
                                 } else {
                                     shard.rc.begin_checkpoint_streaming_persist(
                                         bfg,

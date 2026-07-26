@@ -1,11 +1,11 @@
-//! Refcount shard: a [`PagedRefcountArray`] fronted by a 4-slot BFG ring
-//! of [`DeltaMap`]s.
+//! Refcount shard: a [`PagedRefcountArray`] fronted by a BFG_SIZE-slot BFG
+//! ring of [`DeltaMap`]s.
 //!
 //! ## Why a BFG-slot ring (mirrors L2P)
 //!
 //! Under `rc_authoritative_reclaim` the refcount is *derived* from L2P
 //! remaps (`incref(new) + decref(old)`). L2P buffers its updates in a
-//! 4-slot BFG ring ([`crate::db::l2p_buffer::L2pBuffer`]) and the sync
+//! BFG_SIZE-slot BFG ring ([`crate::db::l2p_buffer::L2pBuffer`]) and the sync
 //! folds only the frozen Syncing slot, so L2P durability is keyed to a
 //! clean per-BFG `checkpoint_lsn` prefix. refcount must fold on the SAME
 //! boundary: metadb has no data-plane WAL, so on crash onyx re-derives
@@ -20,24 +20,24 @@
 //! ## Read path (`get` / `lookup_entry`)
 //!
 //! refcount is *cumulative*, so the effective rc = on-disk array base +
-//! the SUM of pending deltas across all four slots (unlike L2P's
+//! the SUM of pending deltas across all of the ring's slots (unlike L2P's
 //! newest-slot-wins). Underflow is floored to 0 via
 //! [`super::merge_read_or_floor`] (the same transient-checkpoint-race
 //! floor as before).
 //!
 //! ## Apply path (`stage`)
 //!
-//! `stage(bfg, …)` merges its delta into `delta_slots[bfg & 3]` after reading
-//! the cumulative prev. Like `stage_batch`, it samples the array before taking
-//! `fold_lock.read()`, validates `fold_epoch`, then locks all four slots in
-//! order. This makes the base + pending view atomic with respect to a
-//! checkpoint's publish-before-clear move, which is required for an exact
-//! `prev > 0 && new == 0` freed transition.
+//! `stage(bfg, …)` merges its delta into `delta_slots[bfg & (BFG_SIZE - 1)]`
+//! after reading the cumulative prev. Like `stage_batch`, it samples the array
+//! before taking `fold_lock.read()`, validates `fold_epoch`, then locks all
+//! of the ring's slots in order. This makes the base + pending view atomic
+//! with respect to a checkpoint's publish-before-clear move, which is
+//! required for an exact `prev > 0 && new == 0` freed transition.
 //!
 //! ## Fold path (`begin_checkpoint`)
 //!
-//! `begin_checkpoint(bfg)` folds ONLY `delta_slots[bfg & 3]` (the frozen
-//! Syncing slot — `promote_to_syncing` required `inflight == 0`, so it
+//! `begin_checkpoint(bfg)` folds ONLY `delta_slots[bfg & (BFG_SIZE - 1)]` (the
+//! frozen Syncing slot — `promote_to_syncing` required `inflight == 0`, so it
 //! receives no concurrent inserts). It is **publish-before-clear**: it
 //! folds the slot's entries into the array (via `stage_deltas_in_memory`,
 //! which installs into the page cache + page table) and only THEN clears
@@ -121,17 +121,17 @@ fn sample_refcount_breakdown(lsn: Lsn) -> bool {
 }
 
 #[inline]
-fn active_slot_mask(slots: &[parking_lot::MutexGuard<'_, DeltaMap>], open_idx: usize) -> u8 {
+fn active_slot_mask(slots: &[parking_lot::MutexGuard<'_, DeltaMap>], open_idx: usize) -> u16 {
     debug_assert_eq!(slots.len(), BFG_SLOTS);
     debug_assert!(open_idx < slots.len());
     slots
         .iter()
         .enumerate()
-        .fold(1 << open_idx, |mask, (idx, slot)| {
+        .fold(1u16 << open_idx, |mask, (idx, slot)| {
             if slot.is_empty() {
                 mask
             } else {
-                mask | (1 << idx)
+                mask | (1u16 << idx)
             }
         })
 }
@@ -139,7 +139,7 @@ fn active_slot_mask(slots: &[parking_lot::MutexGuard<'_, DeltaMap>], open_idx: u
 #[inline]
 fn scan_active_locked_pending(
     slots: &[parking_lot::MutexGuard<'_, DeltaMap>],
-    mut active_slots: u8,
+    mut active_slots: u16,
     pba: Pba,
 ) -> (i64, Lsn, bool) {
     let mut net = 0i64;
@@ -202,13 +202,27 @@ fn merge_staged_action(
     Ok((merged_prev.rc, post.rc))
 }
 
-/// Number of BFG ring slots. Matches `crate::db::l2p_buffer::BFG_SIZE`.
-const BFG_SLOTS: usize = 4;
-const ALL_SLOT_MASK: u8 = (1 << BFG_SLOTS) - 1;
+/// Number of BFG ring slots. Single source of truth is the BFG state machine's
+/// `BFG_SIZE`; mirroring it here as a `const` alias keeps the slot arrays and
+/// masks in lockstep with a ring-depth change (must be a power of two).
+const BFG_SLOTS: usize = crate::bfg::BFG_SIZE;
+/// One bit per ring slot. `u16` (not `u8`) so `1 << BFG_SLOTS` does not overflow
+/// at `BFG_SLOTS == 8` (a `u8` shift by 8 is UB/panic).
+const ALL_SLOT_MASK: u16 = (1u16 << BFG_SLOTS) - 1;
 
 #[inline]
 fn slot_index(bfg: Bfg) -> usize {
     (bfg as usize) & (BFG_SLOTS - 1)
+}
+
+/// Every ring-slot index `[0, 1, .., BFG_SLOTS - 1]`. Used by the "fold every
+/// slot" paths (threads-off inline flush, open-time condense). MUST track
+/// `BFG_SLOTS` — a hard-coded `[0, 1, 2, 3]` silently drops slots 4..8 at
+/// `BFG_SIZE == 8`, orphaning any rc delta staged to a high slot (a persisted
+/// refcount would vanish on reopen).
+#[inline]
+fn all_slot_indices() -> Vec<usize> {
+    (0..BFG_SLOTS).collect()
 }
 
 struct FoldEpochGuard<'a> {
@@ -306,10 +320,10 @@ impl StageBatchTestHook {
 }
 
 pub struct RcShard {
-    /// Pending deltas keyed by BFG ring slot (`bfg & 3`). A commit
-    /// stamped to BFG `t` merges into `delta_slots[t & 3]`; the sync
-    /// folds only the Syncing slot. Reads sum across all four (refcount
-    /// is cumulative).
+    /// Pending deltas keyed by BFG ring slot (`bfg & (BFG_SIZE - 1)`). A
+    /// commit stamped to BFG `t` merges into `delta_slots[t & (BFG_SIZE - 1)]`;
+    /// the sync folds only the Syncing slot. Reads sum across all of the
+    /// ring's slots (refcount is cumulative).
     delta_slots: [Mutex<DeltaMap>; BFG_SLOTS],
     pub(super) array: PagedRefcountArray,
     /// Serialises the fold's [publish, clear] inconsistency window
@@ -730,8 +744,8 @@ impl RcShard {
         self.array.warmup_data_pages()
     }
 
-    /// Logical refcount. Sums pending across all four slots, falls back
-    /// to the on-disk array, floors a transient underflow to 0.
+    /// Logical refcount. Sums pending across all of the ring's slots, falls
+    /// back to the on-disk array, floors a transient underflow to 0.
     pub fn get(&self, pba: Pba) -> Result<u32> {
         Ok(self.lookup_entry(pba)?.rc)
     }
@@ -821,7 +835,7 @@ impl RcShard {
         Ok(())
     }
 
-    /// Sum the pending deltas for `pba` across all four slots. Returns
+    /// Sum the pending deltas for `pba` across all of the ring's slots. Returns
     /// `(net_delta, max_lsn, any)`. Each slot is read under a brief
     /// individual lock — never holding two at once.
     fn sum_pending(&self, pba: Pba, skip: Option<usize>) -> (i64, Lsn, bool) {
@@ -1171,7 +1185,7 @@ impl RcShard {
         }
     }
 
-    /// Fold ONLY the Syncing slot (`bfg & 3`). Caller has frozen the slot
+    /// Fold ONLY the Syncing slot (`bfg & (BFG_SIZE - 1)`). Caller has frozen the slot
     /// by promoting `bfg` to Syncing (`inflight == 0`). After the fold rc
     /// is durable up to that BFG's `wal_checkpoint` (the slot held exactly
     /// this BFG's deltas), so the flush's `wal_checkpoint.max(prev)`
@@ -1368,7 +1382,7 @@ impl RcShard {
     /// `stage_deltas_in_memory_preserving`. Base publish → overlay clear → slot
     /// clear → descriptor clear happen atomically under one `fold_lock.write()` +
     /// epoch so `get_consistent` never straddles. `slots` is the frozen Syncing
-    /// slot (hot) or all four (cold / open-replay).
+    /// slot (hot) or all of the ring's slots (cold / open-replay).
     ///
     /// The stage is ALWAYS `force=false` (replay-skip on): a crash between the
     /// base fold and the manifest commit leaves the segments still anchored by
@@ -1504,7 +1518,7 @@ impl RcShard {
     /// `force=false` replay-skip drops them). Runs before the post-replay
     /// force-fold, so the slots are empty and only the segments fold.
     pub fn condense_for_open(&self) -> Result<Vec<PageId>> {
-        let ckpt = self.condense(&[0, 1, 2, 3])?;
+        let ckpt = self.condense(&all_slot_indices())?;
         let mut free_pages = ckpt.condense_segment_pages();
         if !ckpt.staged.is_empty() {
             self.array.write_staged_pages(&ckpt.staged)?;
@@ -1902,7 +1916,7 @@ impl RcShard {
     /// path (see [`PagedRefcountArray::stage_deltas_in_memory_force`]);
     /// the hot run_sync_cycle drainer passes `false`.
     pub fn begin_checkpoint_all_slots(&self, force: bool) -> Result<RcCheckpoint> {
-        self.checkpoint_slots(&[0, 1, 2, 3], force, &[])
+        self.checkpoint_slots(&all_slot_indices(), force, &[])
     }
 
     /// All-slot fold (threads-OFF inline flush) that also force-increfs
@@ -1913,7 +1927,7 @@ impl RcShard {
         force: bool,
         force_increfs: &[Pba],
     ) -> Result<RcCheckpoint> {
-        self.checkpoint_slots(&[0, 1, 2, 3], force, force_increfs)
+        self.checkpoint_slots(&all_slot_indices(), force, force_increfs)
     }
 
     /// Shared fold body (publish-before-clear). `force_increfs` is the

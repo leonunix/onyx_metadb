@@ -1030,8 +1030,9 @@ impl Db {
         Ok(())
     }
 
-    /// Threads-ON BFG sync drain: fold only the frozen syncing slot (`bfg & 3`)
-    /// of every L2P shard into its tree. Open and Quiescing slots are left
+    /// Threads-ON BFG sync drain: fold only the frozen syncing slot
+    /// (`bfg & (BFG_SIZE - 1)`) of every L2P shard into its tree. Open and
+    /// Quiescing slots are left
     /// untouched and drain on their own future sync cycles, so each cycle's work
     /// is bounded by one group's writes (roughly `bfg_timeout`) instead of the
     /// whole accumulated backlog.

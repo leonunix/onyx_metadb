@@ -1,4 +1,4 @@
-//! 4-slot BFG ring buffer for L2P updates.
+//! BFG_SIZE-slot BFG ring buffer for L2P updates.
 //!
 //! Commits stamped to BFG `n` insert into slot `n & (BFG_SIZE - 1)`. The
 //! background [`crate::db::bfg_sync::BfgSyncThread`] drains the slot
@@ -9,21 +9,24 @@
 //!
 //! ## Slot semantics
 //!
-//! Ring index = `bfg & (BFG_SIZE - 1)` (currently `bfg & 3`).
+//! Ring index = `bfg & (BFG_SIZE - 1)`.
 //!
 //! - **Open slot** (state machine's open_bfg): commits insert here.
-//! - **Quiescing slot** (open_bfg - 1): no new inserts; in-flight commits
-//!   on this BFG have not yet dropped their guards.
+//! - **Quiescing slot(s)** (below open_bfg): no new inserts; in-flight
+//!   commits on these BFGs have not yet dropped their guards. Legacy mode:
+//!   at most one Quiescing slot. Pipeline mode: a FIFO of frozen Quiescing
+//!   generations.
 //! - **Syncing slot** (typically open_bfg - 2): frozen; `BfgSyncThread`
 //!   borrows the move-frozen immutable generation and clears it only after
 //!   the folded tree view is published.
-//! - The 4th slot is always Empty.
+//! - Any ring slots the walk doesn't reach are Empty.
 //!
 //! ## Lookup ordering
 //!
 //! [`L2pBuffer::lookup_for_open_bfg`] walks slots in newest-first order:
-//! `open & 3` → `(open-1) & 3` → `(open-2) & 3`. The fourth slot (the
-//! wrap-around) is always Empty and is skipped.
+//! `open & (BFG_SIZE - 1)` → `(open-1) & (BFG_SIZE - 1)` → ..., visiting at
+//! most `BFG_SIZE - 1` slots. Any slots it doesn't reach are Empty and are
+//! skipped.
 //!
 //! Tombstone semantics: a tombstone in a newer slot suppresses any
 //! value in older slots; readers translate Tombstone → "absent"
@@ -93,12 +96,7 @@ pub struct L2pBuffer {
 impl L2pBuffer {
     pub fn new(initial_compacted_lsn: Lsn) -> Self {
         Self {
-            slots: [
-                Mutex::new(SlotState::Mutable(HashMap::new())),
-                Mutex::new(SlotState::Mutable(HashMap::new())),
-                Mutex::new(SlotState::Mutable(HashMap::new())),
-                Mutex::new(SlotState::Mutable(HashMap::new())),
-            ],
+            slots: std::array::from_fn(|_| Mutex::new(SlotState::Mutable(HashMap::new()))),
             compacted_lsn: AtomicU64::new(initial_compacted_lsn),
         }
     }
@@ -160,9 +158,10 @@ impl L2pBuffer {
         }
     }
 
-    /// Walk slots newest-first starting at `open_bfg`: `open_bfg & 3` →
-    /// `(open_bfg-1) & 3` → `(open_bfg-2) & 3`. The 4th slot is always
-    /// Empty (state machine invariant) and is skipped.
+    /// Walk slots newest-first starting at `open_bfg`: `open_bfg & (BFG_SIZE - 1)`
+    /// → `(open_bfg-1) & (BFG_SIZE - 1)` → ..., visiting at most `BFG_SIZE - 1`
+    /// slots. Any ring slots it doesn't reach are Empty (state machine
+    /// invariant) and are skipped.
     ///
     /// Returns the first hit; tombstones suppress fallthrough to the
     /// tree.
@@ -290,7 +289,7 @@ impl L2pBuffer {
         }
     }
 
-    /// Visit every live (non-tombstone) entry across all four slots. The
+    /// Visit every live (non-tombstone) entry across all ring slots. The
     /// caller tolerates duplicates and stale-superseded entries across
     /// slots — used by the reclaim reference check
     /// ([`crate::db::Db::scan_l2p_buffer_values`]), which only ORs
@@ -323,7 +322,7 @@ impl L2pBuffer {
     ///
     /// Conflicts (same LBA across slots) resolve by highest LSN, so
     /// the post-drain tree state matches the lookup order
-    /// (newest-first across the four slots).
+    /// (newest-first across the ring's slots).
     pub fn drain_all_slots(&self) -> HashMap<Lba, BufferEntry> {
         let mut merged: HashMap<Lba, BufferEntry> = HashMap::new();
         for slot in &self.slots {
@@ -353,7 +352,7 @@ impl L2pBuffer {
         self.slots.iter().map(|s| s.lock().len()).sum()
     }
 
-    /// Number of entries currently in the slot indexed by `bfg & 3`.
+    /// Number of entries currently in the slot indexed by `bfg & (BFG_SIZE - 1)`.
     pub fn slot_len(&self, bfg: Bfg) -> usize {
         self.slots[(bfg & BFG_INDEX_MASK) as usize].lock().len()
     }
@@ -414,18 +413,15 @@ mod tests {
     #[test]
     fn insert_at_bfg_indexes_by_bfg_mod() {
         let b = L2pBuffer::new(0);
-        b.insert_at_bfg(0, 1, val(1), 100);
-        assert_eq!(b.slot_len(0), 1);
-        b.insert_at_bfg(1, 2, val(2), 200);
-        assert_eq!(b.slot_len(1), 1);
-        b.insert_at_bfg(2, 3, val(3), 300);
-        assert_eq!(b.slot_len(2), 1);
-        b.insert_at_bfg(3, 4, val(4), 400);
-        assert_eq!(b.slot_len(3), 1);
-        // BFG 4 wraps to slot 0.
-        b.insert_at_bfg(4, 5, val(5), 500);
-        assert_eq!(b.slot_len(4), 2);
-        assert_eq!(b.slot_total_len(), 5);
+        // Each BFG in [0, BFG_SIZE) maps to its own slot.
+        for i in 0..BFG_SIZE as u64 {
+            b.insert_at_bfg(i, i + 1, val((i + 1) as u8), 100 * (i + 1));
+            assert_eq!(b.slot_len(i), 1);
+        }
+        // BFG == BFG_SIZE wraps back to slot 0 (shares it with BFG 0).
+        b.insert_at_bfg(BFG_SIZE as u64, 999, val(0), 9999);
+        assert_eq!(b.slot_len(BFG_SIZE as u64), 2);
+        assert_eq!(b.slot_total_len(), BFG_SIZE + 1);
     }
 
     #[test]

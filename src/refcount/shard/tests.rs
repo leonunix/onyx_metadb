@@ -975,7 +975,7 @@ fn persist_multiple_bfg_cycles_rc_matches_model() {
     let mut model: std::collections::HashMap<Pba, i64> = std::collections::HashMap::new();
     let mut lsn = 1u64;
     for cycle in 0..6u64 {
-        let bfg = cycle; // rotates across the four slots
+        let bfg = cycle; // rotates across the ring's slots
         for pba in 0..24u64 {
             // Only increfs and non-underflowing decrefs so rc == model exactly.
             let cur = *model.get(&pba).unwrap_or(&0);

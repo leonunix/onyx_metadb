@@ -338,6 +338,13 @@ fn run_worker(inner: Arc<Inner>) {
                     crate::metrics::CheckpointSyncPhase::Idle,
                     None,
                 );
+                // Pipeline mode: the quiesce worker does not block-promote, so
+                // the sync worker pulls the next frozen generation itself and
+                // self-notifies to fold it back-to-back. Legacy mode leaves
+                // promotion to the quiesce worker's blocking `promote_to_syncing`.
+                if inner.state.pipeline_enabled() && inner.state.try_promote_next().is_some() {
+                    inner.notifier.notify();
+                }
             }
             Err(err) => {
                 tracing::error!(error = %err, bfg, "metadb: BfgSyncThread cycle failed; BFG stays Syncing (sync subsystem poisoned; restart required)");
