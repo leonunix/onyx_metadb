@@ -1437,8 +1437,14 @@ fn validate_rc_neutral_refcount_mode(cfg: &Config) -> Result<()> {
 /// `rc_checkpoint_streaming_enabled`. The version-dependent refusals (persist on
 /// a v25 manifest; persist-off on a v27 manifest with non-empty segment chains)
 /// live in `open_core`, where the decoded manifest is available.
+///
+/// [`Config::offline_audit`] is exempt: it guards a read-and-drain open that must
+/// CONSUME existing segments (open refuses a segment-carrying manifest with the
+/// persist arm disarmed) while keeping every background worker off. Producing is
+/// what this check protects, and an audit never produces.
 fn validate_rc_delta_run_persist_config(cfg: &Config) -> Result<()> {
     if cfg.rc_delta_run_persist_enabled
+        && !cfg.offline_audit
         && !(cfg.bfg_threads_enabled && cfg.rc_checkpoint_streaming_enabled)
     {
         return Err(MetaDbError::InvalidArgument(

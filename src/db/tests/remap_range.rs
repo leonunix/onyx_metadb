@@ -1400,6 +1400,23 @@ fn rc_delta_run_persist_requires_bfg_streaming() {
     );
 }
 
+/// ...but an OFFLINE AUDIT open is exempt. `Config::offline_audit` marks a
+/// read-and-drain open with every worker already disabled, which is a
+/// combination the production check makes impossible: an audit must CONSUME
+/// un-condensed segments (open refuses a segment-carrying manifest with the
+/// persist arm disarmed) while having the BFG threads off. Onyx's
+/// `metadb-verify` was unopenable on every persist-on config until this exempt
+/// path existed.
+#[test]
+fn offline_audit_exempts_the_persist_bfg_cross_check() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = rc_auth_cfg(dir.path(), false); // bfg threads OFF
+    cfg.rc_delta_run_persist_enabled = true;
+    cfg.offline_audit = true;
+    let db = Db::create_with_config(cfg).expect("audit open must be accepted");
+    drop(db);
+}
+
 /// With the threads-ON per-BFG sync driving the fold, the rc fold folds only
 /// the frozen Syncing slot per cycle. A sequence of overwrite commits, each
 /// flushed (rolling/syncing BFGs), must keep rc EXACT — the cross-BFG

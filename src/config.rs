@@ -215,6 +215,29 @@ pub struct Config {
     /// explicit maintenance/verify job instead.
     pub reclaim_orphans_on_open: bool,
 
+    /// This open is an OFFLINE AUDIT: `verify` / `probe` style, read-and-drain
+    /// only, with every continuous background worker already disabled by the
+    /// caller. Default **false**; a production open must never set it.
+    ///
+    /// It exists because two of this config's cross-checks guard the ability to
+    /// *produce* state, which an audit does not need and cannot do. Concretely,
+    /// [`Self::rc_delta_run_persist_enabled`] normally requires
+    /// `bfg_threads_enabled + rc_checkpoint_streaming_enabled`, because durable
+    /// delta-run segments are only ever EMITTED by the streaming BFG checkpoint.
+    /// An audit must still CONSUME them — a manifest carrying un-condensed
+    /// segments cannot be opened at all with the persist arm disarmed — while
+    /// having the worker threads off. Those two requirements are contradictory
+    /// under the production check, so an audit config was unopenable: onyx's
+    /// `metadb-verify` failed with `rc_delta_run_persist_enabled requires
+    /// bfg_threads_enabled + ...` on every config that turns persist on, i.e. on
+    /// the only path that can count orphan pages on a live pool.
+    ///
+    /// This flag relaxes exactly that check. The segment READ path
+    /// (`load_segments_from_directory` + the merged overlay + condense-on-open)
+    /// is already independent of the worker threads, so nothing else changes:
+    /// reads stay correct and the inline flush folds segments into the base.
+    pub offline_audit: bool,
+
     /// Number of buckets in the dedup_index cuckoo hash table. Each
     /// bucket holds 4 entries (`crate::dedup::cuckoo::ENTRIES_PER_BUCKET`),
     /// so the upper-bound capacity is `dedup_cuckoo_buckets * 4`. Pick
@@ -713,6 +736,7 @@ impl Config {
             lineage_gc_drop_dedup_shared: false,
             rebuild_free_list_on_open: true,
             reclaim_orphans_on_open: true,
+            offline_audit: false,
             // 1 M buckets × 4 entries = 4 M cuckoo capacity at load
             // factor 1.0 (target ~3.4 M at 0.85). Sized for soak +
             // small production deployments; large production should
