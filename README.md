@@ -2,7 +2,7 @@
 
 Embedded metadata engine for [Onyx Storage](https://github.com/leonunix/onyx_storage).
 
-Purpose-built to replace RocksDB for Onyx's metadata plane. Onyx's three
+Purpose-built for Onyx's metadata plane. Onyx's three
 metadata workloads have very different access patterns and a single
 general-purpose LSM cannot serve them all well at the same time, so each one
 gets its own structure under a single shared WAL:
@@ -24,16 +24,6 @@ the exact set of keys that become reclaimable when a snapshot is dropped.
 > `src/paged_reverse` replaces them with paged structures sized for Onyx's
 > actual access patterns.
 
-## Why not RocksDB / redb / fjall
-
-- **RocksDB**: LSM read/write amplification kills dedup; single DB with both
-  workloads fights itself; varlen/CF abstractions cost dearly for fixed-size
-  records.
-- **redb**: single-writer per DB. Onyx has N concurrent flush lanes — a
-  serialized root-COW is a hard throughput ceiling.
-- **fjall**: pure LSM. Bolting a B+tree partition onto its shared-WAL protocol
-  is equivalent to a rewrite.
-
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the full rationale and architecture.
 
 ## Status
@@ -48,7 +38,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full rationale and architecture.
 | 5     | Fixed-record LSM + PBA refcount (later retired) | landed |
 | 6     | Transactions + WAL replay + `dedup_reverse` | landed |
 | 6.5   | Paged COW radix L2P + bounded page cache + index pin | landed |
-| 7     | Integration with onyx-storage (in-tree path dep, RocksDB removed from onyx) | landed |
+| 7     | Integration with onyx-storage (in-tree path dependency) | landed |
 | 8a    | Standalone soak hardening (`metadb-soak`, fault injection, proptest scale-up) — continuous gate for deep changes | continuous |
 | Restructure | Refcount → paged-array + delta; `dedup_reverse` → paged radix + overflow; `dedup_index` → on-disk cuckoo + L0/L1; `src/btree` and `src/lsm` retired | landed |
 | 8b    | Production polish (metrics, dumps, real-hardware soak, dedup-shard tuning, NVMe perf) | ongoing |

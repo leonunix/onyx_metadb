@@ -24,7 +24,7 @@ until v0.1 is tagged on main.
 
 ### Non-goals
 
-- General-purpose KV. This is not a RocksDB replacement for arbitrary users.
+- General-purpose KV. This engine is specific to Onyx metadata.
 - Variable-length values. Dedup and L2P are both fixed-size; exploit it.
 - Secondary indexes, SQL, query planner.
 - Network layer, replication, consensus. Onyx handles that above us.
@@ -32,16 +32,16 @@ until v0.1 is tagged on main.
 
 ## 2. Workload model
 
-Onyx has two metadata workloads coexisting in one RocksDB today:
+The initial design separates two primary metadata workloads:
 
 ### 2.1 L2P
 
-- Per-volume column family: `blockmap:{volume_id}`.
+- Per-volume L2P map, keyed by LBA.
 - Key: 8-byte big-endian LBA.
 - Value: 28-byte `BlockmapValue` (see `onyx_storage/src/meta/codec.rs`).
 - Access:
   - Point `get` on worker read path.
-  - Point `put`/`delete` on flusher batch commit (WriteBatch-atomic).
+  - Point `put`/`delete` on flusher batch commit (transaction-atomic).
   - Range scan during GC / scanner.
   - Batch `multi_get` on flusher for cross-checking old mappings.
 - Scale: a 1 TiB volume = 256 M LBAs. Hundreds of volumes plausible.
@@ -54,7 +54,7 @@ directly.
 
 ### 2.2 Dedup
 
-- Global CF: `dedup_index`, plus `dedup_reverse` for PBA-triggered cleanup.
+- Global dedup index; the initial design also included a reverse index for PBA-triggered cleanup.
 - Key: 32-byte SHA-256 content hash.
 - Value: ~27 bytes (PBA + refcount + flags).
 - Access:
@@ -557,24 +557,15 @@ given B+tree shard are serialized through that shard's writer lock.
 
 ## 13. Integration with Onyx
 
-### 13.1 What moves out of RocksDB
+The Onyx adapter routes all metadata through metadb:
 
-- `blockmap:{volume_id}` CFs → metadb partitions.
-- `dedup_index` + `dedup_reverse` CFs → metadb dedup LSM.
-- `refcount` CF → metadb per-PBA refcount (fits naturally as a small
-  fixed-record LSM or a separate paged B+tree; decision in phase 5).
+- Per-volume L2P maps use paged COW radix trees.
+- Global PBA refcounts use paged arrays with per-shard deltas.
+- The global dedup index uses an on-disk cuckoo table and shared caches.
+- The volume catalog maps Onyx volume IDs to metadb volume ordinals.
 
-### 13.2 What stays
-
-- `volumes` CF stays in a minimal separate store (or a metadb system
-  partition) — it's low-traffic config data.
-
-### 13.3 Migration
-
-Phase 7 milestone. Tooling plan:
-- `metadb-import-rocks`: read existing RocksDB CFs, write to metadb.
-- Verify round-trip equivalence with diff tool.
-- Cutover: stop engine, swap metadata backend, restart, validate.
+Cross-index changes are grouped in metadb transactions. See
+[`ONYX_INTEGRATION_SPEC.md`](ONYX_INTEGRATION_SPEC.md) for the integration contract.
 
 ## 14. Open questions
 
@@ -587,7 +578,7 @@ Each gets resolved in its phase:
 - **Compression of L2P pages**: none for v1; revisit if page-cache pressure
   becomes measurable.
 - **O_DIRECT on macOS**: emulate with F_NOCACHE or skip. (phase 1)
-- **Endian**: big-endian for sort keys (same as RocksDB convention), native
+- **Endian**: big-endian for sort keys, native
   for page header fields.
 
 ## 15. Out-of-band tooling

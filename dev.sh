@@ -140,7 +140,7 @@ ensure_bench_binaries() {
     echo "Building release benchmark binaries..."
     (
         cd "$PROJ_ROOT"
-        cargo build --release --bin metadb-bench --bin rocksdb-bench
+        cargo build --release --bin metadb-bench
     )
 }
 
@@ -551,21 +551,20 @@ bench_key_count_for_bytes() {
 }
 
 run_bench_backend() {
-    local backend="$1"
-    local scenario="$2"
-    local run_dir="$3"
-    local size_bytes="${4:-0}"
-    local path_tag="${5:-$scenario}"
-    local reuse_existing="${6:-0}"
-    local skip_prefill="${7:-0}"
+    local scenario="$1"
+    local run_dir="$2"
+    local size_bytes="${3:-0}"
+    local path_tag="${4:-$scenario}"
+    local reuse_existing="${5:-0}"
+    local skip_prefill="${6:-0}"
     local scenario_arg json_path bench_path key_space
     local -a cmd
 
     scenario_arg="$(bench_scenario_arg "$scenario")"
-    bench_path="$run_dir/$backend-$path_tag"
-    json_path="$run_dir/$backend-$scenario.json"
+    bench_path="$run_dir/metadb-$path_tag"
+    json_path="$run_dir/metadb-$scenario.json"
     cmd=(
-        "$PROJ_ROOT/target/release/$backend-bench"
+        "$PROJ_ROOT/target/release/metadb-bench"
         "$scenario_arg"
         "--path" "$bench_path"
         "--threads" "$BENCH_DEFAULT_THREADS"
@@ -573,7 +572,7 @@ run_bench_backend() {
         "--seed" "$BENCH_DEFAULT_SEED"
         "--json"
     )
-    [[ "$backend" == "metadb" ]] && cmd+=("--prefill-flush-keys" "$BENCH_DEFAULT_PREFILL_FLUSH_KEYS")
+    cmd+=("--prefill-flush-keys" "$BENCH_DEFAULT_PREFILL_FLUSH_KEYS")
     if [[ "$reuse_existing" == "1" ]]; then
         cmd+=("--reuse-existing")
     else
@@ -591,15 +590,15 @@ run_bench_backend() {
                 "--key-space" "$key_space"
                 "--prefill-bytes" "$size_bytes"
             )
-            [[ "$backend" == "metadb" ]] && cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
-            [[ "$backend" == "metadb" || "$backend" == "rocksdb" ]] && cmd+=("--cache-mb" "$BENCH_DEFAULT_CACHE_MB")
+            cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
+            cmd+=("--cache-mb" "$BENCH_DEFAULT_CACHE_MB")
             ;;
         put)
             cmd+=(
                 "--ops" "$BENCH_DEFAULT_PUT_OPS"
                 "--cache-mb" "$BENCH_DEFAULT_CACHE_MB"
             )
-            [[ "$backend" == "metadb" ]] && cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
+            cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
             ;;
         get)
             key_space="$(bench_key_count_for_bytes "$size_bytes")"
@@ -609,8 +608,8 @@ run_bench_backend() {
                 "--prefill-bytes" "$size_bytes"
                 "--warmup-ops" "$BENCH_DEFAULT_GET_WARMUP"
             )
-            [[ "$backend" == "metadb" ]] && cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
-            [[ "$backend" == "metadb" || "$backend" == "rocksdb" ]] && cmd+=("--cache-mb" "$BENCH_DEFAULT_CACHE_MB")
+            cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
+            cmd+=("--cache-mb" "$BENCH_DEFAULT_CACHE_MB")
             ;;
         multi-get)
             key_space="$(bench_key_count_for_bytes "$size_bytes")"
@@ -621,8 +620,8 @@ run_bench_backend() {
                 "--batch-size" "$BENCH_DEFAULT_MULTI_BATCH_SIZE"
                 "--warmup-ops" "$BENCH_DEFAULT_MULTI_WARMUP"
             )
-            [[ "$backend" == "metadb" ]] && cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
-            [[ "$backend" == "metadb" || "$backend" == "rocksdb" ]] && cmd+=("--cache-mb" "$BENCH_DEFAULT_CACHE_MB")
+            cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
+            cmd+=("--cache-mb" "$BENCH_DEFAULT_CACHE_MB")
             ;;
         meta-tx)
             cmd+=(
@@ -632,11 +631,11 @@ run_bench_backend() {
                 "--overwrite-pct" "$BENCH_DEFAULT_OVERWRITE_PCT"
                 "--dedup-hit-pct" "$BENCH_DEFAULT_DEDUP_HIT_PCT"
             )
-            [[ "$backend" == "metadb" ]] && cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
+            cmd+=("--shards" "$BENCH_DEFAULT_SHARDS")
             ;;
     esac
 
-    echo "Running $backend $scenario ..." >&2
+    echo "Running metadb $scenario ..." >&2
     "${cmd[@]}" > "$json_path"
     printf '%s\n' "$json_path"
 }
@@ -672,41 +671,17 @@ if cache:
 PY
 }
 
-print_bench_compare() {
-    python3 - <<'PY' "$1" "$2"
-import json, pathlib, sys
-a = json.loads(pathlib.Path(sys.argv[1]).read_text())
-b = json.loads(pathlib.Path(sys.argv[2]).read_text())
-def ratio(fast, slow):
-    return fast / slow if slow else 0.0
-print(f"scenario: {a['scenario']}")
-if a.get('prefill_keys', 0) or b.get('prefill_keys', 0):
-    print("prefill:")
-    print(f"  metadb  keys/s={a.get('prefill_ops_per_sec', 0):.2f} bytes/s={a.get('prefill_bytes_per_sec', 0):.2f}")
-    print(f"  rocksdb keys/s={b.get('prefill_ops_per_sec', 0):.2f} bytes/s={b.get('prefill_bytes_per_sec', 0):.2f}")
-print("measure:")
-print(f"  metadb  ops/s={a['ops_per_sec']:.2f} items/s={a['items_per_sec']:.2f}")
-print(f"  rocksdb ops/s={b['ops_per_sec']:.2f} items/s={b['items_per_sec']:.2f}")
-print("latency_us:")
-for key in ('avg', 'p50', 'p95', 'p99', 'max'):
-    print(f"  {key}: metadb={a['latency_us'][key]} rocksdb={b['latency_us'][key]}")
-faster = 'metadb' if a['ops_per_sec'] >= b['ops_per_sec'] else 'rocksdb'
-r = ratio(max(a['ops_per_sec'], b['ops_per_sec']), min(a['ops_per_sec'], b['ops_per_sec']))
-print(f"winner_by_ops: {faster} ({r:.2f}x)")
-PY
-}
-
 cmd_bench() {
-    local target="${1:-compare}"
+    local target="${1:-metadb}"
     local scenario="${2:-multi-get}"
     local size_label="${3:-$BENCH_DEFAULT_SIZE}"
     local size_bytes=0
-    local run_dir metadb_json rocksdb_json current_scenario
-    local metadb_read_tag rocksdb_read_tag
+    local run_dir metadb_json current_scenario
+    local metadb_read_tag
     local -a scenarios
 
     case "$target" in
-        metadb|rocksdb|compare) ;;
+        metadb) ;;
         *)
             echo "unknown bench target: $target" >&2
             exit 1
@@ -725,60 +700,24 @@ cmd_bench() {
     save_bench_run_dir "$run_dir"
     ensure_bench_binaries
     metadb_read_tag="readset"
-    rocksdb_read_tag="readset"
 
     for current_scenario in "${scenarios[@]}"; do
         if [[ ${#scenarios[@]} -gt 1 ]]; then
             echo ""
             echo "=== $current_scenario ==="
         fi
-        case "$target" in
-            metadb)
-                case "$current_scenario" in
-                    prefill)
-                        metadb_json="$(run_bench_backend metadb prefill "$run_dir" "$size_bytes" "$metadb_read_tag" 0 0)"
-                        ;;
-                    get|multi-get)
-                        metadb_json="$(run_bench_backend metadb "$current_scenario" "$run_dir" "$size_bytes" "$metadb_read_tag" 1 1)"
-                        ;;
-                    *)
-                        metadb_json="$(run_bench_backend metadb "$current_scenario" "$run_dir" "$size_bytes")"
-                        ;;
-                esac
-                print_bench_summary "$metadb_json"
+        case "$current_scenario" in
+            prefill)
+                metadb_json="$(run_bench_backend prefill "$run_dir" "$size_bytes" "$metadb_read_tag" 0 0)"
                 ;;
-            rocksdb)
-                case "$current_scenario" in
-                    prefill)
-                        rocksdb_json="$(run_bench_backend rocksdb prefill "$run_dir" "$size_bytes" "$rocksdb_read_tag" 0 0)"
-                        ;;
-                    get|multi-get)
-                        rocksdb_json="$(run_bench_backend rocksdb "$current_scenario" "$run_dir" "$size_bytes" "$rocksdb_read_tag" 1 1)"
-                        ;;
-                    *)
-                        rocksdb_json="$(run_bench_backend rocksdb "$current_scenario" "$run_dir" "$size_bytes")"
-                        ;;
-                esac
-                print_bench_summary "$rocksdb_json"
+            get|multi-get)
+                metadb_json="$(run_bench_backend "$current_scenario" "$run_dir" "$size_bytes" "$metadb_read_tag" 1 1)"
                 ;;
-            compare)
-                case "$current_scenario" in
-                    prefill)
-                        metadb_json="$(run_bench_backend metadb prefill "$run_dir" "$size_bytes" "$metadb_read_tag" 0 0)"
-                        rocksdb_json="$(run_bench_backend rocksdb prefill "$run_dir" "$size_bytes" "$rocksdb_read_tag" 0 0)"
-                        ;;
-                    get|multi-get)
-                        metadb_json="$(run_bench_backend metadb "$current_scenario" "$run_dir" "$size_bytes" "$metadb_read_tag" 1 1)"
-                        rocksdb_json="$(run_bench_backend rocksdb "$current_scenario" "$run_dir" "$size_bytes" "$rocksdb_read_tag" 1 1)"
-                        ;;
-                    *)
-                        metadb_json="$(run_bench_backend metadb "$current_scenario" "$run_dir" "$size_bytes")"
-                        rocksdb_json="$(run_bench_backend rocksdb "$current_scenario" "$run_dir" "$size_bytes")"
-                        ;;
-                esac
-                print_bench_compare "$metadb_json" "$rocksdb_json"
+            *)
+                metadb_json="$(run_bench_backend "$current_scenario" "$run_dir" "$size_bytes")"
                 ;;
         esac
+        print_bench_summary "$metadb_json"
     done
 
     echo "bench dir: $run_dir"
@@ -797,7 +736,7 @@ usage() {
     echo "  metrics-summary [path|run-dir] [samples]  Summarize metrics rates and bottlenecks"
     echo "  summary             Print summary.json for the current run"
     echo "  verify              Run metadb-verify --strict on the current run dir"
-    echo "  bench               Run metadb / rocksdb / compare benchmark"
+    echo "  bench               Run metadb benchmark"
     echo ""
     echo "Examples:"
     echo "  ./dev.sh start"
@@ -811,11 +750,11 @@ usage() {
     echo "  ./dev.sh metrics"
     echo "  ./dev.sh metrics-summary"
     echo "  ./dev.sh metrics-summary .dev/soak/20260425T235719Z 24"
-    echo "  ./dev.sh bench compare get 1g"
-    echo "  ./dev.sh bench compare all 10g"
-    echo "  ./dev.sh bench compare put"
+    echo "  ./dev.sh bench metadb get 1g"
+    echo "  ./dev.sh bench metadb all 10g"
+    echo "  ./dev.sh bench metadb put"
     echo "  ./dev.sh bench metadb multi-get 10g"
-    echo "  ./dev.sh bench rocksdb meta-tx"
+    echo "  ./dev.sh bench metadb meta-tx"
     echo ""
     echo "Environment overrides:"
     echo "  METADB_SOAK_DURATION=$DEFAULT_DURATION"
@@ -864,6 +803,6 @@ case "${1:-}" in
     metrics-summary) cmd_metrics_summary "${2:-}" "${3:-12}" ;;
     summary) cmd_summary ;;
     verify)  cmd_verify ;;
-    bench)   cmd_bench "${2:-compare}" "${3:-multi-get}" "${4:-$BENCH_DEFAULT_SIZE}" ;;
+    bench)   cmd_bench "${2:-metadb}" "${3:-multi-get}" "${4:-$BENCH_DEFAULT_SIZE}" ;;
     *)       usage ;;
 esac

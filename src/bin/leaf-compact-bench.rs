@@ -15,9 +15,7 @@
 //!
 //! The bench is single-threaded by design — we're characterizing
 //! per-leaf encode/decode work, not throughput. The numbers are
-//! reproducible enough on a quiet machine to gate format choice; for
-//! competitive comparison against the dense format and RocksDB we run
-//! the full integration bench in Day 3.
+//! reproducible enough on a quiet machine to gate format choice.
 
 use std::hint::black_box;
 use std::time::Instant;

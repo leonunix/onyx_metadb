@@ -44,7 +44,7 @@ const H2_OFFSET: usize = 16;
 
 /// Fixed-size 10-bit-per-entry bloom filter with 7 hash functions. This
 /// is the default configuration; it yields ≈ 1 % false-positive rate at
-/// full occupancy, which is the RocksDB default.
+/// full occupancy.
 pub const DEFAULT_BITS_PER_ENTRY: u32 = 10;
 
 /// Number of hash functions for a given bits-per-entry value. Derived

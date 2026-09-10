@@ -234,10 +234,7 @@ L2P 接入后的关键不变量：
 
 dedup 是第二条主线，但要和当前实现状态对齐。
 
-如果 dedup 仍主要在 onyx RocksDB 路径中，metadb 的 hugepage arena 覆盖不到 RocksDB
-内部 block cache。此时只能通过 RocksDB cache / allocator 侧做间接调优。
-
-当 dedup 迁入 metadb 原生结构后，接入顺序建议：
+dedup 使用 metadb 原生结构，hugepage 接入顺序建议：
 
 1. **dedup index block cache**
    - hash -> DedupEntry 的 SST / block cache。

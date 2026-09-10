@@ -652,8 +652,7 @@ Before 6.5 the phase-2–6 code bypassed any shared cache:
 
 ## Phase 7 — Integration with onyx-storage  (2 weeks)
 
-Replace RocksDB usage in onyx-storage. **一次切换，无过渡期**：RocksDB 直接从
-onyx 依赖里删除，不保留双栈、不做数据迁移（.dev/ 直接弃）。
+Integrate onyx-metadb as the metadata engine for onyx-storage.
 
 **对接规格**：[`docs/ONYX_INTEGRATION_SPEC.md`](ONYX_INTEGRATION_SPEC.md)。本 Phase
 按该文档 §9 验收清单逐条收尾。
@@ -677,19 +676,15 @@ onyx 依赖里删除，不保留双栈、不做数据迁移（.dev/ 直接弃）
 - writer / dedup worker / GC / DedupScanner / delete_volume / hole purge 全部重写为
   metadb Transaction（单 WAL / fused ops）
 - 删掉 onyx 里 1024+1024 条 striped lock、async cleanup 线程的 per-PBA 验死循环
-- `Cargo.toml` 删 rocksdb 依赖；`tools/blockmap_probe.py` 等调试脚本改走 metadb CLI
-
-**不再有** migration tool `metadb-import-rocks`、**不再有** 双后端对比 perf report —
-都被"一次删掉 rocksdb"替代。
+- `Cargo.toml` 使用 in-tree metadb 依赖；元数据调试脚本使用 metadb CLI
 
 ### Exit criteria
 
 - Full onyx-storage test suite passes with metadb backend.
 - 24h soak at target load, no corruption, no unbounded growth（`metadb-verify`
   无报错、`iter_refcounts` 与 reference 对账零偏差）。
-- `cargo tree` 无 `rocksdb`、`Cargo.lock` 无 `rocksdb`、`grep -r rocksdb src/` 无命中。
-- 性能基线：新路径的 writer / dedup hit / snapshot take 都不低于此前 RocksDB 实测值
-  （见 ONYX_INTEGRATION_SPEC §8）。
+- 元数据路径统一通过 metadb 依赖。
+- 性能目标见 ONYX_INTEGRATION_SPEC §8。
 
 ---
 

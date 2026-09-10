@@ -11,7 +11,7 @@
 
 项目经理额外要求的几件事情
 1. 但rs文件不要过长，如果过长请拆分模块（期待单文件代码不超过1k）
-2. dedup之类的测试请参考一下onyx的rocksdb的测试，几十个坑都在那里面复现过
+2. dedup 等测试参考 Onyx 的元数据回归用例，保留已复现问题的断言。
 3. 已经完成项目记得更新这张表
 4. commit里面不要带上你自己的名字
 5. 完成一个步骤。记得commit
@@ -29,7 +29,7 @@
 
 ---
 
-## 参考实现：onyx RocksDB 路径（已稳定运行，踩过数百个 refcount 坑）
+## 参考语义：Onyx 元数据回归用例
 
 **实施时强烈建议先读 onyx 侧的现有实现再动笔**。SPEC §3.1 的 decref/incref 决策
 表、`self_decrement` 同 pba net 0 补偿、newly_zeroed 严格语义、dedup cleanup 批量
@@ -372,9 +372,8 @@ S1 已落。S2/S3 建议已落（共用 `head_pba` helper 和 `decref_to_maybe_z
 4. **`Db::cleanup_dedup_for_dead_pbas(pbas: &[Pba]) -> Result<Lsn>`**
    - 文件：[`src/db.rs`](../src/db.rs)
    - **参考原型**：[`onyx/src/meta/store/dedup.rs::cleanup_dedup_for_pbas_batch`](../../src/meta/store/dedup.rs#L410)
-     （几乎 1:1 对应）。onyx 版本用 `WriteBatch` 做 RocksDB 原子提交，metadb 版
-     换成单个 `Transaction` 打包所有 ops；竞态保护（hash 被重新注册不误删）逻
-     辑照抄。
+     metadb 使用单个 `Transaction` 打包所有 ops，并保留 hash 被重新注册时不误删的
+     竞态保护。
    - 内部步骤：
      1. 调 `multi_scan_dedup_reverse_for_pba(pbas)` 拿 `(pba, hash)` 列表（SPEC §2.2）
      2. 对每个 `hash` 做 `get_dedup(hash)`；若 `entry.pba == 目标 pba` 发 `DedupDelete { hash }`
@@ -688,7 +687,7 @@ Phase B（onyx 侧切换）开工允许。
 
 4. **`DropSnapshot` 扩展字段的迁移语义**（S4）
    - 旧版本 WAL 里的 DropSnapshot 记录在 schema bump 后拒绝读（和 S1 对齐），
-     无迁移路径。确认此策略和 onyx 侧 "RocksDB 一次性进历史" 同步。
+     无迁移路径。onyx 侧需同步处理 schema 切换。
 
 5. **proptest seed 数量的环境变量**（S5）
    - 本地默认 64 seeds 快速迭代，CI 跑 256，release 前本地再跑 ≥ 1024 过夜。不要
@@ -704,7 +703,7 @@ Phase B（onyx 侧切换）开工允许。
 
 - **v1** 2026-04-23：初稿。对应 SPEC v1。6 session 拆分：S1 基础 / S2 L2pRemap /
   S3 L2pRangeDelete / S4 DropSnapshot+cleanup / S5 proptest+soak / S6 bench+签收。
-- **v1.1** 2026-04-23：加「参考实现」章节，把 onyx-storage 已稳定运行的 RocksDB
-  refcount 路径作为参考原型列出（`atomic_batch_write_packed` / `self_decrement` /
+- **v1.1** 2026-04-23：加「参考实现」章节，把 onyx-storage 已稳定运行的
+  refcount 语义作为参考原型列出（`atomic_batch_write_packed` / `self_decrement` /
   `cleanup_dedup_for_pbas_batch` 等）；S2 / S4 inline 回指。实施时优先对齐 onyx
   既有语义，不再重走一遍事故复盘。

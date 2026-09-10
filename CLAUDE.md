@@ -1,8 +1,7 @@
 # onyx-metadb
 
 Onyx 的定制元数据引擎（crate）。独立 git 仓库，但通过 path dep 被 onyx-storage 主
-crate 引用——onyx **唯一**的 meta backend，已经替掉 RocksDB（onyx 主仓 commit
-`b512c44 meta: switch onyx to metadb`）。所有针对 onyx 写路径需求做的 API 形状让步
+crate 引用——onyx **唯一**的 meta backend。所有针对 onyx 写路径需求做的 API 形状让步
 （fused WalOp、`atomic_batch_*`、L2pValue 头 8B 即 PBA 的契约、snapshot-aware refcount
 规则等）保留为长期不变量；不再为"抽象通用 KV"留中立接口。
 
@@ -186,8 +185,7 @@ Phase 7（onyx 接入）已 landed，但 standalone soak 仍是任何深层改�
 
 ## 和 onyx-storage 的关系
 
-- onyx-storage 在 `/root/onyx_storage`，是 metadb 的**唯一 client**，已经把 RocksDB
-  切到 metadb（onyx commit `b512c44 meta: switch onyx to metadb`）。metadb 就是 onyx 的
+- onyx-storage 在 `/root/onyx_storage`，是 metadb 的**唯一 client**。metadb 就是 onyx 的
   定制元数据引擎，**接受为 onyx 语义下沉做 API 形状让步**（fused WalOp、头 8B 即 pba
   的 L2pValue 布局契约、`atomic_batch_*`、snapshot-aware refcount 规则等），不再为
   "抽象的通用 db" 保留中立接口。

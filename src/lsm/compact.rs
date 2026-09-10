@@ -163,9 +163,8 @@ pub(super) fn plan_ln_to_next(
     if total_records <= budget {
         return None;
     }
-    // Pick the SST with the most records as victim (simple heuristic;
-    // RocksDB uses round-robin for leveled, but for MVP this keeps
-    // levels sorted in record density).
+    // Pick the SST with the most records as victim to keep levels sorted
+    // in record density.
     let (victim_idx, _) = level
         .iter()
         .enumerate()

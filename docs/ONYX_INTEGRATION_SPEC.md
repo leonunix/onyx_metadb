@@ -5,7 +5,7 @@
 
 ## 0. 背景
 
-onyx-storage 准备一次性移除 rocksdb，改由 onyx-metadb 承载全部元数据语义。
+onyx-storage 由 onyx-metadb 承载全部元数据语义。
 本文是 Phase A（metadb 侧改造）的验收清单：以下需求全部 landed、soak 过、门控项
 全部 green，才进 Phase B（onyx 侧切换）。
 
@@ -38,8 +38,7 @@ snapshot 的交互不变量在 metadb 内部关死，onyx 只负责发意图和�
 
 ### 明确的边界
 
-- onyx **不再持有**任何 refcount 条件判断逻辑、不再拼 RocksDB WriteBatch、
-  不再维护自己的 striped lock 保护跨表原子性
+- onyx 将 refcount 决策与跨表原子性统一交给 metadb 事务处理
 - metadb **不感知**物理设备、不感知 4KB 内压缩 fragment 打包、不感知 SHA-256
 
 ---
@@ -423,7 +422,7 @@ clone_volume / cleanup_dedup_for_dead_pbas`，长度 ≥ 10k，种子 ≥ 256。
   维护路径留接口。
 - `Transaction::insert` / `delete` **保留**，给非 refcount 相关场景用（比如纯测试）。
 - 旧版 `DropSnapshot` op 的 WAL 兼容性：**不做兼容**。metadb 自身版本号 bump，
-  旧 WAL 不读（和 onyx "rocksdb 一次进历史" 同步）。
+  旧 WAL 不读。
 
 ---
 

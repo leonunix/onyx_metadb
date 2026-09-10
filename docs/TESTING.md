@@ -393,11 +393,6 @@ metadb-faultctl set-injection <point> <nth-hit>
 For manual fault testing of a running test harness. Not used in automated
 CI.
 
-### `metadb-import-rocks`
-
-Phase 7 only. Read onyx-storage's RocksDB CFs, write to metadb. Includes
-a `--verify` mode that diffs metadb against the source RocksDB.
-
 ## 11. CI matrix
 
 ```
