@@ -164,6 +164,7 @@ impl Db {
             refcount_routing,
             metrics.clone(),
         )?;
+        let rc_shard_count = refcount_shards.len();
         let dedup_index = Arc::new(crate::dedup::DedupIndex::create(
             page_store.clone(),
             page_cache.clone(),
@@ -369,6 +370,14 @@ impl Db {
             rc_condense_interval_cycles: cfg.rc_condense_interval_cycles,
             rc_segment_overlay_max_entries: cfg.rc_segment_overlay_max_entries,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
+            // Sized to the WIDEST fan-out: the L2P fold and the rc sample never
+            // overlap (the `L2pFold` phase completes before
+            // `SampleWaitRefcount` starts), so one pool serves both, but
+            // sizing it to the narrower one would make the wider phase run in
+            // waves and lengthen the checkpoint.
+            ckpt_pool: crate::ckpt_pool::CheckpointPool::new(
+                cfg.parallel_l2p_drain_workers.max(rc_shard_count),
+            ),
             parallel_l2p_drain_workers: cfg.parallel_l2p_drain_workers,
             l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
             l2p_checkpoint_pipeline_enabled: cfg.l2p_checkpoint_pipeline_enabled,
@@ -652,6 +661,7 @@ impl Db {
             refcount_routing,
             metrics.clone(),
         )?;
+        let rc_shard_count = refcount_shards.len();
         // v27 (delta-run persist): reconcile each shard's segment directory.
         // Persist-on: LOAD shards that already have a directory (populating their
         // descriptors + framing cache and returning the real segment count) and
@@ -678,7 +688,8 @@ impl Db {
             for &head in manifest.refcount_delta_run_heads.iter() {
                 if head != crate::types::NULL_PAGE {
                     uncondensed_segment_count +=
-                        crate::refcount::segment_dir::read_directory_chain(&page_store, head)?.len();
+                        crate::refcount::segment_dir::read_directory_chain(&page_store, head)?
+                            .len();
                 }
             }
         }
@@ -956,7 +967,10 @@ impl Db {
         // v27 (S3): a persist reopen with un-condensed segments MUST force entry
         // into this block even if nothing else replayed, else the emptied
         // directory heads never commit.
-        if replayed_drop || mutated_volumes || lifecycle_replayed_anything || condense_on_open_needed
+        if replayed_drop
+            || mutated_volumes
+            || lifecycle_replayed_anything
+            || condense_on_open_needed
         {
             let sorted: Vec<Arc<Volume>> = {
                 let mut v: Vec<Arc<Volume>> = volumes.values().cloned().collect();
@@ -1293,6 +1307,14 @@ impl Db {
             rc_condense_interval_cycles: cfg.rc_condense_interval_cycles,
             rc_segment_overlay_max_entries: cfg.rc_segment_overlay_max_entries,
             parallel_l2p_drain_enabled: cfg.parallel_l2p_drain_enabled,
+            // Sized to the WIDEST fan-out: the L2P fold and the rc sample never
+            // overlap (the `L2pFold` phase completes before
+            // `SampleWaitRefcount` starts), so one pool serves both, but
+            // sizing it to the narrower one would make the wider phase run in
+            // waves and lengthen the checkpoint.
+            ckpt_pool: crate::ckpt_pool::CheckpointPool::new(
+                cfg.parallel_l2p_drain_workers.max(rc_shard_count),
+            ),
             parallel_l2p_drain_workers: cfg.parallel_l2p_drain_workers,
             l2p_drain_chunk_entries: cfg.l2p_drain_chunk_entries,
             l2p_checkpoint_pipeline_enabled: cfg.l2p_checkpoint_pipeline_enabled,

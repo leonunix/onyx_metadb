@@ -978,24 +978,28 @@ impl Db {
         let rc_overlay_per_shard_cap =
             (self.rc_segment_overlay_max_entries / self.refcount_shards.len().max(1)).max(1);
         let forced_flush = matches!(kind, crate::metrics::FlushKind::Forced);
-        let rc_results: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> =
-            std::thread::scope(|scope| {
-                let mut handles: Vec<(usize, std::thread::ScopedJoinHandle<_>)> = Vec::new();
-                for (s_idx, shard) in self.refcount_shards.iter().enumerate() {
-                    if selected.rc[s_idx] {
-                        let h = scope.spawn(move || {
-                            if bfg_threads_enabled
-                                && rc_checkpoint_streaming_enabled
-                                && rc_delta_run_persist_enabled
-                            {
-                                // v27: append a durable delta-run segment instead
-                                // of folding the base array — UNLESS condense is
-                                // due (K segments, overlay cap, or a Forced sweep
-                                // with any un-condensed segment), in which case
-                                // fold every segment + the frozen slot back into
-                                // the base and empty the directory.
-                                let segments = shard.rc.segment_count() as u64;
-                                let condense_due = (rc_condense_k > 0
+        // One job per selected shard. `rc_shard_job` is the body both execution
+        // paths run; only WHERE it runs differs.
+        //
+        // The pool path exists because the scoped path created one thread per
+        // selected shard per checkpoint cycle, and each exit ran jemalloc's
+        // `tsd_cleanup` -> `arena_decay` -> `pac_decay_all`, purging every dirty
+        // extent that worker had built (~954 madvise per exit, each broadcasting
+        // a TLB-shootdown IPI to all ~39 CPUs sharing the mm). See
+        // `crate::ckpt_pool`.
+        let rc_shard_job = |s_idx: usize, shard: &crate::db::Shard| {
+            if bfg_threads_enabled
+                && rc_checkpoint_streaming_enabled
+                && rc_delta_run_persist_enabled
+            {
+                // v27: append a durable delta-run segment instead
+                // of folding the base array — UNLESS condense is
+                // due (K segments, overlay cap, or a Forced sweep
+                // with any un-condensed segment), in which case
+                // fold every segment + the frozen slot back into
+                // the base and empty the directory.
+                let segments = shard.rc.segment_count() as u64;
+                let condense_due = (rc_condense_k > 0
                                     && segments >= rc_condense_k)
                                     || shard.rc.segment_overlay_entries() as u64
                                         > rc_overlay_per_shard_cap as u64
@@ -1005,41 +1009,76 @@ impl Db {
                                     || (forced_flush
                                         && segments > 0
                                         && shard.rc.frozen_slot_is_empty(bfg));
-                                if condense_due {
-                                    shard.rc.condense(&[(bfg & (crate::bfg::BFG_SIZE as u64 - 1)) as usize])
-                                } else {
-                                    shard.rc.begin_checkpoint_streaming_persist(
-                                        bfg,
-                                        shard.routing.manifest_version(),
-                                        s_idx as u32,
-                                        wal_checkpoint,
-                                    )
-                                }
-                            } else if bfg_threads_enabled && rc_checkpoint_streaming_enabled {
-                                shard.rc.begin_checkpoint_streaming_shadow(
-                                    bfg,
-                                    shard.routing.manifest_version(),
-                                    s_idx as u32,
-                                    wal_checkpoint,
-                                    rc_delta_run_shadow_enabled,
-                                )
-                            } else if bfg_threads_enabled {
-                                shard.rc.begin_checkpoint(bfg)
-                            } else {
-                                shard.rc.begin_checkpoint_all_slots(false)
-                            }
-                        });
-                        handles.push((s_idx, h));
-                    }
+                if condense_due {
+                    shard
+                        .rc
+                        .condense(&[(bfg & (crate::bfg::BFG_SIZE as u64 - 1)) as usize])
+                } else {
+                    shard.rc.begin_checkpoint_streaming_persist(
+                        bfg,
+                        shard.routing.manifest_version(),
+                        s_idx as u32,
+                        wal_checkpoint,
+                    )
                 }
-                let mut out: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> =
-                    (0..self.refcount_shards.len()).map(|_| None).collect();
-                for (s_idx, h) in handles {
-                    let result = h.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
-                    out[s_idx] = Some(result);
-                }
-                out
-            });
+            } else if bfg_threads_enabled && rc_checkpoint_streaming_enabled {
+                shard.rc.begin_checkpoint_streaming_shadow(
+                    bfg,
+                    shard.routing.manifest_version(),
+                    s_idx as u32,
+                    wal_checkpoint,
+                    rc_delta_run_shadow_enabled,
+                )
+            } else if bfg_threads_enabled {
+                shard.rc.begin_checkpoint(bfg)
+            } else {
+                shard.rc.begin_checkpoint_all_slots(false)
+            }
+        };
+
+        let rc_jobs: Vec<(usize, &crate::db::Shard)> = self
+            .refcount_shards
+            .iter()
+            .enumerate()
+            .filter(|(s_idx, _)| selected.rc[*s_idx])
+            .collect();
+        let rc_completed: Vec<(usize, Result<crate::refcount::shard::RcCheckpoint>)> = match self
+            .ckpt_pool
+            .as_ref()
+            .filter(|_| crate::ckpt_pool::checkpoint_pool_enabled())
+        {
+            Some(pool) => pool.install(|| {
+                use rayon::prelude::*;
+                rc_jobs
+                    .into_par_iter()
+                    .map(|(s_idx, shard)| (s_idx, rc_shard_job(s_idx, shard)))
+                    .collect()
+            }),
+            None => std::thread::scope(|scope| {
+                let handles: Vec<(usize, std::thread::ScopedJoinHandle<_>)> = rc_jobs
+                    .into_iter()
+                    .map(|(s_idx, shard)| (s_idx, scope.spawn(move || rc_shard_job(s_idx, shard))))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(s_idx, h)| {
+                        (
+                            s_idx,
+                            h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                        )
+                    })
+                    .collect()
+            }),
+        };
+        let rc_results: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> = {
+            let mut out: Vec<Option<Result<crate::refcount::shard::RcCheckpoint>>> =
+                (0..self.refcount_shards.len()).map(|_| None).collect();
+            for (s_idx, result) in rc_completed {
+                debug_assert!(out[s_idx].is_none(), "rc shard checkpointed twice");
+                out[s_idx] = Some(result);
+            }
+            out
+        };
         let rc_drain_elapsed = rc_drain_started.elapsed();
         trace.rc_drain_wall_us = micros(rc_drain_elapsed);
         let mut refcount_checkpoints: Vec<Option<crate::refcount::shard::RcCheckpoint>> =
@@ -1370,7 +1409,8 @@ impl Db {
                     // persist checkpoint. A missing head is an invariant violation
                     // (persist cannot be enabled mid-run); fail cleanly rather than
                     // allocate a fresh head that a crash would orphan.
-                    self.metrics.record_flush_total(kind, flush_started.elapsed());
+                    self.metrics
+                        .record_flush_total(kind, flush_started.elapsed());
                     self.abort_rc_checkpoints_sparse(refcount_checkpoints, wal_checkpoint);
                     self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                     return Err(MetaDbError::Corruption(format!(
@@ -1905,8 +1945,7 @@ impl Db {
                 manifest_state.manifest.body_version =
                     crate::manifest::DELTA_RUN_MANIFEST_BODY_VERSION;
             }
-            if manifest_state.manifest.refcount_delta_run_heads.len()
-                != self.refcount_shards.len()
+            if manifest_state.manifest.refcount_delta_run_heads.len() != self.refcount_shards.len()
             {
                 manifest_state.manifest.refcount_delta_run_heads =
                     vec![crate::types::NULL_PAGE; self.refcount_shards.len()].into_boxed_slice();
@@ -1941,7 +1980,11 @@ impl Db {
                     .record_flush_total(kind, flush_started.elapsed());
                 drop(manifest_state);
                 release_apply_guard!();
-                self.rollback_dead_list_drain(&mut drained_deadlists, &dead_list_plans, wal_checkpoint);
+                self.rollback_dead_list_drain(
+                    &mut drained_deadlists,
+                    &dead_list_plans,
+                    wal_checkpoint,
+                );
                 self.retain_rc_checkpoints_after_global_write(refcount_checkpoints);
                 self.abort_checkpoints_sparse(&volumes, &l2p_checkpoints);
                 return Err(err);

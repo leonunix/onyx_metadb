@@ -364,6 +364,11 @@ pub struct Db {
     /// Cached copy of `Config::parallel_l2p_drain_enabled`. Fans the
     /// per-BFG L2P syncing-slot drain out across shards when `true`.
     pub(crate) parallel_l2p_drain_enabled: bool,
+    /// Persistent workers for the two checkpoint fan-outs (L2P fold, rc
+    /// sample). `None` only when the pool could not be built, in which case
+    /// both fall back to `std::thread::scope` — the pre-2026-09-25 behaviour.
+    /// See [`crate::ckpt_pool`] for why spawn-per-cycle was expensive.
+    pub(crate) ckpt_pool: Option<crate::ckpt_pool::CheckpointPool>,
     /// Cached copy of `Config::parallel_l2p_drain_workers`. Zero preserves the
     /// legacy one-worker-per-job fan-out; positive values cap active folds.
     pub(crate) parallel_l2p_drain_workers: usize,

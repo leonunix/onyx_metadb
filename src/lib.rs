@@ -17,6 +17,7 @@ pub mod affinity;
 pub mod apply_gate;
 pub mod bfg;
 pub mod cache;
+pub mod ckpt_pool;
 pub mod config;
 pub mod db;
 pub mod deadlist;
@@ -43,6 +44,7 @@ pub(crate) mod u64_hash;
 pub mod verify;
 
 pub use cache::{PageCache, PageCacheStats};
+pub use ckpt_pool::{checkpoint_pool_enabled, set_checkpoint_pool_enabled};
 pub use config::{Config, MAX_DEDUP_SHARDS, MetaDbJournalMode, PAGE_SIZE};
 pub use db::{
     Db, DbDedupIter, DbRangeIter, DbRefcountIter, DedupScanBatch, DedupScanCursor,

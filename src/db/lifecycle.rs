@@ -28,7 +28,12 @@ fn l2p_drain_worker_count(job_count: usize, configured_workers: usize) -> usize 
 /// Run scoped jobs with a fixed number of workers while retaining input-order
 /// results. Workers keep taking jobs after an error, so callers can finish all
 /// independent shard drains before returning the first ordered error.
-fn run_scoped_jobs_bounded<T, R, F>(jobs: Vec<T>, configured_workers: usize, run: F) -> Vec<R>
+fn run_scoped_jobs_bounded<T, R, F>(
+    jobs: Vec<T>,
+    configured_workers: usize,
+    pool: Option<&crate::ckpt_pool::CheckpointPool>,
+    run: F,
+) -> Vec<R>
 where
     T: Send,
     R: Send,
@@ -45,34 +50,66 @@ where
             .enumerate()
             .collect::<std::collections::VecDeque<_>>(),
     );
-    let completed = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let queue = &queue;
-            let run = &run;
-            handles.push(scope.spawn(move || {
-                let mut local = Vec::new();
-                loop {
-                    // Drop the queue lock before executing the potentially
-                    // multi-second shard fold.
-                    let job = { queue.lock().pop_front() };
-                    let Some((order, job)) = job else {
-                        break;
-                    };
-                    local.push((order, run(job)));
-                }
-                local
-            }));
+    // One consumer per worker, each draining the shared queue until it is
+    // empty. Deliberately NOT one task per job: this keeps `configured_workers`
+    // meaning exactly what it meant when it was A/B'd (4/8/4,
+    // `tools/l2p_fold_workers_ab.sh`), and keeps the continuous shared-queue
+    // shape rather than waves, so a straggler does not stall its peers.
+    let worker_body = |queue: &parking_lot::Mutex<std::collections::VecDeque<(usize, T)>>,
+                       run: &F| {
+        let mut local = Vec::new();
+        loop {
+            // Drop the queue lock before executing the potentially
+            // multi-second shard fold.
+            let job = { queue.lock().pop_front() };
+            let Some((order, job)) = job else {
+                break;
+            };
+            local.push((order, run(job)));
         }
-        handles
-            .into_iter()
-            .flat_map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
-            .collect::<Vec<_>>()
-    });
+        local
+    };
+
+    // The pool path exists to stop creating and destroying these workers once
+    // per checkpoint cycle: each exit ran jemalloc's `tsd_cleanup` ->
+    // `pac_decay_all`, purging every dirty extent the worker had touched
+    // (~954 madvise per exit, each a TLB-shootdown IPI to every CPU sharing the
+    // mm). See `crate::ckpt_pool`.
+    //
+    // `configured_workers == 0` means "one worker per job", i.e. unbounded, and
+    // a fixed-width pool cannot honour that — so that configuration keeps the
+    // scoped path.
+    let pool =
+        pool.filter(|_| configured_workers > 0 && crate::ckpt_pool::checkpoint_pool_enabled());
+    let completed = if let Some(pool) = pool {
+        pool.install(|| {
+            use rayon::prelude::*;
+            (0..worker_count)
+                .into_par_iter()
+                .map(|_| worker_body(&queue, &run))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+    } else {
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                let queue = &queue;
+                let run = &run;
+                handles.push(scope.spawn(move || worker_body(queue, run)));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect::<Vec<_>>()
+        })
+    };
 
     let mut ordered: Vec<Option<R>> = (0..job_count).map(|_| None).collect();
     for (order, result) in completed {
@@ -1119,8 +1156,12 @@ impl Db {
                     }));
                 }
             }
-            let results =
-                run_scoped_jobs_bounded(jobs, self.parallel_l2p_drain_workers, |job| job());
+            let results = run_scoped_jobs_bounded(
+                jobs,
+                self.parallel_l2p_drain_workers,
+                self.ckpt_pool.as_ref(),
+                |job| job(),
+            );
             // First error wins. Every shard that could drain has drained and
             // cleared its frozen slot, so a retry of this BFG only re-processes
             // the shard(s) that errored (their slots are still populated).

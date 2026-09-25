@@ -17,6 +17,17 @@ path = "src/lib.rs"
 parking_lot = { version = "0.12", features = ["deadlock_detection"] }
 crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
+# Persistent worker pool for the checkpoint fan-outs. Both of them used
+# `std::thread::scope`, i.e. 16 fresh threads per checkpoint cycle, and each
+# exiting thread ran jemalloc's `tsd_cleanup` -> `arena_decay` ->
+# `pac_decay_all`, purging every dirty extent it had touched: ~954
+# `madvise(MADV_DONTNEED)` per exit, 3,815/s, each broadcasting a TLB-shootdown
+# IPI to all ~39 CPUs sharing the mm. rayon is used for its SCOPED pool: the
+# fan-out closures borrow `&self`, so a plain 'static worker pool cannot take
+# them without either an unsafe lifetime erasure of our own or Arc-ifying the
+# drain data structures. Already a direct dependency of onyx-storage and
+# onyx-chunklet, so this adds nothing to the build graph.
+rayon = "1.10"
 dashmap = "6"
 lru = "0.12"
 
