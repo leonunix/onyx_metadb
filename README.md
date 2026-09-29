@@ -103,6 +103,11 @@ let lsn = db.cleanup_dedup_for_dead_pbas(&dead_pbas)?;
 let cache   = db.cache_stats();
 let metrics = db.metrics_snapshot();
 let snaps   = db.snapshots_for(vol);
+
+// Process-wide Page buffer pool (default on, 1 GiB free cap; flips live)
+onyx_metadb::set_page_pool_enabled(false);             // every Page back on a fresh heap buffer
+onyx_metadb::set_page_pool_max_free_bytes(512 << 20);
+let pool = onyx_metadb::page_pool_stats();             // takes / fresh / releases / overflow / bypass
 ```
 
 ## Layout

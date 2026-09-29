@@ -61,7 +61,11 @@ pub use manifest::{
     volume_entry_inline_size,
 };
 pub use metrics::{FlushKind, MetaMetrics, MetaMetricsSnapshot};
-pub use page::{PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader, PageType};
+pub use page::{
+    DEFAULT_PAGE_POOL_MAX_FREE_BYTES, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, Page, PageHeader,
+    PagePoolStats, PageType, page_pool_enabled, page_pool_stats, set_page_pool_enabled,
+    set_page_pool_max_free_bytes,
+};
 pub use page_store::{BlockPageDevice, PageBlockIo, PageDevice, PageStore, ReclaimOutcome};
 pub use paged::{DiffEntry, L2pValue, PagedL2p};
 pub use tx::{ApplyOutcome, Transaction};

@@ -29,9 +29,17 @@
 //! byte of payload with one pass and one field; we don't have to remember
 //! "which bytes are covered" per page type.
 
+use std::mem::ManuallyDrop;
+
 use crate::config::PAGE_SIZE;
 use crate::error::{MetaDbError, Result};
 use crate::types::{Lsn, PageId};
+
+pub mod pool;
+pub use pool::{
+    DEFAULT_PAGE_POOL_MAX_FREE_BYTES, PagePoolStats, page_pool_enabled, page_pool_stats,
+    set_page_pool_enabled, set_page_pool_max_free_bytes,
+};
 
 /// Size of the shared page header, in bytes.
 pub const PAGE_HEADER_SIZE: usize = 64;
@@ -217,12 +225,38 @@ impl PageHeader {
 
 /// Owned 4 KiB page.
 ///
-/// The buffer lives on the heap so `Page` values are cheap to move around.
-/// Construction does not zero the buffer twice — we allocate a zeroed box
-/// directly.
-#[derive(Clone)]
+/// The buffer lives on the heap so `Page` values are cheap to move around. It
+/// comes from, and goes back to, the process-wide [`pool`]: every constructor
+/// overwrites all 4096 bytes of a recycled buffer, and `Drop` hands the buffer
+/// back instead of freeing it. See [`pool`] for why a 4 KiB heap buffer is
+/// allocator churn at the scale metadb uses pages.
 pub struct Page {
-    bytes: Box<[u8; PAGE_SIZE]>,
+    // `ManuallyDrop` so `Drop` can move the buffer out to the pool.
+    bytes: ManuallyDrop<pool::PageBytes>,
+}
+
+impl Clone for Page {
+    fn clone(&self) -> Self {
+        let bytes = match pool::take() {
+            Some(mut buf) => {
+                buf.copy_from_slice(&self.bytes[..]);
+                buf
+            }
+            None => pool::PageBytes::clone(&self.bytes),
+        };
+        Self {
+            bytes: ManuallyDrop::new(bytes),
+        }
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        // SAFETY: this is the last use of `bytes`; `ManuallyDrop` keeps the
+        // field from being dropped again after this body returns.
+        let bytes = unsafe { ManuallyDrop::take(&mut self.bytes) };
+        pool::release(bytes);
+    }
 }
 
 impl std::fmt::Debug for Page {
@@ -236,8 +270,15 @@ impl std::fmt::Debug for Page {
 impl Page {
     /// All-zero page. Not a valid on-disk page until [`seal`](Self::seal).
     pub fn zeroed() -> Self {
+        let bytes = match pool::take() {
+            Some(mut buf) => {
+                buf.fill(0);
+                buf
+            }
+            None => Box::new([0u8; PAGE_SIZE]),
+        };
         Self {
-            bytes: Box::new([0u8; PAGE_SIZE]),
+            bytes: ManuallyDrop::new(bytes),
         }
     }
 
@@ -245,8 +286,15 @@ impl Page {
     /// fuzzing paths that need to inspect arbitrary on-disk images.
     #[doc(hidden)]
     pub fn from_raw_bytes(bytes: [u8; PAGE_SIZE]) -> Self {
+        let bytes = match pool::take() {
+            Some(mut buf) => {
+                *buf = bytes;
+                buf
+            }
+            None => Box::new(bytes),
+        };
         Self {
-            bytes: Box::new(bytes),
+            bytes: ManuallyDrop::new(bytes),
         }
     }
 
@@ -274,7 +322,7 @@ impl Page {
     /// [`verify`](Self::verify) for full integrity checking when you have a
     /// `page_id` for error reporting.
     pub fn header(&self) -> Result<PageHeader> {
-        let b = &*self.bytes;
+        let b = &self.bytes[..];
         let magic = u32_le(b, OFF_MAGIC);
         if magic != PAGE_MAGIC {
             return Err(MetaDbError::PageMagicMismatch {
@@ -302,7 +350,7 @@ impl Page {
     /// Overwrite the page header fields. The CRC is not recomputed until
     /// [`seal`](Self::seal) is called.
     pub fn write_header(&mut self, h: &PageHeader) {
-        let b = &mut *self.bytes;
+        let b = &mut self.bytes[..];
         put_u32_le(b, OFF_MAGIC, PAGE_MAGIC);
         b[OFF_PAGE_TYPE] = h.page_type as u8;
         b[OFF_VERSION] = PAGE_VERSION;
@@ -339,50 +387,50 @@ impl Page {
 
     /// Current `key_count` from the header.
     pub fn key_count(&self) -> u16 {
-        u16_le(&*self.bytes, OFF_KEY_COUNT)
+        u16_le(&self.bytes[..], OFF_KEY_COUNT)
     }
 
     /// Overwrite `key_count`.  Does not reseal.
     pub fn set_key_count(&mut self, n: u16) {
-        put_u16_le(&mut *self.bytes, OFF_KEY_COUNT, n);
+        put_u16_le(&mut self.bytes[..], OFF_KEY_COUNT, n);
     }
 
     /// Current `generation` (LSN) from the header.
     pub fn generation(&self) -> Lsn {
-        u64_le(&*self.bytes, OFF_GENERATION)
+        u64_le(&self.bytes[..], OFF_GENERATION)
     }
 
     /// Current header flags.
     pub fn flags(&self) -> u32 {
-        u32_le(&*self.bytes, OFF_FLAGS)
+        u32_le(&self.bytes[..], OFF_FLAGS)
     }
 
     /// Overwrite header flags. Does not reseal.
     pub fn set_flags(&mut self, flags: u32) {
-        put_u32_le(&mut *self.bytes, OFF_FLAGS, flags);
+        put_u32_le(&mut self.bytes[..], OFF_FLAGS, flags);
     }
 
     /// Overwrite `generation`. Does not reseal.
     pub fn set_generation(&mut self, lsn: Lsn) {
-        put_u64_le(&mut *self.bytes, OFF_GENERATION, lsn);
+        put_u64_le(&mut self.bytes[..], OFF_GENERATION, lsn);
     }
 
     /// Current `birth_lsn` (immutable birth-LSN) from the header.
     pub fn birth_lsn(&self) -> Lsn {
-        u64_le(&*self.bytes, OFF_BIRTH)
+        u64_le(&self.bytes[..], OFF_BIRTH)
     }
 
     /// Stamp `birth_lsn`. Must be called exactly once, when the page
     /// *version* is created (alloc / clone / cow); never on in-place
     /// modify. Does not reseal.
     pub fn set_birth_lsn(&mut self, lsn: Lsn) {
-        put_u64_le(&mut *self.bytes, OFF_BIRTH, lsn);
+        put_u64_le(&mut self.bytes[..], OFF_BIRTH, lsn);
     }
 
     /// Compute the CRC32C over the page buffer with the CRC field zeroed.
     /// Pure; does not mutate the page.
     pub fn compute_crc(&self) -> u32 {
-        let b = &*self.bytes;
+        let b = &self.bytes[..];
         let mut c: u32 = 0;
         c = crc32c::crc32c_append(c, &b[..OFF_CRC]);
         c = crc32c::crc32c_append(c, &[0u8; 4]);
@@ -394,13 +442,13 @@ impl Page {
     /// storage. Must be the final mutation before a disk write.
     pub fn seal(&mut self) {
         let crc = self.compute_crc();
-        put_u32_le(&mut *self.bytes, OFF_CRC, crc);
+        put_u32_le(&mut self.bytes[..], OFF_CRC, crc);
     }
 
     /// Full integrity check: magic, version, then CRC32C. `page_id` is used
     /// only to enrich the error; it is not otherwise consulted.
     pub fn verify(&self, page_id: PageId) -> Result<()> {
-        let b = &*self.bytes;
+        let b = &self.bytes[..];
         let magic = u32_le(b, OFF_MAGIC);
         if magic != PAGE_MAGIC {
             return Err(MetaDbError::PageMagicMismatch {

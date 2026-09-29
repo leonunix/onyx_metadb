@@ -67,7 +67,7 @@ fn crc_is_independent_of_crc_field_contents() {
     let mut p = Page::new(PageHeader::new(PageType::L2pLeaf, 1));
     p.seal();
     let crc1 = p.compute_crc();
-    put_u32_le(&mut *p.bytes, OFF_CRC, 0xFFFF_FFFF);
+    put_u32_le(&mut p.bytes[..], OFF_CRC, 0xFFFF_FFFF);
     let crc2 = p.compute_crc();
     assert_eq!(crc1, crc2, "CRC must be identical regardless of CRC field");
 }
@@ -76,7 +76,7 @@ fn crc_is_independent_of_crc_field_contents() {
 fn magic_mismatch_reports_page_id() {
     let mut p = Page::new(PageHeader::new(PageType::L2pLeaf, 1));
     p.seal();
-    put_u32_le(&mut *p.bytes, OFF_MAGIC, 0xDEAD_BEEF);
+    put_u32_le(&mut p.bytes[..], OFF_MAGIC, 0xDEAD_BEEF);
     match p.verify(42).unwrap_err() {
         MetaDbError::PageMagicMismatch { page_id, found } => {
             assert_eq!(page_id, 42);
